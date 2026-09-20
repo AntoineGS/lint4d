@@ -1462,6 +1462,29 @@ fn revalidate_records(
         }
         if let Some(path) = &record.path {
             revalidate_path_record(path, record, cancel, validate_transport_observations)?;
+            // A retained path-backed record can become superseded by a newly
+            // admitted overlay.  Effective owner validation must compare the
+            // overlay's text, while ordinary worker validation must continue
+            // to treat the current overlay as authoritative over its disk
+            // metadata.
+            if let Some(overlay) = overlays.get(&record.uri).filter(|_| {
+                !validate_transport_observations
+                    && (record.content_hash.is_some() || record.include_payload)
+            }) {
+                let text_changed = if record.text.is_empty() {
+                    record.content_hash.is_none_or(|expected| {
+                        super::content_hash_bytes(overlay.text.as_bytes()) != expected
+                    })
+                } else {
+                    overlay.text != record.text
+                } || parsed_source_changed(record, &overlay.text);
+                if text_changed {
+                    return Err(format!(
+                        "source changed while resolving {}; retry the request",
+                        record.uri
+                    ));
+                }
+            }
             continue;
         }
         if record.open {
@@ -1585,7 +1608,14 @@ fn revalidate_path_record(
         } else {
             path_stamp(path)
         };
-        if validate_transport_observations && actual_path_stamp != record.path_stamp {
+        // Effective validation ignores mtime-only rewrites, but a negative
+        // configuration witness must remain a real dependency: absent ->
+        // present (or a file/type change) changes the selected context.
+        let effective_path_changed = is_configuration_file(path)
+            && !effective_path_stamp_matches(&actual_path_stamp, &record.path_stamp);
+        if (validate_transport_observations && actual_path_stamp != record.path_stamp)
+            || effective_path_changed
+        {
             let kind = if is_configuration_file(path) {
                 "configuration"
             } else {
@@ -1642,6 +1672,18 @@ fn revalidate_path_record(
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     Ok(())
+}
+
+fn effective_path_stamp_matches(actual: &Option<PathStamp>, expected: &Option<PathStamp>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => {
+            actual.bytes == expected.bytes
+                && actual.is_dir == expected.is_dir
+                && actual.is_symlink == expected.is_symlink
+        }
+        _ => false,
+    }
 }
 
 fn file_content_hash(

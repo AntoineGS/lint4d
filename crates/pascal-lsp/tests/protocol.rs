@@ -5373,6 +5373,439 @@ fn related_document_refresh_reconciles_a_changed_shared_owner() {
     server.shutdown();
 }
 
+#[test]
+fn related_document_refresh_invalidates_an_owner_when_an_unnotified_config_appears() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let config = root.path().join(".lint4d.toml");
+    let with_include =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    let without_include = "unit A;\ninterface\nimplementation\nend.\n";
+    write_file(&include, "const badConst = 1;\n");
+    write_file(&first, &with_include("A"));
+    write_file(&second, &with_include("B"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "configuration transition pull failed: {response:?}"
+        );
+        response.result.expect("configuration transition result")
+    };
+    let include_has_warning = |result: &Value| {
+        result["relatedDocuments"]
+            .as_object()
+            .and_then(|reports| reports.get(uri(&include).as_str()))
+            .and_then(|report| report["items"].as_array())
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming"))
+    };
+
+    let first_result = pull(&mut server, "config-appears-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("first configuration result ID")
+        .to_string();
+    let second_result = pull(&mut server, "config-appears-b-first", &second, None);
+    let second_id = second_result["resultId"]
+        .as_str()
+        .expect("second configuration result ID")
+        .to_string();
+    assert!(
+        include_has_warning(&second_result),
+        "initial shared warning must be retained: {second_result}"
+    );
+
+    // This is the E1 transition: the candidate was observed absent by both
+    // owners, then becomes the effective configuration without a watcher
+    // notification. Removing A's include makes B's retained contribution the
+    // only stale state visible to A's pull.
+    write_file(&first, without_include);
+    write_file(&config, "[rules]\nconstant-naming = \"off\"\n");
+    let after_creation = pull(
+        &mut server,
+        "config-appears-a-refresh",
+        &first,
+        Some(first_id),
+    );
+    let cleared = after_creation["relatedDocuments"]
+        .as_object()
+        .expect("configuration appearance must publish a related clear")
+        .get(uri(&include).as_str())
+        .expect("configuration appearance include clear");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+
+    // The other owner and a repeated owner pull must not resurrect the
+    // contribution after the first pull has retired it.
+    let after_b = pull(
+        &mut server,
+        "config-appears-b-after-a",
+        &second,
+        Some(second_id),
+    );
+    assert!(
+        !include_has_warning(&after_b),
+        "effective config must suppress B's direct report too: {after_b}"
+    );
+    let after_a_again = pull(
+        &mut server,
+        "config-appears-a-again",
+        &first,
+        after_creation["resultId"].as_str().map(str::to_owned),
+    );
+    assert!(
+        !include_has_warning(&after_a_again),
+        "repeated A pull must not resurrect a retired warning: {after_a_again}"
+    );
+
+    // Positive presence->absence control: deleting an effective config without
+    // a watcher must make the warning current again for B.
+    fs::remove_file(&config).expect("delete lint configuration");
+    let after_deletion = pull(&mut server, "config-deleted-b", &second, None);
+    assert!(
+        include_has_warning(&after_deletion),
+        "deleting the config must restore the warning: {after_deletion}"
+    );
+    // An inaccessible candidate is an analysis error, not evidence that the
+    // old owner disappeared. A valid replacement must still be able to clear
+    // the retained report transactionally.
+    fs::create_dir(&config).expect("replace config with inaccessible directory");
+    let failed_id = RequestId::from("config-inaccessible-a".to_string());
+    server.send_request(
+        failed_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&first)},
+            "previousResultId": after_a_again["resultId"]
+        }),
+    );
+    let failed = server.response(&failed_id);
+    assert!(
+        failed.error.is_some(),
+        "directory config must fail closed: {failed:?}"
+    );
+    fs::remove_dir(&config).expect("remove inaccessible config directory");
+    write_file(&config, "[rules]\nconstant-naming = \"off\"\n");
+    let recovered = pull(
+        &mut server,
+        "config-inaccessible-recovery-a",
+        &first,
+        after_a_again["resultId"].as_str().map(str::to_owned),
+    );
+    assert_eq!(
+        recovered["relatedDocuments"][uri(&include).as_str()]["items"],
+        json!([]),
+        "a failed config replacement must not lose the later clear: {recovered}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn related_document_refresh_invalidates_a_closed_owner_after_a_new_changed_overlay() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let with_include =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    let second_source = with_include("B");
+    let without_include = "unit B;\ninterface\nimplementation\nend.\n";
+    write_file(&include, "const badConst = 1;\n");
+    write_file(&first, &with_include("A"));
+    write_file(&second, &second_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "overlay transition pull failed: {response:?}"
+        );
+        response.result.expect("overlay transition result")
+    };
+    let include_has_warning = |result: &Value| {
+        result["relatedDocuments"]
+            .as_object()
+            .and_then(|reports| reports.get(uri(&include).as_str()))
+            .and_then(|report| report["items"].as_array())
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming"))
+    };
+
+    let first_result = pull(&mut server, "overlay-appears-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("first overlay result ID")
+        .to_string();
+    let second_result = pull(&mut server, "overlay-appears-b-first", &second, None);
+    let second_id = second_result["resultId"]
+        .as_str()
+        .expect("second overlay result ID")
+        .to_string();
+    assert!(
+        include_has_warning(&second_result),
+        "initial closed owner must contribute the warning: {second_result}"
+    );
+
+    // This is E2: B was closed when its dependency evidence was captured. A
+    // newly admitted overlay for B now removes its include while B's disk
+    // bytes remain unchanged.
+    write_file(&first, "unit A;\ninterface\nimplementation\nend.\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&first), "type": 2}]}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&second),
+                "languageId": "pascal",
+                "version": 1,
+                "text": without_include
+            }
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let after_new_overlay = pull(
+        &mut server,
+        "overlay-appears-a-refresh",
+        &first,
+        Some(first_id),
+    );
+    let cleared = after_new_overlay["relatedDocuments"]
+        .as_object()
+        .expect("changed overlay must publish a related clear")
+        .get(uri(&include).as_str())
+        .expect("changed overlay include clear");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+
+    // Pulling the direct owner and then the other owner again must not bring
+    // the old disk contribution back.
+    let after_b = pull(
+        &mut server,
+        "overlay-appears-b-after-a",
+        &second,
+        Some(second_id),
+    );
+    assert!(
+        !include_has_warning(&after_b),
+        "direct overlay owner pull must remain clear: {after_b}"
+    );
+    let after_a_again = pull(
+        &mut server,
+        "overlay-appears-a-again",
+        &first,
+        after_new_overlay["resultId"].as_str().map(str::to_owned),
+    );
+    assert!(
+        !include_has_warning(&after_a_again),
+        "other-root repetition must remain clear: {after_a_again}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn related_document_refresh_preserves_a_closed_owner_after_a_same_text_overlay() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let with_include =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    let second_source = with_include("B");
+    write_file(&include, "const badConst = 1;\n");
+    write_file(&first, &with_include("A"));
+    write_file(&second, &second_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "same-text overlay pull failed: {response:?}"
+        );
+        response.result.expect("same-text overlay result")
+    };
+
+    let first_result = pull(&mut server, "overlay-same-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("same-text first result ID")
+        .to_string();
+    let second_result = pull(&mut server, "overlay-same-b-first", &second, None);
+    assert!(
+        second_result["relatedDocuments"][uri(&include).as_str()]["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming")),
+        "initial same-text owner warning missing: {second_result}"
+    );
+
+    write_file(&first, "unit A;\ninterface\nimplementation\nend.\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&first), "type": 2}]}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&second),
+                "languageId": "pascal",
+                "version": 1,
+                "text": second_source
+            }
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    // A version-only edit after the closed->open transition is also a no-op.
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&second), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let changed = pull(
+        &mut server,
+        "overlay-same-a-refresh",
+        &first,
+        Some(first_id),
+    );
+    assert!(
+        changed["relatedDocuments"][uri(&include).as_str()]["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming")),
+        "same effective overlay must preserve the warning: {changed}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn related_document_refresh_retires_an_already_open_owner_after_a_real_overlay_change() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let with_include =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    let second_source = with_include("B");
+    write_file(&include, "const badConst = 1;\n");
+    write_file(&first, &with_include("A"));
+    write_file(&second, &second_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&second),
+                "languageId": "pascal",
+                "version": 1,
+                "text": second_source
+            }
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "open-owner pull failed: {response:?}"
+        );
+        response.result.expect("open-owner result")
+    };
+    let first_result = pull(&mut server, "overlay-real-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("open-owner first result ID")
+        .to_string();
+    let second_result = pull(&mut server, "overlay-real-b-first", &second, None);
+    assert!(
+        second_result["relatedDocuments"][uri(&include).as_str()]["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming")),
+        "initial open owner warning missing: {second_result}"
+    );
+
+    write_file(&first, "unit A;\ninterface\nimplementation\nend.\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&first), "type": 2}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&second), "version": 2},
+            "contentChanges": [{"text": "unit B;\ninterface\nimplementation\nend.\n"}]
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let changed = pull(
+        &mut server,
+        "overlay-real-a-refresh",
+        &first,
+        Some(first_id),
+    );
+    assert_eq!(
+        changed["relatedDocuments"][uri(&include).as_str()]["items"],
+        json!([]),
+        "a real already-open overlay change must clear the warning: {changed}"
+    );
+    server.shutdown();
+}
+
 fn assert_shared_owner_noop_transition_preserves_warning(open_owner: bool) {
     let root = tempfile::tempdir().expect("workspace");
     let include = root.path().join("Shared.inc");

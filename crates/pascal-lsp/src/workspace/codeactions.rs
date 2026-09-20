@@ -1,16 +1,19 @@
 //! Naming quick-fix planning for the workspace snapshot.
 
 use super::rename::{
-    CANCELLATION_MESSAGE, Computed, RenameSnapshot, SnapshotMode, SnapshotSeed, SourceRecord,
-    WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
+    CANCELLATION_MESSAGE, Computed, OverlayInput, RenameSnapshot, SnapshotMode, SnapshotSeed,
+    SourceRecord, WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
     input_source_is_editable, is_cancelled, may_contain_include_directive, snapshot_records,
-    source_for_input_with_cancel, workspace_edit,
+    source_for_input_with_cancel, text_content_hash, workspace_edit,
 };
 use super::{
     absolute_path, canonical_file_uri, is_configuration_file, is_lint_excluded, path_stamp,
 };
 use crate::configuration::{config_directories, resolve_lint};
-use crate::navigation::MissingUnitCandidate;
+use crate::navigation::{
+    AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
+    MissingUnitCandidate, MissingUnitUseKind,
+};
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
 use lint4d::engine::suppress::parse_suppressions;
@@ -31,11 +34,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
-const ACTION_DATA_VERSION: u8 = 2;
+const ACTION_DATA_VERSION: u8 = 3;
 const MAX_ACTION_ID_BYTES: usize = 64;
 const MAX_ACTION_NAME_BYTES: usize = 256;
 const MAX_ACTION_UNIT_BYTES: usize = 256;
 const MAX_ACTION_URI_BYTES: usize = 4096;
+const MAX_MISSING_UNIT_RESPONSE_BYTES: usize = 64 * 1024;
 const MISSING_UNIT_ACTION_KIND: &str = "add-missing-unit";
 const CONSTANT_RULE: &str = "constant-naming";
 const LOCAL_RULE: &str = "local-variable-naming";
@@ -71,6 +75,7 @@ pub(crate) struct MissingUnitActionData {
     pub(crate) unit_name: String,
     pub(crate) provider_uri: Url,
     pub(crate) provider_symbol: String,
+    pub(crate) use_kind: MissingUnitUseKind,
     #[serde(with = "decimal_u64")]
     pub(crate) provider_source_hash: u64,
     #[serde(with = "decimal_u64")]
@@ -221,12 +226,12 @@ pub(crate) fn code_actions_from_input(
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     if features.resolve {
-        let mut actions: Vec<CodeActionOrCommand> = candidates
-            .iter()
-            .map(|candidate| {
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        for candidate in &candidates {
+            let action = CodeActionOrCommand::CodeAction({
                 let data =
                     RenameActionData::new(candidate, source_generation, configuration_generation);
-                CodeActionOrCommand::CodeAction(CodeAction {
+                CodeAction {
                     title: action_title(candidate),
                     kind: Some(CodeActionKind::QUICKFIX),
                     diagnostics: candidate
@@ -240,13 +245,18 @@ pub(crate) fn code_actions_from_input(
                     data: Some(
                         serde_json::to_value(&data).expect("rename action data is serializable"),
                     ),
-                })
-            })
-            .collect();
-        actions.extend(missing_plans.iter().map(|plan| {
+                }
+            });
+            match push_bounded_code_action(&mut actions, action) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
+        for plan in &missing_plans {
             let data =
                 MissingUnitActionData::new(plan, source_generation, configuration_generation);
-            CodeActionOrCommand::CodeAction(CodeAction {
+            let action = CodeActionOrCommand::CodeAction(CodeAction {
                 title: missing_unit_action_title(&plan.candidate),
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: plan.diagnostic.clone().map(|diagnostic| vec![diagnostic]),
@@ -257,8 +267,13 @@ pub(crate) fn code_actions_from_input(
                 data: Some(
                     serde_json::to_value(&data).expect("missing unit action data is serializable"),
                 ),
-            })
-        }));
+            });
+            match push_bounded_code_action(&mut actions, action) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
         return Computed {
             source_generation,
             configuration_generation,
@@ -367,7 +382,11 @@ pub(crate) fn code_actions_from_input(
                 }
             }
         }
-        actions.push(CodeActionOrCommand::CodeAction(action));
+        match push_bounded_code_action(&mut actions, CodeActionOrCommand::CodeAction(action)) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
     }
     for plan in &missing_plans {
         if is_cancelled(cancel) {
@@ -400,7 +419,11 @@ pub(crate) fn code_actions_from_input(
                 }
             }
         }
-        actions.push(CodeActionOrCommand::CodeAction(action));
+        match push_bounded_code_action(&mut actions, CodeActionOrCommand::CodeAction(action)) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
     }
     let mut records = snapshot_records(&snapshot);
     append_records(&mut records, missing_records);
@@ -454,15 +477,24 @@ fn missing_unit_plans_from_input(
     {
         return Ok((Vec::new(), Vec::new()));
     }
-    let mut snapshot = snapshot;
-    let candidates =
-        snapshot
-            .index
-            .missing_unit_candidates_with_cancel(uri, params.range.start, cancel)?;
+    let mut budget = AssistanceBudget::new(
+        MAX_MISSING_UNIT_REQUEST_WORK,
+        MAX_MISSING_UNIT_REQUEST_BYTES,
+        "missing-unit request",
+    );
+    let candidates = snapshot.index.missing_unit_candidates_with_budget(
+        uri,
+        params.range.start,
+        cancel,
+        &mut budget,
+    )?;
     let mut plans = Vec::new();
     for candidate in candidates {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if !missing_unit_candidate_identity_is_bounded(&candidate, uri, &identifier) {
+            continue;
         }
         let diagnostic = matching_missing_unit_diagnostic(&candidate, &params.context);
         if !params.context.diagnostics.is_empty() && diagnostic.is_none() {
@@ -485,14 +517,21 @@ fn missing_unit_plans_from_input(
         else {
             continue;
         };
-        let binds = snapshot.index.missing_unit_binds_after_import_with_cancel(
+        let binds = missing_unit_binding_proof(
+            input,
             uri,
+            target_record,
+            configuration_records,
             updated_source,
             updated_position,
+            &identifier,
             &candidate.unit_name,
             &candidate.provider_uri,
             &candidate.symbol_name,
+            candidate.use_kind,
+            candidate.provider_source_hash,
             cancel,
+            &mut budget,
         )?;
         if !binds {
             continue;
@@ -512,6 +551,103 @@ fn missing_unit_plans_from_input(
         return Ok((Vec::new(), Vec::new()));
     }
     Ok((plans, snapshot_records(&snapshot)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn missing_unit_binding_proof(
+    input: &WorkspaceInput,
+    uri: &Url,
+    target_record: &SourceRecord,
+    configuration_records: &[SourceRecord],
+    updated_source: String,
+    updated_position: lsp_types::Position,
+    identifier: &str,
+    unit_name: &str,
+    provider_uri: &Url,
+    symbol_name: &str,
+    use_kind: MissingUnitUseKind,
+    provider_source_hash: u64,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let mut proof_input = input.clone();
+    proof_input.overlays.insert(
+        uri.clone(),
+        OverlayInput {
+            text: updated_source.clone(),
+            version: target_record.version.unwrap_or_default(),
+        },
+    );
+    let mut proof_record = target_record.clone();
+    proof_record.text = updated_source.clone();
+    proof_record.parsed_text_hash = Some(text_content_hash(&updated_source));
+    proof_record.content_hash = None;
+    let snapshot = build_snapshot(
+        &proof_input,
+        std::slice::from_ref(uri),
+        std::slice::from_ref(&identifier.to_string()),
+        SnapshotMode::Assistance,
+        Some(
+            SnapshotSeed::new(proof_record)
+                .with_consumed_configuration(configuration_records)
+                .with_completion_position(Some(updated_position)),
+        ),
+        &[],
+        cancel,
+    )?;
+    if !snapshot.complete
+        || !snapshot.include_errors.is_empty()
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|source| source != &updated_source)
+        || snapshot
+            .index
+            .source_text(provider_uri)
+            .is_none_or(|source| source_hash(source) != provider_source_hash)
+    {
+        return Ok(false);
+    }
+    snapshot.index.missing_unit_binds_after_import_with_cancel(
+        uri,
+        updated_position,
+        unit_name,
+        provider_uri,
+        symbol_name,
+        use_kind,
+        cancel,
+        budget,
+    )
+}
+
+fn missing_unit_candidate_identity_is_bounded(
+    candidate: &MissingUnitCandidate,
+    target_uri: &Url,
+    identifier: &str,
+) -> bool {
+    !identifier.is_empty()
+        && identifier.len() <= MAX_ACTION_NAME_BYTES
+        && !candidate.unit_name.is_empty()
+        && candidate.unit_name.len() <= MAX_ACTION_UNIT_BYTES
+        && !candidate.symbol_name.is_empty()
+        && candidate.symbol_name.len() <= MAX_ACTION_NAME_BYTES
+        && target_uri.as_str().len() <= MAX_ACTION_URI_BYTES
+        && candidate.provider_uri.as_str().len() <= MAX_ACTION_URI_BYTES
+}
+
+fn push_bounded_code_action(
+    actions: &mut Vec<CodeActionOrCommand>,
+    action: CodeActionOrCommand,
+) -> Result<bool, String> {
+    let mut candidate = actions.clone();
+    candidate.push(action.clone());
+    let encoded = serde_json::to_vec(&candidate)
+        .map_err(|error| format!("could not serialize bounded code actions: {error}"))?;
+    if encoded.len() > MAX_MISSING_UNIT_RESPONSE_BYTES {
+        return Ok(false);
+    }
+    actions.push(action);
+    Ok(true)
 }
 
 fn matching_missing_unit_diagnostic(
@@ -778,12 +914,7 @@ fn resolve_missing_unit_from_input(
 ) -> Computed<CodeAction> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
-    if let Err(error) = validate_missing_unit_action_data(
-        &data,
-        &action,
-        source_generation,
-        configuration_generation,
-    ) {
+    if let Err(error) = validate_missing_unit_action_data(&data, &action) {
         return failed(source_generation, configuration_generation, error);
     }
 
@@ -874,6 +1005,7 @@ fn resolve_missing_unit_from_input(
             && plan.candidate.unit_name == data.unit_name
             && plan.candidate.provider_uri == data.provider_uri
             && plan.candidate.symbol_name == data.provider_symbol
+            && plan.candidate.use_kind == data.use_kind
             && plan.candidate.provider_source_hash == data.provider_source_hash
             && plan.config_fingerprint == data.config_fingerprint
             && plan.source_hash == data.source_hash
@@ -1392,6 +1524,7 @@ impl MissingUnitActionData {
             unit_name: plan.candidate.unit_name.clone(),
             provider_uri: plan.candidate.provider_uri.clone(),
             provider_symbol: plan.candidate.symbol_name.clone(),
+            use_kind: plan.candidate.use_kind,
             provider_source_hash: plan.candidate.provider_source_hash,
             source_generation,
             configuration_generation,
@@ -1433,6 +1566,7 @@ fn missing_unit_action_id(data: &MissingUnitActionData) -> String {
     data.unit_name.hash(&mut hasher);
     data.provider_uri.hash(&mut hasher);
     data.provider_symbol.hash(&mut hasher);
+    data.use_kind.hash(&mut hasher);
     data.provider_source_hash.hash(&mut hasher);
     data.source_generation.hash(&mut hasher);
     data.configuration_generation.hash(&mut hasher);
@@ -1508,14 +1642,10 @@ fn validate_rename_action_data(
 fn validate_missing_unit_action_data(
     data: &MissingUnitActionData,
     action: &CodeAction,
-    source_generation: u64,
-    configuration_generation: u64,
 ) -> Result<(), String> {
     if data.version != ACTION_DATA_VERSION
         || data.kind != MISSING_UNIT_ACTION_KIND
         || data.action_id != missing_unit_action_id(data)
-        || data.source_generation != source_generation
-        || data.configuration_generation != configuration_generation
     {
         return Err("missing-unit code action resolve data is stale or tampered".to_string());
     }

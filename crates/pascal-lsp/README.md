@@ -1338,6 +1338,16 @@ not fully modeled. These checks are conservative; they bound races and
 avoid false-safe workspace edits but do not eliminate changes made after a
 request has completed.
 
+The provider export must match the use-site role: types require a source type,
+call sites require a routine, and value/assignment sites require a compatible
+constant, variable, or enum value. Interface imports are withheld when the
+proposed edge forms a direct or transitive interface cycle, or when the
+bounded dependency graph is incomplete; implementation-local back-edges remain
+eligible. Project aliases, search paths, read policy, conditional state, and
+the actual resolved import are checked again for deferred resolve. A no-op
+buffer version change or unrelated overlay does not expire an otherwise
+unchanged action, while target/provider/project changes do.
+
 ## Limits
 
 | Initialization option | Default and maximum |
@@ -1402,10 +1412,14 @@ at most 2,048 items and 8 MiB in one server session, with compact dependency
 observations capped at 1,024 records and 2 MiB. Resolve data is capped at 512
 bytes per item and retained completion items at 64 KiB; oldest entries are
 evicted to stay within the bounds.
-Missing-unit discovery shares the 100,000-node/symbol work budget and 64 KiB
-assistance byte budget, returns at most 32 provider actions, and fails closed
-when provider discovery, binding proof, cancellation, or edit planning cannot
-finish.
+Missing-unit discovery, absence checking, and every post-edit binding proof
+share one request-wide budget of 300,000 bounded work units and 8 MiB of
+charged source bytes. The request returns at most 32 provider actions and the
+actual serialized code-action result (including escaped titles, resolve data,
+and eager edits) is capped at 64 KiB; identities are limited to 256 bytes for
+names/unit names and 4 KiB per URI. Cancellation or exhaustion fails closed
+when provider discovery, authoritative import resolution, cycle checking, or
+edit planning cannot finish.
 
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP

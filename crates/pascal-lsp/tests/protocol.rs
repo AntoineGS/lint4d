@@ -1744,6 +1744,36 @@ fn result_locations(response: Response) -> Vec<Value> {
         .clone()
 }
 
+fn request_missing_unit_actions(
+    server: &mut TestServer,
+    path: &Path,
+    source: &str,
+    identifier: &str,
+    request_id: &str,
+) -> Vec<Value> {
+    let id = RequestId::from(request_id.to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(path)},
+            "range": {
+                "start": position_of(source, identifier, 0),
+                "end": position_after(source, identifier, 0),
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    response
+        .result
+        .expect("code action result")
+        .as_array()
+        .expect("code action array")
+        .clone()
+}
+
 #[cfg(feature = "test-support")]
 fn collect_partial_response(
     server: &mut TestServer,
@@ -29693,6 +29723,849 @@ fn code_action_supports_a_namespaced_provider_for_an_interface_type() {
     assert_eq!(actions[0]["title"], "Add unit 'Vendor.Provider' to uses");
     let updated = apply_workspace_edit_to_source(main_source, &actions[0]["edit"], &uri(&main));
     assert!(updated.contains("uses Vendor.Provider;\n"));
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_reject_providers_not_authorized_by_the_selected_project() {
+    let main_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "type TAlias = MissingType;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "type MissingType = class end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let cases = [
+        (
+            "Provider.pas",
+            "<DCC_UnitAlias>Provider=Other</DCC_UnitAlias>",
+        ),
+        ("WrongFilename.pas", ""),
+        ("sub/Provider.pas", ""),
+    ];
+
+    for deferred in [false, true] {
+        for (index, (provider_path, alias)) in cases.into_iter().enumerate() {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let root = temp.path().join("fixture");
+            let main = root.join("Consumer.pas");
+            write_file(&main, main_source);
+            write_file(&root.join(provider_path), provider_source);
+            if alias.contains("UnitAlias") {
+                write_file(
+                    &root.join("Other.pas"),
+                    "unit Other;\ninterface\nimplementation\nend.\n",
+                );
+            }
+            write_file(
+                &root.join("App.dproj"),
+                &format!(
+                    "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource>{alias}</PropertyGroup></Project>"
+                ),
+            );
+
+            let mut server = TestServer::launch();
+            if deferred {
+                server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+            } else {
+                server.initialize_without_document_changes(&root, Value::Null);
+            }
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&main),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": main_source,
+                    }
+                }),
+            );
+            let actions = request_missing_unit_actions(
+                &mut server,
+                &main,
+                main_source,
+                "MissingType",
+                &format!("unauthorized-provider-{deferred}-{index}"),
+            );
+            assert!(
+                actions.is_empty(),
+                "project-rejected provider must not produce an action: {actions:?}"
+            );
+            server.shutdown();
+        }
+    }
+}
+
+#[test]
+fn authorized_missing_unit_edit_binds_after_eager_and_deferred_application() {
+    for deferred in [false, true] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let consumer = root.join("Consumer.pas");
+        let provider = root.join("Provider.pas");
+        let consumer_source = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "type TAlias = MissingType;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let provider_source = concat!(
+            "unit Provider;\n",
+            "interface\n",
+            "type MissingType = class end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        write_file(&consumer, consumer_source);
+        write_file(&provider, provider_source);
+
+        let mut server = TestServer::launch();
+        if deferred {
+            server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+        } else {
+            server.initialize_without_document_changes(&root, Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": consumer_source,
+                }
+            }),
+        );
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &consumer,
+            consumer_source,
+            "MissingType",
+            if deferred {
+                "authorized-deferred-action"
+            } else {
+                "authorized-eager-action"
+            },
+        );
+        assert_eq!(actions.len(), 1, "authorized provider action: {actions:?}");
+        let action = if deferred {
+            let resolve_id = RequestId::from("authorized-deferred-resolve".to_string());
+            server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+            let response = server.response(&resolve_id);
+            assert!(response.error.is_none(), "authorized resolve: {response:?}");
+            response.result.expect("resolved authorized action")
+        } else {
+            actions[0].clone()
+        };
+        let updated =
+            apply_workspace_edit_to_source(consumer_source, &action["edit"], &uri(&consumer));
+        assert!(updated.contains("uses Provider;\n"));
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&consumer), "version": 2},
+                "contentChanges": [{"text": updated}]
+            }),
+        );
+        let definition_id = RequestId::from(if deferred {
+            "authorized-deferred-definition".to_string()
+        } else {
+            "authorized-eager-definition".to_string()
+        });
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, &updated, "MissingType", 0),
+        );
+        let locations = result_locations(server.response(&definition_id));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+        server.shutdown();
+    }
+}
+
+#[test]
+fn code_action_resolve_rejects_an_unnotified_project_alias_change() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Consumer.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "type TAlias = MissingType;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "type MissingType = class end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, main_source);
+    write_file(&provider, provider_source);
+    let project = root.join("App.dproj");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &main,
+        main_source,
+        "MissingType",
+        "unnotified-alias-action",
+    );
+    assert_eq!(actions.len(), 1, "valid project action: {actions:?}");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitAlias>Provider=Other</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+
+    let resolve_id = RequestId::from("unnotified-alias-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "unnotified alias mutation must invalidate resolve: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_withholds_interface_cycles_but_allows_an_implementation_back_edge() {
+    let run_without_action =
+        |consumer_source: &str, provider_source: &str, middle_source: Option<&str>, id: &str| {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let root = temp.path().join("fixture");
+            let consumer = root.join("Consumer.pas");
+            write_file(&consumer, consumer_source);
+            write_file(&root.join("Provider.pas"), provider_source);
+            if let Some(middle_source) = middle_source {
+                write_file(&root.join("Middle.pas"), middle_source);
+            }
+            let mut server = TestServer::launch();
+            server.initialize_without_document_changes(&root, Value::Null);
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&consumer),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": consumer_source,
+                    }
+                }),
+            );
+            let actions = request_missing_unit_actions(
+                &mut server,
+                &consumer,
+                consumer_source,
+                "MissingType",
+                id,
+            );
+            assert!(
+                actions.is_empty(),
+                "uncertain or illegal interface cycle must be withheld: {actions:?}"
+            );
+            server.shutdown();
+        };
+
+    run_without_action(
+        concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "type TAlias = MissingType;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+        concat!(
+            "unit Provider;\n",
+            "interface\n",
+            "uses Consumer;\n",
+            "type MissingType = class end;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+        None,
+        "direct-interface-cycle",
+    );
+    run_without_action(
+        concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "type TAlias = MissingType;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+        concat!(
+            "unit Provider;\n",
+            "interface\n",
+            "uses Middle;\n",
+            "type MissingType = class end;\n",
+            "implementation\n",
+            "end.\n",
+        ),
+        Some(concat!(
+            "unit Middle;\n",
+            "interface\n",
+            "uses Consumer;\n",
+            "implementation\n",
+            "end.\n",
+        )),
+        "transitive-interface-cycle-provider",
+    );
+
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let consumer = root.join("Consumer.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "uses Consumer;\n",
+        "type MissingType = class end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Value: MissingType;\n",
+        "begin\n",
+        "  Value := 1;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&consumer, consumer_source);
+    write_file(&root.join("Provider.pas"), provider_source);
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 1,
+                "text": consumer_source,
+            }
+        }),
+    );
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &consumer,
+        consumer_source,
+        "MissingType",
+        "implementation-back-edge",
+    );
+    assert_eq!(actions.len(), 1, "legal implementation import: {actions:?}");
+    let updated =
+        apply_workspace_edit_to_source(consumer_source, &actions[0]["edit"], &uri(&consumer));
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&consumer), "version": 2},
+            "contentChanges": [{"text": updated}]
+        }),
+    );
+    let definition_id = RequestId::from("implementation-back-edge-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &updated, "MissingType", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(
+        locations[0]["uri"],
+        uri(&root.join("Provider.pas")).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_require_a_provider_export_kind_compatible_with_the_use_site() {
+    let run_case = |provider_declaration: &str,
+                    consumer_source: &str,
+                    identifier: &str,
+                    expected_action: bool,
+                    expected_fragment: Option<&str>,
+                    id: &str| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let consumer = root.join("Consumer.pas");
+        let provider = root.join("Provider.pas");
+        write_file(&consumer, consumer_source);
+        write_file(
+            &provider,
+            &format!("unit Provider;\ninterface\n{provider_declaration}\nimplementation\nend.\n"),
+        );
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": consumer_source,
+                }
+            }),
+        );
+        let actions =
+            request_missing_unit_actions(&mut server, &consumer, consumer_source, identifier, id);
+        assert_eq!(
+            actions.len() == 1,
+            expected_action,
+            "kind case actions: {actions:?}"
+        );
+        if expected_action {
+            let updated = apply_workspace_edit_to_source(
+                consumer_source,
+                &actions[0]["edit"],
+                &uri(&consumer),
+            );
+            server.send_notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri(&consumer), "version": 2},
+                    "contentChanges": [{"text": updated}]
+                }),
+            );
+            let definition_id = RequestId::from(format!("{id}-definition"));
+            server.send_request(
+                definition_id.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, &updated, identifier, 0),
+            );
+            let locations = result_locations(server.response(&definition_id));
+            assert_eq!(
+                locations.len(),
+                1,
+                "provider kind definition: {locations:?}"
+            );
+            assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+            let hover_id = RequestId::from(format!("{id}-hover"));
+            server.send_request(
+                hover_id.clone(),
+                "textDocument/hover",
+                navigation_params(&consumer, &updated, identifier, 0),
+            );
+            let hover = server.response(&hover_id);
+            assert!(hover.error.is_none(), "provider kind hover: {hover:?}");
+            let hover_result = hover.result.expect("provider kind hover result");
+            let hover_text = hover_result["contents"]["value"]
+                .as_str()
+                .expect("provider kind hover text");
+            if let Some(expected_fragment) = expected_fragment {
+                assert!(
+                    hover_text
+                        .to_ascii_lowercase()
+                        .contains(&expected_fragment.to_ascii_lowercase()),
+                    "hover must retain the expected export {expected_fragment:?}: {hover_text:?}"
+                );
+            }
+        }
+        server.shutdown();
+    };
+
+    let type_use = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "type TAlias = MissingType;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    run_case(
+        "const MissingType = 1;",
+        type_use,
+        "MissingType",
+        false,
+        None,
+        "type-constant",
+    );
+    run_case(
+        "procedure MissingType;",
+        type_use,
+        "MissingType",
+        false,
+        None,
+        "type-routine",
+    );
+    run_case(
+        "type MissingType = class end;",
+        type_use,
+        "MissingType",
+        true,
+        Some("type"),
+        "type-type",
+    );
+    let value_use = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "var Sink: Integer;\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  Sink := MissingValue;\n",
+        "end;\n",
+        "end.\n",
+    );
+    run_case(
+        "const MissingValue = 1;",
+        value_use,
+        "MissingValue",
+        true,
+        Some("= 1"),
+        "value-constant",
+    );
+    run_case(
+        "var MissingValue: Integer;",
+        value_use,
+        "MissingValue",
+        true,
+        Some(": Integer"),
+        "value-variable",
+    );
+    let call_use = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    run_case(
+        "var MissingProc: Integer;",
+        call_use,
+        "MissingProc",
+        false,
+        None,
+        "call-variable",
+    );
+    run_case(
+        "procedure MissingProc;",
+        call_use,
+        "MissingProc",
+        true,
+        Some("MissingProc"),
+        "call-routine",
+    );
+}
+
+#[test]
+fn code_action_creation_rejects_overlong_identity_and_caps_serialized_output() {
+    let long_name = "M".repeat(257);
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let consumer = root.join("Consumer.pas");
+    let provider = root.join("Provider.pas");
+    let consumer_source = format!(
+        "unit Consumer;\ninterface\nimplementation\nprocedure Run;\nbegin\n  {long_name};\nend;\nend.\n"
+    );
+    let provider_source =
+        format!("unit Provider;\ninterface\nprocedure {long_name};\nimplementation\nend.\n");
+    write_file(&consumer, &consumer_source);
+    write_file(&provider, &provider_source);
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 1,
+                "text": consumer_source,
+            }
+        }),
+    );
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &consumer,
+        &consumer_source,
+        &long_name,
+        "overlong-missing-unit",
+    );
+    assert!(
+        actions.is_empty(),
+        "overlong identity must be withheld: {actions:?}"
+    );
+    server.shutdown();
+
+    for deferred in [false, true] {
+        let temp = tempfile::tempdir().expect("serialized-output workspace");
+        let root = temp.path().join("fixture");
+        let long_directory = (0..10)
+            .map(|_| "d".repeat(220))
+            .collect::<Vec<_>>()
+            .join(std::path::MAIN_SEPARATOR_STR);
+        let provider_root = root.join(long_directory);
+        let consumer = root.join("Consumer.pas");
+        let output_name = "M".repeat(128);
+        let consumer_source = format!(
+            "unit Consumer;\ninterface\nimplementation\nprocedure Run;\nbegin\n  {output_name};\nend;\nend.\n"
+        );
+        write_file(&consumer, &consumer_source);
+        for index in 0..32 {
+            write_file(
+                &provider_root.join(format!("Provider{index}.pas")),
+                &format!(
+                    "unit Provider{index};\ninterface\nprocedure {output_name};\nimplementation\nend.\n"
+                ),
+            );
+        }
+        let mut server = TestServer::launch();
+        if deferred {
+            server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+        } else {
+            server.initialize_without_document_changes(&root, Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": consumer_source,
+                }
+            }),
+        );
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &consumer,
+            &consumer_source,
+            &output_name,
+            if deferred {
+                "missing-unit-deferred-output-budget"
+            } else {
+                "missing-unit-eager-output-budget"
+            },
+        );
+        let encoded = serde_json::to_vec(&actions).expect("serialized code actions");
+        assert!(
+            !actions.is_empty() && actions.len() < 32,
+            "the aggregate output budget should admit a deterministic prefix only: {} actions",
+            actions.len()
+        );
+        assert!(
+            encoded.len() <= 64 * 1024,
+            "missing-unit response exceeded the advertised assistance budget: {} bytes",
+            encoded.len()
+        );
+        if deferred {
+            assert!(actions.iter().all(|action| action["edit"].is_null()));
+        } else {
+            assert!(actions.iter().all(|action| action["edit"].is_object()));
+        }
+        server.shutdown();
+    }
+}
+
+#[test]
+fn deferred_missing_unit_resolve_uses_effective_dependencies_not_transport_generations() {
+    let run_case = |open_unrelated: bool, id_prefix: &str| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let consumer = root.join("Consumer.pas");
+        let provider = root.join("Provider.pas");
+        let other = root.join("Other.pas");
+        let consumer_source = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  MissingProc;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let provider_source = concat!(
+            "unit Provider;\n",
+            "interface\n",
+            "procedure MissingProc;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let other_source = "unit Other;\ninterface\nimplementation\nend.\n";
+        write_file(&consumer, consumer_source);
+        write_file(&provider, provider_source);
+        write_file(&other, other_source);
+        let mut server = TestServer::launch();
+        server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": consumer_source,
+                }
+            }),
+        );
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &consumer,
+            consumer_source,
+            "MissingProc",
+            &format!("{id_prefix}-action"),
+        );
+        assert_eq!(actions.len(), 1, "deferred action creation: {actions:?}");
+        if open_unrelated {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&other),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": other_source,
+                    }
+                }),
+            );
+        } else {
+            server.send_notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri(&consumer), "version": 2},
+                    "contentChanges": [{"text": consumer_source}]
+                }),
+            );
+        }
+        let resolve_id = RequestId::from(format!("{id_prefix}-resolve"));
+        server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+        let response = server.response(&resolve_id);
+        assert!(
+            response.error.is_none(),
+            "unchanged dependencies must resolve: {response:?}"
+        );
+        let resolved = response.result.expect("resolved code action");
+        let edit = resolved["edit"]
+            .as_object()
+            .expect("resolved workspace edit");
+        if !open_unrelated {
+            let version = edit["documentChanges"][0]["textDocument"]["version"]
+                .as_i64()
+                .expect("edit document version");
+            assert_eq!(
+                version, 2,
+                "resolved edit must use the current document version"
+            );
+        }
+        let updated =
+            apply_workspace_edit_to_source(consumer_source, &resolved["edit"], &uri(&consumer));
+        server.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri(&consumer), "version": 3},
+                "contentChanges": [{"text": updated}]
+            }),
+        );
+        let definition_id = RequestId::from(format!("{id_prefix}-definition"));
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, &updated, "MissingProc", 0),
+        );
+        let locations = result_locations(server.response(&definition_id));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+        server.shutdown();
+    };
+
+    run_case(false, "same-text-version");
+    run_case(true, "unrelated-overlay");
+}
+
+#[test]
+fn deferred_missing_unit_resolve_rejects_a_same_size_provider_mutation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let consumer = root.join("Consumer.pas");
+    let provider = root.join("Provider.pas");
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc;\n",
+        "implementation\n",
+        "// A\n",
+        "end.\n",
+    );
+    let mutated_provider_source = provider_source.replace("// A", "// B");
+    assert_eq!(provider_source.len(), mutated_provider_source.len());
+    write_file(&consumer, consumer_source);
+    write_file(&provider, provider_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 1,
+                "text": consumer_source,
+            }
+        }),
+    );
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &consumer,
+        consumer_source,
+        "MissingProc",
+        "same-size-provider-mutation-action",
+    );
+    assert_eq!(actions.len(), 1, "same-size mutation setup: {actions:?}");
+    write_file(&provider, &mutated_provider_source);
+    let resolve_id = RequestId::from("same-size-provider-mutation-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "same-size provider mutation must invalidate resolve: {response:?}"
+    );
     server.shutdown();
 }
 

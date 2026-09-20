@@ -1,9 +1,9 @@
 use super::{
-    AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
-    ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind, TypeKind, canonical_name,
-    documentation, is_declaration_identifier, is_ignored_offset, location_for_span,
-    member_expression_at, node_text, node_text_with_budget, symbol_is_available_at,
-    symbol_visible_in_region, use_name_at,
+    AssistanceBudget, Candidate, Document, GenericSubstitution, MissingUnitUseKind,
+    NavigationIndex, Origin, ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind,
+    TypeKind, canonical_name, documentation, is_declaration_identifier, is_ignored_offset,
+    location_for_span, member_expression_at, node_text, node_text_with_budget,
+    symbol_is_available_at, symbol_visible_in_region, use_name_at,
 };
 use crate::text;
 use lsp_types::{
@@ -311,6 +311,7 @@ pub(crate) struct MissingUnitCandidate {
     pub(crate) unit_name: String,
     pub(crate) provider_uri: Url,
     pub(crate) symbol_name: String,
+    pub(crate) use_kind: MissingUnitUseKind,
     pub(crate) provider_source_hash: u64,
 }
 
@@ -677,18 +678,14 @@ impl NavigationIndex {
     /// unit is an independently validated action.  The filtering here keeps
     /// the same syntax, visibility, conditional, and provider-catalogue
     /// boundaries as auto-import completion.
-    pub(crate) fn missing_unit_candidates_with_cancel(
+    pub(crate) fn missing_unit_candidates_with_budget(
         &self,
         uri: &Url,
         position: Position,
         cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
     ) -> Result<Vec<MissingUnitCandidate>, String> {
         check_cancel(cancel)?;
-        let mut budget = AssistanceBudget::new(
-            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
-            MAX_HOVER_VALUE_BYTES,
-            "missing-unit discovery",
-        );
         if self.auto_import_discovery_complete == Some(false) {
             return Ok(Vec::new());
         }
@@ -702,7 +699,7 @@ impl NavigationIndex {
             document.tree.root_node(),
             offset,
             cancel,
-            &mut budget,
+            budget,
             "missing-unit discovery",
         )?;
         let Some(identifier) = identifier else {
@@ -714,11 +711,11 @@ impl NavigationIndex {
             || use_name_at(identifier, &document.source).is_some()
             || member_expression_at(identifier).is_some()
             || document.has_with_context_at(offset)
-            || unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)?
+            || unsupported_hover_context_with_budget(document, identifier, cancel, budget)?
         {
             return Ok(Vec::new());
         }
-        let name = node_text_with_budget(identifier, &document.source, cancel, &mut budget)?;
+        let name = node_text_with_budget(identifier, &document.source, cancel, budget)?;
         if name.is_empty() {
             return Ok(Vec::new());
         }
@@ -727,10 +724,14 @@ impl NavigationIndex {
         if !matches!(region, Region::Interface | Region::Implementation) {
             return Ok(Vec::new());
         }
-        if !self.missing_unit_is_unresolved_with_cancel(uri, position, cancel)? {
+        let use_kind =
+            Self::missing_unit_use_kind_with_budget(identifier, &document.source, cancel, budget)?;
+        if !self
+            .missing_unit_is_unresolved_at_with_budget(uri, offset, identifier, cancel, budget)?
+        {
             return Ok(Vec::new());
         }
-        let active_uses = document.active_uses_with_budget(region, cancel, &mut budget)?;
+        let active_uses = document.active_uses_with_budget(region, cancel, budget)?;
         if active_uses
             .iter()
             .any(|unit| document.unknown_imports.contains(unit.as_str()))
@@ -741,10 +742,11 @@ impl NavigationIndex {
             .iter()
             .map(|unit| unit_import_key(unit))
             .collect::<HashSet<_>>();
-        let imported_provider_uris = active_uses
-            .iter()
-            .flat_map(|unit| self.unit_urls_for_import(document, unit))
-            .collect::<HashSet<_>>();
+        let mut imported_provider_uris = HashSet::new();
+        for unit in &active_uses {
+            imported_provider_uris
+                .extend(self.unit_urls_for_import_with_budget(document, unit, cancel, budget)?);
+        }
 
         let mut unit_providers = HashMap::<String, Vec<Url>>::new();
         for (unit_name, providers) in &self.auto_import_unit_providers {
@@ -760,6 +762,8 @@ impl NavigationIndex {
                 continue;
             }
             for provider in providers {
+                budget.require_work(1, cancel)?;
+                budget.require_bytes(provider.as_str().len(), cancel)?;
                 if provider != uri && !imported_provider_uris.contains(provider) {
                     unit_providers
                         .entry(unit_name.clone())
@@ -767,35 +771,6 @@ impl NavigationIndex {
                         .push(provider.clone());
                 }
             }
-        }
-        for (provider_uri, provider) in &self.documents {
-            check_cancel(cancel)?;
-            if !budget.take_work(1, cancel)? {
-                return Ok(Vec::new());
-            }
-            if self
-                .auto_import_unit_providers
-                .get(&unit_import_key(&provider.unit_name))
-                .is_some_and(|providers| {
-                    providers.iter().any(|candidate| candidate == provider_uri)
-                })
-            {
-                continue;
-            }
-            let provider_key = unit_import_key(&provider.unit_name);
-            if provider_uri == uri
-                || imported_provider_uris.contains(provider_uri)
-                || active_units.contains(&provider_key)
-                || provider_key == "system"
-                || provider_key == unit_import_key(&document.unit_name)
-                || provider_key.is_empty()
-            {
-                continue;
-            }
-            unit_providers
-                .entry(provider_key)
-                .or_default()
-                .push(provider_uri.clone());
         }
         for providers in unit_providers.values_mut() {
             providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -839,6 +814,7 @@ impl NavigationIndex {
                         .interface_range
                         .is_some_and(|range| provider.has_parser_recovery_near(range))
                     || canonical_name(&symbol.name) != key
+                    || !use_kind.accepts(symbol.kind)
                     || self.candidate_is_conditionally_unavailable(&Candidate {
                         uri: provider_uri.clone(),
                         index: *index,
@@ -868,7 +844,7 @@ impl NavigationIndex {
                 },
                 &mut state,
                 cancel,
-                &mut budget,
+                budget,
             )? {
                 super::AccessDecision::Visible => {}
                 super::AccessDecision::Unknown | super::AccessDecision::Inaccessible => continue,
@@ -886,6 +862,7 @@ impl NavigationIndex {
                 unit_name,
                 provider_uri,
                 symbol_name,
+                use_kind,
                 provider_source_hash: super::source_content_hash(&provider.source),
             });
             if candidates.len() >= MAX_MISSING_UNIT_CANDIDATES {

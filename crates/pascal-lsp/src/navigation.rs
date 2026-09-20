@@ -337,6 +337,35 @@ pub(crate) enum SemanticDiagnosticKind {
     MissingInterfaceImplementation,
 }
 
+/// Syntactic role required by an add-missing-unit use site.
+///
+/// This is intentionally narrower than the completion symbol catalogue.  A
+/// completion candidate may be useful for exploration, while a code action
+/// must establish that importing the candidate can make the particular Pascal
+/// use valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum MissingUnitUseKind {
+    Type,
+    Callable,
+    Value,
+    WritableValue,
+}
+
+impl MissingUnitUseKind {
+    fn accepts(self, symbol_kind: SymbolKind) -> bool {
+        match self {
+            Self::Type => symbol_kind == SymbolKind::Type,
+            Self::Callable => symbol_kind == SymbolKind::Routine,
+            Self::Value => matches!(
+                symbol_kind,
+                SymbolKind::Constant | SymbolKind::Variable | SymbolKind::EnumValue
+            ),
+            Self::WritableValue => symbol_kind == SymbolKind::Variable,
+        }
+    }
+}
+
 fn semantic_diagnostic_kind_rank(kind: SemanticDiagnosticKind) -> u8 {
     match kind {
         SemanticDiagnosticKind::UnresolvedIdentifier => 0,
@@ -358,6 +387,8 @@ pub(crate) struct SemanticDiagnostic {
 const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_MISSING_UNIT_REQUEST_WORK: usize = 300_000;
+pub(crate) const MAX_MISSING_UNIT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
 const MAX_CONTRACT_ANCESTRY_DEPTH: usize = 256;
 
@@ -3018,26 +3049,17 @@ impl NavigationIndex {
     /// source binding.  This is the missing-unit action boundary: an unknown
     /// compiler-provided System export does not by itself suppress a
     /// provider-specific action, but every concrete resolver uncertainty does.
-    pub(crate) fn missing_unit_is_unresolved_with_cancel(
+    pub(crate) fn missing_unit_is_unresolved_at_with_budget(
         &self,
         uri: &Url,
-        position: Position,
+        offset: usize,
+        identifier: Node<'_>,
         cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
         let Some(document) = self.documents.get(uri) else {
             return Err(format!("document is not indexed: {uri}"));
         };
-        let Some(offset) = text::position_to_offset(&document.source, position) else {
-            return Ok(false);
-        };
-        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
-            return Ok(false);
-        };
-        let mut budget = AssistanceBudget::new(
-            MAX_SEMANTIC_DIAGNOSTIC_WORK,
-            MAX_SEMANTIC_DIAGNOSTIC_BYTES,
-            "missing-unit absence proof",
-        );
         budget.require_work(1, cancel)?;
         budget.require_bytes(
             identifier
@@ -3049,26 +3071,19 @@ impl NavigationIndex {
             identifier,
             &document.source,
             cancel,
-            &mut budget,
+            budget,
         )? || document.conditionals.is_unknown_at(offset)
             || document
                 .opaque_ranges
                 .iter()
                 .any(|range| range.contains_offset(offset))
-            || !self.imports_are_complete_for_proof(document, offset, cancel, &mut budget)?
+            || !self.imports_are_complete_for_proof(document, offset, cancel, budget)?
         {
             return Ok(false);
         }
         let mut state = ResolutionState::new();
         let candidates = self.resolve_candidates_at_with_state_and_budget(
-            uri,
-            document,
-            offset,
-            identifier,
-            &mut state,
-            0,
-            cancel,
-            &mut budget,
+            uri, document, offset, identifier, &mut state, 0, cancel, budget,
         )?;
         Ok(candidates.is_empty()
             && !state.ambiguous
@@ -3184,103 +3199,183 @@ impl NavigationIndex {
         Ok(true)
     }
 
+    pub(crate) fn missing_unit_use_kind_with_budget(
+        identifier: Node<'_>,
+        source: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<MissingUnitUseKind, String> {
+        let span = Span::from_node(identifier);
+        let mut current = Some(identifier);
+        while let Some(node) = current {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if is_type_reference_node(node)
+                || node
+                    .child_by_field_name("type")
+                    .is_some_and(|type_node| Span::from_node(type_node).contains(span))
+                || node
+                    .child_by_field_name("parent")
+                    .is_some_and(|parent| Span::from_node(parent).contains(span))
+            {
+                return Ok(MissingUnitUseKind::Type);
+            }
+            if node.kind() == "exprCall"
+                && node
+                    .child_by_field_name("entity")
+                    .is_some_and(|entity| Span::from_node(entity).contains(span))
+            {
+                return Ok(MissingUnitUseKind::Callable);
+            }
+            // A Pascal procedure call may omit parentheses.  In that form the
+            // identifier is the complete expression statement rather than an
+            // `exprCall` node, so preserve the callable role from the
+            // statement boundary instead of treating a routine as a value.
+            if node.kind() == "statement"
+                && Span::from_node(node).contains(span)
+                && node
+                    .named_children(&mut node.walk())
+                    .next()
+                    .is_some_and(|expression| Span::from_node(expression).contains(span))
+            {
+                return Ok(MissingUnitUseKind::Callable);
+            }
+            if node.kind() == "exprBinary"
+                && node
+                    .child_by_field_name("lhs")
+                    .is_some_and(|lhs| Span::from_node(lhs).contains(span))
+                && node
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| node_text(operator, source) == ":=")
+            {
+                return Ok(MissingUnitUseKind::WritableValue);
+            }
+            current = node.parent();
+        }
+        Ok(MissingUnitUseKind::Value)
+    }
+
     /// Validate the exact binding produced by a proposed provider import.
     ///
-    /// The source is parsed in a temporary replacement of the target document
-    /// and the existing workspace import bindings are extended with the
-    /// proposed provider.  The original parsed document and unit catalogue are
-    /// restored before returning, including when parsing or semantic work is
-    /// cancelled.  This keeps code-action planning side-effect free while
-    /// proving the edit against the same resolver used by navigation.
+    /// The target document has already been rebuilt by the project-scoped
+    /// snapshot loader.  Consequently the import binding below is the result
+    /// of the authoritative project resolver, rather than a URI inserted by
+    /// the code-action planner.  This method only checks that binding and then
+    /// runs the ordinary navigation resolver against it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn missing_unit_binds_after_import_with_cancel(
-        &mut self,
+        &self,
         uri: &Url,
-        updated_source: String,
         position: Position,
         unit_name: &str,
         provider_uri: &Url,
         symbol_name: &str,
+        use_kind: MissingUnitUseKind,
         cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
         check_navigation_cancel(cancel)?;
-        let Some(old_document) = self.documents.remove(uri) else {
+        let Some(document) = self.documents.get(uri) else {
             return Err(format!("document is not indexed: {uri}"));
         };
-        let old_units = self.units.clone();
-        let context = old_document.conditional_context.clone();
-        let mut bindings = old_document.import_bindings.clone().unwrap_or_default();
-        if old_document.import_bindings.is_none() {
-            for unit in old_document
-                .interface_uses
-                .iter()
-                .chain(old_document.implementation_uses.iter())
-            {
-                let key = canonical_name(unit);
-                let urls = self.unit_urls_for_import(&old_document, &key);
-                if urls.len() != 1 {
-                    self.documents.insert(uri.clone(), old_document);
-                    self.units = old_units;
-                    return Ok(false);
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(false);
+        };
+        let region = document.region_at(offset);
+        let active_uses = document.active_uses_with_budget(region, cancel, budget)?;
+        if !active_uses
+            .into_iter()
+            .any(|unit| canonical_name(unit) == canonical_name(unit_name))
+        {
+            return Ok(false);
+        }
+        let import_urls = self.unit_urls_for_import_with_budget(
+            document,
+            &canonical_name(unit_name),
+            cancel,
+            budget,
+        )?;
+        if import_urls.len() != 1 || import_urls[0] != *provider_uri {
+            return Ok(false);
+        }
+        if !self.documents.contains_key(provider_uri) {
+            return Ok(false);
+        }
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(false);
+        };
+        let actual_use_kind =
+            Self::missing_unit_use_kind_with_budget(identifier, &document.source, cancel, budget)?;
+        if actual_use_kind != use_kind {
+            return Ok(false);
+        }
+        let mut state = ResolutionState::new();
+        let candidates = self.resolve_candidates_at_with_state_and_budget(
+            uri, document, offset, identifier, &mut state, 0, cancel, budget,
+        )?;
+        if state.ambiguous
+            || state.member_lookup_incomplete
+            || state.receiver_resolution_uncertain()
+            || state.inaccessible_candidate
+            || candidates.is_empty()
+            || candidates.iter().any(|candidate| {
+                candidate.uri != *provider_uri
+                    || self.symbol(candidate).is_none_or(|symbol| {
+                        canonical_name(&symbol.name) != canonical_name(symbol_name)
+                            || !use_kind.accepts(symbol.kind)
+                    })
+            })
+        {
+            return Ok(false);
+        }
+        if region == Region::Interface
+            && self.missing_unit_interface_cycle_with_cancel(provider_uri, uri, cancel)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn missing_unit_interface_cycle_with_cancel(
+        &self,
+        start: &Url,
+        target: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        const MAX_INTERFACE_DEPENDENCY_WORK: usize = 256;
+        let mut frontier = vec![start.clone()];
+        let mut visited = HashSet::new();
+        let mut work = 0usize;
+        while let Some(uri) = frontier.pop() {
+            check_navigation_cancel(cancel)?;
+            if uri == *target {
+                return Ok(true);
+            }
+            if !visited.insert(uri.clone()) {
+                continue;
+            }
+            work = work.saturating_add(1);
+            if work > MAX_INTERFACE_DEPENDENCY_WORK {
+                return Ok(true);
+            }
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(true);
+            };
+            let Some(bindings) = document.import_bindings.as_ref() else {
+                return Ok(true);
+            };
+            for unit in &document.interface_uses {
+                check_navigation_cancel(cancel)?;
+                let Some(dependency) = bindings.get(&canonical_name(unit)) else {
+                    return Ok(true);
+                };
+                if !self.documents.contains_key(dependency) {
+                    return Ok(true);
                 }
-                bindings.insert(key, urls[0].clone());
+                frontier.push(dependency.clone());
             }
         }
-        bindings.insert(canonical_name(unit_name), provider_uri.clone());
-        let result = (|| {
-            self.update_with_context_with_cancel(uri.clone(), updated_source, &context, cancel)?;
-            self.bind_imports(uri, bindings);
-            let Some(document) = self.documents.get(uri) else {
-                return Ok(false);
-            };
-            let Some(offset) = text::position_to_offset(&document.source, position) else {
-                return Ok(false);
-            };
-            let region = document.region_at(offset);
-            if !document
-                .active_uses(region)
-                .into_iter()
-                .any(|unit| canonical_name(unit) == canonical_name(unit_name))
-            {
-                return Ok(false);
-            }
-            let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
-                return Ok(false);
-            };
-            let mut budget = AssistanceBudget::new(
-                MAX_SEMANTIC_DIAGNOSTIC_WORK,
-                MAX_SEMANTIC_DIAGNOSTIC_BYTES,
-                "missing-unit binding proof",
-            );
-            let mut state = ResolutionState::new();
-            let candidates = self.resolve_candidates_at_with_state_and_budget(
-                uri,
-                document,
-                offset,
-                identifier,
-                &mut state,
-                0,
-                cancel,
-                &mut budget,
-            )?;
-            if state.ambiguous
-                || state.member_lookup_incomplete
-                || state.receiver_resolution_uncertain()
-                || candidates.is_empty()
-                || candidates.iter().any(|candidate| {
-                    candidate.uri != *provider_uri
-                        || self.symbol(candidate).is_none_or(|symbol| {
-                            canonical_name(&symbol.name) != canonical_name(symbol_name)
-                        })
-                })
-            {
-                return Ok(false);
-            }
-            Ok(true)
-        })();
-        self.documents.insert(uri.clone(), old_document);
-        self.units = old_units;
-        result
+        Ok(false)
     }
 
     fn imports_are_complete_for_proof(
@@ -15191,6 +15286,40 @@ mod tests {
             .expect("class-field references resolve");
         let root_lookups = OWNER_TYPE_ROOT_LOOKUPS.with(Cell::get);
         (locations.len(), root_lookups)
+    }
+
+    #[test]
+    fn missing_unit_discovery_honors_cancellation_and_budget_exhaustion() {
+        let uri = Url::parse("file:///tmp/missing-unit-budget.pas").expect("fixture URI");
+        let source = "unit MissingUnitBudget;\ninterface\ntype TAlias = MissingType;\nimplementation\nend.\n";
+        let position = text::offset_to_position(
+            source,
+            source.find("MissingType").expect("missing identifier"),
+        )
+        .expect("identifier position");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("budget fixture parses");
+
+        let cancelled = AtomicBool::new(true);
+        let mut budget = AssistanceBudget::new(1, 1, "missing-unit test");
+        assert_eq!(
+            index
+                .missing_unit_candidates_with_budget(&uri, position, &cancelled, &mut budget)
+                .expect_err("cancelled discovery must fail"),
+            "request cancelled"
+        );
+
+        let cancel = AtomicBool::new(false);
+        let mut exhausted = AssistanceBudget::new(0, 0, "missing-unit test");
+        let error = index
+            .missing_unit_candidates_with_budget(&uri, position, &cancel, &mut exhausted)
+            .expect_err("exhausted discovery must fail closed");
+        assert!(
+            error.contains("missing-unit test exceeds"),
+            "unexpected deterministic budget error: {error}"
+        );
     }
 
     #[test]

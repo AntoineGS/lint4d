@@ -9,7 +9,9 @@ use pascal_project::ConditionalContext;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +30,9 @@ mod symbols;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
 pub(crate) use assistance::completion_prefix_at_position;
-pub(crate) use assistance::{CompletionMetadata, CompletionOptions, CompletionResult};
+pub(crate) use assistance::{
+    CompletionMetadata, CompletionOptions, CompletionResult, MissingUnitCandidate,
+};
 pub(crate) use folding::{
     FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
 };
@@ -3010,6 +3014,69 @@ impl NavigationIndex {
         self.semantic_proof_at_with_budget(uri, document, offset, identifier, cancel, &mut budget)
     }
 
+    /// Return whether the current identifier has no resolvable or ambiguous
+    /// source binding.  This is the missing-unit action boundary: an unknown
+    /// compiler-provided System export does not by itself suppress a
+    /// provider-specific action, but every concrete resolver uncertainty does.
+    pub(crate) fn missing_unit_is_unresolved_with_cancel(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Err(format!("document is not indexed: {uri}"));
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(false);
+        };
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(false);
+        };
+        let mut budget = AssistanceBudget::new(
+            MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            MAX_SEMANTIC_DIAGNOSTIC_BYTES,
+            "missing-unit absence proof",
+        );
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(
+            identifier
+                .end_byte()
+                .saturating_sub(identifier.start_byte()),
+            cancel,
+        )?;
+        if !Self::missing_unit_lookup_context_supported_with_budget(
+            identifier,
+            &document.source,
+            cancel,
+            &mut budget,
+        )? || document.conditionals.is_unknown_at(offset)
+            || document
+                .opaque_ranges
+                .iter()
+                .any(|range| range.contains_offset(offset))
+            || !self.imports_are_complete_for_proof(document, offset, cancel, &mut budget)?
+        {
+            return Ok(false);
+        }
+        let mut state = ResolutionState::new();
+        let candidates = self.resolve_candidates_at_with_state_and_budget(
+            uri,
+            document,
+            offset,
+            identifier,
+            &mut state,
+            0,
+            cancel,
+            &mut budget,
+        )?;
+        Ok(candidates.is_empty()
+            && !state.ambiguous
+            && !state.member_lookup_incomplete
+            && !state.receiver_resolution_uncertain()
+            && !state.inaccessible_candidate)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn semantic_proof_at_with_budget(
         &self,
@@ -3066,6 +3133,154 @@ impl NavigationIndex {
             return Ok(SemanticProofStatus::Incomplete);
         }
         Ok(SemanticProofStatus::ProvenAbsent)
+    }
+
+    fn missing_unit_lookup_context_supported_with_budget(
+        identifier: Node<'_>,
+        source: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let name = canonical_name(node_text_with_budget(identifier, source, cancel, budget)?);
+        if is_declaration_identifier(identifier)
+            || is_implicit_or_intrinsic_name(&name)
+            || is_type_valued_intrinsic_argument_with_budget(identifier, source, cancel, budget)?
+        {
+            return Ok(false);
+        }
+        let span = Span::from_node(identifier);
+        let mut current = Some(identifier);
+        while let Some(node) = current {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if matches!(
+                node.kind(),
+                "asm"
+                    | "declExport"
+                    | "declExports"
+                    | "declHelper"
+                    | "declLabels"
+                    | "inherited"
+                    | "label"
+                    | "goto"
+                    | "procAttribute"
+                    | "rttiAttributes"
+            ) {
+                return Ok(false);
+            }
+            if node.kind() == "exprBinary"
+                && node
+                    .child_by_field_name("lhs")
+                    .is_some_and(|lhs| Span::from_node(lhs).contains(span))
+                && node
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| node_text(operator, source) == ":=")
+                && has_ancestor_kind_with_budget(node, "exprCall", cancel, budget)?
+            {
+                return Ok(false);
+            }
+            current = node.parent();
+        }
+        Ok(true)
+    }
+
+    /// Validate the exact binding produced by a proposed provider import.
+    ///
+    /// The source is parsed in a temporary replacement of the target document
+    /// and the existing workspace import bindings are extended with the
+    /// proposed provider.  The original parsed document and unit catalogue are
+    /// restored before returning, including when parsing or semantic work is
+    /// cancelled.  This keeps code-action planning side-effect free while
+    /// proving the edit against the same resolver used by navigation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn missing_unit_binds_after_import_with_cancel(
+        &mut self,
+        uri: &Url,
+        updated_source: String,
+        position: Position,
+        unit_name: &str,
+        provider_uri: &Url,
+        symbol_name: &str,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        check_navigation_cancel(cancel)?;
+        let Some(old_document) = self.documents.remove(uri) else {
+            return Err(format!("document is not indexed: {uri}"));
+        };
+        let old_units = self.units.clone();
+        let context = old_document.conditional_context.clone();
+        let mut bindings = old_document.import_bindings.clone().unwrap_or_default();
+        if old_document.import_bindings.is_none() {
+            for unit in old_document
+                .interface_uses
+                .iter()
+                .chain(old_document.implementation_uses.iter())
+            {
+                let key = canonical_name(unit);
+                let urls = self.unit_urls_for_import(&old_document, &key);
+                if urls.len() != 1 {
+                    self.documents.insert(uri.clone(), old_document);
+                    self.units = old_units;
+                    return Ok(false);
+                }
+                bindings.insert(key, urls[0].clone());
+            }
+        }
+        bindings.insert(canonical_name(unit_name), provider_uri.clone());
+        let result = (|| {
+            self.update_with_context_with_cancel(uri.clone(), updated_source, &context, cancel)?;
+            self.bind_imports(uri, bindings);
+            let Some(document) = self.documents.get(uri) else {
+                return Ok(false);
+            };
+            let Some(offset) = text::position_to_offset(&document.source, position) else {
+                return Ok(false);
+            };
+            let region = document.region_at(offset);
+            if !document
+                .active_uses(region)
+                .into_iter()
+                .any(|unit| canonical_name(unit) == canonical_name(unit_name))
+            {
+                return Ok(false);
+            }
+            let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+                return Ok(false);
+            };
+            let mut budget = AssistanceBudget::new(
+                MAX_SEMANTIC_DIAGNOSTIC_WORK,
+                MAX_SEMANTIC_DIAGNOSTIC_BYTES,
+                "missing-unit binding proof",
+            );
+            let mut state = ResolutionState::new();
+            let candidates = self.resolve_candidates_at_with_state_and_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                &mut state,
+                0,
+                cancel,
+                &mut budget,
+            )?;
+            if state.ambiguous
+                || state.member_lookup_incomplete
+                || state.receiver_resolution_uncertain()
+                || candidates.is_empty()
+                || candidates.iter().any(|candidate| {
+                    candidate.uri != *provider_uri
+                        || self.symbol(candidate).is_none_or(|symbol| {
+                            canonical_name(&symbol.name) != canonical_name(symbol_name)
+                        })
+                })
+            {
+                return Ok(false);
+            }
+            Ok(true)
+        })();
+        self.documents.insert(uri.clone(), old_document);
+        self.units = old_units;
+        result
     }
 
     fn imports_are_complete_for_proof(
@@ -13844,7 +14059,7 @@ fn declaration_name_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
     result
 }
 
-fn is_declaration_identifier(identifier: Node<'_>) -> bool {
+pub(super) fn is_declaration_identifier(identifier: Node<'_>) -> bool {
     let identifier_span = Span::from_node(identifier);
     let mut current = Some(identifier);
     while let Some(node) = current {
@@ -14471,7 +14686,7 @@ fn canonical_name_eq(left: &str, right: &str) -> bool {
         .eq_ignore_ascii_case(right.trim_start_matches('&'))
 }
 
-fn node_text_with_budget<'a>(
+pub(super) fn node_text_with_budget<'a>(
     node: Node<'_>,
     source: &'a str,
     cancel: &AtomicBool,
@@ -14657,6 +14872,12 @@ fn canonical_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
 }
 
+pub(super) fn source_content_hash(source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn canonical_path(parts: &[String]) -> String {
     parts
         .iter()
@@ -14720,7 +14941,7 @@ fn identifier_at(root: Node<'_>, offset: usize) -> Option<Node<'_>> {
     None
 }
 
-fn is_ignored_offset(root: Node<'_>, offset: usize) -> bool {
+pub(super) fn is_ignored_offset(root: Node<'_>, offset: usize) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if !Span::from_node(node).contains_offset(offset) {
@@ -14901,7 +15122,7 @@ fn is_type_valued_intrinsic_argument_with_budget(
     Ok(false)
 }
 
-fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
+pub(super) fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
     let mut current = Some(identifier);
     while let Some(node) = current {
         if node.kind() == "moduleName" && has_ancestor_kind(node, "declUses") {
@@ -14912,7 +15133,7 @@ fn use_name_at(identifier: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn member_expression_at(identifier: Node<'_>) -> Option<Node<'_>> {
     let mut current = identifier.parent();
     while let Some(node) = current {
         if node.kind() == "exprDot" {

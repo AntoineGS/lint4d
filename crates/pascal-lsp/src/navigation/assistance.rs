@@ -1,7 +1,9 @@
 use super::{
     AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, Origin,
     ROOT_SCOPE, Receiver, Region, RoutineKind, Span, Symbol, SymbolKind, TypeKind, canonical_name,
-    documentation, location_for_span, node_text, symbol_is_available_at, symbol_visible_in_region,
+    documentation, is_declaration_identifier, is_ignored_offset, location_for_span,
+    member_expression_at, node_text, node_text_with_budget, symbol_is_available_at,
+    symbol_visible_in_region, use_name_at,
 };
 use crate::text;
 use lsp_types::{
@@ -24,6 +26,7 @@ const MAX_HOVER_CANDIDATES: usize = 128;
 const MAX_HOVER_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_HOVER_VALUE_BYTES: usize = 64 * 1024;
 const MAX_COMPLETION_ITEMS: usize = 256;
+const MAX_MISSING_UNIT_CANDIDATES: usize = 32;
 const MAX_COMPLETION_SCANNED_SYMBOLS: usize = 100_000;
 const MAX_COMPLETION_CONTEXT_NODES: usize = 100_000;
 const MAX_SIGNATURES: usize = 128;
@@ -300,6 +303,15 @@ struct CompletionCandidate {
 struct AutoImportCandidate {
     unit_name: String,
     additional_text_edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingUnitCandidate {
+    pub(crate) anchor: Range,
+    pub(crate) unit_name: String,
+    pub(crate) provider_uri: Url,
+    pub(crate) symbol_name: String,
+    pub(crate) provider_source_hash: u64,
 }
 
 struct SpecializedRoutineSignature {
@@ -654,6 +666,277 @@ impl NavigationIndex {
             &mut budget,
         )?;
         Ok(matches!(member, CompletionMember::Unqualified))
+    }
+
+    /// Return independently selectable source-backed provider units for the
+    /// identifier at `position`.
+    ///
+    /// Completion intentionally coalesces equal exported names so that one
+    /// completion item cannot represent several provider choices.  Code
+    /// actions need the opposite behavior: each unique, resolver-authorized
+    /// unit is an independently validated action.  The filtering here keeps
+    /// the same syntax, visibility, conditional, and provider-catalogue
+    /// boundaries as auto-import completion.
+    pub(crate) fn missing_unit_candidates_with_cancel(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<MissingUnitCandidate>, String> {
+        check_cancel(cancel)?;
+        let mut budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES + MAX_COMPLETION_SCANNED_SYMBOLS,
+            MAX_HOVER_VALUE_BYTES,
+            "missing-unit discovery",
+        );
+        if self.auto_import_discovery_complete == Some(false) {
+            return Ok(Vec::new());
+        }
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(Vec::new());
+        };
+        let identifier = identifier_at_with_budget(
+            document.tree.root_node(),
+            offset,
+            cancel,
+            &mut budget,
+            "missing-unit discovery",
+        )?;
+        let Some(identifier) = identifier else {
+            return Ok(Vec::new());
+        };
+        if document.conditionals.is_unknown_at(offset)
+            || is_ignored_offset(document.tree.root_node(), offset)
+            || is_declaration_identifier(identifier)
+            || use_name_at(identifier, &document.source).is_some()
+            || member_expression_at(identifier).is_some()
+            || document.has_with_context_at(offset)
+            || unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)?
+        {
+            return Ok(Vec::new());
+        }
+        let name = node_text_with_budget(identifier, &document.source, cancel, &mut budget)?;
+        if name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = canonical_name(name);
+        let region = document.region_at(offset);
+        if !matches!(region, Region::Interface | Region::Implementation) {
+            return Ok(Vec::new());
+        }
+        if !self.missing_unit_is_unresolved_with_cancel(uri, position, cancel)? {
+            return Ok(Vec::new());
+        }
+        let active_uses = document.active_uses_with_budget(region, cancel, &mut budget)?;
+        if active_uses
+            .iter()
+            .any(|unit| document.unknown_imports.contains(unit.as_str()))
+        {
+            return Ok(Vec::new());
+        }
+        let active_units = active_uses
+            .iter()
+            .map(|unit| unit_import_key(unit))
+            .collect::<HashSet<_>>();
+        let imported_provider_uris = active_uses
+            .iter()
+            .flat_map(|unit| self.unit_urls_for_import(document, unit))
+            .collect::<HashSet<_>>();
+
+        let mut unit_providers = HashMap::<String, Vec<Url>>::new();
+        for (unit_name, providers) in &self.auto_import_unit_providers {
+            if !budget.take_work(1, cancel)? {
+                return Ok(Vec::new());
+            }
+            let unit_name = unit_import_key(unit_name);
+            if unit_name.is_empty()
+                || unit_name == "system"
+                || active_units.contains(&unit_name)
+                || unit_name == unit_import_key(&document.unit_name)
+            {
+                continue;
+            }
+            for provider in providers {
+                if provider != uri && !imported_provider_uris.contains(provider) {
+                    unit_providers
+                        .entry(unit_name.clone())
+                        .or_default()
+                        .push(provider.clone());
+                }
+            }
+        }
+        for (provider_uri, provider) in &self.documents {
+            check_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                return Ok(Vec::new());
+            }
+            if self
+                .auto_import_unit_providers
+                .get(&unit_import_key(&provider.unit_name))
+                .is_some_and(|providers| {
+                    providers.iter().any(|candidate| candidate == provider_uri)
+                })
+            {
+                continue;
+            }
+            let provider_key = unit_import_key(&provider.unit_name);
+            if provider_uri == uri
+                || imported_provider_uris.contains(provider_uri)
+                || active_units.contains(&provider_key)
+                || provider_key == "system"
+                || provider_key == unit_import_key(&document.unit_name)
+                || provider_key.is_empty()
+            {
+                continue;
+            }
+            unit_providers
+                .entry(provider_key)
+                .or_default()
+                .push(provider_uri.clone());
+        }
+        for providers in unit_providers.values_mut() {
+            providers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            providers.dedup();
+        }
+
+        let mut candidates = Vec::new();
+        for providers in unit_providers.into_values() {
+            check_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                return Ok(Vec::new());
+            }
+            if providers.len() != 1 {
+                continue;
+            }
+            let provider_uri = providers
+                .first()
+                .cloned()
+                .expect("provider count checked above");
+            let Some(provider) = self.documents.get(&provider_uri) else {
+                continue;
+            };
+            let mut symbols = Vec::new();
+            for index in &provider.exported_symbol_indices {
+                check_cancel(cancel)?;
+                if !budget.take_work(1, cancel)? {
+                    return Ok(Vec::new());
+                }
+                let Some(symbol) = provider.symbols.get(*index) else {
+                    continue;
+                };
+                if symbol.owner_type.is_some()
+                    || symbol.kind == SymbolKind::Unit
+                    || symbol.local_only
+                    || symbol.region != Region::Interface
+                    || symbol.origin != Origin::Declaration
+                    || symbol.unresolved_abbreviated
+                    || !completion_symbol_kind_supported(symbol.kind)
+                    || provider.interface_range.is_none()
+                    || provider
+                        .interface_range
+                        .is_some_and(|range| provider.has_parser_recovery_near(range))
+                    || canonical_name(&symbol.name) != key
+                    || self.candidate_is_conditionally_unavailable(&Candidate {
+                        uri: provider_uri.clone(),
+                        index: *index,
+                    })
+                {
+                    continue;
+                }
+                symbols.push((
+                    *index,
+                    symbol.name.clone(),
+                    provider.unit_display_name.clone(),
+                ));
+            }
+            if symbols.len() != 1 {
+                continue;
+            }
+            let (index, symbol_name, unit_name) =
+                symbols.pop().expect("symbol count checked above");
+            let mut state = super::ResolutionState::new();
+            match self.candidate_access_decision_with_budget(
+                uri,
+                document,
+                offset,
+                &Candidate {
+                    uri: provider_uri.clone(),
+                    index,
+                },
+                &mut state,
+                cancel,
+                &mut budget,
+            )? {
+                super::AccessDecision::Visible => {}
+                super::AccessDecision::Unknown | super::AccessDecision::Inaccessible => continue,
+            }
+            candidates.push(MissingUnitCandidate {
+                anchor: Range::new(
+                    text::offset_to_position(&document.source, identifier.start_byte())
+                        .ok_or_else(|| {
+                            "missing-unit identifier is not a UTF-16 boundary".to_string()
+                        })?,
+                    text::offset_to_position(&document.source, identifier.end_byte()).ok_or_else(
+                        || "missing-unit identifier is not a UTF-16 boundary".to_string(),
+                    )?,
+                ),
+                unit_name,
+                provider_uri,
+                symbol_name,
+                provider_source_hash: super::source_content_hash(&provider.source),
+            });
+            if candidates.len() >= MAX_MISSING_UNIT_CANDIDATES {
+                break;
+            }
+        }
+        candidates.sort_by(|left, right| {
+            unit_import_key(&left.unit_name)
+                .cmp(&unit_import_key(&right.unit_name))
+                .then_with(|| left.provider_uri.as_str().cmp(right.provider_uri.as_str()))
+                .then_with(|| {
+                    canonical_name(&left.symbol_name).cmp(&canonical_name(&right.symbol_name))
+                })
+        });
+        candidates.dedup_by(|left, right| {
+            unit_import_key(&left.unit_name) == unit_import_key(&right.unit_name)
+                && left.provider_uri == right.provider_uri
+                && canonical_name(&left.symbol_name) == canonical_name(&right.symbol_name)
+        });
+        Ok(candidates)
+    }
+
+    pub(crate) fn missing_unit_edit_with_cancel(
+        &self,
+        uri: &Url,
+        position: Position,
+        unit_name: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<TextEdit>, String> {
+        check_cancel(cancel)?;
+        let mut budget = AssistanceBudget::new(
+            MAX_COMPLETION_CONTEXT_NODES,
+            MAX_HOVER_VALUE_BYTES,
+            "missing-unit edit",
+        );
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(None);
+        };
+        let region = document.region_at(offset);
+        auto_import_edit(
+            document,
+            region,
+            unit_name,
+            &self.uses_clause_spans(document, region),
+            offset,
+            cancel,
+            &mut budget,
+        )
     }
 
     pub(crate) fn completion_metadata_for_seed(

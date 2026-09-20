@@ -6729,6 +6729,8 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::DocumentDiagnostics(_)
                 | AnalysisResultValue::WorkspaceDiagnostics(_)
                 | AnalysisResultValue::TypeDefinitions(_)
+                | AnalysisResultValue::CodeActions(_)
+                | AnalysisResultValue::Resolve(_)
                 | AnalysisResultValue::DocumentSymbols { .. }
                 | AnalysisResultValue::DocumentHighlights(_)
                 | AnalysisResultValue::SelectionRanges(_)

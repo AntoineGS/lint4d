@@ -1295,6 +1295,21 @@ the server rechecks the declaration, source/configuration generations, rule,
 and configuration before resolving it. Clients without resolve support receive
 eager edits instead.
 
+The same `quickfix` request can offer `Add unit '<Unit>' to uses` for an
+unqualified identifier that is proven unresolved by the source resolver. The
+suggestion is limited to one accessible, source-backed exported declaration in
+one uniquely identified provider unit, with one independently proven action per
+provider unit. Namespaced unit names are retained in the proposed `uses`
+entry. Existing imports, local/shadowed or already-resolved names, member and
+`with` expressions, inaccessible or ambiguous providers, compiler-only/System
+names without source evidence, unknown conditionals, incomplete imports, and
+include-owned or otherwise unsafe `uses` clauses are withheld. The safe edit
+planner preserves the detected newline style and only edits a simple active
+interface or implementation `uses` clause (or inserts a new clause at a safe
+section boundary); it never writes files. These actions carry bounded source,
+provider, configuration, project, and conditional freshness evidence, and are
+revalidated before eager delivery and deferred `codeAction/resolve`.
+
 For safety, rename is refused rather than returning a partial edit when the
 workspace scan is incomplete, an import/project context is unresolved or
 ambiguous, a source path is a symlink escape, or an edit would touch an
@@ -1387,6 +1402,10 @@ at most 2,048 items and 8 MiB in one server session, with compact dependency
 observations capped at 1,024 records and 2 MiB. Resolve data is capped at 512
 bytes per item and retained completion items at 64 KiB; oldest entries are
 evicted to stay within the bounds.
+Missing-unit discovery shares the 100,000-node/symbol work budget and 64 KiB
+assistance byte budget, returns at most 32 provider actions, and fails closed
+when provider discovery, binding proof, cancellation, or edit planning cannot
+finish.
 
 Linting and formatting reject syntax trees deeper than 256 levels to protect
 their recursive analysis pipelines. Navigation uses iterative tree walks. LSP

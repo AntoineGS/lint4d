@@ -1911,6 +1911,55 @@ fn workspace_edit_uris(edit: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+fn apply_workspace_edit_to_source(source: &str, edit: &Value, document_uri: &Url) -> String {
+    let uri = document_uri.to_string();
+    let edits = if let Some(changes) = edit["changes"].as_object() {
+        changes
+            .get(&uri)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        edit["documentChanges"]
+            .as_array()
+            .and_then(|changes| {
+                changes.iter().find_map(|change| {
+                    (change["textDocument"]["uri"] == uri)
+                        .then(|| change["edits"].as_array().cloned().unwrap_or_default())
+                })
+            })
+            .unwrap_or_default()
+    };
+    let mut byte_edits = edits
+        .into_iter()
+        .map(|edit| {
+            let start = text::position_to_offset(
+                source,
+                serde_json::from_value(edit["range"]["start"].clone())
+                    .expect("workspace edit start position"),
+            )
+            .expect("workspace edit start is a UTF-16 boundary");
+            let end = text::position_to_offset(
+                source,
+                serde_json::from_value(edit["range"]["end"].clone())
+                    .expect("workspace edit end position"),
+            )
+            .expect("workspace edit end is a UTF-16 boundary");
+            (
+                start,
+                end,
+                edit["newText"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    byte_edits.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    let mut result = source.to_owned();
+    for (start, end, new_text) in byte_edits {
+        result.replace_range(start..end, &new_text);
+    }
+    result
+}
+
 fn diagnostics_for_uri(server: &mut TestServer, expected: &Url) -> Value {
     let expected = expected.to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -29207,6 +29256,443 @@ fn code_action_revalidates_a_single_constant_diagnostic_and_eagerly_shares_renam
         rename_response.result.expect("explicit rename result"),
         "naming quick-fix and explicit rename must share the edit planner"
     );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_adds_a_unique_provider_unit_and_reanalysis_resolves_the_use() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc;\n",
+        "implementation\n",
+        "procedure MissingProc;\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&main));
+    let missing_position = position_of(main_source, "MissingProc", 0);
+    let missing_range = json!({
+        "start": missing_position,
+        "end": position_after(main_source, "MissingProc", 0),
+    });
+
+    let action_id = RequestId::from("add-missing-provider-unit".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": missing_range,
+            "context": {
+                "diagnostics": [],
+                "only": ["quickfix"]
+            }
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let actions = response.result.expect("code action result");
+    assert_eq!(actions.as_array().expect("actions").len(), 1);
+    let action = &actions[0];
+    assert_eq!(action["title"], "Add unit 'Provider' to uses");
+    assert_eq!(action["kind"], "quickfix");
+    let edit = action["edit"].as_object().expect("eager workspace edit");
+    let updated = apply_workspace_edit_to_source(main_source, &json!(edit), &uri(&main));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Main;\n",
+            "interface\n",
+            "implementation\n",
+            "uses Provider;\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  MissingProc;\n",
+            "end;\n",
+            "end.\n",
+        )
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": updated}]
+        }),
+    );
+    let after = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        !after["diagnostics"]
+            .as_array()
+            .expect("reanalysis diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pascal-unresolved-identifier")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_adds_a_missing_provider_unit_when_edit_resolution_is_advertised() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc;\n",
+        "implementation\n",
+        "procedure MissingProc;\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&main));
+    let missing_position = position_of(main_source, "MissingProc", 0);
+    let action_id = RequestId::from("deferred-add-missing-provider-unit".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": missing_position,
+                "end": position_after(main_source, "MissingProc", 0),
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let actions = response.result.expect("code action result");
+    assert_eq!(actions.as_array().expect("actions").len(), 1);
+    let action = actions[0].clone();
+    assert_eq!(action["title"], "Add unit 'Provider' to uses");
+    assert!(action["edit"].is_null(), "edit must be deferred");
+    assert!(
+        action["data"].is_object(),
+        "resolve identity must be retained"
+    );
+
+    let resolve_id = RequestId::from("resolve-add-missing-provider-unit".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved_response = server.response(&resolve_id);
+    assert!(
+        resolved_response.error.is_none(),
+        "codeAction/resolve failed: {resolved_response:?}"
+    );
+    let resolved = resolved_response.result.expect("resolved action");
+    let updated = apply_workspace_edit_to_source(main_source, &resolved["edit"], &uri(&main));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Main;\n",
+            "interface\n",
+            "implementation\n",
+            "uses Provider;\n",
+            "procedure Run;\n",
+            "begin\n",
+            "  MissingProc;\n",
+            "end;\n",
+            "end.\n",
+        )
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": updated}]
+        }),
+    );
+    let after = diagnostics_for_uri(&mut server, &uri(&main));
+    assert!(
+        !after["diagnostics"]
+            .as_array()
+            .expect("reanalysis diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pascal-unresolved-identifier")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_resolve_rejects_a_same_size_provider_mutation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc;\n",
+        "implementation\n",
+        "procedure MissingProc;\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&main));
+    let action_id = RequestId::from("same-size-provider-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": position_of(main_source, "MissingProc", 0),
+                "end": position_after(main_source, "MissingProc", 0),
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let action = response.result.expect("actions")[0].clone();
+    let mutated = provider_source.replace("begin", "BEgin");
+    assert_eq!(mutated.len(), provider_source.len());
+    write_file(&provider, &mutated);
+
+    let resolve_id = RequestId::from("same-size-provider-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_some(),
+        "same-size provider mutation must invalidate resolve: {resolved:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_actions_offer_each_independently_proven_provider_unit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider_a = root.join("ProviderA.pas");
+    let provider_b = root.join("ProviderB.pas");
+    let main = root.join("Main.pas");
+    let provider_a_source = concat!(
+        "unit ProviderA;\n",
+        "interface\n",
+        "procedure MissingProc;\n",
+        "implementation\n",
+        "procedure MissingProc; begin end;\n",
+        "end.\n",
+    );
+    let provider_b_source = concat!(
+        "unit ProviderB;\n",
+        "interface\n",
+        "function MissingProc: Integer;\n",
+        "implementation\n",
+        "function MissingProc: Integer; begin Result := 1; end;\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&provider_a, provider_a_source);
+    write_file(&provider_b, provider_b_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&main));
+    let action_id = RequestId::from("multiple-add-missing-provider-units".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": position_of(main_source, "MissingProc", 0),
+                "end": position_after(main_source, "MissingProc", 0),
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let actions = response
+        .result
+        .expect("code action result")
+        .as_array()
+        .expect("actions")
+        .to_vec();
+    let titles = actions
+        .iter()
+        .map(|action| action["title"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        titles,
+        [
+            "Add unit 'ProviderA' to uses",
+            "Add unit 'ProviderB' to uses",
+        ]
+    );
+    assert!(actions.iter().all(|action| !action["edit"].is_null()));
+    server.shutdown();
+}
+
+#[test]
+fn code_action_supports_a_namespaced_provider_for_an_interface_type() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Vendor.Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = concat!(
+        "unit Vendor.Provider;\n",
+        "interface\n",
+        "type\n",
+        "  MissingType = Integer;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "type\n",
+        "  TAlias = MissingType;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    let _ = diagnostics_for_uri(&mut server, &uri(&main));
+    let action_id = RequestId::from("namespaced-type-provider".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": position_of(main_source, "MissingType", 0),
+                "end": position_after(main_source, "MissingType", 0),
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&action_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let result = response.result.expect("code action result");
+    let actions = result.as_array().expect("actions");
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["title"], "Add unit 'Vendor.Provider' to uses");
+    let updated = apply_workspace_edit_to_source(main_source, &actions[0]["edit"], &uri(&main));
+    assert!(updated.contains("uses Vendor.Provider;\n"));
     server.shutdown();
 }
 

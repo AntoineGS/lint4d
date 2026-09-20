@@ -3322,26 +3322,44 @@ impl NavigationIndex {
         let candidates = self.resolve_candidates_at_with_state_and_budget(
             uri, document, offset, identifier, &mut state, 0, cancel, budget,
         )?;
-        let candidates_match_provider = candidates.iter().all(|candidate| {
-            candidate.uri == *provider_uri
-                && self.symbol(candidate).is_some_and(|symbol| {
-                    canonical_name(&symbol.name) == canonical_name(symbol_name)
-                        && use_kind.accepts(symbol.kind)
+        let expected_declaration = candidates.iter().find_map(|candidate| {
+            (candidate.uri == *provider_uri)
+                .then(|| self.symbol(candidate))
+                .flatten()
+                .filter(|symbol| {
+                    symbol.origin == Origin::Declaration
+                        && missing_unit_provider_declaration_fingerprint(symbol, &provider.source)
+                            == provider_declaration_fingerprint
                 })
         });
-        let expected_declaration_is_present = candidates.iter().any(|candidate| {
-            self.symbol(candidate).is_some_and(|symbol| {
-                missing_unit_provider_declaration_fingerprint(symbol, &provider.source)
-                    == provider_declaration_fingerprint
-            })
-        });
+        let candidates_match_provider = expected_declaration.is_some()
+            && candidates.iter().all(|candidate| {
+                candidate.uri == *provider_uri
+                    && self.symbol(candidate).is_some_and(|symbol| {
+                        canonical_name(&symbol.name) == canonical_name(symbol_name)
+                            && use_kind.accepts(symbol.kind)
+                            && match symbol.origin {
+                                Origin::Declaration => {
+                                    missing_unit_provider_declaration_fingerprint(
+                                        symbol,
+                                        &provider.source,
+                                    ) == provider_declaration_fingerprint
+                                }
+                                Origin::Definition => {
+                                    expected_declaration.is_some_and(|expected| {
+                                        missing_unit_routine_implementation_status(expected, symbol)
+                                            == ContractMatch::Yes
+                                    })
+                                }
+                            }
+                    })
+            });
         if state.ambiguous
             || state.member_lookup_incomplete
             || state.receiver_resolution_uncertain()
             || state.inaccessible_candidate
             || candidates.is_empty()
             || !candidates_match_provider
-            || !expected_declaration_is_present
         {
             return Ok(false);
         }
@@ -13905,7 +13923,8 @@ fn routine_signature(node: Node<'_>, source: &str) -> String {
         };
         let type_name = child
             .child_by_field_name("type")
-            .and_then(|type_node| simple_type_path(type_node, source))
+            .and_then(|type_node| type_shape_from_node(type_node, source))
+            .and_then(|shape| missing_unit_type_shape_signature(&shape))
             .unwrap_or_else(|| "?".to_string());
         for _ in 0..count {
             types.push(format!("{mode}{type_name}"));
@@ -13979,6 +13998,25 @@ fn routine_key_with_owner(
         signature,
         scope,
     )
+}
+
+fn missing_unit_type_shape_signature(shape: &TypeShape) -> Option<String> {
+    match shape {
+        TypeShape::Named(type_ref) => Some(type_ref.display()),
+        TypeShape::Pointer(element) => {
+            Some(format!("^{}", missing_unit_type_shape_signature(element)?))
+        }
+        TypeShape::Array {
+            element,
+            dynamic: true,
+        } => Some(format!(
+            "array of {}",
+            missing_unit_type_shape_signature(element)?
+        )),
+        // Static bounds are not retained by TypeShape, so do not manufacture
+        // a routine identity for them from an incomplete representation.
+        TypeShape::Array { dynamic: false, .. } | TypeShape::Callable | TypeShape::Unknown => None,
+    }
 }
 
 fn generic_shape(parameters: &[GenericParameter]) -> String {
@@ -15013,6 +15051,156 @@ fn missing_unit_provider_declaration_fingerprint(symbol: &Symbol, source: &str) 
         .unwrap_or_default()
         .hash(&mut hasher);
     hasher.finish()
+}
+
+/// Establish the relation that the resolver's routine key is intended to
+/// represent.  A key is useful for finding declaration/definition pairs, but
+/// it is not by itself a proof: unsupported parameter syntax can collapse
+/// distinct overloads onto the same key.  Missing-unit actions need a proof
+/// for every returned candidate, so unknown identity is deliberately not a
+/// match.
+fn missing_unit_routine_implementation_status(
+    declaration: &Symbol,
+    definition: &Symbol,
+) -> ContractMatch {
+    if declaration.kind != SymbolKind::Routine
+        || definition.kind != SymbolKind::Routine
+        || declaration.origin != Origin::Declaration
+        || definition.origin != Origin::Definition
+        || declaration.key != definition.key
+        || declaration.scope != definition.scope
+        || declaration.owner_type != definition.owner_type
+        || declaration.routine_kind != definition.routine_kind
+        || declaration.is_static != definition.is_static
+        || declaration.routine_key != definition.routine_key
+    {
+        return ContractMatch::No;
+    }
+    if declaration.routine_directives.calling_convention_unknown
+        || definition.routine_directives.calling_convention_unknown
+    {
+        return ContractMatch::Unknown;
+    }
+    match (
+        declaration.routine_directives.calling_convention,
+        definition.routine_directives.calling_convention,
+    ) {
+        (Some(left), Some(right)) if left != right => return ContractMatch::No,
+        (None, Some(_)) | (Some(_), None) => return ContractMatch::Unknown,
+        _ => {}
+    }
+
+    if declaration.generic_parameters.len() != definition.generic_parameters.len() {
+        return ContractMatch::No;
+    }
+    for (left, right) in declaration
+        .generic_parameters
+        .iter()
+        .zip(&definition.generic_parameters)
+    {
+        if left.constraint_unsupported || right.constraint_unsupported {
+            return ContractMatch::Unknown;
+        }
+        if generic_parameter_shape(left) != generic_parameter_shape(right) {
+            return ContractMatch::No;
+        }
+    }
+
+    // An abbreviated implementation is paired by the shared resolver only
+    // when exactly one declaration can own it.  Its synthetic parameters are
+    // materialized separately, so use that established pair rather than
+    // treating the deliberately abbreviated header as an empty signature.
+    let abbreviated_definition = definition.routine_signature.as_deref() == Some("");
+    if !abbreviated_definition {
+        if declaration.routine_parameters.len() != definition.routine_parameters.len() {
+            return ContractMatch::No;
+        }
+        for (left, right) in declaration
+            .routine_parameters
+            .iter()
+            .zip(&definition.routine_parameters)
+        {
+            if left.mode != right.mode {
+                return ContractMatch::No;
+            }
+            match missing_unit_type_shape_match(left.type_shape.as_ref(), right.type_shape.as_ref())
+            {
+                ContractMatch::Yes => {}
+                other => return other,
+            }
+        }
+    }
+
+    match declaration.routine_kind {
+        RoutineKind::Function | RoutineKind::Operator => {
+            let (Some(left), Some(right)) = (
+                declaration.result_type_ref.as_ref(),
+                definition.result_type_ref.as_ref(),
+            ) else {
+                return ContractMatch::Unknown;
+            };
+            if !missing_unit_type_ref_equal(left, right) {
+                return ContractMatch::No;
+            }
+        }
+        RoutineKind::Procedure | RoutineKind::Constructor | RoutineKind::Destructor => {
+            if declaration.result_type_ref.is_some() != definition.result_type_ref.is_some() {
+                return ContractMatch::No;
+            }
+        }
+    }
+    ContractMatch::Yes
+}
+
+fn missing_unit_type_shape_match(
+    left: Option<&TypeShape>,
+    right: Option<&TypeShape>,
+) -> ContractMatch {
+    let (Some(left), Some(right)) = (left, right) else {
+        return ContractMatch::Unknown;
+    };
+    match (left, right) {
+        (TypeShape::Named(left), TypeShape::Named(right)) => {
+            if missing_unit_type_ref_equal(left, right) {
+                ContractMatch::Yes
+            } else {
+                ContractMatch::No
+            }
+        }
+        (TypeShape::Pointer(left), TypeShape::Pointer(right)) => {
+            missing_unit_type_shape_match(Some(left), Some(right))
+        }
+        (
+            TypeShape::Array {
+                element: left,
+                dynamic: left_dynamic,
+            },
+            TypeShape::Array {
+                element: right,
+                dynamic: right_dynamic,
+            },
+        ) if left_dynamic == right_dynamic && *left_dynamic => {
+            missing_unit_type_shape_match(Some(left), Some(right))
+        }
+        (TypeShape::Array { dynamic: false, .. }, TypeShape::Array { dynamic: false, .. }) => {
+            // The indexed shape intentionally does not retain static bounds.
+            ContractMatch::Unknown
+        }
+        (TypeShape::Callable, TypeShape::Callable)
+        | (TypeShape::Unknown, _)
+        | (_, TypeShape::Unknown) => ContractMatch::Unknown,
+        _ => ContractMatch::No,
+    }
+}
+
+fn missing_unit_type_ref_equal(left: &TypeRef, right: &TypeRef) -> bool {
+    left.path == right.path
+        && left.args.len() == right.args.len()
+        && left
+            .args
+            .iter()
+            .zip(&right.args)
+            .all(|(left, right)| missing_unit_type_ref_equal(left, right))
 }
 
 fn canonical_path(parts: &[String]) -> String {

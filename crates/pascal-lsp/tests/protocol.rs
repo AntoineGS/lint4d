@@ -30418,6 +30418,174 @@ fn code_actions_preserve_argument_value_roles_and_reject_procedural_values() {
 }
 
 #[test]
+fn code_action_proves_only_the_selected_routine_implementation_partner() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let consumer = root.join("Consumer.pas");
+    let provider = root.join("Provider.pas");
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc([1]);\n",
+        "end;\n",
+        "end.\n",
+    );
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc(const Values: array of Integer); overload;\n",
+        "implementation\n",
+        "procedure MissingProc(const Values: array of String); overload; begin end;\n",
+        "procedure MissingProc(const Values: array of Integer); begin end;\n",
+        "end.\n",
+    );
+    write_file(&consumer, consumer_source);
+    write_file(&provider, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 1,
+                "text": consumer_source,
+            }
+        }),
+    );
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &consumer,
+        consumer_source,
+        "MissingProc",
+        "routine-pair-action",
+    );
+    assert_eq!(
+        actions.len(),
+        1,
+        "routine-pair action creation: {actions:?}"
+    );
+
+    let resolve_id = RequestId::from("routine-pair-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "routine-pair resolve: {response:?}"
+    );
+    let resolved = response.result.expect("resolved routine-pair action");
+    let updated =
+        apply_workspace_edit_to_source(consumer_source, &resolved["edit"], &uri(&consumer));
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&consumer), "version": 2},
+            "contentChanges": [{"text": updated}]
+        }),
+    );
+
+    let definition_id = RequestId::from("routine-pair-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &updated, "MissingProc", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1, "routine-pair definition: {locations:?}");
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    assert_eq!(locations[0]["range"]["start"]["line"], 5);
+    server.shutdown();
+}
+
+#[test]
+fn code_action_withholds_public_overloads_and_unsupported_routine_identity() {
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc([1]);\n",
+        "end;\n",
+        "end.\n",
+    );
+
+    let run_case = |provider_source: &str, deferred: bool, id: &str| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let consumer = root.join("Consumer.pas");
+        write_file(&consumer, consumer_source);
+        write_file(&root.join("Provider.pas"), provider_source);
+
+        let mut server = TestServer::launch();
+        if deferred {
+            server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+        } else {
+            server.initialize_without_document_changes(&root, Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": consumer_source,
+                }
+            }),
+        );
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &consumer,
+            consumer_source,
+            "MissingProc",
+            id,
+        );
+        assert!(
+            actions.is_empty(),
+            "unsupported routine identity must be withheld ({deferred}): {actions:?}"
+        );
+        server.shutdown();
+    };
+
+    let public_overloads = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc(const Values: array of Integer); overload;\n",
+        "procedure MissingProc(const Values: array of String); overload;\n",
+        "implementation\n",
+        "procedure MissingProc(const Values: array of Integer); begin end;\n",
+        "procedure MissingProc(const Values: array of String); begin end;\n",
+        "end.\n",
+    );
+    run_case(public_overloads, false, "public-overloads");
+
+    let unsupported_static_array = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "procedure MissingProc(const Values: array[1..2] of Integer);\n",
+        "implementation\n",
+        "procedure MissingProc(const Values: array[1..2] of Integer); begin end;\n",
+        "end.\n",
+    );
+    run_case(
+        unsupported_static_array,
+        false,
+        "unsupported-static-array-eager",
+    );
+    run_case(
+        unsupported_static_array,
+        true,
+        "unsupported-static-array-deferred",
+    );
+}
+
+#[test]
 fn code_action_creation_rejects_overlong_identity_and_caps_serialized_output() {
     let long_name = "M".repeat(257);
     let temp = tempfile::tempdir().expect("temporary workspace");

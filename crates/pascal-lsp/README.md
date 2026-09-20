@@ -308,10 +308,11 @@ Diagnostics use the standard pull requests when the client advertises
 `interFileDependencies: true`, and work-done support. The normal capability
 shape also advertises `workspaceDiagnostics: true` when the client advertises
 the canonical LSP `workspace.diagnostics` capability (the pinned
-`lsp-types` version's legacy singular spelling is accepted too). Neovim 0.12 is
-kept on document-pull refresh because it tracks attached buffers as document
-reports while ignoring workspace reports for those buffers; other clients with
-the canonical capability receive the workspace provider. Clients that do not
+`lsp-types` version's legacy singular spelling is accepted too). The evidenced
+Neovim 0.12.5 client is kept on document-pull refresh because it tracks
+attached buffers as document reports while ignoring workspace reports for
+those buffers. The exception is exact and versioned: versionless, unknown, and
+newer Neovim clients receive the canonical workspace provider. Clients that do not
 advertise document pull keep the existing debounced
 `textDocument/publishDiagnostics` push path instead; a negotiated client never
 receives both ownership models.
@@ -359,9 +360,10 @@ produces a successful complete report.
 
 Pull state is bounded independently of the source catalogue: at most 2,048
 diagnostic result entries and 32 MiB of retained result/cache state are kept.
-Worker-prepared dependency evidence is capped at 32,768 records and 8 MiB per
-analysis; cache pressure degrades safely to a full response rather than
-rejecting an otherwise valid report.
+Worker-prepared dependency evidence is capped at 32,768 records and 64 MiB per
+analysis. Optional result-cache admission remains capped at 8 MiB; cache
+pressure disables unchanged-result reuse, while evidence pressure fails with a
+retryable diagnostic response before any partial result is published.
 Workspace reports are limited to 10,000 document items, 64 KiB per encoded
 item, and 7 MiB encoded output. Partial workspace chunks are limited to 128
 items and 64 KiB, with at most one chunk pumped per event-loop turn. The

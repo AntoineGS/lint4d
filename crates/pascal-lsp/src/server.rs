@@ -82,6 +82,8 @@ const MAX_CONFIGURATION_DEFERRED_REQUESTS: usize =
     MAX_CONFIGURATION_DEFERRED_MESSAGES.saturating_sub(1);
 const CONFIGURATION_REQUEST_RETRY_MESSAGE: &str =
     "configuration update is still being prepared; retry the request";
+const DIAGNOSTIC_VALIDATION_RETRY_PREFIX: &str =
+    "diagnostic validation evidence is unavailable; retry the request: ";
 const MAX_COMPLETION_RESOLUTION_ENTRIES: usize = 2_048;
 const MAX_COMPLETION_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPLETION_RESOLUTION_DATA_BYTES: usize = 512;
@@ -92,7 +94,12 @@ const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
 const MAX_DIAGNOSTIC_RESULT_ENTRIES: usize = 2_048;
 const MAX_DIAGNOSTIC_RESULT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DIAGNOSTIC_DEPENDENCY_RECORDS: usize = 32_768;
+// This is the mandatory worker-side freshness-evidence bound.  Optional
+// result-cache admission remains smaller below, so cache pressure can only
+// disable reuse; it can never discard the evidence used for validation.
+const MAX_DIAGNOSTIC_VALIDATION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_DEPENDENCY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DIAGNOSTIC_RELATED_CONTRIBUTIONS: usize = MAX_DIAGNOSTIC_RESULT_ENTRIES;
 const MAX_DIAGNOSTIC_REPORT_ITEMS: usize = 10_000;
 const MAX_DIAGNOSTIC_REPORT_BYTES: usize = 7 * 1024 * 1024;
 const MAX_DIAGNOSTIC_REPORT_ITEM_BYTES: usize = 64 * 1024;
@@ -1617,6 +1624,7 @@ struct DocumentDiagnosticsAnalysis {
     related_document_support: bool,
     publications: Vec<queries::DiagnosticPublication>,
     dependencies: HashMap<Url, DiagnosticDependency>,
+    invalid_related_owners: Vec<Url>,
 }
 
 #[derive(Clone)]
@@ -1632,12 +1640,33 @@ struct WorkspaceDiagnosticsAnalysis {
 #[derive(Clone)]
 struct DiagnosticDependency {
     identity: Arc<Vec<u8>>,
+    records: Arc<Vec<SourceRecord>>,
+    source_generation: u64,
+    configuration_generation: u64,
     retained_bytes: usize,
 }
 
-fn compact_diagnostic_records(records: &[SourceRecord]) -> Option<Vec<SourceRecord>> {
+fn diagnostic_dependency_retained_bytes(identity: &[u8], records: &[SourceRecord]) -> usize {
+    size_of::<DiagnosticDependency>()
+        .saturating_add(identity.len())
+        .saturating_add(source_records_retained_bytes(records))
+}
+
+fn diagnostic_validation_retry(error: String) -> String {
+    format!("{DIAGNOSTIC_VALIDATION_RETRY_PREFIX}{error}")
+}
+
+fn diagnostic_items_retained_bytes(diagnostics: &[lsp_types::Diagnostic]) -> Result<usize, String> {
+    let encoded = serde_json::to_vec(diagnostics)
+        .map_err(|error| format!("could not encode diagnostic storage estimate: {error}"))?;
+    Ok(size_of::<Vec<lsp_types::Diagnostic>>().saturating_add(encoded.len()))
+}
+
+fn compact_diagnostic_records(records: &[SourceRecord]) -> Result<Vec<SourceRecord>, String> {
     if records.len() > MAX_DIAGNOSTIC_DEPENDENCY_RECORDS {
-        return None;
+        return Err(format!(
+            "diagnostic validation evidence exceeds the {MAX_DIAGNOSTIC_DEPENDENCY_RECORDS}-record limit"
+        ));
     }
 
     // Preflight the bounded representation before allocating its vector.  The
@@ -1652,8 +1681,10 @@ fn compact_diagnostic_records(records: &[SourceRecord]) -> Option<Vec<SourceReco
             .capacity()
             .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::capacity));
         estimated_bytes = estimated_bytes.saturating_add(full.saturating_sub(source_payload));
-        if estimated_bytes > MAX_DIAGNOSTIC_DEPENDENCY_BYTES {
-            return None;
+        if estimated_bytes > MAX_DIAGNOSTIC_VALIDATION_BYTES {
+            return Err(format!(
+                "diagnostic validation evidence exceeds the {MAX_DIAGNOSTIC_VALIDATION_BYTES}-byte limit"
+            ));
         }
     }
 
@@ -1674,7 +1705,10 @@ fn compact_diagnostic_records(records: &[SourceRecord]) -> Option<Vec<SourceReco
             }
         });
         if !record.open && record.path.is_none() && content_hash.is_none() {
-            return None;
+            return Err(format!(
+                "diagnostic dependency {} has no bounded content observation",
+                record.uri
+            ));
         }
         let compact_record = SourceRecord {
             uri: record.uri.clone(),
@@ -1703,7 +1737,7 @@ fn compact_diagnostic_records(records: &[SourceRecord]) -> Option<Vec<SourceReco
         };
         compact.push(compact_record);
     }
-    Some(compact)
+    Ok(compact)
 }
 
 fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
@@ -1749,30 +1783,93 @@ fn diagnostic_records_identity(records: &[SourceRecord]) -> Vec<u8> {
     identity
 }
 
-fn prepare_diagnostic_dependency(records: &[SourceRecord]) -> Option<DiagnosticDependency> {
-    let records = compact_diagnostic_records(records)?;
+fn prepare_diagnostic_dependency(
+    records: &[SourceRecord],
+    source_generation: u64,
+    configuration_generation: u64,
+) -> Result<Option<DiagnosticDependency>, String> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let records = Arc::new(compact_diagnostic_records(records)?);
     let identity = diagnostic_records_identity(&records);
-    Some(DiagnosticDependency {
-        retained_bytes: source_records_retained_bytes(&records),
+    let retained_bytes = diagnostic_dependency_retained_bytes(&identity, &records);
+    Ok(Some(DiagnosticDependency {
+        retained_bytes,
         identity: Arc::new(identity),
-    })
+        records,
+        source_generation,
+        configuration_generation,
+    }))
 }
 
-fn prepare_diagnostic_dependencies(
+fn prepare_diagnostic_dependencies_with_generations(
     dependencies: &HashMap<Url, Arc<Vec<SourceRecord>>>,
-) -> HashMap<Url, DiagnosticDependency> {
+    source_generation: u64,
+    configuration_generation: u64,
+) -> Result<HashMap<Url, DiagnosticDependency>, String> {
     let mut prepared = HashMap::<usize, Option<DiagnosticDependency>>::new();
-    dependencies
-        .iter()
-        .filter_map(|(uri, records)| {
-            let key = Arc::as_ptr(records) as usize;
-            let dependency = prepared
-                .entry(key)
-                .or_insert_with(|| prepare_diagnostic_dependency(records.as_slice()))
-                .clone();
-            dependency.map(|dependency| (uri.clone(), dependency))
-        })
-        .collect()
+    let mut result = HashMap::with_capacity(dependencies.len());
+    for (uri, records) in dependencies {
+        let key = Arc::as_ptr(records) as usize;
+        let dependency = if let Some(dependency) = prepared.get(&key) {
+            dependency.clone()
+        } else {
+            let dependency = prepare_diagnostic_dependency(
+                records.as_slice(),
+                source_generation,
+                configuration_generation,
+            )?;
+            prepared.insert(key, dependency.clone());
+            dependency
+        };
+        if let Some(dependency) = dependency {
+            result.insert(uri.clone(), dependency);
+        }
+    }
+    Ok(result)
+}
+
+fn validate_related_owner_evidence(
+    input: &rename::WorkspaceInput,
+    owners: &[RelatedOwnerValidation],
+    cancel: &AtomicBool,
+) -> Result<Vec<Url>, String> {
+    let mut validated = HashMap::<usize, bool>::new();
+    let mut invalid = Vec::new();
+    for owner in owners {
+        let owner_valid = !owner.dependencies.is_empty()
+            && owner.dependencies.iter().all(|dependency| {
+                if dependency.records.is_empty()
+                    || dependency.configuration_generation != input.configuration_generation
+                {
+                    return false;
+                }
+                let key = Arc::as_ptr(&dependency.records) as usize;
+                if let Some(valid) = validated.get(&key) {
+                    return *valid;
+                }
+                let valid =
+                    match rename::revalidate_input(input, dependency.records.as_slice(), cancel) {
+                        Ok(()) => true,
+                        Err(error) if error == rename::CANCELLATION_MESSAGE => {
+                            return false;
+                        }
+                        Err(_) => false,
+                    };
+                validated.insert(key, valid);
+                valid
+            });
+        if !owner_valid {
+            invalid.push(owner.root_uri.clone());
+        }
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(rename::CANCELLATION_MESSAGE.to_string());
+        }
+    }
+    invalid.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    invalid.dedup();
+    Ok(invalid)
 }
 
 #[derive(Clone)]
@@ -1785,13 +1882,14 @@ struct DiagnosticResultCacheEntry {
     diagnostics_identity: Vec<u8>,
     retained_bytes: usize,
     cacheable: bool,
+    dependency: Option<DiagnosticDependency>,
 }
 
 #[derive(Default)]
 struct DiagnosticPullStore {
     entries: HashMap<String, DiagnosticResultCacheEntry>,
     uri_to_result: HashMap<Url, String>,
-    related_owners: HashMap<Url, HashMap<Url, RelatedDiagnosticContribution>>,
+    related_owners: HashMap<Url, RelatedDiagnosticOwner>,
     related_owner_order: VecDeque<Url>,
     order: VecDeque<String>,
     retained_bytes: usize,
@@ -1802,6 +1900,18 @@ struct DiagnosticPullStore {
 struct RelatedDiagnosticContribution {
     diagnostics: Vec<lsp_types::Diagnostic>,
     dependency: Option<DiagnosticDependency>,
+}
+
+#[derive(Clone)]
+struct RelatedDiagnosticOwner {
+    contributions: HashMap<Url, RelatedDiagnosticContribution>,
+    retained_bytes: usize,
+}
+
+#[derive(Clone)]
+struct RelatedOwnerValidation {
+    root_uri: Url,
+    dependencies: Vec<DiagnosticDependency>,
 }
 
 struct RelatedDiagnosticReport {
@@ -1825,11 +1935,30 @@ impl DiagnosticPullStore {
                 Option<DiagnosticDependency>,
             ),
         >,
-    ) -> Vec<RelatedDiagnosticReport> {
+        extra_affected: impl IntoIterator<Item = Url>,
+    ) -> Result<Vec<RelatedDiagnosticReport>, String> {
         let was_present = self.related_owners.contains_key(root_uri);
-        let previous = self.related_owners.remove(root_uri).unwrap_or_default();
-        let mut current = HashMap::new();
+        let previous = self.related_owners.get(root_uri).cloned();
+        let publications = publications.into_iter().collect::<Vec<_>>();
+        if publications.len() > MAX_DIAGNOSTIC_REPORT_ITEMS {
+            return Err(
+                "related diagnostic contribution count exceeds the bounded limit".to_string(),
+            );
+        }
+        if !was_present
+            && !publications.is_empty()
+            && self.related_owners.len() >= MAX_DIAGNOSTIC_RESULT_ENTRIES
+        {
+            return Err("related diagnostic owner capacity is full; retry the request".to_string());
+        }
+
+        let mut current = HashMap::with_capacity(publications.len());
         for (uri, diagnostics, dependency) in publications {
+            if !diagnostics.is_empty() && dependency.is_none() {
+                return Err(format!(
+                    "related diagnostic {uri} has no bounded freshness evidence"
+                ));
+            }
             current.insert(
                 uri,
                 RelatedDiagnosticContribution {
@@ -1838,26 +1967,180 @@ impl DiagnosticPullStore {
                 },
             );
         }
-        let affected = previous
-            .keys()
-            .chain(current.keys())
-            .cloned()
-            .collect::<HashSet<_>>();
-        if !current.is_empty() {
+        let current_owner = if current.is_empty() {
+            None
+        } else {
+            let retained_bytes = self.related_owner_retained_bytes(root_uri, &current)?;
+            Some(RelatedDiagnosticOwner {
+                contributions: current,
+                retained_bytes,
+            })
+        };
+        let previous_bytes = previous.as_ref().map_or(0, |owner| owner.retained_bytes);
+        let current_bytes = current_owner
+            .as_ref()
+            .map_or(0, |owner| owner.retained_bytes);
+        let previous_contributions = previous
+            .as_ref()
+            .map_or(0, |owner| owner.contributions.len());
+        let current_contributions = current_owner
+            .as_ref()
+            .map_or(0, |owner| owner.contributions.len());
+        let retained_contributions = self
+            .related_owners
+            .values()
+            .map(|owner| owner.contributions.len())
+            .sum::<usize>();
+        if retained_contributions
+            .saturating_sub(previous_contributions)
+            .saturating_add(current_contributions)
+            > MAX_DIAGNOSTIC_RELATED_CONTRIBUTIONS
+        {
+            return Err(
+                "related diagnostic contribution capacity is full; retry the request".to_string(),
+            );
+        }
+        let candidate_total = self
+            .retained_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(current_bytes);
+        if candidate_total > MAX_DIAGNOSTIC_RESULT_BYTES {
+            return Err(
+                "related diagnostic ownership exceeds the bounded result-state budget; retry the request"
+                    .to_string(),
+            );
+        }
+        let previous_keys = previous
+            .as_ref()
+            .map(|owner| owner.contributions.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let current_keys = current_owner
+            .as_ref()
+            .map(|owner| owner.contributions.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let mut affected = previous_keys;
+        affected.extend(current_keys);
+        affected.extend(extra_affected);
+
+        if previous.is_some() {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous_bytes);
+            self.related_owners.remove(root_uri);
+        }
+        if let Some(owner) = current_owner {
+            self.retained_bytes = self.retained_bytes.saturating_add(owner.retained_bytes);
             if !was_present {
                 self.related_owner_order.push_back(root_uri.clone());
             }
-            self.related_owners.insert(root_uri.clone(), current);
+            self.related_owners.insert(root_uri.clone(), owner);
         } else {
             self.related_owner_order.retain(|uri| uri != root_uri);
         }
-        while self.related_owner_order.len() > MAX_DIAGNOSTIC_RESULT_ENTRIES {
-            let Some(evicted_root) = self.related_owner_order.pop_front() else {
-                break;
-            };
-            self.related_owners.remove(&evicted_root);
-        }
 
+        match self.related_reports_for(affected) {
+            Ok(reports) => Ok(reports),
+            Err(error) => {
+                if let Some(owner) = self.related_owners.remove(root_uri) {
+                    self.retained_bytes = self.retained_bytes.saturating_sub(owner.retained_bytes);
+                }
+                self.related_owner_order.retain(|uri| uri != root_uri);
+                if let Some(previous) = previous {
+                    self.retained_bytes =
+                        self.retained_bytes.saturating_add(previous.retained_bytes);
+                    self.related_owner_order.push_back(root_uri.clone());
+                    self.related_owners.insert(root_uri.clone(), previous);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn related_owner_retained_bytes(
+        &self,
+        root_uri: &Url,
+        contributions: &HashMap<Url, RelatedDiagnosticContribution>,
+    ) -> Result<usize, String> {
+        if contributions.len() > MAX_DIAGNOSTIC_RELATED_CONTRIBUTIONS {
+            return Err(
+                "related diagnostic contribution count exceeds the bounded limit".to_string(),
+            );
+        }
+        let mut bytes = size_of::<RelatedDiagnosticOwner>()
+            .saturating_add(size_of::<Url>())
+            .saturating_add(root_uri.as_str().len())
+            .saturating_add(
+                contributions
+                    .capacity()
+                    .saturating_mul(size_of::<(Url, RelatedDiagnosticContribution)>()),
+            );
+        for (uri, contribution) in contributions {
+            bytes = bytes
+                .saturating_add(size_of::<Url>())
+                .saturating_add(uri.as_str().len())
+                .saturating_add(size_of::<RelatedDiagnosticContribution>())
+                .saturating_add(diagnostic_items_retained_bytes(&contribution.diagnostics)?);
+            if let Some(dependency) = &contribution.dependency {
+                bytes = bytes.saturating_add(dependency.retained_bytes);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn related_owner_validation_snapshot(&self) -> Vec<RelatedOwnerValidation> {
+        self.related_owners
+            .iter()
+            .map(|(root_uri, owner)| RelatedOwnerValidation {
+                root_uri: root_uri.clone(),
+                dependencies: owner
+                    .contributions
+                    .values()
+                    .filter_map(|contribution| contribution.dependency.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn reconcile_related_owners(
+        &mut self,
+        workspace: &Workspace,
+        invalidated: impl IntoIterator<Item = Url>,
+    ) -> HashSet<Url> {
+        let invalidated = invalidated.into_iter().collect::<HashSet<_>>();
+        let stale_roots = self
+            .related_owners
+            .iter()
+            .filter_map(|(root_uri, owner)| {
+                let stale = invalidated.contains(root_uri)
+                    || owner.contributions.values().any(|contribution| {
+                        let Some(dependency) = contribution.dependency.as_ref() else {
+                            return true;
+                        };
+                        dependency.records.is_empty()
+                            || workspace
+                                .dependency_scoped_result_is_fresh(
+                                    dependency.source_generation,
+                                    dependency.configuration_generation,
+                                    dependency.records.as_slice(),
+                                )
+                                .is_err()
+                    });
+                stale.then(|| root_uri.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut affected = HashSet::new();
+        for root_uri in stale_roots {
+            if let Some(owner) = self.related_owners.remove(&root_uri) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(owner.retained_bytes);
+                affected.extend(owner.contributions.into_keys());
+            }
+            self.related_owner_order.retain(|uri| uri != &root_uri);
+        }
+        affected
+    }
+
+    fn related_reports_for(
+        &self,
+        affected: HashSet<Url>,
+    ) -> Result<Vec<RelatedDiagnosticReport>, String> {
         let mut affected = affected.into_iter().collect::<Vec<_>>();
         affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         affected
@@ -1865,11 +2148,15 @@ impl DiagnosticPullStore {
             .map(|uri| {
                 let mut diagnostics = Vec::new();
                 let mut dependency_identity = Vec::new();
-                let mut dependency_bytes = 0usize;
+                let mut dependency_records = Vec::new();
+                let mut dependency_records_available = true;
+                let mut dependency_records_bytes = 0usize;
+                let mut source_generation: Option<u64> = None;
+                let mut configuration_generation: Option<u64> = None;
                 let mut owners = self.related_owners.iter().collect::<Vec<_>>();
                 owners.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
-                for (owner_uri, contributions) in owners {
-                    let Some(contribution) = contributions.get(&uri) else {
+                for (owner_uri, owner) in owners {
+                    let Some(contribution) = owner.contributions.get(&uri) else {
                         continue;
                     };
                     for diagnostic in &contribution.diagnostics {
@@ -1877,27 +2164,65 @@ impl DiagnosticPullStore {
                             diagnostics.push(diagnostic.clone());
                         }
                     }
-                    if let Some(dependency) = &contribution.dependency {
-                        let owner_uri = owner_uri.as_str().as_bytes();
-                        dependency_identity
-                            .extend_from_slice(&(owner_uri.len() as u64).to_le_bytes());
-                        dependency_identity.extend_from_slice(owner_uri);
-                        dependency_identity
-                            .extend_from_slice(&(dependency.identity.len() as u64).to_le_bytes());
-                        dependency_identity.extend_from_slice(dependency.identity.as_slice());
-                        dependency_bytes =
-                            dependency_bytes.saturating_add(dependency.retained_bytes);
+                    let Some(dependency) = contribution.dependency.as_ref() else {
+                        continue;
+                    };
+                    let owner_uri = owner_uri.as_str().as_bytes();
+                    dependency_identity.extend_from_slice(&(owner_uri.len() as u64).to_le_bytes());
+                    dependency_identity.extend_from_slice(owner_uri);
+                    dependency_identity
+                        .extend_from_slice(&(dependency.identity.len() as u64).to_le_bytes());
+                    dependency_identity.extend_from_slice(dependency.identity.as_slice());
+                    if dependency_records_available {
+                        let record_bytes = source_records_retained_bytes(&dependency.records);
+                        if dependency_records_bytes.saturating_add(record_bytes)
+                            <= MAX_DIAGNOSTIC_DEPENDENCY_BYTES
+                        {
+                            dependency_records.extend(dependency.records.iter().cloned());
+                            dependency_records_bytes =
+                                dependency_records_bytes.saturating_add(record_bytes);
+                        } else {
+                            dependency_records.clear();
+                            dependency_records_available = false;
+                        }
                     }
+                    source_generation = Some(
+                        source_generation.map_or(dependency.source_generation, |generation| {
+                            generation.min(dependency.source_generation)
+                        }),
+                    );
+                    configuration_generation = Some(
+                        configuration_generation
+                            .map_or(dependency.configuration_generation, |generation| {
+                                generation.min(dependency.configuration_generation)
+                            }),
+                    );
                 }
-                let dependency = (!dependency_identity.is_empty()).then(|| DiagnosticDependency {
-                    identity: Arc::new(dependency_identity),
-                    retained_bytes: dependency_bytes,
-                });
-                RelatedDiagnosticReport {
+                if diagnostics.len() > MAX_DIAGNOSTIC_REPORT_ITEMS {
+                    return Err("related diagnostic report item limit reached".to_string());
+                }
+                let diagnostics_bytes = diagnostic_items_retained_bytes(&diagnostics)?;
+                if diagnostics_bytes > MAX_DIAGNOSTIC_REPORT_BYTES {
+                    return Err("related diagnostic report byte limit reached".to_string());
+                }
+                let dependency = (!dependency_identity.is_empty() && dependency_records_available)
+                    .then(|| {
+                        let records = Arc::new(dependency_records);
+                        let retained_bytes =
+                            diagnostic_dependency_retained_bytes(&dependency_identity, &records);
+                        DiagnosticDependency {
+                            identity: Arc::new(dependency_identity),
+                            records,
+                            source_generation: source_generation.unwrap_or_default(),
+                            configuration_generation: configuration_generation.unwrap_or_default(),
+                            retained_bytes,
+                        }
+                    });
+                Ok(RelatedDiagnosticReport {
                     uri,
                     diagnostics,
                     dependency,
-                }
+                })
             })
             .collect()
     }
@@ -1932,11 +2257,7 @@ impl DiagnosticPullStore {
             let Some(result_id) = self.order.pop_front() else {
                 break;
             };
-            if let Some(entry) = self.remove(&result_id) {
-                if self.related_owners.remove(&entry.uri).is_some() {
-                    self.related_owner_order.retain(|uri| uri != &entry.uri);
-                }
-            }
+            let _ = self.remove(&result_id);
         }
     }
 
@@ -1961,6 +2282,7 @@ impl DiagnosticPullStore {
             .as_ref()
             .filter(|previous| {
                 previous.cacheable
+                    && previous.dependency.is_some()
                     && dependency.is_some()
                     && previous.diagnostics_identity == diagnostics_identity
                     && previous.records_identity == records_identity
@@ -1976,7 +2298,13 @@ impl DiagnosticPullStore {
             .saturating_add(diagnostics_identity.len())
             .saturating_add(records_identity.len())
             .saturating_add(dependency.map_or(0, |dependency| dependency.retained_bytes));
-        let cacheable = dependency.is_some() && retained_bytes <= MAX_DIAGNOSTIC_RESULT_BYTES;
+        let retained_bytes = retained_bytes.saturating_add(
+            size_of::<Vec<lsp_types::Diagnostic>>().saturating_add(diagnostics_identity.len()),
+        );
+        let cacheable = dependency.is_some_and(|dependency| {
+            dependency.retained_bytes <= MAX_DIAGNOSTIC_DEPENDENCY_BYTES
+                && retained_bytes <= MAX_DIAGNOSTIC_RESULT_BYTES
+        });
         if let Some(previous) = previous {
             let _ = self.remove(&previous.result_id);
         }
@@ -1989,11 +2317,12 @@ impl DiagnosticPullStore {
             records_identity,
             retained_bytes,
             cacheable,
+            dependency: dependency.cloned(),
         };
         if !cacheable {
             // Cache admission is an optimization.  An oversized or
-            // unavailable dependency set must degrade to an uncached full
-            // report rather than reject a valid diagnostic response.
+            // unavailable optional cache set must degrade to an uncached full
+            // report; mandatory validation evidence was retained separately.
             return Ok(entry);
         }
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
@@ -2324,6 +2653,7 @@ struct ConfigurationCoordinator {
     runtime_options: RuntimeOptionsOverride,
     applied_options: WorkspaceOptions,
     pull_supported: bool,
+    diagnostic_pull_supported: bool,
     initialized: bool,
     scope_uri: Option<Url>,
     accepted_scope: Option<ConfigurationScope>,
@@ -2337,12 +2667,18 @@ struct ConfigurationCoordinator {
 }
 
 impl ConfigurationCoordinator {
-    fn new(scope_uri: Option<Url>, options: WorkspaceOptions, pull_supported: bool) -> Self {
+    fn new(
+        scope_uri: Option<Url>,
+        options: WorkspaceOptions,
+        pull_supported: bool,
+        diagnostic_pull_supported: bool,
+    ) -> Self {
         Self {
             base_options: options.clone(),
             runtime_options: RuntimeOptionsOverride::default(),
             applied_options: options.clone(),
             pull_supported,
+            diagnostic_pull_supported,
             initialized: false,
             scope_uri,
             accepted_scope: None,
@@ -2402,9 +2738,7 @@ impl ConfigurationCoordinator {
         }
         if self.pull_supported {
             self.request_refresh(connection)?;
-            let mut effect = DiagnosticNotificationEffect::default();
-            effect.request_refresh();
-            return Ok(effect);
+            return Ok(DiagnosticNotificationEffect::default());
         }
 
         let settings = runtime_settings_section(&params.settings)?;
@@ -2605,7 +2939,7 @@ impl ConfigurationCoordinator {
         if workspace.apply_prepared_runtime_options(prepared) {
             self.applied_options = result.options;
             let mut effect = DiagnosticNotificationEffect::default();
-            if self.pull_supported {
+            if self.diagnostic_pull_supported {
                 effect.request_refresh();
             }
             for uri in workspace.open_document_uris() {
@@ -2951,35 +3285,51 @@ fn is_partial_result_value(value: &AnalysisResultValue) -> bool {
 }
 
 fn source_records_retained_bytes(records: &[SourceRecord]) -> usize {
-    records
-        .iter()
-        .fold(size_of::<SourceRecord>(), |total, record| {
-            total
-                .saturating_add(record.uri.as_str().len())
-                .saturating_add(record.text.len())
-                .saturating_add(
-                    record
-                        .path
-                        .as_ref()
-                        .map_or(0, |path| path.as_os_str().len()),
-                )
-                .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::len))
-                .saturating_add(
-                    record
-                        .auto_import_scopes
-                        .iter()
-                        .map(|scope| {
-                            scope.root.as_os_str().len()
-                                + scope.provider_units.iter().map(String::len).sum::<usize>()
-                                + scope
-                                    .candidate_prefixes
-                                    .iter()
-                                    .map(String::len)
-                                    .sum::<usize>()
-                        })
-                        .sum::<usize>(),
-                )
-        })
+    let mut bytes = size_of::<Vec<SourceRecord>>()
+        .saturating_add(records.len().saturating_mul(size_of::<SourceRecord>()));
+    for record in records {
+        bytes = bytes
+            .saturating_add(size_of::<SourceRecord>())
+            .saturating_add(record.uri.as_str().len())
+            .saturating_add(record.text.capacity())
+            .saturating_add(record.path.as_ref().map_or(0, path_storage_bytes))
+            .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::capacity))
+            .saturating_add(
+                record
+                    .candidate_membership
+                    .as_ref()
+                    .map_or(0, candidate_membership_storage_bytes),
+            )
+            .saturating_add(candidate_observations_storage_bytes(
+                &record.candidate_observations,
+            ))
+            .saturating_add(
+                record
+                    .read_policy
+                    .as_ref()
+                    .map_or(0, pascal_project::ReadPolicy::retained_size_hint),
+            )
+            .saturating_add(
+                record
+                    .path_entry
+                    .as_ref()
+                    .map_or(0, path_entry_storage_bytes),
+            )
+            .saturating_add(
+                record
+                    .missing_provider_scope
+                    .as_ref()
+                    .map_or(0, missing_provider_scope_storage_bytes),
+            )
+            .saturating_add(
+                record
+                    .auto_import_scopes
+                    .iter()
+                    .map(auto_import_scope_storage_bytes)
+                    .sum::<usize>(),
+            );
+    }
+    bytes
 }
 
 #[derive(Debug, Clone)]
@@ -3884,6 +4234,13 @@ impl AnalysisJobs {
         let source_generation = input.source_generation;
         let configuration_generation = input.configuration_generation;
         let worker_cancellation = Arc::clone(&cancellation);
+        let related_owner_validation = match &request {
+            AnalysisRequest::DocumentDiagnostics {
+                related_document_support: true,
+                ..
+            } => self.diagnostic_results.related_owner_validation_snapshot(),
+            _ => Vec::new(),
+        };
         let test_barriers = self.test_barriers.clone();
         let sender = self.sender.clone();
         let worker_id = id;
@@ -4222,22 +4579,52 @@ impl AnalysisJobs {
                                             &uri,
                                             &worker_cancellation,
                                         );
-                                        let value = computed.value.map(|result| {
-                                            DocumentDiagnosticsAnalysis {
-                                                uri,
-                                                previous_result_id,
-                                                related_document_support,
-                                                publications: result.publications,
-                                                dependencies: prepare_diagnostic_dependencies(
+                                        let mut value =
+                                            computed.value.and_then(|result| {
+                                                prepare_diagnostic_dependencies_with_generations(
                                                     &result.publication_dependencies,
-                                                ),
+                                                    computed.source_generation,
+                                                    computed.configuration_generation,
+                                                )
+                                                .map_err(diagnostic_validation_retry)
+                                                .map(|dependencies| DocumentDiagnosticsAnalysis {
+                                                    uri,
+                                                    previous_result_id,
+                                                    related_document_support,
+                                                    publications: result.publications,
+                                                    dependencies,
+                                                    invalid_related_owners: Vec::new(),
+                                                })
+                                            });
+                                        let records = if value.is_ok() {
+                                            match compact_diagnostic_records(&computed.records) {
+                                                Ok(records) => records,
+                                                Err(error) => {
+                                                    value = Err(diagnostic_validation_retry(error));
+                                                    Vec::new()
+                                                }
                                             }
-                                        });
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        if value.is_ok() && related_document_support {
+                                            match validate_related_owner_evidence(
+                                                &validation_input,
+                                                &related_owner_validation,
+                                                &worker_cancellation,
+                                            ) {
+                                                Ok(invalid) => {
+                                                    if let Ok(analysis) = value.as_mut() {
+                                                        analysis.invalid_related_owners = invalid;
+                                                    }
+                                                }
+                                                Err(error) => value = Err(error),
+                                            }
+                                        }
                                         (
                                             computed.source_generation,
                                             computed.configuration_generation,
-                                            compact_diagnostic_records(&computed.records)
-                                                .unwrap_or_default(),
+                                            records,
                                             value,
                                         )
                                     }
@@ -4277,20 +4664,35 @@ impl AnalysisJobs {
                                             input,
                                             &worker_cancellation,
                                         );
-                                        let value = computed.value.map(|result| {
-                                            WorkspaceDiagnosticsAnalysis {
-                                                previous_result_ids,
-                                                publications: result.publications,
-                                                dependencies: prepare_diagnostic_dependencies(
+                                        let mut value =
+                                            computed.value.and_then(|result| {
+                                                prepare_diagnostic_dependencies_with_generations(
                                                     &result.publication_dependencies,
-                                                ),
+                                                    computed.source_generation,
+                                                    computed.configuration_generation,
+                                                )
+                                                .map_err(diagnostic_validation_retry)
+                                                .map(|dependencies| WorkspaceDiagnosticsAnalysis {
+                                                    previous_result_ids,
+                                                    publications: result.publications,
+                                                    dependencies,
+                                                })
+                                            });
+                                        let records = if value.is_ok() {
+                                            match compact_diagnostic_records(&computed.records) {
+                                                Ok(records) => records,
+                                                Err(error) => {
+                                                    value = Err(diagnostic_validation_retry(error));
+                                                    Vec::new()
+                                                }
                                             }
-                                        });
+                                        } else {
+                                            Vec::new()
+                                        };
                                         (
                                             computed.source_generation,
                                             computed.configuration_generation,
-                                            compact_diagnostic_records(&computed.records)
-                                                .unwrap_or_default(),
+                                            records,
                                             value,
                                         )
                                     }
@@ -6679,8 +7081,10 @@ fn send_document_diagnostics(
             "items": entry.diagnostics,
         })
     };
+    let affected =
+        diagnostic_results.reconcile_related_owners(workspace, analysis.invalid_related_owners);
     if analysis.related_document_support {
-        let related_reports = diagnostic_results.replace_related_owner(
+        let related_reports = match diagnostic_results.replace_related_owner(
             &analysis.uri,
             analysis
                 .publications
@@ -6690,7 +7094,13 @@ fn send_document_diagnostics(
                     let dependency = analysis.dependencies.get(&publication.uri).cloned();
                     (publication.uri, publication.diagnostics, dependency)
                 }),
-        );
+            affected,
+        ) {
+            Ok(reports) => reports,
+            Err(error) => {
+                return send_error(connection, client_id, ErrorCode::RequestFailed, error);
+            }
+        };
         let mut related = serde_json::Map::new();
         for report in related_reports {
             let dependency = report.dependency.as_ref();
@@ -6720,8 +7130,10 @@ fn send_document_diagnostics(
                 object.insert("relatedDocuments".to_string(), Value::Object(related));
             }
         }
-    } else {
-        let _ = diagnostic_results.replace_related_owner(&analysis.uri, std::iter::empty());
+    } else if let Err(error) =
+        diagnostic_results.replace_related_owner(&analysis.uri, std::iter::empty(), affected)
+    {
+        return send_error(connection, client_id, ErrorCode::RequestFailed, error);
     }
     send_ok(connection, client_id, value)
 }
@@ -6807,7 +7219,7 @@ fn workspace_diagnostic_items(
         .cloned()
         .collect::<Vec<_>>();
     missing.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    let empty_dependency = prepare_diagnostic_dependency(&[]);
+    let empty_dependency: Option<DiagnosticDependency> = None;
     for uri in missing {
         let entry = diagnostic_results.insert(
             uri.clone(),
@@ -6907,6 +7319,9 @@ fn send_diagnostic_analysis_error(
     id: RequestId,
     error: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if error.starts_with(DIAGNOSTIC_VALIDATION_RETRY_PREFIX) {
+        return send_diagnostic_server_cancelled(connection, id, error);
+    }
     if error != rename::CANCELLATION_MESSAGE {
         return send_error(connection, id, ErrorCode::RequestFailed, error);
     }
@@ -7251,6 +7666,7 @@ fn run_connection(
         workspace.configuration_scope_uri(),
         options,
         configuration_pull_supported,
+        pull_diagnostics_supported,
     );
     configuration.on_initialized(connection)?;
     let watcher_registration = watcher_registration_supported
@@ -9181,22 +9597,38 @@ fn supports_diagnostic_refresh(client: &ClientCapabilities, raw_initialize: &Val
         })
 }
 
+fn is_affected_neovim_document_pull_client(raw_initialize: &Value) -> bool {
+    raw_initialize
+        .pointer("/clientInfo/name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == "Neovim")
+        && raw_initialize
+            .pointer("/clientInfo/version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| {
+                matches!(
+                    version.trim(),
+                    // Neovim 0.12.5 reports the first form from its LSP
+                    // clientInfo and the second form is accepted for clients
+                    // that include the usual display-version prefix.
+                    "0.12.5" | "v0.12.5" | "0.12.5+v0.12.5" | "v0.12.5+v0.12.5"
+                )
+            })
+}
+
 fn supports_workspace_diagnostic_reports(raw_initialize: &Value) -> bool {
     // `workspace.diagnostics` is the canonical LSP 3.17 capability spelling.
     // The pinned lsp-types version still exposes the older singular field, so
     // inspect the raw initialize value only to accept either workspace wire
     // spelling.  Refresh support is optional and does not gate reports.
     //
-    // Neovim 0.12 advertises the canonical capability but deliberately keeps
-    // attached buffers in document-pull mode.  Its workspace refresh handler
-    // then ignores workspace reports for those buffers and opens every
-    // unopened URI returned by the scan.  Keep that client-specific behavior
-    // on document pull; ordinary clients with the same capability still get
-    // the standard workspace provider.
-    let neovim_document_pull_compat = raw_initialize
-        .pointer("/clientInfo/name")
-        .and_then(Value::as_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("Neovim"));
+    // The evidenced Neovim 0.12.5 client advertises the canonical capability
+    // but deliberately keeps attached buffers in document-pull mode.  Its
+    // workspace refresh handler then ignores workspace reports for those
+    // buffers and opens every unopened URI returned by the scan.  Keep only
+    // that exact, versioned client on document pull; versionless, unknown, and
+    // newer clients still receive the standard workspace provider.
+    let neovim_document_pull_compat = is_affected_neovim_document_pull_client(raw_initialize);
     !neovim_document_pull_compat
         && (raw_initialize
             .pointer("/capabilities/workspace/diagnostics")
@@ -9405,6 +9837,78 @@ mod tests {
                 }
             }
         })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.12.5-dev"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.12.50"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(!supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.12.5+v0.12.5"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(!supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "v0.12.5+v0.12.5"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.12.5+patched"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "neovim", "version": "0.12.5"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.12.6"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.13.0"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim"},
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        })));
     }
 
     fn test_completion_analysis(uri: &Url, index: usize) -> CompletionAnalysis {
@@ -9440,10 +9944,40 @@ mod tests {
         )]
     }
 
+    fn test_diagnostic_dependency() -> Option<super::DiagnosticDependency> {
+        let record = SourceRecord {
+            uri: Url::parse("file:///diagnostic-dependency.pas").expect("dependency URI"),
+            text: String::new(),
+            version: Some(1),
+            stamp: None,
+            open: true,
+            path: None,
+            path_stamp: None,
+            content_hash: Some(0),
+            parsed_text_hash: Some(0),
+            content_bytes: None,
+            candidate_membership: None,
+            candidate_observations: Vec::new(),
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
+        };
+        Some(
+            super::prepare_diagnostic_dependency(&[record], 0, 0)
+                .expect("diagnostic dependency")
+                .expect("non-empty diagnostic dependency"),
+        )
+    }
+
     #[test]
     fn diagnostic_result_store_evicts_old_ids_but_keeps_new_ids() {
         let mut store = DiagnosticPullStore::new();
-        let empty_dependency = super::prepare_diagnostic_dependency(&[]);
+        let empty_dependency = test_diagnostic_dependency();
         let mut first = None;
         let mut last = None;
         for index in 0..=super::MAX_DIAGNOSTIC_RESULT_ENTRIES {
@@ -9471,7 +10005,7 @@ mod tests {
     fn diagnostic_result_store_reissues_an_actual_evicted_id() {
         let first_uri = Url::parse("file:///diagnostic-evicted.pas").expect("diagnostic URI");
         let mut store = DiagnosticPullStore::new();
-        let empty_dependency = super::prepare_diagnostic_dependency(&[]);
+        let empty_dependency = test_diagnostic_dependency();
         let first = store
             .insert(
                 first_uri.clone(),
@@ -9507,7 +10041,7 @@ mod tests {
     fn diagnostic_result_store_replacement_does_not_grow_eviction_order() {
         let uri = Url::parse("file:///diagnostic-replacement.pas").expect("diagnostic URI");
         let mut store = DiagnosticPullStore::new();
-        let empty_dependency = super::prepare_diagnostic_dependency(&[]);
+        let empty_dependency = test_diagnostic_dependency();
         for index in 0..64 {
             store
                 .insert(

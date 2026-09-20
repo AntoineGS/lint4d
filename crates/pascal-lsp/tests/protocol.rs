@@ -1369,6 +1369,40 @@ impl TestServer {
         response.result.expect("initialize result")
     }
 
+    fn initialize_with_pull_diagnostics_and_configuration(
+        &mut self,
+        root: &Path,
+        configuration: bool,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("pull-diagnostics-configuration-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {
+                        "diagnostic": {
+                            "dynamicRegistration": false,
+                            "relatedDocumentSupport": true
+                        }
+                    },
+                    "workspace": {
+                        "diagnostics": {"refreshSupport": true},
+                        "configuration": configuration,
+                        "workspaceFolders": true
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
     #[cfg(feature = "test-support")]
     fn initialize_with_configuration_and_document_changes(
         &mut self,
@@ -4772,6 +4806,86 @@ fn negotiated_pull_diagnostics_refreshes_authorized_unopened_changes() {
 }
 
 #[test]
+fn pushed_configuration_refreshes_unopened_pull_diagnostics_without_open_buffers() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(
+        &source,
+        "unit Main;\ninterface\nconst badConst = 1;\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics_and_configuration(root.path(), false);
+    let initial_id = RequestId::from("pushed-config-unopened-initial".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let initial = server.response(&initial_id);
+    assert!(initial.error.is_none(), "initial pull failed: {initial:?}");
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"exclude": ["Main.pas"]}}}),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("pushed effective configuration must refresh unopened diagnostics");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn pulled_configuration_refresh_waits_for_effective_change_without_open_buffers() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(
+        &source,
+        "unit Main;\ninterface\nconst badConst = 1;\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics_and_configuration(root.path(), true);
+    let initial = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("initial configuration request");
+    server.send(Message::Response(Response::new_ok(initial.id, json!([{}]))));
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let noop = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("no-op configuration request");
+    assert!(
+        server
+            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(100))
+            .is_none(),
+        "configuration-pull negotiation must not refresh before its response"
+    );
+    server.send(Message::Response(Response::new_ok(noop.id, json!([{}]))));
+    assert!(
+        server
+            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(100))
+            .is_none(),
+        "an unchanged pulled configuration must not refresh diagnostics"
+    );
+
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings": {}}));
+    let changed = server
+        .request_with_timeout("workspace/configuration", IO_TIMEOUT)
+        .expect("changed configuration request");
+    server.send(Message::Response(Response::new_ok(
+        changed.id,
+        json!([{"exclude": ["Main.pas"]}]),
+    )));
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("effective pulled configuration must refresh diagnostics");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
 fn diagnostic_refresh_late_response_cannot_restart_after_shutdown() {
     let root = tempfile::tempdir().expect("workspace");
     let source = root.path().join("Main.pas");
@@ -5185,6 +5299,148 @@ fn related_document_clears_preserve_other_root_owners() {
 }
 
 #[test]
+fn related_document_refresh_reconciles_a_changed_shared_owner() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let root_source =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    write_file(&include, "const badConst = 1;\n");
+    write_file(&first, &root_source("A"));
+    write_file(&second, &root_source("B"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "related pull failed: {response:?}"
+        );
+        response.result.expect("related pull result")
+    };
+
+    let first_result = pull(&mut server, "shared-change-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("first root result ID")
+        .to_string();
+    let second_result = pull(&mut server, "shared-change-b-first", &second, None);
+    assert!(
+        second_result["relatedDocuments"]
+            .as_object()
+            .expect("second related reports")
+            .values()
+            .any(|report| {
+                report["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|diagnostic| {
+                        diagnostic["code"] == "constant-naming"
+                            && diagnostic["message"]
+                                == "Constant 'badConst' should use UPPER_CASE naming convention."
+                    })
+                })
+            })
+    );
+
+    write_file(&include, "const BAD_CONST = 1;\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&include), "type": 2}]}),
+    );
+    let changed = pull(
+        &mut server,
+        "shared-change-a-refresh",
+        &first,
+        Some(first_id),
+    );
+    let related = changed["relatedDocuments"]
+        .as_object()
+        .expect("changed related reports");
+    let cleared = related
+        .get(uri(&include).as_str())
+        .expect("changed shared include report");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn related_document_refresh_retires_a_deleted_owner() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let with_include =
+        |unit: &str| format!("unit {unit};\ninterface\nimplementation\n{{$I Shared.inc}}\nend.\n");
+    write_file(&include, "const badConst = 1;\n");
+    write_file(&first, &with_include("A"));
+    write_file(&second, &with_include("B"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "related pull failed: {response:?}"
+        );
+        response.result.expect("related pull result")
+    };
+
+    let first_result = pull(&mut server, "deleted-owner-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("first root result ID")
+        .to_string();
+    let _ = pull(&mut server, "deleted-owner-b-first", &second, None);
+
+    fs::remove_file(&second).expect("delete second owner");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&second), "type": 3}]}),
+    );
+    write_file(&first, "unit A;\ninterface\nimplementation\nend.\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&first), "type": 2}]}),
+    );
+    let changed = pull(
+        &mut server,
+        "deleted-owner-a-refresh",
+        &first,
+        Some(first_id),
+    );
+    let related = changed["relatedDocuments"]
+        .as_object()
+        .expect("deleted-owner related reports");
+    let cleared = related
+        .get(uri(&include).as_str())
+        .expect("deleted owner shared include report");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+    server.shutdown();
+}
+
+#[test]
 fn pull_document_diagnostics_detects_an_unnotified_disk_change() {
     let root = tempfile::tempdir().expect("workspace");
     let source = root.path().join("Main.pas");
@@ -5506,6 +5762,61 @@ fn stale_workspace_diagnostic_partial_delivery_requests_retrigger() {
     let error = response.error.expect("stale workspace partial must fail");
     assert_eq!(error.code, -32802);
     assert_eq!(error.data, Some(json!({"retriggerRequest": true})));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn evidence_pressure_partial_delivery_retriggers_before_stale_success() {
+    let root = tempfile::tempdir().expect("workspace");
+    let mut units = Vec::new();
+    for index in 0..8 {
+        let path = root.path().join(format!("U{index:02}.pas"));
+        write_file(
+            &path,
+            &format!("unit U{index:02};\ninterface\nconst badConst = 1;\nimplementation\nend.\n"),
+        );
+        units.push(path);
+    }
+    let mut source_paths = vec![".".to_string()];
+    for index in 0..64 {
+        let directory = root.path().join(format!("p{index:03}_{}", "x".repeat(115)));
+        fs::create_dir(&directory).expect("authorized empty source directory");
+        source_paths.push(directory.to_string_lossy().to_string());
+    }
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize_with_pull_diagnostics_options(
+        units[0].parent().expect("workspace root"),
+        json!({"sourcePaths": source_paths}),
+    );
+    let request_id = RequestId::from("evidence-pressure-partial".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/diagnostic",
+        json!({
+            "previousResultIds": [],
+            "partialResultToken": "evidence-pressure-partial"
+        }),
+    );
+    barrier.wait_until_entered();
+
+    let original = fs::read_to_string(&units[0]).expect("read first unit");
+    fs::write(&units[0], original.replace("badConst", "BADCONST"))
+        .expect("mutate first unit during validation");
+    barrier.release();
+
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("evidence pressure must not complete stale partial delivery");
+    assert_eq!(error.code, -32802);
+    assert_eq!(error.data, Some(json!({"retriggerRequest": true})));
+    let partial = server.take_partial_items("evidence-pressure-partial");
+    assert!(
+        partial.is_empty(),
+        "stale evidence must not be published in a partial chunk: {partial:?}"
+    );
     server.shutdown();
 }
 

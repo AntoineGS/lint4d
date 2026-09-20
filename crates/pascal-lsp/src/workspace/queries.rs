@@ -1,7 +1,7 @@
 use super::KnownDocumentOwner;
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
-    WorkspaceInput, auto_import_source_is_relevant, build_snapshot,
+    SourceRecord, WorkspaceInput, auto_import_source_is_relevant, build_snapshot,
     input_source_is_readable_with_owner, is_cancelled, owner_for_input,
     project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
     query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
@@ -20,6 +20,7 @@ use lsp_types::{
 };
 use pascal_project::has_invalid_project_selection;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub(crate) struct NavigationResult {
@@ -31,10 +32,12 @@ pub(crate) struct DiagnosticsResult {
     pub(crate) uri: Url,
     pub(crate) version: Option<i32>,
     pub(crate) publications: Vec<DiagnosticPublication>,
+    pub(crate) publication_dependencies: HashMap<Url, Arc<Vec<SourceRecord>>>,
 }
 
 pub(crate) struct WorkspaceDiagnosticsResult {
     pub(crate) publications: Vec<DiagnosticPublication>,
+    pub(crate) publication_dependencies: HashMap<Url, Arc<Vec<SourceRecord>>>,
 }
 
 #[derive(Clone)]
@@ -1239,6 +1242,7 @@ pub(crate) fn diagnostics_from_input(
             uri,
             version,
             publications: diagnostics,
+            publication_dependencies: HashMap::new(),
         }),
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
@@ -1252,6 +1256,15 @@ pub(crate) fn diagnostics_from_input(
         }
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    let value = value.map(|mut result| {
+        let shared = Arc::new(records.clone());
+        result.publication_dependencies = result
+            .publications
+            .iter()
+            .map(|publication| (publication.uri.clone(), Arc::clone(&shared)))
+            .collect();
+        result
+    });
     with_records(source_generation, configuration_generation, value, records)
 }
 
@@ -1299,12 +1312,30 @@ pub(crate) fn workspace_diagnostics_from_input(
     uris.dedup();
 
     let mut merged = HashMap::<Url, DiagnosticPublication>::new();
+    let mut publication_dependencies = HashMap::<Url, Arc<Vec<SourceRecord>>>::new();
     let mut records = super::rename::snapshot_records(&snapshot);
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    if let Err(error) = workspace.prepare_diagnostic_root_ownership(&uris, cancel) {
+        if error == CANCELLATION_MESSAGE {
+            return cancelled(source_generation, configuration_generation);
+        }
+        return failed(source_generation, configuration_generation, error);
+    }
+    // Ownership preparation intentionally does not contribute report
+    // dependencies.  Each root below gets a fresh bounded evidence set while
+    // all prepared expansions remain available to semantic ownership checks.
+    workspace.clear_diagnostic_analysis_records();
     for uri in uris {
         if is_cancelled(cancel) {
             return cancelled(source_generation, configuration_generation);
         }
-        let mut workspace = super::Workspace::from_analysis_input(&input);
+        let context_key = match workspace.context_for_uri_with_cancel(&uri, Some(cancel)) {
+            Ok(context_key) => context_key,
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
         let publications = match workspace.diagnostics_for_with_cancel(&uri, cancel) {
             Ok(publications) => publications,
             Err(error) if error == CANCELLATION_MESSAGE => {
@@ -1312,14 +1343,18 @@ pub(crate) fn workspace_diagnostics_from_input(
             }
             Err(error) => return failed(source_generation, configuration_generation, error),
         };
-        match workspace.analysis_records(cancel) {
-            Ok(additional) => records.extend(additional),
+        let additional = match workspace.diagnostic_analysis_records(&context_key, cancel) {
+            Ok(additional) => additional,
             Err(error) if error == CANCELLATION_MESSAGE => {
                 return cancelled(source_generation, configuration_generation);
             }
             Err(error) => return failed(source_generation, configuration_generation, error),
-        }
+        };
+        workspace.clear_diagnostic_analysis_records();
+        records.extend(additional.iter().cloned());
+        let shared_dependencies = Arc::new(additional);
         for publication in publications {
+            let publication_uri = publication.uri.clone();
             let entry =
                 merged
                     .entry(publication.uri.clone())
@@ -1334,6 +1369,15 @@ pub(crate) fn workspace_diagnostics_from_input(
             for diagnostic in publication.diagnostics {
                 if !entry.diagnostics.contains(&diagnostic) {
                     entry.diagnostics.push(diagnostic);
+                }
+            }
+            match publication_dependencies.entry(publication_uri) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Arc::clone(&shared_dependencies));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let dependencies = Arc::make_mut(slot.get_mut());
+                    dependencies.extend(shared_dependencies.iter().cloned());
                 }
             }
         }
@@ -1357,7 +1401,10 @@ pub(crate) fn workspace_diagnostics_from_input(
     with_records(
         source_generation,
         configuration_generation,
-        Ok(WorkspaceDiagnosticsResult { publications }),
+        Ok(WorkspaceDiagnosticsResult {
+            publications,
+            publication_dependencies,
+        }),
         records,
     )
 }

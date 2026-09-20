@@ -986,7 +986,7 @@ impl TestServer {
                         }
                     },
                     "workspace": {
-                        "diagnostic": {"refreshSupport": true},
+                        "diagnostics": {"refreshSupport": true},
                         "workspaceFolders": true
                     }
                 }
@@ -4357,6 +4357,190 @@ fn pull_workspace_diagnostics_reports_authorized_unopened_sources() {
 }
 
 #[test]
+fn pull_workspace_diagnostics_reports_open_buffers() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+    let request_id = RequestId::from("pull-workspace-open-buffer".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "open-buffer workspace pull failed: {response:?}"
+    );
+    let result = response.result.expect("open-buffer workspace result");
+    let reports = result["items"]
+        .as_array()
+        .expect("open-buffer workspace items");
+    let report = reports
+        .iter()
+        .find(|report| report["uri"] == uri(&source).to_string())
+        .expect("open-buffer report");
+    assert!(
+        report["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")),
+        "open-buffer report did not contain the lint diagnostic: {report:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn workspace_pull_suppresses_shared_include_claims_for_unopened_and_open_roots() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    write_file(
+        &include,
+        "procedure Run;\nvar Box: TBox;\nbegin\n  Box.Missing := 1;\nend;\n",
+    );
+    write_file(
+        &first,
+        "unit A;\ninterface\ntype TBox = class\n  Value: Integer;\nend;\nimplementation\n{$I Shared.inc}\nend.\n",
+    );
+    write_file(
+        &second,
+        "unit B;\ninterface\ntype TBox = class\n  Missing: Integer;\nend;\nimplementation\n{$I Shared.inc}\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial_id = RequestId::from("shared-owner-neither-open".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let initial = server.response(&initial_id);
+    assert!(
+        initial.error.is_none(),
+        "neither-open pull failed: {initial:?}"
+    );
+    let initial_result = initial.result.expect("neither-open result");
+    assert!(
+        !initial_result["items"]
+            .as_array()
+            .expect("neither-open items")
+            .iter()
+            .any(|report| {
+                report["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|diagnostic| {
+                        diagnostic["code"] == "pascal-missing-member"
+                            && diagnostic["message"] == "missing member 'Missing'"
+                    })
+                })
+            })
+    );
+    let mut previous = initial_result["items"]
+        .as_array()
+        .expect("neither-open items")
+        .iter()
+        .map(|item| json!({"uri": item["uri"], "value": item["resultId"]}))
+        .collect::<Vec<_>>();
+
+    let acknowledge_refresh = |server: &mut TestServer| {
+        let refresh = server.request("workspace/diagnostic/refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    };
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&first),
+                "languageId": "pascal",
+                "version": 1,
+                "text": fs::read_to_string(&first).expect("first source")
+            }
+        }),
+    );
+    acknowledge_refresh(&mut server);
+    let one_id = RequestId::from("shared-owner-one-open".to_string());
+    server.send_request(
+        one_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": previous}),
+    );
+    let one = server.response(&one_id);
+    assert!(one.error.is_none(), "one-open pull failed: {one:?}");
+    let one_result = one.result.expect("one-open result");
+    assert!(
+        !one_result["items"]
+            .as_array()
+            .expect("one-open items")
+            .iter()
+            .any(|report| {
+                report["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|diagnostic| {
+                        diagnostic["code"] == "pascal-missing-member"
+                            && diagnostic["message"] == "missing member 'Missing'"
+                    })
+                })
+            })
+    );
+    previous = one_result["items"]
+        .as_array()
+        .expect("one-open items")
+        .iter()
+        .map(|item| json!({"uri": item["uri"], "value": item["resultId"]}))
+        .collect();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&second),
+                "languageId": "pascal",
+                "version": 1,
+                "text": fs::read_to_string(&second).expect("second source")
+            }
+        }),
+    );
+    acknowledge_refresh(&mut server);
+    let both_id = RequestId::from("shared-owner-both-open".to_string());
+    server.send_request(
+        both_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": previous}),
+    );
+    let both = server.response(&both_id);
+    assert!(both.error.is_none(), "both-open pull failed: {both:?}");
+    for report in both.result.expect("both-open result")["items"]
+        .as_array()
+        .expect("both-open items")
+    {
+        let diagnostics = report["items"].as_array().map_or(&[][..], Vec::as_slice);
+        assert!(!diagnostics.iter().any(|diagnostic| {
+            diagnostic["code"] == "pascal-missing-member"
+                && diagnostic["message"] == "missing member 'Missing'"
+        }));
+    }
+    server.shutdown();
+}
+
+#[test]
 fn pull_workspace_diagnostics_clears_deleted_previous_reports() {
     let root = tempfile::tempdir().expect("workspace");
     let first = root.path().join("First.pas");
@@ -4551,6 +4735,85 @@ fn negotiated_pull_diagnostics_request_refresh_after_document_change() {
         "refresh responses must not trigger a refresh loop"
     );
     server.shutdown();
+}
+
+#[test]
+fn negotiated_pull_diagnostics_refreshes_authorized_unopened_changes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let valid = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, valid);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial_id = RequestId::from("pull-unopened-refresh-initial".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let initial = server.response(&initial_id);
+    assert!(
+        initial.error.is_none(),
+        "initial workspace pull failed: {initial:?}"
+    );
+
+    let changed = valid.replace("interface", "interface\nconst badConst = 1;");
+    write_file(&source, &changed);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&source), "type": 2}]}),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("unopened source changes must request a pull refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn diagnostic_refresh_late_response_cannot_restart_after_shutdown() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source), "version": 2},
+            "contentChanges": [{"text": text}]
+        }),
+    );
+    let shutdown_id = RequestId::from("refresh-shutdown".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown = server.response(&shutdown_id);
+    assert!(shutdown.error.is_none(), "shutdown failed: {shutdown:?}");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    assert!(
+        server
+            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(250))
+            .is_none(),
+        "late refresh acknowledgement must not start another request"
+    );
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server.child.wait().expect("wait for LSP server");
+    assert!(status.success(), "server exited unsuccessfully: {status}");
 }
 
 #[test]
@@ -4795,6 +5058,10 @@ fn pull_document_diagnostics_returns_owned_related_include_reports() {
     );
     let result = response.result.expect("related document result");
     assert_eq!(result["kind"], "full");
+    let root_result_id = result["resultId"]
+        .as_str()
+        .expect("root diagnostic result ID")
+        .to_string();
     assert!(
         result["items"]
             .as_array()
@@ -4815,6 +5082,105 @@ fn pull_document_diagnostics_returns_owned_related_include_reports() {
             .iter()
             .any(|diagnostic| diagnostic["message"] == "missing member 'Missing'")
     );
+
+    let fixed_include = include_source.replace("Missing", "Value");
+    write_file(&include, &fixed_include);
+    let changed_id = RequestId::from("pull-document-diagnostic-related-cleared".to_string());
+    server.send_request(
+        changed_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "previousResultId": root_result_id
+        }),
+    );
+    let changed = server.response(&changed_id);
+    assert!(
+        changed.error.is_none(),
+        "related clear pull failed: {changed:?}"
+    );
+    let changed = changed.result.expect("changed related document result");
+    let related = changed["relatedDocuments"]
+        .as_object()
+        .expect("changed related reports");
+    let cleared = related
+        .get(uri(&include).as_str())
+        .expect("fixed include must be explicitly cleared");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn related_document_clears_preserve_other_root_owners() {
+    let root = tempfile::tempdir().expect("workspace");
+    let include = root.path().join("Shared.inc");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let include_source = "procedure Run;\nvar Box: TBox;\nbegin\n  Box.Missing := 1;\nend;\n";
+    let root_source = |unit: &str| {
+        format!(
+            "unit {unit};\ninterface\ntype TBox = class\n  Value: Integer;\nend;\nimplementation\n{{$I Shared.inc}}\nend.\n"
+        )
+    };
+    write_file(&include, include_source);
+    write_file(&first, &root_source("A"));
+    write_file(&second, &root_source("B"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let pull = |server: &mut TestServer, id: &str, file: &Path, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({
+                "textDocument": {"uri": uri(file)},
+                "previousResultId": previous
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "related pull failed: {response:?}"
+        );
+        response.result.expect("related pull result")
+    };
+    let first_result = pull(&mut server, "related-owner-a-first", &first, None);
+    let first_id = first_result["resultId"]
+        .as_str()
+        .expect("first root result ID")
+        .to_string();
+    let second_result = pull(&mut server, "related-owner-b-first", &second, None);
+    let second_related = second_result["relatedDocuments"]
+        .as_object()
+        .expect("second root related reports");
+    assert!(second_related.values().any(|report| {
+        report["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "pascal-missing-member")
+        })
+    }));
+
+    let fixed_first = root_source("A").replace("{$I Shared.inc}", "");
+    write_file(&first, &fixed_first);
+    let changed_first = pull(
+        &mut server,
+        "related-owner-a-cleared",
+        &first,
+        Some(first_id),
+    );
+    let related_after_clear = changed_first["relatedDocuments"]
+        .as_object()
+        .expect("remaining related owner report");
+    assert!(related_after_clear.values().any(|report| {
+        report["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "pascal-missing-member")
+        })
+    }));
     server.shutdown();
 }
 
@@ -4865,6 +5231,162 @@ fn pull_document_diagnostics_detects_an_unnotified_disk_change() {
             .expect("changed disk diagnostics")
             .is_empty()
     );
+    server.shutdown();
+}
+
+#[test]
+fn pull_document_diagnostics_reuses_noop_disk_and_overlay_reports() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut disk_server = TestServer::launch();
+    disk_server.initialize_with_pull_diagnostics(root.path());
+    let first_id = RequestId::from("noop-disk-first".to_string());
+    disk_server.send_request(
+        first_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let first = disk_server.response(&first_id);
+    let previous = first.result.as_ref().expect("first disk report")["resultId"]
+        .as_str()
+        .expect("first disk result ID")
+        .to_string();
+    write_file(&source, text);
+    let second_id = RequestId::from("noop-disk-second".to_string());
+    disk_server.send_request(
+        second_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": previous
+        }),
+    );
+    let second = disk_server.response(&second_id);
+    assert_eq!(
+        second.result.expect("second disk report")["kind"],
+        "unchanged"
+    );
+    disk_server.shutdown();
+
+    let mut overlay_server = TestServer::launch();
+    overlay_server.initialize_with_pull_diagnostics(root.path());
+    overlay_server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let refresh = overlay_server.request("workspace/diagnostic/refresh");
+    overlay_server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let first_id = RequestId::from("noop-overlay-first".to_string());
+    overlay_server.send_request(
+        first_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let first = overlay_server.response(&first_id);
+    let previous = first.result.as_ref().expect("first overlay report")["resultId"]
+        .as_str()
+        .expect("first overlay result ID")
+        .to_string();
+    overlay_server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source), "version": 2},
+            "contentChanges": [{"text": text}]
+        }),
+    );
+    let refresh = overlay_server.request("workspace/diagnostic/refresh");
+    overlay_server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let second_id = RequestId::from("noop-overlay-second".to_string());
+    overlay_server.send_request(
+        second_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": previous
+        }),
+    );
+    let second = overlay_server.response(&second_id);
+    assert_eq!(
+        second.result.expect("second overlay report")["kind"],
+        "unchanged"
+    );
+    overlay_server.shutdown();
+}
+
+#[test]
+fn workspace_pull_reuses_reports_unrelated_to_a_changed_file() {
+    let root = tempfile::tempdir().expect("workspace");
+    let first = root.path().join("A.pas");
+    let second = root.path().join("B.pas");
+    let valid = "unit A;\ninterface\nimplementation\nend.\n";
+    write_file(&first, valid);
+    write_file(&second, &valid.replace("unit A", "unit B"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let first_id = RequestId::from("unrelated-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let first_response = server.response(&first_id);
+    let previous = first_response.result.expect("initial workspace report")["items"]
+        .as_array()
+        .expect("initial workspace items")
+        .iter()
+        .map(|item| json!({"uri": item["uri"], "value": item["resultId"]}))
+        .collect::<Vec<_>>();
+
+    let changed = "unit B;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+    write_file(&second, changed);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&second), "type": 2}]}),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+    let second_id = RequestId::from("unrelated-second".to_string());
+    server.send_request(
+        second_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": previous}),
+    );
+    let second_response = server.response(&second_id);
+    assert!(
+        second_response.error.is_none(),
+        "changed workspace request failed: {second_response:?}"
+    );
+    let changed_workspace = second_response.result.expect("changed workspace report");
+    let reports = changed_workspace["items"]
+        .as_array()
+        .expect("workspace reports");
+    let first_report = reports
+        .iter()
+        .find(|report| report["uri"] == uri(&first).as_str())
+        .expect("first report");
+    assert_eq!(first_report["kind"], "unchanged");
+    let second_report = reports
+        .iter()
+        .find(|report| report["uri"] == uri(&second).as_str())
+        .expect("second report");
+    assert_eq!(second_report["kind"], "full");
+    assert!(second_report["items"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    }));
     server.shutdown();
 }
 

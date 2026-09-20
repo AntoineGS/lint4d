@@ -91,6 +91,8 @@ const MAX_COMPLETION_RESOLUTION_ITEM_BYTES: usize = 64 * 1024;
 const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
 const MAX_DIAGNOSTIC_RESULT_ENTRIES: usize = 2_048;
 const MAX_DIAGNOSTIC_RESULT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DIAGNOSTIC_DEPENDENCY_RECORDS: usize = 32_768;
+const MAX_DIAGNOSTIC_DEPENDENCY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_REPORT_ITEMS: usize = 10_000;
 const MAX_DIAGNOSTIC_REPORT_BYTES: usize = 7 * 1024 * 1024;
 const MAX_DIAGNOSTIC_REPORT_ITEM_BYTES: usize = 64 * 1024;
@@ -1614,12 +1616,163 @@ struct DocumentDiagnosticsAnalysis {
     previous_result_id: Option<String>,
     related_document_support: bool,
     publications: Vec<queries::DiagnosticPublication>,
+    dependencies: HashMap<Url, DiagnosticDependency>,
 }
 
 #[derive(Clone)]
 struct WorkspaceDiagnosticsAnalysis {
     previous_result_ids: Vec<(Url, String)>,
     publications: Vec<queries::DiagnosticPublication>,
+    dependencies: HashMap<Url, DiagnosticDependency>,
+}
+
+/// Worker-prepared evidence for one effective diagnostic report.  The full
+/// source records are compacted before delivery; the protocol thread only
+/// compares this bounded fingerprint and retained-size charge.
+#[derive(Clone)]
+struct DiagnosticDependency {
+    identity: Arc<Vec<u8>>,
+    retained_bytes: usize,
+}
+
+fn compact_diagnostic_records(records: &[SourceRecord]) -> Option<Vec<SourceRecord>> {
+    if records.len() > MAX_DIAGNOSTIC_DEPENDENCY_RECORDS {
+        return None;
+    }
+
+    // Preflight the bounded representation before allocating its vector.  The
+    // source payloads are deliberately excluded: freshness is proved from the
+    // content hashes below, while authorization and resolver observations are
+    // retained for dependency validation.
+    let mut estimated_bytes = 0usize;
+    for record in records {
+        let full = compact_completion_record_bytes(record);
+        let source_payload = record
+            .text
+            .capacity()
+            .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::capacity));
+        estimated_bytes = estimated_bytes.saturating_add(full.saturating_sub(source_payload));
+        if estimated_bytes > MAX_DIAGNOSTIC_DEPENDENCY_BYTES {
+            return None;
+        }
+    }
+
+    let mut compact = Vec::with_capacity(records.len());
+    for record in records {
+        let content_hash = record.content_hash.or_else(|| {
+            if record.open {
+                Some(crate::workspace::content_hash_bytes(record.text.as_bytes()))
+            } else {
+                record
+                    .content_bytes
+                    .as_deref()
+                    .map(crate::workspace::content_hash_bytes)
+                    .or_else(|| {
+                        (!record.text.is_empty())
+                            .then(|| crate::workspace::content_hash_bytes(record.text.as_bytes()))
+                    })
+            }
+        });
+        if !record.open && record.path.is_none() && content_hash.is_none() {
+            return None;
+        }
+        let compact_record = SourceRecord {
+            uri: record.uri.clone(),
+            text: String::new(),
+            version: record.version,
+            stamp: record.stamp.clone(),
+            open: record.open,
+            path: record.path.clone(),
+            path_stamp: record.path_stamp.clone(),
+            content_hash,
+            parsed_text_hash: record.parsed_text_hash.or_else(|| {
+                (!record.text.is_empty())
+                    .then(|| crate::workspace::rename::text_content_hash(&record.text))
+            }),
+            content_bytes: None,
+            candidate_membership: record.candidate_membership.clone(),
+            candidate_observations: record.candidate_observations.clone(),
+            read_policy: record.read_policy.clone(),
+            path_entry: record.path_entry.clone(),
+            include_payload: record.include_payload,
+            missing_provider_candidate: record.missing_provider_candidate,
+            directory_observation: record.directory_observation,
+            missing_provider_scope: record.missing_provider_scope.clone(),
+            auto_import_provider_observation: record.auto_import_provider_observation,
+            auto_import_scopes: record.auto_import_scopes.clone(),
+        };
+        compact.push(compact_record);
+    }
+    Some(compact)
+}
+
+fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::fmt::Debug;
+
+    fn hash_debug<T: Debug>(hasher: &mut DefaultHasher, value: &T) {
+        format!("{value:?}").hash(hasher);
+    }
+
+    let mut hasher = DefaultHasher::new();
+    record.uri.hash(&mut hasher);
+    record.open.hash(&mut hasher);
+    record.content_hash.hash(&mut hasher);
+    record.parsed_text_hash.hash(&mut hasher);
+    record.include_payload.hash(&mut hasher);
+    record.missing_provider_candidate.hash(&mut hasher);
+    record.directory_observation.hash(&mut hasher);
+    record.auto_import_provider_observation.hash(&mut hasher);
+    hash_debug(&mut hasher, &record.candidate_membership);
+    hash_debug(&mut hasher, &record.candidate_observations);
+    hash_debug(&mut hasher, &record.read_policy);
+    hash_debug(&mut hasher, &record.path_entry);
+    hash_debug(&mut hasher, &record.missing_provider_scope);
+    hash_debug(&mut hasher, &record.auto_import_scopes);
+    hasher.finish()
+}
+
+fn diagnostic_records_identity(records: &[SourceRecord]) -> Vec<u8> {
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.uri.as_str().cmp(right.uri.as_str()).then_with(|| {
+            diagnostic_record_fingerprint(left).cmp(&diagnostic_record_fingerprint(right))
+        })
+    });
+    let mut identity = Vec::with_capacity(ordered.len().saturating_mul(32));
+    for record in ordered {
+        let uri = record.uri.as_str().as_bytes();
+        identity.extend_from_slice(&(uri.len() as u64).to_le_bytes());
+        identity.extend_from_slice(uri);
+        identity.extend_from_slice(&diagnostic_record_fingerprint(record).to_le_bytes());
+    }
+    identity
+}
+
+fn prepare_diagnostic_dependency(records: &[SourceRecord]) -> Option<DiagnosticDependency> {
+    let records = compact_diagnostic_records(records)?;
+    let identity = diagnostic_records_identity(&records);
+    Some(DiagnosticDependency {
+        retained_bytes: source_records_retained_bytes(&records),
+        identity: Arc::new(identity),
+    })
+}
+
+fn prepare_diagnostic_dependencies(
+    dependencies: &HashMap<Url, Arc<Vec<SourceRecord>>>,
+) -> HashMap<Url, DiagnosticDependency> {
+    let mut prepared = HashMap::<usize, Option<DiagnosticDependency>>::new();
+    dependencies
+        .iter()
+        .filter_map(|(uri, records)| {
+            let key = Arc::as_ptr(records) as usize;
+            let dependency = prepared
+                .entry(key)
+                .or_insert_with(|| prepare_diagnostic_dependency(records.as_slice()))
+                .clone();
+            dependency.map(|dependency| (uri.clone(), dependency))
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1630,19 +1783,31 @@ struct DiagnosticResultCacheEntry {
     diagnostics: Vec<lsp_types::Diagnostic>,
     records_identity: Vec<u8>,
     diagnostics_identity: Vec<u8>,
-    source_generation: u64,
-    configuration_generation: u64,
-    records: Vec<SourceRecord>,
     retained_bytes: usize,
+    cacheable: bool,
 }
 
 #[derive(Default)]
 struct DiagnosticPullStore {
     entries: HashMap<String, DiagnosticResultCacheEntry>,
     uri_to_result: HashMap<Url, String>,
+    related_owners: HashMap<Url, HashMap<Url, RelatedDiagnosticContribution>>,
+    related_owner_order: VecDeque<Url>,
     order: VecDeque<String>,
     retained_bytes: usize,
     next_id: u64,
+}
+
+#[derive(Clone)]
+struct RelatedDiagnosticContribution {
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    dependency: Option<DiagnosticDependency>,
+}
+
+struct RelatedDiagnosticReport {
+    uri: Url,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    dependency: Option<DiagnosticDependency>,
 }
 
 impl DiagnosticPullStore {
@@ -1650,29 +1815,100 @@ impl DiagnosticPullStore {
         Self::default()
     }
 
+    fn replace_related_owner(
+        &mut self,
+        root_uri: &Url,
+        publications: impl IntoIterator<
+            Item = (
+                Url,
+                Vec<lsp_types::Diagnostic>,
+                Option<DiagnosticDependency>,
+            ),
+        >,
+    ) -> Vec<RelatedDiagnosticReport> {
+        let was_present = self.related_owners.contains_key(root_uri);
+        let previous = self.related_owners.remove(root_uri).unwrap_or_default();
+        let mut current = HashMap::new();
+        for (uri, diagnostics, dependency) in publications {
+            current.insert(
+                uri,
+                RelatedDiagnosticContribution {
+                    diagnostics,
+                    dependency,
+                },
+            );
+        }
+        let affected = previous
+            .keys()
+            .chain(current.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !current.is_empty() {
+            if !was_present {
+                self.related_owner_order.push_back(root_uri.clone());
+            }
+            self.related_owners.insert(root_uri.clone(), current);
+        } else {
+            self.related_owner_order.retain(|uri| uri != root_uri);
+        }
+        while self.related_owner_order.len() > MAX_DIAGNOSTIC_RESULT_ENTRIES {
+            let Some(evicted_root) = self.related_owner_order.pop_front() else {
+                break;
+            };
+            self.related_owners.remove(&evicted_root);
+        }
+
+        let mut affected = affected.into_iter().collect::<Vec<_>>();
+        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected
+            .into_iter()
+            .map(|uri| {
+                let mut diagnostics = Vec::new();
+                let mut dependency_identity = Vec::new();
+                let mut dependency_bytes = 0usize;
+                let mut owners = self.related_owners.iter().collect::<Vec<_>>();
+                owners.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+                for (owner_uri, contributions) in owners {
+                    let Some(contribution) = contributions.get(&uri) else {
+                        continue;
+                    };
+                    for diagnostic in &contribution.diagnostics {
+                        if !diagnostics.contains(diagnostic) {
+                            diagnostics.push(diagnostic.clone());
+                        }
+                    }
+                    if let Some(dependency) = &contribution.dependency {
+                        let owner_uri = owner_uri.as_str().as_bytes();
+                        dependency_identity
+                            .extend_from_slice(&(owner_uri.len() as u64).to_le_bytes());
+                        dependency_identity.extend_from_slice(owner_uri);
+                        dependency_identity
+                            .extend_from_slice(&(dependency.identity.len() as u64).to_le_bytes());
+                        dependency_identity.extend_from_slice(dependency.identity.as_slice());
+                        dependency_bytes =
+                            dependency_bytes.saturating_add(dependency.retained_bytes);
+                    }
+                }
+                let dependency = (!dependency_identity.is_empty()).then(|| DiagnosticDependency {
+                    identity: Arc::new(dependency_identity),
+                    retained_bytes: dependency_bytes,
+                });
+                RelatedDiagnosticReport {
+                    uri,
+                    diagnostics,
+                    dependency,
+                }
+            })
+            .collect()
+    }
+
     fn identity_for(
         diagnostics: &[lsp_types::Diagnostic],
-        records: &[SourceRecord],
+        records_identity: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let diagnostics_identity = serde_json::to_vec(diagnostics)
             .map_err(|error| format!("could not encode diagnostic result identity: {error}"))?;
-        let mut records = records.to_vec();
-        records.sort_by(|left, right| {
-            left.uri
-                .as_str()
-                .cmp(right.uri.as_str())
-                .then_with(|| left.text.len().cmp(&right.text.len()))
-                .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
-        });
-        let records_identity = records
-            .iter()
-            .fold(String::new(), |mut identity, record| {
-                use std::fmt::Write as _;
-                writeln!(identity, "{record:?}").expect("writing a source identity cannot fail");
-                identity
-            })
-            .into_bytes();
-        Ok((diagnostics_identity, records_identity))
+        Ok((diagnostics_identity, records_identity.to_vec()))
     }
 
     fn remove(&mut self, result_id: &str) -> Option<DiagnosticResultCacheEntry> {
@@ -1696,7 +1932,11 @@ impl DiagnosticPullStore {
             let Some(result_id) = self.order.pop_front() else {
                 break;
             };
-            let _ = self.remove(&result_id);
+            if let Some(entry) = self.remove(&result_id) {
+                if self.related_owners.remove(&entry.uri).is_some() {
+                    self.related_owner_order.retain(|uri| uri != &entry.uri);
+                }
+            }
         }
     }
 
@@ -1705,11 +1945,12 @@ impl DiagnosticPullStore {
         uri: Url,
         version: Option<i32>,
         diagnostics: Vec<lsp_types::Diagnostic>,
-        source_generation: u64,
-        configuration_generation: u64,
-        records: &[SourceRecord],
+        dependency: Option<&DiagnosticDependency>,
     ) -> Result<DiagnosticResultCacheEntry, String> {
-        let (diagnostics_identity, records_identity) = Self::identity_for(&diagnostics, records)?;
+        let dependency_identity =
+            dependency.map_or(&[][..], |dependency| dependency.identity.as_slice());
+        let (diagnostics_identity, records_identity) =
+            Self::identity_for(&diagnostics, dependency_identity)?;
         let previous = self
             .uri_to_result
             .get(&uri)
@@ -1719,7 +1960,8 @@ impl DiagnosticPullStore {
         let result_id = previous
             .as_ref()
             .filter(|previous| {
-                previous.version == version
+                previous.cacheable
+                    && dependency.is_some()
                     && previous.diagnostics_identity == diagnostics_identity
                     && previous.records_identity == records_identity
             })
@@ -1733,12 +1975,8 @@ impl DiagnosticPullStore {
             .saturating_add(result_id.len())
             .saturating_add(diagnostics_identity.len())
             .saturating_add(records_identity.len())
-            .saturating_add(source_records_retained_bytes(records));
-        if retained_bytes > MAX_DIAGNOSTIC_RESULT_BYTES {
-            return Err(format!(
-                "diagnostic result exceeds the {MAX_DIAGNOSTIC_RESULT_BYTES}-byte cache entry limit"
-            ));
-        }
+            .saturating_add(dependency.map_or(0, |dependency| dependency.retained_bytes));
+        let cacheable = dependency.is_some() && retained_bytes <= MAX_DIAGNOSTIC_RESULT_BYTES;
         if let Some(previous) = previous {
             let _ = self.remove(&previous.result_id);
         }
@@ -1747,13 +1985,17 @@ impl DiagnosticPullStore {
             uri: uri.clone(),
             version,
             diagnostics,
-            records: records.to_vec(),
             diagnostics_identity,
             records_identity,
-            source_generation,
-            configuration_generation,
             retained_bytes,
+            cacheable,
         };
+        if !cacheable {
+            // Cache admission is an optimization.  An oversized or
+            // unavailable dependency set must degrade to an uncached full
+            // report rather than reject a valid diagnostic response.
+            return Ok(entry);
+        }
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
         self.uri_to_result.insert(uri, result_id.clone());
         self.order.push_back(result_id.clone());
@@ -1771,9 +2013,14 @@ impl DiagnosticPullStore {
 struct DiagnosticNotificationEffect {
     refresh: Vec<Url>,
     cancel: Vec<Url>,
+    refresh_requested: bool,
 }
 
 impl DiagnosticNotificationEffect {
+    fn request_refresh(&mut self) {
+        self.refresh_requested = true;
+    }
+
     fn refresh_uri(&mut self, uri: Url) {
         if !self.refresh.contains(&uri) {
             self.refresh.push(uri);
@@ -1868,6 +2115,17 @@ impl DiagnosticRefreshRequests {
         // this coordinator actually issued, leaving unrelated client replies
         // for the normal routing paths.
         Ok(self.retired.iter().any(|id| id == &response.id))
+    }
+
+    fn shutdown(&mut self) {
+        self.supported = false;
+        self.pending = false;
+        if let Some(id) = self.in_flight.take() {
+            self.retired.push_back(id);
+        }
+        while self.retired.len() > 64 {
+            self.retired.pop_front();
+        }
     }
 }
 
@@ -2144,7 +2402,9 @@ impl ConfigurationCoordinator {
         }
         if self.pull_supported {
             self.request_refresh(connection)?;
-            return Ok(DiagnosticNotificationEffect::default());
+            let mut effect = DiagnosticNotificationEffect::default();
+            effect.request_refresh();
+            return Ok(effect);
         }
 
         let settings = runtime_settings_section(&params.settings)?;
@@ -2345,6 +2605,9 @@ impl ConfigurationCoordinator {
         if workspace.apply_prepared_runtime_options(prepared) {
             self.applied_options = result.options;
             let mut effect = DiagnosticNotificationEffect::default();
+            if self.pull_supported {
+                effect.request_refresh();
+            }
             for uri in workspace.open_document_uris() {
                 effect.cancel_uri(uri.clone());
                 effect.refresh_uri(uri);
@@ -3965,12 +4228,16 @@ impl AnalysisJobs {
                                                 previous_result_id,
                                                 related_document_support,
                                                 publications: result.publications,
+                                                dependencies: prepare_diagnostic_dependencies(
+                                                    &result.publication_dependencies,
+                                                ),
                                             }
                                         });
                                         (
                                             computed.source_generation,
                                             computed.configuration_generation,
-                                            computed.records,
+                                            compact_diagnostic_records(&computed.records)
+                                                .unwrap_or_default(),
                                             value,
                                         )
                                     }
@@ -4014,12 +4281,16 @@ impl AnalysisJobs {
                                             WorkspaceDiagnosticsAnalysis {
                                                 previous_result_ids,
                                                 publications: result.publications,
+                                                dependencies: prepare_diagnostic_dependencies(
+                                                    &result.publication_dependencies,
+                                                ),
                                             }
                                         });
                                         (
                                             computed.source_generation,
                                             computed.configuration_generation,
-                                            computed.records,
+                                            compact_diagnostic_records(&computed.records)
+                                                .unwrap_or_default(),
                                             value,
                                         )
                                     }
@@ -5420,14 +5691,8 @@ impl AnalysisJobs {
                         return Ok(());
                     }
                 };
-                match workspace_diagnostic_items(
-                    workspace,
-                    &mut self.diagnostic_results,
-                    source_generation,
-                    configuration_generation,
-                    &records,
-                    analysis,
-                ) {
+                match workspace_diagnostic_items(workspace, &mut self.diagnostic_results, analysis)
+                {
                     Ok(items) => PartialResultPayload::WorkspaceDiagnostics(Arc::new(items)),
                     Err(error) => {
                         return self.fail_client_recipients(
@@ -6249,9 +6514,6 @@ fn deliver_analysis_result_with_store(
                 connection,
                 workspace,
                 diagnostic_results,
-                result.source_generation,
-                result.configuration_generation,
-                &result.records,
                 analysis,
                 client_id.expect("client result"),
             ),
@@ -6264,9 +6526,6 @@ fn deliver_analysis_result_with_store(
                 connection,
                 workspace,
                 diagnostic_results,
-                result.source_generation,
-                result.configuration_generation,
-                &result.records,
                 analysis,
                 client_id.expect("client result"),
             ),
@@ -6369,9 +6628,6 @@ fn send_document_diagnostics(
     connection: &dyn ProtocolSender,
     workspace: &Workspace,
     diagnostic_results: &mut DiagnosticPullStore,
-    source_generation: u64,
-    configuration_generation: u64,
-    records: &[SourceRecord],
     analysis: DocumentDiagnosticsAnalysis,
     client_id: RequestId,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -6390,33 +6646,27 @@ fn send_document_diagnostics(
         .as_deref()
         .and_then(|previous| diagnostic_results.get(previous))
         .cloned();
+    let root_dependency = analysis.dependencies.get(&publication.uri);
     let entry = match diagnostic_results.insert(
         publication.uri,
         publication.version,
         publication.diagnostics,
-        source_generation,
-        configuration_generation,
-        records,
+        root_dependency,
     ) {
         Ok(entry) => entry,
         Err(error) => return send_error(connection, client_id, ErrorCode::RequestFailed, error),
     };
-    let unchanged = previous.is_some_and(|previous| {
-        previous.result_id == entry.result_id
-            && previous.uri == entry.uri
-            && previous.version == entry.version
-            && previous.diagnostics_identity == entry.diagnostics_identity
-            && previous.records_identity == entry.records_identity
-            && previous.source_generation <= source_generation
-            && previous.configuration_generation <= configuration_generation
-            && workspace
-                .dependency_scoped_result_is_fresh(
-                    previous.source_generation,
-                    previous.configuration_generation,
-                    &previous.records,
-                )
-                .is_ok()
-    });
+    let unchanged = entry.cacheable
+        && previous.is_some_and(|previous| {
+            previous.result_id == entry.result_id
+                && previous.uri == entry.uri
+                && previous.diagnostics_identity == entry.diagnostics_identity
+                && previous.records_identity == entry.records_identity
+            // The worker has already re-read and fingerprinted the
+            // effective dependency set for this response.  A protocol
+            // version or watcher generation alone must not defeat an
+            // otherwise identical report (notably a no-op overlay edit).
+        });
     let mut value = if unchanged {
         serde_json::json!({
             "kind": "unchanged",
@@ -6430,19 +6680,26 @@ fn send_document_diagnostics(
         })
     };
     if analysis.related_document_support {
+        let related_reports = diagnostic_results.replace_related_owner(
+            &analysis.uri,
+            analysis
+                .publications
+                .into_iter()
+                .filter(|publication| publication.uri != entry.uri)
+                .map(|publication| {
+                    let dependency = analysis.dependencies.get(&publication.uri).cloned();
+                    (publication.uri, publication.diagnostics, dependency)
+                }),
+        );
         let mut related = serde_json::Map::new();
-        for publication in analysis
-            .publications
-            .into_iter()
-            .filter(|publication| publication.uri != entry.uri)
-        {
+        for report in related_reports {
+            let dependency = report.dependency.as_ref();
+            let report_uri = report.uri.clone();
             let related_entry = match diagnostic_results.insert(
-                publication.uri.clone(),
-                publication.version,
-                publication.diagnostics,
-                source_generation,
-                configuration_generation,
-                records,
+                report_uri.clone(),
+                workspace.document_version(&report_uri),
+                report.diagnostics,
+                dependency,
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -6463,6 +6720,8 @@ fn send_document_diagnostics(
                 object.insert("relatedDocuments".to_string(), Value::Object(related));
             }
         }
+    } else {
+        let _ = diagnostic_results.replace_related_owner(&analysis.uri, std::iter::empty());
     }
     send_ok(connection, client_id, value)
 }
@@ -6472,20 +6731,10 @@ fn send_workspace_diagnostics(
     connection: &dyn ProtocolSender,
     workspace: &Workspace,
     diagnostic_results: &mut DiagnosticPullStore,
-    source_generation: u64,
-    configuration_generation: u64,
-    records: &[SourceRecord],
     analysis: WorkspaceDiagnosticsAnalysis,
     client_id: RequestId,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let items = match workspace_diagnostic_items(
-        workspace,
-        diagnostic_results,
-        source_generation,
-        configuration_generation,
-        records,
-        analysis,
-    ) {
+    let items = match workspace_diagnostic_items(workspace, diagnostic_results, analysis) {
         Ok(items) => items,
         Err(error) => {
             return send_error(connection, client_id, ErrorCode::RequestFailed, error);
@@ -6497,9 +6746,6 @@ fn send_workspace_diagnostics(
 fn workspace_diagnostic_items(
     workspace: &Workspace,
     diagnostic_results: &mut DiagnosticPullStore,
-    source_generation: u64,
-    configuration_generation: u64,
-    records: &[SourceRecord],
     analysis: WorkspaceDiagnosticsAnalysis,
 ) -> Result<Vec<Value>, String> {
     let previous = analysis
@@ -6513,29 +6759,21 @@ fn workspace_diagnostic_items(
             .get(&publication.uri)
             .and_then(|result_id| diagnostic_results.get(result_id))
             .cloned();
+        let dependency = analysis.dependencies.get(&publication.uri);
         let entry = diagnostic_results.insert(
             publication.uri.clone(),
             publication.version,
             publication.diagnostics,
-            source_generation,
-            configuration_generation,
-            records,
+            dependency,
         )?;
         seen.insert(publication.uri.clone());
-        let unchanged = old.is_some_and(|old| {
-            old.result_id == previous[&entry.uri]
-                && old.result_id == entry.result_id
-                && old.version == entry.version
-                && old.diagnostics_identity == entry.diagnostics_identity
-                && old.records_identity == entry.records_identity
-                && workspace
-                    .dependency_scoped_result_is_fresh(
-                        old.source_generation,
-                        old.configuration_generation,
-                        &old.records,
-                    )
-                    .is_ok()
-        });
+        let unchanged = entry.cacheable
+            && old.is_some_and(|old| {
+                old.result_id == previous[&entry.uri]
+                    && old.result_id == entry.result_id
+                    && old.diagnostics_identity == entry.diagnostics_identity
+                    && old.records_identity == entry.records_identity
+            });
         if unchanged {
             items.push(serde_json::json!({
                 "kind": "unchanged",
@@ -6569,14 +6807,13 @@ fn workspace_diagnostic_items(
         .cloned()
         .collect::<Vec<_>>();
     missing.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let empty_dependency = prepare_diagnostic_dependency(&[]);
     for uri in missing {
         let entry = diagnostic_results.insert(
             uri.clone(),
             workspace.document_version(&uri),
             Vec::new(),
-            source_generation,
-            configuration_generation,
-            &[],
+            empty_dependency.as_ref(),
         )?;
         items.push(serde_json::json!({
             "kind": "full",
@@ -7058,7 +7295,9 @@ fn event_loop(
             if let Some(registration) = watcher_registration.as_mut() {
                 sync_file_watcher(connection, workspace, registration)?;
             }
-            if pull_diagnostics_supported && !effect.refresh.is_empty() {
+            if pull_diagnostics_supported
+                && (effect.refresh_requested || !effect.refresh.is_empty())
+            {
                 diagnostic_refresh.request(connection)?;
             }
             if !pull_diagnostics_supported {
@@ -7073,19 +7312,16 @@ fn event_loop(
         }
         jobs.poll(connection, workspace)?;
         let output_pending = connection.has_pending_output();
-        let timeout = workspace
-            .next_diagnostic_timeout()
-            .unwrap_or(Duration::from_secs(86_400))
-            .min(if jobs.is_empty() && !output_pending {
-                Duration::from_secs(86_400)
-            } else {
-                ANALYSIS_POLL_INTERVAL
-            })
-            .min(if configuration.is_preparing() {
-                ANALYSIS_POLL_INTERVAL
-            } else {
-                Duration::from_secs(86_400)
-            });
+        // Pull-owned diagnostics must not inherit the debounced push queue.
+        // Those deadlines have no consumer in pull mode and would otherwise
+        // turn every expired deadline into a zero-duration receive loop.
+        let timeout = event_loop_receive_timeout(
+            pull_diagnostics_supported,
+            workspace.next_diagnostic_timeout(),
+            jobs.is_empty(),
+            output_pending,
+            configuration.is_preparing(),
+        );
         let message = if !configuration.is_preparing() {
             match deferred_configuration_messages.pop_front() {
                 Some(DeferredConfigurationMessage::Request(deferred)) => {
@@ -7116,6 +7352,7 @@ fn event_loop(
                     Err(RecvTimeoutError::Disconnected) => {
                         jobs.shutdown();
                         configuration.shutdown();
+                        diagnostic_refresh.shutdown();
                         return Ok(true);
                     }
                 },
@@ -7133,6 +7370,7 @@ fn event_loop(
                 Err(RecvTimeoutError::Disconnected) => {
                     jobs.shutdown();
                     configuration.shutdown();
+                    diagnostic_refresh.shutdown();
                     return Ok(true);
                 }
             }
@@ -7142,6 +7380,7 @@ fn event_loop(
             Message::Request(request) if request.method == "shutdown" => {
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
+                diagnostic_refresh.shutdown();
                 for deferred in deferred_configuration_messages.drain(..) {
                     if let DeferredConfigurationMessage::Request(deferred) = deferred {
                         send_error(
@@ -7259,6 +7498,7 @@ fn event_loop(
             Message::Notification(notification) if notification.method == "exit" => {
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
+                diagnostic_refresh.shutdown();
                 return Ok(shutdown_received);
             }
             Message::Notification(notification)
@@ -7371,7 +7611,9 @@ fn event_loop(
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
                         }
-                        if pull_diagnostics_supported && !effect.refresh.is_empty() {
+                        if pull_diagnostics_supported
+                            && (effect.refresh_requested || !effect.refresh.is_empty())
+                        {
                             diagnostic_refresh.request(connection)?;
                         }
                         if !pull_diagnostics_supported {
@@ -7404,7 +7646,9 @@ fn event_loop(
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
                     }
-                    if pull_diagnostics_supported && !effect.refresh.is_empty() {
+                    if pull_diagnostics_supported
+                        && (effect.refresh_requested || !effect.refresh.is_empty())
+                    {
                         diagnostic_refresh.request(connection)?;
                     }
                     if !pull_diagnostics_supported {
@@ -7454,6 +7698,30 @@ fn event_loop(
         }
         jobs.pump_partial_deliveries(connection, workspace)?;
     }
+}
+
+fn event_loop_receive_timeout(
+    pull_diagnostics_supported: bool,
+    diagnostic_timeout: Option<Duration>,
+    jobs_empty: bool,
+    output_pending: bool,
+    configuration_preparing: bool,
+) -> Duration {
+    let diagnostic_timeout = (!pull_diagnostics_supported)
+        .then_some(diagnostic_timeout)
+        .flatten()
+        .unwrap_or(Duration::from_secs(86_400));
+    diagnostic_timeout
+        .min(if jobs_empty && !output_pending {
+            Duration::from_secs(86_400)
+        } else {
+            ANALYSIS_POLL_INTERVAL
+        })
+        .min(if configuration_preparing {
+            ANALYSIS_POLL_INTERVAL
+        } else {
+            Duration::from_secs(86_400)
+        })
 }
 
 fn start_analysis(
@@ -8411,6 +8679,7 @@ fn handle_notification(
             let mut effect = DiagnosticNotificationEffect::default();
             effect.cancel_uri(uri.clone());
             if closed {
+                effect.request_refresh();
                 effect.refresh_dependents(workspace, &uri, true);
                 for open_uri in workspace.open_document_uris() {
                     effect.refresh_uri(open_uri);
@@ -8432,6 +8701,14 @@ fn handle_notification(
                 for uri in workspace.file_event(&change.uri, kind) {
                     effect.refresh_uri(uri);
                 }
+                if !push_diagnostics_supported {
+                    // Pull clients must be told about watched changes even
+                    // when the changed source was never opened or indexed by
+                    // the legacy push publication map.  Push clients keep
+                    // the historical affected-open/dependent set so a
+                    // configuration file is not itself analyzed as Pascal.
+                    effect.refresh_uri(change.uri.clone());
+                }
                 effect.refresh_dependents(workspace, &change.uri, true);
             }
             Ok(effect)
@@ -8451,6 +8728,7 @@ fn handle_notification(
                 .filter_map(|folder| folder.uri.to_file_path().ok());
             workspace.update_workspace_folders(added, removed);
             let mut effect = DiagnosticNotificationEffect::default();
+            effect.request_refresh();
             for uri in workspace.open_document_uris() {
                 effect.refresh_uri(uri);
             }
@@ -8904,15 +9182,28 @@ fn supports_diagnostic_refresh(client: &ClientCapabilities, raw_initialize: &Val
 }
 
 fn supports_workspace_diagnostic_reports(raw_initialize: &Value) -> bool {
-    // Neovim 0.12 uses the current plural capability spelling and routes a
-    // refresh to workspace diagnostics whenever the server advertises the
-    // workspace provider.  Its open buffers remain document-pull tracked, so
-    // those reports are ignored.  Keep document refreshes interoperable for
-    // that spelling while retaining the workspace provider for clients using
-    // the lsp-types spelling.
-    raw_initialize
-        .pointer("/capabilities/workspace/diagnostics")
-        .is_none()
+    // `workspace.diagnostics` is the canonical LSP 3.17 capability spelling.
+    // The pinned lsp-types version still exposes the older singular field, so
+    // inspect the raw initialize value only to accept either workspace wire
+    // spelling.  Refresh support is optional and does not gate reports.
+    //
+    // Neovim 0.12 advertises the canonical capability but deliberately keeps
+    // attached buffers in document-pull mode.  Its workspace refresh handler
+    // then ignores workspace reports for those buffers and opens every
+    // unopened URI returned by the scan.  Keep that client-specific behavior
+    // on document pull; ordinary clients with the same capability still get
+    // the standard workspace provider.
+    let neovim_document_pull_compat = raw_initialize
+        .pointer("/clientInfo/name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("Neovim"));
+    !neovim_document_pull_compat
+        && (raw_initialize
+            .pointer("/capabilities/workspace/diagnostics")
+            .is_some_and(Value::is_object)
+            || raw_initialize
+                .pointer("/capabilities/workspace/diagnostic")
+                .is_some_and(Value::is_object))
 }
 
 fn supports_configuration(client: &ClientCapabilities) -> bool {
@@ -8981,8 +9272,8 @@ mod tests {
         MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass,
         OutboundQueue, PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation,
         PartialResultPayload, PendingAnalysis, PriorityQueue, TestBarrierConfig,
-        deliver_analysis_result, invalidate_analysis_result, supports_diagnostic_refresh,
-        supports_workspace_diagnostic_reports,
+        deliver_analysis_result, event_loop_receive_timeout, invalidate_analysis_result,
+        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
     };
     use crate::workspace::Workspace;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -9070,19 +9361,47 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_provider_avoids_workspace_reports_for_plural_refresh_clients() {
+    fn pull_owned_receive_timeout_ignores_expired_push_deadlines() {
+        assert_eq!(
+            event_loop_receive_timeout(true, Some(Duration::ZERO), true, false, false,),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            event_loop_receive_timeout(false, Some(Duration::ZERO), true, false, false,),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn diagnostic_provider_supports_standard_and_legacy_workspace_capabilities() {
         let raw_initialize = serde_json::json!({
             "capabilities": {
+                "textDocument": {"diagnostic": {"relatedDocumentSupport": true}},
                 "workspace": {
                     "diagnostics": {"refreshSupport": true}
                 }
             }
         });
-        assert!(!supports_workspace_diagnostic_reports(&raw_initialize));
+        assert!(supports_workspace_diagnostic_reports(&raw_initialize));
         assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
             "capabilities": {
+                "textDocument": {"diagnostic": {}},
                 "workspace": {
                     "diagnostic": {"refreshSupport": true}
+                }
+            }
+        })));
+        assert!(!supports_workspace_diagnostic_reports(&serde_json::json!({
+            "capabilities": {
+                "textDocument": {"diagnostic": {}}
+            }
+        })));
+        assert!(!supports_workspace_diagnostic_reports(&serde_json::json!({
+            "clientInfo": {"name": "Neovim", "version": "0.12.5"},
+            "capabilities": {
+                "textDocument": {"diagnostic": {}},
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
                 }
             }
         })));
@@ -9124,13 +9443,14 @@ mod tests {
     #[test]
     fn diagnostic_result_store_evicts_old_ids_but_keeps_new_ids() {
         let mut store = DiagnosticPullStore::new();
+        let empty_dependency = super::prepare_diagnostic_dependency(&[]);
         let mut first = None;
         let mut last = None;
         for index in 0..=super::MAX_DIAGNOSTIC_RESULT_ENTRIES {
             let uri =
                 Url::parse(&format!("file:///diagnostic-{index}.pas")).expect("diagnostic URI");
             let entry = store
-                .insert(uri, None, test_diagnostic(index), 1, 1, &[])
+                .insert(uri, None, test_diagnostic(index), empty_dependency.as_ref())
                 .expect("diagnostic result entry");
             if index == 0 {
                 first = Some(entry.result_id.clone());
@@ -9151,14 +9471,20 @@ mod tests {
     fn diagnostic_result_store_reissues_an_actual_evicted_id() {
         let first_uri = Url::parse("file:///diagnostic-evicted.pas").expect("diagnostic URI");
         let mut store = DiagnosticPullStore::new();
+        let empty_dependency = super::prepare_diagnostic_dependency(&[]);
         let first = store
-            .insert(first_uri.clone(), None, test_diagnostic(0), 1, 1, &[])
+            .insert(
+                first_uri.clone(),
+                None,
+                test_diagnostic(0),
+                empty_dependency.as_ref(),
+            )
             .expect("first diagnostic result");
         for index in 1..=super::MAX_DIAGNOSTIC_RESULT_ENTRIES {
             let uri = Url::parse(&format!("file:///diagnostic-fill-{index}.pas"))
                 .expect("diagnostic fill URI");
             store
-                .insert(uri, None, test_diagnostic(index), 1, 1, &[])
+                .insert(uri, None, test_diagnostic(index), empty_dependency.as_ref())
                 .expect("diagnostic fill result");
         }
         assert!(
@@ -9166,7 +9492,12 @@ mod tests {
             "the original result must be gone from the bounded cache"
         );
         let replacement = store
-            .insert(first_uri, None, test_diagnostic(0), 1, 1, &[])
+            .insert(
+                first_uri,
+                None,
+                test_diagnostic(0),
+                empty_dependency.as_ref(),
+            )
             .expect("replacement diagnostic result");
         assert_ne!(replacement.result_id, first.result_id);
         assert!(store.get(&replacement.result_id).is_some());
@@ -9176,9 +9507,15 @@ mod tests {
     fn diagnostic_result_store_replacement_does_not_grow_eviction_order() {
         let uri = Url::parse("file:///diagnostic-replacement.pas").expect("diagnostic URI");
         let mut store = DiagnosticPullStore::new();
+        let empty_dependency = super::prepare_diagnostic_dependency(&[]);
         for index in 0..64 {
             store
-                .insert(uri.clone(), None, test_diagnostic(index), 1, 1, &[])
+                .insert(
+                    uri.clone(),
+                    None,
+                    test_diagnostic(index),
+                    empty_dependency.as_ref(),
+                )
                 .expect("diagnostic replacement entry");
         }
         assert_eq!(store.entries.len(), 1);
@@ -9186,7 +9523,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_result_store_rejects_one_entry_over_the_byte_bound() {
+    fn diagnostic_result_store_degrades_one_entry_over_the_byte_bound() {
         let uri = Url::parse("file:///diagnostic-oversized.pas").expect("diagnostic URI");
         let mut store = DiagnosticPullStore::new();
         let diagnostics = vec![Diagnostic::new(
@@ -9198,10 +9535,10 @@ mod tests {
             None,
             None,
         )];
-        assert!(
-            store.insert(uri, None, diagnostics, 1, 1, &[]).is_err(),
-            "an oversized diagnostic result must not be issued an immediately invalid ID"
-        );
+        let entry = store
+            .insert(uri, None, diagnostics, None)
+            .expect("oversized diagnostic result remains a valid full report");
+        assert!(!entry.result_id.is_empty());
         assert!(store.entries.is_empty());
     }
 

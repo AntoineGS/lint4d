@@ -4337,6 +4337,28 @@ impl Workspace {
         Ok(records)
     }
 
+    pub(crate) fn diagnostic_analysis_records(
+        &self,
+        context_key: &ContextKey,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<rename::SourceRecord>, String> {
+        let mut records = self
+            .analysis_records
+            .as_ref()
+            .map(|records| records.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Some(state) = self.contexts.get(context_key) {
+            records.extend(rename::consumed_context_records(state, cancel)?);
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn clear_diagnostic_analysis_records(&mut self) {
+        if let Some(records) = self.analysis_records.as_mut() {
+            records.clear();
+        }
+    }
+
     fn record_configuration_reads<T>(
         &mut self,
         resolved: &crate::configuration::ResolvedConfig<T>,
@@ -6997,7 +7019,7 @@ impl Workspace {
                 .configuration_change_generations
                 .get(&dependency_uri)
                 .is_some_and(|generation| *generation > configuration_generation);
-            if dependency_changed
+            if (!record.open && dependency_changed)
                 || missing_provider_candidate_changed
                 || missing_provider_scope_changed
                 || candidate_observation_changed
@@ -7033,18 +7055,24 @@ impl Workspace {
                         }
                     },
                 ) || rename::parsed_source_changed(record, text);
-                if document.version != record.version.unwrap_or_default() || text_changed {
+                // A protocol version is a validation observation, not part
+                // of the effective report identity.  An identical overlay
+                // edit therefore remains eligible for an unchanged pull
+                // report; a real text change is still rejected below.
+                if text_changed {
                     return Err(format!(
                         "source changed while resolving {}; retry the request",
                         record.uri
                     ));
                 }
-            } else if record.path.is_none()
-                && record
-                    .stamp
-                    .as_ref()
-                    .zip(self.disk_stamps.get(&dependency_uri))
-                    .is_some_and(|(expected, current)| expected != current)
+            } else if dependency_changed
+                || configuration_changed
+                || (record.path.is_none()
+                    && record
+                        .stamp
+                        .as_ref()
+                        .zip(self.disk_stamps.get(&dependency_uri))
+                        .is_some_and(|(expected, current)| expected != current))
             {
                 return Err(format!(
                     "closed source changed while resolving {}; retry the request",
@@ -7872,6 +7900,59 @@ impl Workspace {
             );
             self.store_expansion(&root_uri, &context_key, source, expansion);
             self.record_expansion_analysis_sources(&root_uri, &context, cancel)?;
+        }
+        Ok(())
+    }
+
+    /// Establish the complete bounded set of root expansions before a
+    /// workspace diagnostic scan evaluates context-sensitive diagnostics in a
+    /// physical include.  The normal document path only needs open roots;
+    /// workspace pull must also account for authorized unopened roots.
+    pub(crate) fn prepare_diagnostic_root_ownership(
+        &mut self,
+        roots: &[Url],
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let input = self.analysis_input();
+        for root_uri in roots {
+            check_workspace_cancel(Some(cancel))?;
+            let root_uri = canonical_file_uri(root_uri);
+            let (source, _) =
+                match rename::source_for_input_with_cancel(&input, &root_uri, Some(cancel)) {
+                    Ok(source) => source,
+                    Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                    Err(_) => {
+                        // The diagnostic pass will publish the appropriate
+                        // bounded authorization/context diagnostic for this URI.
+                        // It cannot be a competing semantic owner if its source
+                        // is unreadable.
+                        continue;
+                    }
+                };
+            let context_key = self.context_for_uri_with_cancel(&root_uri, Some(cancel))?;
+            let Some(context) = self
+                .contexts
+                .get(&context_key)
+                .map(|state| state.context.clone())
+            else {
+                continue;
+            };
+            if has_invalid_project_selection(&context) || context.override_error.is_some() {
+                continue;
+            }
+            let mut expansion =
+                self.expand_source_with_cancel(&root_uri, &source, &context_key, Some(cancel))?;
+            let conditional_context = context.effective_conditional_context();
+            let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
+                expansion.expanded.text(),
+                &conditional_context,
+                cancel,
+            );
+            crate::include_expansion::reconcile_conditional_completeness(
+                &mut expansion,
+                &conditional,
+            );
+            self.store_expansion(&root_uri, &context_key, source, expansion);
         }
         Ok(())
     }

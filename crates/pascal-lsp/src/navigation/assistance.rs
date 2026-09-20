@@ -313,6 +313,9 @@ pub(crate) struct MissingUnitCandidate {
     pub(crate) symbol_name: String,
     pub(crate) use_kind: MissingUnitUseKind,
     pub(crate) provider_source_hash: u64,
+    pub(crate) provider_declaration_fingerprint: u64,
+    pub(crate) provider_context_fingerprint: u64,
+    pub(crate) use_context_fingerprint: u64,
 }
 
 struct SpecializedRoutineSignature {
@@ -833,6 +836,9 @@ impl NavigationIndex {
             }
             let (index, symbol_name, unit_name) =
                 symbols.pop().expect("symbol count checked above");
+            let Some(symbol) = provider.symbols.get(index) else {
+                continue;
+            };
             let mut state = super::ResolutionState::new();
             match self.candidate_access_decision_with_budget(
                 uri,
@@ -864,6 +870,10 @@ impl NavigationIndex {
                 symbol_name,
                 use_kind,
                 provider_source_hash: super::source_content_hash(&provider.source),
+                provider_declaration_fingerprint:
+                    super::missing_unit_provider_declaration_fingerprint(symbol, &provider.source),
+                provider_context_fingerprint: provider.conditional_context.fingerprint(),
+                use_context_fingerprint: document.conditional_context.fingerprint(),
             });
             if candidates.len() >= MAX_MISSING_UNIT_CANDIDATES {
                 break;

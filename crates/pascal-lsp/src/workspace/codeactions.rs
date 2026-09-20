@@ -34,7 +34,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
-const ACTION_DATA_VERSION: u8 = 3;
+const ACTION_DATA_VERSION: u8 = 4;
 const MAX_ACTION_ID_BYTES: usize = 64;
 const MAX_ACTION_NAME_BYTES: usize = 256;
 const MAX_ACTION_UNIT_BYTES: usize = 256;
@@ -78,6 +78,12 @@ pub(crate) struct MissingUnitActionData {
     pub(crate) use_kind: MissingUnitUseKind,
     #[serde(with = "decimal_u64")]
     pub(crate) provider_source_hash: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) provider_declaration_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) provider_context_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) use_context_fingerprint: u64,
     #[serde(with = "decimal_u64")]
     pub(crate) source_generation: u64,
     #[serde(with = "decimal_u64")]
@@ -530,6 +536,9 @@ fn missing_unit_plans_from_input(
             &candidate.symbol_name,
             candidate.use_kind,
             candidate.provider_source_hash,
+            candidate.provider_declaration_fingerprint,
+            candidate.provider_context_fingerprint,
+            candidate.use_context_fingerprint,
             cancel,
             &mut budget,
         )?;
@@ -567,6 +576,9 @@ fn missing_unit_binding_proof(
     symbol_name: &str,
     use_kind: MissingUnitUseKind,
     provider_source_hash: u64,
+    provider_declaration_fingerprint: u64,
+    provider_context_fingerprint: u64,
+    use_context_fingerprint: u64,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
@@ -615,6 +627,9 @@ fn missing_unit_binding_proof(
         provider_uri,
         symbol_name,
         use_kind,
+        provider_declaration_fingerprint,
+        provider_context_fingerprint,
+        use_context_fingerprint,
         cancel,
         budget,
     )
@@ -1007,6 +1022,10 @@ fn resolve_missing_unit_from_input(
             && plan.candidate.symbol_name == data.provider_symbol
             && plan.candidate.use_kind == data.use_kind
             && plan.candidate.provider_source_hash == data.provider_source_hash
+            && plan.candidate.provider_declaration_fingerprint
+                == data.provider_declaration_fingerprint
+            && plan.candidate.provider_context_fingerprint == data.provider_context_fingerprint
+            && plan.candidate.use_context_fingerprint == data.use_context_fingerprint
             && plan.config_fingerprint == data.config_fingerprint
             && plan.source_hash == data.source_hash
     }) else {
@@ -1526,6 +1545,9 @@ impl MissingUnitActionData {
             provider_symbol: plan.candidate.symbol_name.clone(),
             use_kind: plan.candidate.use_kind,
             provider_source_hash: plan.candidate.provider_source_hash,
+            provider_declaration_fingerprint: plan.candidate.provider_declaration_fingerprint,
+            provider_context_fingerprint: plan.candidate.provider_context_fingerprint,
+            use_context_fingerprint: plan.candidate.use_context_fingerprint,
             source_generation,
             configuration_generation,
             config_fingerprint: plan.config_fingerprint,
@@ -1568,6 +1590,9 @@ fn missing_unit_action_id(data: &MissingUnitActionData) -> String {
     data.provider_symbol.hash(&mut hasher);
     data.use_kind.hash(&mut hasher);
     data.provider_source_hash.hash(&mut hasher);
+    data.provider_declaration_fingerprint.hash(&mut hasher);
+    data.provider_context_fingerprint.hash(&mut hasher);
+    data.use_context_fingerprint.hash(&mut hasher);
     data.source_generation.hash(&mut hasher);
     data.configuration_generation.hash(&mut hasher);
     data.config_fingerprint.hash(&mut hasher);

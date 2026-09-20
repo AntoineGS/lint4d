@@ -30284,6 +30284,140 @@ fn code_actions_require_a_provider_export_kind_compatible_with_the_use_site() {
 }
 
 #[test]
+fn code_actions_preserve_argument_value_roles_and_reject_procedural_values() {
+    let run_case = |provider_declaration: &str,
+                    consumer_source: &str,
+                    identifier: &str,
+                    expected_action: bool,
+                    id: &str| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let consumer = root.join("Consumer.pas");
+        let provider = root.join("Provider.pas");
+        write_file(&consumer, consumer_source);
+        write_file(
+            &provider,
+            &format!("unit Provider;\ninterface\n{provider_declaration}\nimplementation\nend.\n"),
+        );
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&consumer),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": consumer_source,
+                }
+            }),
+        );
+        let actions =
+            request_missing_unit_actions(&mut server, &consumer, consumer_source, identifier, id);
+        assert_eq!(
+            actions.len() == 1,
+            expected_action,
+            "argument-role action result: {actions:?}"
+        );
+        if expected_action {
+            let updated = apply_workspace_edit_to_source(
+                consumer_source,
+                &actions[0]["edit"],
+                &uri(&consumer),
+            );
+            server.send_notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": {"uri": uri(&consumer), "version": 2},
+                    "contentChanges": [{"text": updated}]
+                }),
+            );
+            let definition_id = RequestId::from(format!("{id}-definition"));
+            server.send_request(
+                definition_id.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, &updated, identifier, 0),
+            );
+            let locations = result_locations(server.response(&definition_id));
+            assert_eq!(
+                locations.len(),
+                1,
+                "argument-role definition: {locations:?}"
+            );
+            assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+        }
+        server.shutdown();
+    };
+
+    let argument_use = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Sink(Value: Integer);\n",
+        "begin\n",
+        "end;\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  Sink(MissingValue);\n",
+        "end;\n",
+        "end.\n",
+    );
+    run_case(
+        "const MissingValue = 1;",
+        argument_use,
+        "MissingValue",
+        true,
+        "argument-constant-value",
+    );
+    run_case(
+        "var MissingValue: Integer;",
+        argument_use,
+        "MissingValue",
+        true,
+        "argument-variable-value",
+    );
+    run_case(
+        "procedure MissingValue;",
+        argument_use,
+        "MissingValue",
+        false,
+        "argument-procedure-value",
+    );
+    run_case(
+        "function MissingValue: Integer;",
+        argument_use,
+        "MissingValue",
+        false,
+        "argument-function-value",
+    );
+    run_case(
+        "{$IF MaybeUndefined}\nconst MissingValue = 1;\n{$ENDIF}",
+        argument_use,
+        "MissingValue",
+        false,
+        "argument-unknown-conditional",
+    );
+
+    let bare_call = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "begin\n",
+        "  MissingProc;\n",
+        "end;\n",
+        "end.\n",
+    );
+    run_case(
+        "procedure MissingProc;",
+        bare_call,
+        "MissingProc",
+        true,
+        "bare-procedure-call",
+    );
+}
+
+#[test]
 fn code_action_creation_rejects_overlong_identity_and_caps_serialized_output() {
     let long_name = "M".repeat(257);
     let temp = tempfile::tempdir().expect("temporary workspace");
@@ -30507,6 +30641,85 @@ fn deferred_missing_unit_resolve_uses_effective_dependencies_not_transport_gener
 
     run_case(false, "same-text-version");
     run_case(true, "unrelated-overlay");
+}
+
+#[test]
+fn deferred_missing_unit_resolve_rejects_a_changed_effective_conditional_declaration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let consumer = root.join("Consumer.pas");
+    let provider = root.join("Provider.pas");
+    let consumer_source = concat!(
+        "unit Consumer;\n",
+        "interface\n",
+        "type TAlias = MissingType;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "{$IF CompilerVersion >= 24.0}\n",
+        "type MissingType = Integer;\n",
+        "{$ELSE}\n",
+        "type MissingType = Boolean;\n",
+        "{$ENDIF}\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&consumer, consumer_source);
+    write_file(&provider, provider_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_resolve_properties(&root, Value::Null, json!(["edit"]));
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"compilerVersion": "23.0"}}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&consumer),
+                "languageId": "pascal",
+                "version": 1,
+                "text": consumer_source,
+            }
+        }),
+    );
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &consumer,
+        consumer_source,
+        "MissingType",
+        "conditional-declaration-action",
+    );
+    assert_eq!(actions.len(), 1, "conditional action creation: {actions:?}");
+    assert_eq!(actions[0]["data"]["version"], 4);
+    for field in [
+        "providerDeclarationFingerprint",
+        "providerContextFingerprint",
+        "useContextFingerprint",
+    ] {
+        assert!(
+            actions[0]["data"][field].is_string(),
+            "missing immutable provider identity field {field}: {}",
+            actions[0]
+        );
+    }
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"compilerVersion": "24.0"}}}),
+    );
+    let resolve_id = RequestId::from("conditional-declaration-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "changed effective conditional declaration must stale resolve: {response:?}"
+    );
+    server.shutdown();
 }
 
 #[test]

@@ -3236,7 +3236,7 @@ impl NavigationIndex {
                 && node
                     .named_children(&mut node.walk())
                     .next()
-                    .is_some_and(|expression| Span::from_node(expression).contains(span))
+                    .is_some_and(|expression| Span::from_node(expression) == span)
             {
                 return Ok(MissingUnitUseKind::Callable);
             }
@@ -3271,6 +3271,9 @@ impl NavigationIndex {
         provider_uri: &Url,
         symbol_name: &str,
         use_kind: MissingUnitUseKind,
+        provider_declaration_fingerprint: u64,
+        provider_context_fingerprint: u64,
+        use_context_fingerprint: u64,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
@@ -3278,6 +3281,9 @@ impl NavigationIndex {
         let Some(document) = self.documents.get(uri) else {
             return Err(format!("document is not indexed: {uri}"));
         };
+        if document.conditional_context.fingerprint() != use_context_fingerprint {
+            return Ok(false);
+        }
         let Some(offset) = text::position_to_offset(&document.source, position) else {
             return Ok(false);
         };
@@ -3298,7 +3304,10 @@ impl NavigationIndex {
         if import_urls.len() != 1 || import_urls[0] != *provider_uri {
             return Ok(false);
         }
-        if !self.documents.contains_key(provider_uri) {
+        let Some(provider) = self.documents.get(provider_uri) else {
+            return Ok(false);
+        };
+        if provider.conditional_context.fingerprint() != provider_context_fingerprint {
             return Ok(false);
         }
         let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
@@ -3313,18 +3322,26 @@ impl NavigationIndex {
         let candidates = self.resolve_candidates_at_with_state_and_budget(
             uri, document, offset, identifier, &mut state, 0, cancel, budget,
         )?;
+        let candidates_match_provider = candidates.iter().all(|candidate| {
+            candidate.uri == *provider_uri
+                && self.symbol(candidate).is_some_and(|symbol| {
+                    canonical_name(&symbol.name) == canonical_name(symbol_name)
+                        && use_kind.accepts(symbol.kind)
+                })
+        });
+        let expected_declaration_is_present = candidates.iter().any(|candidate| {
+            self.symbol(candidate).is_some_and(|symbol| {
+                missing_unit_provider_declaration_fingerprint(symbol, &provider.source)
+                    == provider_declaration_fingerprint
+            })
+        });
         if state.ambiguous
             || state.member_lookup_incomplete
             || state.receiver_resolution_uncertain()
             || state.inaccessible_candidate
             || candidates.is_empty()
-            || candidates.iter().any(|candidate| {
-                candidate.uri != *provider_uri
-                    || self.symbol(candidate).is_none_or(|symbol| {
-                        canonical_name(&symbol.name) != canonical_name(symbol_name)
-                            || !use_kind.accepts(symbol.kind)
-                    })
-            })
+            || !candidates_match_provider
+            || !expected_declaration_is_present
         {
             return Ok(false);
         }
@@ -14970,6 +14987,31 @@ fn canonical_name(name: &str) -> String {
 pub(super) fn source_content_hash(source: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn missing_unit_provider_declaration_fingerprint(symbol: &Symbol, source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    symbol.kind.hash(&mut hasher);
+    symbol.origin.hash(&mut hasher);
+    symbol.span.start.hash(&mut hasher);
+    symbol.span.end.hash(&mut hasher);
+    symbol.declaration_span.start.hash(&mut hasher);
+    symbol.declaration_span.end.hash(&mut hasher);
+    symbol.selection_span.start.hash(&mut hasher);
+    symbol.selection_span.end.hash(&mut hasher);
+    symbol.name.hash(&mut hasher);
+    symbol.type_kind.hash(&mut hasher);
+    symbol.type_name.hash(&mut hasher);
+    symbol.type_ref.hash(&mut hasher);
+    symbol.result_type_name.hash(&mut hasher);
+    symbol.result_type_ref.hash(&mut hasher);
+    symbol.routine_kind.hash(&mut hasher);
+    symbol.routine_signature.hash(&mut hasher);
+    source
+        .get(symbol.declaration_span.start..symbol.declaration_span.end)
+        .unwrap_or_default()
+        .hash(&mut hasher);
     hasher.finish()
 }
 

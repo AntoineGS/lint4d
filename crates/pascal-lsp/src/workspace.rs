@@ -7233,22 +7233,113 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Result<Vec<queries::DiagnosticPublication>, String> {
         check_workspace_cancel(Some(cancel))?;
-        let Some(document) = self.open_documents.get(uri) else {
-            return Ok(Vec::new());
+        let (version, source) = match self.open_documents.get(uri) {
+            Some(document) => {
+                let version = document.version;
+                if let Some(rejection) = &document.rejection {
+                    return Ok(single_diagnostic_publication(
+                        uri,
+                        Some(version),
+                        vec![server_diagnostic(rejection, DiagnosticSeverity::ERROR)],
+                    ));
+                }
+                (
+                    Some(version),
+                    document
+                        .text
+                        .as_deref()
+                        .expect("accepted open documents retain their text")
+                        .to_owned(),
+                )
+            }
+            None => {
+                let path = uri
+                    .to_file_path()
+                    .map(absolute_path)
+                    .map_err(|_| format!("not a file URI: {uri}"))?;
+                let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
+                let context = self
+                    .contexts
+                    .get(&context_key)
+                    .map(|state| state.context.clone())
+                    .ok_or_else(|| format!("project context was not retained for {uri}"))?;
+                if has_invalid_project_selection(&context) {
+                    return Ok(single_diagnostic_publication(
+                        uri,
+                        None,
+                        vec![server_diagnostic(
+                            "project selection is invalid; select a current project or Automatic",
+                            DiagnosticSeverity::ERROR,
+                        )],
+                    ));
+                }
+                if let Some(error) = context.override_error.as_deref() {
+                    return Ok(single_diagnostic_publication(
+                        uri,
+                        None,
+                        vec![server_diagnostic(
+                            &format!(
+                                "project override configuration is invalid for {uri}: {error}"
+                            ),
+                            DiagnosticSeverity::ERROR,
+                        )],
+                    ));
+                }
+                let legacy_route = self.legacy_route_is_current(uri, &path, &context_key);
+                let has_authorized_read_root = legacy_route
+                    || self.accepts_path(&path)
+                    || context.read_policy.entry_for_path(&path).is_some();
+                if !has_authorized_read_root {
+                    return Ok(single_diagnostic_publication(
+                        uri,
+                        None,
+                        vec![server_diagnostic(
+                            "document is outside configured source paths",
+                            DiagnosticSeverity::ERROR,
+                        )],
+                    ));
+                }
+                if !self.ensure_supported_project_context_with_legacy_route(
+                    &path,
+                    &context,
+                    Some(&context_key),
+                    legacy_route,
+                ) {
+                    return Ok(single_diagnostic_publication(
+                        uri,
+                        None,
+                        vec![server_diagnostic(
+                            "document is outside configured source paths",
+                            DiagnosticSeverity::ERROR,
+                        )],
+                    ));
+                }
+                let entry = context_path_entry(&context, &path)
+                    .or_else(|| {
+                        legacy_route.then_some(ProjectPathEntry {
+                            path: path.clone(),
+                            provenance: ProjectPathProvenance::LegacyNative,
+                        })
+                    })
+                    .ok_or_else(|| format!("document is outside configured source paths: {uri}"))?;
+                let allow_legacy_payload =
+                    matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                        && (legacy_route
+                            || project_path_entry_for(&context, &path).is_some_and(|entry| {
+                                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                            }));
+                let source = read_disk_source_with_cancel(
+                    &path,
+                    self.options.limits.max_file_bytes,
+                    &context.read_policy,
+                    &entry,
+                    allow_legacy_payload,
+                    Some(cancel),
+                )?
+                .text;
+                (None, source)
+            }
         };
-        let version = document.version;
-        if let Some(rejection) = &document.rejection {
-            return Ok(single_diagnostic_publication(
-                uri,
-                version,
-                vec![server_diagnostic(rejection, DiagnosticSeverity::ERROR)],
-            ));
-        }
-        let source = document
-            .text
-            .as_deref()
-            .expect("accepted open documents retain their text")
-            .to_owned();
         let lint_source = normalize_line_endings(&source);
         check_workspace_cancel(Some(cancel))?;
         let path = match uri.to_file_path() {
@@ -8040,12 +8131,12 @@ pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> 
 
 fn single_diagnostic_publication(
     uri: &Url,
-    version: i32,
+    version: Option<i32>,
     diagnostics: Vec<LspDiagnostic>,
 ) -> Vec<queries::DiagnosticPublication> {
     vec![queries::DiagnosticPublication {
         uri: uri.clone(),
-        version: Some(version),
+        version,
         diagnostics,
     }]
 }

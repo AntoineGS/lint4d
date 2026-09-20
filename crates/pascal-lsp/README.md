@@ -300,6 +300,61 @@ An incomplete recursive filename catalogue records potential provider scopes
 for conservative live revalidation and logs its bounded-entry warning instead
 of silently claiming complete absence.
 
+### Pull diagnostics
+
+Diagnostics use the standard pull requests when the client advertises
+`textDocument.diagnostic`. In that mode the initialize response includes a
+`diagnosticProvider` with identifier `pascal-lsp`,
+`interFileDependencies: true`, and work-done support. The normal capability
+shape also advertises `workspaceDiagnostics: true`; the current plural
+`workspace/diagnostics` capability spelling used by some Neovim development
+clients is handled compatibly by keeping workspace-provider advertisement off
+while retaining document pull and refresh behavior. Clients that do not
+advertise document pull keep the existing debounced
+`textDocument/publishDiagnostics` push path instead; a negotiated client never
+receives both ownership models.
+
+`textDocument/diagnostic` returns a `full` report with an opaque `resultId`, or
+an `unchanged` report when the supplied `previousResultId` identifies the same
+validated diagnostics, source snapshot, dependency observations, effective
+configuration, and project context. Result IDs are process-local capabilities,
+not hashes that clients should construct. Unknown, foreign, or evicted IDs
+always receive a fresh full report. Empty diagnostics are still full reports so
+they clear an editor's old state. Pull workers validate disk freshness in the
+worker rather than trusting a watcher notification, and stale results return
+`-32802` with `{ "retriggerRequest": true }`; explicit cancellation remains
+`-32800`.
+
+When `relatedDocumentSupport` is negotiated, a document report may include
+full reports for owned physical include/dependent documents. Include ranges are
+mapped to their physical URI and UTF-16 positions. Reports are omitted when
+ownership is conflicting or the source is not authorized, so an include cannot
+leak another project context. Workspace pulls use `workspace/diagnostic` and
+`previousResultIds` to return deterministic URI-sorted reports for open buffers
+and authorized unopened Pascal sources. Deleted or newly excluded files that
+were present in the previous set receive an empty full report to clear them;
+the server does not read an unauthorized URI merely because the client supplied
+its previous result ID. An incomplete bounded workspace discovery fails the
+request instead of silently returning a complete-looking partial scan.
+
+Changes that affect a diagnostic dependency, overlay, project/configuration
+context, workspace membership, or source freshness invalidate the corresponding
+pull result. If the client advertises `workspace/diagnostic/refresh`, the server
+coalesces affected changes and keeps one bounded refresh request in flight;
+late, duplicate, rejected, and shutdown-time replies are harmless, and a
+refresh response never starts a refresh loop. Unrelated changes reuse valid
+reports. Workspace diagnostic requests may use a `partialResultToken`; bounded
+`$/progress` chunks are delivered separately from the final report and
+work-done progress. Cancellation or a stale race after partial delivery never
+produces a successful complete report.
+
+Pull state is bounded independently of the source catalogue: at most 2,048
+diagnostic result entries and 32 MiB of retained result/cache state are kept.
+Workspace reports are limited to 10,000 document items, 64 KiB per encoded
+item, and 7 MiB encoded output. Partial workspace chunks are limited to 128
+items and 64 KiB, with at most one chunk pumped per event-loop turn. The
+existing 8 MiB LSP message bound remains the final response/output guard.
+
 Workspace symbols, references, prepare/rename, code actions, and code-action
 resolution remain conservative: any source/configuration generation change
 rejects them because their completeness or mutation target may depend on

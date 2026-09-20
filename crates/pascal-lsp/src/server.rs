@@ -24,13 +24,13 @@ use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, ConfigurationItem, ConfigurationParams,
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentFormattingParams, DocumentHighlightParams, FileChangeType, FileSystemWatcher,
-    FoldingRangeParams, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
-    InitializeParams, Location, MarkupKind, OneOf, Position, PrepareRenameResponse, ProgressToken,
-    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
-    SelectionRangeParams, ServerInfo, SignatureHelpParams, SymbolInformation,
-    TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams, WorkspaceEdit,
-    WorkspaceFolder,
+    DocumentDiagnosticParams, DocumentFormattingParams, DocumentHighlightParams, FileChangeType,
+    FileSystemWatcher, FoldingRangeParams, GlobPattern, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, InitializeParams, Location, MarkupKind, OneOf, Position,
+    PrepareRenameResponse, ProgressToken, PublishDiagnosticsParams, ReferenceParams, Registration,
+    RegistrationParams, RelativePattern, SelectionRangeParams, ServerInfo, SignatureHelpParams,
+    SymbolInformation, TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams,
+    WorkspaceDiagnosticParams, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,11 @@ const MAX_COMPLETION_RESOLUTION_RECORDS: usize = 1_024;
 const MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COMPLETION_RESOLUTION_ITEM_BYTES: usize = 64 * 1024;
 const COMPLETION_RESOLUTION_DATA_VERSION: u8 = 1;
+const MAX_DIAGNOSTIC_RESULT_ENTRIES: usize = 2_048;
+const MAX_DIAGNOSTIC_RESULT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DIAGNOSTIC_REPORT_ITEMS: usize = 10_000;
+const MAX_DIAGNOSTIC_REPORT_BYTES: usize = 7 * 1024 * 1024;
+const MAX_DIAGNOSTIC_REPORT_ITEM_BYTES: usize = 64 * 1024;
 /// Progress is deliberately smaller than the analysis recipient bound.  A
 /// client can attach many request recipients to one computation, but progress
 /// state must not become an alternate unbounded queue.
@@ -96,6 +101,7 @@ const MAX_PROGRESS_ENTRIES: usize = 128;
 const MAX_PROGRESS_CREATES: usize = 32;
 const PROGRESS_CREATE_REQUEST_PREFIX: &str = "pascal-lsp-progress-create-";
 const PROGRESS_TOKEN_PREFIX: &str = "pascal-lsp-progress-";
+const DIAGNOSTIC_REFRESH_REQUEST_PREFIX: &str = "pascal-lsp-diagnostic-refresh-";
 /// Partial results are delivered one bounded notification at a time.  Keeping
 /// this separate from work-done progress prevents a large result from becoming
 /// an unbounded protocol-loop operation or from being confused with lifecycle
@@ -513,7 +519,9 @@ impl AnalysisPriority {
             | AnalysisRequest::ResolveCompletion(_)
             | AnalysisRequest::DocumentHighlights { .. }
             | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
-            AnalysisRequest::Diagnostics { .. } => Self::Diagnostics,
+            AnalysisRequest::Diagnostics { .. }
+            | AnalysisRequest::DocumentDiagnostics { .. }
+            | AnalysisRequest::WorkspaceDiagnostics { .. } => Self::Diagnostics,
             AnalysisRequest::Formatting { .. }
             | AnalysisRequest::DocumentSymbols { .. }
             | AnalysisRequest::WorkspaceSymbols { .. }
@@ -1479,6 +1487,14 @@ enum AnalysisRequest {
     Diagnostics {
         uri: Url,
     },
+    DocumentDiagnostics {
+        uri: Url,
+        previous_result_id: Option<String>,
+        related_document_support: bool,
+    },
+    WorkspaceDiagnostics {
+        previous_result_ids: Vec<(Url, String)>,
+    },
     TypeDefinitions {
         uri: Url,
         position: Position,
@@ -1527,6 +1543,8 @@ enum AnalysisRequest {
 fn progress_title(request: &AnalysisRequest) -> &'static str {
     match request {
         AnalysisRequest::Diagnostics { .. } => "Indexing workspace",
+        AnalysisRequest::DocumentDiagnostics { .. } => "Indexing document diagnostics",
+        AnalysisRequest::WorkspaceDiagnostics { .. } => "Indexing workspace diagnostics",
         AnalysisRequest::WorkspaceSymbols { .. } => "Searching workspace symbols",
         AnalysisRequest::References { .. } => "Searching workspace references",
         AnalysisRequest::Rename { .. } => "Preparing rename",
@@ -1556,6 +1574,8 @@ enum AnalysisResultValue {
     Navigation(NavigationAnalysis),
     Formatting(Result<Option<lsp_types::TextEdit>, String>),
     Diagnostics(DiagnosticsAnalysis),
+    DocumentDiagnostics(Result<DocumentDiagnosticsAnalysis, String>),
+    WorkspaceDiagnostics(Result<WorkspaceDiagnosticsAnalysis, String>),
     TypeDefinitions(Result<Vec<lsp_types::Location>, String>),
     Prepare(Result<PrepareRenameResponse, String>),
     Rename(Box<Result<WorkspaceEdit, String>>),
@@ -1588,6 +1608,165 @@ struct DiagnosticsAnalysis {
     discard: bool,
 }
 
+#[derive(Clone)]
+struct DocumentDiagnosticsAnalysis {
+    uri: Url,
+    previous_result_id: Option<String>,
+    related_document_support: bool,
+    publications: Vec<queries::DiagnosticPublication>,
+}
+
+#[derive(Clone)]
+struct WorkspaceDiagnosticsAnalysis {
+    previous_result_ids: Vec<(Url, String)>,
+    publications: Vec<queries::DiagnosticPublication>,
+}
+
+#[derive(Clone)]
+struct DiagnosticResultCacheEntry {
+    result_id: String,
+    uri: Url,
+    version: Option<i32>,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    records_identity: Vec<u8>,
+    diagnostics_identity: Vec<u8>,
+    source_generation: u64,
+    configuration_generation: u64,
+    records: Vec<SourceRecord>,
+    retained_bytes: usize,
+}
+
+#[derive(Default)]
+struct DiagnosticPullStore {
+    entries: HashMap<String, DiagnosticResultCacheEntry>,
+    uri_to_result: HashMap<Url, String>,
+    order: VecDeque<String>,
+    retained_bytes: usize,
+    next_id: u64,
+}
+
+impl DiagnosticPullStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn identity_for(
+        diagnostics: &[lsp_types::Diagnostic],
+        records: &[SourceRecord],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let diagnostics_identity = serde_json::to_vec(diagnostics)
+            .map_err(|error| format!("could not encode diagnostic result identity: {error}"))?;
+        let mut records = records.to_vec();
+        records.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.text.len().cmp(&right.text.len()))
+                .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
+        });
+        let records_identity = records
+            .iter()
+            .fold(String::new(), |mut identity, record| {
+                use std::fmt::Write as _;
+                writeln!(identity, "{record:?}").expect("writing a source identity cannot fail");
+                identity
+            })
+            .into_bytes();
+        Ok((diagnostics_identity, records_identity))
+    }
+
+    fn remove(&mut self, result_id: &str) -> Option<DiagnosticResultCacheEntry> {
+        let entry = self.entries.remove(result_id)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes);
+        if self
+            .uri_to_result
+            .get(&entry.uri)
+            .is_some_and(|current| current == result_id)
+        {
+            self.uri_to_result.remove(&entry.uri);
+        }
+        self.order.retain(|id| id != result_id);
+        Some(entry)
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > MAX_DIAGNOSTIC_RESULT_ENTRIES
+            || self.retained_bytes > MAX_DIAGNOSTIC_RESULT_BYTES
+        {
+            let Some(result_id) = self.order.pop_front() else {
+                break;
+            };
+            let _ = self.remove(&result_id);
+        }
+    }
+
+    fn insert(
+        &mut self,
+        uri: Url,
+        version: Option<i32>,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+        source_generation: u64,
+        configuration_generation: u64,
+        records: &[SourceRecord],
+    ) -> Result<DiagnosticResultCacheEntry, String> {
+        let (diagnostics_identity, records_identity) = Self::identity_for(&diagnostics, records)?;
+        let previous = self
+            .uri_to_result
+            .get(&uri)
+            .cloned()
+            .and_then(|result_id| self.entries.get(&result_id))
+            .cloned();
+        let result_id = previous
+            .as_ref()
+            .filter(|previous| {
+                previous.version == version
+                    && previous.diagnostics_identity == diagnostics_identity
+                    && previous.records_identity == records_identity
+            })
+            .map(|previous| previous.result_id.clone())
+            .unwrap_or_else(|| {
+                self.next_id = self.next_id.wrapping_add(1);
+                format!("{SERVER_NAME}-diagnostic-{}", self.next_id)
+            });
+        let retained_bytes = size_of::<DiagnosticResultCacheEntry>()
+            .saturating_add(uri.as_str().len())
+            .saturating_add(result_id.len())
+            .saturating_add(diagnostics_identity.len())
+            .saturating_add(records_identity.len())
+            .saturating_add(source_records_retained_bytes(records));
+        if retained_bytes > MAX_DIAGNOSTIC_RESULT_BYTES {
+            return Err(format!(
+                "diagnostic result exceeds the {MAX_DIAGNOSTIC_RESULT_BYTES}-byte cache entry limit"
+            ));
+        }
+        if let Some(previous) = previous {
+            let _ = self.remove(&previous.result_id);
+        }
+        let entry = DiagnosticResultCacheEntry {
+            result_id: result_id.clone(),
+            uri: uri.clone(),
+            version,
+            diagnostics,
+            records: records.to_vec(),
+            diagnostics_identity,
+            records_identity,
+            source_generation,
+            configuration_generation,
+            retained_bytes,
+        };
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.uri_to_result.insert(uri, result_id.clone());
+        self.order.push_back(result_id.clone());
+        self.entries.insert(result_id, entry.clone());
+        self.evict_if_needed();
+        Ok(entry)
+    }
+
+    fn get(&self, result_id: &str) -> Option<&DiagnosticResultCacheEntry> {
+        self.entries.get(result_id)
+    }
+}
+
 #[derive(Debug, Default)]
 struct DiagnosticNotificationEffect {
     refresh: Vec<Url>,
@@ -1616,6 +1795,79 @@ impl DiagnosticNotificationEffect {
         for uri in workspace.diagnostic_dependents_for_change(changed_uri, include_parent) {
             self.refresh_uri(uri);
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiagnosticRefreshRequests {
+    supported: bool,
+    pending: bool,
+    in_flight: Option<RequestId>,
+    retired: VecDeque<RequestId>,
+    next_id: u64,
+}
+
+impl DiagnosticRefreshRequests {
+    fn new(supported: bool) -> Self {
+        Self {
+            supported,
+            ..Self::default()
+        }
+    }
+
+    fn send(
+        &mut self,
+        connection: &dyn ProtocolSender,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = RequestId::from(format!(
+            "{DIAGNOSTIC_REFRESH_REQUEST_PREFIX}{}",
+            self.next_id
+        ));
+        connection.send_control(Message::Request(Request::new(
+            id.clone(),
+            "workspace/diagnostic/refresh".to_string(),
+            Value::Null,
+        )))?;
+        self.in_flight = Some(id);
+        Ok(())
+    }
+
+    fn request(
+        &mut self,
+        connection: &dyn ProtocolSender,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !self.supported {
+            return Ok(());
+        }
+        if self.in_flight.is_some() {
+            self.pending = true;
+            return Ok(());
+        }
+        self.send(connection)
+    }
+
+    fn handle_response(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        response: &Response,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        if self.in_flight.as_ref() == Some(&response.id) {
+            self.in_flight = None;
+            self.retired.push_back(response.id.clone());
+            if self.retired.len() > 64 {
+                self.retired.pop_front();
+            }
+            if self.pending {
+                self.pending = false;
+                self.send(connection)?;
+            }
+            return Ok(true);
+        }
+        // Late and duplicate responses are harmless. Consume only IDs that
+        // this coordinator actually issued, leaving unrelated client replies
+        // for the normal routing paths.
+        Ok(self.retired.iter().any(|id| id == &response.id))
     }
 }
 
@@ -2210,6 +2462,7 @@ struct AnalysisProgressTokens {
 enum PartialResultPayload {
     WorkspaceSymbols(Arc<Vec<SymbolInformation>>),
     References(Arc<Vec<Location>>),
+    WorkspaceDiagnostics(Arc<Vec<Value>>),
 }
 
 impl PartialResultPayload {
@@ -2217,6 +2470,7 @@ impl PartialResultPayload {
         match self {
             Self::WorkspaceSymbols(items) => items.len(),
             Self::References(items) => items.len(),
+            Self::WorkspaceDiagnostics(items) => items.len(),
         }
     }
 
@@ -2224,6 +2478,7 @@ impl PartialResultPayload {
         let bytes = match self {
             Self::WorkspaceSymbols(items) => serde_json::to_vec(&items[index]),
             Self::References(items) => serde_json::to_vec(&items[index]),
+            Self::WorkspaceDiagnostics(items) => serde_json::to_vec(&items[index]),
         }
         .map_err(|error| format!("could not encode partial result item: {error}"))?
         .len();
@@ -2270,6 +2525,9 @@ impl PartialResultPayload {
         let value = match self {
             Self::WorkspaceSymbols(items) => serde_json::to_value(&items[start..end]),
             Self::References(items) => serde_json::to_value(&items[start..end]),
+            Self::WorkspaceDiagnostics(items) => {
+                serde_json::to_value(serde_json::json!({"items": &items[start..end]}))
+            }
         }
         .map_err(|error| format!("could not encode partial result chunk: {error}"))?;
         Ok(Some((end, value)))
@@ -2278,6 +2536,7 @@ impl PartialResultPayload {
     fn empty_result(&self) -> Value {
         match self {
             Self::WorkspaceSymbols(_) | Self::References(_) => Value::Array(Vec::new()),
+            Self::WorkspaceDiagnostics(_) => serde_json::json!({"items": []}),
         }
     }
 }
@@ -2391,6 +2650,7 @@ struct PartialDelivery {
     source_generation: u64,
     configuration_generation: u64,
     payload: PartialResultPayload,
+    retrigger_on_stale: bool,
     recipients: Vec<PartialDeliveryRecipient>,
     next_recipient: usize,
     retained_bytes: usize,
@@ -2413,6 +2673,7 @@ fn partial_payload_from_result(
         AnalysisResultValue::References(value) => {
             Some(value.map(|value| PartialResultPayload::References(Arc::new(value))))
         }
+        AnalysisResultValue::WorkspaceDiagnostics(_) => None,
         _ => None,
     }
 }
@@ -2420,7 +2681,9 @@ fn partial_payload_from_result(
 fn is_partial_result_value(value: &AnalysisResultValue) -> bool {
     matches!(
         value,
-        AnalysisResultValue::WorkspaceSymbols(_) | AnalysisResultValue::References(_)
+        AnalysisResultValue::WorkspaceSymbols(_)
+            | AnalysisResultValue::References(_)
+            | AnalysisResultValue::WorkspaceDiagnostics(_)
     )
 }
 
@@ -3109,6 +3372,8 @@ impl ObservationKey {
             ),
             AnalysisRequest::Formatting { .. }
             | AnalysisRequest::Diagnostics { .. }
+            | AnalysisRequest::DocumentDiagnostics { .. }
+            | AnalysisRequest::WorkspaceDiagnostics { .. }
             | AnalysisRequest::Rename { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
@@ -3305,6 +3570,7 @@ struct AnalysisJobs {
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
     diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
     completion_resolutions: CompletionResolutionStore,
+    diagnostic_results: DiagnosticPullStore,
     progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
@@ -3335,6 +3601,7 @@ impl AnalysisJobs {
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
             completion_resolutions: CompletionResolutionStore::new(),
+            diagnostic_results: DiagnosticPullStore::new(),
             progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
             next_computation_id: 0,
@@ -3401,6 +3668,18 @@ impl AnalysisJobs {
                     ),
                     discard: false,
                 })
+            }
+            AnalysisRequest::DocumentDiagnostics {
+                uri,
+                previous_result_id,
+                ..
+            } => AnalysisResultValue::DocumentDiagnostics(Err(format!(
+                "analysis worker failed without changing workspace state for {uri} (previous result: {previous_result_id:?})"
+            ))),
+            AnalysisRequest::WorkspaceDiagnostics { .. } => {
+                AnalysisResultValue::WorkspaceDiagnostics(Err(
+                    "analysis worker failed without changing workspace state".to_string(),
+                ))
             }
             AnalysisRequest::TypeDefinitions { .. } => AnalysisResultValue::TypeDefinitions(Err(
                 "analysis worker failed without changing workspace state".to_string(),
@@ -3655,6 +3934,109 @@ impl AnalysisJobs {
                                         }
                                     },
                                 }
+                            }
+                        }
+                        AnalysisRequest::DocumentDiagnostics {
+                            uri,
+                            previous_result_id,
+                            related_document_support,
+                        } => {
+                            let (source_generation, configuration_generation, records, value) =
+                                match wait_at_test_barrier(
+                                    TestBarrier::Diagnostics,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                ) {
+                                    Err(error) => (
+                                        source_generation,
+                                        configuration_generation,
+                                        Vec::new(),
+                                        Err(error),
+                                    ),
+                                    Ok(()) => {
+                                        let computed = queries::diagnostics_from_input(
+                                            input,
+                                            &uri,
+                                            &worker_cancellation,
+                                        );
+                                        let value = computed.value.map(|result| {
+                                            DocumentDiagnosticsAnalysis {
+                                                uri,
+                                                previous_result_id,
+                                                related_document_support,
+                                                publications: result.publications,
+                                            }
+                                        });
+                                        (
+                                            computed.source_generation,
+                                            computed.configuration_generation,
+                                            computed.records,
+                                            value,
+                                        )
+                                    }
+                                };
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation,
+                                configuration_generation,
+                                records,
+                                value: match value {
+                                    Ok(analysis) => {
+                                        AnalysisResultValue::DocumentDiagnostics(Ok(analysis))
+                                    }
+                                    Err(error) => {
+                                        AnalysisResultValue::DocumentDiagnostics(Err(error))
+                                    }
+                                },
+                            }
+                        }
+                        AnalysisRequest::WorkspaceDiagnostics {
+                            previous_result_ids,
+                        } => {
+                            let (source_generation, configuration_generation, records, value) =
+                                match wait_at_test_barrier(
+                                    TestBarrier::Diagnostics,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                ) {
+                                    Err(error) => (
+                                        source_generation,
+                                        configuration_generation,
+                                        Vec::new(),
+                                        Err(error),
+                                    ),
+                                    Ok(()) => {
+                                        let computed = queries::workspace_diagnostics_from_input(
+                                            input,
+                                            &worker_cancellation,
+                                        );
+                                        let value = computed.value.map(|result| {
+                                            WorkspaceDiagnosticsAnalysis {
+                                                previous_result_ids,
+                                                publications: result.publications,
+                                            }
+                                        });
+                                        (
+                                            computed.source_generation,
+                                            computed.configuration_generation,
+                                            computed.records,
+                                            value,
+                                        )
+                                    }
+                                };
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation,
+                                configuration_generation,
+                                records,
+                                value: match value {
+                                    Ok(analysis) => {
+                                        AnalysisResultValue::WorkspaceDiagnostics(Ok(analysis))
+                                    }
+                                    Err(error) => {
+                                        AnalysisResultValue::WorkspaceDiagnostics(Err(error))
+                                    }
+                                },
                             }
                         }
                         AnalysisRequest::TypeDefinitions { uri, position } => {
@@ -4167,7 +4549,9 @@ impl AnalysisJobs {
         if tokens.partial_result.is_some()
             && !matches!(
                 &request,
-                AnalysisRequest::WorkspaceSymbols { .. } | AnalysisRequest::References { .. }
+                AnalysisRequest::WorkspaceSymbols { .. }
+                    | AnalysisRequest::References { .. }
+                    | AnalysisRequest::WorkspaceDiagnostics { .. }
             )
         {
             return Err("partialResultToken is unsupported for this request".to_string());
@@ -4888,6 +5272,29 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    fn fail_diagnostic_recipients(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        job_id: AnalysisComputationId,
+        recipients: Vec<ClientRecipient>,
+        message: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for recipient in recipients {
+            self.remove_client_mapping(&recipient.id, &job_id);
+            send_diagnostic_server_cancelled(connection, recipient.id.clone(), message)?;
+            self.release_partial_token(&recipient);
+            self.progress
+                .finish_recipient(
+                    Some(connection),
+                    AnalysisJobId::Client(job_id),
+                    &recipient.id,
+                    Some("Failed"),
+                )
+                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        }
+        Ok(())
+    }
+
     fn fail_partial_delivery(
         &mut self,
         connection: &dyn ProtocolSender,
@@ -4914,6 +5321,31 @@ impl AnalysisJobs {
         self.fail_client_recipients(connection, job_id, recipients, code, message)
     }
 
+    fn fail_partial_delivery_with_retrigger(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        delivery: PartialDelivery,
+        message: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let PartialDelivery {
+            job_id,
+            recipients,
+            retained_bytes,
+            validation,
+            ..
+        } = delivery;
+        self.retire_partial_validation(validation, retained_bytes);
+        let recipients = recipients
+            .into_iter()
+            .map(|recipient| ClientRecipient {
+                id: recipient.id,
+                work_done_token: None,
+                partial_result_token: Some(recipient.token),
+            })
+            .collect();
+        self.fail_diagnostic_recipients(connection, job_id, recipients, message)
+    }
+
     fn send_bulk_result(
         connection: &dyn ProtocolSender,
         id: RequestId,
@@ -4922,6 +5354,9 @@ impl AnalysisJobs {
         match payload {
             PartialResultPayload::WorkspaceSymbols(items) => send_ok(connection, id, &**items),
             PartialResultPayload::References(items) => send_ok(connection, id, &**items),
+            PartialResultPayload::WorkspaceDiagnostics(items) => {
+                send_ok(connection, id, serde_json::json!({"items": &**items}))
+            }
         }
     }
 
@@ -4934,6 +5369,14 @@ impl AnalysisJobs {
         primary_id: AnalysisComputationId,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if analysis_result_is_stale(workspace, &result) {
+            if matches!(&result.value, AnalysisResultValue::WorkspaceDiagnostics(_)) {
+                return self.fail_diagnostic_recipients(
+                    connection,
+                    primary_id,
+                    recipients,
+                    "analysis result became stale; retry the request",
+                );
+            }
             return self.fail_client_recipients(
                 connection,
                 primary_id,
@@ -4950,32 +5393,84 @@ impl AnalysisJobs {
             value,
             ..
         } = result;
-        let Some(payload) = partial_payload_from_result(value) else {
-            return self.fail_client_recipients(
-                connection,
-                primary_id,
-                recipients,
-                ErrorCode::RequestFailed,
-                "partial result was attached to an unsupported analysis",
-            );
-        };
-        let payload = match payload {
-            Ok(payload) => payload,
-            Err(error) => {
-                for recipient in recipients {
-                    self.remove_client_mapping(&recipient.id, &primary_id);
-                    send_analysis_error(connection, recipient.id.clone(), error.clone())?;
-                    self.release_partial_token(&recipient);
-                    self.progress
-                        .finish_recipient(
-                            Some(connection),
-                            AnalysisJobId::Client(primary_id),
-                            &recipient.id,
-                            Some("Failed"),
-                        )
-                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        let payload = match value {
+            AnalysisResultValue::WorkspaceDiagnostics(value) => {
+                let analysis = match value {
+                    Ok(analysis) => analysis,
+                    Err(error) => {
+                        for recipient in recipients {
+                            self.remove_client_mapping(&recipient.id, &primary_id);
+                            send_diagnostic_analysis_error(
+                                connection,
+                                recipient.id.clone(),
+                                error.clone(),
+                            )?;
+                            self.release_partial_token(&recipient);
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    Some("Failed"),
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
+                        }
+                        return Ok(());
+                    }
+                };
+                match workspace_diagnostic_items(
+                    workspace,
+                    &mut self.diagnostic_results,
+                    source_generation,
+                    configuration_generation,
+                    &records,
+                    analysis,
+                ) {
+                    Ok(items) => PartialResultPayload::WorkspaceDiagnostics(Arc::new(items)),
+                    Err(error) => {
+                        return self.fail_client_recipients(
+                            connection,
+                            primary_id,
+                            recipients,
+                            ErrorCode::RequestFailed,
+                            &error,
+                        );
+                    }
                 }
-                return Ok(());
+            }
+            value => {
+                let Some(payload) = partial_payload_from_result(value) else {
+                    return self.fail_client_recipients(
+                        connection,
+                        primary_id,
+                        recipients,
+                        ErrorCode::RequestFailed,
+                        "partial result was attached to an unsupported analysis",
+                    );
+                };
+                match payload {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        for recipient in recipients {
+                            self.remove_client_mapping(&recipient.id, &primary_id);
+                            send_analysis_error(connection, recipient.id.clone(), error.clone())?;
+                            self.release_partial_token(&recipient);
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    Some("Failed"),
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
+                        }
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -5114,11 +5609,14 @@ impl AnalysisJobs {
                     );
                 }
             };
+            let retrigger_on_stale =
+                matches!(&payload, PartialResultPayload::WorkspaceDiagnostics(_));
             self.partial_deliveries.push_back(PartialDelivery {
                 job_id: primary_id,
                 source_generation,
                 configuration_generation,
                 payload,
+                retrigger_on_stale,
                 recipients: partial_recipients,
                 next_recipient: 0,
                 retained_bytes,
@@ -5141,12 +5639,20 @@ impl AnalysisJobs {
             if delivery.source_generation != workspace.source_generation()
                 || delivery.configuration_generation != workspace.configuration_generation()
             {
-                self.fail_partial_delivery(
-                    connection,
-                    delivery,
-                    ErrorCode::RequestFailed,
-                    "analysis result became stale during partial delivery; retry the request",
-                )?;
+                if delivery.retrigger_on_stale {
+                    self.fail_partial_delivery_with_retrigger(
+                        connection,
+                        delivery,
+                        "analysis result became stale during partial delivery; retry the request",
+                    )?;
+                } else {
+                    self.fail_partial_delivery(
+                        connection,
+                        delivery,
+                        ErrorCode::RequestFailed,
+                        "analysis result became stale during partial delivery; retry the request",
+                    )?;
+                }
                 continue;
             }
             if delivery.recipients.is_empty() {
@@ -5158,12 +5664,18 @@ impl AnalysisJobs {
                     return Ok(());
                 }
                 Some(Err(error)) => {
-                    self.fail_partial_delivery(
-                        connection,
-                        delivery,
-                        ErrorCode::RequestFailed,
-                        &format!("analysis result became stale during partial delivery: {error}"),
-                    )?;
+                    let message =
+                        format!("analysis result became stale during partial delivery: {error}");
+                    if delivery.retrigger_on_stale {
+                        self.fail_partial_delivery_with_retrigger(connection, delivery, &message)?;
+                    } else {
+                        self.fail_partial_delivery(
+                            connection,
+                            delivery,
+                            ErrorCode::RequestFailed,
+                            &message,
+                        )?;
+                    }
                     continue;
                 }
                 Some(Ok(())) => {}
@@ -5252,6 +5764,7 @@ impl AnalysisJobs {
                             connection,
                             workspace,
                             &mut self.completion_resolutions,
+                            &mut self.diagnostic_results,
                             result,
                             None,
                         )?;
@@ -5308,6 +5821,7 @@ impl AnalysisJobs {
                                     connection,
                                     workspace,
                                     &mut self.completion_resolutions,
+                                    &mut self.diagnostic_results,
                                     result.clone(),
                                     Some(recipient.id.clone()),
                                 )?;
@@ -5515,6 +6029,8 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::Navigation(_)
                 | AnalysisResultValue::Formatting(_)
                 | AnalysisResultValue::Diagnostics(_)
+                | AnalysisResultValue::DocumentDiagnostics(_)
+                | AnalysisResultValue::WorkspaceDiagnostics(_)
                 | AnalysisResultValue::TypeDefinitions(_)
                 | AnalysisResultValue::DocumentSymbols { .. }
                 | AnalysisResultValue::DocumentHighlights(_)
@@ -5561,10 +6077,12 @@ fn deliver_analysis_result(
     client_id: Option<RequestId>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut completion_resolutions = CompletionResolutionStore::new();
+    let mut diagnostic_results = DiagnosticPullStore::new();
     deliver_analysis_result_with_store(
         connection,
         workspace,
         &mut completion_resolutions,
+        &mut diagnostic_results,
         result,
         client_id,
     )
@@ -5574,14 +6092,28 @@ fn deliver_analysis_result_with_store(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     completion_resolutions: &mut CompletionResolutionStore,
+    diagnostic_results: &mut DiagnosticPullStore,
     result: AnalysisResult,
     client_id: Option<RequestId>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let stale = analysis_result_is_stale(workspace, &result);
     if stale {
-        if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
-            workspace.reschedule_diagnostics(diagnostics.uri.clone());
-            return Ok(());
+        match &result.value {
+            AnalysisResultValue::Diagnostics(diagnostics) => {
+                workspace.reschedule_diagnostics(diagnostics.uri.clone());
+                return Ok(());
+            }
+            AnalysisResultValue::DocumentDiagnostics(_)
+            | AnalysisResultValue::WorkspaceDiagnostics(_) => {
+                return send_diagnostic_server_cancelled(
+                    connection,
+                    client_id
+                        .clone()
+                        .expect("stale diagnostic pull has a client result"),
+                    "analysis result became stale; retry the request",
+                );
+            }
+            _ => {}
         }
         return send_error(
             connection,
@@ -5712,6 +6244,36 @@ fn deliver_analysis_result_with_store(
                 Ok(())
             }
         },
+        AnalysisResultValue::DocumentDiagnostics(value) => match value {
+            Ok(analysis) => send_document_diagnostics(
+                connection,
+                workspace,
+                diagnostic_results,
+                result.source_generation,
+                result.configuration_generation,
+                &result.records,
+                analysis,
+                client_id.expect("client result"),
+            ),
+            Err(error) => {
+                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::WorkspaceDiagnostics(value) => match value {
+            Ok(analysis) => send_workspace_diagnostics(
+                connection,
+                workspace,
+                diagnostic_results,
+                result.source_generation,
+                result.configuration_generation,
+                &result.records,
+                analysis,
+                client_id.expect("client result"),
+            ),
+            Err(error) => {
+                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
+            }
+        },
         AnalysisResultValue::TypeDefinitions(value) => match value {
             Ok(value) => send_ok(
                 connection,
@@ -5802,6 +6364,262 @@ fn deliver_analysis_result_with_store(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn send_document_diagnostics(
+    connection: &dyn ProtocolSender,
+    workspace: &Workspace,
+    diagnostic_results: &mut DiagnosticPullStore,
+    source_generation: u64,
+    configuration_generation: u64,
+    records: &[SourceRecord],
+    analysis: DocumentDiagnosticsAnalysis,
+    client_id: RequestId,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let publication = analysis
+        .publications
+        .iter()
+        .find(|publication| publication.uri == analysis.uri)
+        .cloned()
+        .unwrap_or_else(|| queries::DiagnosticPublication {
+            uri: analysis.uri.clone(),
+            version: None,
+            diagnostics: Vec::new(),
+        });
+    let previous = analysis
+        .previous_result_id
+        .as_deref()
+        .and_then(|previous| diagnostic_results.get(previous))
+        .cloned();
+    let entry = match diagnostic_results.insert(
+        publication.uri,
+        publication.version,
+        publication.diagnostics,
+        source_generation,
+        configuration_generation,
+        records,
+    ) {
+        Ok(entry) => entry,
+        Err(error) => return send_error(connection, client_id, ErrorCode::RequestFailed, error),
+    };
+    let unchanged = previous.is_some_and(|previous| {
+        previous.result_id == entry.result_id
+            && previous.uri == entry.uri
+            && previous.version == entry.version
+            && previous.diagnostics_identity == entry.diagnostics_identity
+            && previous.records_identity == entry.records_identity
+            && previous.source_generation <= source_generation
+            && previous.configuration_generation <= configuration_generation
+            && workspace
+                .dependency_scoped_result_is_fresh(
+                    previous.source_generation,
+                    previous.configuration_generation,
+                    &previous.records,
+                )
+                .is_ok()
+    });
+    let mut value = if unchanged {
+        serde_json::json!({
+            "kind": "unchanged",
+            "resultId": entry.result_id,
+        })
+    } else {
+        serde_json::json!({
+            "kind": "full",
+            "resultId": entry.result_id,
+            "items": entry.diagnostics,
+        })
+    };
+    if analysis.related_document_support {
+        let mut related = serde_json::Map::new();
+        for publication in analysis
+            .publications
+            .into_iter()
+            .filter(|publication| publication.uri != entry.uri)
+        {
+            let related_entry = match diagnostic_results.insert(
+                publication.uri.clone(),
+                publication.version,
+                publication.diagnostics,
+                source_generation,
+                configuration_generation,
+                records,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return send_error(connection, client_id, ErrorCode::RequestFailed, error);
+                }
+            };
+            related.insert(
+                related_entry.uri.to_string(),
+                serde_json::json!({
+                    "kind": "full",
+                    "resultId": related_entry.result_id,
+                    "items": related_entry.diagnostics,
+                }),
+            );
+        }
+        if !related.is_empty() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("relatedDocuments".to_string(), Value::Object(related));
+            }
+        }
+    }
+    send_ok(connection, client_id, value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_workspace_diagnostics(
+    connection: &dyn ProtocolSender,
+    workspace: &Workspace,
+    diagnostic_results: &mut DiagnosticPullStore,
+    source_generation: u64,
+    configuration_generation: u64,
+    records: &[SourceRecord],
+    analysis: WorkspaceDiagnosticsAnalysis,
+    client_id: RequestId,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let items = match workspace_diagnostic_items(
+        workspace,
+        diagnostic_results,
+        source_generation,
+        configuration_generation,
+        records,
+        analysis,
+    ) {
+        Ok(items) => items,
+        Err(error) => {
+            return send_error(connection, client_id, ErrorCode::RequestFailed, error);
+        }
+    };
+    send_ok(connection, client_id, serde_json::json!({"items": items}))
+}
+
+fn workspace_diagnostic_items(
+    workspace: &Workspace,
+    diagnostic_results: &mut DiagnosticPullStore,
+    source_generation: u64,
+    configuration_generation: u64,
+    records: &[SourceRecord],
+    analysis: WorkspaceDiagnosticsAnalysis,
+) -> Result<Vec<Value>, String> {
+    let previous = analysis
+        .previous_result_ids
+        .into_iter()
+        .collect::<HashMap<Url, String>>();
+    let mut seen = HashSet::new();
+    let mut items = Vec::with_capacity(analysis.publications.len());
+    for publication in analysis.publications {
+        let old = previous
+            .get(&publication.uri)
+            .and_then(|result_id| diagnostic_results.get(result_id))
+            .cloned();
+        let entry = diagnostic_results.insert(
+            publication.uri.clone(),
+            publication.version,
+            publication.diagnostics,
+            source_generation,
+            configuration_generation,
+            records,
+        )?;
+        seen.insert(publication.uri.clone());
+        let unchanged = old.is_some_and(|old| {
+            old.result_id == previous[&entry.uri]
+                && old.result_id == entry.result_id
+                && old.version == entry.version
+                && old.diagnostics_identity == entry.diagnostics_identity
+                && old.records_identity == entry.records_identity
+                && workspace
+                    .dependency_scoped_result_is_fresh(
+                        old.source_generation,
+                        old.configuration_generation,
+                        &old.records,
+                    )
+                    .is_ok()
+        });
+        if unchanged {
+            items.push(serde_json::json!({
+                "kind": "unchanged",
+                "uri": entry.uri,
+                "version": entry.version.map(i64::from),
+                "resultId": entry.result_id,
+            }));
+        } else {
+            items.push(serde_json::json!({
+                "kind": "full",
+                "uri": entry.uri,
+                "version": entry.version.map(i64::from),
+                "resultId": entry.result_id,
+                "items": entry.diagnostics,
+            }));
+        }
+
+        if items.len() > MAX_DIAGNOSTIC_REPORT_ITEMS {
+            return Err(format!(
+                "workspace diagnostic report exceeds the {MAX_DIAGNOSTIC_REPORT_ITEMS}-item limit"
+            ));
+        }
+    }
+
+    // A workspace request must explicitly clear documents that were reported
+    // by the client previously but are no longer an authorized/current source.
+    // The URI is supplied by the client, so this branch never reads it.
+    let mut missing = previous
+        .keys()
+        .filter(|uri| !seen.contains(*uri))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for uri in missing {
+        let entry = diagnostic_results.insert(
+            uri.clone(),
+            workspace.document_version(&uri),
+            Vec::new(),
+            source_generation,
+            configuration_generation,
+            &[],
+        )?;
+        items.push(serde_json::json!({
+            "kind": "full",
+            "uri": entry.uri,
+            "version": entry.version.map(i64::from),
+            "resultId": entry.result_id,
+            "items": entry.diagnostics,
+        }));
+        if items.len() > MAX_DIAGNOSTIC_REPORT_ITEMS {
+            return Err(format!(
+                "workspace diagnostic report exceeds the {MAX_DIAGNOSTIC_REPORT_ITEMS}-item limit"
+            ));
+        }
+    }
+    items.sort_by(|left, right| {
+        left["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["uri"].as_str().unwrap_or_default())
+    });
+
+    let mut encoded_bytes = 2usize; // The enclosing JSON array brackets.
+    for item in &items {
+        let item_bytes = serde_json::to_vec(item)
+            .map_err(|error| format!("could not encode workspace diagnostic report: {error}"))?
+            .len();
+        if item_bytes > MAX_DIAGNOSTIC_REPORT_ITEM_BYTES {
+            return Err(format!(
+                "workspace diagnostic report item exceeds the {MAX_DIAGNOSTIC_REPORT_ITEM_BYTES}-byte limit"
+            ));
+        }
+        encoded_bytes = encoded_bytes
+            .saturating_add(item_bytes)
+            .saturating_add(usize::from(encoded_bytes > 2));
+        if encoded_bytes > MAX_DIAGNOSTIC_REPORT_BYTES {
+            return Err(format!(
+                "workspace diagnostic report exceeds the {MAX_DIAGNOSTIC_REPORT_BYTES}-byte limit"
+            ));
+        }
+    }
+    Ok(items)
+}
+
 fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
     match &mut result.value {
         AnalysisResultValue::Hover(value) => *value = Err(error),
@@ -5817,6 +6635,8 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
             diagnostics.value = Err(error);
             diagnostics.discard = true;
         }
+        AnalysisResultValue::DocumentDiagnostics(value) => *value = Err(error),
+        AnalysisResultValue::WorkspaceDiagnostics(value) => *value = Err(error),
         AnalysisResultValue::TypeDefinitions(value) => *value = Err(error),
         AnalysisResultValue::Prepare(value) => *value = Err(error),
         AnalysisResultValue::Rename(value) => **value = Err(error),
@@ -5843,6 +6663,30 @@ fn send_analysis_error(
         ErrorCode::RequestFailed
     };
     send_error(connection, id, code, error)
+}
+
+fn send_diagnostic_analysis_error(
+    connection: &dyn ProtocolSender,
+    id: RequestId,
+    error: String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if error != rename::CANCELLATION_MESSAGE {
+        return send_error(connection, id, ErrorCode::RequestFailed, error);
+    }
+    send_diagnostic_server_cancelled(connection, id, error)
+}
+
+fn send_diagnostic_server_cancelled(
+    connection: &dyn ProtocolSender,
+    id: RequestId,
+    message: impl Into<String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut response = Response::new_err(id, ErrorCode::ServerCancelled as i32, message.into());
+    if let Some(response_error) = response.error.as_mut() {
+        response_error.data = Some(serde_json::json!({"retriggerRequest": true}));
+    }
+    connection.send_control(Message::Response(response))?;
+    Ok(())
 }
 
 /// Run one native LSP session over stdin/stdout.
@@ -6110,9 +6954,9 @@ fn run_connection(
     connection: &ProtocolConnection,
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let (initialize_id, initialize, options) = loop {
+    let (initialize_id, initialize, options, initialize_value) = loop {
         let (initialize_id, initialize_value) = connection.initialize_start()?;
-        let initialize: InitializeParams = match serde_json::from_value(initialize_value) {
+        let initialize: InitializeParams = match serde_json::from_value(initialize_value.clone()) {
             Ok(initialize) => initialize,
             Err(error) => {
                 send_error(
@@ -6131,7 +6975,7 @@ fn run_connection(
                 continue;
             }
         };
-        break (initialize_id, initialize, options);
+        break (initialize_id, initialize, options, initialize_value);
     };
     let roots = workspace_roots(&initialize);
     let workspace_folders_supported = supports_workspace_folders(&initialize.capabilities);
@@ -6146,7 +6990,13 @@ fn run_connection(
         .as_ref()
         .and_then(|window| window.work_done_progress)
         .unwrap_or(false);
-    let capabilities = server_capabilities(&initialize.capabilities);
+    let pull_diagnostics_supported = supports_pull_diagnostics(&initialize.capabilities);
+    let pull_related_diagnostics_supported = supports_related_diagnostics(&initialize.capabilities);
+    let diagnostic_refresh_supported =
+        supports_diagnostic_refresh(&initialize.capabilities, &initialize_value);
+    let workspace_diagnostics_supported = supports_workspace_diagnostic_reports(&initialize_value);
+    let capabilities =
+        server_capabilities(&initialize.capabilities, workspace_diagnostics_supported);
 
     connection.initialize_finish(
         initialize_id,
@@ -6177,35 +7027,48 @@ fn run_connection(
         &mut workspace,
         workspace_folders_supported,
         client_features,
+        pull_diagnostics_supported,
+        pull_related_diagnostics_supported,
+        diagnostic_refresh_supported,
         &mut configuration,
         watcher_registration,
         jobs,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn event_loop(
     connection: &ProtocolConnection,
     workspace: &mut Workspace,
     workspace_folders_supported: bool,
     client_features: ClientFeatures,
+    pull_diagnostics_supported: bool,
+    pull_related_diagnostics_supported: bool,
+    diagnostic_refresh_supported: bool,
     configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
     mut jobs: AnalysisJobs,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
     let mut deferred_configuration_messages = VecDeque::new();
+    let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
     loop {
         connection.flush()?;
         if let Some(effect) = configuration.poll(workspace)? {
             if let Some(registration) = watcher_registration.as_mut() {
                 sync_file_watcher(connection, workspace, registration)?;
             }
-            jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
-                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-            jobs.refresh_diagnostics_with_connection(connection, workspace, &effect.refresh)
-                .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            if pull_diagnostics_supported && !effect.refresh.is_empty() {
+                diagnostic_refresh.request(connection)?;
+            }
+            if !pull_diagnostics_supported {
+                jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                jobs.refresh_diagnostics_with_connection(connection, workspace, &effect.refresh)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            }
         }
-        if !shutdown_received {
+        if !shutdown_received && !pull_diagnostics_supported {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
         jobs.poll(connection, workspace)?;
@@ -6244,7 +7107,7 @@ fn event_loop(
                 None => match connection.receiver().recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
-                        if !shutdown_received {
+                        if !shutdown_received && !pull_diagnostics_supported {
                             publish_due_diagnostics(connection, workspace, &mut jobs)?;
                         }
                         jobs.pump_partial_deliveries(connection, workspace)?;
@@ -6261,7 +7124,7 @@ fn event_loop(
             match connection.receiver().recv_timeout(timeout) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
-                    if !shutdown_received {
+                    if !shutdown_received && !pull_diagnostics_supported {
                         publish_due_diagnostics(connection, workspace, &mut jobs)?;
                     }
                     jobs.pump_partial_deliveries(connection, workspace)?;
@@ -6363,17 +7226,30 @@ fn event_loop(
                 } else {
                     let source_generation = workspace.source_generation();
                     let configuration_generation = workspace.configuration_generation();
-                    handle_request(connection, workspace, request, client_features, &mut jobs)?;
+                    handle_request(
+                        connection,
+                        workspace,
+                        request,
+                        client_features,
+                        pull_diagnostics_supported,
+                        pull_related_diagnostics_supported,
+                        &mut jobs,
+                    )?;
                     if source_generation != workspace.source_generation()
                         || configuration_generation != workspace.configuration_generation()
                     {
                         let open_documents = workspace.open_document_uris();
-                        jobs.refresh_diagnostics_with_connection(
-                            connection,
-                            workspace,
-                            &open_documents,
-                        )
-                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        if pull_diagnostics_supported {
+                            diagnostic_refresh.request(connection)?;
+                        }
+                        if !pull_diagnostics_supported {
+                            jobs.refresh_diagnostics_with_connection(
+                                connection,
+                                workspace,
+                                &open_documents,
+                            )
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        }
                     }
                     if let Some(registration) = watcher_registration.as_mut() {
                         sync_file_watcher(connection, workspace, registration)?;
@@ -6478,6 +7354,7 @@ fn event_loop(
                         workspace,
                         notification,
                         workspace_folders_supported,
+                        !pull_diagnostics_supported,
                     );
                     if refresh_configuration && result.is_ok() {
                         configuration
@@ -6494,6 +7371,43 @@ fn event_loop(
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
                         }
+                        if pull_diagnostics_supported && !effect.refresh.is_empty() {
+                            diagnostic_refresh.request(connection)?;
+                        }
+                        if !pull_diagnostics_supported {
+                            jobs.cancel_diagnostics_for_with_connection(
+                                Some(connection),
+                                &effect.cancel,
+                            )
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                            jobs.refresh_diagnostics_with_connection(
+                                connection,
+                                workspace,
+                                &effect.refresh,
+                            )
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("pascal-lsp: notification handling failed: {error}");
+                    }
+                }
+            }
+            Message::Response(response) => {
+                if diagnostic_refresh.handle_response(connection, &response)? {
+                    // Refresh responses are deliberately non-blocking. A
+                    // pending coalesced refresh, if any, was sent by the
+                    // coordinator above.
+                } else if let Some(effect) =
+                    configuration.handle_response(connection, workspace, &response)?
+                {
+                    if let Some(registration) = watcher_registration.as_mut() {
+                        sync_file_watcher(connection, workspace, registration)?;
+                    }
+                    if pull_diagnostics_supported && !effect.refresh.is_empty() {
+                        diagnostic_refresh.request(connection)?;
+                    }
+                    if !pull_diagnostics_supported {
                         jobs.cancel_diagnostics_for_with_connection(
                             Some(connection),
                             &effect.cancel,
@@ -6506,26 +7420,6 @@ fn event_loop(
                         )
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
-                    Err(error) => {
-                        eprintln!("pascal-lsp: notification handling failed: {error}");
-                    }
-                }
-            }
-            Message::Response(response) => {
-                if let Some(effect) =
-                    configuration.handle_response(connection, workspace, &response)?
-                {
-                    if let Some(registration) = watcher_registration.as_mut() {
-                        sync_file_watcher(connection, workspace, registration)?;
-                    }
-                    jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
-                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                    jobs.refresh_diagnostics_with_connection(
-                        connection,
-                        workspace,
-                        &effect.refresh,
-                    )
-                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 } else if jobs
                     .handle_progress_response(connection, &response)
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?
@@ -6634,7 +7528,9 @@ fn request_partial_result_token(request: &Request) -> Result<Option<ProgressToke
 fn request_requires_configuration(method: &str) -> bool {
     matches!(
         method,
-        "pascal/projectContext"
+        "workspace/diagnostic"
+            | "textDocument/diagnostic"
+            | "pascal/projectContext"
             | "pascal/selectProject"
             | "textDocument/hover"
             | "textDocument/completion"
@@ -6768,6 +7664,8 @@ fn handle_request(
     workspace: &mut Workspace,
     request: Request,
     client_features: ClientFeatures,
+    pull_diagnostics_supported: bool,
+    pull_related_diagnostics_supported: bool,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let work_done_token = match request_work_done_token(&request) {
@@ -6784,7 +7682,7 @@ fn handle_request(
     };
     let partial_result_token = if matches!(
         request.method.as_str(),
-        "workspace/symbol" | "textDocument/references"
+        "workspace/symbol" | "textDocument/references" | "workspace/diagnostic"
     ) {
         match request_partial_result_token(&request) {
             Ok(token) => token,
@@ -6802,6 +7700,102 @@ fn handle_request(
         None
     };
     match request.method.as_str() {
+        "workspace/diagnostic" => {
+            if !pull_diagnostics_supported {
+                send_error(
+                    connection,
+                    request.id,
+                    ErrorCode::MethodNotFound,
+                    "workspace/diagnostic was not negotiated by this client",
+                )?;
+                return Ok(());
+            }
+            let id = request.id.clone();
+            let params: WorkspaceDiagnosticParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            if params
+                .identifier
+                .as_deref()
+                .is_some_and(|identifier| identifier != SERVER_NAME)
+            {
+                send_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams,
+                    "unsupported diagnostic provider identifier",
+                )?;
+                return Ok(());
+            }
+            let previous_result_ids = params
+                .previous_result_ids
+                .into_iter()
+                .map(|previous| (canonical_file_uri(&previous.uri), previous.value))
+                .collect();
+            start_analysis_with_partial(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::WorkspaceDiagnostics {
+                    previous_result_ids,
+                },
+                client_features,
+                AnalysisProgressTokens {
+                    work_done: params.work_done_progress_params.work_done_token,
+                    partial_result: partial_result_token,
+                },
+            )?;
+        }
+        "textDocument/diagnostic" => {
+            if !pull_diagnostics_supported {
+                send_error(
+                    connection,
+                    request.id,
+                    ErrorCode::MethodNotFound,
+                    "textDocument/diagnostic was not negotiated by this client",
+                )?;
+                return Ok(());
+            }
+            let id = request.id.clone();
+            let params: DocumentDiagnosticParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            if params
+                .identifier
+                .as_deref()
+                .is_some_and(|identifier| identifier != SERVER_NAME)
+            {
+                send_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams,
+                    "unsupported diagnostic provider identifier",
+                )?;
+                return Ok(());
+            }
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::DocumentDiagnostics {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    previous_result_id: params.previous_result_id,
+                    related_document_support: pull_related_diagnostics_supported,
+                },
+                client_features,
+                params.work_done_progress_params.work_done_token,
+            )?;
+        }
         "pascal/projectContext" => {
             let id = request.id.clone();
             let params: ProjectContextRequestParams = match parse_params(&request) {
@@ -7305,6 +8299,7 @@ fn handle_notification(
     workspace: &mut Workspace,
     notification: Notification,
     workspace_folders_supported: bool,
+    push_diagnostics_supported: bool,
 ) -> Result<DiagnosticNotificationEffect, String> {
     match notification.method.as_str() {
         "initialized" => Ok(DiagnosticNotificationEffect::default()),
@@ -7395,15 +8390,22 @@ fn handle_notification(
             let closed = workspace.close_document(&uri);
             if closed {
                 let updates = workspace.clear_diagnostic_publications(&uri);
-                let mut root_was_updated = false;
-                for update in updates {
-                    root_was_updated |= update.uri == uri;
-                    send_diagnostics(connection, &update.uri, update.version, update.diagnostics)
+                if push_diagnostics_supported {
+                    let mut root_was_updated = false;
+                    for update in updates {
+                        root_was_updated |= update.uri == uri;
+                        send_diagnostics(
+                            connection,
+                            &update.uri,
+                            update.version,
+                            update.diagnostics,
+                        )
                         .map_err(|error| error.to_string())?;
-                }
-                if !root_was_updated {
-                    send_diagnostics(connection, &uri, None, Vec::new())
-                        .map_err(|error| error.to_string())?;
+                    }
+                    if !root_was_updated {
+                        send_diagnostics(connection, &uri, None, Vec::new())
+                            .map_err(|error| error.to_string())?;
+                    }
                 }
             }
             let mut effect = DiagnosticNotificationEffect::default();
@@ -7688,7 +8690,10 @@ fn send_error(
     Ok(())
 }
 
-fn server_capabilities(client: &ClientCapabilities) -> Value {
+fn server_capabilities(
+    client: &ClientCapabilities,
+    workspace_diagnostics_supported: bool,
+) -> Value {
     let mut capabilities = serde_json::json!({
         "positionEncoding": "utf-16",
         "textDocumentSync": {
@@ -7732,6 +8737,14 @@ fn server_capabilities(client: &ClientCapabilities) -> Value {
                 "supported": true,
                 "changeNotifications": true
             }
+        });
+    }
+    if supports_pull_diagnostics(client) {
+        capabilities["diagnosticProvider"] = serde_json::json!({
+            "identifier": SERVER_NAME,
+            "interFileDependencies": true,
+            "workspaceDiagnostics": workspace_diagnostics_supported,
+            "workDoneProgress": true
         });
     }
     capabilities
@@ -7859,6 +8872,49 @@ fn supports_workspace_folders(client: &ClientCapabilities) -> bool {
         .unwrap_or(false)
 }
 
+fn supports_pull_diagnostics(client: &ClientCapabilities) -> bool {
+    client
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.diagnostic.as_ref())
+        .is_some()
+}
+
+fn supports_related_diagnostics(client: &ClientCapabilities) -> bool {
+    client
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.diagnostic.as_ref())
+        .and_then(|diagnostic| diagnostic.related_document_support)
+        .unwrap_or(false)
+}
+
+fn supports_diagnostic_refresh(client: &ClientCapabilities, raw_initialize: &Value) -> bool {
+    client
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.diagnostic.as_ref())
+        .and_then(|diagnostic| diagnostic.refresh_support)
+        .unwrap_or_else(|| {
+            raw_initialize
+                .pointer("/capabilities/workspace/diagnostics/refreshSupport")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+}
+
+fn supports_workspace_diagnostic_reports(raw_initialize: &Value) -> bool {
+    // Neovim 0.12 uses the current plural capability spelling and routes a
+    // refresh to workspace diagnostics whenever the server advertises the
+    // workspace provider.  Its open buffers remain document-pull tracked, so
+    // those reports are ignored.  Keep document refreshes interoperable for
+    // that spelling while retaining the workspace provider for clients using
+    // the lsp-types spelling.
+    raw_initialize
+        .pointer("/capabilities/workspace/diagnostics")
+        .is_none()
+}
+
 fn supports_configuration(client: &ClientCapabilities) -> bool {
     let supported = client
         .workspace
@@ -7916,23 +8972,26 @@ mod tests {
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisProgressTokens, AnalysisRequest,
         AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
-        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DocumentationFormat,
-        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
-        MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
-        MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
-        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
-        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
-        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, PartialDelivery,
-        PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload, PendingAnalysis,
-        PriorityQueue, TestBarrierConfig, deliver_analysis_result, invalidate_analysis_result,
+        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DiagnosticPullStore,
+        DocumentationFormat, FileWatcherRegistration, MAX_ANALYSIS_QUEUE,
+        MAX_CLIENT_ANALYSIS_RECIPIENTS, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
+        MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
+        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
+        MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass,
+        OutboundQueue, PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation,
+        PartialResultPayload, PendingAnalysis, PriorityQueue, TestBarrierConfig,
+        deliver_analysis_result, invalidate_analysis_result, supports_diagnostic_refresh,
+        supports_workspace_diagnostic_reports,
     };
     use crate::workspace::Workspace;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
     use crossbeam_channel::{RecvTimeoutError, bounded};
     use lsp_server::{Connection, Message, Notification, RequestId, Response};
     use lsp_types::{
-        ClientCapabilities, CompletionItem, CompletionList, Location, MarkupKind, Position,
-        PrepareRenameResponse, Range, SymbolInformation, SymbolKind, Url,
+        ClientCapabilities, CompletionItem, CompletionList, Diagnostic, DiagnosticSeverity,
+        Location, MarkupKind, Position, PrepareRenameResponse, Range, SymbolInformation,
+        SymbolKind, Url,
     };
     use pascal_project::delphi_overrides::OverrideSession;
     use std::fs;
@@ -7995,6 +9054,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diagnostic_refresh_support_accepts_the_plural_protocol_capability_name() {
+        let raw_initialize = serde_json::json!({
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        });
+        let capabilities: ClientCapabilities =
+            serde_json::from_value(raw_initialize["capabilities"].clone())
+                .expect("client capabilities");
+        assert!(supports_diagnostic_refresh(&capabilities, &raw_initialize));
+    }
+
+    #[test]
+    fn diagnostic_provider_avoids_workspace_reports_for_plural_refresh_clients() {
+        let raw_initialize = serde_json::json!({
+            "capabilities": {
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true}
+                }
+            }
+        });
+        assert!(!supports_workspace_diagnostic_reports(&raw_initialize));
+        assert!(supports_workspace_diagnostic_reports(&serde_json::json!({
+            "capabilities": {
+                "workspace": {
+                    "diagnostic": {"refreshSupport": true}
+                }
+            }
+        })));
+    }
+
     fn test_completion_analysis(uri: &Url, index: usize) -> CompletionAnalysis {
         CompletionAnalysis {
             uri: uri.clone(),
@@ -8014,6 +9107,102 @@ mod tests {
                 seeds: vec![CompletionResolutionSeed::test_new(uri.clone(), index)],
             }),
         }
+    }
+
+    fn test_diagnostic(index: usize) -> Vec<Diagnostic> {
+        vec![Diagnostic::new(
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            Some(DiagnosticSeverity::WARNING),
+            None,
+            None,
+            format!("diagnostic {index}"),
+            None,
+            None,
+        )]
+    }
+
+    #[test]
+    fn diagnostic_result_store_evicts_old_ids_but_keeps_new_ids() {
+        let mut store = DiagnosticPullStore::new();
+        let mut first = None;
+        let mut last = None;
+        for index in 0..=super::MAX_DIAGNOSTIC_RESULT_ENTRIES {
+            let uri =
+                Url::parse(&format!("file:///diagnostic-{index}.pas")).expect("diagnostic URI");
+            let entry = store
+                .insert(uri, None, test_diagnostic(index), 1, 1, &[])
+                .expect("diagnostic result entry");
+            if index == 0 {
+                first = Some(entry.result_id.clone());
+            }
+            last = Some(entry.result_id);
+        }
+        assert!(
+            store.get(&first.expect("first result ID")).is_none(),
+            "old diagnostic IDs must be evicted"
+        );
+        assert!(
+            store.get(&last.expect("last result ID")).is_some(),
+            "new diagnostic IDs must remain available"
+        );
+    }
+
+    #[test]
+    fn diagnostic_result_store_reissues_an_actual_evicted_id() {
+        let first_uri = Url::parse("file:///diagnostic-evicted.pas").expect("diagnostic URI");
+        let mut store = DiagnosticPullStore::new();
+        let first = store
+            .insert(first_uri.clone(), None, test_diagnostic(0), 1, 1, &[])
+            .expect("first diagnostic result");
+        for index in 1..=super::MAX_DIAGNOSTIC_RESULT_ENTRIES {
+            let uri = Url::parse(&format!("file:///diagnostic-fill-{index}.pas"))
+                .expect("diagnostic fill URI");
+            store
+                .insert(uri, None, test_diagnostic(index), 1, 1, &[])
+                .expect("diagnostic fill result");
+        }
+        assert!(
+            store.get(&first.result_id).is_none(),
+            "the original result must be gone from the bounded cache"
+        );
+        let replacement = store
+            .insert(first_uri, None, test_diagnostic(0), 1, 1, &[])
+            .expect("replacement diagnostic result");
+        assert_ne!(replacement.result_id, first.result_id);
+        assert!(store.get(&replacement.result_id).is_some());
+    }
+
+    #[test]
+    fn diagnostic_result_store_replacement_does_not_grow_eviction_order() {
+        let uri = Url::parse("file:///diagnostic-replacement.pas").expect("diagnostic URI");
+        let mut store = DiagnosticPullStore::new();
+        for index in 0..64 {
+            store
+                .insert(uri.clone(), None, test_diagnostic(index), 1, 1, &[])
+                .expect("diagnostic replacement entry");
+        }
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.order.len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_result_store_rejects_one_entry_over_the_byte_bound() {
+        let uri = Url::parse("file:///diagnostic-oversized.pas").expect("diagnostic URI");
+        let mut store = DiagnosticPullStore::new();
+        let diagnostics = vec![Diagnostic::new(
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            Some(DiagnosticSeverity::ERROR),
+            None,
+            None,
+            "x".repeat(super::MAX_DIAGNOSTIC_RESULT_BYTES),
+            None,
+            None,
+        )];
+        assert!(
+            store.insert(uri, None, diagnostics, 1, 1, &[]).is_err(),
+            "an oversized diagnostic result must not be issued an immediately invalid ID"
+        );
+        assert!(store.entries.is_empty());
     }
 
     #[test]
@@ -8781,6 +9970,7 @@ mod tests {
             source_generation: workspace.source_generation(),
             configuration_generation: workspace.configuration_generation(),
             payload: PartialResultPayload::References(Arc::new(Vec::new())),
+            retrigger_on_stale: false,
             recipients,
             next_recipient: 0,
             retained_bytes: 1,

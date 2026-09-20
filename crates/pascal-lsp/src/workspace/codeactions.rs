@@ -887,8 +887,14 @@ fn matching_diagnostic(
     context
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic_code(diagnostic) == Some(rule) && diagnostic.range == anchor)
+        .find(|diagnostic| {
+            diagnostic_code(diagnostic) == Some(rule) && ranges_overlap(diagnostic.range, anchor)
+        })
         .cloned()
+}
+
+fn ranges_overlap(left: Range, right: Range) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 fn diagnostic_code(diagnostic: &Diagnostic) -> Option<&str> {
@@ -1146,6 +1152,60 @@ mod tests {
             "unused configurations blocked resolve: {:?}",
             resolved.value
         );
+    }
+
+    #[test]
+    fn code_actions_accept_a_stale_overlapping_diagnostic_after_identifier_edit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source_path = root.join("Provider.pas");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(
+            &source_path,
+            "unit Provider;\ninterface\nconst\n  renamedConst = 1;\nimplementation\nend.\n",
+        )
+        .expect("source");
+
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": {
+                "start": {"line": 3, "character": 2},
+                "end": {"line": 3, "character": 14}
+            },
+            "context": {
+                "diagnostics": [{
+                    "code": "constant-naming",
+                    "message": "Constant 'badConst' should use UPPER_CASE naming convention.",
+                    "range": {
+                        "start": {"line": 3, "character": 2},
+                        "end": {"line": 3, "character": 10}
+                    },
+                    "severity": 4,
+                    "source": "lint4d"
+                }],
+                "only": ["quickfix"]
+            }
+        }))
+        .expect("code action parameters");
+        let computed = code_actions_from_input(
+            test_workspace(vec![root], Default::default()).analysis_input(),
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &AtomicBool::new(false),
+        );
+        let actions = computed
+            .value
+            .expect("stale diagnostic must not suppress the current fix");
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected a code action");
+        };
+        assert_eq!(action.title, "Rename 'renamedConst' to 'RENAMED_CONST'");
     }
 
     #[test]

@@ -19,6 +19,7 @@ use lsp_types::{
     SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use pascal_project::has_invalid_project_selection;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 pub(crate) struct NavigationResult {
@@ -29,6 +30,10 @@ pub(crate) struct NavigationResult {
 pub(crate) struct DiagnosticsResult {
     pub(crate) uri: Url,
     pub(crate) version: Option<i32>,
+    pub(crate) publications: Vec<DiagnosticPublication>,
+}
+
+pub(crate) struct WorkspaceDiagnosticsResult {
     pub(crate) publications: Vec<DiagnosticPublication>,
 }
 
@@ -1248,6 +1253,113 @@ pub(crate) fn diagnostics_from_input(
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     with_records(source_generation, configuration_generation, value, records)
+}
+
+pub(crate) fn workspace_diagnostics_from_input(
+    input: WorkspaceInput,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<WorkspaceDiagnosticsResult> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let snapshot =
+        match build_snapshot(&input, &[], &[], SnapshotMode::Workspace, None, &[], cancel) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if !snapshot.complete {
+        let reason = snapshot
+            .incomplete_reason
+            .as_deref()
+            .unwrap_or("bounded source discovery did not finish");
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("workspace diagnostic scan incomplete: {reason}"),
+        );
+    }
+
+    let mut uris = snapshot
+        .sources
+        .keys()
+        .filter(|uri| {
+            uri.to_file_path()
+                .ok()
+                .is_some_and(|path| super::is_pascal_path(&path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    uris.dedup();
+
+    let mut merged = HashMap::<Url, DiagnosticPublication>::new();
+    let mut records = super::rename::snapshot_records(&snapshot);
+    for uri in uris {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let mut workspace = super::Workspace::from_analysis_input(&input);
+        let publications = match workspace.diagnostics_for_with_cancel(&uri, cancel) {
+            Ok(publications) => publications,
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+        match workspace.analysis_records(cancel) {
+            Ok(additional) => records.extend(additional),
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+        for publication in publications {
+            let entry =
+                merged
+                    .entry(publication.uri.clone())
+                    .or_insert_with(|| DiagnosticPublication {
+                        uri: publication.uri.clone(),
+                        version: publication.version,
+                        diagnostics: Vec::new(),
+                    });
+            if entry.version.is_none() {
+                entry.version = publication.version;
+            }
+            for diagnostic in publication.diagnostics {
+                if !entry.diagnostics.contains(&diagnostic) {
+                    entry.diagnostics.push(diagnostic);
+                }
+            }
+        }
+    }
+
+    let mut publications = merged.into_values().collect::<Vec<_>>();
+    publications.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+    records.sort_by(|left, right| {
+        left.uri
+            .as_str()
+            .cmp(right.uri.as_str())
+            .then_with(|| left.text.len().cmp(&right.text.len()))
+    });
+    if records.len() > 32_768 {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "workspace diagnostic dependency record limit reached".to_string(),
+        );
+    }
+    with_records(
+        source_generation,
+        configuration_generation,
+        Ok(WorkspaceDiagnosticsResult { publications }),
+        records,
+    )
 }
 
 pub(crate) fn workspace_symbols_from_input(

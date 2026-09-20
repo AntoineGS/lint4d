@@ -960,6 +960,44 @@ impl TestServer {
         self.initialize_with_watched_registration(root, initialization_options, false)
     }
 
+    fn initialize_with_pull_diagnostics(&mut self, root: &Path) -> Value {
+        self.initialize_with_pull_diagnostics_options(root, Value::Null)
+    }
+
+    fn initialize_with_pull_diagnostics_options(
+        &mut self,
+        root: &Path,
+        initialization_options: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("pull-diagnostics-initialize".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "initializationOptions": initialization_options,
+                "capabilities": {
+                    "textDocument": {
+                        "diagnostic": {
+                            "dynamicRegistration": false,
+                            "relatedDocumentSupport": true
+                        }
+                    },
+                    "workspace": {
+                        "diagnostic": {"refreshSupport": true},
+                        "workspaceFolders": true
+                    }
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
     #[cfg(feature = "test-support")]
     fn initialize_with_progress(&mut self, root: &Path) -> Value {
         let id = RequestId::from("progress-helper-initialize".to_string());
@@ -4174,6 +4212,778 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
         true
     );
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
+    server.shutdown();
+}
+
+#[test]
+fn pull_diagnostics_advertises_provider_and_returns_document_report() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    write_file(&source, "unit Main;\ninterface\nimplementation\nend.\n");
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize_with_pull_diagnostics(root.path());
+    assert_eq!(
+        initialize["capabilities"]["diagnosticProvider"]["identifier"],
+        "pascal-lsp"
+    );
+    assert_eq!(
+        initialize["capabilities"]["diagnosticProvider"]["interFileDependencies"],
+        true
+    );
+    assert_eq!(
+        initialize["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
+        true
+    );
+
+    let request_id = RequestId::from("pull-document-diagnostic".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": null
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "document diagnostic request failed: {response:?}"
+    );
+    let result = response.result.expect("document diagnostic result");
+    assert_eq!(result["kind"], "full");
+    let result_id = result["resultId"]
+        .as_str()
+        .expect("document diagnostic result ID")
+        .to_string();
+    assert!(result["items"].is_array());
+
+    let unchanged_id = RequestId::from("pull-document-diagnostic-unchanged".to_string());
+    server.send_request(
+        unchanged_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": result_id
+        }),
+    );
+    let unchanged = server.response(&unchanged_id);
+    assert!(
+        unchanged.error.is_none(),
+        "unchanged document diagnostic request failed: {unchanged:?}"
+    );
+    let unchanged = unchanged
+        .result
+        .expect("unchanged document diagnostic result");
+    assert_eq!(unchanged["kind"], "unchanged");
+    assert_eq!(unchanged["resultId"], result_id);
+    server.shutdown();
+}
+
+#[test]
+fn pull_workspace_diagnostics_reports_authorized_unopened_sources() {
+    let root = tempfile::tempdir().expect("workspace");
+    let first = root.path().join("First.pas");
+    let second = root.path().join("Second.pas");
+    write_file(&first, "unit First;\ninterface\nimplementation\nend.\n");
+    write_file(&second, "unit Second;\ninterface\nimplementation\nend.\n");
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize_with_pull_diagnostics(root.path());
+    assert_eq!(
+        initialize["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
+        true
+    );
+
+    let request_id = RequestId::from("pull-workspace-diagnostic".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/diagnostic",
+        json!({
+            "identifier": "pascal-lsp",
+            "previousResultIds": []
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "workspace diagnostic request failed: {response:?}"
+    );
+    let result = response.result.expect("workspace diagnostic result");
+    assert!(result["items"].is_array());
+    let items = result["items"].as_array().expect("workspace report items");
+    let uris = items
+        .iter()
+        .filter_map(|item| item["uri"].as_str())
+        .collect::<HashSet<_>>();
+    assert!(uris.contains(uri(&first).as_str()));
+    assert!(uris.contains(uri(&second).as_str()));
+    assert!(items.iter().all(|item| item["kind"] == "full"));
+
+    let previous_result_ids = items
+        .iter()
+        .map(|item| {
+            json!({
+                "uri": item["uri"],
+                "value": item["resultId"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let unchanged_id = RequestId::from("pull-workspace-diagnostic-unchanged".to_string());
+    server.send_request(
+        unchanged_id.clone(),
+        "workspace/diagnostic",
+        json!({
+            "identifier": "pascal-lsp",
+            "previousResultIds": previous_result_ids
+        }),
+    );
+    let unchanged = server.response(&unchanged_id);
+    assert!(
+        unchanged.error.is_none(),
+        "unchanged workspace diagnostic request failed: {unchanged:?}"
+    );
+    let unchanged_items = unchanged.result.expect("unchanged workspace result")["items"]
+        .as_array()
+        .expect("unchanged workspace items")
+        .to_vec();
+    assert!(
+        unchanged_items
+            .iter()
+            .all(|item| item["kind"] == "unchanged"),
+        "expected unchanged workspace reports: {unchanged_items:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_workspace_diagnostics_clears_deleted_previous_reports() {
+    let root = tempfile::tempdir().expect("workspace");
+    let first = root.path().join("First.pas");
+    let second = root.path().join("Second.pas");
+    write_file(&first, "unit First;\ninterface\nimplementation\nend.\n");
+    write_file(&second, "unit Second;\ninterface\nimplementation\nend.\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let first_id = RequestId::from("pull-workspace-diagnostic-delete-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let first_response = server.response(&first_id);
+    assert!(
+        first_response.error.is_none(),
+        "initial pull failed: {first_response:?}"
+    );
+    let previous_result_ids = first_response.result.expect("initial workspace result")["items"]
+        .as_array()
+        .expect("initial workspace items")
+        .iter()
+        .map(|item| {
+            json!({
+                "uri": item["uri"],
+                "value": item["resultId"]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    fs::remove_file(&second).expect("delete workspace source");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({
+            "changes": [{"uri": uri(&second), "type": 3}]
+        }),
+    );
+
+    let second_id = RequestId::from("pull-workspace-diagnostic-delete-second".to_string());
+    server.send_request(
+        second_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": previous_result_ids}),
+    );
+    let second_response = server.response(&second_id);
+    assert!(
+        second_response.error.is_none(),
+        "deleted-source pull failed: {second_response:?}"
+    );
+    let result = second_response
+        .result
+        .expect("deleted-source workspace result");
+    let items = result["items"]
+        .as_array()
+        .expect("deleted-source workspace items");
+    let cleared = items
+        .iter()
+        .find(|item| item["uri"] == uri(&second).as_str())
+        .expect("deleted source must be explicitly cleared");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn pull_workspace_diagnostics_clears_newly_excluded_previous_reports() {
+    let root = tempfile::tempdir().expect("workspace");
+    let included = root.path().join("Included.pas");
+    let excluded = root.path().join("Excluded.pas");
+    write_file(
+        &included,
+        "unit Included;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
+        &excluded,
+        "unit Excluded;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let first_id = RequestId::from("pull-workspace-diagnostic-exclude-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": []}),
+    );
+    let first_response = server.response(&first_id);
+    assert!(
+        first_response.error.is_none(),
+        "initial pull failed: {first_response:?}"
+    );
+    let previous_result_ids = first_response.result.expect("initial workspace result")["items"]
+        .as_array()
+        .expect("initial workspace items")
+        .iter()
+        .map(|item| {
+            json!({
+                "uri": item["uri"],
+                "value": item["resultId"]
+            })
+        })
+        .collect::<Vec<_>>();
+
+    server.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"pascalLsp": {"exclude": ["Excluded.pas"]}}}),
+    );
+
+    let second_id = RequestId::from("pull-workspace-diagnostic-exclude-second".to_string());
+    server.send_request(
+        second_id.clone(),
+        "workspace/diagnostic",
+        json!({"previousResultIds": previous_result_ids}),
+    );
+    let second_response = server.response(&second_id);
+    assert!(
+        second_response.error.is_none(),
+        "excluded-source pull failed: {second_response:?}"
+    );
+    let result = second_response
+        .result
+        .expect("excluded-source workspace result");
+    let items = result["items"]
+        .as_array()
+        .expect("excluded-source workspace items");
+    let cleared = items
+        .iter()
+        .find(|item| item["uri"] == uri(&excluded).as_str())
+        .expect("excluded source must be explicitly cleared");
+    assert_eq!(cleared["kind"], "full");
+    assert_eq!(cleared["items"], json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn negotiated_pull_diagnostics_do_not_publish_push_notifications() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    assert_eq!(
+        server.diagnostic_with_timeout(&uri(&source), Duration::from_millis(500)),
+        None,
+        "pull-negotiated clients must own diagnostics through pull reports"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn negotiated_pull_diagnostics_request_refresh_after_document_change() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    assert!(refresh.params.is_null() || refresh.params == json!({}));
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    assert!(
+        server
+            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(100))
+            .is_none(),
+        "refresh responses must not trigger a refresh loop"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_workspace_diagnostics_delivers_partial_items_before_final_report() {
+    let root = tempfile::tempdir().expect("workspace");
+    let first = root.path().join("First.pas");
+    let second = root.path().join("Second.pas");
+    write_file(&first, "unit First;\ninterface\nimplementation\nend.\n");
+    write_file(&second, "unit Second;\ninterface\nimplementation\nend.\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let request_id = RequestId::from("pull-workspace-diagnostic-partial".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/diagnostic",
+        json!({
+            "identifier": "pascal-lsp",
+            "previousResultIds": [],
+            "partialResultToken": "workspace-diagnostics-partial"
+        }),
+    );
+
+    let partial = server.notification("$/progress");
+    assert_eq!(partial["token"], "workspace-diagnostics-partial");
+    assert!(partial["value"]["items"].is_array());
+    assert!(
+        !partial["value"]["items"]
+            .as_array()
+            .expect("partial workspace items")
+            .is_empty()
+    );
+
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "workspace partial diagnostic request failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("workspace final result")["items"],
+        json!([])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_document_diagnostics_returns_full_for_changed_foreign_and_empty_reports() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let invalid = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "type\n",
+        "  TBox = class\n",
+        "    Value: Integer;\n",
+        "  end;\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var Box: TBox;\n",
+        "begin\n",
+        "  Box.Missing := 1;\n",
+        "end;\n",
+        "end.\n",
+    );
+    let valid = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, invalid);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+
+    let first_id = RequestId::from("pull-document-diagnostic-ids-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let first = server.response(&first_id);
+    assert!(first.error.is_none(), "initial pull failed: {first:?}");
+    let first_result = first.result.expect("initial document report");
+    assert_eq!(first_result["kind"], "full");
+    assert!(
+        !first_result["items"]
+            .as_array()
+            .expect("initial diagnostic items")
+            .is_empty()
+    );
+    let first_result_id = first_result["resultId"]
+        .as_str()
+        .expect("initial result ID")
+        .to_string();
+
+    write_file(&source, valid);
+    let changed_id = RequestId::from("pull-document-diagnostic-ids-changed".to_string());
+    server.send_request(
+        changed_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": first_result_id
+        }),
+    );
+    let changed = server.response(&changed_id);
+    assert!(changed.error.is_none(), "changed pull failed: {changed:?}");
+    let changed_result = changed.result.expect("changed document report");
+    assert_eq!(changed_result["kind"], "full");
+    assert!(
+        changed_result["items"]
+            .as_array()
+            .expect("changed diagnostic items")
+            .is_empty()
+    );
+    let changed_result_id = changed_result["resultId"]
+        .as_str()
+        .expect("changed result ID")
+        .to_string();
+    assert_ne!(changed_result_id, first_result_id);
+
+    let foreign = root.path().join("Foreign.pas");
+    write_file(&foreign, valid);
+    let foreign_id = RequestId::from("pull-document-diagnostic-ids-foreign".to_string());
+    server.send_request(
+        foreign_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": "foreign-result-id"
+        }),
+    );
+    let foreign_response = server.response(&foreign_id);
+    assert!(
+        foreign_response.error.is_none(),
+        "foreign ID pull failed: {foreign_response:?}"
+    );
+    assert_eq!(
+        foreign_response.result.expect("foreign ID report")["kind"],
+        "full"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_document_diagnostics_reports_an_unauthorized_source_without_reading_it() {
+    let root = tempfile::tempdir().expect("workspace");
+    let outside_root = tempfile::tempdir().expect("outside workspace");
+    let outside = outside_root.path().join("Outside.pas");
+    write_file(&outside, "unit Outside; this is not a valid source; end.\n");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let request_id = RequestId::from("pull-document-diagnostic-unauthorized".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&outside)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "unauthorized document report failed: {response:?}"
+    );
+    let result = response.result.expect("unauthorized diagnostic report");
+    assert_eq!(result["kind"], "full");
+    let items = result["items"]
+        .as_array()
+        .expect("unauthorized diagnostics");
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outside configured source paths")),
+        "unexpected unauthorized diagnostic: {items:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_document_diagnostics_allows_an_explicit_external_source_path() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let root = temp.path().join("workspace");
+    let external_root = temp.path().join("external");
+    let external = external_root.join("External.pas");
+    write_file(
+        &external,
+        "unit External;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics_options(
+        &root,
+        json!({"sourcePaths": [external_root.to_string_lossy()]}),
+    );
+    let request_id = RequestId::from("pull-document-diagnostic-external".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&external)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "explicit external source path failed: {response:?}"
+    );
+    assert_eq!(
+        response.result.expect("external diagnostic report")["kind"],
+        "full"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_document_diagnostics_returns_owned_related_include_reports() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Shared.inc");
+    let main_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "type\n",
+        "  TBox = class\n",
+        "    Value: Integer;\n",
+        "  end;\n",
+        "implementation\n",
+        "{$I Shared.inc}\n",
+        "end.\n",
+    );
+    let include_source = "procedure Run;\nvar Box: TBox;\nbegin\n  Box.Missing := 1;\nend;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let request_id = RequestId::from("pull-document-diagnostic-related".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "related pull failed: {response:?}"
+    );
+    let result = response.result.expect("related document result");
+    assert_eq!(result["kind"], "full");
+    assert!(
+        result["items"]
+            .as_array()
+            .expect("main diagnostics")
+            .is_empty()
+    );
+    let related = result["relatedDocuments"]
+        .as_object()
+        .expect("related document reports");
+    let include_report = related
+        .get(uri(&include).as_str())
+        .expect("include related report");
+    assert_eq!(include_report["kind"], "full");
+    assert!(
+        include_report["items"]
+            .as_array()
+            .expect("include related diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["message"] == "missing member 'Missing'")
+    );
+    server.shutdown();
+}
+
+#[test]
+fn pull_document_diagnostics_detects_an_unnotified_disk_change() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let valid = "unit Main;\ninterface\nimplementation\nend.\n";
+    let invalid = "unit Main; this is not valid Pascal; end.\n";
+    write_file(&source, valid);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let first_id = RequestId::from("pull-document-diagnostic-disk-first".to_string());
+    server.send_request(
+        first_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    let first = server.response(&first_id);
+    assert!(first.error.is_none(), "initial disk pull failed: {first:?}");
+    let first_result = first.result.expect("initial disk report");
+    let first_result_id = first_result["resultId"]
+        .as_str()
+        .expect("initial disk result ID")
+        .to_string();
+
+    write_file(&source, invalid);
+    let second_id = RequestId::from("pull-document-diagnostic-disk-second".to_string());
+    server.send_request(
+        second_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri(&source)},
+            "previousResultId": first_result_id
+        }),
+    );
+    let second = server.response(&second_id);
+    assert!(
+        second.error.is_none(),
+        "changed disk pull failed: {second:?}"
+    );
+    let second_result = second.result.expect("changed disk report");
+    assert_eq!(second_result["kind"], "full");
+    assert!(
+        !second_result["items"]
+            .as_array()
+            .expect("changed disk diagnostics")
+            .is_empty()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_an_inflight_pull_diagnostic_returns_request_canceled_once() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let text = "unit Main;\ninterface\nimplementation\nend.\n";
+    write_file(&source, text);
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(root);
+    server.initialize_with_pull_diagnostics(source.parent().expect("workspace root"));
+
+    let request_id = RequestId::from("pull-document-diagnostic-cancel".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": request_id}));
+
+    let response = server.response(&request_id);
+    let error = response.error.expect("cancelled pull must fail");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    barrier.release();
+    server.assert_no_response(&request_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn pull_diagnostics_stale_worker_returns_server_cancelled_with_retrigger_data() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source = root.path().join("Main.pas");
+    let original = "unit Main;\ninterface\nimplementation\nend.\n";
+    let changed = "unit Main;\ninterface\nconst Changed = 1;\nimplementation\nend.\n";
+    write_file(&source, original);
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(root);
+    server.initialize_with_pull_diagnostics(source.parent().expect("workspace root"));
+
+    let request_id = RequestId::from("pull-document-diagnostic-stale".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri(&source)}}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": changed
+            }
+        }),
+    );
+    barrier.release();
+
+    let response = server.response(&request_id);
+    let error = response.error.expect("stale pull must fail");
+    assert_eq!(error.code, -32802);
+    assert_eq!(error.data, Some(json!({"retriggerRequest": true})));
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn stale_workspace_diagnostic_partial_delivery_requests_retrigger() {
+    let root = tempfile::tempdir().expect("workspace");
+    let first = root.path().join("Unit000.pas");
+    let first_text = "unit Unit000;\ninterface\nimplementation\nend.\n";
+    for index in 0..64 {
+        let path = root.path().join(format!("Unit{index:03}.pas"));
+        write_file(
+            &path,
+            &format!("unit Unit{index:03};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let request_id = RequestId::from("stale-workspace-diagnostic-partial".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/diagnostic",
+        json!({
+            "previousResultIds": [],
+            "partialResultToken": "stale-workspace-diagnostic-partial"
+        }),
+    );
+    let partial = server.notification("$/progress");
+    assert_eq!(partial["token"], "stale-workspace-diagnostic-partial");
+    assert!(
+        !partial["value"]["items"]
+            .as_array()
+            .expect("partial workspace diagnostic items")
+            .is_empty()
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&first),
+                "languageId": "pascal",
+                "version": 1,
+                "text": first_text
+            }
+        }),
+    );
+
+    let response = server.response(&request_id);
+    let error = response.error.expect("stale workspace partial must fail");
+    assert_eq!(error.code, -32802);
+    assert_eq!(error.data, Some(json!({"retriggerRequest": true})));
     server.shutdown();
 }
 

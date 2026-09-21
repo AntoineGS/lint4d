@@ -4374,7 +4374,17 @@ pub(crate) fn build_snapshot(
                         .bind_imports(&uri, std::iter::empty::<(String, Url)>());
                     continue;
                 }
-                let import_count = loader.index.imports(&uri).len();
+                // A case-insensitive duplicate names one provider, so it
+                // must not make an otherwise complete snapshot look partial.
+                // Organizer actions rely on this distinction when proving
+                // that an exact duplicate can be removed.
+                let import_count = loader
+                    .index
+                    .imports(&uri)
+                    .into_iter()
+                    .map(|import| import.name.trim_start_matches('&').to_ascii_lowercase())
+                    .collect::<HashSet<_>>()
+                    .len();
                 let dependencies =
                     loader.load_imports_with_cancel(&uri, &context_key, &mut pins, Some(cancel))?;
                 if dependencies.len() < import_count {

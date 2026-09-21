@@ -446,6 +446,32 @@ pub struct ImportMetadata {
     pub span: SourceSpan,
 }
 
+/// The source span of one parsed `uses` declaration.  The span includes the
+/// `uses` keyword and its terminating semicolon; callers that need to preserve
+/// trivia can use it as a boundary around the already-parsed import entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsesClauseMetadata {
+    pub(crate) span: SourceSpan,
+    pub(crate) interface: bool,
+}
+
+/// Facts needed before changing the relative order of imported units.
+///
+/// This is intentionally a source-backed proof, not a formatting preference.
+/// A caller may reorder only when the unit has no initialization/finalization
+/// side effects, no helpers, no unresolved dependency state, and its exported
+/// names do not conflict with another selected provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnitOrderSafety {
+    pub(crate) complete: bool,
+    pub(crate) has_initialization: bool,
+    pub(crate) has_finalization: bool,
+    pub(crate) has_helpers: bool,
+    pub(crate) exported_names: Vec<String>,
+    pub(crate) dependency_uris: Vec<Url>,
+    pub(crate) conditional_fingerprint: u64,
+}
+
 impl NavigationIndex {
     /// Construct an empty navigation index.
     pub fn new() -> Self {
@@ -666,6 +692,80 @@ impl NavigationIndex {
             .get(uri)
             .map(|document| document.imports.clone())
             .unwrap_or_default()
+    }
+
+    /// Return the parsed `uses` declaration boundaries for one document.
+    pub(crate) fn uses_clauses(&self, uri: &Url) -> Vec<UsesClauseMetadata> {
+        self.documents
+            .get(uri)
+            .map(|document| document.uses_clauses.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the project/provider binding selected for an imported unit.
+    ///
+    /// An explicit workspace binding is required for source actions.  The
+    /// fallback catalogue used by a standalone `NavigationIndex` is useful
+    /// for navigation, but it is not a sufficient identity proof for edits.
+    pub(crate) fn import_provider_uri(&self, uri: &Url, name: &str) -> Option<Url> {
+        self.documents
+            .get(uri)
+            .and_then(|document| document.import_bindings.as_ref())
+            .and_then(|bindings| bindings.get(&canonical_name(name)).cloned())
+    }
+
+    /// Return the source-backed facts used by conservative import ordering.
+    pub(crate) fn unit_order_safety(&self, uri: &Url) -> Option<UnitOrderSafety> {
+        let document = self.documents.get(uri)?;
+        let mut exported_names = Vec::new();
+        for index in &document.exported_symbol_indices {
+            let Some(symbol) = document.symbols.get(*index) else {
+                return Some(UnitOrderSafety {
+                    complete: false,
+                    has_initialization: document.has_initialization,
+                    has_finalization: document.has_finalization,
+                    has_helpers: !document.helpers.is_empty(),
+                    exported_names,
+                    dependency_uris: Vec::new(),
+                    conditional_fingerprint: document.conditional_context.fingerprint(),
+                });
+            };
+            if document
+                .conditional_unknown_symbols
+                .get(*index)
+                .copied()
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            exported_names.push(canonical_name(&symbol.key));
+        }
+        exported_names.sort();
+        exported_names.dedup();
+
+        let mut dependency_uris = Vec::new();
+        let mut complete = document.conditionals.complete
+            && document.conditionals.unknown_spans.is_empty()
+            && document.parser_recovery_spans.is_empty()
+            && document.unknown_imports.is_empty();
+        for import in &document.imports {
+            let Some(provider) = self.import_provider_uri(uri, &import.name) else {
+                complete = false;
+                continue;
+            };
+            if !dependency_uris.contains(&provider) {
+                dependency_uris.push(provider);
+            }
+        }
+        Some(UnitOrderSafety {
+            complete,
+            has_initialization: document.has_initialization,
+            has_finalization: document.has_finalization,
+            has_helpers: !document.helpers.is_empty(),
+            exported_names,
+            dependency_uris,
+            conditional_fingerprint: document.conditional_context.fingerprint(),
+        })
     }
 
     pub(crate) fn source_text(&self, uri: &Url) -> Option<&str> {
@@ -13673,6 +13773,7 @@ pub(crate) struct ParsedDocument {
     unit_display_name: String,
     interface_range: Option<Span>,
     implementation_range: Option<Span>,
+    uses_clauses: Vec<UsesClauseMetadata>,
     interface_uses: Vec<String>,
     implementation_uses: Vec<String>,
     imports: Vec<ImportMetadata>,
@@ -13688,6 +13789,8 @@ pub(crate) struct ParsedDocument {
     opaque_ranges: Vec<Span>,
     conditionals: ConditionalAnalysis,
     conditional_unknown_symbols: Vec<bool>,
+    has_initialization: bool,
+    has_finalization: bool,
     unknown_class_owners: HashSet<String>,
     known_non_class_owners: HashSet<String>,
     symbol_indices_by_scope_key: HashMap<(usize, String), Vec<usize>>,
@@ -13810,6 +13913,9 @@ impl Document {
 
         let mut module_names = Vec::new();
         let mut sections = Vec::new();
+        let mut uses_clauses = Vec::new();
+        let mut has_initialization = false;
+        let mut has_finalization = false;
         collect_nodes(root, &mut |node| {
             if node.kind() == "moduleName" {
                 module_names.push(node);
@@ -13817,6 +13923,18 @@ impl Document {
                 sections.push((Region::Interface, Span::from_node(node)));
             } else if node.kind() == "implementation" {
                 sections.push((Region::Implementation, Span::from_node(node)));
+            } else if node.kind() == "declUses" {
+                uses_clauses.push(UsesClauseMetadata {
+                    span: SourceSpan {
+                        start: node.start_byte(),
+                        end: node.end_byte(),
+                    },
+                    interface: region_for_node(node) == Region::Interface,
+                });
+            } else if node.kind() == "initialization" {
+                has_initialization = true;
+            } else if node.kind() == "finalization" {
+                has_finalization = true;
             }
         });
 
@@ -14092,6 +14210,7 @@ impl Document {
             unit_display_name,
             interface_range,
             implementation_range,
+            uses_clauses,
             interface_uses,
             implementation_uses,
             imports,
@@ -14107,6 +14226,8 @@ impl Document {
             opaque_ranges,
             conditionals,
             conditional_unknown_symbols,
+            has_initialization,
+            has_finalization,
             unknown_class_owners,
             known_non_class_owners,
             symbol_indices_by_scope_key,

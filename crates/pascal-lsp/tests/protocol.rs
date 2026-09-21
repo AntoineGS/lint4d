@@ -29301,6 +29301,186 @@ fn code_action_revalidates_a_single_constant_diagnostic_and_eagerly_shares_renam
 }
 
 #[test]
+fn source_action_organizes_equivalent_uses_without_reordering_bindings() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nimplementation\ninitialization\nend.\n",
+    );
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Beta, Alpha, alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let request_id = RequestId::from("organize-equivalent-uses".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            },
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let result = response.result.expect("organizeImports result");
+    let actions = result.as_array().expect("organizeImports actions");
+    assert_eq!(actions.len(), 1, "expected one source action: {actions:?}");
+    assert_eq!(actions[0]["title"], "Organize Imports");
+    assert_eq!(actions[0]["kind"], "source.organizeImports");
+    let edit = actions[0]["edit"].as_object().expect("eager source edit");
+    let updated = apply_workspace_edit_to_source(source, &json!(edit), &uri(&main));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses Beta, Alpha;\n",
+            "implementation\n",
+            "end.\n",
+        )
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_action_organize_imports_resolves_a_frozen_safe_ordering_proof() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Beta, Alpha, alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let request_id = RequestId::from("deferred-organize-imports".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            },
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let actions = response
+        .result
+        .expect("organizeImports result")
+        .as_array()
+        .expect("organizeImports actions")
+        .clone();
+    assert_eq!(actions.len(), 1);
+    assert!(actions[0]["edit"].is_null(), "action should be deferred");
+    assert!(
+        actions[0]["data"].is_object(),
+        "resolve identity is required"
+    );
+
+    let resolve_id = RequestId::from("resolve-organize-imports".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let resolved = server.response(&resolve_id);
+    assert!(resolved.error.is_none(), "resolve failed: {resolved:?}");
+    let resolved_action = resolved.result.expect("resolved action");
+    let updated = apply_workspace_edit_to_source(source, &resolved_action["edit"], &uri(&main));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses Alpha, Beta;\n",
+            "implementation\n",
+            "end.\n",
+        )
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_action_withholds_recovered_explicit_path_uses() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Alpha in 'Alpha.pas', alpha in 'Alpha.pas';\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let request_id = RequestId::from("withhold-recovered-path-uses".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            },
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(response.error.is_none(), "codeAction failed: {response:?}");
+    let result = response.result.expect("organizeImports result");
+    let actions = result.as_array().expect("organizeImports actions");
+    assert!(
+        actions.is_empty(),
+        "parser-recovery/path-qualified uses must be withheld: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn code_action_adds_a_unique_provider_unit_and_reanalysis_resolves_the_use() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

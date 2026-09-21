@@ -1447,6 +1447,28 @@ the actual resolved import are checked again for deferred resolve. A no-op
 buffer version change or unrelated overlay does not expire an otherwise
 unchanged action, while target/provider/project changes do.
 
+`source.organizeImports` is advertised as a separate source action. It removes
+only case-insensitive duplicates that resolve to the same source provider and
+have the same explicit `in 'path'` qualifier; it never removes an import merely
+because it appears unused. Relative alphabetical ordering is offered only when
+every selected provider is complete source, has no initialization/finalization
+section or helper, has no exported-name conflict, and has no dependency on
+another selected provider. Otherwise the original relative order is retained,
+while independently proven duplicates may still be removed. Interface and
+implementation `uses` clauses are planned independently and are never merged.
+
+The organizer preserves the clause's original text outside the changed unit
+names/delimiters, including LF/CRLF, indentation, BOM/non-BMP text, and path
+spelling. Conditional/compiler-directive clauses, comments, include or
+multi-root provenance, parser recovery, malformed layouts, unresolved or
+ambiguous providers, and incomplete discovery are withheld rather than
+rewritten; this deliberately supported subset avoids moving trivia across a
+structural boundary. The action is idempotent and is returned only when a
+proven edit exists. Clients with code-action data/resolve support receive a
+deferred action and the server rechecks the exact clause hashes, provider
+identity/source hashes, conditional and ordering proof, configuration, source,
+and negative discovery observations. Other clients receive an eager edit.
+
 ## Limits
 
 | Initialization option | Default and maximum |
@@ -1511,6 +1533,9 @@ at most 2,048 items and 8 MiB in one server session, with compact dependency
 observations capped at 1,024 records and 2 MiB. Resolve data is capped at 512
 bytes per item and retained completion items at 64 KiB; oldest entries are
 evicted to stay within the bounds.
+Organize-imports planning is capped at 64 `uses` clauses, 512 entries, 64 KiB
+per clause, and 64 KiB of generated edit text in one request. Its serialized
+code-action response remains subject to the shared 64 KiB response bound.
 Missing-unit discovery, absence checking, and every post-edit binding proof
 share one request-wide budget of 300,000 bounded work units and 8 MiB of
 charged source bytes. The request returns at most 32 provider actions and the

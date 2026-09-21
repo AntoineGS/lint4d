@@ -13,7 +13,7 @@ use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
     AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
     MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
-    MissingUnitCandidate, MissingUnitUseKind, SemanticDiagnosticKind,
+    MissingUnitCandidate, MissingUnitUseKind, SemanticDiagnosticKind, UnitOrderSafety,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -31,6 +31,7 @@ use pascal_project::{has_invalid_project_selection, project_candidates};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
@@ -47,6 +48,14 @@ const METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-method";
 const METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-interface-method";
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
+const ORGANIZE_IMPORTS_ACTION_KIND: &str = "organize-imports";
+const ORGANIZE_IMPORTS_ACTION_DATA_VERSION: u8 = 1;
+const ORGANIZE_IMPORTS_CODE_ACTION_KIND: CodeActionKind =
+    CodeActionKind::new("source.organizeImports");
+const MAX_ORGANIZE_IMPORTS_CLAUSES: usize = 64;
+const MAX_ORGANIZE_IMPORTS_ENTRIES: usize = 512;
+const MAX_ORGANIZE_IMPORTS_CLAUSE_BYTES: usize = 64 * 1024;
+const MAX_ORGANIZE_IMPORTS_EDIT_BYTES: usize = 64 * 1024;
 const INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("quickfix.implement-interface-method");
 const CONSTANT_RULE: &str = "constant-naming";
@@ -153,6 +162,52 @@ pub(crate) struct InterfaceMethodImplementationActionData {
     pub(crate) source_hash: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OrganizeImportsActionData {
+    pub(crate) version: u8,
+    pub(crate) action_id: String,
+    pub(crate) kind: String,
+    pub(crate) uri: Url,
+    pub(crate) clauses: Vec<OrganizeImportsClauseIdentity>,
+    pub(crate) providers: Vec<OrganizeImportsProviderIdentity>,
+    #[serde(with = "decimal_u64")]
+    pub(crate) ordering_proof: u64,
+    pub(crate) discovery_complete: bool,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) configuration_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) config_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_hash: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OrganizeImportsClauseIdentity {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) interface: bool,
+    #[serde(with = "decimal_u64")]
+    pub(crate) input_hash: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) output_hash: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OrganizeImportsProviderIdentity {
+    pub(crate) uri: Url,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_hash: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) conditional_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) safety_fingerprint: u64,
+}
+
 mod decimal_u64 {
     use super::*;
 
@@ -217,11 +272,24 @@ struct InterfaceMethodImplementationPlan {
 }
 
 #[derive(Debug, Clone)]
+struct OrganizeImportsPlan {
+    uri: Url,
+    source_hash: u64,
+    config_fingerprint: u64,
+    clauses: Vec<OrganizeImportsClauseIdentity>,
+    providers: Vec<OrganizeImportsProviderIdentity>,
+    ordering_proof: u64,
+    discovery_complete: bool,
+    edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Clone)]
 enum ParsedActionData {
     Rename(RenameActionData),
     MissingUnit(MissingUnitActionData),
     MethodImplementation(MethodImplementationActionData),
     InterfaceMethodImplementation(InterfaceMethodImplementationActionData),
+    OrganizeImports(OrganizeImportsActionData),
 }
 
 struct CandidateRequest<'a> {
@@ -250,7 +318,8 @@ pub(crate) fn code_actions_from_input(
     let configuration_generation = input.configuration_generation;
     let requests_quickfix = requests_quickfix(&params.context);
     let requests_interface_method = requests_interface_method(&params.context);
-    if !requests_quickfix && !requests_interface_method {
+    let requests_organize_imports = requests_organize_imports(&params.context);
+    if !requests_quickfix && !requests_interface_method && !requests_organize_imports {
         return Computed {
             source_generation,
             configuration_generation,
@@ -355,6 +424,22 @@ pub(crate) fn code_actions_from_input(
     } else {
         (Vec::new(), Vec::new())
     };
+    let (organize_imports_plan, organize_imports_records) = if requests_organize_imports {
+        match organize_imports_plan_from_input(
+            &input,
+            &uri,
+            &source,
+            &target_record,
+            config_fingerprint,
+            &configuration_records,
+            cancel,
+        ) {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    } else {
+        (None, Vec::new())
+    };
     if features.resolve {
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
         for candidate in &candidates {
@@ -454,6 +539,28 @@ pub(crate) fn code_actions_from_input(
                 Err(error) => return failed(source_generation, configuration_generation, error),
             }
         }
+        if let Some(plan) = &organize_imports_plan {
+            let data =
+                OrganizeImportsActionData::new(plan, source_generation, configuration_generation);
+            let action = CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Organize Imports".to_string(),
+                kind: Some(ORGANIZE_IMPORTS_CODE_ACTION_KIND),
+                diagnostics: None,
+                edit: None,
+                command: None,
+                is_preferred: Some(true),
+                disabled: None,
+                data: Some(
+                    serde_json::to_value(&data)
+                        .expect("organize imports action data is serializable"),
+                ),
+            });
+            match push_bounded_code_action(&mut actions, action) {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
         return Computed {
             source_generation,
             configuration_generation,
@@ -463,6 +570,7 @@ pub(crate) fn code_actions_from_input(
                 append_records(&mut records, missing_records);
                 append_records(&mut records, method_records);
                 append_records(&mut records, interface_method_records);
+                append_records(&mut records, organize_imports_records);
                 append_records(&mut records, configuration_records);
                 records
             },
@@ -688,10 +796,61 @@ pub(crate) fn code_actions_from_input(
             Err(error) => return failed(source_generation, configuration_generation, error),
         }
     }
+    if let Some(plan) = &organize_imports_plan {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let data =
+            OrganizeImportsActionData::new(plan, source_generation, configuration_generation);
+        let mut action = CodeAction {
+            title: "Organize Imports".to_string(),
+            kind: Some(ORGANIZE_IMPORTS_CODE_ACTION_KIND),
+            diagnostics: None,
+            edit: None,
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: Some(
+                serde_json::to_value(&data).expect("organize imports action data is serializable"),
+            ),
+        };
+        if !features.resolve {
+            let mut raw_edits = HashMap::new();
+            raw_edits.insert(uri.clone(), plan.edits.clone());
+            let mut records_by_uri = HashMap::new();
+            records_by_uri.insert(uri.clone(), target_record.clone());
+            match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+                Ok(edit) => action.edit = Some(edit),
+                Err(error) => {
+                    if !set_disabled_or_skip(&mut action, features.disabled, error) {
+                        // An eager source action without a negotiated disabled
+                        // form must be withheld rather than returned without
+                        // an applicable edit.
+                        return Computed {
+                            source_generation,
+                            configuration_generation,
+                            value: Ok(actions),
+                            records: {
+                                let mut records = organize_imports_records.clone();
+                                append_records(&mut records, configuration_records);
+                                records
+                            },
+                        };
+                    }
+                }
+            }
+        }
+        match push_bounded_code_action(&mut actions, CodeActionOrCommand::CodeAction(action)) {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    }
     let mut records = snapshot_records(&snapshot);
     append_records(&mut records, missing_records);
     append_records(&mut records, method_records);
     append_records(&mut records, interface_method_records);
+    append_records(&mut records, organize_imports_records);
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -1018,6 +1177,617 @@ fn interface_method_implementation_plans_from_input(
         return Ok((Vec::new(), Vec::new()));
     }
     Ok((plans, snapshot_records(&snapshot)))
+}
+
+#[derive(Debug, Clone)]
+struct OrganizeImportsEntry {
+    name: String,
+    name_start: usize,
+    name_end: usize,
+    end: usize,
+    path: Option<String>,
+    preceding_comma: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedOrganizeImportsClause {
+    start: usize,
+    end: usize,
+    interface: bool,
+    entries: Vec<OrganizeImportsEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct OrganizeImportsProvider {
+    uri: Url,
+    source_hash: u64,
+    safety: UnitOrderSafety,
+}
+
+/// Plan the conservative source action from one complete workspace snapshot.
+///
+/// The parser intentionally accepts only a small, trivia-free uses-clause
+/// subset.  Refusing a clause with comments, directives, recovery, or an
+/// ambiguous provider is preferable to manufacturing an edit that changes
+/// Pascal visibility or compiler semantics.
+#[allow(clippy::too_many_arguments)]
+fn organize_imports_plan_from_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    config_fingerprint: u64,
+    configuration_records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(Option<OrganizeImportsPlan>, Vec<SourceRecord>), String> {
+    if may_contain_include_directive(source.as_bytes()) {
+        return Ok((None, Vec::new()));
+    }
+
+    let snapshot = match build_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        &[],
+        SnapshotMode::Workspace,
+        Some(
+            SnapshotSeed::new(target_record.clone())
+                .with_consumed_configuration(configuration_records),
+        ),
+        &[],
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) if is_cancelled(cancel) => return Err(error),
+        // Source actions are optional assistance.  An incomplete project or
+        // unreadable provider must suppress the action, not turn an otherwise
+        // valid code-action request into a protocol error.
+        Err(_) => return Ok((None, Vec::new())),
+    };
+    if !snapshot.complete
+        || !snapshot.include_errors.is_empty()
+        || !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|indexed| indexed != source)
+    {
+        return Ok((None, Vec::new()));
+    }
+
+    let Some(target_safety) = snapshot.index.unit_order_safety(uri) else {
+        return Ok((None, Vec::new()));
+    };
+    if !target_safety.complete {
+        return Ok((None, Vec::new()));
+    }
+
+    let clauses = snapshot.index.uses_clauses(uri);
+    if clauses.is_empty() || clauses.len() > MAX_ORGANIZE_IMPORTS_CLAUSES {
+        return Ok((None, Vec::new()));
+    }
+
+    let mut total_entries = 0usize;
+    let mut edits = Vec::new();
+    let mut identities = Vec::new();
+    let mut providers = HashMap::<Url, OrganizeImportsProviderIdentity>::new();
+
+    for clause in clauses {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if clause.span.end.saturating_sub(clause.span.start) > MAX_ORGANIZE_IMPORTS_CLAUSE_BYTES {
+            continue;
+        }
+        let Some(parsed) = parse_organize_imports_clause(
+            source,
+            clause.span.start,
+            clause.span.end,
+            clause.interface,
+        ) else {
+            continue;
+        };
+        total_entries = total_entries.saturating_add(parsed.entries.len());
+        if total_entries > MAX_ORGANIZE_IMPORTS_ENTRIES {
+            return Ok((None, Vec::new()));
+        }
+
+        let (clause_edits, clause_providers) =
+            organize_clause_edits(source, &parsed, &snapshot.index, uri, cancel)?;
+        if clause_edits.is_empty() {
+            continue;
+        }
+        let Some(output) = apply_organize_clause_edits(source, &parsed, &clause_edits) else {
+            continue;
+        };
+        let input_text = source.get(parsed.start..parsed.end).unwrap_or_default();
+        identities.push(OrganizeImportsClauseIdentity {
+            start: parsed.start,
+            end: parsed.end,
+            interface: parsed.interface,
+            input_hash: source_hash(input_text),
+            output_hash: source_hash(&output),
+        });
+        for provider in clause_providers {
+            let identity = organize_provider_identity(&provider);
+            providers.entry(provider.uri.clone()).or_insert(identity);
+        }
+        edits.extend(clause_edits);
+    }
+
+    if edits.is_empty() || identities.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    if !organize_edits_are_bounded_and_disjoint(source, &edits) {
+        return Ok((None, Vec::new()));
+    }
+    let edit_bytes = edits
+        .iter()
+        .map(|edit| edit.new_text.len())
+        .fold(0usize, usize::saturating_add);
+    if edit_bytes > MAX_ORGANIZE_IMPORTS_EDIT_BYTES {
+        return Ok((None, Vec::new()));
+    }
+    edits.sort_by(|left, right| {
+        left.range
+            .start
+            .cmp(&right.range.start)
+            .then_with(|| left.range.end.cmp(&right.range.end))
+            .then_with(|| left.new_text.cmp(&right.new_text))
+    });
+
+    identities.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+    });
+    let mut provider_identities = providers.into_values().collect::<Vec<_>>();
+    provider_identities.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+    let ordering_proof = organize_ordering_proof(&identities, &provider_identities);
+    let plan = OrganizeImportsPlan {
+        uri: uri.clone(),
+        source_hash: source_hash(source),
+        config_fingerprint,
+        clauses: identities,
+        providers: provider_identities,
+        ordering_proof,
+        discovery_complete: snapshot.complete,
+        edits,
+    };
+    Ok((Some(plan), snapshot_records(&snapshot)))
+}
+
+fn parse_organize_imports_clause(
+    source: &str,
+    start: usize,
+    end: usize,
+    interface: bool,
+) -> Option<ParsedOrganizeImportsClause> {
+    if start >= end
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
+    {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut cursor = start;
+    while cursor < end && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if !source_keyword_at(source, cursor, end, "uses") {
+        return None;
+    }
+    cursor += "uses".len();
+    while cursor < end && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    let mut semicolon = end;
+    while semicolon > cursor && bytes[semicolon - 1].is_ascii_whitespace() {
+        semicolon -= 1;
+    }
+    if semicolon == cursor || bytes.get(semicolon.saturating_sub(1)) != Some(&b';') {
+        return None;
+    }
+    semicolon -= 1;
+
+    let mut entries = Vec::new();
+    let mut preceding_comma = None;
+    while cursor < semicolon {
+        while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= semicolon {
+            return None;
+        }
+        let name_start = cursor;
+        let name_end = organize_identifier_end(source, cursor, semicolon)?;
+        let name = source.get(name_start..name_end)?.to_string();
+        if name.is_empty() || name.eq_ignore_ascii_case("in") {
+            return None;
+        }
+        cursor = name_end;
+        while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        let mut path = None;
+        let mut entry_end = name_end;
+        if source_keyword_at(source, cursor, semicolon, "in") {
+            cursor += "in".len();
+            while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let quote = *bytes.get(cursor)?;
+            if quote != b'\'' && quote != b'"' {
+                return None;
+            }
+            let path_start = cursor;
+            cursor = quoted_string_end(bytes, cursor, semicolon, quote)?;
+            entry_end = cursor;
+            path = Some(source.get(path_start..entry_end)?.to_string());
+        }
+        entries.push(OrganizeImportsEntry {
+            name,
+            name_start,
+            name_end,
+            end: entry_end,
+            path,
+            preceding_comma,
+        });
+        if entries.len() > MAX_ORGANIZE_IMPORTS_ENTRIES {
+            return None;
+        }
+
+        while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == semicolon {
+            break;
+        }
+        match bytes.get(cursor).copied() {
+            Some(b',') => {
+                preceding_comma = Some(cursor);
+                cursor += 1;
+            }
+            _ => return None,
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(ParsedOrganizeImportsClause {
+        start,
+        end,
+        interface,
+        entries,
+    })
+}
+
+fn organize_identifier_end(source: &str, start: usize, limit: usize) -> Option<usize> {
+    let mut end = start;
+    for (offset, character) in source.get(start..limit)?.char_indices() {
+        if character.is_alphanumeric() || matches!(character, '_' | '&' | '.') {
+            end = start
+                .saturating_add(offset)
+                .saturating_add(character.len_utf8());
+        } else {
+            break;
+        }
+    }
+    (end > start).then_some(end)
+}
+
+fn source_keyword_at(source: &str, start: usize, limit: usize, keyword: &str) -> bool {
+    let Some(candidate) = source.get(start..limit) else {
+        return false;
+    };
+    if candidate.len() < keyword.len() || !candidate[..keyword.len()].eq_ignore_ascii_case(keyword)
+    {
+        return false;
+    }
+    let after = start.saturating_add(keyword.len());
+    if after >= limit {
+        return true;
+    }
+    let next = source.as_bytes()[after];
+    next.is_ascii_whitespace() || matches!(next, b',' | b';')
+}
+
+fn quoted_string_end(bytes: &[u8], start: usize, limit: usize, quote: u8) -> Option<usize> {
+    let mut cursor = start.saturating_add(1);
+    while cursor < limit {
+        if bytes[cursor] != quote {
+            cursor += 1;
+            continue;
+        }
+        if cursor.saturating_add(1) < limit && bytes[cursor + 1] == quote {
+            cursor += 2;
+        } else {
+            return Some(cursor + 1);
+        }
+    }
+    None
+}
+
+fn organize_clause_edits(
+    source: &str,
+    clause: &ParsedOrganizeImportsClause,
+    navigation_index: &crate::NavigationIndex,
+    target_uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<(Vec<TextEdit>, Vec<OrganizeImportsProvider>), String> {
+    let mut bindings = Vec::with_capacity(clause.entries.len());
+    for entry in &clause.entries {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        bindings.push(organize_import_provider(
+            navigation_index,
+            target_uri,
+            entry,
+        ));
+    }
+
+    let mut removed = HashSet::new();
+    let mut seen = HashMap::<(Option<String>, Url), usize>::new();
+    for (entry_index, (entry, provider)) in clause.entries.iter().zip(bindings.iter()).enumerate() {
+        let Some(provider) = provider else {
+            continue;
+        };
+        if !provider.safety.complete {
+            continue;
+        }
+        // Provider identity, rather than spelling, is the deduplication key:
+        // it covers case-folding and project namespace aliases.  An explicit
+        // path remains part of the key because two paths can deliberately
+        // select different source identities even when the unit name agrees.
+        let key = (entry.path.clone(), provider.uri.clone());
+        if seen.insert(key, entry_index).is_some() {
+            removed.insert(entry_index);
+        }
+    }
+
+    let survivors = clause
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| (!removed.contains(&index)).then_some(index))
+        .collect::<Vec<_>>();
+    let can_reorder = survivors.len() > 1
+        && survivors.iter().all(|index| {
+            clause.entries[*index].path.is_none()
+                && bindings[*index].as_ref().is_some_and(|provider| {
+                    provider.safety.complete
+                        && !provider.safety.has_initialization
+                        && !provider.safety.has_finalization
+                        && !provider.safety.has_helpers
+                        && !may_contain_include_directive(
+                            navigation_index
+                                .source_text(&provider.uri)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        )
+                })
+        })
+        && selected_provider_order_is_safe(&survivors, &bindings);
+
+    let mut edits = Vec::new();
+    for index in removed.iter().copied() {
+        let entry = &clause.entries[index];
+        let Some(start) = entry.preceding_comma else {
+            continue;
+        };
+        let Some(edit) = organize_byte_edit(source, start, entry.end, String::new()) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        edits.push(edit);
+    }
+
+    if can_reorder {
+        let mut ordered = survivors.clone();
+        ordered.sort_by(|left, right| {
+            organize_name_key(&clause.entries[*left].name)
+                .cmp(&organize_name_key(&clause.entries[*right].name))
+                .then_with(|| left.cmp(right))
+        });
+        for (slot, desired) in survivors.iter().zip(ordered.iter()) {
+            let current = &clause.entries[*slot];
+            let replacement = &clause.entries[*desired].name;
+            if current.name == *replacement {
+                continue;
+            }
+            let Some(edit) = organize_byte_edit(
+                source,
+                current.name_start,
+                current.name_end,
+                replacement.clone(),
+            ) else {
+                return Ok((Vec::new(), Vec::new()));
+            };
+            edits.push(edit);
+        }
+    }
+
+    if edits.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let providers = clause
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(entry_index, _)| {
+            removed.contains(entry_index) || can_reorder && survivors.contains(entry_index)
+        })
+        .filter_map(|(entry_index, _)| bindings[entry_index].clone())
+        .collect::<Vec<_>>();
+    Ok((edits, providers))
+}
+
+fn organize_import_provider(
+    index: &crate::NavigationIndex,
+    target_uri: &Url,
+    entry: &OrganizeImportsEntry,
+) -> Option<OrganizeImportsProvider> {
+    let uri = index.import_provider_uri(target_uri, &entry.name)?;
+    let source = index.source_text(&uri)?;
+    if may_contain_include_directive(source.as_bytes()) {
+        return None;
+    }
+    let safety = index.unit_order_safety(&uri)?;
+    Some(OrganizeImportsProvider {
+        uri,
+        source_hash: source_hash(source),
+        safety,
+    })
+}
+
+fn selected_provider_order_is_safe(
+    selected: &[usize],
+    bindings: &[Option<OrganizeImportsProvider>],
+) -> bool {
+    for (left_offset, left_index) in selected.iter().enumerate() {
+        let Some(left) = bindings[*left_index].as_ref() else {
+            return false;
+        };
+        for right_index in selected.iter().skip(left_offset + 1) {
+            let Some(right) = bindings[*right_index].as_ref() else {
+                return false;
+            };
+            if left
+                .safety
+                .exported_names
+                .iter()
+                .any(|name| right.safety.exported_names.binary_search(name).is_ok())
+                || left.safety.dependency_uris.contains(&right.uri)
+                || right.safety.dependency_uris.contains(&left.uri)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn organize_name_key(name: &str) -> String {
+    name.trim_start_matches('&').to_ascii_lowercase()
+}
+
+fn organize_byte_edit(
+    source: &str,
+    start: usize,
+    end: usize,
+    new_text: String,
+) -> Option<TextEdit> {
+    if start > end
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
+    {
+        return None;
+    }
+    Some(TextEdit::new(
+        Range::new(
+            text::offset_to_position(source, start)?,
+            text::offset_to_position(source, end)?,
+        ),
+        new_text,
+    ))
+}
+
+fn apply_organize_clause_edits(
+    source: &str,
+    clause: &ParsedOrganizeImportsClause,
+    edits: &[TextEdit],
+) -> Option<String> {
+    let mut byte_edits = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let start = text::position_to_offset(source, edit.range.start)?;
+        let end = text::position_to_offset(source, edit.range.end)?;
+        if start < clause.start || end > clause.end || start > end {
+            return None;
+        }
+        byte_edits.push((start, end, edit.new_text.as_str()));
+    }
+    byte_edits.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    if byte_edits.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return None;
+    }
+    let mut output = source.get(clause.start..clause.end)?.to_string();
+    byte_edits.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    for (start, end, replacement) in byte_edits {
+        output.replace_range(
+            start.saturating_sub(clause.start)..end.saturating_sub(clause.start),
+            replacement,
+        );
+    }
+    Some(output)
+}
+
+fn organize_edits_are_bounded_and_disjoint(source: &str, edits: &[TextEdit]) -> bool {
+    let mut ranges = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let Some(start) = text::position_to_offset(source, edit.range.start) else {
+            return false;
+        };
+        let Some(end) = text::position_to_offset(source, edit.range.end) else {
+            return false;
+        };
+        if start > end {
+            return false;
+        }
+        ranges.push((start, end));
+    }
+    ranges.sort_unstable();
+    !ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
+}
+
+fn organize_provider_identity(
+    provider: &OrganizeImportsProvider,
+) -> OrganizeImportsProviderIdentity {
+    OrganizeImportsProviderIdentity {
+        uri: provider.uri.clone(),
+        source_hash: provider.source_hash,
+        conditional_fingerprint: provider.safety.conditional_fingerprint,
+        safety_fingerprint: organize_safety_fingerprint(&provider.uri, &provider.safety),
+    }
+}
+
+fn organize_safety_fingerprint(uri: &Url, safety: &UnitOrderSafety) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    uri.hash(&mut hasher);
+    safety.complete.hash(&mut hasher);
+    safety.has_initialization.hash(&mut hasher);
+    safety.has_finalization.hash(&mut hasher);
+    safety.has_helpers.hash(&mut hasher);
+    safety.conditional_fingerprint.hash(&mut hasher);
+    for name in &safety.exported_names {
+        name.hash(&mut hasher);
+    }
+    for dependency in &safety.dependency_uris {
+        dependency.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn organize_ordering_proof(
+    clauses: &[OrganizeImportsClauseIdentity],
+    providers: &[OrganizeImportsProviderIdentity],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for clause in clauses {
+        clause.start.hash(&mut hasher);
+        clause.end.hash(&mut hasher);
+        clause.interface.hash(&mut hasher);
+        clause.input_hash.hash(&mut hasher);
+        clause.output_hash.hash(&mut hasher);
+    }
+    for provider in providers {
+        provider.uri.hash(&mut hasher);
+        provider.source_hash.hash(&mut hasher);
+        provider.conditional_fingerprint.hash(&mut hasher);
+        provider.safety_fingerprint.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn method_candidate_identity_is_bounded(
@@ -1639,6 +2409,9 @@ pub(crate) fn resolve_from_input(
                 input, action, data, features, cancel,
             );
         }
+        ParsedActionData::OrganizeImports(data) => {
+            return resolve_organize_imports_from_input(input, action, data, features, cancel);
+        }
         ParsedActionData::Rename(data) => data,
     };
     if let Err(error) =
@@ -2259,6 +3032,126 @@ fn resolve_interface_method_implementation_from_input(
     }
 }
 
+fn resolve_organize_imports_from_input(
+    input: WorkspaceInput,
+    action: CodeAction,
+    data: OrganizeImportsActionData,
+    features: ClientActionFeatures,
+    cancel: &AtomicBool,
+) -> Computed<CodeAction> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if let Err(error) = validate_organize_imports_action_data(
+        &data,
+        &action,
+        source_generation,
+        configuration_generation,
+    ) {
+        return failed(source_generation, configuration_generation, error);
+    }
+
+    let target_uri = canonical_file_uri(&data.uri);
+    let (target_source, target_record) =
+        match source_for_input_with_cancel(&input, &target_uri, Some(cancel)) {
+            Ok(source) => source,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if !input_source_is_editable(&input, &target_uri) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("code-action document is outside configured workspace roots: {target_uri}"),
+        );
+    }
+    if source_hash(&target_source) != data.source_hash {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source changed; request code actions again".to_string(),
+        );
+    }
+    let (_config, config_fingerprint, excluded, configuration_records) =
+        match lint_configuration_for_input(&input, &target_uri) {
+            Ok(config) => config,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if excluded {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source is excluded by lint configuration".to_string(),
+        );
+    }
+    if config_fingerprint != data.config_fingerprint {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action configuration is stale; request code actions again".to_string(),
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let (plan, plan_records) = match organize_imports_plan_from_input(
+        &input,
+        &target_uri,
+        &target_source,
+        &target_record,
+        config_fingerprint,
+        &configuration_records,
+        cancel,
+    ) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let Some(plan) = plan else {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "organize-imports proof is stale; request code actions again".to_string(),
+        );
+    };
+    if plan.uri != target_uri
+        || plan.source_hash != data.source_hash
+        || plan.config_fingerprint != data.config_fingerprint
+        || plan.clauses != data.clauses
+        || plan.providers != data.providers
+        || plan.ordering_proof != data.ordering_proof
+        || plan.discovery_complete != data.discovery_complete
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "organize-imports binding or ordering proof is stale; request code actions again"
+                .to_string(),
+        );
+    }
+
+    let mut raw_edits = HashMap::new();
+    raw_edits.insert(target_uri.clone(), plan.edits);
+    let mut records_by_uri = HashMap::new();
+    records_by_uri.insert(target_uri, target_record);
+    let edit = match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+        Ok(edit) => edit,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let mut resolved = action;
+    resolved.edit = Some(edit);
+    resolved.disabled = None;
+    if let Err(error) = ensure_bounded_resolved_action(&resolved) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    let mut records = plan_records;
+    append_records(&mut records, configuration_records);
+    Computed {
+        source_generation,
+        configuration_generation,
+        value: Ok(resolved),
+        records,
+    }
+}
+
 fn failed<T>(source_generation: u64, configuration_generation: u64, error: String) -> Computed<T> {
     Computed {
         source_generation,
@@ -2350,6 +3243,14 @@ fn requests_interface_method(context: &CodeActionContext) -> bool {
         kinds.iter().any(|kind| {
             code_action_kind_contains(kind, &INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND)
         })
+    })
+}
+
+fn requests_organize_imports(context: &CodeActionContext) -> bool {
+    context.only.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| code_action_kind_contains(kind, &ORGANIZE_IMPORTS_CODE_ACTION_KIND))
     })
 }
 
@@ -2844,6 +3745,31 @@ impl InterfaceMethodImplementationActionData {
     }
 }
 
+impl OrganizeImportsActionData {
+    fn new(
+        plan: &OrganizeImportsPlan,
+        source_generation: u64,
+        configuration_generation: u64,
+    ) -> Self {
+        let mut data = Self {
+            version: ORGANIZE_IMPORTS_ACTION_DATA_VERSION,
+            action_id: String::new(),
+            kind: ORGANIZE_IMPORTS_ACTION_KIND.to_string(),
+            uri: plan.uri.clone(),
+            clauses: plan.clauses.clone(),
+            providers: plan.providers.clone(),
+            ordering_proof: plan.ordering_proof,
+            discovery_complete: plan.discovery_complete,
+            source_generation,
+            configuration_generation,
+            config_fingerprint: plan.config_fingerprint,
+            source_hash: plan.source_hash,
+        };
+        data.action_id = organize_imports_action_id(&data);
+        data
+    }
+}
+
 fn action_id(data: &RenameActionData) -> String {
     let mut hasher = DefaultHasher::new();
     data.version.hash(&mut hasher);
@@ -2939,6 +3865,33 @@ fn interface_method_implementation_action_id(
     format!("pascal-lsp:{:016x}", hasher.finish())
 }
 
+fn organize_imports_action_id(data: &OrganizeImportsActionData) -> String {
+    let mut hasher = DefaultHasher::new();
+    data.version.hash(&mut hasher);
+    data.kind.hash(&mut hasher);
+    data.uri.hash(&mut hasher);
+    for clause in &data.clauses {
+        clause.start.hash(&mut hasher);
+        clause.end.hash(&mut hasher);
+        clause.interface.hash(&mut hasher);
+        clause.input_hash.hash(&mut hasher);
+        clause.output_hash.hash(&mut hasher);
+    }
+    for provider in &data.providers {
+        provider.uri.hash(&mut hasher);
+        provider.source_hash.hash(&mut hasher);
+        provider.conditional_fingerprint.hash(&mut hasher);
+        provider.safety_fingerprint.hash(&mut hasher);
+    }
+    data.ordering_proof.hash(&mut hasher);
+    data.discovery_complete.hash(&mut hasher);
+    data.source_generation.hash(&mut hasher);
+    data.configuration_generation.hash(&mut hasher);
+    data.config_fingerprint.hash(&mut hasher);
+    data.source_hash.hash(&mut hasher);
+    format!("pascal-lsp:{:016x}", hasher.finish())
+}
+
 fn source_hash(source: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
@@ -2949,7 +3902,32 @@ fn parse_action_data(value: Option<&Value>) -> Result<ParsedActionData, String> 
     let Some(value) = value else {
         return Err("code action has no resolve data".to_string());
     };
-    if value.get("kind").and_then(Value::as_str)
+    if value.get("kind").and_then(Value::as_str) == Some(ORGANIZE_IMPORTS_ACTION_KIND) {
+        let mut data: OrganizeImportsActionData = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid organize-imports resolve data: {error}"))?;
+        data.uri = canonical_file_uri(&data.uri);
+        if data.action_id.len() > MAX_ACTION_ID_BYTES
+            || data.uri.as_str().len() > MAX_ACTION_URI_BYTES
+            || data.clauses.len() > MAX_ORGANIZE_IMPORTS_CLAUSES
+            || data.providers.len() > MAX_ORGANIZE_IMPORTS_ENTRIES
+        {
+            return Err(
+                "organize-imports resolve data exceeds its bounded identity limits".to_string(),
+            );
+        }
+        for clause in &data.clauses {
+            if clause.start > clause.end {
+                return Err("organize-imports clause identity has an invalid span".to_string());
+            }
+        }
+        for provider in &mut data.providers {
+            provider.uri = canonical_file_uri(&provider.uri);
+            if provider.uri.as_str().len() > MAX_ACTION_URI_BYTES {
+                return Err("organize-imports provider identity exceeds its URI limit".to_string());
+            }
+        }
+        Ok(ParsedActionData::OrganizeImports(data))
+    } else if value.get("kind").and_then(Value::as_str)
         == Some(INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND)
     {
         let mut data: InterfaceMethodImplementationActionData =
@@ -3143,6 +4121,38 @@ fn validate_interface_method_implementation_action_data(
             "interface method implementation action identity was modified by the client"
                 .to_string(),
         );
+    }
+    if action.data.as_ref().is_none_or(|value| value.is_null()) {
+        return Err("code action resolve data is missing".to_string());
+    }
+    Ok(())
+}
+
+fn validate_organize_imports_action_data(
+    data: &OrganizeImportsActionData,
+    action: &CodeAction,
+    source_generation: u64,
+    configuration_generation: u64,
+) -> Result<(), String> {
+    if data.version != ORGANIZE_IMPORTS_ACTION_DATA_VERSION
+        || data.kind != ORGANIZE_IMPORTS_ACTION_KIND
+        || data.action_id != organize_imports_action_id(data)
+        || data.source_generation != source_generation
+        || data.configuration_generation != configuration_generation
+    {
+        return Err("organize-imports resolve data is stale or tampered".to_string());
+    }
+    if data.uri.as_str().len() > MAX_ACTION_URI_BYTES
+        || data.clauses.is_empty()
+        || data.clauses.len() > MAX_ORGANIZE_IMPORTS_CLAUSES
+        || data.providers.len() > MAX_ORGANIZE_IMPORTS_ENTRIES
+    {
+        return Err("organize-imports action identity is invalid".to_string());
+    }
+    if action.title != "Organize Imports"
+        || action.kind.as_ref() != Some(&ORGANIZE_IMPORTS_CODE_ACTION_KIND)
+    {
+        return Err("organize-imports code action identity was modified by the client".to_string());
     }
     if action.data.as_ref().is_none_or(|value| value.is_null()) {
         return Err("code action resolve data is missing".to_string());

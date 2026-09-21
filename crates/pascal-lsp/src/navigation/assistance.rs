@@ -5679,25 +5679,55 @@ fn specialized_routine_signature_label(
         let Some(span) = parameter.type_span else {
             continue;
         };
-        let Some(text) = specialized_type_text(
+        let rendered = specialized_type_text(
             index,
             symbol,
+            &document.source,
+            None,
+            None,
             parameter.type_ref.as_ref(),
             substitution,
             cancel,
             budget,
-        )?
-        else {
-            continue;
+        )?;
+        match rendered {
+            SpecializedTypeText::Unchanged => {}
+            SpecializedTypeText::Replaced(text) => {
+                replacements.push(LabelReplacement { span, text });
+            }
+            SpecializedTypeText::Unsupported => {
+                return Ok(Some(SpecializedRoutineSignature {
+                    label,
+                    label_start,
+                    parameter_spans,
+                }));
+            }
         };
-        replacements.push(LabelReplacement { span, text });
     }
     if let (Some(span), Some(type_ref)) = (symbol.result_type_span, symbol.result_type_ref.as_ref())
     {
-        if let Some(text) =
-            specialized_type_text(index, symbol, Some(type_ref), substitution, cancel, budget)?
-        {
-            replacements.push(LabelReplacement { span, text });
+        match specialized_type_text(
+            index,
+            symbol,
+            &document.source,
+            None,
+            None,
+            Some(type_ref),
+            substitution,
+            cancel,
+            budget,
+        )? {
+            SpecializedTypeText::Unchanged => {}
+            SpecializedTypeText::Replaced(text) => {
+                replacements.push(LabelReplacement { span, text });
+            }
+            SpecializedTypeText::Unsupported => {
+                return Ok(Some(SpecializedRoutineSignature {
+                    label,
+                    label_start,
+                    parameter_spans,
+                }));
+            }
         }
     }
 
@@ -5771,29 +5801,260 @@ struct LabelReplacement {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SpecializedTypeText {
+    Unchanged,
+    Replaced(String),
+    Unsupported,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn specialized_type_text(
     index: &NavigationIndex,
     _symbol: &Symbol,
+    source: &str,
+    source_uri: Option<&Url>,
+    destination_uri: Option<&Url>,
     type_ref: Option<&super::TypeRef>,
     substitution: &GenericSubstitution,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<Option<String>, String> {
+) -> Result<SpecializedTypeText, String> {
     let Some(type_ref) = type_ref else {
-        return Ok(None);
+        return Ok(SpecializedTypeText::Unchanged);
     };
-    if type_ref.path.len() != 1 || !type_ref.args.is_empty() {
-        return Ok(None);
+    specialized_type_ref_text(
+        index,
+        type_ref,
+        source,
+        source_uri,
+        destination_uri,
+        substitution,
+        cancel,
+        budget,
+        0,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeQualification {
+    NotRequired,
+    Required(String),
+    Unknown,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn specialized_type_ref_text(
+    index: &NavigationIndex,
+    type_ref: &super::TypeRef,
+    source: &str,
+    source_uri: Option<&Url>,
+    destination_uri: Option<&Url>,
+    substitution: &GenericSubstitution,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    depth: usize,
+) -> Result<SpecializedTypeText, String> {
+    if depth >= super::MAX_TYPE_REF_RECURSION_DEPTH {
+        return Ok(SpecializedTypeText::Unsupported);
     }
-    let Some(resolved) = substitution.get(&type_ref.path[0]) else {
-        return Ok(None);
+    if type_ref.path.len() == 1 && type_ref.args.is_empty() {
+        if let Some(resolved) = substitution.get(&type_ref.path[0]) {
+            let Some(text) =
+                resolved_type_text(index, resolved, destination_uri, cancel, budget, depth)?
+            else {
+                return Ok(SpecializedTypeText::Unsupported);
+            };
+            return Ok(SpecializedTypeText::Replaced(text));
+        }
+        let Some(text) = source.get(type_ref.span.start..type_ref.span.end) else {
+            return Ok(SpecializedTypeText::Unsupported);
+        };
+        return Ok(
+            match qualified_type_unit(index, type_ref, source_uri, destination_uri, cancel, budget)?
+            {
+                TypeQualification::NotRequired => SpecializedTypeText::Unchanged,
+                TypeQualification::Required(unit) => {
+                    SpecializedTypeText::Replaced(format!("{unit}.{}", text.trim()))
+                }
+                TypeQualification::Unknown => SpecializedTypeText::Unsupported,
+            },
+        );
+    }
+
+    let mut changed = false;
+    let mut arguments = Vec::with_capacity(type_ref.args.len());
+    for argument in &type_ref.args {
+        let rendered = specialized_type_ref_text(
+            index,
+            argument,
+            source,
+            source_uri,
+            destination_uri,
+            substitution,
+            cancel,
+            budget,
+            depth.saturating_add(1),
+        )?;
+        match rendered {
+            SpecializedTypeText::Unchanged => {}
+            SpecializedTypeText::Replaced(text) => {
+                changed = true;
+                arguments.push((argument.span, text));
+            }
+            SpecializedTypeText::Unsupported => {
+                return Ok(SpecializedTypeText::Unsupported);
+            }
+        }
+    }
+    let qualified_unit =
+        match qualified_type_unit(index, type_ref, source_uri, destination_uri, cancel, budget)? {
+            TypeQualification::NotRequired => None,
+            TypeQualification::Required(unit) => {
+                changed = true;
+                Some(unit)
+            }
+            TypeQualification::Unknown => return Ok(SpecializedTypeText::Unsupported),
+        };
+    if !changed {
+        return Ok(SpecializedTypeText::Unchanged);
+    }
+    let Some(mut text) = source
+        .get(type_ref.span.start..type_ref.span.end)
+        .map(str::to_owned)
+    else {
+        return Ok(SpecializedTypeText::Unsupported);
     };
-    resolved_type_text(index, resolved, cancel, budget, 0)
+    arguments.sort_by_key(|(span, _)| (span.start, span.end));
+    for (span, replacement) in arguments.into_iter().rev() {
+        let Some(start) = span.start.checked_sub(type_ref.span.start) else {
+            return Ok(SpecializedTypeText::Unsupported);
+        };
+        let Some(end) = span.end.checked_sub(type_ref.span.start) else {
+            return Ok(SpecializedTypeText::Unsupported);
+        };
+        if start > end || end > text.len() {
+            return Ok(SpecializedTypeText::Unsupported);
+        }
+        text.replace_range(start..end, &replacement);
+    }
+    if let Some(unit) = qualified_unit {
+        let Some(angle) = text.find('<') else {
+            return Ok(SpecializedTypeText::Unsupported);
+        };
+        let path = text[..angle].trim();
+        let suffix = &text[angle..];
+        text = format!("{unit}.{path}{suffix}");
+    }
+    budget.require_bytes(text.len(), cancel)?;
+    Ok(SpecializedTypeText::Replaced(text))
+}
+
+fn qualified_type_unit(
+    index: &NavigationIndex,
+    type_ref: &super::TypeRef,
+    source_uri: Option<&Url>,
+    destination_uri: Option<&Url>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<TypeQualification, String> {
+    let (Some(source_uri), Some(destination_uri)) = (source_uri, destination_uri) else {
+        return Ok(TypeQualification::NotRequired);
+    };
+    if source_uri == destination_uri || type_ref.path.len() != 1 {
+        return Ok(TypeQualification::NotRequired);
+    }
+    let Some(name) = type_ref.path.first() else {
+        return Ok(TypeQualification::Unknown);
+    };
+    if builtin_type_name(name) {
+        return Ok(TypeQualification::NotRequired);
+    }
+    let Some(document) = index.documents.get(source_uri) else {
+        return Ok(TypeQualification::Unknown);
+    };
+    let Some(identifier) = index.contract_lookup_identifier_with_budget(
+        document,
+        type_ref.span,
+        cancel,
+        budget,
+        "interface signature type",
+    )?
+    else {
+        return Ok(TypeQualification::Unknown);
+    };
+    let candidates = index.type_reference_candidates_with_budget(
+        source_uri,
+        document,
+        type_ref.span.start,
+        identifier,
+        &type_ref.path,
+        0,
+        cancel,
+        budget,
+    )?;
+    if candidates.len() != 1 {
+        return Ok(TypeQualification::Unknown);
+    }
+    let candidate = &candidates[0];
+    let Some(symbol) = index.symbol(candidate) else {
+        return Ok(TypeQualification::Unknown);
+    };
+    if symbol.kind != SymbolKind::Type {
+        return Ok(TypeQualification::Unknown);
+    }
+    if symbol.generic_parameter.is_some() {
+        return Ok(if source_uri == destination_uri {
+            TypeQualification::NotRequired
+        } else {
+            TypeQualification::Unknown
+        });
+    }
+    if candidate.uri == *destination_uri {
+        return Ok(TypeQualification::NotRequired);
+    }
+    Ok(index
+        .unit_display_name(&candidate.uri)
+        .map_or(TypeQualification::Unknown, TypeQualification::Required))
+}
+
+fn builtin_type_name(name: &str) -> bool {
+    matches!(
+        super::canonical_name(name).as_str(),
+        "ansistring"
+            | "boolean"
+            | "byte"
+            | "cardinal"
+            | "char"
+            | "currency"
+            | "double"
+            | "extended"
+            | "int64"
+            | "integer"
+            | "longint"
+            | "longword"
+            | "nativeint"
+            | "nativeuint"
+            | "real"
+            | "real48"
+            | "shortint"
+            | "single"
+            | "smallint"
+            | "string"
+            | "uint64"
+            | "unicodechar"
+            | "unicodestring"
+            | "variant"
+            | "widechar"
+            | "widestring"
+            | "word"
+    )
 }
 
 fn resolved_type_text(
     index: &NavigationIndex,
     resolved: &super::ResolvedType,
+    destination_uri: Option<&Url>,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
     depth: usize,
@@ -5813,6 +6074,12 @@ fn resolved_type_text(
                 return Ok(None);
             };
             let mut text = symbol.name.clone();
+            if destination_uri.is_some_and(|destination| destination != &instance.uri) {
+                let Some(unit) = index.unit_display_name(&instance.uri) else {
+                    return Ok(None);
+                };
+                text = format!("{unit}.{text}");
+            }
             if !instance.parameter_names.is_empty() {
                 let mut arguments = Vec::with_capacity(instance.parameter_names.len());
                 for name in &instance.parameter_names {
@@ -5822,6 +6089,7 @@ fn resolved_type_text(
                     let Some(argument) = resolved_type_text(
                         index,
                         argument,
+                        destination_uri,
                         cancel,
                         budget,
                         depth.saturating_add(1),
@@ -6285,6 +6553,7 @@ fn declaration_excerpt(
                 Some(specialized_typed_declaration_label(
                     index,
                     symbol,
+                    &document.source,
                     raw,
                     substitution,
                     cancel,
@@ -6314,6 +6583,7 @@ fn declaration_excerpt(
 fn specialized_typed_declaration_label(
     index: &NavigationIndex,
     symbol: &Symbol,
+    source: &str,
     raw: String,
     substitution: &GenericSubstitution,
     cancel: &AtomicBool,
@@ -6322,10 +6592,19 @@ fn specialized_typed_declaration_label(
     let Some(type_ref) = symbol.type_ref.as_ref() else {
         return Ok(raw);
     };
-    let Some(text) =
-        specialized_type_text(index, symbol, Some(type_ref), substitution, cancel, budget)?
-    else {
-        return Ok(raw);
+    let text = match specialized_type_text(
+        index,
+        symbol,
+        source,
+        None,
+        None,
+        Some(type_ref),
+        substitution,
+        cancel,
+        budget,
+    )? {
+        SpecializedTypeText::Replaced(text) => text,
+        SpecializedTypeText::Unchanged | SpecializedTypeText::Unsupported => return Ok(raw),
     };
 
     let label = raw.trim();

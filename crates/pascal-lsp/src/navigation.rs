@@ -77,6 +77,7 @@ pub(crate) struct MissingInterfaceMethodImplementationCandidate {
     pub(crate) declaration_add_public: bool,
     pub(crate) implementation_header: String,
     pub(crate) implementation_insertion_offset: usize,
+    pub(crate) obligation_identity: u64,
     pub(crate) identity: u64,
 }
 pub(crate) use folding::{
@@ -868,6 +869,8 @@ impl NavigationIndex {
             declaration,
             declaration_node,
             document.source.as_ref(),
+            uri,
+            uri,
             &owner_name,
             &GenericSubstitution::empty(),
             cancel,
@@ -1062,6 +1065,8 @@ impl NavigationIndex {
                 interface_method_symbol,
                 interface_node,
                 interface_document.source.as_ref(),
+                &obligation.requirement.candidate.uri,
+                uri,
                 &owner_name,
                 &obligation.requirement.substitution,
                 cancel,
@@ -1112,6 +1117,8 @@ impl NavigationIndex {
                             interface_method_symbol,
                             interface_node,
                             interface_document.source.as_ref(),
+                            &obligation.requirement.candidate.uri,
+                            uri,
                             &method_name,
                             &obligation.requirement.substitution,
                             cancel,
@@ -1160,6 +1167,8 @@ impl NavigationIndex {
                             symbol,
                             node,
                             document.source.as_ref(),
+                            uri,
+                            uri,
                             &owner_name,
                             &class_instance.substitution,
                             cancel,
@@ -1202,6 +1211,9 @@ impl NavigationIndex {
             if interface_method_name.is_empty() {
                 continue;
             }
+            let mut obligation_hasher = DefaultHasher::new();
+            obligation.identity.hash(&mut obligation_hasher);
+            let obligation_identity = obligation_hasher.finish();
             let mut hasher = DefaultHasher::new();
             obligation.identity.hash(&mut hasher);
             obligation.requirement.candidate.hash(&mut hasher);
@@ -1242,6 +1254,7 @@ impl NavigationIndex {
                     document, cancel, budget,
                 )?
                 .ok_or_else(|| "implementation insertion point is unavailable".to_string())?,
+                obligation_identity,
                 identity,
             });
         }
@@ -1280,6 +1293,12 @@ impl NavigationIndex {
         self.documents
             .get(uri)
             .map(|document| document.unit_name.clone())
+    }
+
+    pub(crate) fn unit_display_name(&self, uri: &Url) -> Option<String> {
+        self.documents
+            .get(uri)
+            .map(|document| document.unit_display_name.clone())
     }
 
     /// Return whether this URI has a parsed document in the index.
@@ -2472,13 +2491,6 @@ impl NavigationIndex {
         let Some(document) = self.documents.get(&owner.uri) else {
             return Ok(None);
         };
-        if canonical_path(&type_ref.path) == "tobject"
-            && !document.type_symbol_indices.contains_key("tobject")
-            && type_ref.args.is_empty()
-        {
-            return self
-                .authoritative_tobject_instance_with_budget(&owner.uri, ancestry, cancel, budget);
-        }
         let Some(lookup_identifier) = self.contract_lookup_identifier_with_budget(
             document,
             type_ref.span,
@@ -2505,7 +2517,16 @@ impl NavigationIndex {
         if resolution_state.receiver_resolution_uncertain() {
             return Ok(None);
         }
+        let no_source_backed_parent = receivers.is_empty();
         let Some(parent_instance) = unique_type_instance(receivers) else {
+            if no_source_backed_parent
+                && canonical_path(&type_ref.path) == "tobject"
+                && type_ref.args.is_empty()
+            {
+                return self.authoritative_tobject_instance_with_budget(
+                    &owner.uri, ancestry, cancel, budget,
+                );
+            }
             return Ok(None);
         };
         if matches!(parent_instance.kind, TypeKind::Class | TypeKind::Interface) {
@@ -2873,6 +2894,13 @@ impl NavigationIndex {
                 self.resolve_contract_type_with_budget(instance, ancestry, cancel, budget)?;
             if resolution.status == AncestryStatus::Unknown {
                 return Ok(AncestryStatus::Unknown);
+            }
+            if self.contract_instance_is_synthetic_tobject_with_budget(instance, cancel, budget)? {
+                // A compiler-provided root has no source-backed member list.
+                // Keep the explicit interface proof usable for ordinary
+                // names, but retain the uncertainty for collision analysis.
+                surface.unknown_synthetic_tobject_members = true;
+                return Ok(AncestryStatus::Complete);
             }
             self.direct_contract_routines(instance, &mut surface.routines, cancel, budget)?;
             self.direct_contract_nonroutine_names(instance, surface, cancel, budget)?;
@@ -3430,11 +3458,173 @@ impl NavigationIndex {
         ) else {
             return Ok(ContractMatch::Unknown);
         };
-        Ok(if left == right {
-            ContractMatch::Yes
-        } else {
-            ContractMatch::No
+        let left_identity =
+            self.semantic_type_identity_with_budget(&left, cancel, budget, &mut HashSet::new(), 0)?;
+        let right_identity = self.semantic_type_identity_with_budget(
+            &right,
+            cancel,
+            budget,
+            &mut HashSet::new(),
+            0,
+        )?;
+        Ok(match (left_identity, right_identity) {
+            (Some(left), Some(right)) if left == right => ContractMatch::Yes,
+            (Some(_), Some(_)) => ContractMatch::No,
+            _ => ContractMatch::Unknown,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_type_identity_with_budget(
+        &self,
+        uri: &Url,
+        type_ref: &TypeRef,
+        substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<TypeIdentity>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        let Some(lookup_identifier) = self.contract_lookup_identifier_with_budget(
+            document,
+            type_ref.span,
+            cancel,
+            budget,
+            "contract type identity",
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut state = ResolutionState::new();
+        let receivers = self.type_receivers_for_type_ref_with_budget(
+            uri,
+            document,
+            type_ref.span.start,
+            type_ref,
+            lookup_identifier,
+            None,
+            substitution,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if state.receiver_resolution_uncertain() {
+            return Ok(None);
+        }
+        let Some(resolved) = resolved_type_from_receivers(receivers) else {
+            return Ok(None);
+        };
+        self.semantic_type_identity_with_budget(&resolved, cancel, budget, &mut HashSet::new(), 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_type_identity_with_budget(
+        &self,
+        resolved: &ResolvedType,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        depth: usize,
+    ) -> Result<Option<TypeIdentity>, String> {
+        if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
+            return Ok(None);
+        }
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let ResolvedType::Named(instance) = resolved else {
+            return Ok(type_identity_from_resolved_type(resolved));
+        };
+        let Some(candidate) = self.type_symbol_candidate(instance) else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.symbol(&candidate) else {
+            return Ok(None);
+        };
+        if symbol.generic_parameter.is_some() {
+            return Ok(None);
+        }
+        if let Some(alias_ref) = symbol
+            .type_ref
+            .as_ref()
+            .filter(|_| symbol.type_kind == TypeKind::Other)
+        {
+            let alias_key = (
+                instance.uri.clone(),
+                instance.key.clone(),
+                instance.substitution.clone(),
+            );
+            if !active_aliases.insert(alias_key.clone()) {
+                return Ok(None);
+            }
+            let identity = (|| {
+                let Some(document) = self.documents.get(&instance.uri) else {
+                    return Ok(None);
+                };
+                let Some(identifier) = self.contract_lookup_identifier_with_budget(
+                    document,
+                    alias_ref.span,
+                    cancel,
+                    budget,
+                    "contract type alias identity",
+                )?
+                else {
+                    return Ok(None);
+                };
+                let mut state = ResolutionState::new();
+                let receivers = self.type_receivers_for_type_ref_with_budget(
+                    &instance.uri,
+                    document,
+                    alias_ref.span.start,
+                    alias_ref,
+                    identifier,
+                    Some(symbol.scope),
+                    &instance.substitution,
+                    &mut state,
+                    cancel,
+                    budget,
+                )?;
+                if state.receiver_resolution_uncertain() {
+                    return Ok(None);
+                }
+                let Some(underlying) = resolved_type_from_receivers(receivers) else {
+                    return Ok(None);
+                };
+                self.semantic_type_identity_with_budget(
+                    &underlying,
+                    cancel,
+                    budget,
+                    active_aliases,
+                    depth.saturating_add(1),
+                )
+            })();
+            active_aliases.remove(&alias_key);
+            return identity;
+        }
+
+        let mut args = Vec::with_capacity(instance.parameter_names.len());
+        for name in &instance.parameter_names {
+            let Some(argument) = instance.substitution.get(name) else {
+                return Ok(None);
+            };
+            let Some(argument) = self.semantic_type_identity_with_budget(
+                argument,
+                cancel,
+                budget,
+                active_aliases,
+                depth.saturating_add(1),
+            )?
+            else {
+                return Ok(None);
+            };
+            args.push(argument);
+        }
+        Ok(Some(TypeIdentity::Named {
+            uri: instance.uri.clone(),
+            key: instance.key.clone(),
+            kind: instance.kind,
+            args,
+        }))
     }
 
     fn contract_method_implementation_status(
@@ -3573,6 +3763,9 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
+        if surface.unknown_synthetic_tobject_members && synthetic_tobject_member_name(method_name) {
+            return Ok(false);
+        }
         if surface
             .nonroutine_names
             .contains(&canonical_name(method_name))
@@ -3590,6 +3783,21 @@ impl NavigationIndex {
             if symbol.key != method_key {
                 continue;
             }
+            // Overload directives do not make result-only, ABI-only, or
+            // parameter-mode-only differences legal overload distinctions.
+            // Compare the parameter *types* separately from full interface
+            // conformance so these same-call-shape collisions are withheld
+            // even when every declaration happens to carry `overload`.
+            match self.routine_parameter_shape_match(
+                &obligation.requirement,
+                &candidate.candidate,
+                &candidate.substitution,
+                cancel,
+                budget,
+            )? {
+                ContractMatch::Yes | ContractMatch::Unknown => return Ok(false),
+                ContractMatch::No => {}
+            }
             same_name_routines.push(symbol);
         }
         if same_name_routines.is_empty() {
@@ -3606,6 +3814,52 @@ impl NavigationIndex {
             && same_name_routines
                 .iter()
                 .all(|symbol| symbol.routine_directives.overload))
+    }
+
+    /// Compare only the number and resolved types of parameters.  Pascal
+    /// cannot use a result type, calling convention, or `var`/`out` mode as
+    /// the sole distinction for a same-name overload.  Unknown type identity
+    /// is deliberately returned to the caller so generation is suppressed.
+    #[allow(clippy::too_many_arguments)]
+    fn routine_parameter_shape_match(
+        &self,
+        requirement: &ContractRequirement,
+        candidate: &Candidate,
+        candidate_substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<ContractMatch, String> {
+        let Some(left) = self.symbol(&requirement.candidate) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        let Some(right) = self.symbol(candidate) else {
+            return Ok(ContractMatch::Unknown);
+        };
+        if left.routine_parameters.len() != right.routine_parameters.len() {
+            return Ok(ContractMatch::No);
+        }
+        for (left_parameter, right_parameter) in left
+            .routine_parameters
+            .iter()
+            .zip(&right.routine_parameters)
+        {
+            let parameter_match = self.contract_parameter_type_match(
+                &requirement.candidate.uri,
+                left_parameter.type_ref.as_ref(),
+                &requirement.substitution,
+                &candidate.uri,
+                right_parameter.type_ref.as_ref(),
+                candidate_substitution,
+                cancel,
+                budget,
+            )?;
+            match parameter_match {
+                ContractMatch::Yes => {}
+                ContractMatch::No => return Ok(ContractMatch::No),
+                ContractMatch::Unknown => return Ok(ContractMatch::Unknown),
+            }
+        }
+        Ok(ContractMatch::Yes)
     }
 
     fn contract_method_resolution_name(
@@ -11976,6 +12230,58 @@ impl ContractRequirement {
             ),
             cancel,
         )?;
+        let mut parameter_types = Vec::with_capacity(symbol.routine_parameters.len());
+        for parameter in &symbol.routine_parameters {
+            parameter_types.push(
+                parameter
+                    .type_ref
+                    .as_ref()
+                    .map(|type_ref| {
+                        index.contract_type_identity_with_budget(
+                            &self.candidate.uri,
+                            type_ref,
+                            &self.substitution,
+                            cancel,
+                            budget,
+                        )
+                    })
+                    .transpose()?
+                    .flatten(),
+            );
+        }
+        let result_type = symbol
+            .result_type_ref
+            .as_ref()
+            .map(|type_ref| {
+                index.contract_type_identity_with_budget(
+                    &self.candidate.uri,
+                    type_ref,
+                    &self.substitution,
+                    cancel,
+                    budget,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let header = symbol
+            .routine_header_span
+            .and_then(|_span| index.documents.get(&self.candidate.uri))
+            .and_then(|document| {
+                symbol
+                    .routine_header_span
+                    .and_then(|span| document.source.get(span.start..span.end))
+            })
+            .map(str::to_owned);
+        budget.require_bytes(
+            header.as_deref().map_or(0, str::len)
+                + parameter_types
+                    .len()
+                    .saturating_mul(std::mem::size_of::<TypeIdentity>())
+                + result_type
+                    .as_ref()
+                    .map_or(0, |_| std::mem::size_of::<TypeIdentity>()),
+            cancel,
+        )?;
         Ok(ContractRequirementIdentity {
             name: symbol.key.clone(),
             signature: symbol.routine_signature.clone(),
@@ -11983,6 +12289,9 @@ impl ContractRequirement {
             routine_kind: symbol.routine_kind,
             generic_shape: generic_shape(&symbol.generic_parameters),
             substitution: self.substitution.clone(),
+            parameter_types,
+            result_type,
+            header,
         })
     }
 }
@@ -12017,6 +12326,9 @@ struct ContractRequirementIdentity {
     routine_kind: RoutineKind,
     generic_shape: String,
     substitution: GenericSubstitution,
+    parameter_types: Vec<Option<TypeIdentity>>,
+    result_type: Option<TypeIdentity>,
+    header: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -12049,6 +12361,7 @@ struct ContractClassSurface {
     nonroutine_names: HashSet<String>,
     method_resolutions: Vec<MethodResolution>,
     delegations: Vec<InterfaceDelegation>,
+    unknown_synthetic_tobject_members: bool,
 }
 
 type ContractInterfaceIdentity = (Url, String, GenericSubstitution);
@@ -12067,6 +12380,54 @@ fn contract_substitution_is_complete(instance: &TypeInstance) -> bool {
         .parameter_names
         .iter()
         .all(|name| instance.substitution.get(name).is_some())
+}
+
+/// Names supplied by Delphi's compiler-provided `TObject` that are relevant
+/// to interface implementation collisions.  The synthetic-root model cannot
+/// enumerate every compiler member, so only these stable, well-known members
+/// are used as a conservative collision boundary; unknown names retain the
+/// existing standalone-source assistance behavior.
+fn synthetic_tobject_member_name(name: &str) -> bool {
+    matches!(
+        canonical_name(name).as_str(),
+        "afterconstruction"
+            | "beforedestruction"
+            | "cleanupinstance"
+            | "classname"
+            | "classnameis"
+            | "classinfo"
+            | "classinstance"
+            | "classparent"
+            | "classtype"
+            | "defaultinstance"
+            | "defaulthandler"
+            | "destroy"
+            | "dispatch"
+            | "equals"
+            | "fieldaddress"
+            | "free"
+            | "freeinstance"
+            | "gethashcode"
+            | "getinterface"
+            | "getinterfaceentry"
+            | "getinterfacetable"
+            | "inheritsfrom"
+            | "initinstance"
+            | "instancekind"
+            | "instancesize"
+            | "methodaddress"
+            | "methodname"
+            | "newinstance"
+            | "queryinterface"
+            | "safecallexception"
+            | "tostring"
+            | "qualifiedclassname"
+            | "unitname"
+            | "unitscope"
+            | "_addref"
+            | "_queryinterface"
+            | "_release"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16022,6 +16383,8 @@ fn method_declaration_header(
     symbol: &Symbol,
     node: Node<'_>,
     source: &str,
+    source_uri: &Url,
+    destination_uri: &Url,
     method_name: &str,
     substitution: &GenericSubstitution,
     cancel: &AtomicBool,
@@ -16042,17 +16405,35 @@ fn method_declaration_header(
         return Ok(None);
     }
     let mut replacements = vec![(name.start_byte(), name.end_byte(), method_name.to_owned())];
-    append_specialized_routine_replacements(
+    if !append_specialized_routine_replacements(
         index,
         symbol,
         source,
+        source_uri,
+        destination_uri,
         substitution,
         node.start_byte(),
         header_end.saturating_add(1),
         cancel,
         budget,
         &mut replacements,
-    )?;
+    )? {
+        return Ok(None);
+    }
+    if !append_qualified_default_replacements(
+        index,
+        node,
+        source,
+        source_uri,
+        destination_uri,
+        node.start_byte(),
+        header_end.saturating_add(1),
+        cancel,
+        budget,
+        &mut replacements,
+    )? {
+        return Ok(None);
+    }
     let Some(mut rendered) = apply_source_replacements(
         source,
         node.start_byte(),
@@ -16070,6 +16451,112 @@ fn method_declaration_header(
         rendered.push(';');
     }
     Ok(Some(rendered))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_qualified_default_replacements(
+    index: &NavigationIndex,
+    node: Node<'_>,
+    source: &str,
+    source_uri: &Url,
+    destination_uri: &Url,
+    header_start: usize,
+    header_end: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    replacements: &mut Vec<(usize, usize, String)>,
+) -> Result<bool, String> {
+    if source_uri == destination_uri {
+        return Ok(true);
+    }
+    let Some(document) = index.documents.get(source_uri) else {
+        return Ok(false);
+    };
+    let Some(arguments) = node.child_by_field_name("args") else {
+        return Ok(true);
+    };
+    for group in direct_routine_argument_groups(arguments) {
+        let Some(default) = group.child_by_field_name("defaultValue") else {
+            continue;
+        };
+        let mut identifiers = Vec::new();
+        collect_nodes(default, &mut |candidate| {
+            if candidate.kind() == "identifier" {
+                identifiers.push(candidate);
+            }
+        });
+        budget.require_work(identifiers.len(), cancel)?;
+        for identifier in identifiers {
+            check_navigation_cancel(cancel)?;
+            let span = Span::from_node(identifier);
+            if span.start < header_start
+                || span.end > header_end
+                || identifier_is_qualified(identifier, default)
+            {
+                continue;
+            }
+            let Some(name) = source.get(span.start..span.end) else {
+                continue;
+            };
+            let mut state = ResolutionState::new();
+            let candidates = index.unqualified_references_with_budget_and_state(
+                source_uri, document, span.start, name, identifier, &mut state, cancel, budget,
+            )?;
+            if candidates.len() != 1 {
+                if builtin_default_value(name) {
+                    continue;
+                }
+                return Ok(false);
+            }
+            let candidate = &candidates[0];
+            let Some(symbol) = index.symbol(candidate) else {
+                continue;
+            };
+            if candidate.uri == *destination_uri
+                || !matches!(
+                    symbol.kind,
+                    SymbolKind::Constant
+                        | SymbolKind::EnumValue
+                        | SymbolKind::Routine
+                        | SymbolKind::Type
+                        | SymbolKind::Variable
+                        | SymbolKind::Property
+                )
+            {
+                if candidate.uri == *destination_uri {
+                    continue;
+                }
+                return Ok(false);
+            }
+            let Some(unit) = index.unit_display_name(&candidate.uri) else {
+                return Ok(false);
+            };
+            budget.require_bytes(
+                unit.len().saturating_add(name.len()).saturating_add(1),
+                cancel,
+            )?;
+            replacements.push((span.start, span.end, format!("{unit}.{name}")));
+        }
+    }
+    Ok(true)
+}
+
+fn identifier_is_qualified(identifier: Node<'_>, boundary: Node<'_>) -> bool {
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.id() == boundary.id() {
+            return false;
+        }
+        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot") {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn builtin_default_value(name: &str) -> bool {
+    matches!(canonical_name(name).as_str(), "false" | "nil" | "true")
 }
 
 fn class_member_insertion(
@@ -16413,6 +16900,8 @@ fn method_implementation_header(
     symbol: &Symbol,
     node: Node<'_>,
     source: &str,
+    source_uri: &Url,
+    destination_uri: &Url,
     owner_name: &str,
     substitution: &GenericSubstitution,
     cancel: &AtomicBool,
@@ -16454,17 +16943,21 @@ fn method_implementation_header(
             replacements.push((start, default.end_byte(), String::new()));
         }
     }
-    append_specialized_routine_replacements(
+    if !append_specialized_routine_replacements(
         index,
         symbol,
         source,
+        source_uri,
+        destination_uri,
         substitution,
         node.start_byte(),
         header_end.saturating_add(1),
         cancel,
         budget,
         &mut replacements,
-    )?;
+    )? {
+        return Ok(None);
+    }
     let Some(mut rendered) = apply_source_replacements(
         source,
         node.start_byte(),
@@ -16487,13 +16980,15 @@ fn append_specialized_routine_replacements(
     index: &NavigationIndex,
     symbol: &Symbol,
     source: &str,
+    source_uri: &Url,
+    destination_uri: &Url,
     substitution: &GenericSubstitution,
     header_start: usize,
     header_end: usize,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
     replacements: &mut Vec<(usize, usize, String)>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     for parameter in &symbol.routine_parameters {
         let Some(span) = parameter.type_span else {
             continue;
@@ -16501,36 +16996,49 @@ fn append_specialized_routine_replacements(
         if span.start < header_start || span.end > header_end {
             continue;
         }
-        let Some(text) = assistance::specialized_type_text(
+        let rendered = assistance::specialized_type_text(
             index,
             symbol,
+            source,
+            Some(source_uri),
+            Some(destination_uri),
             parameter.type_ref.as_ref(),
             substitution,
             cancel,
             budget,
-        )?
-        else {
-            continue;
-        };
-        replacements.push((span.start, span.end, text));
+        )?;
+        match rendered {
+            assistance::SpecializedTypeText::Unchanged => {}
+            assistance::SpecializedTypeText::Replaced(text) => {
+                replacements.push((span.start, span.end, text));
+            }
+            assistance::SpecializedTypeText::Unsupported => return Ok(false),
+        }
     }
     if let (Some(span), Some(type_ref)) = (symbol.result_type_span, symbol.result_type_ref.as_ref())
     {
         if span.start >= header_start && span.end <= header_end {
-            if let Some(text) = assistance::specialized_type_text(
+            match assistance::specialized_type_text(
                 index,
                 symbol,
+                source,
+                Some(source_uri),
+                Some(destination_uri),
                 Some(type_ref),
                 substitution,
                 cancel,
                 budget,
             )? {
-                replacements.push((span.start, span.end, text));
+                assistance::SpecializedTypeText::Unchanged => {}
+                assistance::SpecializedTypeText::Replaced(text) => {
+                    replacements.push((span.start, span.end, text));
+                }
+                assistance::SpecializedTypeText::Unsupported => return Ok(false),
             }
         }
     }
     let _ = source;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_source_replacements(

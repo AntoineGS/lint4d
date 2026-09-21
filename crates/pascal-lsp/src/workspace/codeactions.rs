@@ -13,7 +13,7 @@ use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
     AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
     MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
-    MissingUnitCandidate, MissingUnitUseKind,
+    MissingUnitCandidate, MissingUnitUseKind, SemanticDiagnosticKind,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -48,7 +48,7 @@ const METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-interface-method";
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND: CodeActionKind =
-    CodeActionKind::new(INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND);
+    CodeActionKind::new("quickfix.implement-interface-method");
 const CONSTANT_RULE: &str = "constant-naming";
 const LOCAL_RULE: &str = "local-variable-naming";
 
@@ -993,6 +993,18 @@ fn interface_method_implementation_plans_from_input(
         let Some(edits) = interface_method_implementation_edits(uri, source, &candidate) else {
             continue;
         };
+        if !interface_post_edit_proves_obligation(
+            input,
+            uri,
+            source,
+            target_record,
+            configuration_records,
+            &candidate,
+            &edits,
+            cancel,
+        )? {
+            continue;
+        }
         plans.push(InterfaceMethodImplementationPlan {
             candidate,
             uri: uri.clone(),
@@ -1292,6 +1304,112 @@ fn validate_interface_method_generation(
     !edits.is_empty() && todo.saturating_add(body_end) > todo
 }
 
+#[allow(clippy::too_many_arguments)]
+fn interface_post_edit_proves_obligation(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    configuration_records: &[SourceRecord],
+    candidate: &MissingInterfaceMethodImplementationCandidate,
+    edits: &[TextEdit],
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let Some(updated_source) = apply_text_edits(source, edits) else {
+        return Ok(false);
+    };
+    let Some(identifier) = identifier_at_position(&updated_source, candidate.anchor.start) else {
+        return Ok(false);
+    };
+
+    let mut proof_input = input.clone();
+    proof_input.overlays.insert(
+        uri.clone(),
+        OverlayInput {
+            text: updated_source.clone(),
+            version: target_record.version.unwrap_or_default(),
+        },
+    );
+    let mut proof_record = target_record.clone();
+    proof_record.text = updated_source.clone();
+    proof_record.parsed_text_hash = Some(text_content_hash(&updated_source));
+    proof_record.content_hash = None;
+    let snapshot = match build_snapshot(
+        &proof_input,
+        std::slice::from_ref(uri),
+        std::slice::from_ref(&identifier),
+        SnapshotMode::Workspace,
+        Some(SnapshotSeed::new(proof_record).with_consumed_configuration(configuration_records)),
+        &[],
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+        Err(_) => return Ok(false),
+    };
+    if !snapshot.complete
+        || !snapshot.include_errors.is_empty()
+        || !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|text| text != &updated_source)
+        || snapshot
+            .index
+            .source_text(uri)
+            .is_none_or(|text| text != updated_source)
+    {
+        return Ok(false);
+    }
+
+    let mut budget = AssistanceBudget::new(
+        MAX_MISSING_UNIT_REQUEST_WORK,
+        MAX_MISSING_UNIT_REQUEST_BYTES,
+        "interface method post-edit validation",
+    );
+    let remaining = snapshot
+        .index
+        .missing_interface_method_implementation_candidates_with_budget(
+            uri,
+            candidate.anchor.start,
+            cancel,
+            &mut budget,
+        )?;
+    let exact_obligation_remains = remaining.iter().any(|remaining| {
+        remaining.obligation_identity == candidate.obligation_identity
+            && remaining.interface_uri == candidate.interface_uri
+            && remaining.interface_owner == candidate.interface_owner
+            && remaining.interface_method == candidate.interface_method
+    });
+    if exact_obligation_remains {
+        return Ok(false);
+    }
+
+    let diagnostics = match snapshot.index.semantic_diagnostics_with_cancel(uri, cancel) {
+        Ok(diagnostics) => diagnostics,
+        Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+        Err(_) => return Ok(false),
+    };
+    let Some(anchor_start) = text::position_to_offset(&updated_source, candidate.anchor.start)
+    else {
+        return Ok(false);
+    };
+    let same_named_obligation_remains = remaining.iter().any(|remaining| {
+        remaining.interface_uri == candidate.interface_uri
+            && remaining.interface_owner == candidate.interface_owner
+            && remaining.interface_method == candidate.interface_method
+    });
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == SemanticDiagnosticKind::MissingInterfaceImplementation
+            && diagnostic.span.start == anchor_start
+            && diagnostic.message.contains(&candidate.interface_method)
+            && !same_named_obligation_remains
+    }) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn has_one_generated_interface_definition(
     root: Node<'_>,
     source: &str,
@@ -1438,6 +1556,17 @@ fn push_bounded_code_action(
     }
     actions.push(action);
     Ok(true)
+}
+
+fn ensure_bounded_resolved_action(action: &CodeAction) -> Result<(), String> {
+    let encoded = serde_json::to_vec(&[CodeActionOrCommand::CodeAction(action.clone())])
+        .map_err(|error| format!("could not serialize resolved code action: {error}"))?;
+    if encoded.len() > MAX_MISSING_UNIT_RESPONSE_BYTES {
+        return Err(format!(
+            "resolved code action exceeds the {MAX_MISSING_UNIT_RESPONSE_BYTES}-byte response limit"
+        ));
+    }
+    Ok(())
 }
 
 fn matching_missing_unit_diagnostic(
@@ -1674,6 +1803,9 @@ pub(crate) fn resolve_from_input(
             let mut resolved = action;
             resolved.edit = Some(edit);
             resolved.disabled = None;
+            if let Err(error) = ensure_bounded_resolved_action(&resolved) {
+                return failed(source_generation, configuration_generation, error);
+            }
             Computed {
                 source_generation,
                 configuration_generation,
@@ -1831,6 +1963,9 @@ fn resolve_missing_unit_from_input(
     let mut resolved = action;
     resolved.edit = Some(edit);
     resolved.disabled = None;
+    if let Err(error) = ensure_bounded_resolved_action(&resolved) {
+        return failed(source_generation, configuration_generation, error);
+    }
     let mut records = missing_records;
     append_records(&mut records, configuration_records);
     Computed {
@@ -1968,6 +2103,9 @@ fn resolve_method_implementation_from_input(
     let mut resolved = action;
     resolved.edit = Some(edit);
     resolved.disabled = None;
+    if let Err(error) = ensure_bounded_resolved_action(&resolved) {
+        return failed(source_generation, configuration_generation, error);
+    }
     let mut records = method_records;
     append_records(&mut records, configuration_records);
     Computed {
@@ -2108,6 +2246,9 @@ fn resolve_interface_method_implementation_from_input(
     let mut resolved = action;
     resolved.edit = Some(edit);
     resolved.disabled = None;
+    if let Err(error) = ensure_bounded_resolved_action(&resolved) {
+        return failed(source_generation, configuration_generation, error);
+    }
     let mut records = interface_records;
     append_records(&mut records, configuration_records);
     Computed {
@@ -2197,19 +2338,28 @@ fn run_after_lint_configuration_hook() {
 fn run_after_lint_configuration_hook() {}
 
 fn requests_quickfix(context: &CodeActionContext) -> bool {
-    context
-        .only
-        .as_ref()
-        .is_none_or(|kinds| kinds.iter().any(|kind| kind == &CodeActionKind::QUICKFIX))
+    context.only.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| code_action_kind_contains(kind, &CodeActionKind::QUICKFIX))
+    })
 }
 
 fn requests_interface_method(context: &CodeActionContext) -> bool {
     context.only.as_ref().is_none_or(|kinds| {
         kinds.iter().any(|kind| {
-            kind == &CodeActionKind::QUICKFIX
-                || kind == &INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND
+            code_action_kind_contains(kind, &INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND)
         })
     })
+}
+
+/// LSP code-action kinds form a dot-separated hierarchy.  An empty filter is
+/// the root, while a filter matches its exact kind and all descendants.
+fn code_action_kind_contains(filter: &CodeActionKind, action: &CodeActionKind) -> bool {
+    filter.as_str().is_empty()
+        || filter == action
+        || action.as_str().starts_with(filter.as_str())
+            && action.as_str().as_bytes().get(filter.as_str().len()) == Some(&b'.')
 }
 
 fn plan_candidate(

@@ -29682,6 +29682,145 @@ fn source_action_withholds_nonadjacent_duplicate_with_precedence_conflict() {
 }
 
 #[test]
+fn source_action_withholds_alias_qualified_references_with_noncanonical_spelling() {
+    for (case_name, qualified_use) in [
+        ("spaced", "Vendor . Alpha . Run"),
+        ("commented", "Vendor {between} . Alpha . Run"),
+        ("escaped", "Vendor . &Alpha . Run"),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        write_file(
+            &root.join("Vendor.Alpha.pas"),
+            "unit Vendor.Alpha;\ninterface\nprocedure Run;\nimplementation\nprocedure Run; begin end;\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Legacy=Vendor.Alpha</DCC_UnitAlias></PropertyGroup></Project>",
+        );
+        let source = format!(
+            "unit Main;\ninterface\nuses Legacy, Vendor.Alpha;\nimplementation\nprocedure Call; begin {qualified_use}; end;\nend.\n",
+            qualified_use = qualified_use,
+        );
+        write_file(&main, &source);
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let request_id = RequestId::from(format!("organize-alias-qualified-{case_name}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "{case_name} organizeImports failed: {response:?}"
+        );
+        let result = response.result.expect("organizeImports result");
+        let actions = result.as_array().expect("organizeImports actions");
+        assert!(
+            actions.is_empty(),
+            "{case_name} qualified alias use must withhold the unsafe duplicate edit: {actions:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn deferred_organize_imports_rejects_alias_rebinding_with_the_same_provider_set() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let alpha = root.join("Alpha.pas");
+    let beta = root.join("Beta.pas");
+    write_file(&alpha, "unit Alpha;\ninterface\nimplementation\nend.\n");
+    write_file(&beta, "unit Beta;\ninterface\nimplementation\nend.\n");
+    let project = root.join("App.dproj");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Legacy=Alpha;Current=Beta</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Legacy, Current;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let request_id = RequestId::from("deferred-alias-rebinding".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let action = response
+        .result
+        .expect("organizeImports result")
+        .as_array()
+        .expect("organizeImports actions")
+        .first()
+        .cloned()
+        .expect("deferred organize action");
+    assert!(
+        action["edit"].is_null(),
+        "action should be deferred: {action}"
+    );
+    assert_eq!(
+        action["data"]["providers"].as_array().map(Vec::len),
+        Some(2),
+        "the provider set is intentionally unchanged by the alias swap: {action}"
+    );
+    let bindings = action["data"]["clauses"][0]["bindingFingerprints"]
+        .as_array()
+        .expect("per-entry organize bindings");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "every import spelling must be frozen: {action}"
+    );
+    assert!(
+        bindings.iter().all(Value::is_string),
+        "each spelling/provider/context binding must have a compact fingerprint: {action}"
+    );
+    assert_ne!(
+        bindings[0], bindings[1],
+        "the initial aliases must bind distinctly: {action}"
+    );
+
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Legacy=Beta;Current=Alpha</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+    let resolve_id = RequestId::from("resolve-deferred-alias-rebinding".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_some(),
+        "an alias binding swap must stale the deferred action even when the provider set is unchanged: {resolved:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn deferred_organize_imports_survives_a_noop_version_change() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -29887,12 +30026,28 @@ fn source_action_supports_an_unused_project_unit_alias_but_not_a_qualified_use()
         "interface\n",
         "uses Alpha, Legacy;\n",
         "implementation\n",
+        "procedure Call; begin Run; end;\n",
         "end.\n",
     );
     write_file(&main, safe_source);
 
     let mut server = TestServer::launch();
     server.initialize_without_document_changes(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": safe_source}
+        }),
+    );
+    let before_id = RequestId::from("organize-unused-alias-before".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, safe_source, "Run", 0),
+    );
+    let before = result_locations(server.response(&before_id));
+    assert_eq!(before.len(), 1, "safe alias pre-edit binding: {before:?}");
+    assert_eq!(before[0]["uri"], uri(&root.join("Alpha.pas")).to_string());
     let safe_id = RequestId::from("organize-unused-alias".to_string());
     server.send_request(
         safe_id.clone(),
@@ -29921,6 +30076,22 @@ fn source_action_supports_an_unused_project_unit_alias_but_not_a_qualified_use()
         safe_updated.contains("uses Alpha;"),
         "safe alias edit: {safe_updated}"
     );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": safe_updated.clone()}]
+        }),
+    );
+    let after_id = RequestId::from("organize-unused-alias-after".to_string());
+    server.send_request(
+        after_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, &safe_updated, "Run", 0),
+    );
+    let after = result_locations(server.response(&after_id));
+    assert_eq!(after.len(), 1, "safe alias post-edit binding: {after:?}");
+    assert_eq!(after[0]["uri"], uri(&root.join("Alpha.pas")).to_string());
     server.shutdown();
 
     let qualified_temp = tempfile::tempdir().expect("qualified alias workspace");

@@ -13,7 +13,7 @@ use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
     AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
     MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
-    MissingUnitCandidate, MissingUnitUseKind, SemanticDiagnosticKind, UnitOrderSafety,
+    MissingUnitCandidate, MissingUnitUseKind, SemanticDiagnosticKind, SourceSpan, UnitOrderSafety,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -33,6 +33,7 @@ use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
@@ -49,7 +50,7 @@ const METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-interface-method";
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const ORGANIZE_IMPORTS_ACTION_KIND: &str = "organize-imports";
-const ORGANIZE_IMPORTS_ACTION_DATA_VERSION: u8 = 2;
+const ORGANIZE_IMPORTS_ACTION_DATA_VERSION: u8 = 3;
 const ORGANIZE_IMPORTS_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("source.organizeImports");
 const MAX_ORGANIZE_IMPORTS_CLAUSES: usize = 64;
@@ -194,6 +195,12 @@ pub(crate) struct OrganizeImportsClauseIdentity {
     pub(crate) input_hash: u64,
     #[serde(with = "decimal_u64")]
     pub(crate) output_hash: u64,
+    /// One ordered fingerprint per parsed import spelling. Each fingerprint
+    /// covers spelling, path qualifier, selected provider URI, and binding
+    /// context; the compact representation keeps the bounded action response
+    /// usable for the 512-entry clause limit.
+    #[serde(with = "decimal_u64_vec")]
+    pub(crate) binding_fingerprints: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +232,31 @@ mod decimal_u64 {
         String::deserialize(deserializer)?
             .parse()
             .map_err(serde::de::Error::custom)
+    }
+}
+
+mod decimal_u64_vec {
+    use super::*;
+
+    pub(super) fn serialize<S>(values: &[u64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.parse().map_err(serde::de::Error::custom))
+            .collect()
     }
 }
 
@@ -1209,6 +1241,7 @@ struct OrganizeImportsProvider {
     uri: Url,
     source_hash: u64,
     safety: UnitOrderSafety,
+    binding_context_fingerprint: u64,
 }
 
 /// Plan the conservative source action from one complete workspace snapshot.
@@ -1313,7 +1346,7 @@ fn organize_imports_plan_from_input(
             return Ok((None, Vec::new()));
         }
 
-        let (clause_edits, clause_providers) =
+        let (clause_edits, clause_providers, binding_fingerprints) =
             organize_clause_edits(source, &parsed, &snapshot.index, uri, cancel, &mut budget)?;
         if clause_edits.is_empty() {
             continue;
@@ -1329,12 +1362,20 @@ fn organize_imports_plan_from_input(
             interface: parsed.interface,
             input_hash: source_hash(input_text),
             output_hash: source_hash(&output),
+            binding_fingerprints,
         });
         for provider in clause_providers {
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(provider.uri.as_str().len(), cancel)?;
             if !providers.contains_key(&provider.uri) {
-                budget.require_work(1, cancel)?;
                 budget.require_work(provider.safety.exported_names.len(), cancel)?;
                 budget.require_work(provider.safety.dependency_uris.len(), cancel)?;
+                for name in &provider.safety.exported_names {
+                    budget.require_bytes(name.len(), cancel)?;
+                }
+                for dependency in &provider.safety.dependency_uris {
+                    budget.require_bytes(dependency.as_str().len(), cancel)?;
+                }
                 let identity = organize_provider_identity(&provider);
                 providers.insert(provider.uri.clone(), identity);
             }
@@ -1370,7 +1411,8 @@ fn organize_imports_plan_from_input(
     });
     let mut provider_identities = providers.into_values().collect::<Vec<_>>();
     provider_identities.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
-    let ordering_proof = organize_ordering_proof(&identities, &provider_identities);
+    let ordering_proof =
+        organize_ordering_proof(&identities, &provider_identities, cancel, &mut budget)?;
     let plan = OrganizeImportsPlan {
         uri: uri.clone(),
         source_hash: source_hash(source),
@@ -1552,6 +1594,8 @@ fn quoted_string_end(bytes: &[u8], start: usize, limit: usize, quote: u8) -> Opt
     None
 }
 
+type OrganizeClauseEdits = (Vec<TextEdit>, Vec<Arc<OrganizeImportsProvider>>, Vec<u64>);
+
 fn organize_clause_edits(
     source: &str,
     clause: &ParsedOrganizeImportsClause,
@@ -1559,17 +1603,17 @@ fn organize_clause_edits(
     target_uri: &Url,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-) -> Result<(Vec<TextEdit>, Vec<OrganizeImportsProvider>), String> {
+) -> Result<OrganizeClauseEdits, String> {
     // Explicit path-qualified entries require a path-aware resolver proof.
     // The navigation binding intentionally records only the resolved unit
     // identity, so the organizer withholds the whole clause rather than
     // assuming that the textual unit name and path selected the same source.
     if clause.entries.iter().any(|entry| entry.path.is_some()) {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
 
     let mut bindings = Vec::with_capacity(clause.entries.len());
-    let mut provider_cache = HashMap::<Url, Option<OrganizeImportsProvider>>::new();
+    let mut provider_cache = HashMap::<Url, Option<Arc<OrganizeImportsProvider>>>::new();
     for entry in &clause.entries {
         budget.require_work(1, cancel)?;
         bindings.push(organize_import_provider(
@@ -1585,7 +1629,7 @@ fn organize_clause_edits(
     // providers.  In particular, an unknown intervening entry could change
     // precedence even when a known duplicate appears removable.
     if bindings.iter().any(Option::is_none) {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
 
     let all_indices = (0..bindings.len()).collect::<Vec<_>>();
@@ -1608,15 +1652,22 @@ fn organize_clause_edits(
         // it covers case-folding and project namespace aliases.  An explicit
         // path remains part of the key because two paths can deliberately
         // select different source identities even when the unit name agrees.
+        let key_bytes = entry
+            .path
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(provider.uri.as_str().len());
+        budget.require_bytes(key_bytes.saturating_mul(2), cancel)?;
         let key = (entry.path.clone(), provider.uri.clone());
         if let Some(previous_index) = seen.get(&key).copied() {
             if dedup_context_safe
                 && duplicate_occurrence_is_safe(
-                    source,
                     clause,
+                    navigation_index,
+                    target_uri,
                     &clause.entries[previous_index],
                     entry,
-                    provider,
+                    provider.as_ref(),
                     cancel,
                     budget,
                 )?
@@ -1663,7 +1714,7 @@ fn organize_clause_edits(
             continue;
         };
         let Some(edit) = organize_byte_edit(source, start, entry.end, String::new()) else {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
         };
         budget.require_work(1, cancel)?;
         edits.push(edit);
@@ -1672,8 +1723,9 @@ fn organize_clause_edits(
     if can_reorder {
         let mut sort_keys = HashMap::<usize, String>::new();
         for index in &survivors {
-            let key = organize_name_key(&clause.entries[*index].name);
-            budget.require_bytes(key.len(), cancel)?;
+            let name = &clause.entries[*index].name;
+            budget.require_bytes(name.len(), cancel)?;
+            let key = organize_name_key(name);
             sort_keys.insert(*index, key);
         }
         let mut ordered: Vec<usize> = Vec::with_capacity(survivors.len());
@@ -1690,6 +1742,7 @@ fn organize_clause_edits(
                     .get(&previous)
                     .expect("ordering key was prepared")
                     .as_str();
+                budget.require_bytes(previous_key.len().saturating_add(key.len()), cancel)?;
                 if (previous_key, previous) <= (key, *index) {
                     break;
                 }
@@ -1709,7 +1762,7 @@ fn organize_clause_edits(
                 current.name_end,
                 replacement.clone(),
             ) else {
-                return Ok((Vec::new(), Vec::new()));
+                return Ok((Vec::new(), Vec::new(), Vec::new()));
             };
             budget.require_work(1, cancel)?;
             budget.require_bytes(edit.new_text.len(), cancel)?;
@@ -1718,13 +1771,22 @@ fn organize_clause_edits(
     }
 
     if edits.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     // Freeze every selected-clause provider, not only entries whose text was
     // directly deleted or renamed.  Negative observations (conflicts and
     // relative-order checks) are part of the proof as well.
+    let mut binding_fingerprints = Vec::with_capacity(clause.entries.len());
+    for (entry, provider) in clause.entries.iter().zip(bindings.iter()) {
+        let Some(provider) = provider.as_ref() else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        binding_fingerprints.push(organize_binding_fingerprint(
+            entry, provider, cancel, budget,
+        )?);
+    }
     let providers = bindings.into_iter().flatten().collect::<Vec<_>>();
-    Ok((edits, providers))
+    Ok((edits, providers, binding_fingerprints))
 }
 
 fn organize_import_provider(
@@ -1733,11 +1795,18 @@ fn organize_import_provider(
     entry: &OrganizeImportsEntry,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
-    cache: &mut HashMap<Url, Option<OrganizeImportsProvider>>,
-) -> Result<Option<OrganizeImportsProvider>, String> {
-    let Some(uri) = index.import_provider_uri(target_uri, &entry.name) else {
+    cache: &mut HashMap<Url, Option<Arc<OrganizeImportsProvider>>>,
+) -> Result<Option<Arc<OrganizeImportsProvider>>, String> {
+    budget.require_bytes(entry.name.len(), cancel)?;
+    let Some(provider_uri) = index.import_provider_uri(target_uri, &entry.name) else {
         return Ok(None);
     };
+    let Some(binding_context_fingerprint) = index.import_binding_context_fingerprint(target_uri)
+    else {
+        return Ok(None);
+    };
+    budget.require_bytes(provider_uri.as_str().len().saturating_mul(2), cancel)?;
+    let uri = provider_uri.clone();
     if let Some(provider) = cache.get(&uri) {
         return Ok(provider.clone());
     }
@@ -1756,18 +1825,20 @@ fn organize_import_provider(
         uri: uri.clone(),
         source_hash: source_hash(source),
         safety,
+        binding_context_fingerprint,
     });
+    let provider = provider.map(Arc::new);
     cache.insert(uri, provider.clone());
     Ok(provider)
 }
 
 fn selected_provider_order_is_safe(
     selected: &[usize],
-    bindings: &[Option<OrganizeImportsProvider>],
+    bindings: &[Option<Arc<OrganizeImportsProvider>>],
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
-    let mut exported_by_provider = HashMap::<String, Url>::new();
+    let mut exported_by_provider = HashMap::<&str, &Url>::new();
     for index in selected {
         let Some(provider) = bindings[*index].as_ref() else {
             return Ok(false);
@@ -1778,21 +1849,25 @@ fn selected_provider_order_is_safe(
         }
         for name in &provider.safety.exported_names {
             budget.require_work(1, cancel)?;
-            if let Some(existing) = exported_by_provider.get(name) {
-                if existing != &provider.uri {
+            budget.require_bytes(name.len(), cancel)?;
+            budget.require_bytes(provider.uri.as_str().len(), cancel)?;
+            if let Some(existing) = exported_by_provider.get(name.as_str()) {
+                if *existing != &provider.uri {
                     return Ok(false);
                 }
             } else {
-                exported_by_provider.insert(name.clone(), provider.uri.clone());
+                exported_by_provider.insert(name.as_str(), &provider.uri);
             }
         }
     }
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn duplicate_occurrence_is_safe(
-    source: &str,
     clause: &ParsedOrganizeImportsClause,
+    navigation_index: &crate::NavigationIndex,
+    target_uri: &Url,
     first: &OrganizeImportsEntry,
     duplicate: &OrganizeImportsEntry,
     provider: &OrganizeImportsProvider,
@@ -1812,51 +1887,26 @@ fn duplicate_occurrence_is_safe(
         cancel,
     )?;
     // Case-only spellings have the same Pascal qualifier.  An actual
-    // project/namespace alias needs a proof that the removed spelling is not
-    // used by a qualified reference.
-    if organize_name_key(&first.name) == organize_name_key(&duplicate.name) {
+    // project/namespace alias needs a parsed-syntax proof that the removed
+    // spelling is not used by a qualified reference.
+    let first_key = organize_name_key(&first.name);
+    let duplicate_key = organize_name_key(&duplicate.name);
+    if first_key == duplicate_key {
         Ok(true)
     } else {
-        organize_spelling_is_not_used(source, clause, duplicate, cancel, budget)
+        Ok(
+            !navigation_index.import_spelling_has_qualified_use_with_budget(
+                target_uri,
+                SourceSpan {
+                    start: clause.start,
+                    end: clause.end,
+                },
+                &duplicate.name,
+                cancel,
+                budget,
+            )?,
+        )
     }
-}
-
-fn organize_spelling_is_not_used(
-    source: &str,
-    clause: &ParsedOrganizeImportsClause,
-    entry: &OrganizeImportsEntry,
-    cancel: &AtomicBool,
-    budget: &mut AssistanceBudget,
-) -> Result<bool, String> {
-    // The scan is deliberately charged per source character.  Alias-aware
-    // deduplication is optional assistance, so a large target or repeated
-    // alias spelling must withhold the whole action instead of running an
-    // unbounded uninterruptible search.
-    let name = entry.name.as_str();
-    for (start, _) in source.char_indices() {
-        budget.require_work(1, cancel)?;
-        let Some(candidate) = source.get(start..start.saturating_add(name.len())) else {
-            continue;
-        };
-        if !candidate.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        let end = start.saturating_add(name.len());
-        if start < clause.end && end > clause.start {
-            continue;
-        }
-        let before = source[..start].chars().next_back();
-        let after = source[end..].chars().next();
-        // A dot is a boundary here: both `Alias.Member` and
-        // `Namespace.Alias.Member` must count as a use.
-        let boundary = |character: Option<char>| {
-            character.is_none_or(|character| !character.is_alphanumeric() && character != '_')
-        };
-        if boundary(before) && boundary(after) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn organize_name_key(name: &str) -> String {
@@ -1932,6 +1982,29 @@ fn organize_edits_are_bounded_and_disjoint(source: &str, edits: &[TextEdit]) -> 
     !ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
 }
 
+fn organize_binding_fingerprint(
+    entry: &OrganizeImportsEntry,
+    provider: &OrganizeImportsProvider,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<u64, String> {
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(
+        entry
+            .name
+            .len()
+            .saturating_add(entry.path.as_ref().map_or(0, String::len))
+            .saturating_add(provider.uri.as_str().len()),
+        cancel,
+    )?;
+    let mut hasher = DefaultHasher::new();
+    entry.name.hash(&mut hasher);
+    entry.path.hash(&mut hasher);
+    provider.uri.hash(&mut hasher);
+    provider.binding_context_fingerprint.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
 fn organize_provider_identity(
     provider: &OrganizeImportsProvider,
 ) -> OrganizeImportsProviderIdentity {
@@ -1963,22 +2036,32 @@ fn organize_safety_fingerprint(uri: &Url, safety: &UnitOrderSafety) -> u64 {
 fn organize_ordering_proof(
     clauses: &[OrganizeImportsClauseIdentity],
     providers: &[OrganizeImportsProviderIdentity],
-) -> u64 {
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<u64, String> {
     let mut hasher = DefaultHasher::new();
     for clause in clauses {
+        budget.require_work(1, cancel)?;
         clause.start.hash(&mut hasher);
         clause.end.hash(&mut hasher);
         clause.interface.hash(&mut hasher);
         clause.input_hash.hash(&mut hasher);
         clause.output_hash.hash(&mut hasher);
+        for binding_fingerprint in &clause.binding_fingerprints {
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(std::mem::size_of_val(binding_fingerprint), cancel)?;
+            binding_fingerprint.hash(&mut hasher);
+        }
     }
     for provider in providers {
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(provider.uri.as_str().len(), cancel)?;
         provider.uri.hash(&mut hasher);
         provider.source_hash.hash(&mut hasher);
         provider.conditional_fingerprint.hash(&mut hasher);
         provider.safety_fingerprint.hash(&mut hasher);
     }
-    hasher.finish()
+    Ok(hasher.finish())
 }
 
 fn method_candidate_identity_is_bounded(
@@ -4067,6 +4150,9 @@ fn organize_imports_action_id(data: &OrganizeImportsActionData) -> String {
         clause.interface.hash(&mut hasher);
         clause.input_hash.hash(&mut hasher);
         clause.output_hash.hash(&mut hasher);
+        for binding_fingerprint in &clause.binding_fingerprints {
+            binding_fingerprint.hash(&mut hasher);
+        }
     }
     for provider in &data.providers {
         provider.uri.hash(&mut hasher);
@@ -4109,6 +4195,9 @@ fn parse_action_data(value: Option<&Value>) -> Result<ParsedActionData, String> 
         for clause in &data.clauses {
             if clause.start > clause.end {
                 return Err("organize-imports clause identity has an invalid span".to_string());
+            }
+            if clause.binding_fingerprints.len() > MAX_ORGANIZE_IMPORTS_ENTRIES {
+                return Err("organize-imports binding identity is too large".to_string());
             }
         }
         for provider in &mut data.providers {
@@ -4367,6 +4456,7 @@ mod tests {
     use std::fs::{self, File, FileTimes};
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
@@ -4389,8 +4479,9 @@ mod tests {
                 dependency_uris: Vec::new(),
                 conditional_fingerprint: 1,
             },
+            binding_context_fingerprint: 1,
         };
-        let bindings = vec![Some(provider)];
+        let bindings = vec![Some(Arc::new(provider))];
         let selected = vec![0];
         let cancel = AtomicBool::new(false);
         let mut budget = AssistanceBudget::new(1, 1024, "organize-imports test");
@@ -4416,13 +4507,42 @@ mod tests {
                 dependency_uris: Vec::new(),
                 conditional_fingerprint: 1,
             },
+            binding_context_fingerprint: 1,
         };
-        let bindings = vec![Some(provider)];
-        let cancel = AtomicBool::new(true);
+        let bindings = vec![Some(Arc::new(provider))];
+        let cancel = AtomicBool::new(false);
         let mut budget = AssistanceBudget::new(16, 1024, "organize-imports test");
+        budget.cancel_after_work(2);
         let error = selected_provider_order_is_safe(&[0], &bindings, &cancel, &mut budget)
-            .expect_err("ordering proof must stop when cancellation is requested");
+            .expect_err("ordering proof must stop when cancellation is requested mid-loop");
         assert_eq!(error, "request cancelled");
+    }
+
+    #[test]
+    fn organize_imports_order_proof_charges_variable_length_export_comparisons() {
+        let provider = OrganizeImportsProvider {
+            uri: Url::parse("file:///tmp/organize-byte-budget-provider.pas").expect("provider URI"),
+            source_hash: 1,
+            safety: UnitOrderSafety {
+                complete: true,
+                has_initialization: false,
+                has_finalization: false,
+                has_helpers: false,
+                exported_names: vec!["x".repeat(4096)],
+                dependency_uris: Vec::new(),
+                conditional_fingerprint: 1,
+            },
+            binding_context_fingerprint: 1,
+        };
+        let bindings = vec![Some(Arc::new(provider))];
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(16, 1, "organize-imports test");
+        let error = selected_provider_order_is_safe(&[0], &bindings, &cancel, &mut budget)
+            .expect_err("variable-length export comparison must consume byte budget");
+        assert!(
+            error.contains("organize-imports test exceeds the 1-byte scan limit"),
+            "unexpected budget error: {error}"
+        );
     }
 
     #[test]

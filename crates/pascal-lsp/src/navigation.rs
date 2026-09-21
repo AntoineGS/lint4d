@@ -708,11 +708,84 @@ impl NavigationIndex {
     /// An explicit workspace binding is required for source actions.  The
     /// fallback catalogue used by a standalone `NavigationIndex` is useful
     /// for navigation, but it is not a sufficient identity proof for edits.
-    pub(crate) fn import_provider_uri(&self, uri: &Url, name: &str) -> Option<Url> {
+    pub(crate) fn import_provider_uri<'a>(&'a self, uri: &Url, name: &str) -> Option<&'a Url> {
         self.documents
             .get(uri)
             .and_then(|document| document.import_bindings.as_ref())
-            .and_then(|bindings| bindings.get(&canonical_name(name)).cloned())
+            .and_then(|bindings| bindings.get(&canonical_name(name)))
+    }
+
+    /// Return the identity of the complete import-binding context used for a
+    /// document.  The value includes the effective conditional context and
+    /// every resolved import spelling, so a project alias rebinding cannot
+    /// look fresh merely because the same provider URI set remains present.
+    pub(crate) fn import_binding_context_fingerprint(&self, uri: &Url) -> Option<u64> {
+        self.documents
+            .get(uri)
+            .and_then(|document| document.import_binding_fingerprint)
+    }
+
+    /// Check qualified references to one import spelling using the parsed
+    /// syntax tree rather than a raw-text search.  Comments, whitespace,
+    /// escaped identifiers, and dotted namespace spellings are represented by
+    /// the same semantic path here.  Failure to understand a qualified node
+    /// fails closed for the optional organizer assistance.
+    pub(crate) fn import_spelling_has_qualified_use_with_budget(
+        &self,
+        uri: &Url,
+        clause: SourceSpan,
+        spelling: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(true);
+        };
+        budget.require_bytes(spelling.len(), cancel)?;
+        let expected = spelling.split('.').collect::<Vec<_>>();
+        if expected.iter().any(|part| part.is_empty()) {
+            return Ok(true);
+        }
+        let mut pending = vec![document.tree.root_node()];
+        while let Some(node) = pending.pop() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot") {
+                let span = Span::from_node(node);
+                if span.start < clause.end && span.end > clause.start {
+                    // The import clause itself is not a use of its spelling.
+                } else if let Some(parts) = qualified_identifier_nodes(node) {
+                    if parts.len() > expected.len() {
+                        let mut matches = true;
+                        for (part, expected_part) in parts.iter().zip(expected.iter()) {
+                            let actual = document
+                                .source
+                                .get(part.start_byte()..part.end_byte())
+                                .unwrap_or_default();
+                            budget.require_work(1, cancel)?;
+                            budget.require_bytes(actual.len(), cancel)?;
+                            if !canonical_identifier_eq(actual, expected_part) {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        if matches {
+                            return Ok(true);
+                        }
+                    }
+                } else {
+                    return Ok(true);
+                }
+            }
+            let mut cursor = node.walk();
+            pending.extend(
+                node.children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        Ok(false)
     }
 
     /// Return source-backed ordering facts while charging the caller's
@@ -768,12 +841,14 @@ impl NavigationIndex {
             && document.unknown_imports.is_empty();
         for import in &document.imports {
             budget.require_work(1, cancel)?;
+            budget.require_bytes(import.name.len(), cancel)?;
             let Some(provider) = self.import_provider_uri(uri, &import.name) else {
                 complete = false;
                 continue;
             };
-            if seen_dependencies.insert(provider.clone()) {
-                dependency_uris.push(provider);
+            budget.require_bytes(provider.as_str().len(), cancel)?;
+            if seen_dependencies.insert(provider) {
+                dependency_uris.push(provider.clone());
             }
         }
         Ok(Some(UnitOrderSafety {
@@ -1418,6 +1493,10 @@ impl NavigationIndex {
             .map(|(name, uri)| (canonical_name(&name), uri))
             .collect();
         if let Some(document) = self.documents.get_mut(uri) {
+            document.import_binding_fingerprint = Some(import_binding_fingerprint(
+                &document.conditional_context,
+                &bindings,
+            ));
             document.import_bindings = Some(bindings);
         }
     }
@@ -1426,6 +1505,10 @@ impl NavigationIndex {
     /// workspace-owned empty binding map.
     pub fn clear_import_bindings(&mut self, uri: &Url) {
         if let Some(document) = self.documents.get_mut(uri) {
+            document.import_binding_fingerprint = Some(import_binding_fingerprint(
+                &document.conditional_context,
+                &HashMap::new(),
+            ));
             document.import_bindings = Some(HashMap::new());
         }
     }
@@ -12855,6 +12938,8 @@ pub(super) struct AssistanceBudget {
     work_limit: usize,
     byte_limit: usize,
     operation: &'static str,
+    #[cfg(test)]
+    cancel_after_work: Option<usize>,
 }
 
 fn check_navigation_cancel(cancel: &AtomicBool) -> Result<(), String> {
@@ -12875,7 +12960,14 @@ impl AssistanceBudget {
             work_limit,
             byte_limit,
             operation,
+            #[cfg(test)]
+            cancel_after_work: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancel_after_work(&mut self, work: usize) {
+        self.cancel_after_work = Some(work);
     }
 
     pub(super) fn take_work(&mut self, amount: usize, cancel: &AtomicBool) -> Result<bool, String> {
@@ -12887,6 +12979,15 @@ impl AssistanceBudget {
             return Ok(false);
         }
         self.remaining_work -= amount;
+        #[cfg(test)]
+        if let Some(remaining) = self.cancel_after_work.as_mut() {
+            if amount >= *remaining {
+                *remaining = 0;
+                cancel.store(true, Ordering::Relaxed);
+            } else {
+                *remaining -= amount;
+            }
+        }
         Ok(true)
     }
 
@@ -13836,6 +13937,7 @@ pub(crate) struct ParsedDocument {
 struct Document {
     parsed: Arc<ParsedDocument>,
     import_bindings: Option<HashMap<String, Url>>,
+    import_binding_fingerprint: Option<u64>,
 }
 
 impl Deref for Document {
@@ -13864,6 +13966,7 @@ impl Document {
                 return Ok(Self {
                     parsed: previous.clone(),
                     import_bindings: None,
+                    import_binding_fingerprint: None,
                 });
             }
         }
@@ -14272,6 +14375,7 @@ impl Document {
         Ok(Self {
             parsed,
             import_bindings: None,
+            import_binding_fingerprint: None,
         })
     }
 
@@ -16881,6 +16985,24 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
+fn qualified_identifier_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let mut pending = vec![node];
+    let mut parts = Vec::new();
+    while let Some(current) = pending.pop() {
+        match current.kind() {
+            "identifier" => parts.push(current),
+            "exprDot" | "genericDot" | "typerefDot" => {
+                let lhs = current.child_by_field_name("lhs")?;
+                let rhs = current.child_by_field_name("rhs")?;
+                pending.push(rhs);
+                pending.push(lhs);
+            }
+            _ => return None,
+        }
+    }
+    Some(parts)
+}
+
 fn is_identifier_in_qualified_path(identifier: Node<'_>, _source: &str) -> bool {
     let span = Span::from_node(identifier);
     let mut current = identifier.parent();
@@ -17257,6 +17379,30 @@ fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
 
 fn canonical_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
+}
+
+fn canonical_identifier_eq(left: &str, right: &str) -> bool {
+    left.trim_start_matches('&')
+        .eq_ignore_ascii_case(right.trim_start_matches('&'))
+}
+
+fn import_binding_fingerprint(
+    conditional_context: &ConditionalContext,
+    bindings: &HashMap<String, Url>,
+) -> u64 {
+    let mut entries = bindings.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.0
+            .cmp(right.0)
+            .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+    });
+    let mut hasher = DefaultHasher::new();
+    conditional_context.fingerprint().hash(&mut hasher);
+    for (name, uri) in entries {
+        name.hash(&mut hasher);
+        uri.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 pub(super) fn source_content_hash(source: &str) -> u64 {

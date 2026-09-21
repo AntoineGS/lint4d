@@ -202,6 +202,40 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
 
+### Generate missing method implementations
+
+Code actions also offer `Implement 'TOwner.Method'` for a source-backed class
+method declaration when the indexed unit proves that its implementation is
+missing. The supported finite subset is ordinary `procedure`/`function`,
+`constructor`, and `destructor` declarations, including `class` (static)
+methods, grouped `var`/`out`/`const`/value parameters, named types, pointers,
+dynamic arrays, supported generic owners and method type parameters, and a
+known function result type. Declaration-only defaults are removed from the
+implementation header; parameter modes, result types, generic spelling, and
+comments are retained. Operators, abstract/forward/external declarations,
+unknown calling conventions, unsupported generic constraints, static arrays,
+unknown types, and parser-recovery or conditional-uncertain declarations are
+withheld.
+
+The edit is limited to the declaration's own editable physical unit. It is
+inserted before `initialization`, `finalization`, or the unit's final `end.`
+and never writes an include, creates a file, appends after `end.`, or guesses
+across an include expansion. Existing full or abbreviated implementations,
+overloads whose identity is uncertain, conditional implementations, and
+include-owned provenance suppress the action. The generated body is deliberately
+minimal and contains an explicit `// TODO: Implement ...` comment; it does not
+invent a function return value or exception behavior. UTF-16 ranges, BOMs,
+non-BMP text, comments, indentation, and the source's line-ending convention
+are preserved.
+
+The action is a standard `quickfix` and supports both eager edits and
+`codeAction/resolve`. Resolution rechecks the source, owner, declaration,
+configuration, conditional context, implementation proof, and output version;
+stale or cancelled work fails closed. Traversal and serialized output remain
+bounded by the assistance work/byte budgets and the 16 KiB method-header and
+64 KiB code-action response limits. Uncertain source ownership, imports,
+conditional state, physical mapping, or insertion safety produces no edit.
+
 ### Background analysis
 
 Navigation, formatting, and open-buffer diagnostics run as cancellable,

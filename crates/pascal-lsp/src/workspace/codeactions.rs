@@ -12,7 +12,7 @@ use super::{
 use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
     AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
-    MissingUnitCandidate, MissingUnitUseKind,
+    MissingMethodImplementationCandidate, MissingUnitCandidate, MissingUnitUseKind,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -40,7 +40,10 @@ const MAX_ACTION_NAME_BYTES: usize = 256;
 const MAX_ACTION_UNIT_BYTES: usize = 256;
 const MAX_ACTION_URI_BYTES: usize = 4096;
 const MAX_MISSING_UNIT_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_METHOD_HEADER_BYTES: usize = 16 * 1024;
 const MISSING_UNIT_ACTION_KIND: &str = "add-missing-unit";
+const METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-method";
+const METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const CONSTANT_RULE: &str = "constant-naming";
 const LOCAL_RULE: &str = "local-variable-naming";
 
@@ -84,6 +87,30 @@ pub(crate) struct MissingUnitActionData {
     pub(crate) provider_context_fingerprint: u64,
     #[serde(with = "decimal_u64")]
     pub(crate) use_context_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) configuration_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) config_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_hash: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MethodImplementationActionData {
+    pub(crate) version: u8,
+    pub(crate) action_id: String,
+    pub(crate) kind: String,
+    pub(crate) uri: Url,
+    pub(crate) anchor: Range,
+    pub(crate) declaration: Range,
+    pub(crate) owner: String,
+    pub(crate) method: String,
+    pub(crate) unit_name: String,
+    #[serde(with = "decimal_u64")]
+    pub(crate) identity: u64,
     #[serde(with = "decimal_u64")]
     pub(crate) source_generation: u64,
     #[serde(with = "decimal_u64")]
@@ -139,9 +166,19 @@ struct MissingUnitPlan {
 }
 
 #[derive(Debug, Clone)]
+struct MethodImplementationPlan {
+    candidate: MissingMethodImplementationCandidate,
+    uri: Url,
+    source_hash: u64,
+    config_fingerprint: u64,
+    edit: TextEdit,
+}
+
+#[derive(Debug, Clone)]
 enum ParsedActionData {
     Rename(RenameActionData),
     MissingUnit(MissingUnitActionData),
+    MethodImplementation(MethodImplementationActionData),
 }
 
 struct CandidateRequest<'a> {
@@ -231,6 +268,19 @@ pub(crate) fn code_actions_from_input(
         Ok(result) => result,
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    let (method_plans, method_records) = match method_implementation_plans_from_input(
+        &input,
+        &uri,
+        &source,
+        &target_record,
+        &params,
+        config_fingerprint,
+        &configuration_records,
+        cancel,
+    ) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
     if features.resolve {
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
         for candidate in &candidates {
@@ -280,6 +330,31 @@ pub(crate) fn code_actions_from_input(
                 Err(error) => return failed(source_generation, configuration_generation, error),
             }
         }
+        for plan in &method_plans {
+            let data = MethodImplementationActionData::new(
+                plan,
+                source_generation,
+                configuration_generation,
+            );
+            let action = CodeActionOrCommand::CodeAction(CodeAction {
+                title: method_implementation_action_title(&plan.candidate),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: None,
+                edit: None,
+                command: None,
+                is_preferred: Some(method_plans.len() == 1),
+                disabled: None,
+                data: Some(
+                    serde_json::to_value(&data)
+                        .expect("method implementation action data is serializable"),
+                ),
+            });
+            match push_bounded_code_action(&mut actions, action) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
         return Computed {
             source_generation,
             configuration_generation,
@@ -287,6 +362,7 @@ pub(crate) fn code_actions_from_input(
             records: {
                 let mut records = vec![target_record];
                 append_records(&mut records, missing_records);
+                append_records(&mut records, method_records);
                 append_records(&mut records, configuration_records);
                 records
             },
@@ -431,8 +507,48 @@ pub(crate) fn code_actions_from_input(
             Err(error) => return failed(source_generation, configuration_generation, error),
         }
     }
+    for plan in &method_plans {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let data =
+            MethodImplementationActionData::new(plan, source_generation, configuration_generation);
+        let mut action = CodeAction {
+            title: method_implementation_action_title(&plan.candidate),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: None,
+            edit: None,
+            command: None,
+            is_preferred: Some(method_plans.len() == 1),
+            disabled: None,
+            data: Some(
+                serde_json::to_value(&data)
+                    .expect("method implementation action data is serializable"),
+            ),
+        };
+        if !features.resolve {
+            let mut raw_edits = std::collections::HashMap::new();
+            raw_edits.insert(uri.clone(), vec![plan.edit.clone()]);
+            let mut records_by_uri = std::collections::HashMap::new();
+            records_by_uri.insert(uri.clone(), target_record.clone());
+            match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+                Ok(edit) => action.edit = Some(edit),
+                Err(error) => {
+                    if !set_disabled_or_skip(&mut action, features.disabled, error) {
+                        continue;
+                    }
+                }
+            }
+        }
+        match push_bounded_code_action(&mut actions, CodeActionOrCommand::CodeAction(action)) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    }
     let mut records = snapshot_records(&snapshot);
     append_records(&mut records, missing_records);
+    append_records(&mut records, method_records);
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -560,6 +676,183 @@ fn missing_unit_plans_from_input(
         return Ok((Vec::new(), Vec::new()));
     }
     Ok((plans, snapshot_records(&snapshot)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn method_implementation_plans_from_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    params: &CodeActionParams,
+    config_fingerprint: u64,
+    configuration_records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(Vec<MethodImplementationPlan>, Vec<SourceRecord>), String> {
+    // A declaration or insertion point inside an include expansion has no
+    // single physical owner unless a separate provenance proof is available.
+    // This action deliberately chooses the safe, direct-source subset.
+    if may_contain_include_directive(source.as_bytes()) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let Some(identifier) = identifier_at_position(source, params.range.start) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let snapshot = match build_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        std::slice::from_ref(&identifier),
+        SnapshotMode::Workspace,
+        Some(
+            SnapshotSeed::new(target_record.clone())
+                .with_consumed_configuration(configuration_records),
+        ),
+        &[],
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) if is_cancelled(cancel) => return Err(error),
+        // Method generation is an optional action. An incomplete project
+        // context suppresses this action, but must not hide unrelated
+        // naming or missing-unit actions from the same request.
+        Err(_) => return Ok((Vec::new(), Vec::new())),
+    };
+    if !snapshot.complete
+        || !snapshot.include_errors.is_empty()
+        || !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|indexed| indexed != source)
+        || snapshot
+            .index
+            .source_text(uri)
+            .is_none_or(|indexed| indexed != source)
+    {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut budget = AssistanceBudget::new(
+        MAX_MISSING_UNIT_REQUEST_WORK,
+        MAX_MISSING_UNIT_REQUEST_BYTES,
+        "method implementation request",
+    );
+    let candidates = snapshot
+        .index
+        .missing_method_implementation_candidates_with_budget(
+            uri,
+            params.range.start,
+            cancel,
+            &mut budget,
+        )?;
+    let mut plans = Vec::new();
+    for candidate in candidates {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if !method_candidate_identity_is_bounded(&candidate, uri) {
+            continue;
+        }
+        let Some(edit) = method_implementation_edit(source, &candidate) else {
+            continue;
+        };
+        plans.push(MethodImplementationPlan {
+            candidate,
+            uri: uri.clone(),
+            source_hash: source_hash(source),
+            config_fingerprint,
+            edit,
+        });
+    }
+    if plans.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    Ok((plans, snapshot_records(&snapshot)))
+}
+
+fn method_candidate_identity_is_bounded(
+    candidate: &MissingMethodImplementationCandidate,
+    uri: &Url,
+) -> bool {
+    !candidate.owner.is_empty()
+        && candidate.owner.len() <= MAX_ACTION_UNIT_BYTES
+        && !candidate.method.is_empty()
+        && candidate.method.len() <= MAX_ACTION_NAME_BYTES
+        && !candidate.unit_name.is_empty()
+        && candidate.unit_name.len() <= MAX_ACTION_UNIT_BYTES
+        && candidate.header.len() <= MAX_METHOD_HEADER_BYTES
+        && uri.as_str().len() <= MAX_ACTION_URI_BYTES
+}
+
+fn method_implementation_edit(
+    source: &str,
+    candidate: &MissingMethodImplementationCandidate,
+) -> Option<TextEdit> {
+    if candidate.insertion_offset > source.len()
+        || !source.is_char_boundary(candidate.insertion_offset)
+    {
+        return None;
+    }
+    let position = text::offset_to_position(source, candidate.insertion_offset)?;
+    let line_start = source[..candidate.insertion_offset]
+        .rfind('\n')
+        .map_or(0, |index| index.saturating_add(1));
+    let line_start = if source[line_start..candidate.insertion_offset].contains('\r') {
+        source[..candidate.insertion_offset]
+            .rfind('\r')
+            .map_or(0, |index| index.saturating_add(1))
+    } else {
+        line_start
+    };
+    let current_prefix = source.get(line_start..candidate.insertion_offset)?;
+    if current_prefix.len() > MAX_METHOD_HEADER_BYTES {
+        return None;
+    }
+    let indentation = if current_prefix.trim().is_empty() {
+        current_prefix
+    } else {
+        ""
+    };
+    let line_ending = if source.contains("\r\n") {
+        "\r\n"
+    } else if source.contains('\n') {
+        "\n"
+    } else if source.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    };
+    let header = candidate
+        .header
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', line_ending);
+    let leading = if current_prefix.trim().is_empty() {
+        ""
+    } else {
+        line_ending
+    };
+    let mut new_text = String::new();
+    new_text.push_str(leading);
+    new_text.push_str(&header);
+    new_text.push_str(line_ending);
+    new_text.push_str(indentation);
+    new_text.push_str("begin");
+    new_text.push_str(line_ending);
+    new_text.push_str(indentation);
+    new_text.push_str("  // TODO: Implement ");
+    new_text.push_str(&candidate.owner);
+    new_text.push('.');
+    new_text.push_str(&candidate.method);
+    new_text.push('.');
+    new_text.push_str(line_ending);
+    new_text.push_str(indentation);
+    new_text.push_str("end;");
+    new_text.push_str(line_ending);
+    new_text.push_str(indentation);
+    if new_text.len() > MAX_METHOD_HEADER_BYTES.saturating_mul(2) {
+        return None;
+    }
+    Some(TextEdit::new(Range::new(position, position), new_text))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -726,6 +1019,9 @@ pub(crate) fn resolve_from_input(
     let data = match data {
         ParsedActionData::MissingUnit(data) => {
             return resolve_missing_unit_from_input(input, action, data, features, cancel);
+        }
+        ParsedActionData::MethodImplementation(data) => {
+            return resolve_method_implementation_from_input(input, action, data, features, cancel);
         }
         ParsedActionData::Rename(data) => data,
     };
@@ -1049,6 +1345,143 @@ fn resolve_missing_unit_from_input(
     resolved.edit = Some(edit);
     resolved.disabled = None;
     let mut records = missing_records;
+    append_records(&mut records, configuration_records);
+    Computed {
+        source_generation,
+        configuration_generation,
+        value: Ok(resolved),
+        records,
+    }
+}
+
+fn resolve_method_implementation_from_input(
+    input: WorkspaceInput,
+    action: CodeAction,
+    data: MethodImplementationActionData,
+    features: ClientActionFeatures,
+    cancel: &AtomicBool,
+) -> Computed<CodeAction> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if let Err(error) = validate_method_implementation_action_data(
+        &data,
+        &action,
+        source_generation,
+        configuration_generation,
+    ) {
+        return failed(source_generation, configuration_generation, error);
+    }
+
+    let target_uri = canonical_file_uri(&data.uri);
+    let (target_source, target_record) =
+        match source_for_input_with_cancel(&input, &target_uri, Some(cancel)) {
+            Ok(source) => source,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if !input_source_is_editable(&input, &target_uri) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("code-action document is outside configured workspace roots: {target_uri}"),
+        );
+    }
+    if source_hash(&target_source) != data.source_hash {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source changed; request code actions again".to_string(),
+        );
+    }
+    if identifier_at_position(&target_source, data.anchor.start)
+        .is_none_or(|identifier| identifier != data.method)
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "method declaration changed; request code actions again".to_string(),
+        );
+    }
+
+    let (_config, config_fingerprint, excluded, configuration_records) =
+        match lint_configuration_for_input(&input, &target_uri) {
+            Ok(config) => config,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if excluded {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source is excluded by lint configuration".to_string(),
+        );
+    }
+    if config_fingerprint != data.config_fingerprint {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action configuration is stale; request code actions again".to_string(),
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let params = CodeActionParams {
+        text_document: lsp_types::TextDocumentIdentifier {
+            uri: target_uri.clone(),
+        },
+        range: data.anchor,
+        context: CodeActionContext {
+            diagnostics: action.diagnostics.clone().unwrap_or_default(),
+            only: Some(vec![CodeActionKind::QUICKFIX]),
+            trigger_kind: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    let (plans, method_records) = match method_implementation_plans_from_input(
+        &input,
+        &target_uri,
+        &target_source,
+        &target_record,
+        &params,
+        config_fingerprint,
+        &configuration_records,
+        cancel,
+    ) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let Some(plan) = plans.into_iter().find(|plan| {
+        plan.uri == target_uri
+            && plan.candidate.anchor == data.anchor
+            && plan.candidate.declaration == data.declaration
+            && plan.candidate.owner == data.owner
+            && plan.candidate.method == data.method
+            && plan.candidate.unit_name == data.unit_name
+            && plan.candidate.identity == data.identity
+            && plan.config_fingerprint == data.config_fingerprint
+            && plan.source_hash == data.source_hash
+    }) else {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "method declaration, owner, or implementation proof is stale; request code actions again"
+                .to_string(),
+        );
+    };
+
+    let mut raw_edits = std::collections::HashMap::new();
+    raw_edits.insert(target_uri.clone(), vec![plan.edit]);
+    let mut records_by_uri = std::collections::HashMap::new();
+    records_by_uri.insert(target_uri, target_record);
+    let edit = match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+        Ok(edit) => edit,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let mut resolved = action;
+    resolved.edit = Some(edit);
+    resolved.disabled = None;
+    let mut records = method_records;
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -1508,6 +1941,10 @@ fn missing_unit_action_title(candidate: &MissingUnitCandidate) -> String {
     format!("Add unit '{}' to uses", candidate.unit_name)
 }
 
+fn method_implementation_action_title(candidate: &MissingMethodImplementationCandidate) -> String {
+    format!("Implement '{}.{}'", candidate.owner, candidate.method)
+}
+
 impl RenameActionData {
     fn new(
         candidate: &NamingCandidate,
@@ -1558,6 +1995,33 @@ impl MissingUnitActionData {
     }
 }
 
+impl MethodImplementationActionData {
+    fn new(
+        plan: &MethodImplementationPlan,
+        source_generation: u64,
+        configuration_generation: u64,
+    ) -> Self {
+        let mut data = Self {
+            version: METHOD_IMPLEMENTATION_ACTION_DATA_VERSION,
+            action_id: String::new(),
+            kind: METHOD_IMPLEMENTATION_ACTION_KIND.to_string(),
+            uri: plan.uri.clone(),
+            anchor: plan.candidate.anchor,
+            declaration: plan.candidate.declaration,
+            owner: plan.candidate.owner.clone(),
+            method: plan.candidate.method.clone(),
+            unit_name: plan.candidate.unit_name.clone(),
+            identity: plan.candidate.identity,
+            source_generation,
+            configuration_generation,
+            config_fingerprint: plan.config_fingerprint,
+            source_hash: plan.source_hash,
+        };
+        data.action_id = method_implementation_action_id(&data);
+        data
+    }
+}
+
 fn action_id(data: &RenameActionData) -> String {
     let mut hasher = DefaultHasher::new();
     data.version.hash(&mut hasher);
@@ -1600,6 +2064,30 @@ fn missing_unit_action_id(data: &MissingUnitActionData) -> String {
     format!("pascal-lsp:{:016x}", hasher.finish())
 }
 
+fn method_implementation_action_id(data: &MethodImplementationActionData) -> String {
+    let mut hasher = DefaultHasher::new();
+    data.version.hash(&mut hasher);
+    data.kind.hash(&mut hasher);
+    data.uri.hash(&mut hasher);
+    data.anchor.start.line.hash(&mut hasher);
+    data.anchor.start.character.hash(&mut hasher);
+    data.anchor.end.line.hash(&mut hasher);
+    data.anchor.end.character.hash(&mut hasher);
+    data.declaration.start.line.hash(&mut hasher);
+    data.declaration.start.character.hash(&mut hasher);
+    data.declaration.end.line.hash(&mut hasher);
+    data.declaration.end.character.hash(&mut hasher);
+    data.owner.hash(&mut hasher);
+    data.method.hash(&mut hasher);
+    data.unit_name.hash(&mut hasher);
+    data.identity.hash(&mut hasher);
+    data.source_generation.hash(&mut hasher);
+    data.configuration_generation.hash(&mut hasher);
+    data.config_fingerprint.hash(&mut hasher);
+    data.source_hash.hash(&mut hasher);
+    format!("pascal-lsp:{:016x}", hasher.finish())
+}
+
 fn source_hash(source: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
@@ -1610,7 +2098,23 @@ fn parse_action_data(value: Option<&Value>) -> Result<ParsedActionData, String> 
     let Some(value) = value else {
         return Err("code action has no resolve data".to_string());
     };
-    if value.get("kind").is_some() {
+    if value.get("kind").and_then(Value::as_str) == Some(METHOD_IMPLEMENTATION_ACTION_KIND) {
+        let mut data: MethodImplementationActionData = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid method implementation resolve data: {error}"))?;
+        data.uri = canonical_file_uri(&data.uri);
+        if data.action_id.len() > MAX_ACTION_ID_BYTES
+            || data.owner.len() > MAX_ACTION_UNIT_BYTES
+            || data.method.len() > MAX_ACTION_NAME_BYTES
+            || data.unit_name.len() > MAX_ACTION_UNIT_BYTES
+            || data.uri.as_str().len() > MAX_ACTION_URI_BYTES
+        {
+            return Err(
+                "method implementation resolve data exceeds its bounded identity limits"
+                    .to_string(),
+            );
+        }
+        Ok(ParsedActionData::MethodImplementation(data))
+    } else if value.get("kind").is_some() {
         let mut data: MissingUnitActionData = serde_json::from_value(value.clone())
             .map_err(|error| format!("invalid missing-unit resolve data: {error}"))?;
         data.uri = canonical_file_uri(&data.uri);
@@ -1687,6 +2191,40 @@ fn validate_missing_unit_action_data(
         || action.kind.as_ref() != Some(&CodeActionKind::QUICKFIX)
     {
         return Err("missing-unit code action identity was modified by the client".to_string());
+    }
+    if action.data.as_ref().is_none_or(|value| value.is_null()) {
+        return Err("code action resolve data is missing".to_string());
+    }
+    Ok(())
+}
+
+fn validate_method_implementation_action_data(
+    data: &MethodImplementationActionData,
+    action: &CodeAction,
+    source_generation: u64,
+    configuration_generation: u64,
+) -> Result<(), String> {
+    if data.version != METHOD_IMPLEMENTATION_ACTION_DATA_VERSION
+        || data.kind != METHOD_IMPLEMENTATION_ACTION_KIND
+        || data.action_id != method_implementation_action_id(data)
+        || data.source_generation != source_generation
+        || data.configuration_generation != configuration_generation
+    {
+        return Err("method implementation resolve data is stale or tampered".to_string());
+    }
+    if data.owner.is_empty()
+        || data.owner.len() > MAX_ACTION_UNIT_BYTES
+        || data.method.is_empty()
+        || data.method.len() > MAX_ACTION_NAME_BYTES
+        || data.unit_name.is_empty()
+        || data.unit_name.len() > MAX_ACTION_UNIT_BYTES
+    {
+        return Err("method implementation action identity is invalid".to_string());
+    }
+    if action.title != format!("Implement '{}.{}'", data.owner, data.method)
+        || action.kind.as_ref() != Some(&CodeActionKind::QUICKFIX)
+    {
+        return Err("method implementation action identity was modified by the client".to_string());
     }
     if action.data.as_ref().is_none_or(|value| value.is_null()) {
         return Err("code action resolve data is missing".to_string());

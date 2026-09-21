@@ -31036,6 +31036,645 @@ fn code_action_resolve_rechecks_identity_and_rejects_stale_source_actions() {
 }
 
 #[test]
+fn code_action_generates_a_missing_class_method_implementation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  TWidget = class\n",
+        "  public\n",
+        "    procedure Run(Value: Integer = 1);\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let position = position_of(source, "Run", 0);
+    let request_id = RequestId::from("generate-method-implementation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": position,
+                "end": position_after(source, "Run", 0)
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "method code action failed: {response:?}"
+    );
+    let actions = response.result.expect("method actions");
+    assert_eq!(actions.as_array().expect("method action array").len(), 1);
+    assert_eq!(actions[0]["title"], "Implement 'TWidget.Run'");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Widget;\n",
+            "interface\n",
+            "type\n",
+            "  TWidget = class\n",
+            "  public\n",
+            "    procedure Run(Value: Integer = 1);\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TWidget.Run(Value: Integer);\n",
+            "begin\n",
+            "  // TODO: Implement TWidget.Run.\n",
+            "end;\n",
+            "end.\n",
+        )
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": updated,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("generated-method-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &updated, "Run", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1, "generated method must reparse and pair");
+    assert_eq!(locations[0]["uri"], uri(&source_path).to_string());
+    assert_eq!(locations[0]["range"]["start"]["line"], 8);
+    server.shutdown();
+}
+
+#[test]
+fn code_action_defers_missing_method_edit_and_resolves_it() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  TWidget = class\n",
+        "  public\n",
+        "    function ValueOf(var Input: Integer): UnicodeString;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let position = position_of(source, "ValueOf", 0);
+    let request_id = RequestId::from("deferred-method-implementation".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": position,
+                "end": position_after(source, "ValueOf", 0)
+            },
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "deferred method action failed: {response:?}"
+    );
+    let actions = response.result.expect("deferred method actions");
+    assert_eq!(actions.as_array().expect("method action array").len(), 1);
+    assert!(actions[0]["edit"].is_null());
+    assert_eq!(actions[0]["data"]["kind"], "implement-method");
+    assert_eq!(actions[0]["data"]["version"], 1);
+    assert!(actions[0]["data"]["identity"].is_string());
+
+    let resolve_id = RequestId::from("deferred-method-implementation-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "method resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved method action");
+    let updated = apply_workspace_edit_to_source(source, &resolved["edit"], &uri(&source_path));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Widget;\n",
+            "interface\n",
+            "type\n",
+            "  TWidget = class\n",
+            "  public\n",
+            "    function ValueOf(var Input: Integer): UnicodeString;\n",
+            "  end;\n",
+            "implementation\n",
+            "function TWidget.ValueOf(var Input: Integer): UnicodeString;\n",
+            "begin\n",
+            "  // TODO: Implement TWidget.ValueOf.\n",
+            "end;\n",
+            "end.\n",
+        )
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_preserves_constructor_destructor_static_and_grouped_method_signatures() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  TWidget = class\n",
+        "  public\n",
+        "    class procedure Reset(First, Second: Integer; var Left, Right: Integer; out Text: UnicodeString; const Enabled, Visible: Boolean);\n",
+        "    constructor Create(const Name: UnicodeString);\n",
+        "    destructor Destroy; override;\n",
+        "  end;\n",
+        "implementation\n",
+        "initialization\n",
+        "  PrepareWidget;\n",
+        "finalization\n",
+        "  ReleaseWidget;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    for (method, expected_header) in [
+        (
+            "Reset",
+            "class procedure TWidget.Reset(First, Second: Integer; var Left, Right: Integer; out Text: UnicodeString; const Enabled, Visible: Boolean);\n",
+        ),
+        (
+            "Create",
+            "constructor TWidget.Create(const Name: UnicodeString);\n",
+        ),
+        ("Destroy", "destructor TWidget.Destroy;\n"),
+    ] {
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &source_path,
+            source,
+            method,
+            &format!("signature-{method}"),
+        );
+        assert_eq!(actions.len(), 1, "missing {method} action: {actions:?}");
+        let updated =
+            apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+        assert_eq!(
+        updated,
+        source.replace(
+            "initialization\n",
+            &format!(
+                "{expected_header}begin\n  // TODO: Implement TWidget.{method}.\nend;\ninitialization\n"
+            ),
+        )
+    );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn code_action_pairs_overloads_and_suppresses_full_or_abbreviated_implementations() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  TWidget = class\n",
+        "  public\n",
+        "    procedure Full(Value: Integer);\n",
+        "    procedure Abbreviated(Value: Integer);\n",
+        "    procedure Overload(Value: Integer); overload;\n",
+        "    procedure Overload(Value: UnicodeString); overload;\n",
+        "  end;\n",
+        "implementation\n",
+        "procedure TWidget.Full(Value: Integer);\n",
+        "begin\n",
+        "end;\n",
+        "procedure TWidget.Abbreviated;\n",
+        "begin\n",
+        "end;\n",
+        "procedure TWidget.Overload(Value: Integer);\n",
+        "begin\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    for (method, occurrence, expected_header) in [
+        ("Full", 0, None),
+        ("Abbreviated", 0, None),
+        ("Overload", 0, None),
+        (
+            "Overload",
+            1,
+            Some("procedure TWidget.Overload(Value: UnicodeString);\n"),
+        ),
+    ] {
+        let request_id = RequestId::from(format!("pairing-{method}-{occurrence}"));
+        let position = position_of(source, method, occurrence);
+        server.send_request(
+            request_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "range": {"start": position, "end": position_after(source, method, occurrence)},
+                "context": {"diagnostics": [], "only": ["quickfix"]}
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "pairing request failed: {response:?}"
+        );
+        let actions = response.result.expect("pairing actions");
+        let actions = actions.as_array().expect("pairing action array");
+        match expected_header {
+            Some(header) => {
+                assert_eq!(
+                    actions.len(),
+                    1,
+                    "unimplemented overload action: {actions:?}"
+                );
+                let updated =
+                    apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+                assert!(
+                    updated.contains(&format!("{header}begin\n")),
+                    "generated overload header missing: {updated}"
+                );
+            }
+            None => assert!(
+                actions.is_empty(),
+                "implemented method must not receive a duplicate action: {actions:?}"
+            ),
+        }
+    }
+    server.shutdown();
+}
+
+#[test]
+fn code_action_preserves_supported_generic_method_and_owner_qualification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("GenericWidget.pas");
+    let source = concat!(
+        "unit GenericWidget;\n",
+        "interface\n",
+        "type\n",
+        "  TBox<T> = class\n",
+        "  public\n",
+        "    function Convert<U>(const Value: U): T;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "Convert",
+        "generic-method-action",
+    );
+    assert_eq!(actions.len(), 1, "generic method action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(
+        updated.contains(
+            "function TBox<T>.Convert<U>(const Value: U): T;\nbegin\n  // TODO: Implement TBox<T>.Convert.\nend;\n"
+        ),
+        "generated generic method is not source-preserving: {updated}"
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": updated,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("generic-generated-method-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &updated, "Convert", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1, "generic method must reparse and pair");
+    assert_eq!(locations[0]["range"]["start"]["line"], 8);
+    server.shutdown();
+}
+
+#[test]
+fn code_action_preserves_nested_class_owner_qualification() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("NestedWidget.pas");
+    let source = concat!(
+        "unit NestedWidget;\n",
+        "interface\n",
+        "type\n",
+        "  TOuter = class\n",
+        "  public\n",
+        "    type\n",
+        "      TInner = class\n",
+        "      public\n",
+        "        procedure Run;\n",
+        "      end;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "Run",
+        "nested-method-action",
+    );
+    assert_eq!(actions.len(), 1, "nested method action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(
+        updated.contains(
+            "procedure TOuter.TInner.Run;\nbegin\n  // TODO: Implement TOuter.TInner.Run.\nend;\n"
+        ),
+        "generated nested method is not owner-qualified: {updated}"
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": updated,
+            }
+        }),
+    );
+    let definition_id = RequestId::from("nested-generated-method-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&source_path, &updated, "Run", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1, "nested method must reparse and pair");
+    assert_eq!(locations[0]["range"]["start"]["line"], 12);
+    server.shutdown();
+}
+
+#[test]
+fn code_action_preserves_bom_crlf_non_bmp_and_header_comments() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("UnicodeWidget.pas");
+    let source = concat!(
+        "\u{feff}unit UnicodeWidget;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  TWidget = class\r\n",
+        "  public\r\n",
+        "    // Keep this declaration's note: 😀\r\n",
+        "    function Run(\r\n",
+        "      const Value: UnicodeString {retain this comment};\r\n",
+        "      var Count: Integer\r\n",
+        "    ): UnicodeString;\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "initialization\r\n",
+        "  StartWidget;\r\n",
+        "end.\r\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "Run",
+        "unicode-method-action",
+    );
+    assert_eq!(actions.len(), 1, "unicode method action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(
+        updated.starts_with('\u{feff}'),
+        "the source BOM must remain"
+    );
+    assert!(
+    updated.contains(
+        "function TWidget.Run(\r\n      const Value: UnicodeString {retain this comment};\r\n      var Count: Integer\r\n    ): UnicodeString;\r\nbegin\r\n  // TODO: Implement TWidget.Run.\r\nend;\r\ninitialization\r\n"
+    ),
+    "generated method must retain comments and CRLF: {updated:?}"
+);
+    server.shutdown();
+}
+
+#[test]
+fn code_action_withholds_abstract_external_forward_conditional_and_include_sources() {
+    let run_case = |source: &str, method: &str, include: bool, id: &str| {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Widget.pas");
+        write_file(&source_path, source);
+        if include {
+            write_file(&root.join("other.inc"), "");
+        }
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let actions = request_missing_unit_actions(&mut server, &source_path, source, method, id);
+        assert!(
+            actions.is_empty(),
+            "unsupported or uncertain declaration must be withheld: {actions:?}"
+        );
+        server.shutdown();
+    };
+
+    let abstract_source = concat!(
+        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Abstracted; abstract;\n  end;\nimplementation\nend.\n",
+    );
+    run_case(abstract_source, "Abstracted", false, "abstract-method");
+
+    let external_source = concat!(
+        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Externalized; external;\n  end;\nimplementation\nend.\n",
+    );
+    run_case(external_source, "Externalized", false, "external-method");
+
+    let forward_source = concat!(
+        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Forwarded; forward;\n  end;\nimplementation\nend.\n",
+    );
+    run_case(forward_source, "Forwarded", false, "forward-method");
+
+    let conditional_source = concat!(
+        "unit Widget;\ninterface\n{$IF UnknownFlag}\ntype\n  TWidget = class\n  public\n    procedure Conditional;\n  end;\n{$ENDIF}\nimplementation\nend.\n",
+    );
+    run_case(
+        conditional_source,
+        "Conditional",
+        false,
+        "conditional-method",
+    );
+
+    let conditional_definition_source = concat!(
+        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure ConditionalDefinition;\n  end;\nimplementation\n{$IF UnknownFlag}\nprocedure TWidget.ConditionalDefinition; begin end;\n{$ENDIF}\nend.\n",
+    );
+    run_case(
+        conditional_definition_source,
+        "ConditionalDefinition",
+        false,
+        "conditional-definition-method",
+    );
+
+    let include_source = concat!(
+        "unit Widget;\ninterface\n{$I other.inc}\ntype\n  TWidget = class\n  public\n    procedure IncludedContext;\n  end;\nimplementation\nend.\n",
+    );
+    run_case(include_source, "IncludedContext", true, "include-method");
+}
+
+#[test]
+fn deferred_method_resolve_rejects_an_implementation_added_after_creation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  TWidget = class\n",
+        "  public\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let changed = source.replace(
+        "implementation\nend.",
+        "implementation\nprocedure TWidget.Run; begin end;\nend.",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "Run",
+        "stale-method-implementation-action",
+    );
+    assert_eq!(actions.len(), 1, "stale method setup: {actions:?}");
+    write_file(&source_path, &changed);
+
+    let resolve_id = RequestId::from("stale-method-implementation-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "a newly appearing implementation must stale the deferred action: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn method_code_actions_honor_quickfix_context_filter_and_capability_negotiation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  TWidget = class\n",
+        "  public\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let refactor_id = RequestId::from("method-refactor-only".to_string());
+    let position = position_of(source, "Run", 0);
+    server.send_request(
+        refactor_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {"start": position, "end": position_after(source, "Run", 0)},
+            "context": {"diagnostics": [], "only": ["refactor"]}
+        }),
+    );
+    let refactor_response = server.response(&refactor_id);
+    assert!(refactor_response.error.is_none());
+    assert_eq!(
+        refactor_response.result.expect("refactor actions"),
+        json!([])
+    );
+
+    let quickfix_id = RequestId::from("method-quickfix".to_string());
+    server.send_request(
+        quickfix_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {"start": position, "end": position_after(source, "Run", 0)},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let quickfix_response = server.response(&quickfix_id);
+    assert!(quickfix_response.error.is_none());
+    let quickfix_actions = quickfix_response
+        .result
+        .expect("quickfix actions")
+        .as_array()
+        .expect("quickfix action array")
+        .clone();
+    assert_eq!(quickfix_actions.len(), 1);
+    assert!(quickfix_actions[0]["edit"].is_object());
+    server.shutdown();
+}
+
+#[test]
 fn code_action_resolve_rejects_closed_source_changes_without_a_generation_event() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

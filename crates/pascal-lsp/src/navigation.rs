@@ -33,6 +33,26 @@ pub(crate) use assistance::completion_prefix_at_position;
 pub(crate) use assistance::{
     CompletionMetadata, CompletionOptions, CompletionResult, MissingUnitCandidate,
 };
+
+/// A source-backed class method declaration for which the complete indexed
+/// unit proves that no implementation currently exists.
+///
+/// The candidate deliberately contains the rendered implementation header and
+/// the safe section boundary computed from the same parsed source. Callers
+/// still have to turn the boundary into a physical edit; keeping the proof and
+/// header construction here prevents code-action code from reconstructing
+/// routine identity from display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingMethodImplementationCandidate {
+    pub(crate) anchor: Range,
+    pub(crate) declaration: Range,
+    pub(crate) owner: String,
+    pub(crate) method: String,
+    pub(crate) unit_name: String,
+    pub(crate) header: String,
+    pub(crate) insertion_offset: usize,
+    pub(crate) identity: u64,
+}
 pub(crate) use folding::{
     FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
 };
@@ -625,6 +645,249 @@ impl NavigationIndex {
         self.documents
             .get(uri)
             .map(|document| document.source.as_ref())
+    }
+
+    /// Find a declaration-owned class method that can safely receive a
+    /// generated implementation.
+    ///
+    /// This is intentionally stricter than ordinary navigation. A method
+    /// action needs one exact owner, a supported signature, a complete
+    /// declaration/definition proof, and a physical implementation boundary
+    /// in the same unit. Any ambiguity is represented as no candidate rather
+    /// than as a best-effort edit.
+    pub(crate) fn missing_method_implementation_candidates_with_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<MissingMethodImplementationCandidate>, String> {
+        check_navigation_cancel(cancel)?;
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(Vec::new());
+        };
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(Vec::new());
+        };
+        if is_ignored_offset(document.tree.root_node(), offset)
+            || !is_declaration_identifier(identifier)
+        {
+            return Ok(Vec::new());
+        }
+        let identifier_span = Span::from_node(identifier);
+        let mut declaration_index = None;
+        for (index, symbol) in document.symbols.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                return Ok(Vec::new());
+            }
+            if symbol.kind == SymbolKind::Routine
+                && symbol.origin == Origin::Declaration
+                && symbol.span == identifier_span
+            {
+                declaration_index = Some(index);
+                break;
+            }
+        }
+        let Some(declaration_index) = declaration_index else {
+            return Ok(Vec::new());
+        };
+        let declaration = &document.symbols[declaration_index];
+        if declaration.owner_type.is_none()
+            || declaration.local_only
+            || !matches!(
+                declaration.region,
+                Region::Interface | Region::Implementation
+            )
+            || declaration.routine_kind == RoutineKind::Operator
+            || declaration.routine_directives.abstract_
+            || declaration.routine_directives.forward
+            || declaration.routine_directives.calling_convention_unknown
+            || declaration.routine_key.is_none()
+            || declaration.routine_signature.is_none()
+            || declaration
+                .routine_signature
+                .as_deref()
+                .is_some_and(|signature| {
+                    signature
+                        .split(',')
+                        .any(|part| part.trim_end().ends_with('?'))
+                })
+        {
+            return Ok(Vec::new());
+        }
+        if document
+            .conditional_unknown_symbols
+            .get(declaration_index)
+            .copied()
+            .unwrap_or(true)
+            || document.has_parser_recovery_near(declaration.declaration_span)
+        {
+            return Ok(Vec::new());
+        }
+
+        let declaration_node = match ancestor_routine_declaration(
+            identifier,
+            declaration.declaration_span,
+            cancel,
+            budget,
+        )? {
+            Some(node) => node,
+            None => return Ok(Vec::new()),
+        };
+        if declaration_node.child_by_field_name("assign").is_some()
+            || declaration_node
+                .child_by_field_name("rttiAttributes")
+                .is_some()
+            || routine_declaration_is_external(declaration_node)
+        {
+            return Ok(Vec::new());
+        }
+
+        let Some(owner_node) = ancestor_declared_type(declaration_node, cancel, budget)? else {
+            return Ok(Vec::new());
+        };
+        let Some(true) =
+            type_node_contains_kind_with_budget(owner_node, "declClass", cancel, budget)?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(false) =
+            type_node_contains_kind_with_budget(owner_node, "declHelper", cancel, budget)?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(owner_name) =
+            declared_type_qualification(owner_node, document.source.as_ref(), cancel, budget)?
+        else {
+            return Ok(Vec::new());
+        };
+        let owner_key = declaration.owner_type.as_deref().unwrap_or_default();
+        let mut owner_symbols = Vec::new();
+        for (index, symbol) in document.symbols.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                return Ok(Vec::new());
+            }
+            if symbol.kind == SymbolKind::Type
+                && symbol.origin == Origin::Declaration
+                && symbol.generic_parameter.is_none()
+                && symbol.key == owner_key
+                && symbol.declaration_span == Span::from_node(owner_node)
+                && symbol.type_kind == TypeKind::Class
+            {
+                owner_symbols.push((index, symbol));
+            }
+        }
+        if owner_symbols.len() != 1 {
+            return Ok(Vec::new());
+        }
+        let (owner_index, owner_symbol) = owner_symbols[0];
+        if !budget.take_work(1, cancel)?
+            || document
+                .conditional_unknown_symbols
+                .get(owner_index)
+                .copied()
+                .unwrap_or(true)
+            || document.has_parser_recovery_near(Span::from_node(owner_node))
+            || owner_symbol
+                .generic_parameters
+                .iter()
+                .any(|parameter| parameter.constraint_unsupported)
+        {
+            return Ok(Vec::new());
+        }
+
+        if !method_signature_is_supported(declaration) {
+            return Ok(Vec::new());
+        }
+        let Some(insertion_offset) =
+            method_implementation_insertion_offset(document, cancel, budget)?
+        else {
+            return Ok(Vec::new());
+        };
+        if document.conditionals.is_unknown_at(insertion_offset)
+            || document.has_parser_recovery_near(Span {
+                start: insertion_offset,
+                end: insertion_offset.saturating_add(1),
+            })
+        {
+            return Ok(Vec::new());
+        }
+
+        match method_definition_proof(document, declaration, declaration_index, cancel, budget)? {
+            ContractMatch::Yes | ContractMatch::Unknown => return Ok(Vec::new()),
+            ContractMatch::No => {}
+        }
+
+        let Some(method_name_node) = declaration_name_identifiers(declaration_node)
+            .last()
+            .copied()
+        else {
+            return Ok(Vec::new());
+        };
+        let method_name = document
+            .source
+            .get(method_name_node.start_byte()..method_name_node.end_byte())
+            .unwrap_or_default()
+            .to_owned();
+        if method_name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(header) =
+            method_implementation_header(declaration_node, document.source.as_ref(), &owner_name)
+        else {
+            return Ok(Vec::new());
+        };
+        if !budget.take_bytes(header.len(), cancel)? {
+            return Ok(Vec::new());
+        }
+        let declaration_range = Range::new(
+            text::offset_to_position(&document.source, declaration.declaration_span.start)
+                .ok_or_else(|| "method declaration is not a UTF-16 boundary".to_string())?,
+            text::offset_to_position(&document.source, declaration.declaration_span.end)
+                .ok_or_else(|| "method declaration is not a UTF-16 boundary".to_string())?,
+        );
+        let anchor = Range::new(
+            text::offset_to_position(&document.source, declaration.span.start)
+                .ok_or_else(|| "method name is not a UTF-16 boundary".to_string())?,
+            text::offset_to_position(&document.source, declaration.span.end)
+                .ok_or_else(|| "method name is not a UTF-16 boundary".to_string())?,
+        );
+        let title = format!("{owner_name}.{method_name}");
+        if owner_name.len() > 256
+            || method_name.len() > 256
+            || title.len() > 512
+            || document.unit_name.len() > 256
+        {
+            return Ok(Vec::new());
+        }
+        let mut hasher = DefaultHasher::new();
+        declaration.routine_key.hash(&mut hasher);
+        declaration.routine_kind.hash(&mut hasher);
+        declaration.is_static.hash(&mut hasher);
+        declaration.routine_signature.hash(&mut hasher);
+        declaration.result_type_ref.hash(&mut hasher);
+        declaration.generic_parameters.hash(&mut hasher);
+        owner_name.hash(&mut hasher);
+        method_name.hash(&mut hasher);
+        header.hash(&mut hasher);
+        declaration.declaration_span.hash(&mut hasher);
+        let identity = hasher.finish();
+
+        Ok(vec![MissingMethodImplementationCandidate {
+            anchor,
+            declaration: declaration_range,
+            owner: owner_name.to_owned(),
+            method: method_name,
+            unit_name: document.unit_name.clone(),
+            header,
+            insertion_offset,
+            identity,
+        }])
     }
 
     /// Bind a document's imports to the workspace-selected unit documents.
@@ -15051,6 +15314,379 @@ fn missing_unit_provider_declaration_fingerprint(symbol: &Symbol, source: &str) 
         .unwrap_or_default()
         .hash(&mut hasher);
     hasher.finish()
+}
+
+fn ancestor_routine_declaration<'a>(
+    identifier: Node<'a>,
+    declaration_span: Span,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(None);
+        }
+        if node.kind() == "declProc" && Span::from_node(node) == declaration_span {
+            if !is_definition_header(node) {
+                return Ok(Some(node));
+            }
+            return Ok(None);
+        }
+        current = node.parent();
+    }
+    Ok(None)
+}
+
+fn ancestor_declared_type<'a>(
+    declaration: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let mut current = declaration.parent();
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(None);
+        }
+        if node.kind() == "declType" {
+            return Ok(Some(node));
+        }
+        current = node.parent();
+    }
+    Ok(None)
+}
+
+fn declared_type_qualification(
+    node: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    let target = Span::from_node(node);
+    let mut names = Vec::new();
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(None);
+        }
+        let is_owner = Span::from_node(candidate) == target;
+        let encloses_owner = candidate
+            .child_by_field_name("type")
+            .is_some_and(|type_node| Span::from_node(type_node).contains(target));
+        if candidate.kind() == "declType" && (is_owner || encloses_owner) {
+            let Some(name_node) = candidate.child_by_field_name("name") else {
+                return Ok(None);
+            };
+            let Some(name) = source.get(name_node.start_byte()..name_node.end_byte()) else {
+                return Ok(None);
+            };
+            if name.is_empty() {
+                return Ok(None);
+            }
+            names.push(name.to_owned());
+        }
+        current = candidate.parent();
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    names.reverse();
+    Ok(Some(names.join(".")))
+}
+
+fn type_node_contains_kind_with_budget(
+    node: Node<'_>,
+    kind: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<bool>, String> {
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(None);
+        }
+        if current.kind() == kind {
+            return Ok(Some(true));
+        }
+        let mut cursor = current.walk();
+        pending.extend(current.children(&mut cursor));
+    }
+    Ok(Some(false))
+}
+
+fn routine_declaration_is_external(node: Node<'_>) -> bool {
+    let mut external = false;
+    collect_nodes(node, &mut |child| {
+        if matches!(child.kind(), "procExternal" | "kExternal") {
+            external = true;
+        }
+    });
+    external
+}
+
+fn method_signature_is_supported(symbol: &Symbol) -> bool {
+    if symbol
+        .generic_parameters
+        .iter()
+        .any(|parameter| parameter.constraint_unsupported)
+    {
+        return false;
+    }
+    if symbol.routine_parameters.iter().any(|parameter| {
+        parameter
+            .type_shape
+            .as_ref()
+            .is_none_or(|shape| !method_type_shape_is_supported(shape))
+    }) {
+        return false;
+    }
+    match symbol.routine_kind {
+        RoutineKind::Function => symbol
+            .result_type_ref
+            .as_ref()
+            .is_some_and(method_type_ref_is_supported),
+        RoutineKind::Procedure | RoutineKind::Constructor | RoutineKind::Destructor => {
+            symbol.result_type_ref.is_none()
+        }
+        RoutineKind::Operator => false,
+    }
+}
+
+fn method_type_shape_is_supported(shape: &TypeShape) -> bool {
+    match shape {
+        TypeShape::Named(type_ref) => method_type_ref_is_supported(type_ref),
+        TypeShape::Pointer(element) => method_type_shape_is_supported(element),
+        TypeShape::Array { element, dynamic } => {
+            *dynamic && method_type_shape_is_supported(element)
+        }
+        TypeShape::Callable => true,
+        TypeShape::Unknown => false,
+    }
+}
+
+fn method_type_ref_is_supported(type_ref: &TypeRef) -> bool {
+    !type_ref.path.is_empty() && type_ref.args.iter().all(method_type_ref_is_supported)
+}
+
+fn method_definition_proof(
+    document: &Document,
+    declaration: &Symbol,
+    declaration_index: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ContractMatch, String> {
+    let mut uncertain = false;
+    for (index, definition) in document.symbols.iter().enumerate() {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(ContractMatch::Unknown);
+        }
+        if index == declaration_index
+            || definition.kind != SymbolKind::Routine
+            || definition.origin != Origin::Definition
+            || definition.owner_type != declaration.owner_type
+            || definition.scope != declaration.scope
+            || definition.key != declaration.key
+            || definition.routine_kind != declaration.routine_kind
+            || definition.is_static != declaration.is_static
+        {
+            continue;
+        }
+        let definition_span = definition
+            .routine_header_span
+            .unwrap_or(definition.declaration_span);
+        let definition_unknown = document
+            .conditional_unknown_symbols
+            .get(index)
+            .copied()
+            .unwrap_or(true)
+            || document.has_parser_recovery_near(definition_span);
+        if definition.routine_key == declaration.routine_key {
+            if definition_unknown {
+                uncertain = true;
+                continue;
+            }
+            match missing_unit_routine_implementation_status(declaration, definition) {
+                ContractMatch::Yes => return Ok(ContractMatch::Yes),
+                ContractMatch::Unknown => uncertain = true,
+                ContractMatch::No => {}
+            }
+            continue;
+        }
+
+        // A deliberately abbreviated implementation is only safe after the
+        // shared pairing pass has selected one declaration. If it remains
+        // unresolved, or if its signature contains an unsupported shape, it
+        // can represent the selected overload and must block generation.
+        if definition.unresolved_abbreviated
+            || definition.routine_signature.is_none()
+            || definition
+                .routine_signature
+                .as_deref()
+                .is_some_and(|signature| {
+                    signature
+                        .split(',')
+                        .any(|part| part.trim_end().ends_with('?'))
+                })
+        {
+            uncertain = true;
+        }
+    }
+    Ok(if uncertain {
+        ContractMatch::Unknown
+    } else {
+        ContractMatch::No
+    })
+}
+
+fn method_implementation_insertion_offset(
+    document: &Document,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<usize>, String> {
+    let root = document.tree.root_node();
+    let unit = if root.kind() == "unit" {
+        root
+    } else {
+        let mut unit = None;
+        for index in 0..root.named_child_count() {
+            check_navigation_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                return Ok(None);
+            }
+            if let Some(child) = root.named_child(index) {
+                if child.kind() == "unit" {
+                    unit = Some(child);
+                    break;
+                }
+            }
+        }
+        let Some(unit) = unit else {
+            return Ok(None);
+        };
+        unit
+    };
+    let mut implementation_seen = false;
+    for index in 0..unit.named_child_count() {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(None);
+        }
+        let Some(child) = unit.named_child(index) else {
+            return Ok(None);
+        };
+        if child.kind() == "implementation" {
+            implementation_seen = true;
+            continue;
+        }
+        if implementation_seen && matches!(child.kind(), "initialization" | "finalization" | "kEnd")
+        {
+            return Ok(Some(child.start_byte()));
+        }
+    }
+    Ok(None)
+}
+
+fn method_implementation_header(node: Node<'_>, source: &str, owner_name: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    let header_end = first_uncommented_semicolon(source, node.start_byte(), node.end_byte())?;
+    if header_end < name.end_byte() {
+        return None;
+    }
+
+    let mut replacements = vec![(
+        name.start_byte(),
+        name.end_byte(),
+        format!(
+            "{owner_name}.{}",
+            source.get(name.start_byte()..name.end_byte())?
+        ),
+    )];
+    if let Some(arguments) = node.child_by_field_name("args") {
+        for group in direct_routine_argument_groups(arguments) {
+            let Some(default) = group.child_by_field_name("defaultValue") else {
+                continue;
+            };
+            let mut start = default.start_byte();
+            while start > group.start_byte()
+                && source
+                    .as_bytes()
+                    .get(start.saturating_sub(1))
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+            {
+                start = start.saturating_sub(1);
+            }
+            replacements.push((start, default.end_byte(), String::new()));
+        }
+    }
+    replacements.sort_by_key(|replacement| replacement.0);
+    let mut rendered = String::new();
+    let mut cursor = node.start_byte();
+    for (start, end, replacement) in replacements {
+        if start < cursor || end > header_end {
+            return None;
+        }
+        rendered.push_str(source.get(cursor..start)?);
+        rendered.push_str(&replacement);
+        cursor = end;
+    }
+    rendered.push_str(source.get(cursor..header_end.saturating_add(1))?);
+
+    if let Some(convention) = routine_calling_convention_keyword(node) {
+        rendered.push(' ');
+        rendered.push_str(convention);
+        rendered.push(';');
+    }
+    Some(rendered)
+}
+
+fn routine_calling_convention_keyword(node: Node<'_>) -> Option<&'static str> {
+    let mut convention = None;
+    collect_nodes(node, &mut |child| {
+        convention = convention.or(match child.kind() {
+            "kCdecl" => Some("cdecl"),
+            "kStdcall" => Some("stdcall"),
+            "kPascal" => Some("pascal"),
+            "kRegister" => Some("register"),
+            "kSafecall" => Some("safecall"),
+            _ => None,
+        });
+    });
+    convention
+}
+
+fn first_uncommented_semicolon(source: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = start.min(bytes.len());
+    let end = end.min(bytes.len());
+    let mut parentheses = 0usize;
+    while index < end {
+        index = match bytes[index] {
+            b'\'' => skip_source_string(bytes, index, end),
+            b'{' => skip_source_brace_comment(bytes, index, end),
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                skip_source_line_comment(bytes, index, end)
+            }
+            b'(' if bytes.get(index + 1) == Some(&b'*') => {
+                skip_source_paren_star_comment(bytes, index, end)
+            }
+            b'(' => {
+                parentheses = parentheses.saturating_add(1);
+                index.saturating_add(1)
+            }
+            b')' => {
+                parentheses = parentheses.saturating_sub(1);
+                index.saturating_add(1)
+            }
+            b';' if parentheses == 0 => return Some(index),
+            _ => index.saturating_add(1),
+        };
+    }
+    None
 }
 
 /// Establish the relation that the resolver's routine key is intended to

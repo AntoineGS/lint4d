@@ -787,6 +787,13 @@ fn method_implementation_edit(
     source: &str,
     candidate: &MissingMethodImplementationCandidate,
 ) -> Option<TextEdit> {
+    if candidate.owner.contains('\r')
+        || candidate.owner.contains('\n')
+        || candidate.method.contains('\r')
+        || candidate.method.contains('\n')
+    {
+        return None;
+    }
     if candidate.insertion_offset > source.len()
         || !source.is_char_boundary(candidate.insertion_offset)
     {

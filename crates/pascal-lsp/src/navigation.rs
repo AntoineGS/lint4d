@@ -837,8 +837,13 @@ impl NavigationIndex {
         if method_name.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(header) =
-            method_implementation_header(declaration_node, document.source.as_ref(), &owner_name)
+        let Some(header) = method_implementation_header(
+            declaration_node,
+            document.source.as_ref(),
+            &owner_name,
+            cancel,
+            budget,
+        )?
         else {
             return Ok(Vec::new());
         };
@@ -15380,13 +15385,10 @@ fn declared_type_qualification(
             let Some(name_node) = candidate.child_by_field_name("name") else {
                 return Ok(None);
             };
-            let Some(name) = source.get(name_node.start_byte()..name_node.end_byte()) else {
+            let Some(name) = reference_name_with_budget(name_node, source, cancel, budget)? else {
                 return Ok(None);
             };
-            if name.is_empty() {
-                return Ok(None);
-            }
-            names.push(name.to_owned());
+            names.push(name);
         }
         current = candidate.parent();
     }
@@ -15394,7 +15396,11 @@ fn declared_type_qualification(
         return Ok(None);
     }
     names.reverse();
-    Ok(Some(names.join(".")))
+    let qualification = names.join(".");
+    if !budget.take_bytes(qualification.len(), cancel)? {
+        return Ok(None);
+    }
+    Ok(Some(qualification))
 }
 
 fn type_node_contains_kind_with_budget(
@@ -15591,20 +15597,31 @@ fn method_implementation_insertion_offset(
     Ok(None)
 }
 
-fn method_implementation_header(node: Node<'_>, source: &str, owner_name: &str) -> Option<String> {
-    let name = node.child_by_field_name("name")?;
-    let header_end = first_uncommented_semicolon(source, node.start_byte(), node.end_byte())?;
+fn method_implementation_header(
+    node: Node<'_>,
+    source: &str,
+    owner_name: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    let Some(name) = node.child_by_field_name("name") else {
+        return Ok(None);
+    };
+    let Some(method_name) = reference_name_with_budget(name, source, cancel, budget)? else {
+        return Ok(None);
+    };
+    let Some(header_end) = first_uncommented_semicolon(source, node.start_byte(), node.end_byte())
+    else {
+        return Ok(None);
+    };
     if header_end < name.end_byte() {
-        return None;
+        return Ok(None);
     }
 
     let mut replacements = vec![(
         name.start_byte(),
         name.end_byte(),
-        format!(
-            "{owner_name}.{}",
-            source.get(name.start_byte()..name.end_byte())?
-        ),
+        format!("{owner_name}.{method_name}"),
     )];
     if let Some(arguments) = node.child_by_field_name("args") {
         for group in direct_routine_argument_groups(arguments) {
@@ -15628,20 +15645,206 @@ fn method_implementation_header(node: Node<'_>, source: &str, owner_name: &str) 
     let mut cursor = node.start_byte();
     for (start, end, replacement) in replacements {
         if start < cursor || end > header_end {
-            return None;
+            return Ok(None);
         }
-        rendered.push_str(source.get(cursor..start)?);
+        let Some(prefix) = source.get(cursor..start) else {
+            return Ok(None);
+        };
+        rendered.push_str(prefix);
         rendered.push_str(&replacement);
         cursor = end;
     }
-    rendered.push_str(source.get(cursor..header_end.saturating_add(1))?);
+    let Some(suffix) = source.get(cursor..header_end.saturating_add(1)) else {
+        return Ok(None);
+    };
+    rendered.push_str(suffix);
 
     if let Some(convention) = routine_calling_convention_keyword(node) {
         rendered.push(' ');
         rendered.push_str(convention);
         rendered.push(';');
     }
-    Some(rendered)
+    Ok(Some(rendered))
+}
+
+fn reference_name_with_budget(
+    node: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    check_navigation_cancel(cancel)?;
+    if !budget.take_work(1, cancel)? {
+        return Ok(None);
+    }
+    match node.kind() {
+        "identifier" => {
+            let Some(name) = source.get(node.start_byte()..node.end_byte()) else {
+                return Ok(None);
+            };
+            if name.is_empty() || !budget.take_bytes(name.len(), cancel)? {
+                return Ok(None);
+            }
+            Ok(Some(name.to_owned()))
+        }
+        "genericTpl" => {
+            let Some(entity) = node.child_by_field_name("entity") else {
+                return Ok(None);
+            };
+            let Some(arguments) = node.child_by_field_name("args") else {
+                return Ok(None);
+            };
+            let Some(entity) = reference_name_with_budget(entity, source, cancel, budget)? else {
+                return Ok(None);
+            };
+            let Some(parameters) =
+                generic_reference_parameters_with_budget(arguments, source, cancel, budget)?
+            else {
+                return Ok(None);
+            };
+            let mut result = entity;
+            result.push('<');
+            result.push_str(&parameters.join(", "));
+            result.push('>');
+            if !budget.take_bytes(result.len(), cancel)? {
+                return Ok(None);
+            }
+            Ok(Some(result))
+        }
+        "genericDot" => {
+            let Some(lhs) = node.child_by_field_name("lhs") else {
+                return Ok(None);
+            };
+            let Some(rhs) = node.child_by_field_name("rhs") else {
+                return Ok(None);
+            };
+            let Some(lhs) = reference_name_with_budget(lhs, source, cancel, budget)? else {
+                return Ok(None);
+            };
+            let Some(rhs) = reference_name_with_budget(rhs, source, cancel, budget)? else {
+                return Ok(None);
+            };
+            let result = format!("{lhs}.{rhs}");
+            if !budget.take_bytes(result.len(), cancel)? {
+                return Ok(None);
+            }
+            Ok(Some(result))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn generic_reference_parameters_with_budget(
+    arguments: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Vec<String>>, String> {
+    let mut parameters = Vec::new();
+    for index in 0..arguments.named_child_count() {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(None);
+        }
+        let Some(argument) = arguments.named_child(index) else {
+            return Ok(None);
+        };
+        match argument.kind() {
+            "genericArg" => {
+                if !append_generic_reference_group(
+                    argument,
+                    source,
+                    cancel,
+                    budget,
+                    &mut parameters,
+                )? {
+                    return Ok(None);
+                }
+            }
+            "genericArgs" => {
+                for child_index in 0..argument.named_child_count() {
+                    check_navigation_cancel(cancel)?;
+                    if !budget.take_work(1, cancel)? {
+                        return Ok(None);
+                    }
+                    let Some(group) = argument.named_child(child_index) else {
+                        return Ok(None);
+                    };
+                    if group.kind() != "genericArg"
+                        || !append_generic_reference_group(
+                            group,
+                            source,
+                            cancel,
+                            budget,
+                            &mut parameters,
+                        )?
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+            "comment" => {}
+            _ => return Ok(None),
+        }
+    }
+    if parameters.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parameters))
+}
+
+fn append_generic_reference_group(
+    group: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    parameters: &mut Vec<String>,
+) -> Result<bool, String> {
+    if !generic_reference_group_is_supported(group, source) {
+        return Ok(false);
+    }
+    let names = field_identifier_nodes(group, "name");
+    if names.is_empty() {
+        return Ok(false);
+    }
+    for name_node in names {
+        check_navigation_cancel(cancel)?;
+        if !budget.take_work(1, cancel)? {
+            return Ok(false);
+        }
+        let Some(name) = source.get(name_node.start_byte()..name_node.end_byte()) else {
+            return Ok(false);
+        };
+        if name.is_empty() || !budget.take_bytes(name.len(), cancel)? {
+            return Ok(false);
+        }
+        parameters.push(name.to_owned());
+    }
+    Ok(true)
+}
+
+fn generic_reference_group_is_supported(group: Node<'_>, source: &str) -> bool {
+    let Some(constraint_node) = generic_constraint_type_node(group) else {
+        return !contains_uncommented_byte(
+            source,
+            Span {
+                start: group.start_byte(),
+                end: group.end_byte(),
+            },
+            b':',
+        );
+    };
+    let has_constraint_syntax = contains_uncommented_byte(
+        source,
+        Span {
+            start: group.start_byte(),
+            end: group.end_byte(),
+        },
+        b':',
+    );
+    !has_constraint_syntax
+        || (type_ref_from_node(constraint_node, source).is_some()
+            && !generic_constraint_has_trailing_tokens(group, constraint_node, source))
 }
 
 fn routine_calling_convention_keyword(node: Node<'_>) -> Option<&'static str> {

@@ -211,11 +211,13 @@ missing. The supported finite subset is ordinary `procedure`/`function`,
 methods, grouped `var`/`out`/`const`/value parameters, named types, pointers,
 dynamic arrays, supported generic owners and method type parameters, and a
 known function result type. Declaration-only defaults are removed from the
-implementation header; parameter modes, result types, generic spelling, and
-comments are retained. Operators, abstract/forward/external declarations,
-unknown calling conventions, unsupported generic constraints, static arrays,
-unknown types, and parser-recovery or conditional-uncertain declarations are
-withheld.
+implementation header; parameter modes, result types, supported generic
+parameter names, source spelling, and comments are retained. Declaration-only
+generic constraints are omitted from implementation owner and method
+references, as required by Delphi implementation syntax. Operators,
+abstract/forward/external declarations, unknown calling conventions,
+unsupported generic constraints, static arrays, unknown types, and
+parser-recovery or conditional-uncertain declarations are withheld.
 
 The edit is limited to the declaration's own editable physical unit. It is
 inserted before `initialization`, `finalization`, or the unit's final `end.`
@@ -223,8 +225,10 @@ and never writes an include, creates a file, appends after `end.`, or guesses
 across an include expansion. Existing full or abbreviated implementations,
 overloads whose identity is uncertain, conditional implementations, and
 include-owned provenance suppress the action. The generated body is deliberately
-minimal and contains an explicit `// TODO: Implement ...` comment; it does not
-invent a function return value or exception behavior. UTF-16 ranges, BOMs,
+minimal and contains an explicit single-line `// TODO: Implement ...` comment;
+its owner identity is rendered from legal generic parameter names rather than
+multiline declaration text. It does not invent a function return value or
+exception behavior. UTF-16 ranges, BOMs,
 non-BMP text, comments, indentation, and the source's line-ending convention
 are preserved.
 

@@ -31397,6 +31397,322 @@ fn code_action_preserves_supported_generic_method_and_owner_qualification() {
     server.shutdown();
 }
 
+fn assert_applied_method_source_parses(source: &str, label: &str) {
+    let info = FileInfo::new("Widget.pas".into());
+    let (tree, diagnostics) = pascal_core::parser::parse_file(&info, source.as_bytes())
+        .unwrap_or_else(|error| panic!("{label}: applied method source did not parse: {error}"));
+    assert!(
+        !tree.root_node().has_error(),
+        "{label}: applied method source has parser errors: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "{label}: applied method source has diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn code_action_renders_legal_generic_reference_parameters_in_applied_headers() {
+    let cases = [
+        (
+            "constrained owner",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TWidget<T: class> = class\n",
+                "  public\n",
+                "    procedure Run;\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TWidget<T>.Run;\nbegin\n  // TODO: Implement TWidget<T>.Run.\nend;\n",
+            "TWidget<T>.Run",
+        ),
+        (
+            "multiple constrained owner parameters",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TWidget<T: class; U: constructor> = class\n",
+                "  public\n",
+                "    procedure Run;\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TWidget<T, U>.Run;\nbegin\n  // TODO: Implement TWidget<T, U>.Run.\nend;\n",
+            "TWidget<T, U>.Run",
+        ),
+        (
+            "constrained method parameters",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TWidget = class\n",
+                "  public\n",
+                "    procedure Run<T: class>(Value: T);\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TWidget.Run<T>(Value: T);\nbegin\n  // TODO: Implement TWidget.Run.\nend;\n",
+            "TWidget.Run",
+        ),
+        (
+            "nested constrained owners",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TOuter<T: class> = class\n",
+                "  public\n",
+                "    type\n",
+                "      TInner<U: constructor> = class\n",
+                "      public\n",
+                "        procedure Run;\n",
+                "      end;\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TOuter<T>.TInner<U>.Run;\nbegin\n  // TODO: Implement TOuter<T>.TInner<U>.Run.\nend;\n",
+            "TOuter<T>.TInner<U>.Run",
+        ),
+        (
+            "unconstrained generic control",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TBox<T> = class\n",
+                "  public\n",
+                "    procedure Run<U>(const Value: U);\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TBox<T>.Run<U>(const Value: U);\nbegin\n  // TODO: Implement TBox<T>.Run.\nend;\n",
+            "TBox<T>.Run",
+        ),
+    ];
+
+    for (label, source, expected_edit, expected_identity) in cases {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Widget.pas");
+        write_file(&source_path, source);
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &source_path,
+            source,
+            "Run",
+            &format!("generic-header-{label}"),
+        );
+        assert_eq!(actions.len(), 1, "{label}: {actions:?}");
+        assert_eq!(
+            actions[0]["title"],
+            format!("Implement '{expected_identity}'"),
+            "{label}: action identity"
+        );
+        let updated =
+            apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+        let expected_source = source.replacen(
+            "implementation\n",
+            &format!("implementation\n{expected_edit}"),
+            1,
+        );
+        assert_eq!(updated, expected_source, "{label}: applied edit");
+        assert_applied_method_source_parses(&updated, label);
+
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&source_path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": updated,
+                }
+            }),
+        );
+        let definition_id = RequestId::from(format!("generic-header-definition-{label}"));
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&source_path, &updated, "Run", 0),
+        );
+        let definitions = result_locations(server.response(&definition_id));
+        assert_eq!(
+            definitions.len(),
+            1,
+            "{label}: applied source must have one paired definition"
+        );
+        assert_eq!(
+            location_signature(&definitions[0]),
+            expected_location_signature(&source_path, &updated, "Run", 1),
+            "{label}: definition location"
+        );
+
+        let declaration_id = RequestId::from(format!("generic-header-declaration-{label}"));
+        server.send_request(
+            declaration_id.clone(),
+            "textDocument/declaration",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": definitions[0]["range"]["start"].clone(),
+            }),
+        );
+        let declarations = result_locations(server.response(&declaration_id));
+        assert_eq!(declarations.len(), 1, "{label}: reverse declaration lookup");
+        assert_eq!(
+            location_signature(&declarations[0]),
+            expected_location_signature(&source_path, &updated, "Run", 0),
+            "{label}: declaration location"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn code_action_keeps_multiline_generic_owner_identity_safe_and_paired() {
+    let cases = [
+        (
+            "multiline owner",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TWidget<\n",
+                "    T> = class\n",
+                "  public\n",
+                "    procedure Run;\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TWidget<T>.Run;\nbegin\n  // TODO: Implement TWidget<T>.Run.\nend;\n",
+        ),
+        (
+            "multiline owner comment",
+            concat!(
+                "unit Widget;\n",
+                "interface\n",
+                "type\n",
+                "  TWidget<{ first\n",
+                "    second }T> = class\n",
+                "  public\n",
+                "    procedure Run;\n",
+                "  end;\n",
+                "implementation\n",
+                "end.\n",
+            ),
+            "procedure TWidget<T>.Run;\nbegin\n  // TODO: Implement TWidget<T>.Run.\nend;\n",
+        ),
+        (
+            "nested multiline owner with CRLF",
+            concat!(
+                "unit Widget;\r\n",
+                "interface\r\n",
+                "type\r\n",
+                "  TOuter<\r\n",
+                "    T> = class\r\n",
+                "  public\r\n",
+                "    type\r\n",
+                "      TInner = class\r\n",
+                "      public\r\n",
+                "        procedure Run;\r\n",
+                "      end;\r\n",
+                "  end;\r\n",
+                "implementation\r\n",
+                "end.\r\n",
+            ),
+            "procedure TOuter<T>.TInner.Run;\r\nbegin\r\n  // TODO: Implement TOuter<T>.TInner.Run.\r\nend;\r\n",
+        ),
+    ];
+
+    for (label, source, expected_edit) in cases {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Widget.pas");
+        write_file(&source_path, source);
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &source_path,
+            source,
+            "Run",
+            &format!("multiline-owner-{label}"),
+        );
+        assert_eq!(actions.len(), 1, "{label}: {actions:?}");
+        let marker = if source.contains("implementation\r\n") {
+            "implementation\r\n"
+        } else {
+            "implementation\n"
+        };
+        let updated =
+            apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+        let expected_source = source.replacen(marker, &format!("{marker}{expected_edit}"), 1);
+        assert_eq!(updated, expected_source, "{label}: applied edit");
+        assert_applied_method_source_parses(&updated, label);
+
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&source_path),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": updated,
+                }
+            }),
+        );
+        let definition_id = RequestId::from(format!("multiline-owner-definition-{label}"));
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&source_path, &updated, "Run", 0),
+        );
+        let definitions = result_locations(server.response(&definition_id));
+        assert_eq!(
+            definitions.len(),
+            1,
+            "{label}: safe applied comment must retain one definition pair"
+        );
+        assert_eq!(
+            location_signature(&definitions[0]),
+            expected_location_signature(&source_path, &updated, "Run", 1),
+            "{label}: definition location"
+        );
+
+        let declaration_id = RequestId::from(format!("multiline-owner-declaration-{label}"));
+        server.send_request(
+            declaration_id.clone(),
+            "textDocument/declaration",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "position": definitions[0]["range"]["start"].clone(),
+            }),
+        );
+        let declarations = result_locations(server.response(&declaration_id));
+        assert_eq!(declarations.len(), 1, "{label}: reverse declaration lookup");
+        assert_eq!(
+            location_signature(&declarations[0]),
+            expected_location_signature(&source_path, &updated, "Run", 0),
+            "{label}: declaration location"
+        );
+        server.shutdown();
+    }
+}
+
 #[test]
 fn code_action_preserves_nested_class_owner_qualification() {
     let temp = tempfile::tempdir().expect("temporary workspace");

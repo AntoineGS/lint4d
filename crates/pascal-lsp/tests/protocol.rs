@@ -29363,6 +29363,103 @@ fn source_action_organizes_equivalent_uses_without_reordering_bindings() {
 }
 
 #[test]
+fn source_action_deduplication_preserves_binding_before_and_after_apply() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("Alpha.pas"),
+        concat!(
+            "unit Alpha;\n",
+            "interface\n",
+            "procedure AlphaOnly;\n",
+            "implementation\n",
+            "procedure AlphaOnly; begin end;\n",
+            "initialization\n",
+            "end.\n",
+        ),
+    );
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Beta, Alpha, alpha;\n",
+        "implementation\n",
+        "procedure Call; begin AlphaOnly; end;\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let before_id = RequestId::from("organize-binding-before".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, source, "AlphaOnly", 0),
+    );
+    let before = result_locations(server.response(&before_id));
+    assert_eq!(
+        before.len(),
+        1,
+        "pre-edit binding must be unique: {before:?}"
+    );
+    assert_eq!(before[0]["uri"], uri(&root.join("Alpha.pas")).to_string());
+
+    let action_id = RequestId::from("organize-binding-action".to_string());
+    server.send_request(
+        action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let action_response = server.response(&action_id);
+    assert!(
+        action_response.error.is_none(),
+        "organizeImports failed: {action_response:?}"
+    );
+    let action_result = action_response.result.expect("organize binding result");
+    let action = action_result
+        .as_array()
+        .expect("organize binding actions")
+        .first()
+        .cloned()
+        .expect("deduplication action");
+    let updated = apply_workspace_edit_to_source(source, &action["edit"], &uri(&main));
+    assert!(
+        updated.contains("uses Beta, Alpha;"),
+        "deduplication edit: {updated}"
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": updated}
+        }),
+    );
+    let after_id = RequestId::from("organize-binding-after".to_string());
+    server.send_request(
+        after_id.clone(),
+        "textDocument/declaration",
+        navigation_params(&main, &updated, "AlphaOnly", 0),
+    );
+    let after = result_locations(server.response(&after_id));
+    assert_eq!(
+        after.len(),
+        1,
+        "post-edit binding must remain unique: {after:?}"
+    );
+    assert_eq!(after[0]["uri"], uri(&root.join("Alpha.pas")).to_string());
+    server.shutdown();
+}
+
+#[test]
 fn source_action_organize_imports_resolves_a_frozen_safe_ordering_proof() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -29478,6 +29575,460 @@ fn source_action_withholds_recovered_explicit_path_uses() {
         "parser-recovery/path-qualified uses must be withheld: {actions:?}"
     );
     server.shutdown();
+}
+
+#[test]
+fn source_action_withholds_transitive_initialization_ordering() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("InitA.pas"),
+        "unit InitA;\ninterface\nimplementation\ninitialization\n  WriteLn('A');\nend.\n",
+    );
+    write_file(
+        &root.join("InitB.pas"),
+        "unit InitB;\ninterface\nimplementation\ninitialization\n  WriteLn('B');\nend.\n",
+    );
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nuses InitA;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nuses InitB;\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Beta, Alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let request_id = RequestId::from("organize-transitive-initialization".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let result = response.result.expect("organizeImports result");
+    let actions = result.as_array().expect("organizeImports actions");
+    assert!(
+        actions.is_empty(),
+        "transitive initialization dependencies must withhold reordering: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_action_withholds_nonadjacent_duplicate_with_precedence_conflict() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nconst Shared = 1;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nconst Shared = 2;\nimplementation\nend.\n",
+    );
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Alpha, Beta, alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let request_id = RequestId::from("organize-nonadjacent-precedence".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let result = response.result.expect("organizeImports result");
+    let actions = result.as_array().expect("organizeImports actions");
+    assert!(
+        actions.is_empty(),
+        "a nonadjacent duplicate with a precedence conflict must be withheld: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deferred_organize_imports_survives_a_noop_version_change() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Beta, Alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}
+        }),
+    );
+    let request_id = RequestId::from("deferred-noop-version".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let action = response
+        .result
+        .expect("organizeImports result")
+        .as_array()
+        .expect("organizeImports actions")
+        .first()
+        .cloned()
+        .expect("deferred organize action");
+    assert!(
+        action["edit"].is_null(),
+        "action should be deferred: {action}"
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": source}]
+        }),
+    );
+    let resolve_id = RequestId::from("resolve-noop-version".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "a no-op overlay version change must not stale organize imports: {resolved:?}"
+    );
+
+    let unrelated_action_id = RequestId::from("deferred-unrelated-overlay".to_string());
+    server.send_request(
+        unrelated_action_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let unrelated_response = server.response(&unrelated_action_id);
+    let unrelated_result = unrelated_response
+        .result
+        .expect("unrelated organize result");
+    let unrelated_action = unrelated_result
+        .as_array()
+        .expect("unrelated organize actions")
+        .first()
+        .cloned()
+        .expect("unrelated deferred organize action");
+    let unrelated = root.join("Unrelated.pas");
+    let unrelated_source = "unit Unrelated;\ninterface\nimplementation\nend.\n";
+    write_file(&unrelated, unrelated_source);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&unrelated),
+                "languageId": "pascal",
+                "version": 1,
+                "text": unrelated_source
+            }
+        }),
+    );
+    let unrelated_resolve_id = RequestId::from("resolve-unrelated-overlay".to_string());
+    server.send_request(
+        unrelated_resolve_id.clone(),
+        "codeAction/resolve",
+        unrelated_action,
+    );
+    let unrelated_resolved = server.response(&unrelated_resolve_id);
+    assert!(
+        unrelated_resolved.error.is_none(),
+        "an unrelated overlay must not stale organize imports: {unrelated_resolved:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deferred_organize_imports_freezes_every_selected_clause_provider() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let alpha_source = "unit Alpha;\ninterface\nimplementation\ninitialization\nend.\n";
+    let beta_source = "unit Beta;\ninterface\nimplementation\nend.\n";
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Alpha, Beta, alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&root.join("Alpha.pas"), alpha_source);
+    write_file(&root.join("Beta.pas"), beta_source);
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let request_id = RequestId::from("deferred-clause-provider-freeze".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "organizeImports failed: {response:?}"
+    );
+    let action = response
+        .result
+        .expect("organizeImports result")
+        .as_array()
+        .expect("organizeImports actions")
+        .first()
+        .cloned()
+        .expect("deferred organize action");
+    assert!(
+        action["edit"].is_null(),
+        "action should be deferred: {action}"
+    );
+    assert_eq!(
+        action["data"]["providers"].as_array().map(Vec::len),
+        Some(2),
+        "every selected clause provider must be frozen: {action}"
+    );
+
+    write_file(
+        &root.join("Beta.pas"),
+        "unit Beta;\ninterface\nconst NewExport = 1;\nimplementation\nend.\n",
+    );
+    let resolve_id = RequestId::from("resolve-clause-provider-freeze".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_some(),
+        "a selected provider export mutation must stale organize imports: {resolved:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_action_supports_an_unused_project_unit_alias_but_not_a_qualified_use() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nprocedure Run;\nimplementation\nprocedure Run; begin end;\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Legacy=Alpha</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+    let safe_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Alpha, Legacy;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&main, safe_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let safe_id = RequestId::from("organize-unused-alias".to_string());
+    server.send_request(
+        safe_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let safe_response = server.response(&safe_id);
+    assert!(
+        safe_response.error.is_none(),
+        "organizeImports failed: {safe_response:?}"
+    );
+    let safe_result = safe_response.result.expect("safe organize result");
+    let safe_actions = safe_result.as_array().expect("safe organize actions");
+    assert_eq!(
+        safe_actions.len(),
+        1,
+        "unused alias should be deduplicated: {safe_actions:?}"
+    );
+    let safe_updated =
+        apply_workspace_edit_to_source(safe_source, &safe_actions[0]["edit"], &uri(&main));
+    assert!(
+        safe_updated.contains("uses Alpha;"),
+        "safe alias edit: {safe_updated}"
+    );
+    server.shutdown();
+
+    let qualified_temp = tempfile::tempdir().expect("qualified alias workspace");
+    let qualified_root = qualified_temp.path().join("fixture");
+    let qualified_main = qualified_root.join("Main.pas");
+    write_file(
+        &qualified_root.join("Alpha.pas"),
+        "unit Alpha;\ninterface\nprocedure Run;\nimplementation\nprocedure Run; begin end;\nend.\n",
+    );
+    write_file(
+        &qualified_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitAlias>Legacy=Alpha</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+    let qualified_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Alpha, Legacy;\n",
+        "implementation\n",
+        "procedure Call; begin Legacy.Run; end;\n",
+        "end.\n",
+    );
+    write_file(&qualified_main, qualified_source);
+    let mut qualified_server = TestServer::launch();
+    qualified_server.initialize_without_document_changes(&qualified_root, Value::Null);
+    let qualified_id = RequestId::from("organize-qualified-alias".to_string());
+    qualified_server.send_request(
+        qualified_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&qualified_main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let qualified_response = qualified_server.response(&qualified_id);
+    assert!(
+        qualified_response.error.is_none(),
+        "qualified organizeImports failed: {qualified_response:?}"
+    );
+    let qualified_result = qualified_response
+        .result
+        .expect("qualified organize result");
+    let qualified_actions = qualified_result
+        .as_array()
+        .expect("qualified organize actions");
+    assert!(
+        qualified_actions.is_empty(),
+        "a qualified alias use must keep both import spellings: {qualified_actions:?}"
+    );
+    qualified_server.shutdown();
+
+    let namespace_temp = tempfile::tempdir().expect("namespace alias workspace");
+    let namespace_root = namespace_temp.path().join("fixture");
+    let namespace_main = namespace_root.join("Main.pas");
+    write_file(
+        &namespace_root.join("Vendor.Alpha.pas"),
+        "unit Vendor.Alpha;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
+        &namespace_root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Namespace>Vendor</DCC_Namespace></PropertyGroup></Project>",
+    );
+    let namespace_source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "uses Vendor.Alpha, Alpha;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&namespace_main, namespace_source);
+    let mut namespace_server = TestServer::launch();
+    namespace_server.initialize_without_document_changes(&namespace_root, Value::Null);
+    let namespace_id = RequestId::from("organize-namespace-alias".to_string());
+    namespace_server.send_request(
+        namespace_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&namespace_main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"]}
+        }),
+    );
+    let namespace_response = namespace_server.response(&namespace_id);
+    assert!(
+        namespace_response.error.is_none(),
+        "namespace organizeImports failed: {namespace_response:?}"
+    );
+    let namespace_result = namespace_response
+        .result
+        .expect("namespace organize result");
+    let namespace_actions = namespace_result
+        .as_array()
+        .expect("namespace organize actions");
+    assert_eq!(
+        namespace_actions.len(),
+        1,
+        "namespace alias should resolve to one provider: {namespace_actions:?}"
+    );
+    let namespace_updated = apply_workspace_edit_to_source(
+        namespace_source,
+        &namespace_actions[0]["edit"],
+        &uri(&namespace_main),
+    );
+    assert!(
+        namespace_updated.contains("uses Vendor.Alpha;"),
+        "namespace alias edit: {namespace_updated}"
+    );
+    namespace_server.shutdown();
 }
 
 #[test]

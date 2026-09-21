@@ -458,9 +458,10 @@ pub(crate) struct UsesClauseMetadata {
 /// Facts needed before changing the relative order of imported units.
 ///
 /// This is intentionally a source-backed proof, not a formatting preference.
-/// A caller may reorder only when the unit has no initialization/finalization
-/// side effects, no helpers, no unresolved dependency state, and its exported
-/// names do not conflict with another selected provider.
+/// The organizer currently accepts only dependency-free providers for relative
+/// reordering.  That is stronger than checking only the selected unit: it
+/// avoids treating a local fact as a proof about a transitive initialization or
+/// finalization closure that has not been traversed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnitOrderSafety {
     pub(crate) complete: bool,
@@ -714,13 +715,24 @@ impl NavigationIndex {
             .and_then(|bindings| bindings.get(&canonical_name(name)).cloned())
     }
 
-    /// Return the source-backed facts used by conservative import ordering.
-    pub(crate) fn unit_order_safety(&self, uri: &Url) -> Option<UnitOrderSafety> {
-        let document = self.documents.get(uri)?;
+    /// Return source-backed ordering facts while charging the caller's
+    /// request-wide assistance budget.
+    pub(crate) fn unit_order_safety_with_budget(
+        &self,
+        uri: &Url,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<UnitOrderSafety>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        budget.require_bytes(document.source.len(), cancel)?;
+        budget.require_work(document.helpers.len(), cancel)?;
         let mut exported_names = Vec::new();
         for index in &document.exported_symbol_indices {
+            budget.require_work(1, cancel)?;
             let Some(symbol) = document.symbols.get(*index) else {
-                return Some(UnitOrderSafety {
+                return Ok(Some(UnitOrderSafety {
                     complete: false,
                     has_initialization: document.has_initialization,
                     has_finalization: document.has_finalization,
@@ -728,7 +740,7 @@ impl NavigationIndex {
                     exported_names,
                     dependency_uris: Vec::new(),
                     conditional_fingerprint: document.conditional_context.fingerprint(),
-                });
+                }));
             };
             if document
                 .conditional_unknown_symbols
@@ -738,26 +750,33 @@ impl NavigationIndex {
             {
                 continue;
             }
+            budget.require_bytes(symbol.key.len(), cancel)?;
             exported_names.push(canonical_name(&symbol.key));
         }
+        budget.require_work(
+            exported_names.len().saturating_mul(usize::BITS as usize),
+            cancel,
+        )?;
         exported_names.sort();
         exported_names.dedup();
 
         let mut dependency_uris = Vec::new();
+        let mut seen_dependencies = HashSet::new();
         let mut complete = document.conditionals.complete
             && document.conditionals.unknown_spans.is_empty()
             && document.parser_recovery_spans.is_empty()
             && document.unknown_imports.is_empty();
         for import in &document.imports {
+            budget.require_work(1, cancel)?;
             let Some(provider) = self.import_provider_uri(uri, &import.name) else {
                 complete = false;
                 continue;
             };
-            if !dependency_uris.contains(&provider) {
+            if seen_dependencies.insert(provider.clone()) {
                 dependency_uris.push(provider);
             }
         }
-        Some(UnitOrderSafety {
+        Ok(Some(UnitOrderSafety {
             complete,
             has_initialization: document.has_initialization,
             has_finalization: document.has_finalization,
@@ -765,7 +784,7 @@ impl NavigationIndex {
             exported_names,
             dependency_uris,
             conditional_fingerprint: document.conditional_context.fingerprint(),
-        })
+        }))
     }
 
     pub(crate) fn source_text(&self, uri: &Url) -> Option<&str> {

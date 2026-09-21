@@ -4374,20 +4374,19 @@ pub(crate) fn build_snapshot(
                         .bind_imports(&uri, std::iter::empty::<(String, Url)>());
                     continue;
                 }
-                // A case-insensitive duplicate names one provider, so it
-                // must not make an otherwise complete snapshot look partial.
-                // Organizer actions rely on this distinction when proving
-                // that an exact duplicate can be removed.
-                let import_count = loader
-                    .index
-                    .imports(&uri)
-                    .into_iter()
-                    .map(|import| import.name.trim_start_matches('&').to_ascii_lowercase())
-                    .collect::<HashSet<_>>()
-                    .len();
-                let dependencies =
-                    loader.load_imports_with_cancel(&uri, &context_key, &mut pins, Some(cancel))?;
-                if dependencies.len() < import_count {
+                // Dependency loading intentionally deduplicates physical
+                // providers.  Completeness must instead be established at
+                // every parsed import site so project/namespace aliases that
+                // bind to one provider do not look incomplete merely because
+                // their dependency URI is shared.
+                let imports = loader.index.imports(&uri);
+                loader.load_imports_with_cancel(&uri, &context_key, &mut pins, Some(cancel))?;
+                if imports.iter().any(|import| {
+                    loader
+                        .index
+                        .import_provider_uri(&uri, &import.name)
+                        .is_none()
+                }) {
                     complete = false;
                     incomplete_reason.get_or_insert_with(|| {
                         format!("one or more imports could not be resolved for {uri}")

@@ -49,7 +49,7 @@ const METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-interface-method";
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const ORGANIZE_IMPORTS_ACTION_KIND: &str = "organize-imports";
-const ORGANIZE_IMPORTS_ACTION_DATA_VERSION: u8 = 1;
+const ORGANIZE_IMPORTS_ACTION_DATA_VERSION: u8 = 2;
 const ORGANIZE_IMPORTS_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("source.organizeImports");
 const MAX_ORGANIZE_IMPORTS_CLAUSES: usize = 64;
@@ -435,7 +435,14 @@ pub(crate) fn code_actions_from_input(
             cancel,
         ) {
             Ok(result) => result,
-            Err(error) => return failed(source_generation, configuration_generation, error),
+            Err(error) if is_cancelled(cancel) => {
+                return failed(source_generation, configuration_generation, error);
+            }
+            // The organizer is optional assistance.  A request-wide proof
+            // budget that cannot finish must withhold the source action,
+            // rather than turning an otherwise valid code-action request into
+            // a protocol failure.
+            Err(_) => (None, Vec::new()),
         }
     } else {
         (None, Vec::new())
@@ -1254,8 +1261,18 @@ fn organize_imports_plan_from_input(
         return Ok((None, Vec::new()));
     }
 
-    let Some(target_safety) = snapshot.index.unit_order_safety(uri) else {
-        return Ok((None, Vec::new()));
+    let mut budget = AssistanceBudget::new(
+        MAX_MISSING_UNIT_REQUEST_WORK,
+        MAX_MISSING_UNIT_REQUEST_BYTES,
+        "organize-imports request",
+    );
+    let target_safety = match snapshot
+        .index
+        .unit_order_safety_with_budget(uri, cancel, &mut budget)
+    {
+        Ok(Some(safety)) => safety,
+        Ok(None) => return Ok((None, Vec::new())),
+        Err(error) => return Err(error),
     };
     if !target_safety.complete {
         return Ok((None, Vec::new()));
@@ -1275,15 +1292,20 @@ fn organize_imports_plan_from_input(
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        if clause.span.end.saturating_sub(clause.span.start) > MAX_ORGANIZE_IMPORTS_CLAUSE_BYTES {
+        let clause_bytes = clause.span.end.saturating_sub(clause.span.start);
+        if clause_bytes > MAX_ORGANIZE_IMPORTS_CLAUSE_BYTES {
             continue;
         }
+        budget.require_bytes(clause_bytes, cancel)?;
         let Some(parsed) = parse_organize_imports_clause(
             source,
             clause.span.start,
             clause.span.end,
             clause.interface,
-        ) else {
+            cancel,
+            &mut budget,
+        )?
+        else {
             continue;
         };
         total_entries = total_entries.saturating_add(parsed.entries.len());
@@ -1292,13 +1314,14 @@ fn organize_imports_plan_from_input(
         }
 
         let (clause_edits, clause_providers) =
-            organize_clause_edits(source, &parsed, &snapshot.index, uri, cancel)?;
+            organize_clause_edits(source, &parsed, &snapshot.index, uri, cancel, &mut budget)?;
         if clause_edits.is_empty() {
             continue;
         }
         let Some(output) = apply_organize_clause_edits(source, &parsed, &clause_edits) else {
             continue;
         };
+        budget.require_bytes(output.len(), cancel)?;
         let input_text = source.get(parsed.start..parsed.end).unwrap_or_default();
         identities.push(OrganizeImportsClauseIdentity {
             start: parsed.start,
@@ -1308,8 +1331,13 @@ fn organize_imports_plan_from_input(
             output_hash: source_hash(&output),
         });
         for provider in clause_providers {
-            let identity = organize_provider_identity(&provider);
-            providers.entry(provider.uri.clone()).or_insert(identity);
+            if !providers.contains_key(&provider.uri) {
+                budget.require_work(1, cancel)?;
+                budget.require_work(provider.safety.exported_names.len(), cancel)?;
+                budget.require_work(provider.safety.dependency_uris.len(), cancel)?;
+                let identity = organize_provider_identity(&provider);
+                providers.insert(provider.uri.clone(), identity);
+            }
         }
         edits.extend(clause_edits);
     }
@@ -1361,13 +1389,15 @@ fn parse_organize_imports_clause(
     start: usize,
     end: usize,
     interface: bool,
-) -> Option<ParsedOrganizeImportsClause> {
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<ParsedOrganizeImportsClause>, String> {
     if start >= end
         || end > source.len()
         || !source.is_char_boundary(start)
         || !source.is_char_boundary(end)
     {
-        return None;
+        return Ok(None);
     }
     let bytes = source.as_bytes();
     let mut cursor = start;
@@ -1375,7 +1405,7 @@ fn parse_organize_imports_clause(
         cursor += 1;
     }
     if !source_keyword_at(source, cursor, end, "uses") {
-        return None;
+        return Ok(None);
     }
     cursor += "uses".len();
     while cursor < end && bytes[cursor].is_ascii_whitespace() {
@@ -1386,24 +1416,29 @@ fn parse_organize_imports_clause(
         semicolon -= 1;
     }
     if semicolon == cursor || bytes.get(semicolon.saturating_sub(1)) != Some(&b';') {
-        return None;
+        return Ok(None);
     }
     semicolon -= 1;
 
     let mut entries = Vec::new();
     let mut preceding_comma = None;
     while cursor < semicolon {
+        budget.require_work(1, cancel)?;
         while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
         if cursor >= semicolon {
-            return None;
+            return Ok(None);
         }
         let name_start = cursor;
-        let name_end = organize_identifier_end(source, cursor, semicolon)?;
-        let name = source.get(name_start..name_end)?.to_string();
+        let Some(name_end) = organize_identifier_end(source, cursor, semicolon) else {
+            return Ok(None);
+        };
+        let Some(name) = source.get(name_start..name_end).map(str::to_string) else {
+            return Ok(None);
+        };
         if name.is_empty() || name.eq_ignore_ascii_case("in") {
-            return None;
+            return Ok(None);
         }
         cursor = name_end;
         while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
@@ -1417,14 +1452,22 @@ fn parse_organize_imports_clause(
             while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            let quote = *bytes.get(cursor)?;
+            let Some(&quote) = bytes.get(cursor) else {
+                return Ok(None);
+            };
             if quote != b'\'' && quote != b'"' {
-                return None;
+                return Ok(None);
             }
             let path_start = cursor;
-            cursor = quoted_string_end(bytes, cursor, semicolon, quote)?;
+            let Some(path_end) = quoted_string_end(bytes, cursor, semicolon, quote) else {
+                return Ok(None);
+            };
+            cursor = path_end;
             entry_end = cursor;
-            path = Some(source.get(path_start..entry_end)?.to_string());
+            let Some(path_text) = source.get(path_start..entry_end).map(str::to_string) else {
+                return Ok(None);
+            };
+            path = Some(path_text);
         }
         entries.push(OrganizeImportsEntry {
             name,
@@ -1435,7 +1478,7 @@ fn parse_organize_imports_clause(
             preceding_comma,
         });
         if entries.len() > MAX_ORGANIZE_IMPORTS_ENTRIES {
-            return None;
+            return Ok(None);
         }
 
         while cursor < semicolon && bytes[cursor].is_ascii_whitespace() {
@@ -1449,18 +1492,18 @@ fn parse_organize_imports_clause(
                 preceding_comma = Some(cursor);
                 cursor += 1;
             }
-            _ => return None,
+            _ => return Ok(None),
         }
     }
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(ParsedOrganizeImportsClause {
+    Ok(Some(ParsedOrganizeImportsClause {
         start,
         end,
         interface,
         entries,
-    })
+    }))
 }
 
 fn organize_identifier_end(source: &str, start: usize, limit: usize) -> Option<usize> {
@@ -1515,18 +1558,45 @@ fn organize_clause_edits(
     navigation_index: &crate::NavigationIndex,
     target_uri: &Url,
     cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
 ) -> Result<(Vec<TextEdit>, Vec<OrganizeImportsProvider>), String> {
+    // Explicit path-qualified entries require a path-aware resolver proof.
+    // The navigation binding intentionally records only the resolved unit
+    // identity, so the organizer withholds the whole clause rather than
+    // assuming that the textual unit name and path selected the same source.
+    if clause.entries.iter().any(|entry| entry.path.is_some()) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
     let mut bindings = Vec::with_capacity(clause.entries.len());
+    let mut provider_cache = HashMap::<Url, Option<OrganizeImportsProvider>>::new();
     for entry in &clause.entries {
-        if is_cancelled(cancel) {
-            return Err(CANCELLATION_MESSAGE.to_string());
-        }
+        budget.require_work(1, cancel)?;
         bindings.push(organize_import_provider(
             navigation_index,
             target_uri,
             entry,
-        ));
+            cancel,
+            budget,
+            &mut provider_cache,
+        )?);
     }
+    // An edit must not be based on a mixture of proven and unknown selected
+    // providers.  In particular, an unknown intervening entry could change
+    // precedence even when a known duplicate appears removable.
+    if bindings.iter().any(Option::is_none) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let all_indices = (0..bindings.len()).collect::<Vec<_>>();
+    let dedup_context_safe =
+        bindings.iter().all(|provider| {
+            provider.as_ref().is_some_and(|provider| {
+                provider.safety.dependency_uris.is_empty()
+                    && !provider.safety.has_helpers
+                    && !provider.safety.has_finalization
+            })
+        }) && selected_provider_order_is_safe(&all_indices, &bindings, cancel, budget)?;
 
     let mut removed = HashSet::new();
     let mut seen = HashMap::<(Option<String>, Url), usize>::new();
@@ -1534,17 +1604,27 @@ fn organize_clause_edits(
         let Some(provider) = provider else {
             continue;
         };
-        if !provider.safety.complete {
-            continue;
-        }
         // Provider identity, rather than spelling, is the deduplication key:
         // it covers case-folding and project namespace aliases.  An explicit
         // path remains part of the key because two paths can deliberately
         // select different source identities even when the unit name agrees.
         let key = (entry.path.clone(), provider.uri.clone());
-        if seen.insert(key, entry_index).is_some() {
-            removed.insert(entry_index);
+        if let Some(previous_index) = seen.get(&key).copied() {
+            if dedup_context_safe
+                && duplicate_occurrence_is_safe(
+                    source,
+                    clause,
+                    &clause.entries[previous_index],
+                    entry,
+                    provider,
+                    cancel,
+                    budget,
+                )?
+            {
+                removed.insert(entry_index);
+            }
         }
+        seen.insert(key, entry_index);
     }
 
     let survivors = clause
@@ -1561,6 +1641,11 @@ fn organize_clause_edits(
                         && !provider.safety.has_initialization
                         && !provider.safety.has_finalization
                         && !provider.safety.has_helpers
+                        // A direct dependency is enough to make the
+                        // initialization/finalization closure relevant.  We
+                        // deliberately withhold rather than pretending that
+                        // a local provider fact proves the transitive order.
+                        && provider.safety.dependency_uris.is_empty()
                         && !may_contain_include_directive(
                             navigation_index
                                 .source_text(&provider.uri)
@@ -1569,7 +1654,7 @@ fn organize_clause_edits(
                         )
                 })
         })
-        && selected_provider_order_is_safe(&survivors, &bindings);
+        && selected_provider_order_is_safe(&survivors, &bindings, cancel, budget)?;
 
     let mut edits = Vec::new();
     for index in removed.iter().copied() {
@@ -1580,16 +1665,38 @@ fn organize_clause_edits(
         let Some(edit) = organize_byte_edit(source, start, entry.end, String::new()) else {
             return Ok((Vec::new(), Vec::new()));
         };
+        budget.require_work(1, cancel)?;
         edits.push(edit);
     }
 
     if can_reorder {
-        let mut ordered = survivors.clone();
-        ordered.sort_by(|left, right| {
-            organize_name_key(&clause.entries[*left].name)
-                .cmp(&organize_name_key(&clause.entries[*right].name))
-                .then_with(|| left.cmp(right))
-        });
+        let mut sort_keys = HashMap::<usize, String>::new();
+        for index in &survivors {
+            let key = organize_name_key(&clause.entries[*index].name);
+            budget.require_bytes(key.len(), cancel)?;
+            sort_keys.insert(*index, key);
+        }
+        let mut ordered: Vec<usize> = Vec::with_capacity(survivors.len());
+        for index in &survivors {
+            let key = sort_keys
+                .get(index)
+                .expect("ordering key was prepared")
+                .as_str();
+            let mut insert_at = ordered.len();
+            while insert_at > 0 {
+                budget.require_work(1, cancel)?;
+                let previous = ordered[insert_at - 1];
+                let previous_key = sort_keys
+                    .get(&previous)
+                    .expect("ordering key was prepared")
+                    .as_str();
+                if (previous_key, previous) <= (key, *index) {
+                    break;
+                }
+                insert_at -= 1;
+            }
+            ordered.insert(insert_at, *index);
+        }
         for (slot, desired) in survivors.iter().zip(ordered.iter()) {
             let current = &clause.entries[*slot];
             let replacement = &clause.entries[*desired].name;
@@ -1604,6 +1711,8 @@ fn organize_clause_edits(
             ) else {
                 return Ok((Vec::new(), Vec::new()));
             };
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(edit.new_text.len(), cancel)?;
             edits.push(edit);
         }
     }
@@ -1611,15 +1720,10 @@ fn organize_clause_edits(
     if edits.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let providers = clause
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(entry_index, _)| {
-            removed.contains(entry_index) || can_reorder && survivors.contains(entry_index)
-        })
-        .filter_map(|(entry_index, _)| bindings[entry_index].clone())
-        .collect::<Vec<_>>();
+    // Freeze every selected-clause provider, not only entries whose text was
+    // directly deleted or renamed.  Negative observations (conflicts and
+    // relative-order checks) are part of the proof as well.
+    let providers = bindings.into_iter().flatten().collect::<Vec<_>>();
     Ok((edits, providers))
 }
 
@@ -1627,45 +1731,132 @@ fn organize_import_provider(
     index: &crate::NavigationIndex,
     target_uri: &Url,
     entry: &OrganizeImportsEntry,
-) -> Option<OrganizeImportsProvider> {
-    let uri = index.import_provider_uri(target_uri, &entry.name)?;
-    let source = index.source_text(&uri)?;
-    if may_contain_include_directive(source.as_bytes()) {
-        return None;
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    cache: &mut HashMap<Url, Option<OrganizeImportsProvider>>,
+) -> Result<Option<OrganizeImportsProvider>, String> {
+    let Some(uri) = index.import_provider_uri(target_uri, &entry.name) else {
+        return Ok(None);
+    };
+    if let Some(provider) = cache.get(&uri) {
+        return Ok(provider.clone());
     }
-    let safety = index.unit_order_safety(&uri)?;
-    Some(OrganizeImportsProvider {
-        uri,
+    let Some(source) = index.source_text(&uri) else {
+        return Ok(None);
+    };
+    if may_contain_include_directive(source.as_bytes()) {
+        budget.require_bytes(source.len(), cancel)?;
+        cache.insert(uri, None);
+        return Ok(None);
+    }
+    let safety = index
+        .unit_order_safety_with_budget(&uri, cancel, budget)?
+        .filter(|safety| safety.complete);
+    let provider = safety.map(|safety| OrganizeImportsProvider {
+        uri: uri.clone(),
         source_hash: source_hash(source),
         safety,
-    })
+    });
+    cache.insert(uri, provider.clone());
+    Ok(provider)
 }
 
 fn selected_provider_order_is_safe(
     selected: &[usize],
     bindings: &[Option<OrganizeImportsProvider>],
-) -> bool {
-    for (left_offset, left_index) in selected.iter().enumerate() {
-        let Some(left) = bindings[*left_index].as_ref() else {
-            return false;
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let mut exported_by_provider = HashMap::<String, Url>::new();
+    for index in selected {
+        let Some(provider) = bindings[*index].as_ref() else {
+            return Ok(false);
         };
-        for right_index in selected.iter().skip(left_offset + 1) {
-            let Some(right) = bindings[*right_index].as_ref() else {
-                return false;
-            };
-            if left
-                .safety
-                .exported_names
-                .iter()
-                .any(|name| right.safety.exported_names.binary_search(name).is_ok())
-                || left.safety.dependency_uris.contains(&right.uri)
-                || right.safety.dependency_uris.contains(&left.uri)
-            {
-                return false;
+        budget.require_work(1, cancel)?;
+        if !provider.safety.dependency_uris.is_empty() {
+            return Ok(false);
+        }
+        for name in &provider.safety.exported_names {
+            budget.require_work(1, cancel)?;
+            if let Some(existing) = exported_by_provider.get(name) {
+                if existing != &provider.uri {
+                    return Ok(false);
+                }
+            } else {
+                exported_by_provider.insert(name.clone(), provider.uri.clone());
             }
         }
     }
-    true
+    Ok(true)
+}
+
+fn duplicate_occurrence_is_safe(
+    source: &str,
+    clause: &ParsedOrganizeImportsClause,
+    first: &OrganizeImportsEntry,
+    duplicate: &OrganizeImportsEntry,
+    provider: &OrganizeImportsProvider,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    if !provider.safety.complete
+        || !provider.safety.dependency_uris.is_empty()
+        || provider.safety.has_helpers
+        || provider.safety.has_finalization
+    {
+        return Ok(false);
+    }
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(
+        first.name.len().saturating_add(duplicate.name.len()),
+        cancel,
+    )?;
+    // Case-only spellings have the same Pascal qualifier.  An actual
+    // project/namespace alias needs a proof that the removed spelling is not
+    // used by a qualified reference.
+    if organize_name_key(&first.name) == organize_name_key(&duplicate.name) {
+        Ok(true)
+    } else {
+        organize_spelling_is_not_used(source, clause, duplicate, cancel, budget)
+    }
+}
+
+fn organize_spelling_is_not_used(
+    source: &str,
+    clause: &ParsedOrganizeImportsClause,
+    entry: &OrganizeImportsEntry,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    // The scan is deliberately charged per source character.  Alias-aware
+    // deduplication is optional assistance, so a large target or repeated
+    // alias spelling must withhold the whole action instead of running an
+    // unbounded uninterruptible search.
+    let name = entry.name.as_str();
+    for (start, _) in source.char_indices() {
+        budget.require_work(1, cancel)?;
+        let Some(candidate) = source.get(start..start.saturating_add(name.len())) else {
+            continue;
+        };
+        if !candidate.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let end = start.saturating_add(name.len());
+        if start < clause.end && end > clause.start {
+            continue;
+        }
+        let before = source[..start].chars().next_back();
+        let after = source[end..].chars().next();
+        // A dot is a boundary here: both `Alias.Member` and
+        // `Namespace.Alias.Member` must count as a use.
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+        };
+        if boundary(before) && boundary(after) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn organize_name_key(name: &str) -> String {
@@ -4131,14 +4322,12 @@ fn validate_interface_method_implementation_action_data(
 fn validate_organize_imports_action_data(
     data: &OrganizeImportsActionData,
     action: &CodeAction,
-    source_generation: u64,
-    configuration_generation: u64,
+    _source_generation: u64,
+    _configuration_generation: u64,
 ) -> Result<(), String> {
     if data.version != ORGANIZE_IMPORTS_ACTION_DATA_VERSION
         || data.kind != ORGANIZE_IMPORTS_ACTION_KIND
         || data.action_id != organize_imports_action_id(data)
-        || data.source_generation != source_generation
-        || data.configuration_generation != configuration_generation
     {
         return Err("organize-imports resolve data is stale or tampered".to_string());
     }
@@ -4163,9 +4352,11 @@ fn validate_organize_imports_action_data(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientActionFeatures, code_actions_from_input, lint_configuration_for_input,
-        resolve_from_input, set_after_lint_configuration_hook,
+        AssistanceBudget, ClientActionFeatures, OrganizeImportsProvider, code_actions_from_input,
+        lint_configuration_for_input, resolve_from_input, selected_provider_order_is_safe,
+        set_after_lint_configuration_hook,
     };
+    use crate::navigation::UnitOrderSafety;
     use crate::workspace::Workspace;
     use crate::workspace::WorkspaceOptions;
     use crate::workspace::rename::revalidate_input;
@@ -4180,6 +4371,58 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn organize_imports_order_proof_charges_export_work() {
+        let provider_uri =
+            Url::parse("file:///tmp/organize-budget-provider.pas").expect("provider URI");
+        let provider = OrganizeImportsProvider {
+            uri: provider_uri,
+            source_hash: 1,
+            safety: UnitOrderSafety {
+                complete: true,
+                has_initialization: false,
+                has_finalization: false,
+                has_helpers: false,
+                exported_names: vec!["exported".to_string()],
+                dependency_uris: Vec::new(),
+                conditional_fingerprint: 1,
+            },
+        };
+        let bindings = vec![Some(provider)];
+        let selected = vec![0];
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(1, 1024, "organize-imports test");
+        let error = selected_provider_order_is_safe(&selected, &bindings, &cancel, &mut budget)
+            .expect_err("export comparison must consume the remaining work budget");
+        assert!(
+            error.contains("organize-imports test exceeds"),
+            "unexpected budget error: {error}"
+        );
+    }
+
+    #[test]
+    fn organize_imports_order_proof_honors_cancellation() {
+        let provider = OrganizeImportsProvider {
+            uri: Url::parse("file:///tmp/organize-cancel-provider.pas").expect("provider URI"),
+            source_hash: 1,
+            safety: UnitOrderSafety {
+                complete: true,
+                has_initialization: false,
+                has_finalization: false,
+                has_helpers: false,
+                exported_names: vec!["exported".to_string()],
+                dependency_uris: Vec::new(),
+                conditional_fingerprint: 1,
+            },
+        };
+        let bindings = vec![Some(provider)];
+        let cancel = AtomicBool::new(true);
+        let mut budget = AssistanceBudget::new(16, 1024, "organize-imports test");
+        let error = selected_provider_order_is_safe(&[0], &bindings, &cancel, &mut budget)
+            .expect_err("ordering proof must stop when cancellation is requested");
+        assert_eq!(error, "request cancelled");
     }
 
     #[test]

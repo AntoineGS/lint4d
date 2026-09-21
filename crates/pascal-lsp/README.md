@@ -1447,27 +1447,36 @@ the actual resolved import are checked again for deferred resolve. A no-op
 buffer version change or unrelated overlay does not expire an otherwise
 unchanged action, while target/provider/project changes do.
 
-`source.organizeImports` is advertised as a separate source action. It removes
-only case-insensitive duplicates that resolve to the same source provider and
-have the same explicit `in 'path'` qualifier; it never removes an import merely
-because it appears unused. Relative alphabetical ordering is offered only when
-every selected provider is complete source, has no initialization/finalization
-section or helper, has no exported-name conflict, and has no dependency on
-another selected provider. Otherwise the original relative order is retained,
-while independently proven duplicates may still be removed. Interface and
-implementation `uses` clauses are planned independently and are never merged.
+`source.organizeImports` is advertised as a separate source action. It never
+removes an import merely because it appears unused. A duplicate is removable
+only when every selected entry resolves to complete source-backed providers in
+one path-free clause, the providers have no dependency/helper/finalization
+hazard, exported names are disjoint, and the removed spelling is not used as a
+qualified reference. Project and namespace aliases therefore require a proof
+of the resolved provider *and* of the removed spelling; ambiguous, qualified,
+or order-sensitive cases are withheld. The retained first occurrence and the
+relative order of distinct providers are preserved. Relative alphabetical
+ordering is offered only when every selected provider is complete source, has
+no initialization/finalization section or helper, has no dependency closure,
+and has no exported-name conflict. Otherwise the original relative order is
+retained. Interface and implementation `uses` clauses are planned
+independently and are never merged.
 
 The organizer preserves the clause's original text outside the changed unit
 names/delimiters, including LF/CRLF, indentation, BOM/non-BMP text, and path
-spelling. Conditional/compiler-directive clauses, comments, include or
+spelling. Conditional/compiler-directive clauses, comments, path-qualified
+uses, include or
 multi-root provenance, parser recovery, malformed layouts, unresolved or
 ambiguous providers, and incomplete discovery are withheld rather than
 rewritten; this deliberately supported subset avoids moving trivia across a
 structural boundary. The action is idempotent and is returned only when a
 proven edit exists. Clients with code-action data/resolve support receive a
 deferred action and the server rechecks the exact clause hashes, provider
-identity/source hashes, conditional and ordering proof, configuration, source,
-and negative discovery observations. Other clients receive an eager edit.
+identity/source hashes for every selected-clause provider, conditional and
+ordering proof, configuration, source, and negative discovery observations.
+Unrelated global generations and no-op overlay versions do not expire a
+proof when those effective observations remain unchanged. Other clients
+receive an eager edit.
 
 ## Limits
 
@@ -1534,7 +1543,10 @@ observations capped at 1,024 records and 2 MiB. Resolve data is capped at 512
 bytes per item and retained completion items at 64 KiB; oldest entries are
 evicted to stay within the bounds.
 Organize-imports planning is capped at 64 `uses` clauses, 512 entries, 64 KiB
-per clause, and 64 KiB of generated edit text in one request. Its serialized
+per clause, and 64 KiB of generated edit text in one request. Provider fact
+extraction, export-conflict checks, bounded ordering, and edit planning share
+the request-wide 300,000-work-unit and 8 MiB source-byte assistance budget;
+cancellation or exhaustion withholds the optional action. Its serialized
 code-action response remains subject to the shared 64 KiB response bound.
 Missing-unit discovery, absence checking, and every post-edit binding proof
 share one request-wide budget of 300,000 bounded work units and 8 MiB of

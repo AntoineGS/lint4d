@@ -33022,6 +33022,107 @@ fn code_action_withholds_body_only_actions_when_direct_visibility_is_uncertain()
 }
 
 #[test]
+fn code_action_does_not_borrow_an_inherited_yes_for_a_non_public_direct_shadow() {
+    for visibility in ["private", "protected"] {
+        let temp = tempfile::tempdir().expect("inherited direct-shadow workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Widget.pas");
+        let source = format!(
+            "unit Widget;\ninterface\ntype\n  TObject = class\n  end;\n  TBase = class(TObject)\n  public\n    procedure Run;\n  end;\n  IRunner = interface\n    procedure Run;\n  end;\n  TWidget = class(TBase, IRunner)\n  {visibility}\n    procedure Run;\n  end;\nimplementation\nprocedure TBase.Run; begin end;\nend.\n"
+        );
+        write_file(&source_path, &source);
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &source_path,
+            &source,
+            "TWidget",
+            &format!("inherited-direct-shadow-{visibility}"),
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| action["data"]["kind"] != "implement-interface-method"),
+            "an inherited public Yes must not authorize a {visibility} direct interface body: {actions:?}"
+        );
+
+        server.shutdown();
+
+        let ordinary_temp = tempfile::tempdir().expect("ordinary private method workspace");
+        let ordinary_root = ordinary_temp.path().join("fixture");
+        let ordinary_path = ordinary_root.join("Widget.pas");
+        let ordinary_source = concat!(
+            "unit Widget;\ninterface\ntype\n",
+            "  TWidget = class\n  private\n    procedure Run;\n  end;\n",
+            "implementation\nend.\n",
+        );
+        write_file(&ordinary_path, ordinary_source);
+        let mut ordinary_server = TestServer::launch();
+        ordinary_server.initialize_without_document_changes(&ordinary_root, Value::Null);
+        let direct_position = position_of(ordinary_source, "Run", 0);
+        let direct_id = RequestId::from(format!("ordinary-direct-shadow-{visibility}"));
+        ordinary_server.send_request(
+            direct_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&ordinary_path)},
+                "range": {
+                    "start": direct_position,
+                    "end": position_after(ordinary_source, "Run", 0),
+                },
+                "context": {"diagnostics": [], "only": ["quickfix"]}
+            }),
+        );
+        let direct_response = ordinary_server.response(&direct_id);
+        assert!(direct_response.error.is_none());
+        let direct_result = direct_response
+            .result
+            .expect("ordinary direct method actions");
+        let direct_actions = direct_result
+            .as_array()
+            .expect("ordinary direct method action array");
+        assert!(
+            direct_actions
+                .iter()
+                .any(|action| action["data"]["kind"] == "implement-method"),
+            "the ordinary Task 30 private/protected body action must remain distinct: {direct_actions:?}"
+        );
+        ordinary_server.shutdown();
+    }
+
+    let temp = tempfile::tempdir().expect("inherited public direct-shadow workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\ninterface\ntype\n",
+        "  TObject = class\n  end;\n",
+        "  TBase = class(TObject)\n  public\n    procedure Run;\n  end;\n",
+        "  IRunner = interface\n    procedure Run;\n  end;\n",
+        "  TWidget = class(TBase, IRunner)\n  public\n    procedure Run;\n  end;\n",
+        "implementation\nprocedure TBase.Run; begin end;\nend.\n",
+    );
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "inherited-public-direct-shadow",
+    );
+    assert_eq!(
+        actions.len(),
+        1,
+        "an exact public direct declaration remains a valid interface body candidate: {actions:?}"
+    );
+    assert_eq!(actions[0]["data"]["kind"], "implement-interface-method");
+    server.shutdown();
+}
+
+#[test]
 fn deferred_interface_action_freezes_provider_alias_meaning() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -33063,6 +33164,84 @@ fn deferred_interface_action_freezes_provider_alias_meaning() {
         "provider alias meaning change must stale deferred action: {response:?}"
     );
     server.shutdown();
+}
+
+#[test]
+fn deferred_interface_action_constant_dependency_controls_are_bounded_and_fail_closed() {
+    let qualified_temp = tempfile::tempdir().expect("qualified constant workspace");
+    let qualified_root = qualified_temp.path().join("fixture");
+    let qualified_provider = qualified_root.join("Provider.pas");
+    let qualified_widget = qualified_root.join("Widget.pas");
+    let qualified_provider_source = concat!(
+        "unit Provider;\ninterface\nconst\n",
+        "  BaseLimit = 1;\n",
+        "type\n",
+        "  TBounds = class\n",
+        "  public\n",
+        "    const Limit = BaseLimit;\n",
+        "  end;\n",
+        "  TValue = array[0..TBounds.Limit] of Integer;\n",
+        "  IRunner = interface\n    procedure Run(Value: TValue);\n  end;\n",
+        "implementation\nend.\n",
+    );
+    let qualified_widget_source = concat!(
+        "unit Widget;\ninterface\nuses Provider;\ntype\n",
+        "  TObject = class\n  end;\n",
+        "  TWidget = class(TObject, IRunner)\n  end;\n",
+        "implementation\nend.\n",
+    );
+    write_file(&qualified_provider, qualified_provider_source);
+    write_file(&qualified_widget, qualified_widget_source);
+    let mut qualified_server = TestServer::launch();
+    qualified_server.initialize_with_action_support(&qualified_root, Value::Null);
+    let qualified_actions = request_missing_unit_actions(
+        &mut qualified_server,
+        &qualified_widget,
+        qualified_widget_source,
+        "TWidget",
+        "qualified-bound-constant-action",
+    );
+    assert!(
+        qualified_actions.is_empty(),
+        "unsupported qualified constant bounds must fail closed: {qualified_actions:?}"
+    );
+    qualified_server.shutdown();
+
+    let cyclic_temp = tempfile::tempdir().expect("cyclic constant workspace");
+    let cyclic_root = cyclic_temp.path().join("fixture");
+    let cyclic_provider = cyclic_root.join("Provider.pas");
+    let cyclic_widget = cyclic_root.join("Widget.pas");
+    let cyclic_provider_source = concat!(
+        "unit Provider;\ninterface\nconst\n",
+        "  FirstLimit = SecondLimit;\n",
+        "  SecondLimit = FirstLimit;\n",
+        "type\n",
+        "  TValue = array[0..FirstLimit] of Integer;\n",
+        "  IRunner = interface\n    procedure Run(Value: TValue);\n  end;\n",
+        "implementation\nend.\n",
+    );
+    let cyclic_widget_source = concat!(
+        "unit Widget;\ninterface\nuses Provider;\ntype\n",
+        "  TObject = class\n  end;\n",
+        "  TWidget = class(TObject, IRunner)\n  end;\n",
+        "implementation\nend.\n",
+    );
+    write_file(&cyclic_provider, cyclic_provider_source);
+    write_file(&cyclic_widget, cyclic_widget_source);
+    let mut cyclic_server = TestServer::launch();
+    cyclic_server.initialize_with_action_support(&cyclic_root, Value::Null);
+    let cyclic_actions = request_missing_unit_actions(
+        &mut cyclic_server,
+        &cyclic_widget,
+        cyclic_widget_source,
+        "TWidget",
+        "cyclic-bound-constant-action",
+    );
+    assert!(
+        cyclic_actions.is_empty(),
+        "cyclic constant dependencies must fail closed instead of comparing incomplete identities: {cyclic_actions:?}"
+    );
+    cyclic_server.shutdown();
 }
 
 #[test]
@@ -33161,6 +33340,57 @@ fn deferred_interface_action_freezes_structural_provider_type_meaning() {
         failures.is_empty(),
         "structural fingerprint failures: {failures:?}"
     );
+}
+
+#[test]
+fn deferred_interface_action_freezes_recursive_static_bound_constant_dependencies() {
+    let temp = tempfile::tempdir().expect("constant-dependency workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let widget = root.join("Widget.pas");
+    let provider_source = concat!(
+        "unit Provider;\ninterface\nconst\n",
+        "  BaseLimit = 1;\n",
+        "  Limit = BaseLimit + 1;\n",
+        "type\n",
+        "  TValue = array[0..Limit] of Integer;\n",
+        "  IRunner = interface\n    procedure Run(Value: TValue);\n  end;\n",
+        "implementation\nend.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\ninterface\nuses Provider;\nconst\n",
+        "  BaseLimit = 99;\n",
+        "type\n",
+        "  TObject = class\n  end;\n",
+        "  TWidget = class(TObject, IRunner)\n  end;\n",
+        "implementation\nend.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&widget, widget_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "recursive-bound-constant-action",
+    );
+    assert_eq!(actions.len(), 1, "recursive constant setup: {actions:?}");
+
+    write_file(
+        &provider,
+        &provider_source.replace("BaseLimit = 1", "BaseLimit = 2"),
+    );
+    let resolve_id = RequestId::from("recursive-bound-constant-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "a transitive constant-bound change must stale the deferred action: {response:?}"
+    );
+    server.shutdown();
 }
 
 #[test]

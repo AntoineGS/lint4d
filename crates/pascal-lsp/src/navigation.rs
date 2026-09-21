@@ -1149,19 +1149,23 @@ impl NavigationIndex {
                         let Some(symbol) = document.symbols.get(index) else {
                             continue;
                         };
-                        // An open compiler root can justify an ordinary body
-                        // edit only when the class itself has an exact,
-                        // publicly accessible declaration.  Unknown results
-                        // from private/protected access, ambiguous lookup, or
-                        // any other incomplete conformance proof must not be
-                        // converted into an interface action merely because
-                        // the declaration text happens to match.
+                        // An interface body action must be authorized by the
+                        // actual direct declaration selected here.  The
+                        // aggregate class status may be Yes because an
+                        // unrelated inherited routine matched the obligation;
+                        // that result cannot make a private/protected direct
+                        // shadow an eligible interface implementation.  Keep
+                        // ordinary Task 30 declaration-selected actions
+                        // independent: this access gate is only on the
+                        // interface-action path.
+                        if !matches!(
+                            symbol.visibility,
+                            Visibility::Public | Visibility::Published
+                        ) {
+                            continue;
+                        }
                         if obligation.implementation == ContractMatch::Unknown
-                            && (!obligation.unknown_only_because_of_open_compiler_root
-                                || !matches!(
-                                    symbol.visibility,
-                                    Visibility::Public | Visibility::Published
-                                ))
+                            && !obligation.unknown_only_because_of_open_compiler_root
                         {
                             continue;
                         }
@@ -3696,6 +3700,7 @@ impl NavigationIndex {
             cancel,
             budget,
             &mut HashSet::new(),
+            &mut HashSet::new(),
             0,
         )
     }
@@ -3749,6 +3754,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
         active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        active_dependencies: &mut HashSet<(Url, usize, usize)>,
         depth: usize,
     ) -> Result<Option<ContractTypeFingerprint>, String> {
         if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
@@ -3791,6 +3797,7 @@ impl NavigationIndex {
                                 cancel,
                                 budget,
                                 active_aliases,
+                                active_dependencies,
                                 depth.saturating_add(1),
                             )?
                         else {
@@ -3820,6 +3827,7 @@ impl NavigationIndex {
                                         cancel,
                                         budget,
                                         active_aliases,
+                                        active_dependencies,
                                         depth.saturating_add(1),
                                     )?
                                 else {
@@ -3835,6 +3843,7 @@ impl NavigationIndex {
                                         cancel,
                                         budget,
                                         active_aliases,
+                                        active_dependencies,
                                         depth,
                                     )?
                                 else {
@@ -3852,6 +3861,7 @@ impl NavigationIndex {
                             cancel,
                             budget,
                             active_aliases,
+                            active_dependencies,
                             depth.saturating_add(1),
                         )?;
                         match shape {
@@ -3866,6 +3876,7 @@ impl NavigationIndex {
                                         cancel,
                                         budget,
                                         active_aliases,
+                                        active_dependencies,
                                         depth,
                                     )?
                                 else {
@@ -3882,6 +3893,7 @@ impl NavigationIndex {
                                 cancel,
                                 budget,
                                 active_aliases,
+                                active_dependencies,
                                 depth,
                             )?
                         else {
@@ -3933,6 +3945,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
         active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        active_dependencies: &mut HashSet<(Url, usize, usize)>,
         depth: usize,
     ) -> Result<Option<ContractTypeDefinitionFingerprint>, String> {
         let Some(text) = self.contract_type_definition_source_fingerprint(
@@ -3950,6 +3963,7 @@ impl NavigationIndex {
             cancel,
             budget,
             active_aliases,
+            active_dependencies,
             depth,
         )?
         else {
@@ -3969,6 +3983,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
         active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        active_dependencies: &mut HashSet<(Url, usize, usize)>,
         depth: usize,
     ) -> Result<Option<Vec<ContractDefinitionDependencyFingerprint>>, String> {
         let Some(document) = self.documents.get(&instance.uri) else {
@@ -4023,6 +4038,7 @@ impl NavigationIndex {
                     cancel,
                     budget,
                     active_aliases,
+                    active_dependencies,
                     depth.saturating_add(1),
                 )?
                 else {
@@ -4037,40 +4053,238 @@ impl NavigationIndex {
             }
 
             let mut state = ResolutionState::new();
-            let candidates = self.unqualified_references_with_budget_and_state(
+            let candidates = self.unqualified_references_with_budget_at_scope_and_state(
                 &instance.uri,
                 document,
                 identifier.start_byte(),
                 name,
                 identifier,
+                symbol.scope,
                 &mut state,
                 cancel,
                 budget,
             )?;
-            if candidates.len() != 1 {
+            if state.receiver_resolution_uncertain() || candidates.len() != 1 {
                 return Ok(None);
             }
             let candidate = &candidates[0];
+            if self.candidate_is_conditionally_unknown(candidate) {
+                return Ok(None);
+            }
             let Some(dependency_symbol) = self.symbol(candidate) else {
                 return Ok(None);
             };
             if dependency_symbol.kind == SymbolKind::Unit {
                 return Ok(None);
             }
-            let Some(dependency_text) = self.contract_type_definition_source_fingerprint(
-                &candidate.uri,
+            let Some(dependency) = self.contract_definition_dependency_fingerprint_with_budget(
+                candidate,
                 dependency_symbol,
+                &instance.substitution,
                 cancel,
                 budget,
+                active_aliases,
+                active_dependencies,
+                depth.saturating_add(1),
             )?
             else {
                 return Ok(None);
             };
-            let dependency = ContractDefinitionDependencyFingerprint::Symbol {
-                uri: candidate.uri.clone(),
-                key: dependency_symbol.key.clone(),
-                kind: dependency_symbol.type_kind,
-                text: dependency_text,
+            if seen.insert(dependency.clone()) {
+                dependencies.push(dependency);
+            }
+        }
+        Ok(Some(dependencies))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_definition_dependency_fingerprint_with_budget(
+        &self,
+        candidate: &Candidate,
+        symbol: &Symbol,
+        substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        active_dependencies: &mut HashSet<(Url, usize, usize)>,
+        depth: usize,
+    ) -> Result<Option<ContractDefinitionDependencyFingerprint>, String> {
+        let Some(text) = self.contract_type_definition_source_fingerprint(
+            &candidate.uri,
+            symbol,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let dependencies = if matches!(symbol.kind, SymbolKind::Constant | SymbolKind::EnumValue) {
+            let key = (
+                candidate.uri.clone(),
+                symbol.declaration_span.start,
+                symbol.declaration_span.end,
+            );
+            if !active_dependencies.insert(key.clone()) {
+                return Ok(None);
+            }
+            let result = self.contract_value_definition_dependencies_with_budget(
+                candidate,
+                symbol,
+                substitution,
+                cancel,
+                budget,
+                active_aliases,
+                active_dependencies,
+                depth,
+            );
+            active_dependencies.remove(&key);
+            result?
+        } else {
+            // Non-value symbols retain the historical source fingerprint. A
+            // value expression that resolves to one is not recursively
+            // evaluable here, but its declaration text remains useful for
+            // supported type-source dependencies. Constant/value references
+            // themselves are handled above and fail closed on uncertainty.
+            Some(Vec::new())
+        };
+        let Some(dependencies) = dependencies else {
+            return Ok(None);
+        };
+        Ok(Some(ContractDefinitionDependencyFingerprint::Symbol {
+            uri: candidate.uri.clone(),
+            key: symbol.key.clone(),
+            kind: symbol.type_kind,
+            text,
+            dependencies,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_value_definition_dependencies_with_budget(
+        &self,
+        candidate: &Candidate,
+        symbol: &Symbol,
+        substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        active_dependencies: &mut HashSet<(Url, usize, usize)>,
+        depth: usize,
+    ) -> Result<Option<Vec<ContractDefinitionDependencyFingerprint>>, String> {
+        if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
+            return Ok(None);
+        }
+        let Some(document) = self.documents.get(&candidate.uri) else {
+            return Ok(None);
+        };
+        let Some(declaration) =
+            declaration_node_for_symbol_with_budget(document, symbol, cancel, budget)?
+        else {
+            return Ok(None);
+        };
+        let Some(value) = declaration
+            .child_by_field_name("defaultValue")
+            .or_else(|| declaration.child_by_field_name("value"))
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        let identifiers = collect_identifier_nodes_with_budget(value, cancel, budget)?;
+        let mut dependencies = Vec::new();
+        let mut seen = HashSet::new();
+        for identifier in identifiers {
+            check_navigation_cancel(cancel)?;
+            if identifier_is_dot_rhs_with_budget(identifier, value, cancel, budget)? {
+                continue;
+            }
+            let Some(name) = document
+                .source
+                .get(identifier.start_byte()..identifier.end_byte())
+            else {
+                return Ok(None);
+            };
+            let type_ref = TypeRef {
+                path: vec![canonical_name(name)],
+                args: Vec::new(),
+                span: Span::from_node(identifier),
+            };
+            if let Some(resolved) = self.resolve_contract_type_ref_with_budget(
+                &candidate.uri,
+                &type_ref,
+                substitution,
+                Some(symbol.scope),
+                cancel,
+                budget,
+            )? {
+                if matches!(resolved, ResolvedType::Builtin(_)) {
+                    continue;
+                }
+                let Some(fingerprint) = self.contract_type_fingerprint_for_resolved_with_budget(
+                    &resolved,
+                    cancel,
+                    budget,
+                    active_aliases,
+                    active_dependencies,
+                    depth.saturating_add(1),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let dependency =
+                    ContractDefinitionDependencyFingerprint::Type(Box::new(fingerprint));
+                if seen.insert(dependency.clone()) {
+                    dependencies.push(dependency);
+                }
+                continue;
+            }
+
+            let mut state = ResolutionState::new();
+            let candidates = self.unqualified_references_with_budget_at_scope_and_state(
+                &candidate.uri,
+                document,
+                identifier.start_byte(),
+                name,
+                identifier,
+                symbol.scope,
+                &mut state,
+                cancel,
+                budget,
+            )?;
+            if state.receiver_resolution_uncertain() || candidates.len() != 1 {
+                return Ok(None);
+            }
+            let dependency_candidate = &candidates[0];
+            if self.candidate_is_conditionally_unknown(dependency_candidate) {
+                return Ok(None);
+            }
+            let Some(dependency_symbol) = self.symbol(dependency_candidate) else {
+                return Ok(None);
+            };
+            if dependency_symbol.kind == SymbolKind::Unit {
+                return Ok(None);
+            }
+            if !matches!(
+                dependency_symbol.kind,
+                SymbolKind::Constant | SymbolKind::EnumValue
+            ) {
+                // A static bound/default dependency must be a proven constant
+                // value. Text for a variable, field, property, or routine is
+                // not a semantic value proof and must not become a reusable
+                // identity merely because its declaration text is stable.
+                return Ok(None);
+            }
+            let Some(dependency) = self.contract_definition_dependency_fingerprint_with_budget(
+                dependency_candidate,
+                dependency_symbol,
+                substitution,
+                cancel,
+                budget,
+                active_aliases,
+                active_dependencies,
+                depth.saturating_add(1),
+            )?
+            else {
+                return Ok(None);
             };
             if seen.insert(dependency.clone()) {
                 dependencies.push(dependency);
@@ -4089,6 +4303,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
         active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        active_dependencies: &mut HashSet<(Url, usize, usize)>,
         depth: usize,
     ) -> Result<Option<ContractTypeShapeFingerprint>, String> {
         if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
@@ -4114,6 +4329,7 @@ impl NavigationIndex {
                     cancel,
                     budget,
                     active_aliases,
+                    active_dependencies,
                     depth.saturating_add(1),
                 )?
                 else {
@@ -4132,6 +4348,7 @@ impl NavigationIndex {
                     cancel,
                     budget,
                     active_aliases,
+                    active_dependencies,
                     depth.saturating_add(1),
                 )?
                 else {
@@ -4156,6 +4373,7 @@ impl NavigationIndex {
                     cancel,
                     budget,
                     active_aliases,
+                    active_dependencies,
                     depth.saturating_add(1),
                 )?
                 else {
@@ -12187,6 +12405,7 @@ pub(super) enum ContractDefinitionDependencyFingerprint {
         key: String,
         kind: TypeKind,
         text: String,
+        dependencies: Vec<ContractDefinitionDependencyFingerprint>,
     },
 }
 
@@ -18287,6 +18506,31 @@ fn declared_type_node_for_span_with_budget<'a>(
             && node
                 .child_by_field_name("name")
                 .is_some_and(|name| Span::from_node(name).contains(span))
+        {
+            return Ok(Some(node));
+        }
+        current = node.parent();
+    }
+    Ok(None)
+}
+
+fn declaration_node_for_symbol_with_budget<'a>(
+    document: &'a Document,
+    symbol: &Symbol,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let Some(identifier) =
+        identifier_at_with_budget(document.tree.root_node(), symbol.span.start, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if Span::from_node(node) == symbol.declaration_span
+            && matches!(node.kind(), "declConst" | "declEnumValue")
         {
             return Ok(Some(node));
         }

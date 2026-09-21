@@ -1385,8 +1385,14 @@ proven after reanalysis. Unsupported signatures and ambiguous provider or
 collision facts are withheld rather than guessed. An implicit compiler
 `TObject` remains an open member namespace: missing declarations are withheld
 until a source-backed authoritative root is available, while an exact direct
-class declaration can still receive its missing body. Deferred interface actions recheck provider/type identity,
-source and configuration freshness, and the serialized response-size limit.
+public or published class declaration can still receive its missing body. An
+inherited conformance result never authorizes a private, strict-private, or
+protected direct shadow; ordinary declaration-selected method actions remain a
+separate operation. Deferred interface actions recheck provider/type identity,
+including supported transitive constant/enum-value dependencies used by type
+bounds and defaults; cycles, limits, or unresolved value dependencies withhold
+the action. Source and configuration freshness and the serialized response-size
+limit are also rechecked.
 
 The same `quickfix` request can offer `Add unit '<Unit>' to uses` for an
 unqualified identifier that is proven unresolved by the source resolver. The

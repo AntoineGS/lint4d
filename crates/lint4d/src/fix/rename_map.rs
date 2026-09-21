@@ -29,6 +29,19 @@ pub fn build_rename_map(
     map
 }
 
+pub(crate) fn build_rename_map_for_rules(
+    root: Node,
+    source: &[u8],
+    config: &Config,
+    suppressions: &[Suppression],
+    rules: &[&str],
+) -> RenameMap {
+    let mut map = RenameMap::default();
+    let fix_config = FixConfig::for_rules(config, rules);
+    walk_declarations(root, source, config, suppressions, &fix_config, &mut map);
+    map
+}
+
 // ---------------------------------------------------------------------------
 // Declaration walker
 // ---------------------------------------------------------------------------

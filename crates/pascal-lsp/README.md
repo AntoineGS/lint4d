@@ -202,6 +202,45 @@ another Pascal language server to the same buffer while evaluating this slice.
 | `:checkhealth vim.lsp` | Inspect attachment, executable, and client configuration |
 | `:lua print(vim.lsp.log.get_filename())` | Locate the LSP log, including server stderr |
 
+### Fix all supported naming diagnostics
+
+The server advertises the standard `source.fixAll` hierarchy for one
+proof-gated, current-document action. The supported finite subset is exactly
+`constant-naming` and `local-variable-naming`; the rule-specific kinds are
+`source.fixAll.constant-naming` and
+`source.fixAll.local-variable-naming`. The action performs fresh analysis of
+the effective document and does not trust the client's diagnostic messages or
+ranges. Unsupported lint rules, including type/interface prefixes and
+identifier casing, remain untouched and are not claimed fixed.
+
+The fix builder is reused to produce byte edits. Before an edit is returned,
+the LSP validates UTF-16/CRLF/non-BMP coordinates, deduplicates identical
+replacements, rejects overlap or ambiguous insertion, proves each rename with
+the existing binding-aware rename index, checks references and name
+collisions, reparses the combined result, and confirms that the selected
+naming diagnostics disappear. A declaration whose references escape the
+requested physical document is withheld rather than partially renamed;
+independent declarations with complete local proofs may still be batched. The
+same proof also rejects swaps, chains, shadow capture, conditional uncertainty,
+parser recovery, include/shared physical provenance, incomplete workspace
+discovery, read-only/external files, stale configuration, and changed source
+content. No file creation, resource operation, or implicit workspace-wide
+batch is performed.
+
+Eager clients receive a normal `WorkspaceEdit`; resolving clients receive the
+same frozen action identity and a fresh versioned edit. Open documents retain
+their checked version, while closed documents use the compatibility null
+version form. Unrelated overlay changes and a no-op document version change do
+not alter the action's effective source proof, but a referenced source,
+configuration, binding, or collision witness changing causes resolution to
+fail closed. Quickfix-only and `source.organizeImports`-only filters do not
+include `source.fixAll`.
+
+The request is bounded by a 4 MiB source, 512 supported candidates, 2,048
+combined edits, 64 KiB replacement text, 4,096 retained dependency records,
+and the shared 64 KiB serialized code-action limit. Cancellation, output
+limits, or proof-budget exhaustion return no partial edit.
+
 ### Generate missing method implementations
 
 Code actions also offer `Implement 'TOwner.Method'` for a source-backed class

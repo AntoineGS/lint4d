@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use lint4d::config::Config;
 use lint4d::engine::suppress::parse_suppressions;
 use lint4d::engine::{FileInfo, parse_file, run_lint};
-use lint4d::fix::{build_rename_map, fix_file};
+use lint4d::fix::{build_rename_map, fix_file, fix_file_edits};
 
 fn build_map_from_source(source: &str) -> lint4d::fix::RenameMap {
     let config = "version = 1".parse::<Config>().unwrap();
@@ -220,6 +220,23 @@ fn fix_source_with_config(source: &str, config_str: &str) -> String {
     let file = FileInfo::new(PathBuf::from("test.pas"));
     let (result, _count) = fix_file(&file, source.as_bytes(), &config).unwrap();
     String::from_utf8(result).unwrap()
+}
+
+#[test]
+fn raw_fix_edits_can_select_only_the_supported_fix_all_rules() {
+    let source = "unit Test;\ninterface\ntype\n  MyClass = class(TObject)\n  end;\nconst\n  badConst = 1;\nimplementation\nprocedure Work;\nvar\n  badLocal: Integer;\nbegin\n  badLocal := badConst;\nend;\nend.\n";
+    let config = "version = 1".parse::<Config>().unwrap();
+    let file = FileInfo::new(PathBuf::from("test.pas"));
+    let edits = fix_file_edits(
+        &file,
+        source.as_bytes(),
+        &config,
+        &["constant-naming", "local-variable-naming"],
+    )
+    .expect("raw fix edits");
+    assert!(edits.iter().any(|edit| edit.new_text == "BAD_CONST"));
+    assert!(edits.iter().any(|edit| edit.new_text == "BadLocal"));
+    assert!(edits.iter().all(|edit| edit.new_text != "TMyClass"));
 }
 
 #[test]

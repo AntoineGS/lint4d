@@ -9,6 +9,18 @@ pub(crate) struct TextEdit {
     pub new_text: String,
 }
 
+/// A bounded, parser-derived edit before it is converted to an editor range.
+///
+/// Byte offsets are relative to the exact source bytes supplied to the fix
+/// builder. Consumers must validate and convert them against that same source;
+/// they must not reuse offsets after applying another edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixEdit {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub new_text: String,
+}
+
 /// Rename map built from naming rule violations.
 #[derive(Debug, Default)]
 pub struct RenameMap {
@@ -58,6 +70,37 @@ impl FixConfig {
                 config.rule_severity("identifier-casing"),
                 Some(RuleSeverityOverride::Off)
             ),
+        }
+    }
+
+    pub(crate) fn for_rules(config: &Config, rules: &[&str]) -> Self {
+        let selected = |rule: &str| rules.iter().any(|candidate| *candidate == rule);
+        Self {
+            type_prefix: selected("type-prefix")
+                && !matches!(
+                    config.rule_severity("type-prefix"),
+                    Some(RuleSeverityOverride::Off)
+                ),
+            intf_prefix: selected("interface-prefix")
+                && !matches!(
+                    config.rule_severity("interface-prefix"),
+                    Some(RuleSeverityOverride::Off)
+                ),
+            const_naming: selected("constant-naming")
+                && !matches!(
+                    config.rule_severity("constant-naming"),
+                    Some(RuleSeverityOverride::Off)
+                ),
+            local_var: selected("local-variable-naming")
+                && !matches!(
+                    config.rule_severity("local-variable-naming"),
+                    Some(RuleSeverityOverride::Off)
+                ),
+            casing: selected("identifier-casing")
+                && !matches!(
+                    config.rule_severity("identifier-casing"),
+                    Some(RuleSeverityOverride::Off)
+                ),
         }
     }
 }

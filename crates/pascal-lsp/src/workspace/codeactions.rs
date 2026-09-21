@@ -18,6 +18,7 @@ use crate::navigation::{
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
 use lint4d::engine::suppress::parse_suppressions;
+use lint4d::fix::fix_file_edits;
 use lint4d::rules::helpers::effective_children;
 use lint4d::rules::naming::{
     to_camel_case, to_pascal_case, to_upper_snake_case, violates_naming_style,
@@ -51,12 +52,24 @@ const INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-interface-m
 const INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
 const ORGANIZE_IMPORTS_ACTION_KIND: &str = "organize-imports";
 const ORGANIZE_IMPORTS_ACTION_DATA_VERSION: u8 = 3;
+const FIX_ALL_ACTION_KIND: &str = "fix-all";
+const FIX_ALL_ACTION_DATA_VERSION: u8 = 1;
 const ORGANIZE_IMPORTS_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("source.organizeImports");
+const FIX_ALL_CODE_ACTION_KIND: CodeActionKind = CodeActionKind::new("source.fixAll");
+const FIX_ALL_CONSTANT_CODE_ACTION_KIND: CodeActionKind =
+    CodeActionKind::new("source.fixAll.constant-naming");
+const FIX_ALL_LOCAL_CODE_ACTION_KIND: CodeActionKind =
+    CodeActionKind::new("source.fixAll.local-variable-naming");
 const MAX_ORGANIZE_IMPORTS_CLAUSES: usize = 64;
 const MAX_ORGANIZE_IMPORTS_ENTRIES: usize = 512;
 const MAX_ORGANIZE_IMPORTS_CLAUSE_BYTES: usize = 64 * 1024;
 const MAX_ORGANIZE_IMPORTS_EDIT_BYTES: usize = 64 * 1024;
+const MAX_FIX_ALL_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FIX_ALL_CANDIDATES: usize = 512;
+const MAX_FIX_ALL_EDITS: usize = 2048;
+const MAX_FIX_ALL_EDIT_BYTES: usize = 64 * 1024;
+const MAX_FIX_ALL_DEPENDENCY_RECORDS: usize = 4096;
 const INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("quickfix.implement-interface-method");
 const CONSTANT_RULE: &str = "constant-naming";
@@ -215,6 +228,46 @@ pub(crate) struct OrganizeImportsProviderIdentity {
     pub(crate) safety_fingerprint: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FixAllActionData {
+    pub(crate) version: u8,
+    pub(crate) action_id: String,
+    pub(crate) kind: String,
+    pub(crate) uri: Url,
+    pub(crate) scope: String,
+    pub(crate) rules: Vec<String>,
+    pub(crate) candidates: Vec<FixAllCandidateIdentity>,
+    pub(crate) edits: Vec<FixAllEditIdentity>,
+    #[serde(with = "decimal_u64")]
+    pub(crate) dependency_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) configuration_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) config_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_hash: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FixAllCandidateIdentity {
+    pub(crate) rule: String,
+    pub(crate) anchor: Range,
+    pub(crate) old_name: String,
+    pub(crate) new_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FixAllEditIdentity {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) new_text: String,
+}
+
 mod decimal_u64 {
     use super::*;
 
@@ -315,6 +368,52 @@ struct OrganizeImportsPlan {
     edits: Vec<TextEdit>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixAllScope {
+    All,
+    Constant,
+    Local,
+}
+
+impl FixAllScope {
+    fn rules(self) -> &'static [&'static str] {
+        match self {
+            Self::All => &[CONSTANT_RULE, LOCAL_RULE],
+            Self::Constant => &[CONSTANT_RULE],
+            Self::Local => &[LOCAL_RULE],
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Constant => CONSTANT_RULE,
+            Self::Local => LOCAL_RULE,
+        }
+    }
+
+    fn action_kind(self) -> CodeActionKind {
+        match self {
+            Self::All => FIX_ALL_CODE_ACTION_KIND,
+            Self::Constant => FIX_ALL_CONSTANT_CODE_ACTION_KIND,
+            Self::Local => FIX_ALL_LOCAL_CODE_ACTION_KIND,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FixAllPlan {
+    uri: Url,
+    scope: FixAllScope,
+    rules: Vec<String>,
+    source_hash: u64,
+    config_fingerprint: u64,
+    dependency_fingerprint: u64,
+    candidates: Vec<FixAllCandidateIdentity>,
+    edits: Vec<TextEdit>,
+    edit_identities: Vec<FixAllEditIdentity>,
+}
+
 #[derive(Debug, Clone)]
 enum ParsedActionData {
     Rename(RenameActionData),
@@ -322,6 +421,7 @@ enum ParsedActionData {
     MethodImplementation(MethodImplementationActionData),
     InterfaceMethodImplementation(InterfaceMethodImplementationActionData),
     OrganizeImports(OrganizeImportsActionData),
+    FixAll(FixAllActionData),
 }
 
 struct CandidateRequest<'a> {
@@ -351,7 +451,12 @@ pub(crate) fn code_actions_from_input(
     let requests_quickfix = requests_quickfix(&params.context);
     let requests_interface_method = requests_interface_method(&params.context);
     let requests_organize_imports = requests_organize_imports(&params.context);
-    if !requests_quickfix && !requests_interface_method && !requests_organize_imports {
+    let fix_all_scopes = requested_fix_all_scopes(&params.context);
+    if !requests_quickfix
+        && !requests_interface_method
+        && !requests_organize_imports
+        && fix_all_scopes.is_empty()
+    {
         return Computed {
             source_generation,
             configuration_generation,
@@ -479,6 +584,38 @@ pub(crate) fn code_actions_from_input(
     } else {
         (None, Vec::new())
     };
+    let (fix_all_plans, fix_all_records) = {
+        let mut plans = Vec::new();
+        let mut records = Vec::new();
+        for scope in fix_all_scopes {
+            match fix_all_plan_from_input(
+                &input,
+                &uri,
+                &source,
+                &target_record,
+                &config,
+                config_fingerprint,
+                scope,
+                &configuration_records,
+                cancel,
+            ) {
+                Ok((Some(plan), plan_records)) => {
+                    plans.push(plan);
+                    append_records(&mut records, plan_records);
+                }
+                Ok((None, plan_records)) => append_records(&mut records, plan_records),
+                Err(error) if is_cancelled(cancel) => {
+                    return failed(source_generation, configuration_generation, error);
+                }
+                // Fix-all is optional assistance. An incomplete semantic context,
+                // unsupported source ownership, or a failed proof withholds only
+                // this source action and does not hide unrelated quick fixes or
+                // another independently requested rule-specific action.
+                Err(_) => {}
+            }
+        }
+        (plans, records)
+    };
     if features.resolve {
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
         for candidate in &candidates {
@@ -600,6 +737,26 @@ pub(crate) fn code_actions_from_input(
                 Err(error) => return failed(source_generation, configuration_generation, error),
             }
         }
+        for plan in &fix_all_plans {
+            let data = FixAllActionData::new(plan, source_generation, configuration_generation);
+            let action = CodeActionOrCommand::CodeAction(CodeAction {
+                title: fix_all_action_title(plan.scope),
+                kind: Some(plan.scope.action_kind()),
+                diagnostics: None,
+                edit: None,
+                command: None,
+                is_preferred: Some(true),
+                disabled: None,
+                data: Some(
+                    serde_json::to_value(&data).expect("fix-all action data is serializable"),
+                ),
+            });
+            match push_bounded_code_action(&mut actions, action) {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
         return Computed {
             source_generation,
             configuration_generation,
@@ -610,6 +767,7 @@ pub(crate) fn code_actions_from_input(
                 append_records(&mut records, method_records);
                 append_records(&mut records, interface_method_records);
                 append_records(&mut records, organize_imports_records);
+                append_records(&mut records, fix_all_records);
                 append_records(&mut records, configuration_records);
                 records
             },
@@ -885,11 +1043,58 @@ pub(crate) fn code_actions_from_input(
             Err(error) => return failed(source_generation, configuration_generation, error),
         }
     }
+    for plan in &fix_all_plans {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let data = FixAllActionData::new(plan, source_generation, configuration_generation);
+        let mut action = CodeAction {
+            title: fix_all_action_title(plan.scope),
+            kind: Some(plan.scope.action_kind()),
+            diagnostics: None,
+            edit: None,
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: Some(serde_json::to_value(&data).expect("fix-all action data is serializable")),
+        };
+        if !features.resolve {
+            let mut raw_edits = HashMap::new();
+            raw_edits.insert(uri.clone(), plan.edits.clone());
+            let mut records_by_uri = HashMap::new();
+            records_by_uri.insert(uri.clone(), target_record.clone());
+            match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+                Ok(edit) => action.edit = Some(edit),
+                Err(error) => {
+                    if !set_disabled_or_skip(&mut action, features.disabled, error) {
+                        // An eager source action without a negotiated disabled
+                        // form is withheld rather than returned without an edit.
+                        return Computed {
+                            source_generation,
+                            configuration_generation,
+                            value: Ok(actions),
+                            records: {
+                                let mut records = fix_all_records.clone();
+                                append_records(&mut records, configuration_records);
+                                records
+                            },
+                        };
+                    }
+                }
+            }
+        }
+        match push_bounded_code_action(&mut actions, CodeActionOrCommand::CodeAction(action)) {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    }
     let mut records = snapshot_records(&snapshot);
     append_records(&mut records, missing_records);
     append_records(&mut records, method_records);
     append_records(&mut records, interface_method_records);
     append_records(&mut records, organize_imports_records);
+    append_records(&mut records, fix_all_records);
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -897,6 +1102,494 @@ pub(crate) fn code_actions_from_input(
         value: Ok(actions),
         records,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fix_all_plan_from_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    config: &Config,
+    config_fingerprint: u64,
+    scope: FixAllScope,
+    configuration_records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(Option<FixAllPlan>, Vec<SourceRecord>), String> {
+    if source.len() > MAX_FIX_ALL_SOURCE_BYTES
+        || target_record.include_payload
+        || may_contain_include_directive(source.as_bytes())
+    {
+        return Ok((None, Vec::new()));
+    }
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+
+    let path = uri
+        .to_file_path()
+        .map(absolute_path)
+        .map_err(|_| format!("not a file URI: {uri}"))?;
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pas"))
+    {
+        return Ok((None, Vec::new()));
+    }
+    let (tree, _) = parser::parse_file(&FileInfo::new(path.clone()), source.as_bytes())
+        .map_err(|error| format!("could not parse fix-all source: {error}"))?;
+    if tree.root_node().has_error() {
+        return Ok((None, Vec::new()));
+    }
+    let end = text::offset_to_position(source, source.len())
+        .ok_or_else(|| "fix-all source has an invalid UTF-16 boundary".to_string())?;
+    let context = CodeActionContext {
+        diagnostics: Vec::new(),
+        only: Some(vec![scope.action_kind()]),
+        trigger_kind: None,
+    };
+    let candidates = naming_candidates(
+        uri,
+        source,
+        Range::new(lsp_types::Position::new(0, 0), end),
+        &context,
+        config,
+        config_fingerprint,
+    )?
+    .into_iter()
+    .filter(|candidate| scope.rules().contains(&candidate.rule.as_str()))
+    .collect::<Vec<_>>();
+    if candidates.is_empty() || candidates.len() > MAX_FIX_ALL_CANDIDATES {
+        return Ok((None, Vec::new()));
+    }
+    let mut rules = Vec::with_capacity(scope.rules().len());
+    rules.extend(scope.rules().iter().copied());
+    let raw_edits = fix_file_edits(&FileInfo::new(path), source.as_bytes(), config, &rules)?;
+    let raw_edits = deduplicate_fix_all_edits(raw_edits, source, cancel)?;
+    if raw_edits.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let edit_bytes = raw_edits
+        .iter()
+        .map(|edit| edit.new_text.len())
+        .fold(0usize, usize::saturating_add);
+    if raw_edits.len() > MAX_FIX_ALL_EDITS || edit_bytes > MAX_FIX_ALL_EDIT_BYTES {
+        return Ok((None, Vec::new()));
+    }
+    let raw_edit_set = raw_edits.iter().cloned().collect::<HashSet<_>>();
+    for candidate in &candidates {
+        let start = text::position_to_offset(source, candidate.anchor.start)
+            .ok_or_else(|| "fix-all candidate has an invalid start position".to_string())?;
+        let end = text::position_to_offset(source, candidate.anchor.end)
+            .ok_or_else(|| "fix-all candidate has an invalid end position".to_string())?;
+        if !raw_edit_set.contains(&FixAllEditIdentity {
+            start,
+            end,
+            new_text: candidate.new_name.clone(),
+        }) {
+            // The raw builder and fresh diagnostic candidate set disagree. Do
+            // not manufacture a replacement from the client diagnostic.
+            return Ok((None, Vec::new()));
+        }
+    }
+
+    let mut candidate_names = Vec::with_capacity(candidates.len().saturating_mul(2));
+    let mut candidate_name_set = HashSet::with_capacity(candidates.len().saturating_mul(2));
+    for candidate in &candidates {
+        for name in [&candidate.old_name, &candidate.new_name] {
+            if candidate_name_set.insert(name.clone()) {
+                candidate_names.push(name.clone());
+            }
+        }
+    }
+    let mode = if candidates
+        .iter()
+        .all(|candidate| candidate.rule == LOCAL_RULE)
+    {
+        SnapshotMode::Local
+    } else {
+        SnapshotMode::Workspace
+    };
+    let snapshot = match build_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        &candidate_names,
+        mode,
+        Some(
+            SnapshotSeed::new(target_record.clone())
+                .with_consumed_configuration(configuration_records),
+        ),
+        &[],
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) if is_cancelled(cancel) => return Err(error),
+        Err(_) => return Ok((None, Vec::new())),
+    };
+    if !snapshot.complete
+        || !snapshot.include_errors.is_empty()
+        || !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|indexed| indexed != source)
+    {
+        return Ok((None, Vec::new()));
+    }
+
+    let mut proven_candidates = Vec::new();
+    for candidate in &candidates {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let candidate_offset = text::position_to_offset(source, candidate.anchor.start)
+            .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
+        if snapshot.index.conditional_unknown_at(uri, candidate_offset) {
+            continue;
+        }
+        if let Err(error) = check_includes(
+            &snapshot,
+            uri,
+            candidate.anchor.start,
+            &[candidate.old_name.clone(), candidate.new_name.clone()],
+            Some(cancel),
+        ) {
+            if is_cancelled(cancel) {
+                return Err(error);
+            }
+            continue;
+        }
+        let planned =
+            match snapshot
+                .index
+                .rename_edits(uri, candidate.anchor.start, &candidate.new_name)
+            {
+                Ok(edits) => edits,
+                Err(_) => continue,
+            };
+        let mut candidate_edits = Vec::new();
+        let mut unsafe_candidate = false;
+        for (edited_uri, edits) in planned {
+            if edited_uri != *uri {
+                // This source action is deliberately document-scoped. A
+                // declaration whose proven references escape the document is
+                // not silently renamed only at its declaration. Independent
+                // candidates in this document may still be retained.
+                unsafe_candidate = true;
+                break;
+            }
+            for edit in edits {
+                let start = text::position_to_offset(source, edit.range.start)
+                    .ok_or_else(|| "rename proof has an invalid start position".to_string())?;
+                let end = text::position_to_offset(source, edit.range.end)
+                    .ok_or_else(|| "rename proof has an invalid end position".to_string())?;
+                if snapshot.index.conditional_unknown_at(uri, start) {
+                    unsafe_candidate = true;
+                    break;
+                }
+                candidate_edits.push(FixAllEditIdentity {
+                    start,
+                    end,
+                    new_text: edit.new_text,
+                });
+            }
+            if unsafe_candidate {
+                break;
+            }
+        }
+        if unsafe_candidate {
+            continue;
+        }
+        let candidate_edits = normalize_fix_all_edit_identities(candidate_edits, source, cancel)?;
+        if candidate_edits.is_empty() {
+            continue;
+        }
+        proven_candidates.push((candidate.clone(), candidate_edits));
+    }
+    if proven_candidates.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let mut semantic_edits = proven_candidates
+        .iter()
+        .flat_map(|(_, edits)| edits.iter().cloned())
+        .collect::<Vec<_>>();
+    semantic_edits = normalize_fix_all_edit_identities(semantic_edits, source, cancel)?;
+    if semantic_edits.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let selected_edit_set = semantic_edits.iter().cloned().collect::<HashSet<_>>();
+    let selected_raw_edits = raw_edits
+        .iter()
+        .filter(|edit| selected_edit_set.contains(*edit))
+        .cloned()
+        .collect::<Vec<_>>();
+    if semantic_edits != selected_raw_edits {
+        // The established file fix builder must agree exactly with the
+        // binding-aware rename proof. This rejects shadow capture, swaps,
+        // chains, missed references, and downstream interactions for the
+        // retained coherent subset.
+        return Ok((None, Vec::new()));
+    }
+
+    let updated_source = apply_fix_all_edits(source, &selected_raw_edits).ok_or_else(|| {
+        "fix-all edits could not be applied to their original source snapshot".to_string()
+    })?;
+    let (updated_tree, _) = parser::parse_file(
+        &FileInfo::new(
+            uri.to_file_path()
+                .map(absolute_path)
+                .map_err(|_| format!("not a file URI: {uri}"))?,
+        ),
+        updated_source.as_bytes(),
+    )
+    .map_err(|error| format!("could not validate fix-all source: {error}"))?;
+    if updated_tree.root_node().has_error() {
+        return Ok((None, Vec::new()));
+    }
+    let remaining = lint4d::engine::run_lint(
+        &FileInfo::new(
+            uri.to_file_path()
+                .map(absolute_path)
+                .map_err(|_| format!("not a file URI: {uri}"))?,
+        ),
+        updated_source.as_bytes(),
+        config,
+    );
+    if remaining
+        .iter()
+        .any(|diagnostic| diagnostic.rule_id == "lint4d-error")
+    {
+        return Ok((None, Vec::new()));
+    }
+    let updated_end = text::offset_to_position(&updated_source, updated_source.len())
+        .ok_or_else(|| "updated fix-all source has an invalid UTF-16 boundary".to_string())?;
+    let updated_context = CodeActionContext {
+        diagnostics: Vec::new(),
+        only: Some(vec![scope.action_kind()]),
+        trigger_kind: None,
+    };
+    let updated_candidates = naming_candidates(
+        uri,
+        &updated_source,
+        Range::new(lsp_types::Position::new(0, 0), updated_end),
+        &updated_context,
+        config,
+        config_fingerprint,
+    )?;
+    for (candidate, _) in &proven_candidates {
+        let start = text::position_to_offset(source, candidate.anchor.start)
+            .ok_or_else(|| "fix-all candidate has an invalid start position".to_string())?;
+        let end = text::position_to_offset(source, candidate.anchor.end)
+            .ok_or_else(|| "fix-all candidate has an invalid end position".to_string())?;
+        let Some(updated_range) = transformed_fix_all_edit_range(
+            &updated_source,
+            start,
+            end,
+            &candidate.new_name,
+            &selected_raw_edits,
+        ) else {
+            return Ok((None, Vec::new()));
+        };
+        let Some(updated_start) = text::position_to_offset(&updated_source, updated_range.start)
+        else {
+            return Ok((None, Vec::new()));
+        };
+        let Some(updated_end) = text::position_to_offset(&updated_source, updated_range.end) else {
+            return Ok((None, Vec::new()));
+        };
+        if updated_source.get(updated_start..updated_end) != Some(candidate.new_name.as_str())
+            || updated_candidates
+                .iter()
+                .any(|updated| updated.rule == candidate.rule && updated.anchor == updated_range)
+        {
+            return Ok((None, Vec::new()));
+        }
+    }
+
+    let mut records = snapshot_records(&snapshot);
+    append_records(&mut records, configuration_records.to_vec());
+    if records.len() > MAX_FIX_ALL_DEPENDENCY_RECORDS {
+        return Ok((None, Vec::new()));
+    }
+    let dependency_fingerprint = fix_all_dependency_fingerprint(&records);
+    let edits = selected_raw_edits
+        .iter()
+        .map(|edit| {
+            let start = text::offset_to_position(source, edit.start)
+                .ok_or_else(|| "fix-all start is not a UTF-16 boundary".to_string())?;
+            let end = text::offset_to_position(source, edit.end)
+                .ok_or_else(|| "fix-all end is not a UTF-16 boundary".to_string())?;
+            Ok(TextEdit::new(Range::new(start, end), edit.new_text.clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let candidates = proven_candidates
+        .into_iter()
+        .map(|(candidate, _)| FixAllCandidateIdentity {
+            rule: candidate.rule,
+            anchor: candidate.anchor,
+            old_name: candidate.old_name,
+            new_name: candidate.new_name,
+        })
+        .collect();
+    Ok((
+        Some(FixAllPlan {
+            uri: uri.clone(),
+            scope,
+            rules: scope
+                .rules()
+                .iter()
+                .map(|rule| (*rule).to_string())
+                .collect(),
+            source_hash: source_hash(source),
+            config_fingerprint,
+            dependency_fingerprint,
+            candidates,
+            edits,
+            edit_identities: selected_raw_edits,
+        }),
+        records,
+    ))
+}
+
+fn normalize_fix_all_edit_identities(
+    edits: Vec<FixAllEditIdentity>,
+    source: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    let normalized = deduplicate_fix_all_edit_identities(edits, source, cancel)?;
+    for pair in normalized.windows(2) {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let previous = &pair[0];
+        let edit = &pair[1];
+        let overlap = previous.end > edit.start
+            || (previous.start == previous.end
+                && edit.start <= previous.start
+                && previous.start <= edit.end)
+            || (edit.start == edit.end
+                && previous.start <= edit.start
+                && edit.start <= previous.end);
+        if overlap {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(normalized)
+}
+
+fn deduplicate_fix_all_edits(
+    edits: Vec<lint4d::fix::FixEdit>,
+    source: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    deduplicate_fix_all_edit_identities(
+        edits
+            .into_iter()
+            .map(|edit| FixAllEditIdentity {
+                start: edit.start_byte,
+                end: edit.end_byte,
+                new_text: edit.new_text,
+            })
+            .collect(),
+        source,
+        cancel,
+    )
+}
+
+fn deduplicate_fix_all_edit_identities(
+    mut edits: Vec<FixAllEditIdentity>,
+    source: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    edits.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.new_text.cmp(&right.new_text))
+    });
+    let mut normalized: Vec<FixAllEditIdentity> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if edit.start > edit.end
+            || source.get(edit.start..edit.end).is_none()
+            || edit.new_text.len() > MAX_FIX_ALL_EDIT_BYTES
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(previous) = normalized.last() {
+            let duplicate = previous.start == edit.start
+                && previous.end == edit.end
+                && previous.new_text == edit.new_text;
+            if duplicate {
+                continue;
+            }
+        }
+        normalized.push(edit);
+    }
+    Ok(normalized)
+}
+
+fn apply_fix_all_edits(source: &str, edits: &[FixAllEditIdentity]) -> Option<String> {
+    let mut updated = source.to_owned();
+    for edit in edits.iter().rev() {
+        updated.replace_range(edit.start..edit.end, &edit.new_text);
+    }
+    Some(updated)
+}
+
+fn transformed_fix_all_edit_range(
+    updated_source: &str,
+    start: usize,
+    end: usize,
+    new_text: &str,
+    edits: &[FixAllEditIdentity],
+) -> Option<Range> {
+    let target_index = edits
+        .iter()
+        .position(|edit| edit.start == start && edit.end == end && edit.new_text == new_text)?;
+    let mut updated_start = start;
+    for edit in &edits[..target_index] {
+        updated_start = updated_start
+            .checked_sub(edit.end.checked_sub(edit.start)?)?
+            .checked_add(edit.new_text.len())?;
+    }
+    let updated_end = updated_start.checked_add(new_text.len())?;
+    Some(Range::new(
+        text::offset_to_position(updated_source, updated_start)?,
+        text::offset_to_position(updated_source, updated_end)?,
+    ))
+}
+
+fn fix_all_dependency_fingerprint(records: &[SourceRecord]) -> u64 {
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+    let mut hasher = DefaultHasher::new();
+    for record in ordered {
+        record.uri.hash(&mut hasher);
+        record.text.hash(&mut hasher);
+        record.content_hash.hash(&mut hasher);
+        record.parsed_text_hash.hash(&mut hasher);
+        record.content_bytes.hash(&mut hasher);
+        record.path.hash(&mut hasher);
+        record.include_payload.hash(&mut hasher);
+        record.missing_provider_candidate.hash(&mut hasher);
+        record.directory_observation.hash(&mut hasher);
+        for observation in &record.candidate_observations {
+            observation.path.hash(&mut hasher);
+            observation.present.hash(&mut hasher);
+        }
+        format!(
+            "{:?}{:?}{:?}",
+            record.candidate_membership, record.path_entry, record.missing_provider_scope
+        )
+        .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2686,6 +3379,9 @@ pub(crate) fn resolve_from_input(
         ParsedActionData::OrganizeImports(data) => {
             return resolve_organize_imports_from_input(input, action, data, features, cancel);
         }
+        ParsedActionData::FixAll(data) => {
+            return resolve_fix_all_from_input(input, action, data, features, cancel);
+        }
         ParsedActionData::Rename(data) => data,
     };
     if let Err(error) =
@@ -3426,6 +4122,129 @@ fn resolve_organize_imports_from_input(
     }
 }
 
+fn resolve_fix_all_from_input(
+    input: WorkspaceInput,
+    action: CodeAction,
+    data: FixAllActionData,
+    features: ClientActionFeatures,
+    cancel: &AtomicBool,
+) -> Computed<CodeAction> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if let Err(error) = validate_fix_all_action_data(&data, &action) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    let target_uri = canonical_file_uri(&data.uri);
+    let (target_source, target_record) =
+        match source_for_input_with_cancel(&input, &target_uri, Some(cancel)) {
+            Ok(source) => source,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if !input_source_is_editable(&input, &target_uri) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("code-action document is outside configured workspace roots: {target_uri}"),
+        );
+    }
+    if source_hash(&target_source) != data.source_hash {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "fix-all source changed; request code actions again".to_string(),
+        );
+    }
+    let (config, config_fingerprint, excluded, configuration_records) =
+        match lint_configuration_for_input(&input, &target_uri) {
+            Ok(config) => config,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if excluded {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source is excluded by lint configuration".to_string(),
+        );
+    }
+    if config_fingerprint != data.config_fingerprint {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "fix-all configuration is stale; request code actions again".to_string(),
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let Some(scope) = fix_all_scope_from_name(&data.scope) else {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "fix-all scope is unsupported".to_string(),
+        );
+    };
+    let (plan, records) = match fix_all_plan_from_input(
+        &input,
+        &target_uri,
+        &target_source,
+        &target_record,
+        &config,
+        config_fingerprint,
+        scope,
+        &configuration_records,
+        cancel,
+    ) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let Some(plan) = plan else {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "fix-all proof is stale; request code actions again".to_string(),
+        );
+    };
+    let expected_data =
+        FixAllActionData::new(&plan, data.source_generation, data.configuration_generation);
+    if plan.uri != target_uri
+        || plan.scope != scope
+        || plan.rules != data.rules
+        || plan.candidates != data.candidates
+        || plan.edit_identities != data.edits
+        || plan.dependency_fingerprint != data.dependency_fingerprint
+        || expected_data.action_id != data.action_id
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "fix-all binding, collision, or dependency proof is stale; request code actions again"
+                .to_string(),
+        );
+    }
+    let mut raw_edits = HashMap::new();
+    raw_edits.insert(target_uri.clone(), plan.edits);
+    let mut records_by_uri = HashMap::new();
+    records_by_uri.insert(target_uri, target_record);
+    let edit = match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+        Ok(edit) => edit,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let mut resolved = action;
+    resolved.edit = Some(edit);
+    resolved.disabled = None;
+    if let Err(error) = ensure_bounded_resolved_action(&resolved) {
+        return failed(source_generation, configuration_generation, error);
+    }
+    let mut records = records;
+    append_records(&mut records, configuration_records);
+    Computed {
+        source_generation,
+        configuration_generation,
+        value: Ok(resolved),
+        records,
+    }
+}
+
 fn failed<T>(source_generation: u64, configuration_generation: u64, error: String) -> Computed<T> {
     Computed {
         source_generation,
@@ -3528,6 +4347,39 @@ fn requests_organize_imports(context: &CodeActionContext) -> bool {
     })
 }
 
+fn requested_fix_all_scopes(context: &CodeActionContext) -> Vec<FixAllScope> {
+    let Some(kinds) = context.only.as_ref() else {
+        return vec![FixAllScope::All];
+    };
+    if kinds.is_empty() {
+        return vec![FixAllScope::All];
+    }
+    let mut root = false;
+    let mut constant = false;
+    let mut local = false;
+    for kind in kinds {
+        if code_action_kind_contains(kind, &FIX_ALL_CODE_ACTION_KIND) {
+            root = true;
+        } else if code_action_kind_contains(kind, &FIX_ALL_CONSTANT_CODE_ACTION_KIND) {
+            constant = true;
+        } else if code_action_kind_contains(kind, &FIX_ALL_LOCAL_CODE_ACTION_KIND) {
+            local = true;
+        }
+    }
+    if root {
+        vec![FixAllScope::All]
+    } else {
+        let mut scopes = Vec::with_capacity(2);
+        if constant {
+            scopes.push(FixAllScope::Constant);
+        }
+        if local {
+            scopes.push(FixAllScope::Local);
+        }
+        scopes
+    }
+}
+
 /// LSP code-action kinds form a dot-separated hierarchy.  An empty filter is
 /// the root, while a filter matches its exact kind and all descendants.
 fn code_action_kind_contains(filter: &CodeActionKind, action: &CodeActionKind) -> bool {
@@ -3535,6 +4387,14 @@ fn code_action_kind_contains(filter: &CodeActionKind, action: &CodeActionKind) -
         || filter == action
         || action.as_str().starts_with(filter.as_str())
             && action.as_str().as_bytes().get(filter.as_str().len()) == Some(&b'.')
+}
+
+fn fix_all_action_title(scope: FixAllScope) -> String {
+    match scope {
+        FixAllScope::All => "Fix all supported naming problems".to_string(),
+        FixAllScope::Constant => "Fix all constant-naming problems".to_string(),
+        FixAllScope::Local => "Fix all local-variable-naming problems".to_string(),
+    }
 }
 
 fn plan_candidate(
@@ -4044,6 +4904,28 @@ impl OrganizeImportsActionData {
     }
 }
 
+impl FixAllActionData {
+    fn new(plan: &FixAllPlan, source_generation: u64, configuration_generation: u64) -> Self {
+        let mut data = Self {
+            version: FIX_ALL_ACTION_DATA_VERSION,
+            action_id: String::new(),
+            kind: FIX_ALL_ACTION_KIND.to_string(),
+            uri: plan.uri.clone(),
+            scope: plan.scope.name().to_string(),
+            rules: plan.rules.clone(),
+            candidates: plan.candidates.clone(),
+            edits: plan.edit_identities.clone(),
+            dependency_fingerprint: plan.dependency_fingerprint,
+            source_generation,
+            configuration_generation,
+            config_fingerprint: plan.config_fingerprint,
+            source_hash: plan.source_hash,
+        };
+        data.action_id = fix_all_action_id(&data);
+        data
+    }
+}
+
 fn action_id(data: &RenameActionData) -> String {
     let mut hasher = DefaultHasher::new();
     data.version.hash(&mut hasher);
@@ -4169,6 +5051,35 @@ fn organize_imports_action_id(data: &OrganizeImportsActionData) -> String {
     format!("pascal-lsp:{:016x}", hasher.finish())
 }
 
+fn fix_all_action_id(data: &FixAllActionData) -> String {
+    let mut hasher = DefaultHasher::new();
+    data.version.hash(&mut hasher);
+    data.kind.hash(&mut hasher);
+    data.uri.hash(&mut hasher);
+    data.scope.hash(&mut hasher);
+    data.rules.hash(&mut hasher);
+    for candidate in &data.candidates {
+        candidate.rule.hash(&mut hasher);
+        candidate.anchor.start.line.hash(&mut hasher);
+        candidate.anchor.start.character.hash(&mut hasher);
+        candidate.anchor.end.line.hash(&mut hasher);
+        candidate.anchor.end.character.hash(&mut hasher);
+        candidate.old_name.hash(&mut hasher);
+        candidate.new_name.hash(&mut hasher);
+    }
+    for edit in &data.edits {
+        edit.start.hash(&mut hasher);
+        edit.end.hash(&mut hasher);
+        edit.new_text.hash(&mut hasher);
+    }
+    data.dependency_fingerprint.hash(&mut hasher);
+    data.source_generation.hash(&mut hasher);
+    data.configuration_generation.hash(&mut hasher);
+    data.config_fingerprint.hash(&mut hasher);
+    data.source_hash.hash(&mut hasher);
+    format!("pascal-lsp:{:016x}", hasher.finish())
+}
+
 fn source_hash(source: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
@@ -4207,6 +5118,32 @@ fn parse_action_data(value: Option<&Value>) -> Result<ParsedActionData, String> 
             }
         }
         Ok(ParsedActionData::OrganizeImports(data))
+    } else if value.get("kind").and_then(Value::as_str) == Some(FIX_ALL_ACTION_KIND) {
+        let mut data: FixAllActionData = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid fix-all resolve data: {error}"))?;
+        data.uri = canonical_file_uri(&data.uri);
+        if data.action_id.len() > MAX_ACTION_ID_BYTES
+            || data.uri.as_str().len() > MAX_ACTION_URI_BYTES
+            || data.rules.len() > 2
+            || data.candidates.len() > MAX_FIX_ALL_CANDIDATES
+            || data.edits.len() > MAX_FIX_ALL_EDITS
+        {
+            return Err("fix-all resolve data exceeds its bounded identity limits".to_string());
+        }
+        for candidate in &data.candidates {
+            if candidate.rule.len() > MAX_ACTION_NAME_BYTES
+                || candidate.old_name.len() > MAX_ACTION_NAME_BYTES
+                || candidate.new_name.len() > MAX_ACTION_NAME_BYTES
+            {
+                return Err("fix-all candidate identity exceeds its name limit".to_string());
+            }
+        }
+        for edit in &data.edits {
+            if edit.start > edit.end || edit.new_text.len() > MAX_FIX_ALL_EDIT_BYTES {
+                return Err("fix-all edit identity has an invalid span or size".to_string());
+            }
+        }
+        Ok(ParsedActionData::FixAll(data))
     } else if value.get("kind").and_then(Value::as_str)
         == Some(INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND)
     {
@@ -4438,12 +5375,72 @@ fn validate_organize_imports_action_data(
     Ok(())
 }
 
+fn fix_all_scope_from_name(name: &str) -> Option<FixAllScope> {
+    match name {
+        "all" => Some(FixAllScope::All),
+        CONSTANT_RULE => Some(FixAllScope::Constant),
+        LOCAL_RULE => Some(FixAllScope::Local),
+        _ => None,
+    }
+}
+
+fn validate_fix_all_action_data(
+    data: &FixAllActionData,
+    action: &CodeAction,
+) -> Result<(), String> {
+    let Some(scope) = fix_all_scope_from_name(&data.scope) else {
+        return Err("fix-all action scope is unsupported".to_string());
+    };
+    if data.version != FIX_ALL_ACTION_DATA_VERSION
+        || data.kind != FIX_ALL_ACTION_KIND
+        || data.action_id != fix_all_action_id(data)
+        || data.uri.as_str().len() > MAX_ACTION_URI_BYTES
+        || data.rules
+            != scope
+                .rules()
+                .iter()
+                .map(|rule| (*rule).to_string())
+                .collect::<Vec<_>>()
+        || data.candidates.is_empty()
+        || data.candidates.len() > MAX_FIX_ALL_CANDIDATES
+        || data.edits.is_empty()
+        || data.edits.len() > MAX_FIX_ALL_EDITS
+    {
+        return Err("fix-all resolve data is stale or tampered".to_string());
+    }
+    if data.candidates.iter().any(|candidate| {
+        !scope.rules().contains(&candidate.rule.as_str())
+            || candidate.old_name.is_empty()
+            || candidate.old_name.len() > MAX_ACTION_NAME_BYTES
+            || candidate.new_name.is_empty()
+            || candidate.new_name.len() > MAX_ACTION_NAME_BYTES
+    }) {
+        return Err("fix-all candidate identity is invalid".to_string());
+    }
+    if data.edits.iter().any(|edit| {
+        edit.start > edit.end
+            || edit.new_text.len() > MAX_FIX_ALL_EDIT_BYTES
+            || edit.new_text.is_empty()
+    }) {
+        return Err("fix-all edit identity is invalid".to_string());
+    }
+    if action.title != fix_all_action_title(scope)
+        || action.kind.as_ref() != Some(&scope.action_kind())
+    {
+        return Err("fix-all code action identity was modified by the client".to_string());
+    }
+    if action.data.as_ref().is_none_or(|value| value.is_null()) {
+        return Err("code action resolve data is missing".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistanceBudget, ClientActionFeatures, OrganizeImportsProvider, code_actions_from_input,
-        lint_configuration_for_input, resolve_from_input, selected_provider_order_is_safe,
-        set_after_lint_configuration_hook,
+        AssistanceBudget, ClientActionFeatures, FixAllEditIdentity, OrganizeImportsProvider,
+        code_actions_from_input, lint_configuration_for_input, normalize_fix_all_edit_identities,
+        resolve_from_input, selected_provider_order_is_safe, set_after_lint_configuration_hook,
     };
     use crate::navigation::UnitOrderSafety;
     use crate::workspace::Workspace;
@@ -4461,6 +5458,73 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn fix_all_edit_normalization_deduplicates_and_rejects_ambiguous_overlaps() {
+        let cancel = AtomicBool::new(false);
+        let source = "abcdef";
+        let deduplicated = normalize_fix_all_edit_identities(
+            vec![
+                FixAllEditIdentity {
+                    start: 0,
+                    end: 1,
+                    new_text: "A".to_string(),
+                },
+                FixAllEditIdentity {
+                    start: 0,
+                    end: 1,
+                    new_text: "A".to_string(),
+                },
+                FixAllEditIdentity {
+                    start: 2,
+                    end: 3,
+                    new_text: "C".to_string(),
+                },
+            ],
+            source,
+            &cancel,
+        )
+        .expect("deduplication should complete");
+        assert_eq!(deduplicated.len(), 2);
+
+        let overlapping = normalize_fix_all_edit_identities(
+            vec![
+                FixAllEditIdentity {
+                    start: 0,
+                    end: 2,
+                    new_text: "AB".to_string(),
+                },
+                FixAllEditIdentity {
+                    start: 1,
+                    end: 3,
+                    new_text: "BC".to_string(),
+                },
+            ],
+            source,
+            &cancel,
+        )
+        .expect("overlap rejection should complete");
+        assert!(overlapping.is_empty());
+
+        let coincident_insertions = normalize_fix_all_edit_identities(
+            vec![
+                FixAllEditIdentity {
+                    start: 3,
+                    end: 3,
+                    new_text: "X".to_string(),
+                },
+                FixAllEditIdentity {
+                    start: 3,
+                    end: 3,
+                    new_text: "Y".to_string(),
+                },
+            ],
+            source,
+            &cancel,
+        )
+        .expect("coincident insertion rejection should complete");
+        assert!(coincident_insertions.is_empty());
     }
 
     #[test]

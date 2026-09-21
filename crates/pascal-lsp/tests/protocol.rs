@@ -29301,6 +29301,614 @@ fn code_action_revalidates_a_single_constant_diagnostic_and_eagerly_shares_renam
 }
 
 #[test]
+fn source_fix_all_batches_fresh_supported_naming_fixes_and_preserves_unsupported_rules() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "type\n",
+        "  MyClass = class(TObject)\n",
+        "  end;\n",
+        "const\n",
+        "  badConst = 1;\n",
+        "implementation\n",
+        "procedure Use(badParam: Integer);\n",
+        "var\n",
+        "  badLocal: Integer;\n",
+        "begin\n",
+        "  badLocal := badParam + badConst;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(&root, Value::Null);
+    assert!(
+        initialize["capabilities"]["codeActionProvider"]["codeActionKinds"]
+            .as_array()
+            .expect("code action kinds")
+            .iter()
+            .any(|kind| kind == "source.fixAll")
+    );
+
+    let request_id = RequestId::from("source-fix-all-fresh-batch".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {
+                "diagnostics": [{
+                    "range": {"start": {"line": 999, "character": 999}, "end": {"line": 999, "character": 1000}},
+                    "severity": 1,
+                    "code": "unsupported-rule",
+                    "source": "untrusted-client",
+                    "message": "this diagnostic must not control fix-all"
+                }],
+                "only": ["source.fixAll"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "source.fixAll failed: {response:?}"
+    );
+    let actions = response.result.expect("source.fixAll result");
+    let actions = actions.as_array().expect("source.fixAll actions");
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected one whole-document action: {actions:?}"
+    );
+    assert_eq!(actions[0]["kind"], "source.fixAll");
+    let edit = actions[0]["edit"].as_object().expect("eager fix-all edit");
+    let updated = apply_workspace_edit_to_source(source, &json!(edit), &uri(&main));
+    assert!(updated.contains("MY_CONST = 1;") || updated.contains("BAD_CONST = 1;"));
+    assert!(updated.contains("BadParam: Integer"));
+    assert!(updated.contains("BadLocal: Integer"));
+    assert!(updated.contains("BadLocal := BadParam + BAD_CONST;"));
+    assert!(updated.contains("MyClass = class(TObject)"));
+    assert!(!updated.contains("badConst"));
+    assert!(!updated.contains("badParam"));
+    assert!(!updated.contains("badLocal"));
+
+    let config = "version = 1\n[rules.naming]\nconstant_style = \"UPPER_CASE\"\nlocal_variable_style = \"PascalCase\"\n"
+        .parse::<lint4d::config::Config>()
+        .expect("lint configuration");
+    let diagnostics =
+        lint4d::engine::run_lint(&FileInfo::new(main.clone()), updated.as_bytes(), &config);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.rule_id != "constant-naming" && diagnostic.rule_id != "local-variable-naming"
+        }),
+        "applied fix-all source still has supported naming diagnostics: {diagnostics:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_fix_all_resolves_to_versioned_workspace_edit_and_quickfix_filters_exclude_it() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 7, "text": source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+
+    let fix_all_id = RequestId::from("source-fix-all-deferred".to_string());
+    server.send_request(
+        fix_all_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = server.response(&fix_all_id);
+    assert!(
+        response.error.is_none(),
+        "deferred source.fixAll failed: {response:?}"
+    );
+    let action = response.result.expect("deferred action result")[0].clone();
+    assert_eq!(action["kind"], "source.fixAll");
+    assert!(
+        action["edit"].is_null(),
+        "action-support clients receive unresolved data"
+    );
+
+    let resolve_id = RequestId::from("source-fix-all-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "source.fixAll resolve failed: {resolved:?}"
+    );
+    let resolved = resolved.result.expect("resolved source.fixAll action");
+    let document_changes = resolved["edit"]["documentChanges"]
+        .as_array()
+        .expect("versioned document changes");
+    let main_change = document_changes
+        .iter()
+        .find(|change| change["textDocument"]["uri"] == uri(&main).to_string())
+        .expect("versioned main document change");
+    assert_eq!(main_change["textDocument"]["version"], 7);
+
+    let quickfix_id = RequestId::from("source-fix-all-quickfix-filter".to_string());
+    server.send_request(
+        quickfix_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 3, "character": 2}, "end": {"line": 3, "character": 10}},
+            "context": {"diagnostics": [], "only": ["quickfix"]}
+        }),
+    );
+    let quickfix_response = server.response(&quickfix_id);
+    assert!(
+        quickfix_response.error.is_none(),
+        "quickfix request failed: {quickfix_response:?}"
+    );
+    let quickfix_actions = quickfix_response
+        .result
+        .expect("quickfix actions")
+        .as_array()
+        .expect("quickfix action array")
+        .clone();
+    assert!(
+        quickfix_actions
+            .iter()
+            .all(|action| action["kind"] != "source.fixAll"),
+        "quickfix-only filtering must not include source.fixAll: {quickfix_actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn source_hierarchy_filter_includes_fix_all_actions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("source-hierarchy-fix-all".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "source hierarchy request failed: {response:?}"
+    );
+    let actions = response.result.expect("source hierarchy result");
+    let actions = actions.as_array().expect("source hierarchy actions");
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| action["kind"] == "source.fixAll")
+            .count(),
+        1,
+        "source hierarchy must include one fix-all action: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn separate_fix_all_rule_filters_return_matching_specific_actions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "const\n",
+        "  badConst = 1;\n",
+        "implementation\n",
+        "procedure Use(badParam: Integer);\n",
+        "var\n",
+        "  badLocal: Integer;\n",
+        "begin\n",
+        "  badLocal := badParam + badConst;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("specific-fix-all-filters".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {
+                "diagnostics": [],
+                "only": ["source.fixAll.constant-naming", "source.fixAll.local-variable-naming"]
+            }
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "specific fix-all request failed: {response:?}"
+    );
+    let actions = response.result.expect("specific fix-all result");
+    let actions = actions.as_array().expect("specific fix-all actions");
+    let kinds = actions
+        .iter()
+        .filter_map(|action| action["kind"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        kinds.len(),
+        2,
+        "expected two specific fix-all actions: {actions:?}"
+    );
+    assert!(kinds.contains("source.fixAll.constant-naming"));
+    assert!(kinds.contains("source.fixAll.local-variable-naming"));
+    assert!(!kinds.contains("source.fixAll"));
+    server.shutdown();
+}
+
+#[test]
+fn source_fix_all_withholds_collisions_external_references_and_includes() {
+    let run_request = |root: &Path, source_path: &Path, request_id: &str| {
+        let mut server = TestServer::launch();
+        server.initialize(root, Value::Null);
+        server.send_request(
+            RequestId::from(request_id.to_string()),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(source_path)},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "context": {"diagnostics": [], "only": ["source.fixAll"]}
+            }),
+        );
+        let response = server.response(&RequestId::from(request_id.to_string()));
+        assert!(
+            response.error.is_none(),
+            "source.fixAll failed: {response:?}"
+        );
+        let result = response.result.expect("source.fixAll result");
+        let actions = result.as_array().expect("source.fixAll actions");
+        assert!(
+            actions.is_empty(),
+            "unsafe fix-all must be withheld: {actions:?}"
+        );
+        server.shutdown();
+    };
+
+    let collision_temp = tempfile::tempdir().expect("collision workspace");
+    let collision_root = collision_temp.path().join("fixture");
+    let collision = collision_root.join("Main.pas");
+    write_file(
+        &collision,
+        "unit Main;\ninterface\nconst\n  badConst = 1;\n  BAD_CONST = 2;\nimplementation\nend.\n",
+    );
+    run_request(&collision_root, &collision, "fix-all-collision");
+
+    let external_temp = tempfile::tempdir().expect("external-reference workspace");
+    let external_root = external_temp.path().join("fixture");
+    let provider = external_root.join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n",
+    );
+    write_file(
+        &external_root.join("Consumer.pas"),
+        "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  WriteLn(badConst);\nend;\nend.\n",
+    );
+    run_request(&external_root, &provider, "fix-all-external-reference");
+
+    let include_temp = tempfile::tempdir().expect("include workspace");
+    let include_root = include_temp.path().join("fixture");
+    let include_source = include_root.join("Main.pas");
+    write_file(
+        &include_source,
+        "unit Main;\ninterface\n{$I Shared.inc}\nconst\n  badConst = 1;\nimplementation\nend.\n",
+    );
+    write_file(&include_root.join("Shared.inc"), "");
+    run_request(&include_root, &include_source, "fix-all-include");
+
+    let conditional_temp = tempfile::tempdir().expect("conditional workspace");
+    let conditional_root = conditional_temp.path().join("fixture");
+    let conditional_source = conditional_root.join("Main.pas");
+    write_file(
+        &conditional_source,
+        "unit Main;\ninterface\n{$IF UnknownFlag}\nconst\n  badConst = 1;\n{$ENDIF}\nimplementation\nend.\n",
+    );
+    run_request(
+        &conditional_root,
+        &conditional_source,
+        "fix-all-conditional",
+    );
+}
+
+#[test]
+fn source_fix_all_keeps_independent_local_fixes_when_global_reference_escapes() {
+    let temp = tempfile::tempdir().expect("external-reference workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "const\n",
+        "  badConst = 1;\n",
+        "implementation\n",
+        "procedure Internal(badLocal: Integer);\n",
+        "begin\n",
+        "  badLocal := badLocal;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("Consumer.pas"),
+        "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  WriteLn(badConst);\nend;\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("fix-all-independent-local".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "independent fix-all failed: {response:?}"
+    );
+    let actions = response.result.expect("independent fix-all result");
+    let actions = actions.as_array().expect("independent fix-all actions");
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected retained safe fix-all: {actions:?}"
+    );
+    let updated =
+        apply_workspace_edit_to_source(provider_source, &actions[0]["edit"], &uri(&provider));
+    assert!(updated.contains("badConst = 1;"));
+    assert!(updated.contains("Internal(BadLocal: Integer)"));
+    assert!(updated.contains("BadLocal := BadLocal;"));
+    assert!(!updated.contains("BAD_CONST = 1;"));
+    server.shutdown();
+}
+
+#[test]
+fn deferred_fix_all_freezes_the_retained_independent_subset() {
+    let temp = tempfile::tempdir().expect("external-reference workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "const\n",
+        "  badConst = 1;\n",
+        "implementation\n",
+        "procedure Internal(badLocal: Integer);\n",
+        "begin\n",
+        "  badLocal := badLocal;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"UPPER_CASE\"\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(
+        &root.join("Consumer.pas"),
+        "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  WriteLn(badConst);\nend;\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&provider),
+                "languageId": "pascal",
+                "version": 1,
+                "text": provider_source
+            }
+        }),
+    );
+    let request_id = RequestId::from("deferred-fix-all-independent".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "deferred independent request failed: {response:?}"
+    );
+    let action = response.result.expect("deferred independent result")[0].clone();
+    assert!(action["edit"].is_null());
+    assert_eq!(action["data"]["candidates"].as_array().unwrap().len(), 1);
+
+    let resolve_id = RequestId::from("deferred-fix-all-independent-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "deferred independent resolve failed: {resolved:?}"
+    );
+    let resolved = resolved
+        .result
+        .expect("resolved deferred independent action");
+    let updated =
+        apply_workspace_edit_to_source(provider_source, &resolved["edit"], &uri(&provider));
+    assert!(updated.contains("badConst = 1;"));
+    assert!(updated.contains("Internal(BadLocal: Integer)"));
+    assert!(!updated.contains("BAD_CONST = 1;"));
+    server.shutdown();
+}
+
+#[test]
+fn source_fix_all_preserves_bom_crlf_utf16_and_specific_rule_hierarchy() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Unicode.pas");
+    let source = concat!(
+        "\u{feff}unit Unicode;\r\n",
+        "interface\r\n",
+        "const\r\n",
+        "  badConst = 1;\r\n",
+        "implementation\r\n",
+        "procedure Use(badParam: Integer);\r\n",
+        "var\r\n",
+        "  badLocal: Integer;\r\n",
+        "begin\r\n",
+        "  // preserve 😀\r\n",
+        "  badLocal := badParam + badConst;\r\n",
+        "end;\r\n",
+        "end.\r\n",
+    );
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let request_id = RequestId::from("fix-all-specific-constant".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll.constant-naming"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "specific fix-all failed: {response:?}"
+    );
+    let actions = response.result.expect("specific fix-all result");
+    let actions = actions.as_array().expect("specific fix-all actions");
+    assert_eq!(actions.len(), 1, "specific fix-all action: {actions:?}");
+    assert_eq!(actions[0]["kind"], "source.fixAll.constant-naming");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&main));
+    assert!(updated.starts_with('\u{feff}'));
+    assert!(updated.contains("BAD_CONST = 1;\r\n"));
+    assert!(updated.contains("badLocal := badParam + BAD_CONST;\r\n"));
+    assert!(updated.contains("preserve 😀"));
+    server.shutdown();
+}
+
+#[test]
+fn deferred_source_fix_all_allows_noop_version_and_rejects_changed_target() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    let request_id = RequestId::from("deferred-fix-all-noop".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "deferred fix-all failed: {response:?}"
+    );
+    let action = response.result.expect("deferred fix-all result")[0].clone();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 2}, "contentChanges": [{"text": source}]}),
+    );
+    let resolve_id = RequestId::from("deferred-fix-all-noop-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", action.clone());
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "no-op version should resolve: {resolved:?}"
+    );
+    assert_eq!(
+        resolved.result.expect("resolved no-op fix-all")["edit"]["documentChanges"][0]["textDocument"]
+            ["version"],
+        2
+    );
+
+    let changed = source.replace("badConst", "otherConst");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 3}, "contentChanges": [{"text": changed}]}),
+    );
+    let stale_id = RequestId::from("deferred-fix-all-stale-resolve".to_string());
+    server.send_request(stale_id.clone(), "codeAction/resolve", action);
+    let stale = server.response(&stale_id);
+    assert!(
+        stale.error.is_some(),
+        "changed target must stale fix-all: {stale:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn source_action_organizes_equivalent_uses_without_reordering_bindings() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

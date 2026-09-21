@@ -18,6 +18,7 @@ use crate::include_expansion::{
     self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
     IncludeResolver, ResolvedInclude,
 };
+use crate::navigation::AssistanceBudget;
 use crate::navigation::ParsedDocument;
 use crate::text;
 use lsp_types::{
@@ -43,6 +44,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1861,6 +1864,61 @@ pub(crate) fn snapshot_records(snapshot: &RenameSnapshot) -> Vec<SourceRecord> {
     records
 }
 
+pub(crate) fn snapshot_records_bounded(
+    snapshot: &RenameSnapshot,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<Vec<SourceRecord>, String> {
+    let mut sources = snapshot.records.values().collect::<Vec<_>>();
+    budget.require_work(comparison_sort_work(sources.len()), cancel)?;
+    sources.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+    let mut records = Vec::with_capacity(
+        snapshot
+            .records
+            .len()
+            .saturating_add(snapshot.baseline_records.len()),
+    );
+    budget.require_bytes(
+        records
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SourceRecord>()),
+        cancel,
+    )?;
+    for record in sources.into_iter().chain(snapshot.baseline_records.iter()) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        let observation_bytes = record
+            .candidate_observations
+            .iter()
+            .map(|observation| observation.path.as_os_str().len())
+            .sum::<usize>();
+        budget.require_bytes(
+            record.uri.as_str().len()
+                + record.text.len()
+                + record.content_bytes.as_ref().map_or(0, |bytes| bytes.len())
+                + observation_bytes,
+            cancel,
+        )?;
+        records.push(record.clone());
+    }
+    Ok(records)
+}
+
+fn comparison_sort_work(length: usize) -> usize {
+    if length < 2 {
+        return 0;
+    }
+    let mut remaining = length;
+    let mut depth = 0;
+    while remaining > 1 {
+        depth += 1;
+        remaining = remaining.saturating_add(1) / 2;
+    }
+    length.saturating_mul(depth)
+}
+
 pub(crate) fn source_for_input_with_cancel(
     input: &WorkspaceInput,
     uri: &Url,
@@ -2028,6 +2086,51 @@ pub(crate) fn input_source_is_editable(input: &WorkspaceInput, uri: &Url) -> boo
     };
     let path = absolute_path(path);
     workspace.accepts_path(&path) && is_editable_source_path(&workspace, &path)
+}
+
+/// Prove that a source action can target the physical path under the current
+/// requester policy. An open overlay for a not-yet-created source remains
+/// eligible: the client owns that unsaved buffer and no filesystem permission
+/// proof exists to inspect. Existing physical files must explicitly expose a
+/// writable permission bit; unknown metadata/errors fail closed.
+pub(crate) fn input_source_is_writable(input: &WorkspaceInput, uri: &Url) -> bool {
+    let workspace = Workspace::with_override_session(
+        input.roots.clone(),
+        input.options.clone(),
+        input.overrides.clone(),
+    );
+    let Ok(path) = uri.to_file_path() else {
+        return false;
+    };
+    let path = absolute_path(path);
+    if !workspace.accepts_path(&path) || !is_editable_source_path(&workspace, &path) {
+        return false;
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => match fs::metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return false;
+                }
+                #[cfg(unix)]
+                {
+                    // Do not treat the test/server UID being root as proof that a
+                    // 0444 target is writable. The advertised edit is intended
+                    // for the normal owner/group/other write policy.
+                    metadata.permissions().mode() & 0o222 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    !metadata.permissions().readonly()
+                }
+            }
+            Err(_) => false,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            input.overlays.contains_key(&canonical_file_uri(uri))
+        }
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn owner_for_input(

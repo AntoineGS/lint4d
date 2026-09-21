@@ -1,8 +1,9 @@
 use super::{
-    Candidate, Document, NavigationIndex, ROOT_SCOPE, Span, Symbol, SymbolKind, canonical_name,
-    collect_nodes_matching, field_identifier_nodes, has_ancestor_kind, identifier_at,
-    identifier_nodes, is_ignored_offset, is_right_hand_member, member_expression_at, node_text,
-    qualified_type_path_at, routine_name, routine_signature, use_name_at,
+    Candidate, Document, NavigationIndex, ROOT_SCOPE, ResolutionState, Span, Symbol, SymbolKind,
+    canonical_name, collect_nodes_matching, field_identifier_nodes, has_ancestor_kind,
+    identifier_at, identifier_nodes, is_ignored_offset, is_right_hand_member, member_expression_at,
+    node_text, qualified_type_path_at, qualified_type_path_at_with_budget, routine_name,
+    routine_signature, use_name_at,
 };
 use crate::text::PositionIndex;
 use lsp_types::{PrepareRenameResponse, Range, TextEdit, Url};
@@ -43,13 +44,66 @@ impl BindingWorkBudget {
         }
         Ok(())
     }
+
+    fn charge_with_cancel(&mut self, cancel: Option<&AtomicBool>) -> Result<(), String> {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        self.charge()?;
+        Ok(())
+    }
 }
 
-fn charge_binding_work(work_budget: &mut Option<&mut BindingWorkBudget>) -> Result<(), String> {
+fn charge_binding_work(
+    work_budget: &mut Option<&mut BindingWorkBudget>,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    if let Some(shared_work_budget) = shared_work_budget.as_deref_mut() {
+        let fallback_cancel = AtomicBool::new(false);
+        shared_work_budget.require_work(1, cancel.unwrap_or(&fallback_cancel))?;
+    }
     if let Some(work_budget) = work_budget.as_deref_mut() {
-        work_budget.charge()?;
+        work_budget.charge_with_cancel(cancel)?;
     }
     Ok(())
+}
+
+fn charge_shared_work(
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    cancel: Option<&AtomicBool>,
+    amount: usize,
+) -> Result<(), String> {
+    if let Some(shared_work_budget) = shared_work_budget.as_deref_mut() {
+        let fallback_cancel = AtomicBool::new(false);
+        shared_work_budget.require_work(amount, cancel.unwrap_or(&fallback_cancel))?;
+    }
+    Ok(())
+}
+
+fn charge_shared_bytes(
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    cancel: Option<&AtomicBool>,
+    amount: usize,
+) -> Result<(), String> {
+    if let Some(shared_work_budget) = shared_work_budget.as_deref_mut() {
+        let fallback_cancel = AtomicBool::new(false);
+        shared_work_budget.require_bytes(amount, cancel.unwrap_or(&fallback_cancel))?;
+    }
+    Ok(())
+}
+
+fn comparison_sort_work(length: usize) -> usize {
+    if length < 2 {
+        return 0;
+    }
+    let mut remaining = length;
+    let mut depth = 0;
+    while remaining > 1 {
+        depth += 1;
+        remaining = remaining.saturating_add(1) / 2;
+    }
+    length.saturating_mul(depth)
 }
 
 #[cfg(test)]
@@ -235,6 +289,7 @@ struct OccurrenceCollectionOptions<'a> {
     result_limit: Option<usize>,
     cancel: Option<&'a AtomicBool>,
     work_budget: Option<&'a mut BindingWorkBudget>,
+    shared_work_budget: Option<&'a mut super::AssistanceBudget>,
 }
 
 impl NavigationIndex {
@@ -350,12 +405,14 @@ impl NavigationIndex {
             result_limit: options.result_limit,
             cancel: options.cancel,
             work_budget: options.work_budget,
+            shared_work_budget: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         self.locations_for_occurrences(
             &occurrences,
             occurrence_options.cancel,
             &mut occurrence_options.work_budget,
+            &mut occurrence_options.shared_work_budget,
         )
     }
 
@@ -599,15 +656,140 @@ impl NavigationIndex {
         Ok(edits)
     }
 
+    /// Plan a rename while charging occurrence collection and range
+    /// materialization to the caller's request-wide assistance budget.
+    ///
+    /// The ordinary public rename API intentionally keeps its historical
+    /// unbounded behavior. Source fix-all is a bounded assistance operation,
+    /// so it uses this companion instead of repeatedly invoking that API.
+    pub(crate) fn rename_edits_with_cancel_and_work_budget(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        new_name: &str,
+        cancel: &AtomicBool,
+        budget: &mut super::AssistanceBudget,
+    ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
+        check_cancel(Some(cancel))?;
+        let mut binding_budget = BindingWorkBudget::new(MAX_BINDING_LOCATIONS);
+        budget.require_work(1, cancel)?;
+        let (binding, selected_span) =
+            self.binding_plan_with_cancel_and_budget(uri, position, Some(cancel), Some(budget))?;
+        let mut occurrence_options = OccurrenceCollectionOptions {
+            document_uri: None,
+            include_declaration: true,
+            strict_resolution: true,
+            result_limit: None,
+            cancel: Some(cancel),
+            work_budget: Some(&mut binding_budget),
+            shared_work_budget: Some(budget),
+        };
+        let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
+        if occurrences.is_empty() {
+            return Err("rename binding has no source occurrences".to_string());
+        }
+        check_cancel(Some(cancel))?;
+        validate_new_name(new_name)?;
+        let new_key = canonical_name(new_name);
+        // These checks are retained from the established rename proof. Charge
+        // their complete phase as one request unit before and after; the
+        // occurrence-sensitive capture check itself is additionally polled by
+        // the bounded occurrence loop above.
+        binding_budget.charge_with_cancel(Some(cancel))?;
+        self.check_proposed_name_references_bounded(
+            &RenamePlan {
+                binding: binding.clone(),
+                selected_span,
+                occurrences: occurrences.clone(),
+            },
+            &new_key,
+            Some(cancel),
+            Some(budget),
+        )?;
+        binding_budget.charge_with_cancel(Some(cancel))?;
+        self.check_declaration_collisions_bounded(&binding, &new_key, Some(cancel), Some(budget))?;
+        binding_budget.charge_with_cancel(Some(cancel))?;
+        self.check_reference_capture_bounded(
+            &RenamePlan {
+                binding,
+                selected_span,
+                occurrences: occurrences.clone(),
+            },
+            new_name,
+            Some(cancel),
+            Some(budget),
+        )?;
+
+        let mut edits: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for occurrence in occurrences {
+            check_cancel(Some(cancel))?;
+            binding_budget.charge_with_cancel(Some(cancel))?;
+            let range = self.range_for_occurrence(&occurrence.uri, occurrence.span)?;
+            budget.require_bytes(new_name.len(), cancel)?;
+            edits
+                .entry(occurrence.uri)
+                .or_default()
+                .push(TextEdit::new(range, new_name.to_owned()));
+        }
+        for document_edits in edits.values_mut() {
+            check_cancel(Some(cancel))?;
+            budget.require_work(comparison_sort_work(document_edits.len()), cancel)?;
+            document_edits.sort_by_key(|edit| {
+                (
+                    edit.range.start.line,
+                    edit.range.start.character,
+                    edit.range.end.line,
+                    edit.range.end.character,
+                )
+            });
+        }
+        Ok(edits)
+    }
+
     fn check_proposed_name_references(
         &self,
         plan: &RenamePlan,
         new_key: &str,
     ) -> Result<(), String> {
-        for (uri, document) in &self.documents {
+        self.check_proposed_name_references_bounded(plan, new_key, None, None)
+    }
+
+    fn check_proposed_name_references_bounded(
+        &self,
+        plan: &RenamePlan,
+        new_key: &str,
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: Option<&mut super::AssistanceBudget>,
+    ) -> Result<(), String> {
+        let mut shared_work_budget = shared_work_budget;
+        let mut documents = self.documents.iter().collect::<Vec<_>>();
+        charge_shared_work(
+            &mut shared_work_budget,
+            cancel,
+            comparison_sort_work(documents.len()),
+        )?;
+        charge_shared_bytes(
+            &mut shared_work_budget,
+            cancel,
+            documents
+                .len()
+                .saturating_mul(std::mem::size_of::<(&Url, &Document)>()),
+        )?;
+        documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        for (uri, document) in documents {
+            charge_shared_work(&mut shared_work_budget, cancel, 1)?;
+            charge_shared_bytes(&mut shared_work_budget, cancel, document.source.len())?;
             let root = document.tree.root_node();
-            for identifier in identifier_nodes(root) {
+            let identifiers = identifier_nodes(root);
+            charge_shared_work(&mut shared_work_budget, cancel, identifiers.len())?;
+            for identifier in identifiers {
+                check_cancel(cancel)?;
                 let span = Span::from_node(identifier);
+                charge_shared_bytes(
+                    &mut shared_work_budget,
+                    cancel,
+                    span.end.saturating_sub(span.start),
+                )?;
                 if canonical_name(&node_text(identifier, &document.source)) != new_key
                     || is_ignored_offset(root, span.start)
                     || has_ancestor_kind(identifier, "ppDirective")
@@ -624,7 +806,19 @@ impl NavigationIndex {
                         span.start
                     ));
                 }
-                let candidates = self.resolve_candidates_at(uri, document, span.start, identifier);
+                let candidates = self.resolve_candidates_at_with_shared_budget(
+                    uri,
+                    document,
+                    span.start,
+                    identifier,
+                    cancel,
+                    &mut shared_work_budget,
+                )?;
+                charge_shared_work(
+                    &mut shared_work_budget,
+                    cancel,
+                    candidates.len().saturating_add(1),
+                )?;
                 let matching = candidates
                     .iter()
                     .filter(|candidate| plan.binding.matches_candidate(self, candidate))
@@ -644,7 +838,9 @@ impl NavigationIndex {
                     document,
                     span.start,
                     &candidates,
-                ) {
+                    cancel,
+                    &mut shared_work_budget,
+                )? {
                     return Err(format!(
                         "rename would change the binding of an existing {:?} reference at {uri}:{}",
                         new_key, span.start
@@ -655,6 +851,7 @@ impl NavigationIndex {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn proposed_binding_visible_at(
         &self,
         binding: &Binding,
@@ -662,11 +859,14 @@ impl NavigationIndex {
         document: &Document,
         offset: usize,
         candidates: &[Candidate],
-    ) -> bool {
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    ) -> Result<bool, String> {
         let occurrence_scope = document.scope_at(offset);
         let occurrence_owner = document.owner_type_at(offset);
 
         for member in &binding.members {
+            charge_shared_work(shared_work_budget, cancel, 1)?;
             let Some(member_document) = self.documents.get(&member.uri) else {
                 continue;
             };
@@ -682,6 +882,7 @@ impl NavigationIndex {
                 if member.uri != *occurrence_uri
                     || occurrence_owner.as_deref() != Some(owner_type.as_str())
                 {
+                    charge_shared_work(shared_work_budget, cancel, candidates.len())?;
                     if candidates.iter().any(|candidate| {
                         let Some(candidate_symbol) = self.symbol(candidate) else {
                             return false;
@@ -693,8 +894,9 @@ impl NavigationIndex {
                     }) {
                         continue;
                     }
-                    return true;
+                    return Ok(true);
                 }
+                charge_shared_work(shared_work_budget, cancel, candidates.len())?;
                 if !candidates.iter().any(|candidate| {
                     let Some(candidate_symbol) = self.symbol(candidate) else {
                         return false;
@@ -704,7 +906,7 @@ impl NavigationIndex {
                         && candidate_symbol.scope != ROOT_SCOPE
                         && scope_is_ancestor(document, candidate_symbol.scope, occurrence_scope)
                 }) {
-                    return true;
+                    return Ok(true);
                 }
                 continue;
             }
@@ -715,6 +917,7 @@ impl NavigationIndex {
                 {
                     continue;
                 }
+                charge_shared_work(shared_work_budget, cancel, candidates.len())?;
                 let shadowed_by_nearer_local = candidates.iter().any(|candidate| {
                     let Some(candidate_symbol) = self.symbol(candidate) else {
                         return false;
@@ -726,7 +929,7 @@ impl NavigationIndex {
                         && scope_is_ancestor(document, symbol.scope, candidate_symbol.scope)
                 });
                 if !shadowed_by_nearer_local {
-                    return true;
+                    return Ok(true);
                 }
                 continue;
             }
@@ -736,6 +939,7 @@ impl NavigationIndex {
             {
                 continue;
             }
+            charge_shared_work(shared_work_budget, cancel, candidates.len())?;
             let shadowed_by_local = candidates.iter().any(|candidate| {
                 let Some(candidate_symbol) = self.symbol(candidate) else {
                     return false;
@@ -745,10 +949,10 @@ impl NavigationIndex {
                     && candidate_symbol.scope != ROOT_SCOPE
             });
             if !shadowed_by_local {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     fn has_class_owned_member(&self, binding: &Binding) -> bool {
@@ -801,6 +1005,7 @@ impl NavigationIndex {
             result_limit: None,
             cancel,
             work_budget: None,
+            shared_work_budget: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         if occurrences.is_empty() {
@@ -827,19 +1032,45 @@ impl NavigationIndex {
         position: lsp_types::Position,
         cancel: Option<&AtomicBool>,
     ) -> Result<(Binding, Span), String> {
+        self.binding_plan_with_cancel_and_budget(uri, position, cancel, None)
+    }
+
+    fn binding_plan_with_cancel_and_budget(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: Option<&mut super::AssistanceBudget>,
+    ) -> Result<(Binding, Span), String> {
+        let mut shared_work_budget = shared_work_budget;
         check_cancel(cancel)?;
+        charge_shared_work(&mut shared_work_budget, cancel, 1)?;
         let document = self
             .documents
             .get(uri)
             .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        charge_shared_bytes(&mut shared_work_budget, cancel, document.source.len())?;
         let offset = super::text::position_to_offset(&document.source, position)
             .ok_or_else(|| "position is outside the source document".to_string())?;
+        charge_shared_work(&mut shared_work_budget, cancel, 1)?;
         if is_ignored_offset(document.tree.root_node(), offset) {
             return Err("cannot rename an identifier in a comment or literal".to_string());
         }
         let identifier = identifier_at(document.tree.root_node(), offset)
             .ok_or_else(|| "no renameable identifier at position".to_string())?;
-        let candidates = self.resolve_candidates_at(uri, document, offset, identifier);
+        let candidates = self.resolve_candidates_at_with_shared_budget(
+            uri,
+            document,
+            offset,
+            identifier,
+            cancel,
+            &mut shared_work_budget,
+        )?;
+        charge_shared_work(
+            &mut shared_work_budget,
+            cancel,
+            candidates.len().saturating_add(1),
+        )?;
         if candidates
             .iter()
             .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
@@ -849,6 +1080,11 @@ impl NavigationIndex {
             );
         }
         let binding = binding_from_candidates(self, candidates)?;
+        charge_shared_work(
+            &mut shared_work_budget,
+            cancel,
+            binding.members.len().saturating_add(binding.names.len()),
+        )?;
         check_cancel(cancel)?;
         if binding.kind == SymbolKind::Unit {
             return Err("unit/module rename requires RenameFile support".to_string());
@@ -866,11 +1102,40 @@ impl NavigationIndex {
         }) {
             return Err("generic parameter rename is not supported".to_string());
         }
+        charge_shared_work(&mut shared_work_budget, cancel, 1)?;
         if binding.kind == SymbolKind::Type && has_forward_class_pair(self, &binding) {
             return Err("forward class/completion type rename is not supported".to_string());
         }
         let selected_span = Span::from_node(identifier);
         Ok((binding, selected_span))
+    }
+
+    fn resolve_candidates_at_with_shared_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    ) -> Result<Vec<Candidate>, String> {
+        if let Some(shared_work_budget) = shared_work_budget.as_deref_mut() {
+            let fallback_cancel = AtomicBool::new(false);
+            let cancel = cancel.unwrap_or(&fallback_cancel);
+            let mut state = ResolutionState::new();
+            self.resolve_candidates_at_with_state_and_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                &mut state,
+                0,
+                cancel,
+                shared_work_budget,
+            )
+        } else {
+            Ok(self.resolve_candidates_at(uri, document, offset, identifier))
+        }
     }
 
     fn collect_occurrences_bounded(
@@ -879,6 +1144,18 @@ impl NavigationIndex {
         options: &mut OccurrenceCollectionOptions<'_>,
     ) -> Result<Vec<Occurrence>, String> {
         let mut documents: Vec<(&Url, &Document)> = self.documents.iter().collect();
+        charge_shared_work(
+            &mut options.shared_work_budget,
+            options.cancel,
+            comparison_sort_work(documents.len()),
+        )?;
+        charge_shared_bytes(
+            &mut options.shared_work_budget,
+            options.cancel,
+            documents
+                .len()
+                .saturating_mul(std::mem::size_of::<(&Url, &Document)>()),
+        )?;
         documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
 
         let mut occurrences = Vec::new();
@@ -888,7 +1165,11 @@ impl NavigationIndex {
         let binding_has_class_owner = self.has_class_owned_member(binding);
         for (uri, document) in documents {
             check_cancel(options.cancel)?;
-            charge_binding_work(&mut options.work_budget)?;
+            charge_binding_work(
+                &mut options.work_budget,
+                &mut options.shared_work_budget,
+                options.cancel,
+            )?;
             if options
                 .document_uri
                 .is_some_and(|requested| requested != uri)
@@ -912,7 +1193,11 @@ impl NavigationIndex {
             let root = document.tree.root_node();
             for identifier in identifier_nodes(root) {
                 check_occurrence_cancel(options.cancel)?;
-                charge_binding_work(&mut options.work_budget)?;
+                charge_binding_work(
+                    &mut options.work_budget,
+                    &mut options.shared_work_budget,
+                    options.cancel,
+                )?;
                 let span = Span::from_node(identifier);
                 let name = canonical_name(&node_text(identifier, &document.source));
                 let is_binding_member = binding.contains_span(uri, span);
@@ -989,8 +1274,14 @@ impl NavigationIndex {
                         if let Some(cached) = unqualified_cache.get(&cache_key) {
                             cached.clone()
                         } else {
-                            let candidates =
-                                self.resolve_candidates_at(uri, document, span.start, identifier);
+                            let candidates = self.resolve_candidates_at_with_shared_budget(
+                                uri,
+                                document,
+                                span.start,
+                                identifier,
+                                options.cancel,
+                                &mut options.shared_work_budget,
+                            )?;
                             let unknown_global_fallback = self.is_unknown_global_fallback(
                                 document,
                                 identifier,
@@ -1002,8 +1293,14 @@ impl NavigationIndex {
                             (candidates, unknown_global_fallback)
                         }
                     } else {
-                        let candidates =
-                            self.resolve_candidates_at(uri, document, span.start, identifier);
+                        let candidates = self.resolve_candidates_at_with_shared_budget(
+                            uri,
+                            document,
+                            span.start,
+                            identifier,
+                            options.cancel,
+                            &mut options.shared_work_budget,
+                        )?;
                         let unknown_global_fallback = self.is_unknown_global_fallback(
                             document,
                             identifier,
@@ -1133,6 +1430,7 @@ impl NavigationIndex {
         occurrences: &[Occurrence],
         cancel: Option<&AtomicBool>,
         work_budget: &mut Option<&mut BindingWorkBudget>,
+        shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
     ) -> Result<Vec<lsp_types::Location>, String> {
         let mut seen = HashSet::new();
         let mut locations = Vec::with_capacity(occurrences.len());
@@ -1159,7 +1457,7 @@ impl NavigationIndex {
                 };
                 for occurrence in &occurrences[group_start..group_end] {
                     check_location_cancel(cancel)?;
-                    charge_binding_work(work_budget)?;
+                    charge_binding_work(work_budget, shared_work_budget, cancel)?;
                     if !seen.insert((occurrence.uri.clone(), occurrence.span)) {
                         continue;
                     }
@@ -1275,7 +1573,39 @@ impl NavigationIndex {
     }
 
     fn check_declaration_collisions(&self, binding: &Binding, new_key: &str) -> Result<(), String> {
-        for target_id in &binding.members {
+        self.check_declaration_collisions_bounded(binding, new_key, None, None)
+    }
+
+    fn check_declaration_collisions_bounded(
+        &self,
+        binding: &Binding,
+        new_key: &str,
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: Option<&mut super::AssistanceBudget>,
+    ) -> Result<(), String> {
+        let mut shared_work_budget = shared_work_budget;
+        let mut target_ids = binding.members.iter().collect::<Vec<_>>();
+        charge_shared_work(
+            &mut shared_work_budget,
+            cancel,
+            comparison_sort_work(target_ids.len()),
+        )?;
+        charge_shared_bytes(
+            &mut shared_work_budget,
+            cancel,
+            target_ids
+                .len()
+                .saturating_mul(std::mem::size_of::<&SymbolId>()),
+        )?;
+        target_ids.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.span.start.cmp(&right.span.start))
+                .then_with(|| left.span.end.cmp(&right.span.end))
+        });
+        for target_id in target_ids {
+            charge_shared_work(&mut shared_work_budget, cancel, 1)?;
             let Some(document) = self.documents.get(&target_id.uri) else {
                 return Err("rename declaration disappeared from the index".to_string());
             };
@@ -1287,7 +1617,9 @@ impl NavigationIndex {
                 return Err("rename declaration disappeared from the index".to_string());
             };
 
+            charge_shared_work(&mut shared_work_budget, cancel, document.symbols.len())?;
             for symbol in &document.symbols {
+                check_cancel(cancel)?;
                 let other_id = symbol_id(&target_id.uri, symbol);
                 if binding.members.contains(&other_id) || symbol.key != new_key {
                     continue;
@@ -1315,7 +1647,22 @@ impl NavigationIndex {
         }
 
         if binding.kind == SymbolKind::Unit {
-            for (uri, document) in &self.documents {
+            let mut documents = self.documents.iter().collect::<Vec<_>>();
+            charge_shared_work(
+                &mut shared_work_budget,
+                cancel,
+                comparison_sort_work(documents.len()),
+            )?;
+            charge_shared_bytes(
+                &mut shared_work_budget,
+                cancel,
+                documents
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(&Url, &Document)>()),
+            )?;
+            documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+            for (uri, document) in documents {
+                charge_shared_work(&mut shared_work_budget, cancel, document.symbols.len())?;
                 if document.symbols.iter().any(|symbol| {
                     symbol.kind == SymbolKind::Unit
                         && symbol.key == new_key
@@ -1329,7 +1676,100 @@ impl NavigationIndex {
     }
 
     fn check_reference_capture(&self, plan: &RenamePlan, new_name: &str) -> Result<(), String> {
+        self.check_reference_capture_bounded(plan, new_name, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn proposed_name_candidates_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        offset: usize,
+        new_name: &str,
+        binding_kind: SymbolKind,
+        cancel: &AtomicBool,
+        budget: &mut super::AssistanceBudget,
+    ) -> Result<Vec<Candidate>, String> {
+        budget.require_bytes(new_name.len(), cancel)?;
+        if let Some(dot) = member_expression_at(identifier) {
+            budget.require_work(1, cancel)?;
+            let mut state = ResolutionState::new();
+            if is_right_hand_member(dot, identifier) {
+                return self.member_references_with_state_and_budget(
+                    uri, document, offset, dot, new_name, identifier, &mut state, 0, cancel, budget,
+                );
+            }
+            return self.unqualified_references_with_budget_and_state(
+                uri, document, offset, new_name, identifier, &mut state, cancel, budget,
+            );
+        }
+        if let Some((mut path, cursor_index)) =
+            qualified_type_path_at_with_budget(identifier, &document.source, cancel, budget)?
+        {
+            budget.require_bytes(new_name.len(), cancel)?;
+            if let Some(part) = path.get_mut(cursor_index) {
+                *part = new_name.to_owned();
+            }
+            return self.type_reference_candidates_with_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                &path,
+                cursor_index,
+                cancel,
+                budget,
+            );
+        }
+        if super::use_name_at(identifier, &document.source).is_some() {
+            if binding_kind != SymbolKind::Unit {
+                return Ok(Vec::new());
+            }
+            let key = canonical_name(new_name);
+            let mut documents = self.documents.iter().collect::<Vec<_>>();
+            documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+            let mut result = Vec::new();
+            for (candidate_uri, candidate_document) in documents {
+                budget.require_work(1, cancel)?;
+                budget.require_work(candidate_document.symbols.len(), cancel)?;
+                budget.require_bytes(
+                    candidate_uri.as_str().len()
+                        + candidate_document
+                            .symbols
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Symbol>()),
+                    cancel,
+                )?;
+                for (index, symbol) in candidate_document.symbols.iter().enumerate() {
+                    if symbol.kind == SymbolKind::Unit && symbol.key == key {
+                        result.push(Candidate {
+                            uri: candidate_uri.clone(),
+                            index,
+                        });
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        let mut state = ResolutionState::new();
+        self.unqualified_references_with_budget_and_state(
+            uri, document, offset, new_name, identifier, &mut state, cancel, budget,
+        )
+    }
+
+    fn check_reference_capture_bounded(
+        &self,
+        plan: &RenamePlan,
+        new_name: &str,
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: Option<&mut super::AssistanceBudget>,
+    ) -> Result<(), String> {
+        let mut shared_work_budget = shared_work_budget;
         for occurrence in &plan.occurrences {
+            check_cancel(cancel)?;
+            charge_shared_work(&mut shared_work_budget, cancel, 1)?;
+            charge_shared_bytes(&mut shared_work_budget, cancel, new_name.len())?;
             let Some(document) = self.documents.get(&occurrence.uri) else {
                 return Err("rename occurrence disappeared from the index".to_string());
             };
@@ -1342,7 +1782,19 @@ impl NavigationIndex {
             }
 
             let offset = occurrence.span.start;
-            let candidates = if let Some(dot) = member_expression_at(identifier) {
+            let fallback_cancel = AtomicBool::new(false);
+            let candidates = if let Some(budget) = shared_work_budget.as_deref_mut() {
+                self.proposed_name_candidates_with_budget(
+                    &occurrence.uri,
+                    document,
+                    identifier,
+                    offset,
+                    new_name,
+                    plan.binding.kind,
+                    cancel.unwrap_or(&fallback_cancel),
+                    budget,
+                )?
+            } else if let Some(dot) = member_expression_at(identifier) {
                 if is_right_hand_member(dot, identifier) {
                     self.member_references(&occurrence.uri, document, offset, dot, new_name)
                 } else {
@@ -1371,6 +1823,12 @@ impl NavigationIndex {
                 self.unqualified_references(&occurrence.uri, document, offset, new_name)
             };
 
+            charge_shared_work(
+                &mut shared_work_budget,
+                cancel,
+                candidates.len().saturating_add(1),
+            )?;
+
             if candidates.iter().any(|candidate| {
                 !plan.binding.matches_candidate(self, candidate)
                     && !plan
@@ -1386,6 +1844,11 @@ impl NavigationIndex {
 
         if plan.binding.kind == SymbolKind::Unit {
             let new_key = canonical_name(new_name);
+            let mut symbol_count = 0usize;
+            for document in self.documents.values() {
+                symbol_count = symbol_count.saturating_add(document.symbols.len());
+            }
+            charge_shared_work(&mut shared_work_budget, cancel, symbol_count)?;
             if self
                 .documents
                 .values()

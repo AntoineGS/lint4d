@@ -1,10 +1,13 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use lint4d::config::Config;
 use lint4d::engine::suppress::parse_suppressions;
 use lint4d::engine::{FileInfo, parse_file, run_lint};
-use lint4d::fix::{build_rename_map, fix_file, fix_file_edits};
+use lint4d::fix::{
+    FixWorkBudget, build_rename_map, fix_file, fix_file_edits, fix_file_edits_bounded,
+};
 
 fn build_map_from_source(source: &str) -> lint4d::fix::RenameMap {
     let config = "version = 1".parse::<Config>().unwrap();
@@ -237,6 +240,84 @@ fn raw_fix_edits_can_select_only_the_supported_fix_all_rules() {
     assert!(edits.iter().any(|edit| edit.new_text == "BAD_CONST"));
     assert!(edits.iter().any(|edit| edit.new_text == "BadLocal"));
     assert!(edits.iter().all(|edit| edit.new_text != "TMyClass"));
+}
+
+struct TestFixBudget {
+    remaining_work: usize,
+    remaining_bytes: usize,
+}
+
+impl FixWorkBudget for TestFixBudget {
+    fn charge_work(&mut self, amount: usize) -> Result<(), String> {
+        if amount > self.remaining_work {
+            return Err("test fix work budget exhausted".to_string());
+        }
+        self.remaining_work -= amount;
+        Ok(())
+    }
+
+    fn charge_bytes(&mut self, amount: usize) -> Result<(), String> {
+        if amount > self.remaining_bytes {
+            return Err("test fix byte budget exhausted".to_string());
+        }
+        self.remaining_bytes -= amount;
+        Ok(())
+    }
+}
+
+#[test]
+fn bounded_raw_fix_builder_honors_work_budget_before_materializing_all_edits() {
+    let source = concat!(
+        "unit Test;\ninterface\nconst\n",
+        "  badConstOne = 1;\n  badConstTwo = 2;\n",
+        "implementation\nend.\n"
+    );
+    let config = "version = 1".parse::<Config>().unwrap();
+    let file = FileInfo::new(PathBuf::from("test.pas"));
+    let cancel = AtomicBool::new(false);
+    let mut budget = TestFixBudget {
+        remaining_work: 1,
+        remaining_bytes: usize::MAX,
+    };
+    let error = fix_file_edits_bounded(
+        &file,
+        source.as_bytes(),
+        &config,
+        &["constant-naming"],
+        &mut budget,
+        &cancel,
+    )
+    .expect_err("bounded raw builder must stop before unbounded collection");
+    assert!(
+        error.contains("test fix work budget exhausted"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn bounded_raw_fix_builder_observes_cancellation_during_collection() {
+    let source = concat!(
+        "unit Test;\ninterface\nconst\n",
+        "  badConstOne = 1;\n  badConstTwo = 2;\n",
+        "implementation\nend.\n"
+    );
+    let config = "version = 1".parse::<Config>().unwrap();
+    let file = FileInfo::new(PathBuf::from("test.pas"));
+    let cancel = AtomicBool::new(true);
+    let mut budget = TestFixBudget {
+        remaining_work: usize::MAX,
+        remaining_bytes: usize::MAX,
+    };
+    let error = fix_file_edits_bounded(
+        &file,
+        source.as_bytes(),
+        &config,
+        &["constant-naming"],
+        &mut budget,
+        &cancel,
+    )
+    .expect_err("cancelled raw builder must not return partial edits");
+    assert_eq!(error, "request cancelled");
 }
 
 #[test]

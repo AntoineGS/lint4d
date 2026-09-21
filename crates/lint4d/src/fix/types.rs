@@ -32,9 +32,9 @@ pub struct RenameMap {
 
 /// Context for the current procedure during the edit-collection walk.
 pub(crate) struct ProcContext {
-    pub start_byte: usize,
-    pub end_byte: usize,
     pub method_scope: HashMap<String, String>,
+    pub local_renames: HashMap<String, String>,
+    pub local_rename_ranges: HashMap<String, usize>,
     pub class_fields: Option<HashMap<String, String>>,
 }
 

@@ -3,7 +3,8 @@
 use super::rename::{
     CANCELLATION_MESSAGE, Computed, OverlayInput, RenameSnapshot, SnapshotMode, SnapshotSeed,
     SourceRecord, WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
-    input_source_is_editable, is_cancelled, may_contain_include_directive, snapshot_records,
+    input_source_is_editable, input_source_is_writable, is_cancelled,
+    may_contain_include_directive, snapshot_records, snapshot_records_bounded,
     source_for_input_with_cancel, text_content_hash, workspace_edit,
 };
 use super::{
@@ -13,12 +14,13 @@ use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
     AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
     MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
-    MissingUnitCandidate, MissingUnitUseKind, SemanticDiagnosticKind, SourceSpan, UnitOrderSafety,
+    MissingUnitCandidate, MissingUnitUseKind, NavigationTarget, SemanticDiagnosticKind, SourceSpan,
+    UnitOrderSafety,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
 use lint4d::engine::suppress::parse_suppressions;
-use lint4d::fix::fix_file_edits;
+use lint4d::fix::{FixWorkBudget, fix_file_edits_bounded};
 use lint4d::rules::helpers::effective_children;
 use lint4d::rules::naming::{
     to_camel_case, to_pascal_case, to_upper_snake_case, violates_naming_style,
@@ -70,10 +72,25 @@ const MAX_FIX_ALL_CANDIDATES: usize = 512;
 const MAX_FIX_ALL_EDITS: usize = 2048;
 const MAX_FIX_ALL_EDIT_BYTES: usize = 64 * 1024;
 const MAX_FIX_ALL_DEPENDENCY_RECORDS: usize = 4096;
+const MAX_FIX_ALL_WORK: usize = 1_000_000;
+const MAX_FIX_ALL_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+const FIX_ALL_CANDIDATE_LIMIT: &str = "fix-all candidate limit reached";
 const INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("quickfix.implement-interface-method");
 const CONSTANT_RULE: &str = "constant-naming";
 const LOCAL_RULE: &str = "local-variable-naming";
+
+impl FixWorkBudget for AssistanceBudget {
+    fn charge_work(&mut self, amount: usize) -> Result<(), String> {
+        let cancel = AtomicBool::new(false);
+        self.require_work(amount, &cancel)
+    }
+
+    fn charge_bytes(&mut self, amount: usize) -> Result<(), String> {
+        let cancel = AtomicBool::new(false);
+        self.require_bytes(amount, &cancel)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -268,6 +285,120 @@ pub(crate) struct FixAllEditIdentity {
     pub(crate) new_text: String,
 }
 
+#[derive(Debug, Clone)]
+struct FixAllIdentifier {
+    start: usize,
+    end: usize,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct FixAllOffsetEntry {
+    start: usize,
+    end: usize,
+    removed_after: usize,
+    added_after: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FixAllOffsetMap {
+    entries: Vec<FixAllOffsetEntry>,
+    selected: HashMap<(usize, usize), (usize, usize)>,
+}
+
+impl FixAllOffsetMap {
+    fn new(
+        updated_source: &str,
+        edits: &[FixAllEditIdentity],
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Self, String> {
+        budget.require_bytes(
+            edits
+                .len()
+                .saturating_mul(std::mem::size_of::<FixAllOffsetEntry>()),
+            cancel,
+        )?;
+        let mut entries = Vec::with_capacity(edits.len());
+        let mut selected = HashMap::with_capacity(edits.len());
+        let mut removed_before = 0usize;
+        let mut added_before = 0usize;
+        let mut previous_end = 0usize;
+        for edit in edits {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(edit.new_text.len(), cancel)?;
+            if edit.start < previous_end || edit.start > edit.end {
+                return Err("fix-all edit offset map contains invalid ranges".to_string());
+            }
+            let updated_start = edit
+                .start
+                .checked_sub(removed_before)
+                .and_then(|offset| offset.checked_add(added_before))
+                .ok_or_else(|| "fix-all edit offset map overflowed".to_string())?;
+            let updated_end = updated_start
+                .checked_add(edit.new_text.len())
+                .ok_or_else(|| "fix-all edit offset map overflowed".to_string())?;
+            if updated_source.get(updated_start..updated_end).is_none() {
+                return Err("fix-all transformed edit range is invalid".to_string());
+            }
+            entries.push(FixAllOffsetEntry {
+                start: edit.start,
+                end: edit.end,
+                removed_after: removed_before
+                    .checked_add(edit.end - edit.start)
+                    .ok_or_else(|| "fix-all edit offset map overflowed".to_string())?,
+                added_after: added_before
+                    .checked_add(edit.new_text.len())
+                    .ok_or_else(|| "fix-all edit offset map overflowed".to_string())?,
+            });
+            selected.insert((edit.start, edit.end), (updated_start, updated_end));
+            removed_before = entries
+                .last()
+                .expect("offset entry was inserted")
+                .removed_after;
+            added_before = entries
+                .last()
+                .expect("offset entry was inserted")
+                .added_after;
+            previous_end = edit.end;
+        }
+        Ok(Self { entries, selected })
+    }
+
+    fn selected_offsets(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        self.selected.get(&(start, end)).copied()
+    }
+
+    fn map_unedited_range(&self, updated_source: &str, start: usize, end: usize) -> Option<Range> {
+        if start > end {
+            return None;
+        }
+        let prior_count = self.entries.partition_point(|entry| entry.end <= start);
+        if self
+            .entries
+            .get(prior_count)
+            .is_some_and(|entry| entry.start < end)
+        {
+            return None;
+        }
+        let (removed_before, added_before) = prior_count
+            .checked_sub(1)
+            .and_then(|index| self.entries.get(index))
+            .map_or((0, 0), |entry| (entry.removed_after, entry.added_after));
+        let mapped_start = start
+            .checked_sub(removed_before)?
+            .checked_add(added_before)?;
+        let mapped_end = end.checked_sub(removed_before)?.checked_add(added_before)?;
+        Some(Range::new(
+            text::offset_to_position(updated_source, mapped_start)?,
+            text::offset_to_position(updated_source, mapped_end)?,
+        ))
+    }
+}
+
 mod decimal_u64 {
     use super::*;
 
@@ -427,6 +558,7 @@ enum ParsedActionData {
 struct CandidateRequest<'a> {
     uri: &'a Url,
     source: &'a str,
+    source_hash: u64,
     config_fingerprint: u64,
     suppressions: &'a [pascal_core::directives::Suppression],
     requested_range: Range,
@@ -584,9 +716,24 @@ pub(crate) fn code_actions_from_input(
     } else {
         (None, Vec::new())
     };
+    let fix_all_requested = !fix_all_scopes.is_empty();
+    let mut fix_all_budget = AssistanceBudget::new(
+        MAX_FIX_ALL_WORK,
+        MAX_FIX_ALL_BUDGET_BYTES,
+        "fix-all request",
+    );
     let (fix_all_plans, fix_all_records) = {
         let mut plans = Vec::new();
         let mut records = Vec::new();
+        let source_hash = if fix_all_scopes.is_empty() {
+            0
+        } else {
+            match source_hash_bounded(&source, &mut fix_all_budget, cancel) {
+                Ok(hash) => hash,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        };
+        let mut budget_failed = false;
         for scope in fix_all_scopes {
             match fix_all_plan_from_input(
                 &input,
@@ -598,6 +745,8 @@ pub(crate) fn code_actions_from_input(
                 scope,
                 &configuration_records,
                 cancel,
+                source_hash,
+                &mut fix_all_budget,
             ) {
                 Ok((Some(plan), plan_records)) => {
                     plans.push(plan);
@@ -611,8 +760,20 @@ pub(crate) fn code_actions_from_input(
                 // unsupported source ownership, or a failed proof withholds only
                 // this source action and does not hide unrelated quick fixes or
                 // another independently requested rule-specific action.
-                Err(_) => {}
+                Err(error) => {
+                    budget_failed |= fix_all_budget.exhausted();
+                    if is_cancelled(cancel) {
+                        return failed(source_generation, configuration_generation, error);
+                    }
+                }
             }
+        }
+        if budget_failed {
+            // A request-wide budget is all-or-nothing. Do not expose a plan
+            // for an earlier scope after a later scope exhausted the shared
+            // proof/materialization budget.
+            plans.clear();
+            records.clear();
         }
         (plans, records)
     };
@@ -1089,7 +1250,14 @@ pub(crate) fn code_actions_from_input(
             Err(error) => return failed(source_generation, configuration_generation, error),
         }
     }
-    let mut records = snapshot_records(&snapshot);
+    let mut records = if fix_all_requested {
+        match snapshot_records_bounded(&snapshot, &mut fix_all_budget, cancel) {
+            Ok(records) => records,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    } else {
+        snapshot_records(&snapshot)
+    };
     append_records(&mut records, missing_records);
     append_records(&mut records, method_records);
     append_records(&mut records, interface_method_records);
@@ -1115,10 +1283,13 @@ fn fix_all_plan_from_input(
     scope: FixAllScope,
     configuration_records: &[SourceRecord],
     cancel: &AtomicBool,
+    source_hash_value: u64,
+    budget: &mut AssistanceBudget,
 ) -> Result<(Option<FixAllPlan>, Vec<SourceRecord>), String> {
     if source.len() > MAX_FIX_ALL_SOURCE_BYTES
         || target_record.include_payload
         || may_contain_include_directive(source.as_bytes())
+        || !input_source_is_writable(input, uri)
     {
         return Ok((None, Vec::new()));
     }
@@ -1136,36 +1307,39 @@ fn fix_all_plan_from_input(
     {
         return Ok((None, Vec::new()));
     }
-    let (tree, _) = parser::parse_file(&FileInfo::new(path.clone()), source.as_bytes())
-        .map_err(|error| format!("could not parse fix-all source: {error}"))?;
-    if tree.root_node().has_error() {
-        return Ok((None, Vec::new()));
-    }
-    let end = text::offset_to_position(source, source.len())
-        .ok_or_else(|| "fix-all source has an invalid UTF-16 boundary".to_string())?;
     let context = CodeActionContext {
         diagnostics: Vec::new(),
         only: Some(vec![scope.action_kind()]),
         trigger_kind: None,
     };
-    let candidates = naming_candidates(
+    let Some(candidates) = naming_candidates_bounded(
         uri,
         source,
-        Range::new(lsp_types::Position::new(0, 0), end),
         &context,
         config,
         config_fingerprint,
+        source_hash_value,
+        scope.rules(),
+        budget,
+        cancel,
     )?
-    .into_iter()
-    .filter(|candidate| scope.rules().contains(&candidate.rule.as_str()))
-    .collect::<Vec<_>>();
+    else {
+        return Ok((None, Vec::new()));
+    };
     if candidates.is_empty() || candidates.len() > MAX_FIX_ALL_CANDIDATES {
         return Ok((None, Vec::new()));
     }
     let mut rules = Vec::with_capacity(scope.rules().len());
     rules.extend(scope.rules().iter().copied());
-    let raw_edits = fix_file_edits(&FileInfo::new(path), source.as_bytes(), config, &rules)?;
-    let raw_edits = deduplicate_fix_all_edits(raw_edits, source, cancel)?;
+    let raw_edits = fix_file_edits_bounded(
+        &FileInfo::new(path),
+        source.as_bytes(),
+        config,
+        &rules,
+        budget,
+        cancel,
+    )?;
+    let raw_edits = deduplicate_fix_all_edits_bounded(raw_edits, source, cancel, budget)?;
     if raw_edits.is_empty() {
         return Ok((None, Vec::new()));
     }
@@ -1196,7 +1370,9 @@ fn fix_all_plan_from_input(
     let mut candidate_names = Vec::with_capacity(candidates.len().saturating_mul(2));
     let mut candidate_name_set = HashSet::with_capacity(candidates.len().saturating_mul(2));
     for candidate in &candidates {
+        budget.require_work(1, cancel)?;
         for name in [&candidate.old_name, &candidate.new_name] {
+            budget.require_bytes(name.len(), cancel)?;
             if candidate_name_set.insert(name.clone()) {
                 candidate_names.push(name.clone());
             }
@@ -1237,6 +1413,12 @@ fn fix_all_plan_from_input(
         return Ok((None, Vec::new()));
     }
 
+    let original_identifiers = match collect_fix_all_identifiers(uri, source, budget, cancel) {
+        Ok(identifiers) => identifiers,
+        Err(error) if is_cancelled(cancel) => return Err(error),
+        Err(_) => return Ok((None, Vec::new())),
+    };
+
     let mut proven_candidates = Vec::new();
     for candidate in &candidates {
         if is_cancelled(cancel) {
@@ -1244,6 +1426,8 @@ fn fix_all_plan_from_input(
         }
         let candidate_offset = text::position_to_offset(source, candidate.anchor.start)
             .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(candidate.old_name.len() + candidate.new_name.len(), cancel)?;
         if snapshot.index.conditional_unknown_at(uri, candidate_offset) {
             continue;
         }
@@ -1259,14 +1443,17 @@ fn fix_all_plan_from_input(
             }
             continue;
         }
-        let planned =
-            match snapshot
-                .index
-                .rename_edits(uri, candidate.anchor.start, &candidate.new_name)
-            {
-                Ok(edits) => edits,
-                Err(_) => continue,
-            };
+        let planned = match snapshot.index.rename_edits_with_cancel_and_work_budget(
+            uri,
+            candidate.anchor.start,
+            &candidate.new_name,
+            cancel,
+            budget,
+        ) {
+            Ok(edits) => edits,
+            Err(error) if is_cancelled(cancel) || budget.exhausted() => return Err(error),
+            Err(_) => continue,
+        };
         let mut candidate_edits = Vec::new();
         let mut unsafe_candidate = false;
         for (edited_uri, edits) in planned {
@@ -1283,6 +1470,8 @@ fn fix_all_plan_from_input(
                     .ok_or_else(|| "rename proof has an invalid start position".to_string())?;
                 let end = text::position_to_offset(source, edit.range.end)
                     .ok_or_else(|| "rename proof has an invalid end position".to_string())?;
+                budget.require_work(1, cancel)?;
+                budget.require_bytes(edit.new_text.len(), cancel)?;
                 if snapshot.index.conditional_unknown_at(uri, start) {
                     unsafe_candidate = true;
                     break;
@@ -1300,7 +1489,8 @@ fn fix_all_plan_from_input(
         if unsafe_candidate {
             continue;
         }
-        let candidate_edits = normalize_fix_all_edit_identities(candidate_edits, source, cancel)?;
+        let candidate_edits =
+            normalize_fix_all_edit_identities_bounded(candidate_edits, source, cancel, budget)?;
         if candidate_edits.is_empty() {
             continue;
         }
@@ -1309,31 +1499,46 @@ fn fix_all_plan_from_input(
     if proven_candidates.is_empty() {
         return Ok((None, Vec::new()));
     }
-    let mut semantic_edits = proven_candidates
-        .iter()
-        .flat_map(|(_, edits)| edits.iter().cloned())
-        .collect::<Vec<_>>();
-    semantic_edits = normalize_fix_all_edit_identities(semantic_edits, source, cancel)?;
-    if semantic_edits.is_empty() {
-        return Ok((None, Vec::new()));
+    // Select a deterministic coherent subset. Each trial is rebound as one
+    // transformed semantic state; an edit is never retained merely because
+    // its individual original-state rename proof succeeded.
+    let mut retained = Vec::new();
+    let mut selected_raw_edits = Vec::new();
+    for candidate in proven_candidates {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        retained.push(candidate);
+        let Some(trial_edits) = validate_fix_all_subset(
+            &snapshot,
+            uri,
+            source,
+            &raw_edits,
+            &retained,
+            &original_identifiers,
+            cancel,
+            budget,
+        )?
+        else {
+            retained.pop();
+            continue;
+        };
+        selected_raw_edits = trial_edits;
     }
-    let selected_edit_set = semantic_edits.iter().cloned().collect::<HashSet<_>>();
-    let selected_raw_edits = raw_edits
-        .iter()
-        .filter(|edit| selected_edit_set.contains(*edit))
-        .cloned()
-        .collect::<Vec<_>>();
-    if semantic_edits != selected_raw_edits {
-        // The established file fix builder must agree exactly with the
-        // binding-aware rename proof. This rejects shadow capture, swaps,
-        // chains, missed references, and downstream interactions for the
-        // retained coherent subset.
+    if retained.is_empty() || selected_raw_edits.is_empty() {
         return Ok((None, Vec::new()));
     }
 
-    let updated_source = apply_fix_all_edits(source, &selected_raw_edits).ok_or_else(|| {
-        "fix-all edits could not be applied to their original source snapshot".to_string()
-    })?;
+    let Some(updated_source) =
+        apply_fix_all_edits_bounded(source, &selected_raw_edits, cancel, budget)?
+    else {
+        return Ok((None, Vec::new()));
+    };
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(updated_source.len(), cancel)?;
+    let final_offset_map =
+        FixAllOffsetMap::new(&updated_source, &selected_raw_edits, cancel, budget)?;
     let (updated_tree, _) = parser::parse_file(
         &FileInfo::new(
             uri.to_file_path()
@@ -1355,63 +1560,84 @@ fn fix_all_plan_from_input(
         updated_source.as_bytes(),
         config,
     );
+    budget.require_work(1, cancel)?;
     if remaining
         .iter()
         .any(|diagnostic| diagnostic.rule_id == "lint4d-error")
     {
         return Ok((None, Vec::new()));
     }
-    let updated_end = text::offset_to_position(&updated_source, updated_source.len())
-        .ok_or_else(|| "updated fix-all source has an invalid UTF-16 boundary".to_string())?;
     let updated_context = CodeActionContext {
         diagnostics: Vec::new(),
         only: Some(vec![scope.action_kind()]),
         trigger_kind: None,
     };
-    let updated_candidates = naming_candidates(
+    let updated_source_hash = source_hash_bounded(updated_source.as_str(), budget, cancel)?;
+    let updated_candidates = naming_candidates_bounded(
         uri,
         &updated_source,
-        Range::new(lsp_types::Position::new(0, 0), updated_end),
         &updated_context,
         config,
         config_fingerprint,
+        updated_source_hash,
+        scope.rules(),
+        budget,
+        cancel,
     )?;
-    for (candidate, _) in &proven_candidates {
+    let Some(updated_candidates) = updated_candidates else {
+        return Ok((None, Vec::new()));
+    };
+    budget.require_work(updated_candidates.len(), cancel)?;
+    budget.require_bytes(
+        updated_candidates
+            .iter()
+            .map(|candidate| candidate.rule.len() + std::mem::size_of::<Range>())
+            .sum(),
+        cancel,
+    )?;
+    let updated_candidate_keys = updated_candidates
+        .into_iter()
+        .map(|candidate| (candidate.rule, candidate.anchor))
+        .collect::<HashSet<_>>();
+    for (candidate, _) in &retained {
         let start = text::position_to_offset(source, candidate.anchor.start)
-            .ok_or_else(|| "fix-all candidate has an invalid start position".to_string())?;
+            .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
         let end = text::position_to_offset(source, candidate.anchor.end)
-            .ok_or_else(|| "fix-all candidate has an invalid end position".to_string())?;
-        let Some(updated_range) = transformed_fix_all_edit_range(
-            &updated_source,
-            start,
-            end,
-            &candidate.new_name,
-            &selected_raw_edits,
-        ) else {
-            return Ok((None, Vec::new()));
-        };
-        let Some(updated_start) = text::position_to_offset(&updated_source, updated_range.start)
+            .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
+        let Some((updated_start, updated_end)) = final_offset_map.selected_offsets(start, end)
         else {
             return Ok((None, Vec::new()));
         };
-        let Some(updated_end) = text::position_to_offset(&updated_source, updated_range.end) else {
-            return Ok((None, Vec::new()));
-        };
-        if updated_source.get(updated_start..updated_end) != Some(candidate.new_name.as_str())
-            || updated_candidates
-                .iter()
-                .any(|updated| updated.rule == candidate.rule && updated.anchor == updated_range)
-        {
+        let updated_range = Range::new(
+            text::offset_to_position(&updated_source, updated_start)
+                .ok_or_else(|| "fix-all transformed candidate start is invalid".to_string())?,
+            text::offset_to_position(&updated_source, updated_end)
+                .ok_or_else(|| "fix-all transformed candidate end is invalid".to_string())?,
+        );
+        budget.require_work(1, cancel)?;
+        if updated_candidate_keys.contains(&(candidate.rule.clone(), updated_range)) {
             return Ok((None, Vec::new()));
         }
     }
 
-    let mut records = snapshot_records(&snapshot);
+    let mut records = snapshot_records_bounded(&snapshot, budget, cancel)?;
+    budget.require_work(configuration_records.len(), cancel)?;
+    budget.require_bytes(
+        configuration_records
+            .iter()
+            .map(|record| {
+                record.uri.as_str().len()
+                    + record.text.len()
+                    + record.content_bytes.as_ref().map_or(0, |bytes| bytes.len())
+            })
+            .sum(),
+        cancel,
+    )?;
     append_records(&mut records, configuration_records.to_vec());
     if records.len() > MAX_FIX_ALL_DEPENDENCY_RECORDS {
         return Ok((None, Vec::new()));
     }
-    let dependency_fingerprint = fix_all_dependency_fingerprint(&records);
+    let dependency_fingerprint = fix_all_dependency_fingerprint_bounded(&records, budget, cancel)?;
     let edits = selected_raw_edits
         .iter()
         .map(|edit| {
@@ -1422,7 +1648,7 @@ fn fix_all_plan_from_input(
             Ok(TextEdit::new(Range::new(start, end), edit.new_text.clone()))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let candidates = proven_candidates
+    let candidates = retained
         .into_iter()
         .map(|(candidate, _)| FixAllCandidateIdentity {
             rule: candidate.rule,
@@ -1440,7 +1666,7 @@ fn fix_all_plan_from_input(
                 .iter()
                 .map(|rule| (*rule).to_string())
                 .collect(),
-            source_hash: source_hash(source),
+            source_hash: source_hash_value,
             config_fingerprint,
             dependency_fingerprint,
             candidates,
@@ -1451,6 +1677,226 @@ fn fix_all_plan_from_input(
     ))
 }
 
+/// Validate one proposed fix-all subset against a single transformed binding
+/// state. The returned edit vector is the exact raw-builder-compatible subset
+/// and is already normalized for application to `source`.
+#[allow(clippy::too_many_arguments)]
+fn validate_fix_all_subset(
+    snapshot: &RenameSnapshot,
+    uri: &Url,
+    source: &str,
+    raw_edits: &[FixAllEditIdentity],
+    candidates: &[(NamingCandidate, Vec<FixAllEditIdentity>)],
+    original_identifiers: &[FixAllIdentifier],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Vec<FixAllEditIdentity>>, String> {
+    let semantic_edits = normalize_fix_all_edit_identities_bounded(
+        candidates
+            .iter()
+            .flat_map(|(_, edits)| edits.iter().cloned())
+            .collect(),
+        source,
+        cancel,
+        budget,
+    )?;
+    if semantic_edits.is_empty() {
+        return Ok(None);
+    }
+    let selected_edit_set = semantic_edits.iter().cloned().collect::<HashSet<_>>();
+    let selected_raw_edits = raw_edits
+        .iter()
+        .filter(|edit| selected_edit_set.contains(*edit))
+        .cloned()
+        .collect::<Vec<_>>();
+    if semantic_edits != selected_raw_edits
+        || selected_raw_edits.len() > MAX_FIX_ALL_EDITS
+        || selected_raw_edits
+            .iter()
+            .map(|edit| edit.new_text.len())
+            .sum::<usize>()
+            > MAX_FIX_ALL_EDIT_BYTES
+    {
+        return Ok(None);
+    }
+    let Some(updated_source) =
+        apply_fix_all_edits_bounded(source, &selected_raw_edits, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(updated_source.len(), cancel)?;
+    let offset_map = FixAllOffsetMap::new(&updated_source, &selected_raw_edits, cancel, budget)?;
+    let transformed = match snapshot.index.rebind_with_replaced_source_for_fix_all(
+        uri,
+        updated_source.clone(),
+        cancel,
+        budget,
+    ) {
+        Ok(index) => index,
+        Err(error) if is_cancelled(cancel) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let selected_edit_set = selected_raw_edits.iter().cloned().collect::<HashSet<_>>();
+    let mut transformed_edit_ranges = HashMap::with_capacity(selected_raw_edits.len());
+    budget.require_work(selected_raw_edits.len(), cancel)?;
+    for edit in &selected_raw_edits {
+        budget.require_bytes(edit.new_text.len(), cancel)?;
+        let (start, end) = offset_map
+            .selected_offsets(edit.start, edit.end)
+            .ok_or_else(|| "fix-all transformed edit range is missing".to_string())?;
+        let range = Range::new(
+            text::offset_to_position(&updated_source, start)
+                .ok_or_else(|| "fix-all transformed edit start is invalid".to_string())?,
+            text::offset_to_position(&updated_source, end)
+                .ok_or_else(|| "fix-all transformed edit end is invalid".to_string())?,
+        );
+        transformed_edit_ranges.insert(edit.clone(), range);
+    }
+    for (candidate, candidate_edits) in candidates {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let declaration_start = text::position_to_offset(source, candidate.anchor.start)
+            .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
+        let declaration_end = text::position_to_offset(source, candidate.anchor.end)
+            .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
+        let declaration_identity = FixAllEditIdentity {
+            start: declaration_start,
+            end: declaration_end,
+            new_text: candidate.new_name.clone(),
+        };
+        let Some(expected_declaration) = transformed_edit_ranges.get(&declaration_identity) else {
+            return Ok(None);
+        };
+        for edit in candidate_edits {
+            if !selected_edit_set.contains(edit) {
+                return Ok(None);
+            }
+            let Some(updated_range) = transformed_edit_ranges.get(edit) else {
+                return Ok(None);
+            };
+            let Some(updated_start) =
+                text::position_to_offset(&updated_source, updated_range.start)
+            else {
+                return Ok(None);
+            };
+            let Some(updated_end) = text::position_to_offset(&updated_source, updated_range.end)
+            else {
+                return Ok(None);
+            };
+            if updated_source.get(updated_start..updated_end) != Some(candidate.new_name.as_str()) {
+                return Ok(None);
+            }
+            budget.require_work(1, cancel)?;
+            let locations =
+                transformed.navigate(uri, updated_range.start, NavigationTarget::Declaration);
+            if locations.len() != 1
+                || locations[0].uri != *uri
+                || locations[0].range != *expected_declaration
+            {
+                // This is the critical original-to-transformed binding
+                // correspondence check. It catches shadow capture and
+                // duplicate/convergent declarations that remain syntactically
+                // valid and lint-clean.
+                return Ok(None);
+            }
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+        }
+    }
+
+    // Existing identifiers that already have one of the proposed final names
+    // are not part of a candidate edit, but they can still be captured by a
+    // combined rename. Re-check their declaration correspondence in the same
+    // transformed index so the proof covers unaffected references as well as
+    // the occurrences emitted by each candidate's rename query.
+    let mut final_names = HashSet::new();
+    for (candidate, _) in candidates {
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(candidate.new_name.len(), cancel)?;
+        final_names.insert(canonical_fix_all_name(&candidate.new_name));
+    }
+    let mut selected_spans = HashSet::with_capacity(selected_raw_edits.len());
+    budget.require_work(selected_raw_edits.len(), cancel)?;
+    for edit in &selected_raw_edits {
+        selected_spans.insert((edit.start, edit.end));
+    }
+    for identifier in original_identifiers {
+        if !final_names.contains(&canonical_fix_all_name(&identifier.name))
+            || selected_spans.contains(&(identifier.start, identifier.end))
+        {
+            continue;
+        }
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(identifier.name.len(), cancel)?;
+        let original_position =
+            text::offset_to_position(source, identifier.start).ok_or_else(|| {
+                "fix-all binding source has an invalid identifier position".to_string()
+            })?;
+        let original_locations =
+            snapshot
+                .index
+                .navigate(uri, original_position, NavigationTarget::Declaration);
+        budget.require_work(1, cancel)?;
+        if original_locations.len() != 1 {
+            return Ok(None);
+        }
+        let mapped_identifier = offset_map
+            .map_unedited_range(&updated_source, identifier.start, identifier.end)
+            .ok_or_else(|| "fix-all unaffected identifier overlaps a selected edit".to_string())?;
+        let transformed_locations =
+            transformed.navigate(uri, mapped_identifier.start, NavigationTarget::Declaration);
+        budget.require_work(1, cancel)?;
+        if transformed_locations.len() != 1 {
+            return Ok(None);
+        }
+        let expected_location = transformed_location_range(
+            source,
+            &updated_source,
+            uri,
+            &original_locations[0],
+            &offset_map,
+        );
+        if expected_location.is_none_or(|range| transformed_locations[0].range != range)
+            || transformed_locations[0].uri != original_locations[0].uri
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(selected_raw_edits))
+}
+
+fn canonical_fix_all_name(name: &str) -> String {
+    name.trim_start_matches('&').to_ascii_lowercase()
+}
+
+fn transformed_location_range(
+    source: &str,
+    updated_source: &str,
+    target_uri: &Url,
+    location: &lsp_types::Location,
+    offset_map: &FixAllOffsetMap,
+) -> Option<Range> {
+    if location.uri != *target_uri {
+        return Some(location.range);
+    }
+    let start = text::position_to_offset(source, location.range.start)?;
+    let end = text::position_to_offset(source, location.range.end)?;
+    if let Some((updated_start, updated_end)) = offset_map.selected_offsets(start, end) {
+        return Some(Range::new(
+            text::offset_to_position(updated_source, updated_start)?,
+            text::offset_to_position(updated_source, updated_end)?,
+        ));
+    }
+    offset_map.map_unedited_range(updated_source, start, end)
+}
+
+#[cfg(test)]
 fn normalize_fix_all_edit_identities(
     edits: Vec<FixAllEditIdentity>,
     source: &str,
@@ -1477,25 +1923,7 @@ fn normalize_fix_all_edit_identities(
     Ok(normalized)
 }
 
-fn deduplicate_fix_all_edits(
-    edits: Vec<lint4d::fix::FixEdit>,
-    source: &str,
-    cancel: &AtomicBool,
-) -> Result<Vec<FixAllEditIdentity>, String> {
-    deduplicate_fix_all_edit_identities(
-        edits
-            .into_iter()
-            .map(|edit| FixAllEditIdentity {
-                start: edit.start_byte,
-                end: edit.end_byte,
-                new_text: edit.new_text,
-            })
-            .collect(),
-        source,
-        cancel,
-    )
-}
-
+#[cfg(test)]
 fn deduplicate_fix_all_edit_identities(
     mut edits: Vec<FixAllEditIdentity>,
     source: &str,
@@ -1534,42 +1962,152 @@ fn deduplicate_fix_all_edit_identities(
     Ok(normalized)
 }
 
-fn apply_fix_all_edits(source: &str, edits: &[FixAllEditIdentity]) -> Option<String> {
+fn normalize_fix_all_edit_identities_bounded(
+    edits: Vec<FixAllEditIdentity>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    let normalized = deduplicate_fix_all_edit_identities_bounded(edits, source, cancel, budget)?;
+    for pair in normalized.windows(2) {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        let previous = &pair[0];
+        let edit = &pair[1];
+        let overlap = previous.end > edit.start
+            || (previous.start == previous.end
+                && edit.start <= previous.start
+                && previous.start <= edit.end)
+            || (edit.start == edit.end
+                && previous.start <= edit.start
+                && edit.start <= previous.end);
+        if overlap {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(normalized)
+}
+
+fn deduplicate_fix_all_edits_bounded(
+    edits: Vec<lint4d::fix::FixEdit>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    deduplicate_fix_all_edit_identities_bounded(
+        edits
+            .into_iter()
+            .map(|edit| FixAllEditIdentity {
+                start: edit.start_byte,
+                end: edit.end_byte,
+                new_text: edit.new_text,
+            })
+            .collect(),
+        source,
+        cancel,
+        budget,
+    )
+}
+
+fn deduplicate_fix_all_edit_identities_bounded(
+    mut edits: Vec<FixAllEditIdentity>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    budget.require_work(edits.len(), cancel)?;
+    budget.require_bytes(edits.iter().map(|edit| edit.new_text.len()).sum(), cancel)?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    budget.require_work(comparison_sort_work(edits.len()), cancel)?;
+    edits.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.new_text.cmp(&right.new_text))
+    });
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let mut normalized: Vec<FixAllEditIdentity> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(edit.new_text.len(), cancel)?;
+        if edit.start > edit.end
+            || source.get(edit.start..edit.end).is_none()
+            || edit.new_text.len() > MAX_FIX_ALL_EDIT_BYTES
+        {
+            return Ok(Vec::new());
+        }
+        if let Some(previous) = normalized.last() {
+            let duplicate = previous.start == edit.start
+                && previous.end == edit.end
+                && previous.new_text == edit.new_text;
+            if duplicate {
+                continue;
+            }
+        }
+        normalized.push(edit);
+        if normalized.len() > MAX_FIX_ALL_EDITS {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(normalized)
+}
+
+fn apply_fix_all_edits_bounded(
+    source: &str,
+    edits: &[FixAllEditIdentity],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(source.len(), cancel)?;
     let mut updated = source.to_owned();
     for edit in edits.iter().rev() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(edit.new_text.len(), cancel)?;
         updated.replace_range(edit.start..edit.end, &edit.new_text);
     }
-    Some(updated)
+    Ok(Some(updated))
 }
 
-fn transformed_fix_all_edit_range(
-    updated_source: &str,
-    start: usize,
-    end: usize,
-    new_text: &str,
-    edits: &[FixAllEditIdentity],
-) -> Option<Range> {
-    let target_index = edits
-        .iter()
-        .position(|edit| edit.start == start && edit.end == end && edit.new_text == new_text)?;
-    let mut updated_start = start;
-    for edit in &edits[..target_index] {
-        updated_start = updated_start
-            .checked_sub(edit.end.checked_sub(edit.start)?)?
-            .checked_add(edit.new_text.len())?;
-    }
-    let updated_end = updated_start.checked_add(new_text.len())?;
-    Some(Range::new(
-        text::offset_to_position(updated_source, updated_start)?,
-        text::offset_to_position(updated_source, updated_end)?,
-    ))
-}
-
-fn fix_all_dependency_fingerprint(records: &[SourceRecord]) -> u64 {
+fn fix_all_dependency_fingerprint_bounded(
+    records: &[SourceRecord],
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
+    budget.require_work(records.len(), cancel)?;
     let mut ordered = records.iter().collect::<Vec<_>>();
+    budget.require_work(comparison_sort_work(ordered.len()), cancel)?;
     ordered.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
     let mut hasher = DefaultHasher::new();
     for record in ordered {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let observation_bytes = record
+            .candidate_observations
+            .iter()
+            .map(|observation| observation.path.as_os_str().len())
+            .sum::<usize>();
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(
+            record.uri.as_str().len()
+                + record.text.len()
+                + record.content_bytes.as_ref().map_or(0, |bytes| bytes.len())
+                + observation_bytes,
+            cancel,
+        )?;
         record.uri.hash(&mut hasher);
         record.text.hash(&mut hasher);
         record.content_hash.hash(&mut hasher);
@@ -1589,7 +2127,7 @@ fn fix_all_dependency_fingerprint(records: &[SourceRecord]) -> u64 {
         )
         .hash(&mut hasher);
     }
-    hasher.finish()
+    Ok(hasher.finish())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4140,6 +4678,11 @@ fn resolve_fix_all_from_input(
             Ok(source) => source,
             Err(error) => return failed(source_generation, configuration_generation, error),
         };
+    let mut fix_all_budget = AssistanceBudget::new(
+        MAX_FIX_ALL_WORK,
+        MAX_FIX_ALL_BUDGET_BYTES,
+        "fix-all request",
+    );
     if !input_source_is_editable(&input, &target_uri) {
         return failed(
             source_generation,
@@ -4147,7 +4690,19 @@ fn resolve_fix_all_from_input(
             format!("code-action document is outside configured workspace roots: {target_uri}"),
         );
     }
-    if source_hash(&target_source) != data.source_hash {
+    if !input_source_is_writable(&input, &target_uri) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "fix-all target is not writable; request code actions again".to_string(),
+        );
+    }
+    let target_source_hash = match source_hash_bounded(&target_source, &mut fix_all_budget, cancel)
+    {
+        Ok(hash) => hash,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if target_source_hash != data.source_hash {
         return failed(
             source_generation,
             configuration_generation,
@@ -4193,6 +4748,8 @@ fn resolve_fix_all_from_input(
         scope,
         &configuration_records,
         cancel,
+        target_source_hash,
+        &mut fix_all_budget,
     ) {
         Ok(result) => result,
         Err(error) => return failed(source_generation, configuration_generation, error),
@@ -4456,6 +5013,7 @@ fn naming_candidates(
     let request = CandidateRequest {
         uri,
         source,
+        source_hash: source_hash(source),
         config_fingerprint,
         suppressions: &suppressions,
         requested_range,
@@ -4486,6 +5044,310 @@ fn naming_candidates(
     });
     candidates.dedup_by(|left, right| left.rule == right.rule && left.anchor == right.anchor);
     Ok(candidates)
+}
+
+/// Bounded candidate collection used only by source fix-all. The collector
+/// stops at `MAX_FIX_ALL_CANDIDATES + 1`, so an over-limit request is withheld
+/// without constructing or sorting an unbounded candidate vector. `None` is a
+/// deliberate no-action result, while `Err` is reserved for cancellation or
+/// a real parser/budget failure.
+#[allow(clippy::too_many_arguments)]
+fn naming_candidates_bounded(
+    uri: &Url,
+    source: &str,
+    context: &CodeActionContext,
+    config: &Config,
+    config_fingerprint: u64,
+    source_hash_value: u64,
+    rules: &[&str],
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<NamingCandidate>>, String> {
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(source.len(), cancel)?;
+    let path = uri
+        .to_file_path()
+        .map(absolute_path)
+        .map_err(|_| format!("not a file URI: {uri}"))?;
+    let (tree, _) = parser::parse_file(&FileInfo::new(path), source.as_bytes())
+        .map_err(|error| format!("could not parse code-action source: {error}"))?;
+    budget.require_work(1, cancel)?;
+    if tree.root_node().has_error() {
+        return Ok(None);
+    }
+    let suppressions = parse_suppressions(source.as_bytes());
+    budget.require_work(1, cancel)?;
+    let request = CandidateRequest {
+        uri,
+        source,
+        source_hash: source_hash_value,
+        config_fingerprint,
+        suppressions: &suppressions,
+        requested_range: Range::new(
+            lsp_types::Position::new(0, 0),
+            text::offset_to_position(source, source.len())
+                .ok_or_else(|| "fix-all source has an invalid UTF-16 boundary".to_string())?,
+        ),
+        context,
+    };
+    let mut candidates = Vec::new();
+    if rules.contains(&CONSTANT_RULE) && !rule_is_off(config, CONSTANT_RULE) {
+        if let Err(error) = collect_constants_bounded(
+            tree.root_node(),
+            config.constant_style(),
+            &request,
+            &mut candidates,
+            budget,
+            cancel,
+        ) {
+            if error == FIX_ALL_CANDIDATE_LIMIT {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+    if rules.contains(&LOCAL_RULE) && !rule_is_off(config, LOCAL_RULE) {
+        if let Err(error) = collect_locals_bounded(
+            tree.root_node(),
+            config.local_variable_style(),
+            &request,
+            &mut candidates,
+            budget,
+            cancel,
+        ) {
+            if error == FIX_ALL_CANDIDATE_LIMIT {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+    if candidates.len() > MAX_FIX_ALL_CANDIDATES {
+        return Ok(None);
+    }
+    budget.require_work(candidates.len(), cancel)?;
+    budget.require_bytes(
+        candidates
+            .iter()
+            .map(|candidate| {
+                candidate.rule.len()
+                    + candidate.old_name.len()
+                    + candidate.new_name.len()
+                    + std::mem::size_of::<Range>()
+            })
+            .sum(),
+        cancel,
+    )?;
+    budget.require_work(comparison_sort_work(candidates.len()), cancel)?;
+    candidates.sort_by(|left, right| {
+        left.anchor
+            .start
+            .cmp(&right.anchor.start)
+            .then_with(|| left.rule.cmp(&right.rule))
+    });
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    let mut deduplicated = Vec::with_capacity(candidates.len());
+    let mut seen = HashSet::with_capacity(candidates.len());
+    for candidate in candidates {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        let identity = (candidate.rule.clone(), candidate.anchor);
+        budget.require_bytes(candidate.rule.len(), cancel)?;
+        if seen.insert(identity) {
+            deduplicated.push(candidate);
+        }
+    }
+    if deduplicated.is_empty() {
+        Ok(Some(Vec::new()))
+    } else {
+        Ok(Some(deduplicated))
+    }
+}
+
+fn collect_constants_bounded(
+    root: Node<'_>,
+    style: &str,
+    request: &CandidateRequest<'_>,
+    candidates: &mut Vec<NamingCandidate>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    walk_bounded(root, budget, cancel, &mut |node, budget| {
+        if node.kind() != "declConst" || node.child_by_field_name("type").is_some() {
+            return Ok(());
+        }
+        for name_node in field_identifier_nodes(node, "name") {
+            let before = candidates.len();
+            add_candidate(CONSTANT_RULE, name_node, style, request, candidates);
+            if candidates.len() != before {
+                let candidate = candidates.last().expect("candidate was just appended");
+                budget.require_work(1, cancel)?;
+                budget.require_bytes(
+                    std::mem::size_of::<NamingCandidate>()
+                        + candidate.rule.len()
+                        + candidate.old_name.len()
+                        + candidate.new_name.len(),
+                    cancel,
+                )?;
+                if candidates.len() > MAX_FIX_ALL_CANDIDATES {
+                    return Err(FIX_ALL_CANDIDATE_LIMIT.to_string());
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn collect_locals_bounded(
+    root: Node<'_>,
+    style: &str,
+    request: &CandidateRequest<'_>,
+    candidates: &mut Vec<NamingCandidate>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    walk_bounded(root, budget, cancel, &mut |node, budget| {
+        if !matches!(node.kind(), "defProc" | "lambda") {
+            return Ok(());
+        }
+        if let Some(header) = node.child_by_field_name("header") {
+            for child in effective_children(header) {
+                if child.kind() != "declArgs" {
+                    continue;
+                }
+                for argument in effective_children(child) {
+                    if argument.kind() != "declArg" {
+                        continue;
+                    }
+                    for name_node in field_identifier_nodes(argument, "name") {
+                        let before = candidates.len();
+                        add_candidate(LOCAL_RULE, name_node, style, request, candidates);
+                        if candidates.len() != before {
+                            let candidate = candidates.last().expect("candidate was just appended");
+                            budget.require_work(1, cancel)?;
+                            budget.require_bytes(
+                                std::mem::size_of::<NamingCandidate>()
+                                    + candidate.rule.len()
+                                    + candidate.old_name.len()
+                                    + candidate.new_name.len(),
+                                cancel,
+                            )?;
+                            if candidates.len() > MAX_FIX_ALL_CANDIDATES {
+                                return Err(FIX_ALL_CANDIDATE_LIMIT.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for child in effective_children(node) {
+            if child.kind() != "declVars" {
+                continue;
+            }
+            for declaration in effective_children(child) {
+                if declaration.kind() != "declVar" {
+                    continue;
+                }
+                for name_node in field_identifier_nodes(declaration, "name") {
+                    let before = candidates.len();
+                    add_candidate(LOCAL_RULE, name_node, style, request, candidates);
+                    if candidates.len() != before {
+                        let candidate = candidates.last().expect("candidate was just appended");
+                        budget.require_work(1, cancel)?;
+                        budget.require_bytes(
+                            std::mem::size_of::<NamingCandidate>()
+                                + candidate.rule.len()
+                                + candidate.old_name.len()
+                                + candidate.new_name.len(),
+                            cancel,
+                        )?;
+                        if candidates.len() > MAX_FIX_ALL_CANDIDATES {
+                            return Err(FIX_ALL_CANDIDATE_LIMIT.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn walk_bounded(
+    root: Node<'_>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+    callback: &mut impl FnMut(Node<'_>, &mut AssistanceBudget) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        callback(node, budget)?;
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        budget.require_work(children.len(), cancel)?;
+        budget.require_bytes(
+            children
+                .len()
+                .saturating_mul(std::mem::size_of::<Node<'_>>()),
+            cancel,
+        )?;
+        pending.extend(children.into_iter().rev());
+    }
+    Ok(())
+}
+
+fn comparison_sort_work(length: usize) -> usize {
+    if length < 2 {
+        return 0;
+    }
+    let mut remaining = length;
+    let mut depth = 0;
+    while remaining > 1 {
+        depth += 1;
+        remaining = remaining.saturating_add(1) / 2;
+    }
+    length.saturating_mul(depth)
+}
+
+fn collect_fix_all_identifiers(
+    uri: &Url,
+    source: &str,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<Vec<FixAllIdentifier>, String> {
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(source.len(), cancel)?;
+    let path = uri
+        .to_file_path()
+        .map(absolute_path)
+        .map_err(|_| format!("not a file URI: {uri}"))?;
+    let (tree, _) = parser::parse_file(&FileInfo::new(path), source.as_bytes())
+        .map_err(|error| format!("could not parse fix-all binding source: {error}"))?;
+    if tree.root_node().has_error() {
+        return Err("fix-all binding source has parser errors".to_string());
+    }
+    let mut identifiers = Vec::new();
+    walk_bounded(tree.root_node(), budget, cancel, &mut |node, budget| {
+        if node.kind() != "identifier" {
+            return Ok(());
+        }
+        let name = node_text(node, source);
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(name.len() + std::mem::size_of::<FixAllIdentifier>(), cancel)?;
+        identifiers.push(FixAllIdentifier {
+            start: node.start_byte(),
+            end: node.end_byte(),
+            name,
+        });
+        Ok(())
+    })?;
+    Ok(identifiers)
 }
 
 fn lint_configuration_for_input(
@@ -4659,7 +5521,7 @@ fn add_candidate(
         old_name: old_name.clone(),
         new_name: replacement(rule, &old_name, style),
         config_fingerprint: request.config_fingerprint,
-        source_hash: source_hash(request.source),
+        source_hash: request.source_hash,
         diagnostic: matching_diagnostic,
     });
 }
@@ -5086,6 +5948,19 @@ fn source_hash(source: &str) -> u64 {
     hasher.finish()
 }
 
+fn source_hash_bounded(
+    source: &str,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
+    budget.require_work(1, cancel)?;
+    budget.require_bytes(source.len(), cancel)?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    Ok(source_hash(source))
+}
+
 fn parse_action_data(value: Option<&Value>) -> Result<ParsedActionData, String> {
     let Some(value) = value else {
         return Err("code action has no resolve data".to_string());
@@ -5438,9 +6313,12 @@ fn validate_fix_all_action_data(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistanceBudget, ClientActionFeatures, FixAllEditIdentity, OrganizeImportsProvider,
-        code_actions_from_input, lint_configuration_for_input, normalize_fix_all_edit_identities,
+        AssistanceBudget, CANCELLATION_MESSAGE, CONSTANT_RULE, ClientActionFeatures, Config,
+        FIX_ALL_CONSTANT_CODE_ACTION_KIND, FixAllEditIdentity, MAX_FIX_ALL_BUDGET_BYTES,
+        MAX_FIX_ALL_CANDIDATES, MAX_FIX_ALL_WORK, OrganizeImportsProvider, code_actions_from_input,
+        lint_configuration_for_input, naming_candidates_bounded, normalize_fix_all_edit_identities,
         resolve_from_input, selected_provider_order_is_safe, set_after_lint_configuration_hook,
+        source_hash,
     };
     use crate::navigation::UnitOrderSafety;
     use crate::workspace::Workspace;
@@ -5525,6 +6403,65 @@ mod tests {
         )
         .expect("coincident insertion rejection should complete");
         assert!(coincident_insertions.is_empty());
+    }
+
+    #[test]
+    fn fix_all_candidate_collection_is_bounded_and_cancellable_without_timing() {
+        let mut source = String::from("unit Main;\ninterface\nconst\n");
+        for index in 0..(MAX_FIX_ALL_CANDIDATES + 1) {
+            source.push_str(&format!("  badConst{index} = {index};\n"));
+        }
+        source.push_str("implementation\nend.\n");
+        let uri = Url::parse("file:///tmp/fix-all-candidate-limit.pas").expect("fixture URI");
+        let config = r#"version = 1
+[rules.naming]
+constant_style = "UPPER_CASE""#
+            .parse::<Config>()
+            .expect("fix-all configuration");
+        let context = lsp_types::CodeActionContext {
+            diagnostics: Vec::new(),
+            only: Some(vec![FIX_ALL_CONSTANT_CODE_ACTION_KIND]),
+            trigger_kind: None,
+        };
+        let mut budget =
+            AssistanceBudget::new(MAX_FIX_ALL_WORK, MAX_FIX_ALL_BUDGET_BYTES, "fix-all test");
+        let candidates = naming_candidates_bounded(
+            &uri,
+            &source,
+            &context,
+            &config,
+            1,
+            source_hash(&source),
+            &[CONSTANT_RULE],
+            &mut budget,
+            &AtomicBool::new(false),
+        )
+        .expect("candidate limit should be a no-action result");
+        assert!(
+            candidates.is_none(),
+            "over-limit candidates must not be truncated into an edit"
+        );
+
+        let cancel = AtomicBool::new(false);
+        let mut cancellation_budget = AssistanceBudget::new(
+            MAX_FIX_ALL_WORK,
+            MAX_FIX_ALL_BUDGET_BYTES,
+            "fix-all cancellation test",
+        );
+        cancellation_budget.cancel_after_work(1);
+        let error = naming_candidates_bounded(
+            &uri,
+            &source,
+            &context,
+            &config,
+            1,
+            source_hash(&source),
+            &[CONSTANT_RULE],
+            &mut cancellation_budget,
+            &cancel,
+        )
+        .expect_err("candidate collection must poll cancellation after parsing work");
+        assert_eq!(error, CANCELLATION_MESSAGE);
     }
 
     #[test]

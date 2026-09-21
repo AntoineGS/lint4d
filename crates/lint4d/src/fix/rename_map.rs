@@ -9,7 +9,9 @@ use crate::rules::naming::{
 };
 use crate::rules::scope::Scopes;
 
+use super::FixWorkBudget;
 use super::types::{FixConfig, RenameMap};
+use std::sync::atomic::AtomicBool;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -22,30 +24,63 @@ pub fn build_rename_map(
     config: &Config,
     suppressions: &[Suppression],
 ) -> RenameMap {
-    let mut map = RenameMap::default();
-    let fix_config = FixConfig::from_config(config);
-
-    walk_declarations(root, source, config, suppressions, &fix_config, &mut map);
-    map
+    let mut budget = None;
+    build_rename_map_bounded(root, source, config, suppressions, &mut budget, None)
+        .expect("unbounded naming fix traversal cannot exhaust a budget")
 }
 
-pub(crate) fn build_rename_map_for_rules(
+pub(crate) fn build_rename_map_bounded(
+    root: Node,
+    source: &[u8],
+    config: &Config,
+    suppressions: &[Suppression],
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<RenameMap, String> {
+    let mut map = RenameMap::default();
+    let fix_config = FixConfig::from_config(config);
+    walk_declarations(
+        root,
+        source,
+        config,
+        suppressions,
+        &fix_config,
+        &mut map,
+        budget,
+        cancel,
+    )?;
+    Ok(map)
+}
+
+pub(crate) fn build_rename_map_for_rules_bounded(
     root: Node,
     source: &[u8],
     config: &Config,
     suppressions: &[Suppression],
     rules: &[&str],
-) -> RenameMap {
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<RenameMap, String> {
     let mut map = RenameMap::default();
     let fix_config = FixConfig::for_rules(config, rules);
-    walk_declarations(root, source, config, suppressions, &fix_config, &mut map);
-    map
+    walk_declarations(
+        root,
+        source,
+        config,
+        suppressions,
+        &fix_config,
+        &mut map,
+        budget,
+        cancel,
+    )?;
+    Ok(map)
 }
 
 // ---------------------------------------------------------------------------
 // Declaration walker
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn walk_declarations(
     node: Node,
     source: &[u8],
@@ -53,7 +88,10 @@ fn walk_declarations(
     suppressions: &[Suppression],
     fix_config: &FixConfig,
     map: &mut RenameMap,
-) {
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    super::charge_budget(budget, cancel, 1, 0)?;
     match node.kind() {
         K::DECL_TYPE => {
             if let Some(type_node) = node.child_by_field_name("type") {
@@ -81,8 +119,18 @@ fn walk_declarations(
     }
 
     for child in node.children(&mut node.walk()) {
-        walk_declarations(child, source, config, suppressions, fix_config, map);
+        walk_declarations(
+            child,
+            source,
+            config,
+            suppressions,
+            fix_config,
+            map,
+            budget,
+            cancel,
+        )?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +319,12 @@ fn check_decl_names(
 // Scope update
 // ---------------------------------------------------------------------------
 
-pub(crate) fn update_scopes(scopes: &mut Scopes, rename_map: &RenameMap) {
+pub(crate) fn update_scopes_bounded(
+    scopes: &mut Scopes,
+    rename_map: &RenameMap,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
     // Update file scope entries
     let file_updates: Vec<(String, String)> = rename_map
         .file
@@ -279,6 +332,7 @@ pub(crate) fn update_scopes(scopes: &mut Scopes, rename_map: &RenameMap) {
         .map(|(old_lower, new_name)| (old_lower.clone(), new_name.clone()))
         .collect();
     for (old_lower, new_name) in &file_updates {
+        super::charge_budget(budget, cancel, 1, old_lower.len() + new_name.len())?;
         scopes.file.remove(old_lower);
         scopes
             .file
@@ -293,8 +347,10 @@ pub(crate) fn update_scopes(scopes: &mut Scopes, rename_map: &RenameMap) {
         .map(|(old_lower, new_name)| (old_lower.clone(), new_name.to_lowercase()))
         .collect();
     for (old_key, new_key) in class_updates {
+        super::charge_budget(budget, cancel, 1, old_key.len() + new_key.len())?;
         if let Some(fields) = scopes.classes.remove(&old_key) {
             scopes.classes.insert(new_key, fields);
         }
     }
+    Ok(())
 }

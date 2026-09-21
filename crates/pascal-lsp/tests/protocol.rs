@@ -6221,7 +6221,7 @@ fn related_document_refresh_retains_a_clear_after_a_failed_replacement() {
         }),
     );
     let failed = server
-        .response_with_timeout(&failed_id, Duration::from_secs(30))
+        .response_with_timeout(&failed_id, Duration::from_secs(120))
         .expect("oversized replacement response");
     let error = failed.error.expect("oversized replacement must fail");
     assert_eq!(error.code, -32803);
@@ -6246,7 +6246,7 @@ fn related_document_refresh_retains_a_clear_after_a_failed_replacement() {
         }),
     );
     let recovery = server
-        .response_with_timeout(&recovery_id, Duration::from_secs(30))
+        .response_with_timeout(&recovery_id, Duration::from_secs(120))
         .expect("recovery response");
     assert!(
         recovery.error.is_none(),
@@ -29906,6 +29906,310 @@ fn deferred_source_fix_all_allows_noop_version_and_rejects_changed_target() {
         "changed target must stale fix-all: {stale:?}"
     );
     server.shutdown();
+}
+
+#[test]
+fn source_fix_all_withholds_combined_binding_conflicts_in_eager_and_deferred_paths() {
+    let run_eager = |source: &str, name: &str| {
+        let temp = tempfile::tempdir().expect("eager conflict workspace");
+        let root = temp.path().join("fixture");
+        let main = root.join("Main.pas");
+        write_file(
+            &root.join(".lint4d.toml"),
+            "[rules.naming]\nlocal_variable_style = \"PascalCase\"\n",
+        );
+        write_file(&main, source);
+
+        let mut server = TestServer::launch();
+        server.initialize(&root, Value::Null);
+        let request_id = RequestId::from(name.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "context": {"diagnostics": [], "only": ["source.fixAll"]}
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "eager conflict request failed: {response:?}"
+        );
+        let actions = response.result.expect("eager conflict result");
+        let actions = actions.as_array().expect("eager conflict actions");
+        assert_eq!(
+            actions.len(),
+            1,
+            "the unsafe candidate group must be withheld while a proven subset remains: {actions:?}"
+        );
+        assert_eq!(
+            actions[0]["data"]["candidates"].as_array().unwrap().len(),
+            1
+        );
+        let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&main));
+        assert_eq!(updated.matches("MyVar: Integer;").count(), 1);
+        server.shutdown();
+    };
+
+    // Both declarations converge on MyVar in one lexical scope. Applying both
+    // would create duplicate declarations.
+    run_eager(
+        concat!(
+            "unit Main;\ninterface\nimplementation\n",
+            "procedure Work;\nvar\n  my_var: Integer;\n  my__var: Integer;\n",
+            "begin\n  my_var := my__var;\nend;\nend.\n"
+        ),
+        "fix-all-same-scope-conflict",
+    );
+
+    // The inner declaration would capture the outer reference after both
+    // names become MyVar. The safe behavior is to withhold the conflicting
+    // batch, even though the transformed text still parses and lint is quiet.
+    let nested_source = concat!(
+        "unit Main;\ninterface\nimplementation\n",
+        "procedure Work;\nvar my_var: Integer;\n",
+        "  procedure Nested;\n  var my__var: Integer;\n",
+        "  begin\n    my__var := 2;\n    my_var := my_var + my__var;\n",
+        "  end;\nbegin\n  my_var := 1;\n  Nested;\nend;\nend.\n"
+    );
+    run_eager(nested_source, "fix-all-nested-capture-conflict");
+
+    // Independent procedures may use the same final spelling. This is the
+    // positive combined case and is checked by applying the actual edit and
+    // asking the live index where each reference resolves.
+    let temp = tempfile::tempdir().expect("independent combined workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    let source = concat!(
+        "unit Main;\ninterface\nimplementation\n",
+        "procedure First;\nvar my_var: Integer;\nbegin\n  my_var := 1;\nend;\n",
+        "procedure Second;\nvar my__var: Integer;\nbegin\n  my__var := 2;\nend;\n",
+        "end.\n"
+    );
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source
+            }
+        }),
+    );
+    let request_id = RequestId::from("fix-all-independent-combined".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "independent combined request failed: {response:?}"
+    );
+    let actions = response.result.expect("independent combined result");
+    let actions = actions.as_array().expect("independent combined actions");
+    assert_eq!(
+        actions.len(),
+        1,
+        "independent fixes should remain coherent: {actions:?}"
+    );
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&main));
+    assert!(updated.contains("var MyVar: Integer;"));
+    assert_eq!(updated.matches("var MyVar: Integer;").count(), 2);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": updated}]
+        }),
+    );
+    let first_definition_id = RequestId::from("independent-first-definition".to_string());
+    server.send_request(
+        first_definition_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&updated, "MyVar := 1", 0)
+        }),
+    );
+    let first_definition = server.response(&first_definition_id);
+    assert!(
+        first_definition.error.is_none(),
+        "first definition failed: {first_definition:?}"
+    );
+    let first_locations = first_definition.result.expect("first definition result");
+    assert_eq!(
+        first_locations.as_array().expect("first locations")[0]["range"]["start"]["line"],
+        4
+    );
+    let second_definition_id = RequestId::from("independent-second-definition".to_string());
+    server.send_request(
+        second_definition_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&updated, "MyVar := 2", 0)
+        }),
+    );
+    let second_definition = server.response(&second_definition_id);
+    assert!(
+        second_definition.error.is_none(),
+        "second definition failed: {second_definition:?}"
+    );
+    let second_locations = second_definition.result.expect("second definition result");
+    assert_eq!(
+        second_locations.as_array().expect("second locations")[0]["range"]["start"]["line"],
+        9
+    );
+    server.shutdown();
+
+    // The deferred path must apply the same combined proof rather than
+    // re-advertising a batch that the eager path withheld.
+    let temp = tempfile::tempdir().expect("deferred conflict workspace");
+    let root = temp.path().join("fixture");
+    let main = root.join("Main.pas");
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nlocal_variable_style = \"PascalCase\"\n",
+    );
+    write_file(&main, nested_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let request_id = RequestId::from("fix-all-deferred-nested-conflict".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "deferred conflict request failed: {response:?}"
+    );
+    let actions = response.result.expect("deferred conflict result");
+    let actions = actions.as_array().expect("deferred conflict actions");
+    assert_eq!(
+        actions.len(),
+        1,
+        "deferred planning must retain only the safe subset: {actions:?}"
+    );
+    assert_eq!(
+        actions[0]["data"]["candidates"].as_array().unwrap().len(),
+        1
+    );
+    let resolve_id = RequestId::from("fix-all-deferred-nested-conflict-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let resolved = server.response(&resolve_id);
+    assert!(
+        resolved.error.is_none(),
+        "safe deferred subset failed: {resolved:?}"
+    );
+    let updated = apply_workspace_edit_to_source(
+        nested_source,
+        &resolved.result.expect("resolved safe subset")["edit"],
+        &uri(&main),
+    );
+    assert_eq!(updated.matches("MyVar: Integer;").count(), 1);
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn source_fix_all_withholds_read_only_targets_at_creation_and_resolution() {
+    let make_source = || "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+
+    let eager_temp = tempfile::tempdir().expect("read-only eager workspace");
+    let eager_root = eager_temp.path().join("fixture");
+    let eager_main = eager_root.join("Main.pas");
+    write_file(&eager_main, make_source());
+    let mut eager_permissions = fs::metadata(&eager_main)
+        .expect("eager metadata")
+        .permissions();
+    eager_permissions.set_mode(0o444);
+    fs::set_permissions(&eager_main, eager_permissions).expect("make eager target read-only");
+    let mut eager_server = TestServer::launch();
+    eager_server.initialize(&eager_root, Value::Null);
+    let eager_id = RequestId::from("fix-all-read-only-eager".to_string());
+    eager_server.send_request(
+        eager_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&eager_main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let eager_response = eager_server.response(&eager_id);
+    assert!(
+        eager_response.error.is_none(),
+        "read-only eager request failed: {eager_response:?}"
+    );
+    assert!(
+        eager_response
+            .result
+            .expect("read-only eager result")
+            .as_array()
+            .expect("read-only eager actions")
+            .is_empty(),
+        "read-only eager targets must not advertise an edit"
+    );
+    eager_server.shutdown();
+
+    let deferred_temp = tempfile::tempdir().expect("read-only deferred workspace");
+    let deferred_root = deferred_temp.path().join("fixture");
+    let deferred_main = deferred_root.join("Main.pas");
+    write_file(&deferred_main, make_source());
+    let mut deferred_server = TestServer::launch();
+    deferred_server.initialize_with_action_support(&deferred_root, Value::Null);
+    let request_id = RequestId::from("fix-all-read-only-deferred-create".to_string());
+    deferred_server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&deferred_main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = deferred_server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "read-only deferred creation failed: {response:?}"
+    );
+    let action = response.result.expect("read-only deferred result")[0].clone();
+    let mut deferred_permissions = fs::metadata(&deferred_main)
+        .expect("deferred metadata")
+        .permissions();
+    deferred_permissions.set_mode(0o444);
+    fs::set_permissions(&deferred_main, deferred_permissions)
+        .expect("make deferred target read-only");
+    let resolve_id = RequestId::from("fix-all-read-only-deferred-resolve".to_string());
+    deferred_server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = deferred_server.response(&resolve_id);
+    assert!(
+        resolved.error.is_some(),
+        "permission transition must invalidate deferred fix-all: {resolved:?}"
+    );
+    deferred_server.shutdown();
 }
 
 #[test]

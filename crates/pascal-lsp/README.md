@@ -238,8 +238,10 @@ include `source.fixAll`.
 
 The request is bounded by a 4 MiB source, 512 supported candidates, 2,048
 combined edits, 64 KiB replacement text, 4,096 retained dependency records,
-and the shared 64 KiB serialized code-action limit. Cancellation, output
-limits, or proof-budget exhaustion return no partial edit.
+the shared 64 KiB serialized code-action limit, and a request-wide 1,000,000
+work-unit/32 MiB proof and materialization budget. Candidate collection stops
+before constructing an over-limit batch. Cancellation, output limits, or
+proof-budget exhaustion return no partial edit.
 
 ### Generate missing method implementations
 

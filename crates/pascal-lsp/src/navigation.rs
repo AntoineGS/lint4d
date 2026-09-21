@@ -709,6 +709,99 @@ impl NavigationIndex {
         Ok(())
     }
 
+    /// Rebuild this retained semantic snapshot with one physical document
+    /// replaced by a transformed source. The original import bindings and
+    /// conditional contexts are copied exactly; only declaration/reference
+    /// identities are rebound from the transformed tree.
+    pub(crate) fn rebind_with_replaced_source_for_fix_all(
+        &self,
+        uri: &Url,
+        replacement: String,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Self, String> {
+        let mut result = Self::default();
+        let mut documents = self.documents.iter().collect::<Vec<_>>();
+        budget.require_work(
+            documents
+                .len()
+                .saturating_mul(binary_search_work(documents.len())),
+            cancel,
+        )?;
+        documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        for (document_uri, document) in documents {
+            check_navigation_cancel(cancel)?;
+            let source_len = if document_uri == uri {
+                replacement.len()
+            } else {
+                document.source.len()
+            };
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(source_len, cancel)?;
+            let source = if document_uri == uri {
+                replacement.clone()
+            } else {
+                document.source.to_string()
+            };
+            let cached = (document_uri != uri).then(|| document.parsed.clone());
+            result.update_with_context_and_cached_with_cancel(
+                document_uri.clone(),
+                source,
+                &document.conditional_context,
+                cached,
+                cancel,
+            )?;
+        }
+        result.auto_import_discovery_complete = self.auto_import_discovery_complete;
+        let provider_work = self
+            .auto_import_unit_providers
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        budget.require_work(
+            self.auto_import_unit_providers
+                .len()
+                .saturating_add(provider_work),
+            cancel,
+        )?;
+        budget.require_bytes(
+            self.auto_import_unit_providers
+                .iter()
+                .map(|(name, providers)| {
+                    name.len()
+                        + providers
+                            .iter()
+                            .map(|provider| provider.as_str().len())
+                            .sum::<usize>()
+                })
+                .sum(),
+            cancel,
+        )?;
+        result.auto_import_unit_providers = self.auto_import_unit_providers.clone();
+        for (document_uri, document) in &self.documents {
+            if let Some(bindings) = &document.import_bindings {
+                budget.require_work(bindings.len(), cancel)?;
+                budget.require_bytes(
+                    bindings
+                        .iter()
+                        .map(|(name, provider)| name.len() + provider.as_str().len())
+                        .sum(),
+                    cancel,
+                )?;
+                result.bind_imports(
+                    document_uri,
+                    bindings
+                        .iter()
+                        .map(|(name, provider)| (name.clone(), provider.clone())),
+                );
+            } else if document.import_binding_fingerprint.is_some() {
+                budget.require_work(1, cancel)?;
+                result.clear_import_bindings(document_uri);
+            }
+        }
+        Ok(result)
+    }
+
     pub(crate) fn reusable_documents(&self) -> Vec<(Url, Arc<ParsedDocument>)> {
         self.documents
             .iter()
@@ -12969,6 +13062,7 @@ pub(super) struct AssistanceBudget {
     work_limit: usize,
     byte_limit: usize,
     operation: &'static str,
+    exhausted: bool,
     #[cfg(test)]
     cancel_after_work: Option<usize>,
 }
@@ -12995,6 +13089,7 @@ impl AssistanceBudget {
             work_limit,
             byte_limit,
             operation,
+            exhausted: false,
             #[cfg(test)]
             cancel_after_work: None,
         }
@@ -13011,6 +13106,7 @@ impl AssistanceBudget {
         }
         if amount > self.remaining_work {
             self.remaining_work = 0;
+            self.exhausted = true;
             return Ok(false);
         }
         self.remaining_work -= amount;
@@ -13036,6 +13132,7 @@ impl AssistanceBudget {
         }
         if amount > self.remaining_bytes {
             self.remaining_bytes = 0;
+            self.exhausted = true;
             return Ok(false);
         }
         self.remaining_bytes -= amount;
@@ -13070,6 +13167,10 @@ impl AssistanceBudget {
                 self.operation, self.byte_limit
             ))
         }
+    }
+
+    pub(super) fn exhausted(&self) -> bool {
+        self.exhausted
     }
 }
 

@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
+use crate::fix::FixWorkBudget;
 use crate::rules::helpers::node_text;
+use std::sync::atomic::AtomicBool;
 
 // ---------------------------------------------------------------------------
 // Data structures for scopes
@@ -28,15 +30,33 @@ pub struct Scopes {
 // ---------------------------------------------------------------------------
 
 pub fn collect_file_scope(root: Node, source: &[u8]) -> Scopes {
+    let mut budget = None;
+    collect_file_scope_bounded(root, source, &mut budget, None)
+        .expect("unbounded scope collection cannot exhaust a budget")
+}
+
+pub(crate) fn collect_file_scope_bounded(
+    root: Node,
+    source: &[u8],
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Scopes, String> {
     let mut scopes = Scopes {
         file: HashMap::new(),
         classes: HashMap::new(),
     };
-    collect_node(root, source, &mut scopes);
-    scopes
+    collect_node(root, source, &mut scopes, budget, cancel)?;
+    Ok(scopes)
 }
 
-fn collect_node(node: Node, source: &[u8], scopes: &mut Scopes) {
+fn collect_node(
+    node: Node,
+    source: &[u8],
+    scopes: &mut Scopes,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    crate::fix::charge_budget(budget, cancel, 1, 0)?;
     match node.kind() {
         K::DECL_TYPE => {
             // Collect the type name itself.
@@ -54,7 +74,7 @@ fn collect_node(node: Node, source: &[u8], scopes: &mut Scopes) {
                 }
             }
             // Don't recurse further — class body is handled above.
-            return;
+            return Ok(());
         }
         K::DECL_CONST => {
             // Only untyped constants (typed ones have a "type" field).
@@ -62,14 +82,14 @@ fn collect_node(node: Node, source: &[u8], scopes: &mut Scopes) {
                 let name = node_text(name_node, source);
                 scopes.file.insert(name.to_lowercase(), name);
             }
-            return;
+            return Ok(());
         }
         K::DECL_VAR => {
             // Only collect file-level vars (not inside defProc/lambda).
             if !is_inside_proc(node) {
                 collect_decl_var_names(node, source, &mut scopes.file);
             }
-            return;
+            return Ok(());
         }
         K::DEF_PROC | K::LAMBDA => {
             // For method implementations, don't add their name to file scope
@@ -78,9 +98,9 @@ fn collect_node(node: Node, source: &[u8], scopes: &mut Scopes) {
             // We DON'T collect params/locals here — they are collected per-method
             // in Pass 2's check_proc.
             for child in node.children(&mut node.walk()) {
-                collect_node(child, source, scopes);
+                collect_node(child, source, scopes, budget, cancel)?;
             }
-            return;
+            return Ok(());
         }
         K::DECL_PROC => {
             // Standalone procedure declaration (not class-qualified).
@@ -94,15 +114,16 @@ fn collect_node(node: Node, source: &[u8], scopes: &mut Scopes) {
                 }
                 // genericDot means class method — skip for file scope.
             }
-            return;
+            return Ok(());
         }
         _ => {}
     }
 
     // Default: recurse into children.
     for child in node.children(&mut node.walk()) {
-        collect_node(child, source, scopes);
+        collect_node(child, source, scopes, budget, cancel)?;
     }
+    Ok(())
 }
 
 /// Collect all field names from a `declClass` or `declRecord` node.

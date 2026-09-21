@@ -8,20 +8,24 @@ use crate::rules::scope::{
     Scopes, collect_method_scope, extract_class_name, is_declaration_position, is_dot_rhs,
     is_inside_inherited, is_inside_module_name, is_inside_typeref,
 };
+use std::sync::atomic::AtomicBool;
 
+use super::FixWorkBudget;
 use super::types::{FixConfig, ProcContext, RenameMap, TextEdit};
 
 // ---------------------------------------------------------------------------
 // Collect edits
 // ---------------------------------------------------------------------------
 
-pub(crate) fn collect_edits(
+pub(crate) fn collect_edits_bounded(
     root: Node,
     source: &[u8],
     rename_map: &RenameMap,
     scopes: &Scopes,
     fix_config: &FixConfig,
-) -> Vec<TextEdit> {
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<TextEdit>, String> {
     let mut edits = Vec::new();
     walk_for_edits(
         root,
@@ -31,10 +35,13 @@ pub(crate) fn collect_edits(
         None,
         fix_config.casing,
         &mut edits,
-    );
-    edits
+        budget,
+        cancel,
+    )?;
+    Ok(edits)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_for_edits(
     node: Node,
     source: &[u8],
@@ -43,7 +50,10 @@ fn walk_for_edits(
     proc_ctx: Option<&ProcContext>,
     casing_enabled: bool,
     edits: &mut Vec<TextEdit>,
-) {
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    super::charge_budget(budget, cancel, 1, 0)?;
     if node.kind() == K::IDENTIFIER {
         resolve_and_emit(
             node,
@@ -53,8 +63,10 @@ fn walk_for_edits(
             proc_ctx,
             casing_enabled,
             edits,
-        );
-        return;
+            budget,
+            cancel,
+        )?;
+        return Ok(());
     }
 
     // Enter a new procedure scope
@@ -64,6 +76,14 @@ fn walk_for_edits(
             Some(ctx) => ctx.method_scope.clone(),
             None => HashMap::new(),
         };
+        let mut local_renames = match proc_ctx {
+            Some(ctx) => ctx.local_renames.clone(),
+            None => HashMap::new(),
+        };
+        let mut local_rename_ranges = match proc_ctx {
+            Some(ctx) => ctx.local_rename_ranges.clone(),
+            None => HashMap::new(),
+        };
         collect_method_scope(node, source, &mut method_scope);
 
         // Apply local renames for THIS procedure AND enclosing procedures.
@@ -71,10 +91,31 @@ fn walk_for_edits(
         // procedure's range is contained within it: rps <= ps && rpe >= pe.
         let ps = node.start_byte();
         let pe = node.end_byte();
-        for ((rps, rpe, old_lower), new_name) in &rename_map.local {
-            if *rps <= ps && *rpe >= pe {
-                method_scope.remove(old_lower);
-                method_scope.insert(new_name.to_lowercase(), new_name.clone());
+        let mut containing_renames = rename_map
+            .local
+            .iter()
+            .filter(|((rps, rpe, _), _)| *rps <= ps && *rpe >= pe)
+            .collect::<Vec<_>>();
+        containing_renames.sort_by(|left, right| {
+            (left.0.1 - left.0.0, left.0.0, left.0.1, &left.0.2, left.1).cmp(&(
+                right.0.1 - right.0.0,
+                right.0.0,
+                right.0.1,
+                &right.0.2,
+                right.1,
+            ))
+        });
+        for ((rps, rpe, old_lower), new_name) in containing_renames {
+            super::charge_budget(budget, cancel, 1, old_lower.len() + new_name.len())?;
+            method_scope.remove(old_lower);
+            method_scope.insert(new_name.to_lowercase(), new_name.clone());
+            let range_size = rpe - rps;
+            let replace = local_rename_ranges
+                .get(old_lower)
+                .is_none_or(|existing| range_size < *existing);
+            if replace {
+                local_renames.insert(old_lower.clone(), new_name.clone());
+                local_rename_ranges.insert(old_lower.clone(), range_size);
             }
         }
 
@@ -86,9 +127,9 @@ fn walk_for_edits(
             .cloned();
 
         let ctx = ProcContext {
-            start_byte: ps,
-            end_byte: pe,
             method_scope,
+            local_renames,
+            local_rename_ranges,
             class_fields,
         };
 
@@ -101,9 +142,11 @@ fn walk_for_edits(
                 Some(&ctx),
                 casing_enabled,
                 edits,
-            );
+                budget,
+                cancel,
+            )?;
         }
-        return;
+        return Ok(());
     }
 
     // Default: recurse into children
@@ -116,10 +159,14 @@ fn walk_for_edits(
             proc_ctx,
             casing_enabled,
             edits,
-        );
+            budget,
+            cancel,
+        )?;
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_and_emit(
     node: Node,
     source: &[u8],
@@ -128,10 +175,12 @@ fn resolve_and_emit(
     proc_ctx: Option<&ProcContext>,
     casing_enabled: bool,
     edits: &mut Vec<TextEdit>,
-) {
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
     // Always skip these (for both renames and casing fixes)
     if is_dot_rhs(node) || is_inside_inherited(node) || is_inside_module_name(node) {
-        return;
+        return Ok(());
     }
 
     let text = node_text(node, source);
@@ -141,49 +190,40 @@ fn resolve_and_emit(
     // A rename keyed to (rps, rpe) applies if this proc context is contained
     // within that range. Prefer the smallest (innermost) containing range.
     if let Some(ctx) = proc_ctx {
-        let mut best_match: Option<&str> = None;
-        let mut best_range = usize::MAX;
-        for ((rps, rpe, key), new_name) in &rename_map.local {
-            if *rps <= ctx.start_byte && *rpe >= ctx.end_byte && *key == lower {
-                let range_size = rpe - rps;
-                if range_size < best_range {
-                    best_range = range_size;
-                    best_match = Some(new_name.as_str());
-                }
-            }
-        }
-        if let Some(new_name) = best_match {
-            if text != new_name {
+        if let Some(new_name) = ctx.local_renames.get(&lower) {
+            if text != *new_name {
+                super::charge_budget(budget, cancel, 1, new_name.len())?;
                 edits.push(TextEdit {
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                     new_text: new_name.to_string(),
                 });
             }
-            return; // local rename found — don't fall through
+            return Ok(()); // local rename found — don't fall through
         }
     }
 
     // Step 2: Check file-scoped rename
     if let Some(new_name) = rename_map.file.get(&lower) {
         if text != *new_name {
+            super::charge_budget(budget, cancel, 1, new_name.len())?;
             edits.push(TextEdit {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 new_text: new_name.clone(),
             });
         }
-        return; // file rename found — don't fall through
+        return Ok(()); // file rename found — don't fall through
     }
 
     // Step 3: Identifier-casing fix (only if enabled)
     if !casing_enabled {
-        return;
+        return Ok(());
     }
 
     // For casing fixes, skip declaration positions and typerefs
     if is_declaration_position(node) || is_inside_typeref(node) {
-        return;
+        return Ok(());
     }
 
     // Look up in scope chain: method -> class fields -> file
@@ -196,6 +236,7 @@ fn resolve_and_emit(
 
     if let Some(declared_name) = declared {
         if text != *declared_name {
+            super::charge_budget(budget, cancel, 1, declared_name.len())?;
             edits.push(TextEdit {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
@@ -203,6 +244,7 @@ fn resolve_and_emit(
             });
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

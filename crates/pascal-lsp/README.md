@@ -244,9 +244,11 @@ conditional state, physical mapping, or insertion safety produces no edit.
 
 For a selected source-backed class declaration, code actions also offer one
 scoped `Implement 'TWidget.Run'` action per proven missing interface
-obligation. These actions use the custom kind `implement-interface-method`
-(and are included by a `quickfix` request); each action completes only its
-named obligation, not an unsupported or unproven "implement all" operation.
+obligation. These actions use the hierarchical kind
+`quickfix.implement-interface-method` (and are included by a `quickfix`
+request); each action completes only its named obligation, not an unsupported
+or unproven "implement all" operation. The private resolve-data discriminator
+is `implement-interface-method`.
 The action is associated with `pascal-missing-interface-implementation` when
 the requesting context supplies the matching diagnostic. A declaration is
 added only when the exact class member is absent; an existing exact
@@ -259,7 +261,10 @@ supported interface delegation. Inherited concrete implementations suppress
 generation, while abstract, compiler-only, ambiguous, conditional, parser-
 recovery, incomplete-import, unresolved-type, unsupported-generic, and
 unsupported-calling-convention contexts remain silent. Standalone implicit
-`TObject` is treated only as an empty ancestry root; compiler-provided
+`TObject` is an open compiler-member namespace: diagnostics do not claim an
+interface method is absent, and a missing declaration is withheld until a
+source-backed authoritative root is available. An exact direct class
+declaration may still receive its missing body; compiler-provided
 `IInterface`/`System` members are never invented. Interface diamonds are
 deduplicated only when their proven obligation and mapped implementation are
 identical.
@@ -1368,6 +1373,20 @@ client with code-action resolve support receives a bounded opaque action token;
 the server rechecks the declaration, source/configuration generations, rule,
 and configuration before resolving it. Clients without resolve support receive
 eager edits instead.
+
+The same request can provide one-obligation interface implementation actions.
+Their wire kind is `quickfix.implement-interface-method`, a child of
+`quickfix`; the private resolve-data discriminator is
+`implement-interface-method`. Each action is titled `Implement 'TWidget.Run'`
+and uses data version `1`. The planner only emits a source-backed, editable
+class/interface obligation whose instantiated signature, ancestry, overload
+legality, provider identities, and generated declaration/body pair remain
+proven after reanalysis. Unsupported signatures and ambiguous provider or
+collision facts are withheld rather than guessed. An implicit compiler
+`TObject` remains an open member namespace: missing declarations are withheld
+until a source-backed authoritative root is available, while an exact direct
+class declaration can still receive its missing body. Deferred interface actions recheck provider/type identity,
+source and configuration freshness, and the serialized response-size limit.
 
 The same `quickfix` request can offer `Add unit '<Unit>' to uses` for an
 unqualified identifier that is proven unresolved by the source resolver. The

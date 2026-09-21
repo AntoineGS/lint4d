@@ -1092,11 +1092,10 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
-            if obligation.implementation == ContractMatch::Yes
-                && matches!(
-                    direct_declaration,
-                    DirectInterfaceMethodDeclaration::Missing
-                )
+            if matches!(
+                direct_declaration,
+                DirectInterfaceMethodDeclaration::Missing
+            ) && obligation.implementation != ContractMatch::No
             {
                 continue;
             }
@@ -1996,14 +1995,29 @@ impl NavigationIndex {
             if !emitted_requirements.insert((identity.clone(), method_name.clone())) {
                 continue;
             }
-            let implementation = self.contract_method_implementation_status(
+            let mut implementation = self.contract_method_implementation_status(
                 &requirement,
                 &method_name,
                 &surface.routines,
                 cancel,
                 budget,
             )?;
+            // The compiler-provided TObject is an open member namespace.  An
+            // empty source-backed routine list cannot prove that *any*
+            // arbitrary requirement is absent, so keep the shared contract
+            // result uncertain.  Both semantic diagnostics and declaration
+            // generation must suppress the unproven absence claim; an exact
+            // direct class declaration may still be used for body-only work.
+            if surface.implicit_compiler_root_is_open && implementation == ContractMatch::No {
+                implementation = ContractMatch::Unknown;
+            }
             if implementation == ContractMatch::Unknown {
+                missing.push(ContractMissingInterfaceMethod {
+                    requirement,
+                    identity,
+                    method_name,
+                    implementation,
+                });
                 continue;
             }
             missing.push(ContractMissingInterfaceMethod {
@@ -2897,9 +2911,11 @@ impl NavigationIndex {
             }
             if self.contract_instance_is_synthetic_tobject_with_budget(instance, cancel, budget)? {
                 // A compiler-provided root has no source-backed member list.
-                // Keep the explicit interface proof usable for ordinary
-                // names, but retain the uncertainty for collision analysis.
-                surface.unknown_synthetic_tobject_members = true;
+                // Its namespace is therefore open: an empty local surface is
+                // not evidence that a member name is absent.  Keep that fact
+                // on the shared surface so both diagnostics and code-action
+                // collision analysis fail closed consistently.
+                surface.implicit_compiler_root_is_open = true;
                 return Ok(AncestryStatus::Complete);
             }
             self.direct_contract_routines(instance, &mut surface.routines, cancel, budget)?;
@@ -3627,6 +3643,341 @@ impl NavigationIndex {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn contract_type_fingerprint_with_budget(
+        &self,
+        uri: &Url,
+        type_ref: &TypeRef,
+        substitution: &GenericSubstitution,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<ContractTypeFingerprint>, String> {
+        let Some(resolved) = self.resolve_contract_type_ref_with_budget(
+            uri,
+            type_ref,
+            substitution,
+            None,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.contract_type_fingerprint_for_resolved_with_budget(
+            &resolved,
+            cancel,
+            budget,
+            &mut HashSet::new(),
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_contract_type_ref_with_budget(
+        &self,
+        uri: &Url,
+        type_ref: &TypeRef,
+        substitution: &GenericSubstitution,
+        scope_override: Option<usize>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<ResolvedType>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        let Some(lookup_identifier) = self.contract_lookup_identifier_with_budget(
+            document,
+            type_ref.span,
+            cancel,
+            budget,
+            "contract type fingerprint",
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut state = ResolutionState::new();
+        let receivers = self.type_receivers_for_type_ref_with_budget(
+            uri,
+            document,
+            type_ref.span.start,
+            type_ref,
+            lookup_identifier,
+            scope_override,
+            substitution,
+            &mut state,
+            cancel,
+            budget,
+        )?;
+        if state.receiver_resolution_uncertain() {
+            return Ok(None);
+        }
+        Ok(resolved_type_from_receivers(receivers))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_type_fingerprint_for_resolved_with_budget(
+        &self,
+        resolved: &ResolvedType,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        depth: usize,
+    ) -> Result<Option<ContractTypeFingerprint>, String> {
+        if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
+            return Ok(None);
+        }
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        match resolved {
+            ResolvedType::Builtin(builtin) => Ok(Some(ContractTypeFingerprint::Builtin(*builtin))),
+            ResolvedType::IntegerLiteral(value) => {
+                Ok(Some(ContractTypeFingerprint::IntegerLiteral(*value)))
+            }
+            ResolvedType::Named(instance) => {
+                let Some(candidate) = self.type_symbol_candidate(instance) else {
+                    return Ok(None);
+                };
+                let Some(symbol) = self.symbol(&candidate) else {
+                    return Ok(None);
+                };
+                if symbol.generic_parameter.is_some() {
+                    return Ok(None);
+                }
+                let alias_key = (
+                    instance.uri.clone(),
+                    instance.key.clone(),
+                    instance.substitution.clone(),
+                );
+                if !active_aliases.insert(alias_key.clone()) {
+                    return Ok(None);
+                }
+                let fingerprint = (|| {
+                    let mut args = Vec::with_capacity(instance.parameter_names.len());
+                    for name in &instance.parameter_names {
+                        let Some(argument) = instance.substitution.get(name) else {
+                            return Ok(None);
+                        };
+                        let Some(argument) = self
+                            .contract_type_fingerprint_for_resolved_with_budget(
+                                argument,
+                                cancel,
+                                budget,
+                                active_aliases,
+                                depth.saturating_add(1),
+                            )?
+                        else {
+                            return Ok(None);
+                        };
+                        args.push(argument);
+                    }
+
+                    let definition = if let Some(alias_ref) = symbol
+                        .type_ref
+                        .as_ref()
+                        .filter(|_| symbol.type_kind == TypeKind::Other)
+                    {
+                        let underlying = self.resolve_contract_type_ref_with_budget(
+                            &instance.uri,
+                            alias_ref,
+                            &instance.substitution,
+                            Some(symbol.scope),
+                            cancel,
+                            budget,
+                        )?;
+                        match underlying {
+                            Some(underlying) => {
+                                let Some(underlying) = self
+                                    .contract_type_fingerprint_for_resolved_with_budget(
+                                        &underlying,
+                                        cancel,
+                                        budget,
+                                        active_aliases,
+                                        depth.saturating_add(1),
+                                    )?
+                                else {
+                                    return Ok(None);
+                                };
+                                ContractTypeDefinitionFingerprint::Alias(Box::new(underlying))
+                            }
+                            None => {
+                                let Some(source) = self
+                                    .contract_type_definition_source_fingerprint(
+                                        &instance.uri,
+                                        symbol,
+                                        cancel,
+                                        budget,
+                                    )?
+                                else {
+                                    return Ok(None);
+                                };
+                                ContractTypeDefinitionFingerprint::Source(source)
+                            }
+                        }
+                    } else if let Some(shape) = symbol.type_shape.as_ref() {
+                        let shape = self.contract_type_shape_fingerprint_with_budget(
+                            &instance.uri,
+                            shape,
+                            &instance.substitution,
+                            Some(symbol.scope),
+                            cancel,
+                            budget,
+                            active_aliases,
+                            depth.saturating_add(1),
+                        )?;
+                        match shape {
+                            Some(shape) => {
+                                ContractTypeDefinitionFingerprint::Shape(Box::new(shape))
+                            }
+                            None => {
+                                let Some(source) = self
+                                    .contract_type_definition_source_fingerprint(
+                                        &instance.uri,
+                                        symbol,
+                                        cancel,
+                                        budget,
+                                    )?
+                                else {
+                                    return Ok(None);
+                                };
+                                ContractTypeDefinitionFingerprint::Source(source)
+                            }
+                        }
+                    } else if symbol.type_kind == TypeKind::Other {
+                        let Some(source) = self.contract_type_definition_source_fingerprint(
+                            &instance.uri,
+                            symbol,
+                            cancel,
+                            budget,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        ContractTypeDefinitionFingerprint::Source(source)
+                    } else {
+                        ContractTypeDefinitionFingerprint::Opaque
+                    };
+
+                    Ok(Some(ContractTypeFingerprint::Named {
+                        uri: instance.uri.clone(),
+                        key: instance.key.clone(),
+                        kind: instance.kind,
+                        args,
+                        definition,
+                    }))
+                })();
+                active_aliases.remove(&alias_key);
+                fingerprint
+            }
+        }
+    }
+
+    fn contract_type_definition_source_fingerprint(
+        &self,
+        uri: &Url,
+        symbol: &Symbol,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<String>, String> {
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(None);
+        };
+        let Some(source) = document
+            .source
+            .get(symbol.declaration_span.start..symbol.declaration_span.end)
+        else {
+            return Ok(None);
+        };
+        let fingerprint = normalized_contract_type_definition(source);
+        budget.require_bytes(fingerprint.len(), cancel)?;
+        Ok((!fingerprint.is_empty()).then_some(fingerprint))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_type_shape_fingerprint_with_budget(
+        &self,
+        uri: &Url,
+        shape: &TypeShape,
+        substitution: &GenericSubstitution,
+        scope_override: Option<usize>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        depth: usize,
+    ) -> Result<Option<ContractTypeShapeFingerprint>, String> {
+        if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
+            return Ok(None);
+        }
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        match shape {
+            TypeShape::Named(type_ref) => {
+                let Some(resolved) = self.resolve_contract_type_ref_with_budget(
+                    uri,
+                    type_ref,
+                    substitution,
+                    scope_override,
+                    cancel,
+                    budget,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(fingerprint) = self.contract_type_fingerprint_for_resolved_with_budget(
+                    &resolved,
+                    cancel,
+                    budget,
+                    active_aliases,
+                    depth.saturating_add(1),
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ContractTypeShapeFingerprint::Named(Box::new(
+                    fingerprint,
+                ))))
+            }
+            TypeShape::Pointer(element) => {
+                let Some(element) = self.contract_type_shape_fingerprint_with_budget(
+                    uri,
+                    element,
+                    substitution,
+                    scope_override,
+                    cancel,
+                    budget,
+                    active_aliases,
+                    depth.saturating_add(1),
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ContractTypeShapeFingerprint::Pointer(Box::new(
+                    element,
+                ))))
+            }
+            TypeShape::Array { element, dynamic } => {
+                let Some(element) = self.contract_type_shape_fingerprint_with_budget(
+                    uri,
+                    element,
+                    substitution,
+                    scope_override,
+                    cancel,
+                    budget,
+                    active_aliases,
+                    depth.saturating_add(1),
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ContractTypeShapeFingerprint::Array {
+                    element: Box::new(element),
+                    dynamic: *dynamic,
+                }))
+            }
+            TypeShape::Callable => Ok(Some(ContractTypeShapeFingerprint::Callable)),
+            TypeShape::Unknown => Ok(None),
+        }
+    }
+
     fn contract_method_implementation_status(
         &self,
         requirement: &ContractRequirement,
@@ -3763,7 +4114,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<bool, String> {
-        if surface.unknown_synthetic_tobject_members && synthetic_tobject_member_name(method_name) {
+        if surface.implicit_compiler_root_is_open {
             return Ok(false);
         }
         if surface
@@ -11602,6 +11953,43 @@ pub(super) enum TypeIdentity {
     },
 }
 
+/// A deferred interface action needs more than nominal `TypeIdentity`: a
+/// provider can keep the same named alias while changing its effective array,
+/// pointer, or strong-typedef definition.  This bounded structural identity
+/// freezes that meaning without weakening the nominal conformance relation
+/// used by the rest of navigation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ContractTypeFingerprint {
+    Builtin(BuiltinType),
+    IntegerLiteral(i128),
+    Named {
+        uri: Url,
+        key: String,
+        kind: TypeKind,
+        args: Vec<ContractTypeFingerprint>,
+        definition: ContractTypeDefinitionFingerprint,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ContractTypeDefinitionFingerprint {
+    Alias(Box<ContractTypeFingerprint>),
+    Shape(Box<ContractTypeShapeFingerprint>),
+    Source(String),
+    Opaque,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ContractTypeShapeFingerprint {
+    Named(Box<ContractTypeFingerprint>),
+    Pointer(Box<ContractTypeShapeFingerprint>),
+    Array {
+        element: Box<ContractTypeShapeFingerprint>,
+        dynamic: bool,
+    },
+    Callable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TypeRef {
     path: Vec<String>,
@@ -12231,6 +12619,7 @@ impl ContractRequirement {
             cancel,
         )?;
         let mut parameter_types = Vec::with_capacity(symbol.routine_parameters.len());
+        let mut parameter_fingerprints = Vec::with_capacity(symbol.routine_parameters.len());
         for parameter in &symbol.routine_parameters {
             parameter_types.push(
                 parameter
@@ -12248,12 +12637,42 @@ impl ContractRequirement {
                     .transpose()?
                     .flatten(),
             );
+            parameter_fingerprints.push(
+                parameter
+                    .type_ref
+                    .as_ref()
+                    .map(|type_ref| {
+                        index.contract_type_fingerprint_with_budget(
+                            &self.candidate.uri,
+                            type_ref,
+                            &self.substitution,
+                            cancel,
+                            budget,
+                        )
+                    })
+                    .transpose()?
+                    .flatten(),
+            );
         }
         let result_type = symbol
             .result_type_ref
             .as_ref()
             .map(|type_ref| {
                 index.contract_type_identity_with_budget(
+                    &self.candidate.uri,
+                    type_ref,
+                    &self.substitution,
+                    cancel,
+                    budget,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let result_fingerprint = symbol
+            .result_type_ref
+            .as_ref()
+            .map(|type_ref| {
+                index.contract_type_fingerprint_with_budget(
                     &self.candidate.uri,
                     type_ref,
                     &self.substitution,
@@ -12282,6 +12701,15 @@ impl ContractRequirement {
                     .map_or(0, |_| std::mem::size_of::<TypeIdentity>()),
             cancel,
         )?;
+        budget.require_bytes(
+            parameter_fingerprints
+                .len()
+                .saturating_mul(std::mem::size_of::<ContractTypeFingerprint>())
+                + result_fingerprint
+                    .as_ref()
+                    .map_or(0, |_| std::mem::size_of::<ContractTypeFingerprint>()),
+            cancel,
+        )?;
         Ok(ContractRequirementIdentity {
             name: symbol.key.clone(),
             signature: symbol.routine_signature.clone(),
@@ -12291,6 +12719,8 @@ impl ContractRequirement {
             substitution: self.substitution.clone(),
             parameter_types,
             result_type,
+            parameter_fingerprints,
+            result_fingerprint,
             header,
         })
     }
@@ -12328,6 +12758,8 @@ struct ContractRequirementIdentity {
     substitution: GenericSubstitution,
     parameter_types: Vec<Option<TypeIdentity>>,
     result_type: Option<TypeIdentity>,
+    parameter_fingerprints: Vec<Option<ContractTypeFingerprint>>,
+    result_fingerprint: Option<ContractTypeFingerprint>,
     header: Option<String>,
 }
 
@@ -12361,7 +12793,7 @@ struct ContractClassSurface {
     nonroutine_names: HashSet<String>,
     method_resolutions: Vec<MethodResolution>,
     delegations: Vec<InterfaceDelegation>,
-    unknown_synthetic_tobject_members: bool,
+    implicit_compiler_root_is_open: bool,
 }
 
 type ContractInterfaceIdentity = (Url, String, GenericSubstitution);
@@ -12380,54 +12812,6 @@ fn contract_substitution_is_complete(instance: &TypeInstance) -> bool {
         .parameter_names
         .iter()
         .all(|name| instance.substitution.get(name).is_some())
-}
-
-/// Names supplied by Delphi's compiler-provided `TObject` that are relevant
-/// to interface implementation collisions.  The synthetic-root model cannot
-/// enumerate every compiler member, so only these stable, well-known members
-/// are used as a conservative collision boundary; unknown names retain the
-/// existing standalone-source assistance behavior.
-fn synthetic_tobject_member_name(name: &str) -> bool {
-    matches!(
-        canonical_name(name).as_str(),
-        "afterconstruction"
-            | "beforedestruction"
-            | "cleanupinstance"
-            | "classname"
-            | "classnameis"
-            | "classinfo"
-            | "classinstance"
-            | "classparent"
-            | "classtype"
-            | "defaultinstance"
-            | "defaulthandler"
-            | "destroy"
-            | "dispatch"
-            | "equals"
-            | "fieldaddress"
-            | "free"
-            | "freeinstance"
-            | "gethashcode"
-            | "getinterface"
-            | "getinterfaceentry"
-            | "getinterfacetable"
-            | "inheritsfrom"
-            | "initinstance"
-            | "instancekind"
-            | "instancesize"
-            | "methodaddress"
-            | "methodname"
-            | "newinstance"
-            | "queryinterface"
-            | "safecallexception"
-            | "tostring"
-            | "qualifiedclassname"
-            | "unitname"
-            | "unitscope"
-            | "_addref"
-            | "_queryinterface"
-            | "_release"
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15356,6 +15740,64 @@ fn type_shape_from_node(node: Node<'_>, source: &str) -> Option<TypeShape> {
     }
 }
 
+fn normalized_contract_type_definition(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\'' {
+            // Keep string/character literals byte-for-byte meaningful while
+            // normalizing identifiers around them.  Comment markers inside a
+            // literal are data, not source comments.
+            result.push(character);
+            while let Some(next) = chars.next() {
+                result.push(next);
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        if let Some(escaped_quote) = chars.next() {
+                            result.push(escaped_quote);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' || next == '\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '{' {
+            for next in chars.by_ref() {
+                if next == '}' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '(' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for next in chars.by_ref() {
+                if previous == '*' && next == ')' {
+                    break;
+                }
+                previous = next;
+            }
+            continue;
+        }
+        if !character.is_whitespace() {
+            result.push(character.to_ascii_lowercase());
+        }
+    }
+    result
+}
+
 fn type_ref_from_node_at_depth(node: Node<'_>, source: &str, depth: usize) -> Option<TypeRef> {
     if depth >= MAX_TYPE_REF_RECURSION_DEPTH {
         return None;
@@ -16466,9 +16908,6 @@ fn append_qualified_default_replacements(
     budget: &mut AssistanceBudget,
     replacements: &mut Vec<(usize, usize, String)>,
 ) -> Result<bool, String> {
-    if source_uri == destination_uri {
-        return Ok(true);
-    }
     let Some(document) = index.documents.get(source_uri) else {
         return Ok(false);
     };
@@ -16486,6 +16925,89 @@ fn append_qualified_default_replacements(
             }
         });
         budget.require_work(identifiers.len(), cancel)?;
+
+        // A declaration and its implementing class can have different
+        // lexical scopes even when they live in the same unit.  A named
+        // default in the interface can therefore be shadowed by a class
+        // member.  Unit qualification is not uniformly legal for every
+        // Pascal expression, so refuse non-literal same-unit defaults unless
+        // there is no identifier to rebind.
+        if source_uri == destination_uri
+            && identifiers.iter().any(|identifier| {
+                source
+                    .get(identifier.start_byte()..identifier.end_byte())
+                    .is_none_or(|name| !builtin_default_value(name))
+            })
+        {
+            return Ok(false);
+        }
+
+        if source_uri != destination_uri {
+            // Qualified expressions were previously treated as self-proving
+            // and copied verbatim.  Resolve their left-most qualifier in the
+            // provider scope.  A source-backed type/value can be made stable
+            // by qualifying it with the provider unit; an already unit-
+            // qualified expression is stable as written.  Anything else is
+            // deliberately unsupported rather than guessed through a target
+            // scope shadow.
+            let Some(root) = identifiers
+                .iter()
+                .min_by_key(|identifier| identifier.start_byte())
+            else {
+                continue;
+            };
+            if identifier_is_qualified(*root, default) {
+                let root_span = Span::from_node(*root);
+                let Some(name) = source.get(root_span.start..root_span.end) else {
+                    return Ok(false);
+                };
+                let mut state = ResolutionState::new();
+                let candidates = index.unqualified_references_with_budget_and_state(
+                    source_uri,
+                    document,
+                    root_span.start,
+                    name,
+                    *root,
+                    &mut state,
+                    cancel,
+                    budget,
+                )?;
+                if candidates.len() != 1 {
+                    return Ok(false);
+                }
+                let candidate = &candidates[0];
+                let Some(symbol) = index.symbol(candidate) else {
+                    return Ok(false);
+                };
+                if candidate.uri != *source_uri {
+                    return Ok(false);
+                }
+                if symbol.kind == SymbolKind::Unit {
+                    // `Provider.TDefaults.Value` already names the provider
+                    // unit and must not be qualified a second time.
+                } else if matches!(
+                    symbol.kind,
+                    SymbolKind::Constant
+                        | SymbolKind::EnumValue
+                        | SymbolKind::Routine
+                        | SymbolKind::Type
+                        | SymbolKind::Variable
+                        | SymbolKind::Property
+                ) {
+                    let Some(unit) = index.unit_display_name(&candidate.uri) else {
+                        return Ok(false);
+                    };
+                    budget.require_bytes(
+                        unit.len().saturating_add(name.len()).saturating_add(1),
+                        cancel,
+                    )?;
+                    replacements.push((root_span.start, root_span.end, format!("{unit}.{name}")));
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
+
         for identifier in identifiers {
             check_navigation_cancel(cancel)?;
             let span = Span::from_node(identifier);
@@ -18357,6 +18879,39 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.kind != SemanticDiagnosticKind::InvalidOverride),
             "an implicit TObject root is not a proven empty ancestor: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_an_implicit_tobject_interface_absence_unknown() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-implicit-tobject-interface.pas")
+            .expect("implicit TObject interface URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsImplicitTObjectInterface;\n",
+            "interface\n",
+            "type\n",
+            "  IRequired = interface\n",
+            "    function ToString: string;\n",
+            "  end;\n",
+            "  TChild = class(TObject, IRequired)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("implicit TObject interface fixture parses");
+
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("semantic diagnostics complete");
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.kind != SemanticDiagnosticKind::MissingInterfaceImplementation
+            }),
+            "an implicit compiler root cannot prove ToString absent: {diagnostics:?}"
         );
     }
 

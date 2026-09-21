@@ -32006,6 +32006,8 @@ fn code_action_generates_a_missing_interface_method_declaration_and_implementati
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  IRunner = interface\n",
         "    procedure Run(Value: Integer = 1);\n",
         "  end;\n",
@@ -32088,6 +32090,8 @@ fn code_action_generates_a_missing_interface_method_declaration_and_implementati
             "unit Widget;\n",
             "interface\n",
             "type\n",
+            "  TObject = class\n",
+            "  end;\n",
             "  IRunner = interface\n",
             "    procedure Run(Value: Integer = 1);\n",
             "  end;\n",
@@ -32158,6 +32162,8 @@ fn code_action_creates_a_public_section_when_the_class_has_no_visibility_section
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  IRunner = interface\n",
         "    procedure Run;\n",
         "  end;\n",
@@ -32270,6 +32276,8 @@ fn deferred_interface_action_rejects_an_implementation_added_after_creation() {
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  IRunner = interface\n",
         "    procedure Run;\n",
         "  end;\n",
@@ -32316,6 +32324,8 @@ fn deferred_interface_action_resolves_to_the_same_validated_workspace_edit() {
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  IRunner = interface\n",
         "    procedure Run(Value: Integer = 1);\n",
         "  end;\n",
@@ -32363,6 +32373,8 @@ fn code_action_renders_an_instantiated_generic_interface_signature() {
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  IRunner<T> = interface\n",
         "    procedure Run(Value: T);\n",
         "  end;\n",
@@ -32409,6 +32421,8 @@ fn code_action_recursively_substitutes_nested_instantiated_generic_interface_typ
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  TBox<T> = class end;\n",
         "  IRunner<T> = interface\n",
         "    procedure Run(Value: TBox<T>);\n",
@@ -32477,6 +32491,8 @@ fn code_action_qualifies_imported_interface_types_and_defaults_in_the_destinatio
         "  DefaultValue = 2;\n",
         "type\n",
         "  TValue = class end;\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  TWidget = class(TObject, IRunner)\n",
         "  end;\n",
         "implementation\n",
@@ -32531,6 +32547,8 @@ fn code_action_qualifies_named_generic_substitutions_from_an_imported_provider()
         "interface\n",
         "uses Provider;\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  TWidget = class(TObject, IRunner<TValue>)\n",
         "  end;\n",
         "implementation\n",
@@ -32560,6 +32578,107 @@ fn code_action_qualifies_named_generic_substitutions_from_an_imported_provider()
         "generated signature changed the provider substitution identity: {updated}"
     );
     assert_applied_method_source_parses(&updated, "imported-generic-substitution-scope-action");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_does_not_rebind_qualified_or_same_unit_default_expressions() {
+    let qualified_temp = tempfile::tempdir().expect("qualified-default workspace");
+    let qualified_root = qualified_temp.path().join("fixture");
+    let provider = qualified_root.join("Provider.pas");
+    let widget = qualified_root.join("Widget.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "type\n",
+        "  TDefaults = class\n",
+        "  public\n",
+        "    const Value = 1;\n",
+        "  end;\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer = TDefaults.Value);\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "type\n",
+        "  TObject = class\n",
+        "  end;\n",
+        "  TDefaults = class\n",
+        "  public\n",
+        "    const Value = 2;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&widget, widget_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&qualified_root, Value::Null);
+    let qualified_actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "qualified-default-scope",
+    );
+    assert_eq!(
+        qualified_actions.len(),
+        1,
+        "a source-backed qualified default should be renderable: {qualified_actions:?}"
+    );
+    let updated =
+        apply_workspace_edit_to_source(widget_source, &qualified_actions[0]["edit"], &uri(&widget));
+    assert!(
+        updated.contains("procedure Run(Value: Integer = Provider.TDefaults.Value);")
+            && updated.contains("procedure TWidget.Run(Value: Integer);")
+            && !updated.contains("procedure TWidget.Run(Value: Integer = TDefaults.Value);")
+    );
+    server.shutdown();
+
+    let same_unit_temp = tempfile::tempdir().expect("same-unit-default workspace");
+    let same_unit_root = same_unit_temp.path().join("fixture");
+    let same_unit = same_unit_root.join("Widget.pas");
+    let same_unit_source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "const\n",
+        "  DefaultValue = 1;\n",
+        "type\n",
+        "  TObject = class\n",
+        "  end;\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer = DefaultValue);\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  public\n",
+        "    const DefaultValue = 2;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&same_unit, same_unit_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&same_unit_root, Value::Null);
+    let same_unit_actions = request_missing_unit_actions(
+        &mut server,
+        &same_unit,
+        same_unit_source,
+        "TWidget",
+        "same-unit-class-default",
+    );
+    assert!(
+        same_unit_actions.is_empty(),
+        "a same-unit class-shadowed default is unsupported and must be withheld: {same_unit_actions:?}"
+    );
     server.shutdown();
 }
 
@@ -32677,6 +32796,85 @@ fn code_action_withholds_interface_methods_colliding_with_synthetic_or_imported_
 }
 
 #[test]
+fn code_action_withholds_all_unknown_implicit_tobject_member_collisions() {
+    for (index, (requirement, expected_actions)) in [
+        ("procedure DisposeOf;", 0),
+        ("procedure Create;", 0),
+        ("function ToString: string;", 0),
+        ("procedure Run;", 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().expect("implicit-root workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Widget.pas");
+        let source = format!(
+            "unit Widget;\ninterface\ntype\n  IRunner = interface\n    {requirement}\n  end;\n  TWidget = class(TObject, IRunner)\n  end;\nimplementation\nend.\n"
+        );
+        write_file(&source_path, &source);
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &source_path,
+            &source,
+            "TWidget",
+            &format!("implicit-root-open-{index}"),
+        );
+        assert_eq!(
+            actions.len(),
+            expected_actions,
+            "implicit compiler root handling for {requirement}: {actions:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn code_action_keeps_a_missing_method_with_a_source_backed_empty_tobject() {
+    let temp = tempfile::tempdir().expect("source-backed-root workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let widget = root.join("Widget.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype\n  TObject = class\n  end;\nimplementation\nend.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&widget, widget_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "source-backed-empty-tobject-positive",
+    );
+    assert_eq!(
+        actions.len(),
+        1,
+        "a complete source-backed empty TObject remains a valid absence proof: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn deferred_interface_action_freezes_provider_alias_meaning() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -32690,6 +32888,7 @@ fn deferred_interface_action_freezes_provider_alias_meaning() {
     );
     let widget_source = concat!(
         "unit Widget;\ninterface\nuses Provider;\ntype\n",
+        "  TObject = class\n  end;\n",
         "  TWidget = class(TObject, IRunner)\n  end;\n",
         "implementation\nend.\n",
     );
@@ -32720,10 +32919,87 @@ fn deferred_interface_action_freezes_provider_alias_meaning() {
 }
 
 #[test]
+fn deferred_interface_action_freezes_structural_provider_type_meaning() {
+    let cases = [
+        ("array", "array of Integer", "array of string"),
+        ("pointer", "^Integer", "^string"),
+        ("strong", "type Integer", "type string"),
+    ];
+
+    for (label, initial_type, changed_type) in cases {
+        let temp = tempfile::tempdir().expect("structural-alias workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let widget = root.join("Widget.pas");
+        let provider_source = format!(
+            "unit Provider;\ninterface\ntype\n  TValue = {initial_type};\n  IRunner = interface\n    procedure Run(Value: TValue);\n  end;\nimplementation\nend.\n"
+        );
+        let widget_source = concat!(
+            "unit Widget;\n",
+            "interface\n",
+            "uses Provider;\n",
+            "type\n",
+            "  TObject = class\n",
+            "  end;\n",
+            "  TWidget = class(TObject, IRunner)\n",
+            "  end;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        write_file(&provider, &provider_source);
+        write_file(&widget, widget_source);
+
+        let mut server = TestServer::launch();
+        server.initialize_with_action_support(&root, Value::Null);
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &widget,
+            widget_source,
+            "TWidget",
+            &format!("provider-structural-freeze-{label}"),
+        );
+        assert_eq!(
+            actions.len(),
+            1,
+            "{label} structural alias must be initially supported: {actions:?}"
+        );
+
+        write_file(
+            &provider,
+            &format!("{provider_source}// unrelated provider comment\n"),
+        );
+        let noop_resolve_id = RequestId::from(format!("provider-structural-noop-{label}"));
+        server.send_request(
+            noop_resolve_id.clone(),
+            "codeAction/resolve",
+            actions[0].clone(),
+        );
+        let noop_response = server.response(&noop_resolve_id);
+        assert!(
+            noop_response.error.is_none(),
+            "{label} unrelated provider comment must preserve deferred action: {noop_response:?}"
+        );
+
+        write_file(
+            &provider,
+            &provider_source.replace(initial_type, changed_type),
+        );
+        let resolve_id = RequestId::from(format!("provider-structural-freeze-resolve-{label}"));
+        server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+        let response = server.response(&resolve_id);
+        assert!(
+            response.error.is_some(),
+            "{label} provider type meaning change must stale deferred action: {response:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
 fn deferred_interface_resolve_enforces_the_serialized_action_bound() {
     let comment = "\"".repeat(16_200);
     let source = format!(
-        "unit Widget;\ninterface\ntype\n  IRunner = interface\n    procedure Run({{{comment}}} Value: Integer);\n  end;\n  TWidget = class(TObject, IRunner)\n  end;\nimplementation\nend.\n"
+        "unit Widget;\ninterface\ntype\n  TObject = class\n  end;\n  IRunner = interface\n    procedure Run({{{comment}}} Value: Integer);\n  end;\n  TWidget = class(TObject, IRunner)\n  end;\nimplementation\nend.\n"
     );
     let temp = tempfile::tempdir().expect("serialized interface workspace");
     let root = temp.path().join("fixture");
@@ -32778,6 +33054,8 @@ fn code_action_keeps_distinct_supported_interface_overloads_distinct() {
         "unit Widget;\n",
         "interface\n",
         "type\n",
+        "  TObject = class\n",
+        "  end;\n",
         "  IRunner = interface\n",
         "    procedure Run(Value: Integer); overload;\n",
         "    procedure Run(Value: string); overload;\n",
@@ -32819,6 +33097,8 @@ fn code_action_preserves_bom_crlf_and_utf16_class_ranges() {
         "\u{feff}unit Widget;\r\n",
         "interface\r\n",
         "type\r\n",
+        "  TObject = class\r\n",
+        "  end;\r\n",
         "  IRunner = interface\r\n",
         "    procedure Run;\r\n",
         "  end;\r\n",

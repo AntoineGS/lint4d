@@ -1455,9 +1455,11 @@ hazard, exported names are disjoint, and the removed spelling is not used as a
 qualified reference. Project and namespace aliases therefore require a proof
 of the resolved provider *and* of the removed spelling; the qualified-use
 check is parsed-syntax based and covers escaped, spaced, commented, and
-namespace-qualified paths. Unsupported or ambiguous alias forms are withheld
-rather than guessed. The retained first occurrence and the relative order of
-distinct providers are preserved. Relative alphabetical
+namespace-qualified paths. The extraction walks each top-level qualified path
+once, charges node storage/source bytes, polls cancellation, and withholds
+paths beyond 128 qualified-path nodes. Unsupported, deep, or ambiguous alias
+forms are withheld rather than guessed. The retained first occurrence and the
+relative order of distinct providers are preserved. Relative alphabetical
 ordering is offered only when every selected provider is complete source, has
 no initialization/finalization section or helper, has no dependency closure,
 and has no exported-name conflict. Otherwise the original relative order is
@@ -1549,7 +1551,9 @@ Organize-imports planning is capped at 64 `uses` clauses, 512 entries, 64 KiB
 per clause, and 64 KiB of generated edit text in one request. Provider facts
 use request-local shared immutable cache entries; export-conflict comparisons,
 variable-length identity work, bounded ordering, and edit planning share the
-request-wide 300,000-work-unit and 8 MiB source-byte assistance budget.
+request-wide 300,000-work-unit and 8 MiB source-byte assistance budget. Parsed
+qualified-alias paths are limited to 128 dot nodes and fail closed when the
+shape, depth, node-storage, source-byte, or cancellation bound is uncertain.
 Cancellation or exhaustion withholds the optional action. Its serialized
 code-action response remains subject to the shared 64 KiB response bound.
 Missing-unit discovery, absence checking, and every post-edit binding proof

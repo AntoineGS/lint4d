@@ -114,6 +114,10 @@ thread_local! {
     static TEST_CANCEL_AFTER_CONTRACT_INTERFACE: Cell<bool> = const { Cell::new(false) };
     static TEST_CANCEL_AFTER_SEMANTIC_SUBSCRIPT_CHILD: Cell<bool> = const { Cell::new(false) };
     static TEST_DOCUMENT_PARSE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static TEST_QUALIFIED_IDENTIFIER_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_CANCEL_AFTER_QUALIFIED_IDENTIFIER_NODE_VISITS: Cell<Option<usize>> =
+        const { Cell::new(None) };
+    static TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -124,6 +128,37 @@ fn test_record_materialization(counter: &'static std::thread::LocalKey<Cell<usiz
 #[cfg(test)]
 fn test_materialization_count(counter: &'static std::thread::LocalKey<Cell<usize>>) -> usize {
     counter.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_reset_qualified_identifier_work() {
+    TEST_QUALIFIED_IDENTIFIER_NODE_VISITS.with(|value| value.set(0));
+    TEST_CANCEL_AFTER_QUALIFIED_IDENTIFIER_NODE_VISITS.with(|value| value.set(None));
+    TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED.with(|value| value.set(false));
+}
+
+#[cfg(test)]
+fn test_qualified_identifier_node_visits() -> usize {
+    TEST_QUALIFIED_IDENTIFIER_NODE_VISITS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_cancel_after_qualified_identifier_node_visits(visits: usize) {
+    TEST_CANCEL_AFTER_QUALIFIED_IDENTIFIER_NODE_VISITS.with(|value| value.set(Some(visits)));
+}
+
+#[cfg(test)]
+fn test_record_qualified_identifier_node_visit() {
+    let visits = TEST_QUALIFIED_IDENTIFIER_NODE_VISITS.with(|value| {
+        let visits = value.get().saturating_add(1);
+        value.set(visits);
+        visits
+    });
+    TEST_CANCEL_AFTER_QUALIFIED_IDENTIFIER_NODE_VISITS.with(|limit| {
+        if limit.get().is_some_and(|limit| visits >= limit) {
+            TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED.with(|requested| requested.set(true));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -438,6 +473,7 @@ pub(crate) const MAX_MISSING_UNIT_REQUEST_WORK: usize = 300_000;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
 const MAX_CONTRACT_ANCESTRY_DEPTH: usize = 256;
+const MAX_QUALIFIED_IMPORT_ALIAS_PATH_NODES: usize = 128;
 
 /// Metadata for one unit imported by a document's `uses` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -742,48 +778,43 @@ impl NavigationIndex {
             return Ok(true);
         };
         budget.require_bytes(spelling.len(), cancel)?;
-        let expected = spelling.split('.').collect::<Vec<_>>();
-        if expected.iter().any(|part| part.is_empty()) {
-            return Ok(true);
+        for part in spelling.split('.') {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            check_navigation_cancel(cancel)?;
+            if part.is_empty() {
+                return Ok(true);
+            }
         }
+        budget.require_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
         let mut pending = vec![document.tree.root_node()];
         while let Some(node) = pending.pop() {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
+            check_navigation_cancel(cancel)?;
             if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot") {
                 let span = Span::from_node(node);
                 if span.start < clause.end && span.end > clause.start {
                     // The import clause itself is not a use of its spelling.
-                } else if let Some(parts) = qualified_identifier_nodes(node) {
-                    if parts.len() > expected.len() {
-                        let mut matches = true;
-                        for (part, expected_part) in parts.iter().zip(expected.iter()) {
-                            let actual = document
-                                .source
-                                .get(part.start_byte()..part.end_byte())
-                                .unwrap_or_default();
-                            budget.require_work(1, cancel)?;
-                            budget.require_bytes(actual.len(), cancel)?;
-                            if !canonical_identifier_eq(actual, expected_part) {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        if matches {
-                            return Ok(true);
-                        }
+                } else if !is_nested_qualified_identifier_node(node) {
+                    match qualified_identifier_matches_spelling_with_budget(
+                        node,
+                        &document.source,
+                        spelling,
+                        cancel,
+                        budget,
+                    )? {
+                        Some(true) => return Ok(true),
+                        Some(false) => {}
+                        None => return Ok(true),
                     }
-                } else {
-                    return Ok(true);
                 }
             }
             let mut cursor = node.walk();
-            pending.extend(
-                node.children(&mut cursor)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev(),
-            );
+            for child in node.children(&mut cursor) {
+                budget.require_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+                pending.push(child);
+            }
         }
         Ok(false)
     }
@@ -12945,6 +12976,10 @@ pub(super) struct AssistanceBudget {
 fn check_navigation_cancel(cancel: &AtomicBool) -> Result<(), String> {
     #[cfg(test)]
     test_cancel_after_semantic_ancestry_if_requested(cancel);
+    #[cfg(test)]
+    if TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED.with(Cell::get) {
+        cancel.store(true, Ordering::Relaxed);
+    }
     if cancel.load(Ordering::Relaxed) {
         Err("request cancelled".to_string())
     } else {
@@ -16985,22 +17020,139 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-fn qualified_identifier_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
-    let mut pending = vec![node];
-    let mut parts = Vec::new();
-    while let Some(current) = pending.pop() {
-        match current.kind() {
-            "identifier" => parts.push(current),
-            "exprDot" | "genericDot" | "typerefDot" => {
-                let lhs = current.child_by_field_name("lhs")?;
-                let rhs = current.child_by_field_name("rhs")?;
-                pending.push(rhs);
-                pending.push(lhs);
+fn is_qualified_identifier_node_kind(kind: &str) -> bool {
+    matches!(kind, "exprDot" | "genericDot" | "typerefDot")
+}
+
+fn is_nested_qualified_identifier_node(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    is_qualified_identifier_node_kind(parent.kind())
+        && (parent
+            .child_by_field_name("lhs")
+            .is_some_and(|lhs| Span::from_node(lhs) == Span::from_node(node))
+            || parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs) == Span::from_node(node)))
+}
+
+/// Compare one top-level, left-associated dotted path with an import spelling.
+///
+/// The old implementation flattened every nested dot node, causing a path of
+/// `n` identifiers to be walked once for each of its `n - 1` dot nodes.  This
+/// helper is deliberately linear: it follows the left spine once, then walks
+/// back through the same parent chain and examines each right-hand identifier
+/// once.  Unsupported shapes and paths beyond the conservative cap are
+/// represented by `None`, which callers must treat as unsafe to rewrite.
+fn qualified_identifier_matches_spelling_with_budget(
+    root: Node<'_>,
+    source: &str,
+    spelling: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<bool>, String> {
+    if !is_qualified_identifier_node_kind(root.kind()) {
+        return Ok(None);
+    }
+
+    let root_span = Span::from_node(root);
+    let mut leftmost = root;
+    let mut dot_nodes = 0usize;
+    loop {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        check_navigation_cancel(cancel)?;
+        #[cfg(test)]
+        test_record_qualified_identifier_node_visit();
+        check_navigation_cancel(cancel)?;
+        match leftmost.kind() {
+            "identifier" => break,
+            kind if is_qualified_identifier_node_kind(kind) => {
+                if dot_nodes >= MAX_QUALIFIED_IMPORT_ALIAS_PATH_NODES {
+                    return Ok(None);
+                }
+                let Some(lhs) = leftmost.child_by_field_name("lhs") else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    lhs.kind(),
+                    "identifier" | "exprDot" | "genericDot" | "typerefDot"
+                ) {
+                    return Ok(None);
+                }
+                leftmost = lhs;
+                dot_nodes = dot_nodes.saturating_add(1);
             }
-            _ => return None,
+            _ => return Ok(None),
         }
     }
-    Some(parts)
+
+    let mut expected = spelling.split('.');
+    let actual = source
+        .get(leftmost.start_byte()..leftmost.end_byte())
+        .ok_or_else(|| "qualified import path has an invalid source span".to_string())?;
+    budget.require_bytes(actual.len(), cancel)?;
+    let Some(expected_part) = expected.next() else {
+        return Ok(None);
+    };
+    if expected_part.is_empty() {
+        return Ok(None);
+    }
+    if !canonical_identifier_eq(actual, expected_part) {
+        return Ok(Some(false));
+    }
+
+    let mut current = leftmost;
+    loop {
+        if Span::from_node(current) == root_span {
+            break;
+        }
+        check_navigation_cancel(cancel)?;
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        if !is_qualified_identifier_node_kind(parent.kind())
+            || Span::from_node(parent).start < root_span.start
+            || Span::from_node(parent).end > root_span.end
+        {
+            return Ok(None);
+        }
+        let Some(lhs) = parent.child_by_field_name("lhs") else {
+            return Ok(None);
+        };
+        if Span::from_node(lhs) != Span::from_node(current) {
+            return Ok(None);
+        }
+        let Some(rhs) = parent.child_by_field_name("rhs") else {
+            return Ok(None);
+        };
+        if rhs.kind() != "identifier" {
+            return Ok(None);
+        }
+
+        budget.require_work(1, cancel)?;
+        check_navigation_cancel(cancel)?;
+        #[cfg(test)]
+        test_record_qualified_identifier_node_visit();
+        check_navigation_cancel(cancel)?;
+        let actual = source
+            .get(rhs.start_byte()..rhs.end_byte())
+            .ok_or_else(|| "qualified import path has an invalid source span".to_string())?;
+        budget.require_bytes(actual.len(), cancel)?;
+        let Some(expected_part) = expected.next() else {
+            return Ok(Some(true));
+        };
+        if expected_part.is_empty() {
+            return Ok(None);
+        }
+        if !canonical_identifier_eq(actual, expected_part) {
+            return Ok(Some(false));
+        }
+        current = parent;
+    }
+
+    Ok(Some(false))
 }
 
 fn is_identifier_in_qualified_path(identifier: Node<'_>, _source: &str) -> bool {
@@ -19102,6 +19254,207 @@ mod tests {
             .expect("class-field references resolve");
         let root_lookups = OWNER_TYPE_ROOT_LOOKUPS.with(Cell::get);
         (locations.len(), root_lookups)
+    }
+
+    fn deep_qualified_import_scan_source() -> String {
+        let mut source = String::from(
+            "unit Main;\ninterface\nuses Alpha, Legacy;\ntype TNode = class\n  Member: TNode;\nend;\nvar Receiver: TNode;\nimplementation\nprocedure Call; begin\n",
+        );
+        for _ in 0..40 {
+            source.push_str("Receiver := Receiver.");
+            for _ in 0..198 {
+                source.push_str("Member.");
+            }
+            source.push_str("Member;\n");
+        }
+        source.push_str("end;\nend.\n");
+        source
+    }
+
+    #[test]
+    fn qualified_alias_scan_fails_closed_before_deep_paths_exceed_the_work_bound() {
+        let source = deep_qualified_import_scan_source();
+        assert_eq!(source.len(), 56_750);
+        let uri = Url::parse("file:///tmp/qualified-alias-work-bound.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("deep qualified fixture parses");
+
+        test_reset_qualified_identifier_work();
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(300_000, 8 * 1024 * 1024, "qualified-alias test");
+        let result = index
+            .import_spelling_has_qualified_use_with_budget(
+                &uri,
+                SourceSpan {
+                    start: 0,
+                    end: source
+                        .find("implementation")
+                        .expect("implementation boundary"),
+                },
+                "Legacy",
+                &cancel,
+                &mut budget,
+            )
+            .expect("deep path scan must stay within the assistance budget");
+        let visits = test_qualified_identifier_node_visits();
+        test_reset_qualified_identifier_work();
+
+        assert!(
+            result,
+            "an unsupported deep path must withhold alias deduplication"
+        );
+        assert_eq!(
+            visits,
+            MAX_QUALIFIED_IMPORT_ALIAS_PATH_NODES + 1,
+            "the deep-path fixture must stop at the documented cap"
+        );
+    }
+
+    #[test]
+    fn qualified_alias_scan_honors_cancellation_inside_deep_path_extraction() {
+        let source = deep_qualified_import_scan_source();
+        let uri = Url::parse("file:///tmp/qualified-alias-cancel.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("deep qualified fixture parses");
+
+        test_reset_qualified_identifier_work();
+        test_cancel_after_qualified_identifier_node_visits(10);
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(300_000, 8 * 1024 * 1024, "qualified-alias test");
+        let error = index
+            .import_spelling_has_qualified_use_with_budget(
+                &uri,
+                SourceSpan {
+                    start: 0,
+                    end: source
+                        .find("implementation")
+                        .expect("implementation boundary"),
+                },
+                "Legacy",
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("cancellation must interrupt deep path extraction");
+        let visits = test_qualified_identifier_node_visits();
+        test_reset_qualified_identifier_work();
+
+        assert_eq!(error, "request cancelled");
+        assert!(
+            visits <= 20,
+            "cancellation must be observed near the configured visit bound, got {visits}"
+        );
+    }
+
+    #[test]
+    fn qualified_alias_path_extraction_charges_work_and_source_bytes() {
+        let source = concat!(
+            "unit QualifiedAliasBudget;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Call; begin Legacy.Value := 1; end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/qualified-alias-budget.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("qualified budget fixture parses");
+        let root = index
+            .documents
+            .get(&uri)
+            .expect("qualified budget document")
+            .tree
+            .root_node();
+        let path = collect_nodes_matching(root, "exprDot")
+            .into_iter()
+            .find(|node| !is_nested_qualified_identifier_node(*node))
+            .expect("top-level qualified path");
+        let cancel = AtomicBool::new(false);
+
+        let mut work_budget = AssistanceBudget::new(1, 8 * 1024 * 1024, "qualified-alias test");
+        let work_error = qualified_identifier_matches_spelling_with_budget(
+            path,
+            source,
+            "Legacy",
+            &cancel,
+            &mut work_budget,
+        )
+        .expect_err("each extracted path node must consume work budget");
+        assert!(
+            work_error.contains("qualified-alias test exceeds the 1-node traversal limit"),
+            "unexpected work-budget error: {work_error}"
+        );
+
+        let mut byte_budget = AssistanceBudget::new(16, 1, "qualified-alias test");
+        let byte_error = qualified_identifier_matches_spelling_with_budget(
+            path,
+            source,
+            "Legacy",
+            &cancel,
+            &mut byte_budget,
+        )
+        .expect_err("identifier source bytes must consume byte budget");
+        assert!(
+            byte_error.contains("qualified-alias test exceeds the 1-byte scan limit"),
+            "unexpected byte-budget error: {byte_error}"
+        );
+    }
+
+    #[test]
+    fn qualified_alias_scan_keeps_small_valid_qualified_paths() {
+        let source = concat!(
+            "unit SmallQualifiedAlias;\n",
+            "interface\n",
+            "uses Alpha, Legacy;\n",
+            "implementation\n",
+            "procedure Call; begin\n",
+            "  Legacy.Value := 1;\n",
+            "  Receiver.Value := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let uri = Url::parse("file:///tmp/small-qualified-alias.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("small qualified fixture parses");
+        let clause = SourceSpan {
+            start: 0,
+            end: source
+                .find("implementation")
+                .expect("implementation boundary"),
+        };
+
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(300_000, 8 * 1024 * 1024, "qualified-alias test");
+        assert!(
+            index
+                .import_spelling_has_qualified_use_with_budget(
+                    &uri,
+                    clause,
+                    "Legacy",
+                    &cancel,
+                    &mut budget,
+                )
+                .expect("valid qualified path scan")
+        );
+
+        let mut budget = AssistanceBudget::new(300_000, 8 * 1024 * 1024, "qualified-alias test");
+        assert!(
+            !index
+                .import_spelling_has_qualified_use_with_budget(
+                    &uri,
+                    clause,
+                    "Unused",
+                    &cancel,
+                    &mut budget,
+                )
+                .expect("unrelated qualified path scan")
+        );
     }
 
     #[test]

@@ -5,13 +5,13 @@ use tree_sitter::Node;
 
 use crate::rules::helpers::node_text;
 use crate::rules::scope::{
-    Scopes, collect_method_scope, extract_class_name, is_declaration_position, is_dot_rhs,
-    is_inside_inherited, is_inside_module_name, is_inside_typeref,
+    Scopes, collect_method_scope_bounded, is_declaration_position, is_dot_rhs, is_inside_inherited,
+    is_inside_module_name, is_inside_typeref,
 };
 use std::sync::atomic::AtomicBool;
 
-use super::FixWorkBudget;
 use super::types::{FixConfig, ProcContext, RenameMap, TextEdit};
+use super::{FixWorkBudget, charge_budget, charge_owned_budget};
 
 // ---------------------------------------------------------------------------
 // Collect edits
@@ -47,7 +47,7 @@ fn walk_for_edits(
     source: &[u8],
     rename_map: &RenameMap,
     scopes: &Scopes,
-    proc_ctx: Option<&ProcContext>,
+    proc_ctx: Option<&ProcContext<'_>>,
     casing_enabled: bool,
     edits: &mut Vec<TextEdit>,
     budget: &mut Option<&mut dyn FixWorkBudget>,
@@ -73,29 +73,54 @@ fn walk_for_edits(
     if node.kind() == K::DEF_PROC || node.kind() == K::LAMBDA {
         // Inherit outer method scope for nested procs (captures outer locals)
         let mut method_scope = match proc_ctx {
-            Some(ctx) => ctx.method_scope.clone(),
+            Some(ctx) => {
+                charge_string_string_map_clone(&ctx.method_scope, budget, cancel)?;
+                ctx.method_scope.clone()
+            }
             None => HashMap::new(),
         };
         let mut local_renames = match proc_ctx {
-            Some(ctx) => ctx.local_renames.clone(),
+            Some(ctx) => {
+                charge_string_string_map_clone(&ctx.local_renames, budget, cancel)?;
+                ctx.local_renames.clone()
+            }
             None => HashMap::new(),
         };
         let mut local_rename_ranges = match proc_ctx {
-            Some(ctx) => ctx.local_rename_ranges.clone(),
+            Some(ctx) => {
+                charge_string_usize_map_clone(&ctx.local_rename_ranges, budget, cancel)?;
+                ctx.local_rename_ranges.clone()
+            }
             None => HashMap::new(),
         };
-        collect_method_scope(node, source, &mut method_scope);
+        collect_method_scope_bounded(node, source, &mut method_scope, budget, cancel)?;
 
         // Apply local renames for THIS procedure AND enclosing procedures.
         // An outer procedure's rename with range (rps, rpe) applies if this
         // procedure's range is contained within it: rps <= ps && rpe >= pe.
         let ps = node.start_byte();
         let pe = node.end_byte();
-        let mut containing_renames = rename_map
-            .local
-            .iter()
-            .filter(|((rps, rpe, _), _)| *rps <= ps && *rpe >= pe)
-            .collect::<Vec<_>>();
+        charge_owned_budget(
+            budget,
+            cancel,
+            rename_map
+                .local
+                .len()
+                .saturating_mul(std::mem::size_of::<(&(usize, usize, String), &String)>()),
+        )?;
+        let mut containing_renames = Vec::with_capacity(rename_map.local.len());
+        for entry in &rename_map.local {
+            charge_budget(budget, cancel, 1, 0)?;
+            if entry.0.0 <= ps && entry.0.1 >= pe {
+                containing_renames.push(entry);
+            }
+        }
+        charge_budget(
+            budget,
+            cancel,
+            comparison_sort_work(containing_renames.len()),
+            0,
+        )?;
         containing_renames.sort_by(|left, right| {
             (left.0.1 - left.0.0, left.0.0, left.0.1, &left.0.2, left.1).cmp(&(
                 right.0.1 - right.0.0,
@@ -108,23 +133,53 @@ fn walk_for_edits(
         for ((rps, rpe, old_lower), new_name) in containing_renames {
             super::charge_budget(budget, cancel, 1, old_lower.len() + new_name.len())?;
             method_scope.remove(old_lower);
+            charge_hash_map_insert(
+                &method_scope,
+                budget,
+                cancel,
+                lowercase_utf8_len(new_name),
+                new_name.len(),
+            )?;
             method_scope.insert(new_name.to_lowercase(), new_name.clone());
             let range_size = rpe - rps;
             let replace = local_rename_ranges
                 .get(old_lower)
                 .is_none_or(|existing| range_size < *existing);
             if replace {
+                charge_hash_map_insert(
+                    &local_renames,
+                    budget,
+                    cancel,
+                    old_lower.len(),
+                    new_name.len(),
+                )?;
+                charge_hash_map_insert(
+                    &local_rename_ranges,
+                    budget,
+                    cancel,
+                    old_lower.len(),
+                    std::mem::size_of::<usize>(),
+                )?;
                 local_renames.insert(old_lower.clone(), new_name.clone());
                 local_rename_ranges.insert(old_lower.clone(), range_size);
             }
         }
 
         // Determine class context
-        let class_name = extract_class_name(node, source);
-        let class_fields = class_name
-            .as_ref()
-            .and_then(|cn| scopes.classes.get(&cn.to_lowercase()))
-            .cloned();
+        let class_name = if let Some(name_node) = class_name_node(node) {
+            let name_bytes = name_node.end_byte().saturating_sub(name_node.start_byte());
+            charge_owned_budget(budget, cancel, decoded_text_capacity(name_bytes))?;
+            Some(node_text(name_node, source))
+        } else {
+            None
+        };
+        let class_fields = if let Some(class_name) = class_name.as_ref() {
+            let key_bytes = lowercase_utf8_len(class_name);
+            charge_owned_budget(budget, cancel, key_bytes)?;
+            scopes.classes.get(&class_name.to_lowercase())
+        } else {
+            None
+        };
 
         let ctx = ProcContext {
             method_scope,
@@ -183,7 +238,10 @@ fn resolve_and_emit(
         return Ok(());
     }
 
+    let text_bytes = node.end_byte().saturating_sub(node.start_byte());
+    charge_owned_budget(budget, cancel, decoded_text_capacity(text_bytes))?;
     let text = node_text(node, source);
+    charge_owned_budget(budget, cancel, lowercase_utf8_len(&text))?;
     let lower = text.to_lowercase();
 
     // Step 1: Check local rename (innermost matching enclosing procedure).
@@ -192,12 +250,14 @@ fn resolve_and_emit(
     if let Some(ctx) = proc_ctx {
         if let Some(new_name) = ctx.local_renames.get(&lower) {
             if text != *new_name {
-                super::charge_budget(budget, cancel, 1, new_name.len())?;
-                edits.push(TextEdit {
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                    new_text: new_name.to_string(),
-                });
+                push_text_edit(
+                    edits,
+                    node.start_byte(),
+                    node.end_byte(),
+                    new_name,
+                    budget,
+                    cancel,
+                )?;
             }
             return Ok(()); // local rename found — don't fall through
         }
@@ -206,12 +266,14 @@ fn resolve_and_emit(
     // Step 2: Check file-scoped rename
     if let Some(new_name) = rename_map.file.get(&lower) {
         if text != *new_name {
-            super::charge_budget(budget, cancel, 1, new_name.len())?;
-            edits.push(TextEdit {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                new_text: new_name.clone(),
-            });
+            push_text_edit(
+                edits,
+                node.start_byte(),
+                node.end_byte(),
+                new_name,
+                budget,
+                cancel,
+            )?;
         }
         return Ok(()); // file rename found — don't fall through
     }
@@ -236,15 +298,150 @@ fn resolve_and_emit(
 
     if let Some(declared_name) = declared {
         if text != *declared_name {
-            super::charge_budget(budget, cancel, 1, declared_name.len())?;
-            edits.push(TextEdit {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                new_text: declared_name.clone(),
-            });
+            push_text_edit(
+                edits,
+                node.start_byte(),
+                node.end_byte(),
+                declared_name,
+                budget,
+                cancel,
+            )?;
         }
     }
     Ok(())
+}
+
+fn hash_map_storage_bytes<K, V>(map: &HashMap<K, V>) -> usize {
+    map.capacity()
+        .saturating_mul(std::mem::size_of::<(K, V)>() + std::mem::size_of::<usize>())
+}
+
+fn charge_hash_map_clone<K, V>(
+    map: &HashMap<K, V>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, map.len(), 0)?;
+    charge_owned_budget(budget, cancel, hash_map_storage_bytes(map))
+}
+
+fn charge_string_string_map_clone(
+    map: &HashMap<String, String>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_hash_map_clone(map, budget, cancel)?;
+    charge_owned_budget(
+        budget,
+        cancel,
+        map.iter()
+            .map(|(key, value)| key.len().saturating_add(value.len()))
+            .sum(),
+    )
+}
+
+fn charge_string_usize_map_clone(
+    map: &HashMap<String, usize>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_hash_map_clone(map, budget, cancel)?;
+    charge_owned_budget(
+        budget,
+        cancel,
+        map.iter()
+            .map(|(key, _)| key.len())
+            .sum::<usize>()
+            .saturating_add(map.len().saturating_mul(std::mem::size_of::<usize>())),
+    )
+}
+
+fn charge_hash_map_insert<K, V>(
+    map: &HashMap<K, V>,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+    key_bytes: usize,
+    value_bytes: usize,
+) -> Result<(), String> {
+    let growth = if map.len() == map.capacity() {
+        map.capacity()
+            .max(1)
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<(K, V)>() + std::mem::size_of::<usize>())
+    } else {
+        0
+    };
+    charge_owned_budget(
+        budget,
+        cancel,
+        std::mem::size_of::<(K, V)>()
+            .saturating_add(key_bytes)
+            .saturating_add(value_bytes)
+            .saturating_add(growth),
+    )
+}
+
+fn push_text_edit(
+    edits: &mut Vec<TextEdit>,
+    start_byte: usize,
+    end_byte: usize,
+    new_text: &str,
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    charge_budget(budget, cancel, 1, 0)?;
+    if edits.len() == edits.capacity() {
+        let old_capacity = edits.capacity();
+        let new_capacity = old_capacity.max(1).saturating_mul(2);
+        let additional = new_capacity.saturating_sub(old_capacity);
+        charge_owned_budget(
+            budget,
+            cancel,
+            old_capacity
+                .saturating_add(new_capacity)
+                .saturating_mul(std::mem::size_of::<TextEdit>()),
+        )?;
+        edits
+            .try_reserve_exact(additional)
+            .map_err(|error| format!("could not reserve bounded fix edit: {error}"))?;
+    }
+    charge_owned_budget(budget, cancel, new_text.len())?;
+    edits.push(TextEdit {
+        start_byte,
+        end_byte,
+        new_text: new_text.to_owned(),
+    });
+    Ok(())
+}
+
+fn comparison_sort_work(length: usize) -> usize {
+    if length < 2 {
+        return 0;
+    }
+    let mut remaining = length;
+    let mut depth = 0;
+    while remaining > 1 {
+        depth += 1;
+        remaining = remaining.saturating_add(1) / 2;
+    }
+    length.saturating_mul(depth)
+}
+
+fn class_name_node(def_proc: Node) -> Option<Node> {
+    let header = def_proc.child_by_field_name("header")?;
+    let name_node = header.child_by_field_name("name")?;
+    (name_node.kind() == K::GENERIC_DOT).then(|| name_node.child_by_field_name("lhs"))?
+}
+
+fn decoded_text_capacity(bytes: usize) -> usize {
+    bytes.saturating_mul(2)
+}
+
+fn lowercase_utf8_len(text: &str) -> usize {
+    text.chars()
+        .flat_map(|character| character.to_lowercase())
+        .map(char::len_utf8)
+        .sum()
 }
 
 // ---------------------------------------------------------------------------

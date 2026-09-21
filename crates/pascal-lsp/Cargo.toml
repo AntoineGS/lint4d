@@ -40,6 +40,9 @@ walkdir = "2"
 globset = "0.4"
 crossbeam-channel = "0.5"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 pascal-project = { path = "../pascal-project", features = ["test-support"] }
 tempfile = "3"

@@ -31,11 +31,11 @@ pub struct RenameMap {
 }
 
 /// Context for the current procedure during the edit-collection walk.
-pub(crate) struct ProcContext {
+pub(crate) struct ProcContext<'a> {
     pub method_scope: HashMap<String, String>,
     pub local_renames: HashMap<String, String>,
     pub local_rename_ranges: HashMap<String, usize>,
-    pub class_fields: Option<HashMap<String, String>>,
+    pub class_fields: Option<&'a HashMap<String, String>>,
 }
 
 /// Pre-computed flags for which fix rules are enabled.

@@ -30212,6 +30212,85 @@ fn source_fix_all_withholds_read_only_targets_at_creation_and_resolution() {
     deferred_server.shutdown();
 }
 
+#[cfg(unix)]
+#[test]
+fn source_fix_all_withholds_owner_nonwritable_0466_targets_at_creation_and_resolution() {
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+
+    let eager_temp = tempfile::tempdir().expect("0466 eager workspace");
+    let eager_root = eager_temp.path().join("fixture");
+    let eager_main = eager_root.join("Main.pas");
+    write_file(&eager_main, source);
+    let mut eager_permissions = fs::metadata(&eager_main)
+        .expect("0466 eager metadata")
+        .permissions();
+    eager_permissions.set_mode(0o466);
+    fs::set_permissions(&eager_main, eager_permissions).expect("make 0466 eager target");
+    let mut eager_server = TestServer::launch();
+    eager_server.initialize(&eager_root, Value::Null);
+    let eager_id = RequestId::from("fix-all-0466-eager".to_string());
+    eager_server.send_request(
+        eager_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&eager_main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let eager_response = eager_server.response(&eager_id);
+    assert!(
+        eager_response.error.is_none(),
+        "0466 eager request failed: {eager_response:?}"
+    );
+    assert!(
+        eager_response
+            .result
+            .expect("0466 eager result")
+            .as_array()
+            .expect("0466 eager actions")
+            .is_empty(),
+        "owner-nonwritable 0466 targets must not advertise an edit"
+    );
+    eager_server.shutdown();
+
+    let deferred_temp = tempfile::tempdir().expect("0466 deferred workspace");
+    let deferred_root = deferred_temp.path().join("fixture");
+    let deferred_main = deferred_root.join("Main.pas");
+    write_file(&deferred_main, source);
+    let mut deferred_server = TestServer::launch();
+    deferred_server.initialize_with_action_support(&deferred_root, Value::Null);
+    let request_id = RequestId::from("fix-all-0466-deferred-create".to_string());
+    deferred_server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&deferred_main)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }),
+    );
+    let response = deferred_server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "0466 deferred creation failed: {response:?}"
+    );
+    let action = response.result.expect("0466 deferred result")[0].clone();
+    let mut deferred_permissions = fs::metadata(&deferred_main)
+        .expect("0466 deferred metadata")
+        .permissions();
+    deferred_permissions.set_mode(0o466);
+    fs::set_permissions(&deferred_main, deferred_permissions).expect("make 0466 deferred target");
+    let resolve_id = RequestId::from("fix-all-0466-deferred-resolve".to_string());
+    deferred_server.send_request(resolve_id.clone(), "codeAction/resolve", action);
+    let resolved = deferred_server.response(&resolve_id);
+    assert!(
+        resolved.error.is_some(),
+        "owner-nonwritable 0466 transition must invalidate deferred fix-all: {resolved:?}"
+    );
+    deferred_server.shutdown();
+}
+
 #[test]
 fn source_action_organizes_equivalent_uses_without_reordering_bindings() {
     let temp = tempfile::tempdir().expect("temporary workspace");

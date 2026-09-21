@@ -15,6 +15,13 @@ use types::FixConfig;
 
 pub use types::FixEdit;
 
+// `tree-sitter` and suppression parsing do not accept a caller budget and
+// materialize auxiliary parser state before the bounded walkers can account
+// their own containers. Reserve a conservative, source-derived envelope
+// before entering those libraries so the public bounded API remains fail
+// closed under the advertised owned-allocation limit.
+const PARSER_OWNED_BYTES_PER_SOURCE_BYTE: usize = 64;
+
 /// Work accounting supplied by a caller that needs a bounded naming-fix
 /// traversal. The legacy [`fix_file`] and [`fix_file_edits`] APIs remain
 /// unbounded for CLI compatibility; the bounded companion charges every
@@ -26,6 +33,15 @@ pub trait FixWorkBudget {
 
     /// Charge bytes inspected or materialized.
     fn charge_bytes(&mut self, amount: usize) -> Result<(), String>;
+
+    /// Charge owned payload/container storage before it is allocated or cloned.
+    ///
+    /// The default keeps existing embedders source-compatible while bounded
+    /// callers may account owned materialization separately from bytes merely
+    /// scanned.
+    fn charge_owned_bytes(&mut self, amount: usize) -> Result<(), String> {
+        self.charge_bytes(amount)
+    }
 }
 
 /// Fix naming convention violations in a single file.
@@ -85,14 +101,21 @@ pub fn fix_file_edits_bounded<B: FixWorkBudget>(
     let mut budget: Option<&mut dyn FixWorkBudget> = Some(budget);
     let edits =
         collect_file_edits_bounded(file, source, config, Some(rules), &mut budget, Some(cancel))?;
-    Ok(edits
-        .into_iter()
-        .map(|edit| FixEdit {
+    charge_owned_budget(
+        &mut budget,
+        Some(cancel),
+        edits.len().saturating_mul(std::mem::size_of::<FixEdit>()),
+    )?;
+    let mut result = Vec::with_capacity(edits.len());
+    for edit in edits {
+        charge_budget(&mut budget, Some(cancel), 1, 0)?;
+        result.push(FixEdit {
             start_byte: edit.start_byte,
             end_byte: edit.end_byte,
             new_text: edit.new_text,
-        })
-        .collect())
+        });
+    }
+    Ok(result)
 }
 
 fn collect_file_edits(
@@ -119,6 +142,18 @@ fn collect_file_edits_bounded(
 
     charge_budget(budget, cancel, 1, source.len())?;
     std::str::from_utf8(source).map_err(|e| format!("invalid UTF-8: {e}"))?;
+    // Parsing and suppression discovery are source scans performed by the
+    // parser/directive libraries. Count that work explicitly; the owned Rust
+    // containers created by the bounded fix path are charged by their
+    // materialization helpers below rather than approximated from source size.
+    charge_budget(budget, cancel, source.len(), 0)?;
+    charge_owned_budget(
+        budget,
+        cancel,
+        source
+            .len()
+            .saturating_mul(PARSER_OWNED_BYTES_PER_SOURCE_BYTE),
+    )?;
 
     let (tree, _parse_errors) = parse_file(file, source)?;
     charge_budget(budget, cancel, 1, 0)?;
@@ -173,6 +208,23 @@ pub(crate) fn charge_budget(
     if let Some(budget) = budget.as_deref_mut() {
         budget.charge_work(work)?;
         budget.charge_bytes(bytes)?;
+    }
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err("request cancelled".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn charge_owned_budget(
+    budget: &mut Option<&mut dyn FixWorkBudget>,
+    cancel: Option<&AtomicBool>,
+    bytes: usize,
+) -> Result<(), String> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err("request cancelled".to_string());
+    }
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.charge_owned_bytes(bytes)?;
     }
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
         return Err("request cancelled".to_string());

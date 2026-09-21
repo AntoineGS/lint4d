@@ -45,7 +45,9 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,6 +223,56 @@ pub(crate) struct SourceRecord {
     /// Bounded semantic observations used to prove that auto-import provider
     /// uniqueness remains fresh without invalidating on unrelated comments.
     pub(crate) auto_import_scopes: Vec<AutoImportProviderScope>,
+}
+
+pub(crate) fn source_record_owned_bytes(record: &SourceRecord) -> usize {
+    std::mem::size_of::<SourceRecord>()
+        .saturating_add(record.uri.as_str().len())
+        .saturating_add(record.text.len())
+        .saturating_add(
+            record
+                .path
+                .as_ref()
+                .map_or(0, |path| path.as_os_str().len()),
+        )
+        .saturating_add(record.content_bytes.as_ref().map_or(0, Vec::len))
+        .saturating_add(
+            record
+                .candidate_observations
+                .len()
+                .saturating_mul(std::mem::size_of::<ResolverCandidateObservation>()),
+        )
+        .saturating_add(
+            record
+                .candidate_observations
+                .iter()
+                .map(|observation| observation.path.as_os_str().len())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            record
+                .auto_import_scopes
+                .len()
+                .saturating_mul(std::mem::size_of::<AutoImportProviderScope>()),
+        )
+        .saturating_add(
+            record
+                .auto_import_scopes
+                .iter()
+                .map(|scope| {
+                    scope.root.as_os_str().len()
+                        + scope.provider_units.iter().map(String::len).sum::<usize>()
+                        + scope
+                            .candidate_prefixes
+                            .iter()
+                            .map(String::len)
+                            .sum::<usize>()
+                })
+                .sum::<usize>(),
+        )
+        .saturating_add(record.missing_provider_scope.as_ref().map_or(0, |scope| {
+            scope.root.as_os_str().len() + scope.names.iter().map(String::len).sum::<usize>()
+        }))
 }
 
 pub(crate) const MAX_RESOLVER_CANDIDATE_OBSERVATIONS: usize = 4_096;
@@ -1878,7 +1930,7 @@ pub(crate) fn snapshot_records_bounded(
             .len()
             .saturating_add(snapshot.baseline_records.len()),
     );
-    budget.require_bytes(
+    budget.require_owned_bytes(
         records
             .capacity()
             .saturating_mul(std::mem::size_of::<SourceRecord>()),
@@ -1901,6 +1953,7 @@ pub(crate) fn snapshot_records_bounded(
                 + observation_bytes,
             cancel,
         )?;
+        budget.require_owned_bytes(source_record_owned_bytes(record), cancel)?;
         records.push(record.clone());
     }
     Ok(records)
@@ -2114,10 +2167,7 @@ pub(crate) fn input_source_is_writable(input: &WorkspaceInput, uri: &Url) -> boo
                 }
                 #[cfg(unix)]
                 {
-                    // Do not treat the test/server UID being root as proof that a
-                    // 0444 target is writable. The advertised edit is intended
-                    // for the normal owner/group/other write policy.
-                    metadata.permissions().mode() & 0o222 != 0
+                    effective_unix_write_access(&path, &metadata)
                 }
                 #[cfg(not(unix))]
                 {
@@ -2131,6 +2181,48 @@ pub(crate) fn input_source_is_writable(input: &WorkspaceInput, uri: &Url) -> boo
         }
         Err(_) => false,
     }
+}
+
+#[cfg(unix)]
+fn effective_unix_write_access(path: &Path, metadata: &fs::Metadata) -> bool {
+    let effective_uid = unsafe { libc::geteuid() };
+    let effective_gid = unsafe { libc::getegid() };
+    let owner = metadata.uid() == effective_uid;
+    let group = metadata.gid() == effective_gid || effective_groups_contain(metadata.gid());
+    let mode = metadata.permissions().mode();
+    let class_allows = if owner {
+        mode & 0o200 != 0
+    } else if group {
+        mode & 0o020 != 0
+    } else {
+        mode & 0o002 != 0
+    };
+
+    // A privileged process must not infer ordinary-user writability from its
+    // ability to bypass mode checks. The owner/group/other class is the
+    // conservative baseline; ACL-aware faccessat may widen it for an
+    // unprivileged caller when the platform can prove that access.
+    if !class_allows && effective_uid == 0 {
+        return false;
+    }
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let access_ok = unsafe {
+        libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0
+    };
+    (effective_uid != 0 || class_allows) && access_ok
+}
+
+#[cfg(unix)]
+fn effective_groups_contain(gid: u32) -> bool {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return false;
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    filled >= 0 && groups[..filled as usize].contains(&(gid as libc::gid_t))
 }
 
 pub(crate) fn owner_for_input(

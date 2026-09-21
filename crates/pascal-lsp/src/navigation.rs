@@ -716,11 +716,20 @@ impl NavigationIndex {
     pub(crate) fn rebind_with_replaced_source_for_fix_all(
         &self,
         uri: &Url,
-        replacement: String,
+        replacement: &str,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Self, String> {
-        let mut result = Self::default();
+        check_navigation_cancel(cancel)?;
+        let target = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        let document_count = self.documents.len();
+        budget.require_owned_bytes(
+            document_count.saturating_mul(std::mem::size_of::<(&Url, &Document)>()),
+            cancel,
+        )?;
         let mut documents = self.documents.iter().collect::<Vec<_>>();
         budget.require_work(
             documents
@@ -729,76 +738,56 @@ impl NavigationIndex {
             cancel,
         )?;
         documents.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+
+        budget.require_owned_bytes(
+            hash_map_clone_storage_bytes::<Url, Document>(document_count),
+            cancel,
+        )?;
+        let mut result = Self {
+            documents: HashMap::with_capacity(self.documents.len()),
+            units: clone_units_for_fix_all(&self.units, cancel, budget)?,
+            auto_import_discovery_complete: self.auto_import_discovery_complete,
+            auto_import_unit_providers: clone_providers_for_fix_all(
+                &self.auto_import_unit_providers,
+                cancel,
+                budget,
+            )?,
+        };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;
-            let source_len = if document_uri == uri {
-                replacement.len()
-            } else {
-                document.source.len()
-            };
             budget.require_work(1, cancel)?;
-            budget.require_bytes(source_len, cancel)?;
-            let source = if document_uri == uri {
-                replacement.clone()
-            } else {
-                document.source.to_string()
-            };
-            let cached = (document_uri != uri).then(|| document.parsed.clone());
-            result.update_with_context_and_cached_with_cancel(
-                document_uri.clone(),
-                source,
-                &document.conditional_context,
-                cached,
+            budget.require_owned_bytes(document_uri.as_str().len(), cancel)?;
+            let import_bindings = clone_import_bindings_for_fix_all(
+                document.import_bindings.as_ref(),
                 cancel,
+                budget,
             )?;
+            result.documents.insert(
+                document_uri.clone(),
+                Document {
+                    parsed: document.parsed.clone(),
+                    import_bindings,
+                    import_binding_fingerprint: document.import_binding_fingerprint,
+                },
+            );
         }
-        result.auto_import_discovery_complete = self.auto_import_discovery_complete;
-        let provider_work = self
-            .auto_import_unit_providers
-            .values()
-            .map(Vec::len)
-            .sum::<usize>();
-        budget.require_work(
-            self.auto_import_unit_providers
-                .len()
-                .saturating_add(provider_work),
+
+        // Unchanged documents keep their parsed semantic payload through Arc;
+        // only the requested physical document is incrementally rebound.
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(replacement.len(), cancel)?;
+        budget.require_work(replacement.len(), cancel)?;
+        budget.require_owned_bytes(replacement.len(), cancel)?;
+        budget.require_work(rebind_work_reservation(target), cancel)?;
+        budget.require_owned_bytes(rebind_owned_reservation(target), cancel)?;
+        let replacement = replacement.to_owned();
+        result.update_with_context_and_cached_with_cancel(
+            uri.clone(),
+            replacement,
+            &target.conditional_context,
+            None,
             cancel,
         )?;
-        budget.require_bytes(
-            self.auto_import_unit_providers
-                .iter()
-                .map(|(name, providers)| {
-                    name.len()
-                        + providers
-                            .iter()
-                            .map(|provider| provider.as_str().len())
-                            .sum::<usize>()
-                })
-                .sum(),
-            cancel,
-        )?;
-        result.auto_import_unit_providers = self.auto_import_unit_providers.clone();
-        for (document_uri, document) in &self.documents {
-            if let Some(bindings) = &document.import_bindings {
-                budget.require_work(bindings.len(), cancel)?;
-                budget.require_bytes(
-                    bindings
-                        .iter()
-                        .map(|(name, provider)| name.len() + provider.as_str().len())
-                        .sum(),
-                    cancel,
-                )?;
-                result.bind_imports(
-                    document_uri,
-                    bindings
-                        .iter()
-                        .map(|(name, provider)| (name.clone(), provider.clone())),
-                );
-            } else if document.import_binding_fingerprint.is_some() {
-                budget.require_work(1, cancel)?;
-                result.clear_import_bindings(document_uri);
-            }
-        }
         Ok(result)
     }
 
@@ -5742,6 +5731,102 @@ impl NavigationIndex {
         }
 
         self.locations_for(self.expand_property_candidates(references, target), target)
+    }
+
+    /// Resolve one navigation target while consuming the caller's request-wide
+    /// cancellation and work budget. Fix-all proof uses this instead of the
+    /// public convenience method so semantic resolution cannot silently create
+    /// a fresh overload budget for every transformed query.
+    pub(crate) fn navigate_with_cancel_and_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        target: NavigationTarget,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Location>, String> {
+        check_navigation_cancel(cancel)?;
+        if target != NavigationTarget::Declaration {
+            return Err("budgeted fix-all navigation only supports declarations".to_string());
+        }
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(Vec::new());
+        };
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(document.source.len(), cancel)?;
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(Vec::new());
+        };
+        if document.conditionals.is_unknown_at(offset)
+            || is_ignored_offset(document.tree.root_node(), offset)
+        {
+            return Ok(Vec::new());
+        }
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(Vec::new());
+        };
+
+        let mut state = ResolutionState::new();
+        let mut references = self.resolve_candidates_at_with_state_and_budget(
+            uri, document, offset, identifier, &mut state, 0, cancel, budget,
+        )?;
+        budget.require_work(references.len(), cancel)?;
+        if references
+            .iter()
+            .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
+        {
+            return Ok(Vec::new());
+        }
+
+        if let Some(call) = overload::call_for_identifier(identifier) {
+            let owner_receivers = call
+                .child_by_field_name("entity")
+                .and_then(callable_owner_node)
+                .map(|owner| {
+                    self.resolve_receivers_with_state_and_budget(
+                        uri, document, offset, owner, owner, &mut state, cancel, budget, 0,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            budget.require_work(owner_receivers.len(), cancel)?;
+            let owner_instances = owner_receivers
+                .iter()
+                .filter_map(|receiver| match receiver {
+                    Receiver::Type(instance) => Some(instance.clone()),
+                    Receiver::Unit(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => None,
+                })
+                .collect::<Vec<_>>();
+            budget.require_owned_bytes(
+                owner_instances
+                    .len()
+                    .saturating_mul(std::mem::size_of::<TypeInstance>()),
+                cancel,
+            )?;
+            let selection = overload::select(
+                self,
+                uri,
+                document,
+                call,
+                &references,
+                &GenericSubstitution::empty(),
+                &owner_instances,
+                &mut state,
+                0,
+                cancel,
+                budget,
+            )?;
+            if let Some(group) = selection.selected_group {
+                references
+                    .retain(|candidate| overload::candidate_in_group(self, candidate, &group));
+            } else if selection.no_viable_group {
+                references
+                    .retain(|candidate| overload::key_for_candidate(self, candidate).is_none());
+            }
+        }
+
+        check_navigation_cancel(cancel)?;
+        self.locations_for_with_budget(references, target, cancel, budget)
     }
 
     fn resolve_candidates_at(
@@ -12620,6 +12705,299 @@ impl NavigationIndex {
         });
         locations
     }
+
+    fn locations_for_with_budget(
+        &self,
+        references: Vec<Candidate>,
+        target: NavigationTarget,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<Location>, String> {
+        budget.require_owned_bytes(
+            references
+                .len()
+                .saturating_mul(std::mem::size_of::<Candidate>()),
+            cancel,
+        )?;
+        let reference_uri_bytes = references
+            .iter()
+            .map(|candidate| candidate.uri.as_str().len())
+            .sum::<usize>();
+        budget.require_owned_bytes(
+            reference_uri_bytes.saturating_mul(3).saturating_add(
+                references
+                    .len()
+                    .saturating_mul(3)
+                    .saturating_mul(std::mem::size_of::<Candidate>()),
+            ),
+            cancel,
+        )?;
+        let mut routine_groups: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
+        let mut non_routines = Vec::with_capacity(references.len());
+        budget.require_owned_bytes(
+            references
+                .len()
+                .saturating_mul(std::mem::size_of::<Candidate>()),
+            cancel,
+        )?;
+        for candidate in references {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(symbol) = self.symbol(&candidate) else {
+                continue;
+            };
+            if let (SymbolKind::Routine, Some(routine_key)) = (symbol.kind, &symbol.routine_key) {
+                budget.require_owned_bytes(
+                    std::mem::size_of::<((String, String), Vec<Candidate>)>()
+                        .saturating_add(candidate.uri.as_str().len())
+                        .saturating_add(routine_key.len())
+                        .saturating_add(std::mem::size_of::<Candidate>()),
+                    cancel,
+                )?;
+                routine_groups
+                    .entry((candidate.uri.to_string(), routine_key.clone()))
+                    .or_default()
+                    .push(candidate);
+            } else {
+                non_routines.push(candidate);
+            }
+        }
+
+        let mut selected = non_routines;
+        for candidates in routine_groups.into_values() {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(candidates.len(), cancel)?;
+            let group_uri_bytes = candidates
+                .iter()
+                .map(|candidate| candidate.uri.as_str().len())
+                .sum::<usize>();
+            budget.require_owned_bytes(
+                candidates
+                    .len()
+                    .saturating_mul(3)
+                    .saturating_mul(std::mem::size_of::<Candidate>())
+                    .saturating_add(group_uri_bytes.saturating_mul(3)),
+                cancel,
+            )?;
+            let declarations: Vec<Candidate> = candidates
+                .iter()
+                .filter(|candidate| {
+                    self.symbol(candidate)
+                        .is_some_and(|symbol| symbol.origin == Origin::Declaration)
+                })
+                .cloned()
+                .collect();
+            let interface_declarations: Vec<Candidate> = declarations
+                .iter()
+                .filter(|candidate| {
+                    self.symbol(candidate)
+                        .is_some_and(|symbol| symbol.region == Region::Interface)
+                })
+                .cloned()
+                .collect();
+            let definitions: Vec<Candidate> = candidates
+                .iter()
+                .filter(|candidate| {
+                    self.symbol(candidate)
+                        .is_some_and(|symbol| symbol.origin == Origin::Definition)
+                })
+                .cloned()
+                .collect();
+            budget.require_owned_bytes(
+                (declarations.len() + interface_declarations.len() + definitions.len())
+                    .saturating_mul(std::mem::size_of::<Candidate>()),
+                cancel,
+            )?;
+            match target {
+                NavigationTarget::Declaration => {
+                    if !interface_declarations.is_empty() {
+                        selected.extend(interface_declarations);
+                    } else if !declarations.is_empty() {
+                        selected.extend(declarations);
+                    } else {
+                        selected.extend(definitions);
+                    }
+                }
+                NavigationTarget::Definition | NavigationTarget::Implementation => {
+                    if !definitions.is_empty() {
+                        selected.extend(definitions);
+                    } else {
+                        selected.extend(declarations);
+                    }
+                }
+            }
+        }
+
+        let mut locations = Vec::with_capacity(selected.len());
+        let mut seen = HashSet::new();
+        budget.require_owned_bytes(
+            selected
+                .len()
+                .saturating_mul(std::mem::size_of::<Location>()),
+            cancel,
+        )?;
+        for candidate in selected {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(document) = self.documents.get(&candidate.uri) else {
+                continue;
+            };
+            budget.require_owned_bytes(candidate.uri.as_str().len(), cancel)?;
+            let Some(symbol) = document.symbols.get(candidate.index) else {
+                continue;
+            };
+            let Some(location) = location_for_span(&candidate.uri, &document.source, symbol.span)
+            else {
+                continue;
+            };
+            budget.require_owned_bytes(candidate.uri.as_str().len(), cancel)?;
+            let deduplication_key = (
+                location.uri.to_string(),
+                location.range.start.line,
+                location.range.start.character,
+                location.range.end.line,
+                location.range.end.character,
+            );
+            budget.require_owned_bytes(deduplication_key.0.len(), cancel)?;
+            if seen.insert(deduplication_key) {
+                locations.push(location);
+            }
+        }
+        budget.require_work(locations.len(), cancel)?;
+        locations.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        Ok(locations)
+    }
+}
+
+fn hash_map_clone_storage_bytes<K, V>(capacity: usize) -> usize {
+    capacity
+        .max(1)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<(K, V)>() + std::mem::size_of::<usize>())
+}
+
+fn clone_units_for_fix_all(
+    units: &HashMap<String, Vec<Url>>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<HashMap<String, Vec<Url>>, String> {
+    budget.require_owned_bytes(
+        hash_map_clone_storage_bytes::<String, Vec<Url>>(units.capacity()),
+        cancel,
+    )?;
+    for (name, providers) in units {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(
+            name.len()
+                .saturating_add(
+                    providers
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Url>()),
+                )
+                .saturating_add(
+                    providers
+                        .iter()
+                        .map(|provider| provider.as_str().len())
+                        .sum::<usize>(),
+                ),
+            cancel,
+        )?;
+    }
+    Ok(units.clone())
+}
+
+fn clone_providers_for_fix_all(
+    providers: &HashMap<String, Vec<Url>>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<HashMap<String, Vec<Url>>, String> {
+    budget.require_owned_bytes(
+        hash_map_clone_storage_bytes::<String, Vec<Url>>(providers.capacity()),
+        cancel,
+    )?;
+    for (name, candidates) in providers {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(
+            name.len()
+                .saturating_add(
+                    candidates
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Url>()),
+                )
+                .saturating_add(
+                    candidates
+                        .iter()
+                        .map(|candidate| candidate.as_str().len())
+                        .sum::<usize>(),
+                ),
+            cancel,
+        )?;
+    }
+    Ok(providers.clone())
+}
+
+fn clone_import_bindings_for_fix_all(
+    bindings: Option<&HashMap<String, Url>>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<HashMap<String, Url>>, String> {
+    let Some(bindings) = bindings else {
+        return Ok(None);
+    };
+    budget.require_owned_bytes(
+        hash_map_clone_storage_bytes::<String, Url>(bindings.capacity()),
+        cancel,
+    )?;
+    for (name, provider) in bindings {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(name.len() + provider.as_str().len(), cancel)?;
+    }
+    Ok(Some(bindings.clone()))
+}
+
+/// Reserve a conservative amount of shared semantic work before parsing the
+/// transformed document.  `Document::parse_with_cancel` builds the tree and
+/// all derived symbol/index tables in one operation, so charging this bounded
+/// reservation before entering it is preferable to charging a cheap source
+/// length after the expensive allocations have already happened.
+fn rebind_work_reservation(target: &Document) -> usize {
+    target
+        .symbols
+        .len()
+        .saturating_mul(64)
+        .saturating_add(target.scopes.len().saturating_mul(32))
+        .saturating_add(target.helpers.len().saturating_mul(16))
+        .saturating_add(target.method_resolutions.len().saturating_mul(16))
+        .saturating_add(target.interface_delegations.len().saturating_mul(16))
+        .saturating_add(target.generic_parameter_contexts.len().saturating_mul(16))
+}
+
+fn rebind_owned_reservation(target: &Document) -> usize {
+    target
+        .parser_source
+        .len()
+        .saturating_add(target.unit_name.len())
+        .saturating_add(target.unit_display_name.len())
+        .saturating_add(
+            target
+                .symbols
+                .len()
+                .saturating_mul(std::mem::size_of::<Symbol>() + std::mem::size_of::<String>() * 4),
+        )
+        .saturating_add(target.scopes.len().saturating_mul(64))
+        .saturating_add(target.helpers.len().saturating_mul(64))
+        .saturating_add(target.method_resolutions.len().saturating_mul(32))
+        .saturating_add(target.interface_delegations.len().saturating_mul(32))
+        .saturating_add(target.generic_parameter_contexts.len().saturating_mul(32))
 }
 
 const ROOT_SCOPE: usize = 0;
@@ -13164,6 +13542,21 @@ impl AssistanceBudget {
         } else {
             Err(format!(
                 "{} exceeds the {}-byte scan limit",
+                self.operation, self.byte_limit
+            ))
+        }
+    }
+
+    pub(super) fn require_owned_bytes(
+        &mut self,
+        amount: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if self.take_bytes(amount, cancel)? {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} exceeds the {}-byte proof/materialization limit",
                 self.operation, self.byte_limit
             ))
         }
@@ -19448,6 +19841,76 @@ mod tests {
             visits <= 20,
             "cancellation must be observed near the configured visit bound, got {visits}"
         );
+    }
+
+    #[test]
+    fn budgeted_navigation_honors_cancellation_inside_resolution() {
+        let source = "unit Main;\ninterface\nimplementation\nprocedure Use;\nvar bad_var: Integer;\nbegin\n  bad_var := bad_var + 1;\nend;\nend.\n";
+        let uri = Url::parse("file:///tmp/budgeted-navigation-cancel.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_string())
+            .expect("navigation fixture parses");
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "budgeted navigation");
+        budget.cancel_after_work(12);
+
+        let result = index.navigate_with_cancel_and_budget(
+            &uri,
+            Position::new(6, 2),
+            NavigationTarget::Declaration,
+            &cancel,
+            &mut budget,
+        );
+
+        assert_eq!(result, Err("request cancelled".to_string()));
+        assert!(
+            budget.remaining_work < 100_000 - 1,
+            "cancellation must occur after entering semantic resolution"
+        );
+    }
+
+    #[test]
+    fn budgeted_navigation_fails_when_shared_work_exhausts_inside_resolution() {
+        let source = "unit Main;\ninterface\nimplementation\nprocedure Use;\nvar bad_var: Integer;\nbegin\n  bad_var := bad_var + 1;\nend;\nend.\n";
+        let uri =
+            Url::parse("file:///tmp/budgeted-navigation-exhaustion.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_string())
+            .expect("navigation fixture parses");
+        let cancel = AtomicBool::new(false);
+        let mut complete_budget =
+            AssistanceBudget::new(100_000, 8 * 1024 * 1024, "budgeted navigation exhaustion");
+        let locations = index
+            .navigate_with_cancel_and_budget(
+                &uri,
+                Position::new(6, 2),
+                NavigationTarget::Declaration,
+                &cancel,
+                &mut complete_budget,
+            )
+            .expect("complete semantic query");
+        assert_eq!(locations.len(), 1);
+        let consumed_work = 100_000 - complete_budget.remaining_work;
+        assert!(consumed_work > 2, "fixture must enter semantic resolution");
+
+        let mut limited_budget = AssistanceBudget::new(
+            consumed_work - 1,
+            8 * 1024 * 1024,
+            "budgeted navigation exhaustion",
+        );
+        let error = index
+            .navigate_with_cancel_and_budget(
+                &uri,
+                Position::new(6, 2),
+                NavigationTarget::Declaration,
+                &cancel,
+                &mut limited_budget,
+            )
+            .expect_err("the shared budget must stop semantic resolution");
+        assert!(error.contains("budgeted navigation exhaustion exceeds"));
+        assert!(limited_budget.exhausted());
     }
 
     #[test]

@@ -878,6 +878,7 @@ dependencies = [
  "crossbeam-channel",
  "fmt4d",
  "globset",
+ "libc",
  "lint4d",
  "lsp-server",
  "lsp-types",

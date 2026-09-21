@@ -5,7 +5,7 @@ use super::rename::{
     SourceRecord, WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
     input_source_is_editable, input_source_is_writable, is_cancelled,
     may_contain_include_directive, snapshot_records, snapshot_records_bounded,
-    source_for_input_with_cancel, text_content_hash, workspace_edit,
+    source_for_input_with_cancel, source_record_owned_bytes, text_content_hash, workspace_edit,
 };
 use super::{
     absolute_path, canonical_file_uri, is_configuration_file, is_lint_excluded, path_stamp,
@@ -74,6 +74,7 @@ const MAX_FIX_ALL_EDIT_BYTES: usize = 64 * 1024;
 const MAX_FIX_ALL_DEPENDENCY_RECORDS: usize = 4096;
 const MAX_FIX_ALL_WORK: usize = 1_000_000;
 const MAX_FIX_ALL_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+const PARSER_OWNED_BYTES_PER_SOURCE_BYTE: usize = 64;
 const FIX_ALL_CANDIDATE_LIMIT: &str = "fix-all candidate limit reached";
 const INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND: CodeActionKind =
     CodeActionKind::new("quickfix.implement-interface-method");
@@ -89,6 +90,11 @@ impl FixWorkBudget for AssistanceBudget {
     fn charge_bytes(&mut self, amount: usize) -> Result<(), String> {
         let cancel = AtomicBool::new(false);
         self.require_bytes(amount, &cancel)
+    }
+
+    fn charge_owned_bytes(&mut self, amount: usize) -> Result<(), String> {
+        let cancel = AtomicBool::new(false);
+        self.require_owned_bytes(amount, &cancel)
     }
 }
 
@@ -313,10 +319,17 @@ impl FixAllOffsetMap {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Self, String> {
-        budget.require_bytes(
+        budget.require_owned_bytes(
             edits
                 .len()
                 .saturating_mul(std::mem::size_of::<FixAllOffsetEntry>()),
+            cancel,
+        )?;
+        budget.require_owned_bytes(
+            edits
+                .len()
+                .saturating_mul(2)
+                .saturating_mul(std::mem::size_of::<((usize, usize), (usize, usize))>()),
             cancel,
         )?;
         let mut entries = Vec::with_capacity(edits.len());
@@ -1251,9 +1264,20 @@ pub(crate) fn code_actions_from_input(
         }
     }
     let mut records = if fix_all_requested {
-        match snapshot_records_bounded(&snapshot, &mut fix_all_budget, cancel) {
-            Ok(records) => records,
-            Err(error) => return failed(source_generation, configuration_generation, error),
+        if fix_all_budget.exhausted() {
+            // The fix-all plan was already discarded when the request-wide
+            // budget exhausted. Do not turn that optional-assistance outcome
+            // into a protocol failure while trying to retain its cache
+            // records; unrelated actions contribute their own records below.
+            Vec::new()
+        } else {
+            match snapshot_records_bounded(&snapshot, &mut fix_all_budget, cancel) {
+                Ok(records) => records,
+                Err(error) if is_cancelled(cancel) => {
+                    return failed(source_generation, configuration_generation, error);
+                }
+                Err(_) => Vec::new(),
+            }
         }
     } else {
         snapshot_records(&snapshot)
@@ -1350,12 +1374,28 @@ fn fix_all_plan_from_input(
     if raw_edits.len() > MAX_FIX_ALL_EDITS || edit_bytes > MAX_FIX_ALL_EDIT_BYTES {
         return Ok((None, Vec::new()));
     }
+    budget.require_owned_bytes(
+        raw_edits
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(
+                std::mem::size_of::<FixAllEditIdentity>() + std::mem::size_of::<usize>(),
+            )
+            .saturating_add(
+                raw_edits
+                    .iter()
+                    .map(|edit| edit.new_text.len())
+                    .sum::<usize>(),
+            ),
+        cancel,
+    )?;
     let raw_edit_set = raw_edits.iter().cloned().collect::<HashSet<_>>();
     for candidate in &candidates {
         let start = text::position_to_offset(source, candidate.anchor.start)
             .ok_or_else(|| "fix-all candidate has an invalid start position".to_string())?;
         let end = text::position_to_offset(source, candidate.anchor.end)
             .ok_or_else(|| "fix-all candidate has an invalid end position".to_string())?;
+        budget.require_owned_bytes(candidate.new_name.len(), cancel)?;
         if !raw_edit_set.contains(&FixAllEditIdentity {
             start,
             end,
@@ -1367,13 +1407,30 @@ fn fix_all_plan_from_input(
         }
     }
 
+    budget.require_owned_bytes(
+        candidates
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<String>()),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        candidates
+            .len()
+            .saturating_mul(4)
+            .saturating_mul(std::mem::size_of::<String>() + std::mem::size_of::<usize>()),
+        cancel,
+    )?;
     let mut candidate_names = Vec::with_capacity(candidates.len().saturating_mul(2));
     let mut candidate_name_set = HashSet::with_capacity(candidates.len().saturating_mul(2));
     for candidate in &candidates {
         budget.require_work(1, cancel)?;
         for name in [&candidate.old_name, &candidate.new_name] {
+            budget.require_work(1, cancel)?;
             budget.require_bytes(name.len(), cancel)?;
+            budget.require_owned_bytes(name.len(), cancel)?;
             if candidate_name_set.insert(name.clone()) {
+                budget.require_owned_bytes(name.len(), cancel)?;
                 candidate_names.push(name.clone());
             }
         }
@@ -1386,6 +1443,28 @@ fn fix_all_plan_from_input(
     } else {
         SnapshotMode::Workspace
     };
+    budget.require_work(
+        configuration_records
+            .len()
+            .saturating_add(candidate_names.len()),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        source_record_owned_bytes(target_record)
+            .saturating_add(
+                configuration_records
+                    .iter()
+                    .map(source_record_owned_bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                candidate_names
+                    .iter()
+                    .map(|name| std::mem::size_of::<String>() + name.len())
+                    .sum::<usize>(),
+            ),
+        cancel,
+    )?;
     let snapshot = match build_snapshot(
         input,
         std::slice::from_ref(uri),
@@ -1419,7 +1498,14 @@ fn fix_all_plan_from_input(
         Err(_) => return Ok((None, Vec::new())),
     };
 
-    let mut proven_candidates = Vec::new();
+    budget.require_owned_bytes(
+        candidates.len().saturating_mul(std::mem::size_of::<(
+            NamingCandidate,
+            Vec<FixAllEditIdentity>,
+        )>()),
+        cancel,
+    )?;
+    let mut proven_candidates = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -1454,7 +1540,12 @@ fn fix_all_plan_from_input(
             Err(error) if is_cancelled(cancel) || budget.exhausted() => return Err(error),
             Err(_) => continue,
         };
-        let mut candidate_edits = Vec::new();
+        let planned_edit_count = planned.values().map(Vec::len).sum::<usize>();
+        budget.require_owned_bytes(
+            planned_edit_count.saturating_mul(std::mem::size_of::<FixAllEditIdentity>()),
+            cancel,
+        )?;
+        let mut candidate_edits = Vec::with_capacity(planned_edit_count);
         let mut unsafe_candidate = false;
         for (edited_uri, edits) in planned {
             if edited_uri != *uri {
@@ -1494,6 +1585,7 @@ fn fix_all_plan_from_input(
         if candidate_edits.is_empty() {
             continue;
         }
+        budget.require_owned_bytes(naming_candidate_owned_bytes(candidate), cancel)?;
         proven_candidates.push((candidate.clone(), candidate_edits));
     }
     if proven_candidates.is_empty() {
@@ -1502,7 +1594,14 @@ fn fix_all_plan_from_input(
     // Select a deterministic coherent subset. Each trial is rebound as one
     // transformed semantic state; an edit is never retained merely because
     // its individual original-state rename proof succeeded.
-    let mut retained = Vec::new();
+    budget.require_owned_bytes(
+        proven_candidates.len().saturating_mul(std::mem::size_of::<(
+            NamingCandidate,
+            Vec<FixAllEditIdentity>,
+        )>()),
+        cancel,
+    )?;
+    let mut retained = Vec::with_capacity(proven_candidates.len());
     let mut selected_raw_edits = Vec::new();
     for candidate in proven_candidates {
         if is_cancelled(cancel) {
@@ -1537,6 +1636,7 @@ fn fix_all_plan_from_input(
     };
     budget.require_work(1, cancel)?;
     budget.require_bytes(updated_source.len(), cancel)?;
+    reserve_transformed_validation_budget(&updated_source, budget, cancel)?;
     let final_offset_map =
         FixAllOffsetMap::new(&updated_source, &selected_raw_edits, cancel, budget)?;
     let (updated_tree, _) = parser::parse_file(
@@ -1551,6 +1651,9 @@ fn fix_all_plan_from_input(
     if updated_tree.root_node().has_error() {
         return Ok((None, Vec::new()));
     }
+    check_fix_all_cancel(cancel)?;
+    budget.require_work(updated_source.len(), cancel)?;
+    reserve_lint_validation_budget(updated_tree.root_node(), budget, cancel)?;
     let remaining = lint4d::engine::run_lint(
         &FileInfo::new(
             uri.to_file_path()
@@ -1595,6 +1698,13 @@ fn fix_all_plan_from_input(
             .sum(),
         cancel,
     )?;
+    budget.require_owned_bytes(
+        updated_candidates
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<(String, Range)>() + std::mem::size_of::<usize>()),
+        cancel,
+    )?;
     let updated_candidate_keys = updated_candidates
         .into_iter()
         .map(|candidate| (candidate.rule, candidate.anchor))
@@ -1615,6 +1725,7 @@ fn fix_all_plan_from_input(
                 .ok_or_else(|| "fix-all transformed candidate end is invalid".to_string())?,
         );
         budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(candidate.rule.len(), cancel)?;
         if updated_candidate_keys.contains(&(candidate.rule.clone(), updated_range)) {
             return Ok((None, Vec::new()));
         }
@@ -1633,11 +1744,35 @@ fn fix_all_plan_from_input(
             .sum(),
         cancel,
     )?;
+    budget.require_owned_bytes(
+        configuration_records
+            .iter()
+            .map(source_record_owned_bytes)
+            .sum::<usize>()
+            .saturating_add(
+                configuration_records
+                    .len()
+                    .saturating_mul(std::mem::size_of::<SourceRecord>()),
+            ),
+        cancel,
+    )?;
     append_records(&mut records, configuration_records.to_vec());
     if records.len() > MAX_FIX_ALL_DEPENDENCY_RECORDS {
         return Ok((None, Vec::new()));
     }
     let dependency_fingerprint = fix_all_dependency_fingerprint_bounded(&records, budget, cancel)?;
+    budget.require_owned_bytes(
+        selected_raw_edits
+            .len()
+            .saturating_mul(std::mem::size_of::<TextEdit>())
+            .saturating_add(
+                selected_raw_edits
+                    .iter()
+                    .map(|edit| edit.new_text.len())
+                    .sum::<usize>(),
+            ),
+        cancel,
+    )?;
     let edits = selected_raw_edits
         .iter()
         .map(|edit| {
@@ -1648,6 +1783,12 @@ fn fix_all_plan_from_input(
             Ok(TextEdit::new(Range::new(start, end), edit.new_text.clone()))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    budget.require_owned_bytes(
+        retained
+            .len()
+            .saturating_mul(std::mem::size_of::<FixAllCandidateIdentity>()),
+        cancel,
+    )?;
     let candidates = retained
         .into_iter()
         .map(|(candidate, _)| FixAllCandidateIdentity {
@@ -1657,6 +1798,18 @@ fn fix_all_plan_from_input(
             new_name: candidate.new_name,
         })
         .collect();
+    budget.require_owned_bytes(
+        std::mem::size_of::<FixAllPlan>()
+            .saturating_add(uri.as_str().len())
+            .saturating_add(
+                scope
+                    .rules()
+                    .iter()
+                    .map(|rule| std::mem::size_of::<String>() + rule.len())
+                    .sum::<usize>(),
+            ),
+        cancel,
+    )?;
     Ok((
         Some(FixAllPlan {
             uri: uri.clone(),
@@ -1680,6 +1833,85 @@ fn fix_all_plan_from_input(
 /// Validate one proposed fix-all subset against a single transformed binding
 /// state. The returned edit vector is the exact raw-builder-compatible subset
 /// and is already normalized for application to `source`.
+fn reserve_transformed_validation_budget(
+    source: &str,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    // The parser does not accept an AssistanceBudget. Count its bounded source
+    // scan before entering it; transformed source storage itself is charged by
+    // `apply_fix_all_edits_bounded` before the String is allocated.
+    budget.require_work(source.len(), cancel)?;
+    budget.require_owned_bytes(
+        source
+            .len()
+            .saturating_mul(PARSER_OWNED_BYTES_PER_SOURCE_BYTE),
+        cancel,
+    )
+}
+
+fn reserve_lint_validation_budget(
+    root: Node<'_>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut node_count = 0usize;
+    count_validation_nodes(root, budget, cancel, &mut node_count)?;
+    budget.require_owned_bytes(
+        node_count.saturating_mul(std::mem::size_of::<lint4d::engine::Diagnostic>() + 128),
+        cancel,
+    )
+}
+
+fn count_validation_nodes(
+    node: Node<'_>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+    node_count: &mut usize,
+) -> Result<(), String> {
+    budget.require_work(1, cancel)?;
+    *node_count = node_count.saturating_add(1);
+    for child in node.children(&mut node.walk()) {
+        count_validation_nodes(child, budget, cancel, node_count)?;
+    }
+    Ok(())
+}
+
+fn check_fix_all_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if is_cancelled(cancel) {
+        Err(CANCELLATION_MESSAGE.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn collect_candidate_edits_bounded(
+    candidates: &[(NamingCandidate, Vec<FixAllEditIdentity>)],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<FixAllEditIdentity>, String> {
+    let edit_count = candidates
+        .iter()
+        .map(|(_, edits)| edits.len())
+        .sum::<usize>();
+    budget.require_owned_bytes(
+        edit_count.saturating_mul(std::mem::size_of::<FixAllEditIdentity>()),
+        cancel,
+    )?;
+    let mut result = Vec::with_capacity(edit_count);
+    for (_, edits) in candidates {
+        for edit in edits {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            budget.require_work(1, cancel)?;
+            budget.require_owned_bytes(edit.new_text.len(), cancel)?;
+            result.push(edit.clone());
+        }
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_fix_all_subset(
     snapshot: &RenameSnapshot,
@@ -1692,10 +1924,7 @@ fn validate_fix_all_subset(
     budget: &mut AssistanceBudget,
 ) -> Result<Option<Vec<FixAllEditIdentity>>, String> {
     let semantic_edits = normalize_fix_all_edit_identities_bounded(
-        candidates
-            .iter()
-            .flat_map(|(_, edits)| edits.iter().cloned())
-            .collect(),
+        collect_candidate_edits_bounded(candidates, cancel, budget)?,
         source,
         cancel,
         budget,
@@ -1703,6 +1932,23 @@ fn validate_fix_all_subset(
     if semantic_edits.is_empty() {
         return Ok(None);
     }
+    budget.require_owned_bytes(
+        semantic_edits
+            .len()
+            .saturating_mul(std::mem::size_of::<FixAllEditIdentity>())
+            .saturating_add(
+                semantic_edits
+                    .iter()
+                    .map(|edit| edit.new_text.len())
+                    .sum::<usize>(),
+            ),
+        cancel,
+    )?;
+    budget.require_owned_bytes(edit_identity_hash_set_storage(&semantic_edits), cancel)?;
+    budget.require_owned_bytes(
+        edit_identity_vec_storage(raw_edits.len(), raw_edits),
+        cancel,
+    )?;
     let selected_edit_set = semantic_edits.iter().cloned().collect::<HashSet<_>>();
     let selected_raw_edits = raw_edits
         .iter()
@@ -1729,7 +1975,7 @@ fn validate_fix_all_subset(
     let offset_map = FixAllOffsetMap::new(&updated_source, &selected_raw_edits, cancel, budget)?;
     let transformed = match snapshot.index.rebind_with_replaced_source_for_fix_all(
         uri,
-        updated_source.clone(),
+        &updated_source,
         cancel,
         budget,
     ) {
@@ -1737,7 +1983,36 @@ fn validate_fix_all_subset(
         Err(error) if is_cancelled(cancel) => return Err(error),
         Err(_) => return Ok(None),
     };
+    budget.require_owned_bytes(edit_identity_hash_set_storage(&selected_raw_edits), cancel)?;
     let selected_edit_set = selected_raw_edits.iter().cloned().collect::<HashSet<_>>();
+    budget.require_owned_bytes(
+        selected_raw_edits
+            .len()
+            .saturating_mul(std::mem::size_of::<(FixAllEditIdentity, Range)>()),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        selected_raw_edits
+            .iter()
+            .map(|edit| edit.new_text.len())
+            .sum(),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        selected_raw_edits
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(
+                std::mem::size_of::<(FixAllEditIdentity, Range)>() + std::mem::size_of::<usize>(),
+            )
+            .saturating_add(
+                selected_raw_edits
+                    .iter()
+                    .map(|edit| edit.new_text.len())
+                    .sum::<usize>(),
+            ),
+        cancel,
+    )?;
     let mut transformed_edit_ranges = HashMap::with_capacity(selected_raw_edits.len());
     budget.require_work(selected_raw_edits.len(), cancel)?;
     for edit in &selected_raw_edits {
@@ -1761,6 +2036,7 @@ fn validate_fix_all_subset(
             .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
         let declaration_end = text::position_to_offset(source, candidate.anchor.end)
             .ok_or_else(|| "fix-all candidate has an invalid source position".to_string())?;
+        budget.require_owned_bytes(candidate.new_name.len(), cancel)?;
         let declaration_identity = FixAllEditIdentity {
             start: declaration_start,
             end: declaration_end,
@@ -1789,8 +2065,13 @@ fn validate_fix_all_subset(
                 return Ok(None);
             }
             budget.require_work(1, cancel)?;
-            let locations =
-                transformed.navigate(uri, updated_range.start, NavigationTarget::Declaration);
+            let locations = transformed.navigate_with_cancel_and_budget(
+                uri,
+                updated_range.start,
+                NavigationTarget::Declaration,
+                cancel,
+                budget,
+            )?;
             if locations.len() != 1
                 || locations[0].uri != *uri
                 || locations[0].range != *expected_declaration
@@ -1812,12 +2093,45 @@ fn validate_fix_all_subset(
     // combined rename. Re-check their declaration correspondence in the same
     // transformed index so the proof covers unaffected references as well as
     // the occurrences emitted by each candidate's rename query.
+    budget.require_owned_bytes(
+        candidates
+            .iter()
+            .map(|(candidate, _)| {
+                candidate
+                    .new_name
+                    .len()
+                    .saturating_add(std::mem::size_of::<String>())
+            })
+            .sum(),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        candidates
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<String>() + std::mem::size_of::<usize>()),
+        cancel,
+    )?;
     let mut final_names = HashSet::new();
     for (candidate, _) in candidates {
         budget.require_work(1, cancel)?;
         budget.require_bytes(candidate.new_name.len(), cancel)?;
+        budget.require_owned_bytes(candidate.new_name.len(), cancel)?;
         final_names.insert(canonical_fix_all_name(&candidate.new_name));
     }
+    budget.require_owned_bytes(
+        selected_raw_edits
+            .len()
+            .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        selected_raw_edits
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<(usize, usize)>() + std::mem::size_of::<usize>()),
+        cancel,
+    )?;
     let mut selected_spans = HashSet::with_capacity(selected_raw_edits.len());
     budget.require_work(selected_raw_edits.len(), cancel)?;
     for edit in &selected_raw_edits {
@@ -1838,20 +2152,26 @@ fn validate_fix_all_subset(
             text::offset_to_position(source, identifier.start).ok_or_else(|| {
                 "fix-all binding source has an invalid identifier position".to_string()
             })?;
-        let original_locations =
-            snapshot
-                .index
-                .navigate(uri, original_position, NavigationTarget::Declaration);
-        budget.require_work(1, cancel)?;
+        let original_locations = snapshot.index.navigate_with_cancel_and_budget(
+            uri,
+            original_position,
+            NavigationTarget::Declaration,
+            cancel,
+            budget,
+        )?;
         if original_locations.len() != 1 {
             return Ok(None);
         }
         let mapped_identifier = offset_map
             .map_unedited_range(&updated_source, identifier.start, identifier.end)
             .ok_or_else(|| "fix-all unaffected identifier overlaps a selected edit".to_string())?;
-        let transformed_locations =
-            transformed.navigate(uri, mapped_identifier.start, NavigationTarget::Declaration);
-        budget.require_work(1, cancel)?;
+        let transformed_locations = transformed.navigate_with_cancel_and_budget(
+            uri,
+            mapped_identifier.start,
+            NavigationTarget::Declaration,
+            cancel,
+            budget,
+        )?;
         if transformed_locations.len() != 1 {
             return Ok(None);
         }
@@ -1873,6 +2193,20 @@ fn validate_fix_all_subset(
 
 fn canonical_fix_all_name(name: &str) -> String {
     name.trim_start_matches('&').to_ascii_lowercase()
+}
+
+fn edit_identity_vec_storage(count: usize, edits: &[FixAllEditIdentity]) -> usize {
+    count
+        .saturating_mul(std::mem::size_of::<FixAllEditIdentity>())
+        .saturating_add(edits.iter().map(|edit| edit.new_text.len()).sum::<usize>())
+}
+
+fn edit_identity_hash_set_storage(edits: &[FixAllEditIdentity]) -> usize {
+    edits
+        .len()
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<FixAllEditIdentity>() + std::mem::size_of::<usize>())
+        .saturating_add(edits.iter().map(|edit| edit.new_text.len()).sum::<usize>())
 }
 
 fn transformed_location_range(
@@ -1996,6 +2330,12 @@ fn deduplicate_fix_all_edits_bounded(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Vec<FixAllEditIdentity>, String> {
+    budget.require_owned_bytes(
+        edits
+            .len()
+            .saturating_mul(std::mem::size_of::<FixAllEditIdentity>()),
+        cancel,
+    )?;
     deduplicate_fix_all_edit_identities_bounded(
         edits
             .into_iter()
@@ -2019,6 +2359,12 @@ fn deduplicate_fix_all_edit_identities_bounded(
 ) -> Result<Vec<FixAllEditIdentity>, String> {
     budget.require_work(edits.len(), cancel)?;
     budget.require_bytes(edits.iter().map(|edit| edit.new_text.len()).sum(), cancel)?;
+    budget.require_owned_bytes(
+        edits
+            .len()
+            .saturating_mul(std::mem::size_of::<FixAllEditIdentity>()),
+        cancel,
+    )?;
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
@@ -2032,6 +2378,7 @@ fn deduplicate_fix_all_edit_identities_bounded(
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
+    budget.require_owned_bytes(edit_identity_vec_storage(edits.len(), &edits), cancel)?;
     let mut normalized: Vec<FixAllEditIdentity> = Vec::with_capacity(edits.len());
     for edit in edits {
         if is_cancelled(cancel) {
@@ -2069,7 +2416,17 @@ fn apply_fix_all_edits_bounded(
 ) -> Result<Option<String>, String> {
     budget.require_work(1, cancel)?;
     budget.require_bytes(source.len(), cancel)?;
-    let mut updated = source.to_owned();
+    let final_len = edits.iter().try_fold(source.len(), |length, edit| {
+        length
+            .checked_sub(edit.end.saturating_sub(edit.start))?
+            .checked_add(edit.new_text.len())
+    });
+    let Some(final_len) = final_len else {
+        return Ok(None);
+    };
+    budget.require_owned_bytes(final_len, cancel)?;
+    let mut updated = String::with_capacity(final_len);
+    updated.push_str(source);
     for edit in edits.iter().rev() {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -2087,6 +2444,12 @@ fn fix_all_dependency_fingerprint_bounded(
     cancel: &AtomicBool,
 ) -> Result<u64, String> {
     budget.require_work(records.len(), cancel)?;
+    budget.require_owned_bytes(
+        records
+            .len()
+            .saturating_mul(std::mem::size_of::<&SourceRecord>()),
+        cancel,
+    )?;
     let mut ordered = records.iter().collect::<Vec<_>>();
     budget.require_work(comparison_sort_work(ordered.len()), cancel)?;
     ordered.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
@@ -2106,6 +2469,15 @@ fn fix_all_dependency_fingerprint_bounded(
                 + record.text.len()
                 + record.content_bytes.as_ref().map_or(0, |bytes| bytes.len())
                 + observation_bytes,
+            cancel,
+        )?;
+        budget.require_owned_bytes(
+            record.uri.as_str().len()
+                + record
+                    .candidate_observations
+                    .iter()
+                    .map(|observation| observation.path.as_os_str().len())
+                    .sum::<usize>(),
             cancel,
         )?;
         record.uri.hash(&mut hasher);
@@ -5047,7 +5419,8 @@ fn naming_candidates(
 }
 
 /// Bounded candidate collection used only by source fix-all. The collector
-/// stops at `MAX_FIX_ALL_CANDIDATES + 1`, so an over-limit request is withheld
+/// stops as soon as `MAX_FIX_ALL_CANDIDATES` candidates have been collected and
+/// another eligible candidate is found, so an over-limit request is withheld
 /// without constructing or sorting an unbounded candidate vector. `None` is a
 /// deliberate no-action result, while `Err` is reserved for cancellation or
 /// a real parser/budget failure.
@@ -5065,6 +5438,13 @@ fn naming_candidates_bounded(
 ) -> Result<Option<Vec<NamingCandidate>>, String> {
     budget.require_work(1, cancel)?;
     budget.require_bytes(source.len(), cancel)?;
+    budget.require_work(source.len(), cancel)?;
+    budget.require_owned_bytes(
+        source
+            .len()
+            .saturating_mul(PARSER_OWNED_BYTES_PER_SOURCE_BYTE),
+        cancel,
+    )?;
     let path = uri
         .to_file_path()
         .map(absolute_path)
@@ -5147,6 +5527,19 @@ fn naming_candidates_bounded(
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
+    budget.require_owned_bytes(
+        candidates
+            .len()
+            .saturating_mul(std::mem::size_of::<NamingCandidate>()),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        candidates
+            .len()
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<(String, Range)>() + std::mem::size_of::<usize>()),
+        cancel,
+    )?;
     let mut deduplicated = Vec::with_capacity(candidates.len());
     let mut seen = HashSet::with_capacity(candidates.len());
     for candidate in candidates {
@@ -5154,6 +5547,7 @@ fn naming_candidates_bounded(
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(candidate.rule.len(), cancel)?;
         let identity = (candidate.rule.clone(), candidate.anchor);
         budget.require_bytes(candidate.rule.len(), cancel)?;
         if seen.insert(identity) {
@@ -5179,9 +5573,17 @@ fn collect_constants_bounded(
         if node.kind() != "declConst" || node.child_by_field_name("type").is_some() {
             return Ok(());
         }
-        for name_node in field_identifier_nodes(node, "name") {
+        for name_node in field_identifier_nodes_bounded(node, "name", budget, cancel)? {
             let before = candidates.len();
-            add_candidate(CONSTANT_RULE, name_node, style, request, candidates);
+            add_candidate_bounded(
+                CONSTANT_RULE,
+                name_node,
+                style,
+                request,
+                candidates,
+                budget,
+                cancel,
+            )?;
             if candidates.len() != before {
                 let candidate = candidates.last().expect("candidate was just appended");
                 budget.require_work(1, cancel)?;
@@ -5214,17 +5616,21 @@ fn collect_locals_bounded(
             return Ok(());
         }
         if let Some(header) = node.child_by_field_name("header") {
-            for child in effective_children(header) {
+            for child in effective_children_bounded(header, budget, cancel)? {
                 if child.kind() != "declArgs" {
                     continue;
                 }
-                for argument in effective_children(child) {
+                for argument in effective_children_bounded(child, budget, cancel)? {
                     if argument.kind() != "declArg" {
                         continue;
                     }
-                    for name_node in field_identifier_nodes(argument, "name") {
+                    for name_node in
+                        field_identifier_nodes_bounded(argument, "name", budget, cancel)?
+                    {
                         let before = candidates.len();
-                        add_candidate(LOCAL_RULE, name_node, style, request, candidates);
+                        add_candidate_bounded(
+                            LOCAL_RULE, name_node, style, request, candidates, budget, cancel,
+                        )?;
                         if candidates.len() != before {
                             let candidate = candidates.last().expect("candidate was just appended");
                             budget.require_work(1, cancel)?;
@@ -5243,17 +5649,21 @@ fn collect_locals_bounded(
                 }
             }
         }
-        for child in effective_children(node) {
+        for child in effective_children_bounded(node, budget, cancel)? {
             if child.kind() != "declVars" {
                 continue;
             }
-            for declaration in effective_children(child) {
+            for declaration in effective_children_bounded(child, budget, cancel)? {
                 if declaration.kind() != "declVar" {
                     continue;
                 }
-                for name_node in field_identifier_nodes(declaration, "name") {
+                for name_node in
+                    field_identifier_nodes_bounded(declaration, "name", budget, cancel)?
+                {
                     let before = candidates.len();
-                    add_candidate(LOCAL_RULE, name_node, style, request, candidates);
+                    add_candidate_bounded(
+                        LOCAL_RULE, name_node, style, request, candidates, budget, cancel,
+                    )?;
                     if candidates.len() != before {
                         let candidate = candidates.last().expect("candidate was just appended");
                         budget.require_work(1, cancel)?;
@@ -5281,7 +5691,9 @@ fn walk_bounded(
     cancel: &AtomicBool,
     callback: &mut impl FnMut(Node<'_>, &mut AssistanceBudget) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut pending = vec![root];
+    budget.require_owned_bytes(std::mem::size_of::<Node<'_>>(), cancel)?;
+    let mut pending = Vec::with_capacity(1);
+    pending.push(root);
     while let Some(node) = pending.pop() {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -5289,14 +5701,31 @@ fn walk_bounded(
         budget.require_work(1, cancel)?;
         callback(node, budget)?;
         let mut cursor = node.walk();
-        let children = node.children(&mut cursor).collect::<Vec<_>>();
-        budget.require_work(children.len(), cancel)?;
-        budget.require_bytes(
-            children
-                .len()
-                .saturating_mul(std::mem::size_of::<Node<'_>>()),
+        let child_capacity = node.child_count();
+        budget.require_owned_bytes(
+            child_capacity.saturating_mul(std::mem::size_of::<Node<'_>>()),
             cancel,
         )?;
+        let mut children = Vec::with_capacity(child_capacity);
+        for child in node.children(&mut cursor) {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            children.push(child);
+        }
+        budget.require_work(children.len(), cancel)?;
+        if pending.len().saturating_add(children.len()) > pending.capacity() {
+            let additional = children.len();
+            budget.require_owned_bytes(
+                additional
+                    .saturating_mul(2)
+                    .saturating_mul(std::mem::size_of::<Node<'_>>()),
+                cancel,
+            )?;
+            pending
+                .try_reserve(additional)
+                .map_err(|error| format!("could not reserve bounded syntax worklist: {error}"))?;
+        }
         pending.extend(children.into_iter().rev());
     }
     Ok(())
@@ -5323,6 +5752,13 @@ fn collect_fix_all_identifiers(
 ) -> Result<Vec<FixAllIdentifier>, String> {
     budget.require_work(1, cancel)?;
     budget.require_bytes(source.len(), cancel)?;
+    budget.require_work(source.len(), cancel)?;
+    budget.require_owned_bytes(
+        source
+            .len()
+            .saturating_mul(PARSER_OWNED_BYTES_PER_SOURCE_BYTE),
+        cancel,
+    )?;
     let path = uri
         .to_file_path()
         .map(absolute_path)
@@ -5337,13 +5773,29 @@ fn collect_fix_all_identifiers(
         if node.kind() != "identifier" {
             return Ok(());
         }
-        let name = node_text(node, source);
+        let Some(name) = source.get(node.start_byte()..node.end_byte()) else {
+            return Ok(());
+        };
         budget.require_work(1, cancel)?;
-        budget.require_bytes(name.len() + std::mem::size_of::<FixAllIdentifier>(), cancel)?;
+        budget.require_owned_bytes(name.len(), cancel)?;
+        if identifiers.len() == identifiers.capacity() {
+            let old_capacity = identifiers.capacity();
+            let new_capacity = old_capacity.max(1).saturating_mul(2);
+            let additional = new_capacity.saturating_sub(old_capacity);
+            budget.require_owned_bytes(
+                old_capacity
+                    .saturating_add(new_capacity)
+                    .saturating_mul(std::mem::size_of::<FixAllIdentifier>()),
+                cancel,
+            )?;
+            identifiers
+                .try_reserve_exact(additional)
+                .map_err(|error| format!("could not reserve fix-all identifier: {error}"))?;
+        }
         identifiers.push(FixAllIdentifier {
             start: node.start_byte(),
             end: node.end_byte(),
-            name,
+            name: name.to_owned(),
         });
         Ok(())
     })?;
@@ -5526,6 +5978,123 @@ fn add_candidate(
     });
 }
 
+fn add_candidate_bounded(
+    rule: &str,
+    name_node: Node<'_>,
+    style: &str,
+    request: &CandidateRequest<'_>,
+    candidates: &mut Vec<NamingCandidate>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let Some(old_name) = request
+        .source
+        .get(name_node.start_byte()..name_node.end_byte())
+    else {
+        return Ok(());
+    };
+    if !violates(rule, old_name, style) {
+        return Ok(());
+    }
+    let line = name_node.start_position().row + 1;
+    if request
+        .suppressions
+        .iter()
+        .any(|suppression| suppression.matches(rule, line))
+    {
+        return Ok(());
+    }
+    let Some(anchor) = range_for_node(name_node, request.source) else {
+        return Ok(());
+    };
+    if !ranges_intersect(anchor, request.requested_range) {
+        return Ok(());
+    }
+    let matching_diagnostic = request.context.diagnostics.iter().find(|diagnostic| {
+        diagnostic_code(diagnostic) == Some(rule) && ranges_overlap(diagnostic.range, anchor)
+    });
+    if !request.context.diagnostics.is_empty() && matching_diagnostic.is_none() {
+        return Ok(());
+    }
+    if candidates.len() >= MAX_FIX_ALL_CANDIDATES {
+        return Err(FIX_ALL_CANDIDATE_LIMIT.to_string());
+    }
+
+    let old_name_bytes = old_name.len();
+    let new_name_bytes = max_generated_name_bytes(old_name_bytes);
+    let diagnostic_bytes = matching_diagnostic.map(diagnostic_owned_bytes).unwrap_or(0);
+    budget.require_owned_bytes(
+        std::mem::size_of::<NamingCandidate>()
+            .saturating_add(rule.len())
+            .saturating_add(request.uri.as_str().len())
+            .saturating_add(old_name_bytes)
+            .saturating_add(new_name_bytes)
+            .saturating_add(naming_workspace_bytes(old_name_bytes))
+            .saturating_add(diagnostic_bytes),
+        cancel,
+    )?;
+    if candidates.len() == candidates.capacity() {
+        let old_capacity = candidates.capacity();
+        let new_capacity = old_capacity.max(1).saturating_mul(2);
+        let additional = new_capacity.saturating_sub(old_capacity);
+        budget.require_owned_bytes(
+            old_capacity
+                .saturating_add(new_capacity)
+                .saturating_mul(std::mem::size_of::<NamingCandidate>()),
+            cancel,
+        )?;
+        candidates
+            .try_reserve_exact(additional)
+            .map_err(|error| format!("could not reserve bounded fix-all candidate: {error}"))?;
+    }
+    let old_name = old_name.to_owned();
+    let new_name = replacement(rule, &old_name, style);
+    let matching_diagnostic = matching_diagnostic.cloned();
+    candidates.push(NamingCandidate {
+        rule: rule.to_string(),
+        uri: request.uri.clone(),
+        anchor,
+        old_name,
+        new_name,
+        config_fingerprint: request.config_fingerprint,
+        source_hash: request.source_hash,
+        diagnostic: matching_diagnostic,
+    });
+    Ok(())
+}
+
+fn diagnostic_owned_bytes(diagnostic: &Diagnostic) -> usize {
+    std::mem::size_of::<Diagnostic>()
+        .saturating_add(diagnostic.message.len())
+        .saturating_add(diagnostic.code.as_ref().map_or(0, |code| match code {
+            NumberOrString::String(value) => value.len(),
+            NumberOrString::Number(_) => std::mem::size_of::<i32>(),
+        }))
+        .saturating_add(diagnostic.source.as_ref().map_or(0, String::len))
+}
+
+fn naming_candidate_owned_bytes(candidate: &NamingCandidate) -> usize {
+    std::mem::size_of::<NamingCandidate>()
+        .saturating_add(candidate.rule.len())
+        .saturating_add(candidate.uri.as_str().len())
+        .saturating_add(candidate.old_name.len())
+        .saturating_add(candidate.new_name.len())
+        .saturating_add(
+            candidate
+                .diagnostic
+                .as_ref()
+                .map_or(0, diagnostic_owned_bytes),
+        )
+}
+
+fn max_generated_name_bytes(input_bytes: usize) -> usize {
+    input_bytes.saturating_mul(2).max(1)
+}
+
+fn naming_workspace_bytes(input_bytes: usize) -> usize {
+    input_bytes.saturating_mul(8)
+}
+
 fn violates(rule: &str, name: &str, style: &str) -> bool {
     match rule {
         CONSTANT_RULE if style == "PascalCase" => !name
@@ -5594,6 +6163,101 @@ fn field_identifier_nodes<'a>(node: Node<'a>, field: &str) -> Vec<Node<'a>> {
                 .then_some(child)
         })
         .collect()
+}
+
+fn field_identifier_nodes_bounded<'a>(
+    node: Node<'a>,
+    field: &str,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<Vec<Node<'a>>, String> {
+    let capacity = node.child_count();
+    budget.require_owned_bytes(
+        capacity.saturating_mul(std::mem::size_of::<Node<'a>>()),
+        cancel,
+    )?;
+    let mut result = Vec::with_capacity(capacity);
+    for index in 0..capacity {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        let Some(child) = node.child(index) else {
+            continue;
+        };
+        if child.kind() == "identifier" && node.field_name_for_child(index as u32) == Some(field) {
+            result.push(child);
+        }
+    }
+    Ok(result)
+}
+
+fn effective_children_bounded<'a>(
+    node: Node<'a>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<Vec<Node<'a>>, String> {
+    let count = count_effective_children(node, budget, cancel)?;
+    budget.require_owned_bytes(
+        count.saturating_mul(std::mem::size_of::<Node<'a>>()),
+        cancel,
+    )?;
+    let mut result = Vec::with_capacity(count);
+    materialize_effective_children(node, &mut result, cancel)?;
+    Ok(result)
+}
+
+fn count_effective_children(
+    node: Node<'_>,
+    budget: &mut AssistanceBudget,
+    cancel: &AtomicBool,
+) -> Result<usize, String> {
+    let mut count = 0usize;
+    for child in node.children(&mut node.walk()) {
+        budget.require_work(1, cancel)?;
+        if child.kind() != "ppBlock" {
+            count = count.saturating_add(1);
+            continue;
+        }
+        for inner in child.children(&mut child.walk()) {
+            budget.require_work(1, cancel)?;
+            match inner.kind() {
+                "ppIf" | "ppElse" | "ppEndIf" => {}
+                "ppBlock" => {
+                    count = count.saturating_add(count_effective_children(inner, budget, cancel)?);
+                }
+                _ => count = count.saturating_add(1),
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn materialize_effective_children<'a>(
+    node: Node<'a>,
+    result: &mut Vec<Node<'a>>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    for child in node.children(&mut node.walk()) {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if child.kind() != "ppBlock" {
+            result.push(child);
+            continue;
+        }
+        for inner in child.children(&mut child.walk()) {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            match inner.kind() {
+                "ppIf" | "ppElse" | "ppEndIf" => {}
+                "ppBlock" => materialize_effective_children(inner, result, cancel)?,
+                _ => result.push(inner),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn walk(root: Node<'_>, callback: &mut impl FnMut(Node<'_>)) {

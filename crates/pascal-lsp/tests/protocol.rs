@@ -2611,6 +2611,8 @@ fn diagnostics_refresh_an_imported_interface_contract_after_a_provider_overlay_e
     let provider_disk = concat!(
         "unit Provider;\n",
         "interface\n",
+        "const\n",
+        "  DefaultValue = 1;\n",
         "type\n",
         "  IRequired = interface\n",
         "    procedure Required;\n",
@@ -2976,6 +2978,8 @@ fn diagnostics_suppress_unknown_imports_and_inaccessible_members() {
     let provider_source = concat!(
         "unit Provider;\n",
         "interface\n",
+        "const\n",
+        "  DefaultValue = 1;\n",
         "type\n",
         "  TBox = class\n",
         "  private\n",
@@ -32546,6 +32550,8 @@ fn code_action_qualifies_named_generic_substitutions_from_an_imported_provider()
         "unit Widget;\n",
         "interface\n",
         "uses Provider;\n",
+        "const\n",
+        "  DefaultValue = 2;\n",
         "type\n",
         "  TObject = class\n",
         "  end;\n",
@@ -32605,6 +32611,8 @@ fn code_action_does_not_rebind_qualified_or_same_unit_default_expressions() {
         "unit Widget;\n",
         "interface\n",
         "uses Provider;\n",
+        "const\n",
+        "  DefaultValue = 2;\n",
         "type\n",
         "  TObject = class\n",
         "  end;\n",
@@ -32679,6 +32687,117 @@ fn code_action_does_not_rebind_qualified_or_same_unit_default_expressions() {
         same_unit_actions.is_empty(),
         "a same-unit class-shadowed default is unsupported and must be withheld: {same_unit_actions:?}"
     );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_stabilizes_every_reference_in_a_compound_default_and_reanalyzes_it() {
+    let temp = tempfile::tempdir().expect("compound-default workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let widget = root.join("Widget.pas");
+    let provider_source = concat!(
+        "unit Provider;\n",
+        "interface\n",
+        "const\n",
+        "  DefaultValue = 1;\n",
+        "type\n",
+        "  TDefaults = class\n",
+        "  public\n",
+        "    const Value = 1;\n",
+        "  end;\n",
+        "  TOther = class\n",
+        "  public\n",
+        "    const Value = 10;\n",
+        "  end;\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer = DefaultValue + TDefaults.Value + TOther.Value);\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "uses Provider;\n",
+        "const\n",
+        "  DefaultValue = 2;\n",
+        "type\n",
+        "  TObject = class\n",
+        "  end;\n",
+        "  TDefaults = class\n",
+        "  public\n",
+        "    const Value = 2;\n",
+        "  end;\n",
+        "  TOther = class\n",
+        "  public\n",
+        "    const Value = 20;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&widget, widget_source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "compound-default-binding",
+    );
+    assert_eq!(actions.len(), 1, "compound default action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(widget_source, &actions[0]["edit"], &uri(&widget));
+    assert!(
+        updated.contains(
+            "procedure Run(Value: Integer = Provider.DefaultValue + Provider.TDefaults.Value + Provider.TOther.Value);"
+        ),
+        "every provider reference must be stabilized: {updated}"
+    );
+    assert!(
+        !updated.contains("Provider.DefaultValue + Provider.TDefaults.Value + TOther.Value"),
+        "the later compound reference must not bind in Widget: {updated}"
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&widget),
+                "languageId": "pascal",
+                "version": 1,
+                "text": updated,
+            }
+        }),
+    );
+    for (needle, id) in [
+        ("TDefaults.Value", "compound-default-first-binding"),
+        ("TOther.Value", "compound-default-second-binding"),
+    ] {
+        let definition_id = RequestId::from(id.to_string());
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&widget, &updated, needle, 0),
+        );
+        let locations = result_locations(server.response(&definition_id));
+        assert_eq!(locations.len(), 1, "{needle} definition: {locations:?}");
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    }
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&widget));
+    assert!(
+        !diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pascal-missing-interface-implementation"),
+        "the applied implementation must satisfy the interface: {diagnostics}"
+    );
+
     server.shutdown();
 }
 
@@ -32875,6 +32994,34 @@ fn code_action_keeps_a_missing_method_with_a_source_backed_empty_tobject() {
 }
 
 #[test]
+fn code_action_withholds_body_only_actions_when_direct_visibility_is_uncertain() {
+    for visibility in ["private", "strict private", "protected"] {
+        let temp = tempfile::tempdir().expect("uncertain-visibility workspace");
+        let root = temp.path().join("fixture");
+        let source_path = root.join("Widget.pas");
+        let source = format!(
+            "unit Widget;\ninterface\ntype\n  IRunner = interface\n    procedure Run;\n  end;\n  TWidget = class(TObject, IRunner)\n  {visibility}\n    procedure Run;\n  end;\nimplementation\nend.\n"
+        );
+        write_file(&source_path, &source);
+
+        let mut server = TestServer::launch();
+        server.initialize_without_document_changes(&root, Value::Null);
+        let actions = request_missing_unit_actions(
+            &mut server,
+            &source_path,
+            &source,
+            "TWidget",
+            &format!("uncertain-visibility-{visibility}"),
+        );
+        assert!(
+            actions.is_empty(),
+            "{visibility} direct declaration cannot authorize an interface action: {actions:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
 fn deferred_interface_action_freezes_provider_alias_meaning() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -32921,18 +33068,31 @@ fn deferred_interface_action_freezes_provider_alias_meaning() {
 #[test]
 fn deferred_interface_action_freezes_structural_provider_type_meaning() {
     let cases = [
-        ("array", "array of Integer", "array of string"),
-        ("pointer", "^Integer", "^string"),
-        ("strong", "type Integer", "type string"),
+        ("array", "array of Integer", "array of string", "TValue"),
+        ("pointer", "^Integer", "^string", "TValue"),
+        ("strong", "type Integer", "type string", "TValue"),
+        (
+            "static-array-bounds",
+            "array[0..1] of Integer",
+            "array[0..2] of Integer",
+            "TValue",
+        ),
+        (
+            "callable-signature",
+            "procedure(Value: Integer)",
+            "procedure(Value: string)",
+            "TValue",
+        ),
     ];
 
-    for (label, initial_type, changed_type) in cases {
+    let mut failures = Vec::new();
+    for (label, initial_type, changed_type, referenced_type) in cases {
         let temp = tempfile::tempdir().expect("structural-alias workspace");
         let root = temp.path().join("fixture");
         let provider = root.join("Provider.pas");
         let widget = root.join("Widget.pas");
         let provider_source = format!(
-            "unit Provider;\ninterface\ntype\n  TValue = {initial_type};\n  IRunner = interface\n    procedure Run(Value: TValue);\n  end;\nimplementation\nend.\n"
+            "unit Provider;\ninterface\ntype\n  TValue = {initial_type};\n  IRunner = interface\n    procedure Run(Value: {referenced_type});\n  end;\nimplementation\nend.\n"
         );
         let widget_source = concat!(
             "unit Widget;\n",
@@ -32958,11 +33118,13 @@ fn deferred_interface_action_freezes_structural_provider_type_meaning() {
             "TWidget",
             &format!("provider-structural-freeze-{label}"),
         );
-        assert_eq!(
-            actions.len(),
-            1,
-            "{label} structural alias must be initially supported: {actions:?}"
-        );
+        if actions.len() != 1 {
+            failures.push(format!(
+                "{label} structural alias was not initially supported: {actions:?}"
+            ));
+            server.shutdown();
+            continue;
+        }
 
         write_file(
             &provider,
@@ -32975,10 +33137,11 @@ fn deferred_interface_action_freezes_structural_provider_type_meaning() {
             actions[0].clone(),
         );
         let noop_response = server.response(&noop_resolve_id);
-        assert!(
-            noop_response.error.is_none(),
-            "{label} unrelated provider comment must preserve deferred action: {noop_response:?}"
-        );
+        if noop_response.error.is_some() {
+            failures.push(format!(
+                "{label} unrelated provider comment staled the action: {noop_response:?}"
+            ));
+        }
 
         write_file(
             &provider,
@@ -32987,12 +33150,146 @@ fn deferred_interface_action_freezes_structural_provider_type_meaning() {
         let resolve_id = RequestId::from(format!("provider-structural-freeze-resolve-{label}"));
         server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
         let response = server.response(&resolve_id);
-        assert!(
-            response.error.is_some(),
-            "{label} provider type meaning change must stale deferred action: {response:?}"
-        );
+        if response.error.is_none() {
+            failures.push(format!(
+                "{label} provider type meaning change reused the action: {response:?}"
+            ));
+        }
         server.shutdown();
     }
+    assert!(
+        failures.is_empty(),
+        "structural fingerprint failures: {failures:?}"
+    );
+}
+
+#[test]
+fn deferred_interface_action_freezes_transitive_strong_type_dependencies_and_withholds_depth_overflow()
+ {
+    let mut failures = Vec::new();
+    let temp = tempfile::tempdir().expect("transitive-strong workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let widget = root.join("Widget.pas");
+    let provider_source = concat!(
+        "unit Provider;\ninterface\ntype\n",
+        "  TBaseValue = Integer;\n",
+        "  TValue = type TBaseValue;\n",
+        "  IRunner = interface\n    procedure Run(Value: TValue);\n  end;\n",
+        "implementation\nend.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\ninterface\nuses Provider;\ntype\n",
+        "  TObject = class\n  end;\n",
+        "  TWidget = class(TObject, IRunner)\n  end;\n",
+        "implementation\nend.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&widget, widget_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "provider-transitive-strong-freeze",
+    );
+    if actions.len() != 1 {
+        failures.push(format!("transitive strong setup failed: {actions:?}"));
+    } else {
+        write_file(
+            &provider,
+            &provider_source.replace("TBaseValue = Integer", "TBaseValue = string"),
+        );
+        let resolve_id = RequestId::from("provider-transitive-strong-freeze-resolve".to_string());
+        server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+        let response = server.response(&resolve_id);
+        if response.error.is_none() {
+            failures.push(format!(
+                "transitive strong dependency change reused the action: {response:?}"
+            ));
+        }
+    }
+    server.shutdown();
+
+    let temp = tempfile::tempdir().expect("deep-alias workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let widget = root.join("Widget.pas");
+    let mut provider_source = String::from("unit Provider;\ninterface\ntype\n");
+    for index in 0..70 {
+        if index == 0 {
+            provider_source.push_str("  TAlias0 = Integer;\n");
+        } else {
+            provider_source.push_str(&format!("  TAlias{index} = TAlias{};\n", index - 1));
+        }
+    }
+    provider_source.push_str(
+        "  IRunner = interface\n    procedure Run(Value: TAlias69);\n  end;\nimplementation\nend.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\ninterface\nuses Provider;\ntype\n",
+        "  TObject = class\n  end;\n",
+        "  TWidget = class(TObject, IRunner)\n  end;\n",
+        "implementation\nend.\n",
+    );
+    write_file(&provider, &provider_source);
+    write_file(&widget, widget_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "provider-deep-alias-freeze",
+    );
+    if !actions.is_empty() {
+        failures.push(format!(
+            "depth-limited type identity must withhold generation: {actions:?}"
+        ));
+    }
+    server.shutdown();
+
+    let temp = tempfile::tempdir().expect("cyclic-alias workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let widget = root.join("Widget.pas");
+    let provider_source = concat!(
+        "unit Provider;\ninterface\ntype\n",
+        "  TAliasA = TAliasB;\n",
+        "  TAliasB = TAliasA;\n",
+        "  IRunner = interface\n    procedure Run(Value: TAliasA);\n  end;\n",
+        "implementation\nend.\n",
+    );
+    let widget_source = concat!(
+        "unit Widget;\ninterface\nuses Provider;\ntype\n",
+        "  TObject = class\n  end;\n",
+        "  TWidget = class(TObject, IRunner)\n  end;\n",
+        "implementation\nend.\n",
+    );
+    write_file(&provider, provider_source);
+    write_file(&widget, widget_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &widget,
+        widget_source,
+        "TWidget",
+        "provider-cyclic-alias-freeze",
+    );
+    if !actions.is_empty() {
+        failures.push(format!(
+            "cyclic type identity must withhold generation: {actions:?}"
+        ));
+    }
+    server.shutdown();
+    assert!(
+        failures.is_empty(),
+        "recursive fingerprint failures: {failures:?}"
+    );
 }
 
 #[test]

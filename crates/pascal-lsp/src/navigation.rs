@@ -989,8 +989,12 @@ impl NavigationIndex {
         if !contract_substitution_is_complete(&class_instance) {
             return Ok(Vec::new());
         }
-        let Some(class_declaration_node) =
-            declared_type_node_for_span(document.tree.root_node(), identifier_span)
+        let Some(class_declaration_node) = declared_type_node_for_span_with_budget(
+            document.tree.root_node(),
+            identifier_span,
+            cancel,
+            budget,
+        )?
         else {
             return Ok(Vec::new());
         };
@@ -1145,6 +1149,22 @@ impl NavigationIndex {
                         let Some(symbol) = document.symbols.get(index) else {
                             continue;
                         };
+                        // An open compiler root can justify an ordinary body
+                        // edit only when the class itself has an exact,
+                        // publicly accessible declaration.  Unknown results
+                        // from private/protected access, ambiguous lookup, or
+                        // any other incomplete conformance proof must not be
+                        // converted into an interface action merely because
+                        // the declaration text happens to match.
+                        if obligation.implementation == ContractMatch::Unknown
+                            && (!obligation.unknown_only_because_of_open_compiler_root
+                                || !matches!(
+                                    symbol.visibility,
+                                    Visibility::Public | Visibility::Published
+                                ))
+                        {
+                            continue;
+                        }
                         match method_definition_proof(document, symbol, index, cancel, budget)? {
                             ContractMatch::No => {}
                             ContractMatch::Yes | ContractMatch::Unknown => continue,
@@ -1963,7 +1983,11 @@ impl NavigationIndex {
         for requirement in requirements {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
-            let identity = requirement.identity(self, cancel, budget)?;
+            let Some(identity) = requirement.identity(self, cancel, budget)? else {
+                // Deferred identity must be complete before it can authorize
+                // either generation or later resolve-time reuse.
+                continue;
+            };
             if self.contract_delegation_status(
                 &requirement,
                 class_instance,
@@ -2002,6 +2026,7 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
+            let mut unknown_only_because_of_open_compiler_root = false;
             // The compiler-provided TObject is an open member namespace.  An
             // empty source-backed routine list cannot prove that *any*
             // arbitrary requirement is absent, so keep the shared contract
@@ -2010,6 +2035,7 @@ impl NavigationIndex {
             // direct class declaration may still be used for body-only work.
             if surface.implicit_compiler_root_is_open && implementation == ContractMatch::No {
                 implementation = ContractMatch::Unknown;
+                unknown_only_because_of_open_compiler_root = true;
             }
             if implementation == ContractMatch::Unknown {
                 missing.push(ContractMissingInterfaceMethod {
@@ -2017,6 +2043,7 @@ impl NavigationIndex {
                     identity,
                     method_name,
                     implementation,
+                    unknown_only_because_of_open_compiler_root,
                 });
                 continue;
             }
@@ -2025,6 +2052,7 @@ impl NavigationIndex {
                 identity,
                 method_name,
                 implementation,
+                unknown_only_because_of_open_compiler_root,
             });
         }
         Ok(Some((missing, surface)))
@@ -3801,16 +3829,18 @@ impl NavigationIndex {
                             }
                             None => {
                                 let Some(source) = self
-                                    .contract_type_definition_source_fingerprint(
-                                        &instance.uri,
+                                    .contract_type_definition_source_fingerprint_with_dependencies(
+                                        instance,
                                         symbol,
                                         cancel,
                                         budget,
+                                        active_aliases,
+                                        depth,
                                     )?
                                 else {
                                     return Ok(None);
                                 };
-                                ContractTypeDefinitionFingerprint::Source(source)
+                                source
                             }
                         }
                     } else if let Some(shape) = symbol.type_shape.as_ref() {
@@ -3830,31 +3860,34 @@ impl NavigationIndex {
                             }
                             None => {
                                 let Some(source) = self
-                                    .contract_type_definition_source_fingerprint(
-                                        &instance.uri,
+                                    .contract_type_definition_source_fingerprint_with_dependencies(
+                                        instance,
                                         symbol,
                                         cancel,
                                         budget,
+                                        active_aliases,
+                                        depth,
                                     )?
                                 else {
                                     return Ok(None);
                                 };
-                                ContractTypeDefinitionFingerprint::Source(source)
+                                source
                             }
                         }
-                    } else if symbol.type_kind == TypeKind::Other {
-                        let Some(source) = self.contract_type_definition_source_fingerprint(
-                            &instance.uri,
-                            symbol,
-                            cancel,
-                            budget,
-                        )?
+                    } else {
+                        let Some(source) = self
+                            .contract_type_definition_source_fingerprint_with_dependencies(
+                                instance,
+                                symbol,
+                                cancel,
+                                budget,
+                                active_aliases,
+                                depth,
+                            )?
                         else {
                             return Ok(None);
                         };
-                        ContractTypeDefinitionFingerprint::Source(source)
-                    } else {
-                        ContractTypeDefinitionFingerprint::Opaque
+                        source
                     };
 
                     Ok(Some(ContractTypeFingerprint::Named {
@@ -3890,6 +3923,160 @@ impl NavigationIndex {
         let fingerprint = normalized_contract_type_definition(source);
         budget.require_bytes(fingerprint.len(), cancel)?;
         Ok((!fingerprint.is_empty()).then_some(fingerprint))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_type_definition_source_fingerprint_with_dependencies(
+        &self,
+        instance: &TypeInstance,
+        symbol: &Symbol,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        depth: usize,
+    ) -> Result<Option<ContractTypeDefinitionFingerprint>, String> {
+        let Some(text) = self.contract_type_definition_source_fingerprint(
+            &instance.uri,
+            symbol,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(dependencies) = self.contract_type_definition_dependencies_with_budget(
+            instance,
+            symbol,
+            cancel,
+            budget,
+            active_aliases,
+            depth,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ContractTypeDefinitionFingerprint::Source {
+            text,
+            dependencies,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn contract_type_definition_dependencies_with_budget(
+        &self,
+        instance: &TypeInstance,
+        symbol: &Symbol,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+        active_aliases: &mut HashSet<(Url, String, GenericSubstitution)>,
+        depth: usize,
+    ) -> Result<Option<Vec<ContractDefinitionDependencyFingerprint>>, String> {
+        let Some(document) = self.documents.get(&instance.uri) else {
+            return Ok(None);
+        };
+        let Some(type_declaration) = declared_type_node_for_span_with_budget(
+            document.tree.root_node(),
+            symbol.span,
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let identifiers = collect_identifier_nodes_with_budget(type_declaration, cancel, budget)?;
+        let mut dependencies = Vec::new();
+        let mut seen = HashSet::new();
+        for identifier in identifiers {
+            check_navigation_cancel(cancel)?;
+            if Span::from_node(identifier) == symbol.span {
+                continue;
+            }
+            if identifier_is_decl_arg_name_with_budget(identifier, cancel, budget)?
+                || identifier_is_dot_rhs_with_budget(identifier, type_declaration, cancel, budget)?
+            {
+                continue;
+            }
+            let Some(name) = document
+                .source
+                .get(identifier.start_byte()..identifier.end_byte())
+            else {
+                return Ok(None);
+            };
+            let type_ref = TypeRef {
+                path: vec![canonical_name(name)],
+                args: Vec::new(),
+                span: Span::from_node(identifier),
+            };
+            if let Some(resolved) = self.resolve_contract_type_ref_with_budget(
+                &instance.uri,
+                &type_ref,
+                &instance.substitution,
+                Some(symbol.scope),
+                cancel,
+                budget,
+            )? {
+                if matches!(resolved, ResolvedType::Builtin(_)) {
+                    continue;
+                }
+                let Some(fingerprint) = self.contract_type_fingerprint_for_resolved_with_budget(
+                    &resolved,
+                    cancel,
+                    budget,
+                    active_aliases,
+                    depth.saturating_add(1),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let dependency =
+                    ContractDefinitionDependencyFingerprint::Type(Box::new(fingerprint));
+                if seen.insert(dependency.clone()) {
+                    dependencies.push(dependency);
+                }
+                continue;
+            }
+
+            let mut state = ResolutionState::new();
+            let candidates = self.unqualified_references_with_budget_and_state(
+                &instance.uri,
+                document,
+                identifier.start_byte(),
+                name,
+                identifier,
+                &mut state,
+                cancel,
+                budget,
+            )?;
+            if candidates.len() != 1 {
+                return Ok(None);
+            }
+            let candidate = &candidates[0];
+            let Some(dependency_symbol) = self.symbol(candidate) else {
+                return Ok(None);
+            };
+            if dependency_symbol.kind == SymbolKind::Unit {
+                return Ok(None);
+            }
+            let Some(dependency_text) = self.contract_type_definition_source_fingerprint(
+                &candidate.uri,
+                dependency_symbol,
+                cancel,
+                budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            let dependency = ContractDefinitionDependencyFingerprint::Symbol {
+                uri: candidate.uri.clone(),
+                key: dependency_symbol.key.clone(),
+                kind: dependency_symbol.type_kind,
+                text: dependency_text,
+            };
+            if seen.insert(dependency.clone()) {
+                dependencies.push(dependency);
+            }
+        }
+        Ok(Some(dependencies))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3955,6 +4142,12 @@ impl NavigationIndex {
                 ))))
             }
             TypeShape::Array { element, dynamic } => {
+                if !dynamic {
+                    // Static bounds are not represented in TypeShape.  Let
+                    // the enclosing declaration's normalized source (and its
+                    // semantic dependencies) carry the complete identity.
+                    return Ok(None);
+                }
                 let Some(element) = self.contract_type_shape_fingerprint_with_budget(
                     uri,
                     element,
@@ -3973,7 +4166,12 @@ impl NavigationIndex {
                     dynamic: *dynamic,
                 }))
             }
-            TypeShape::Callable => Ok(Some(ContractTypeShapeFingerprint::Callable)),
+            TypeShape::Callable => {
+                // Callable parameter/result/mode/convention details are not
+                // retained by TypeShape.  Use the declaration-source fallback
+                // below instead of comparing a lossy marker.
+                Ok(None)
+            }
             TypeShape::Unknown => Ok(None),
         }
     }
@@ -11975,8 +12173,21 @@ pub(super) enum ContractTypeFingerprint {
 pub(super) enum ContractTypeDefinitionFingerprint {
     Alias(Box<ContractTypeFingerprint>),
     Shape(Box<ContractTypeShapeFingerprint>),
-    Source(String),
-    Opaque,
+    Source {
+        text: String,
+        dependencies: Vec<ContractDefinitionDependencyFingerprint>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ContractDefinitionDependencyFingerprint {
+    Type(Box<ContractTypeFingerprint>),
+    Symbol {
+        uri: Url,
+        key: String,
+        kind: TypeKind,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -11987,7 +12198,6 @@ pub(super) enum ContractTypeShapeFingerprint {
         element: Box<ContractTypeShapeFingerprint>,
         dynamic: bool,
     },
-    Callable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -12604,7 +12814,7 @@ impl ContractRequirement {
         index: &NavigationIndex,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<ContractRequirementIdentity, String> {
+    ) -> Result<Option<ContractRequirementIdentity>, String> {
         let Some(symbol) = index.symbol(&self.candidate) else {
             return Err("interface method disappeared".to_owned());
         };
@@ -12621,67 +12831,61 @@ impl ContractRequirement {
         let mut parameter_types = Vec::with_capacity(symbol.routine_parameters.len());
         let mut parameter_fingerprints = Vec::with_capacity(symbol.routine_parameters.len());
         for parameter in &symbol.routine_parameters {
-            parameter_types.push(
-                parameter
-                    .type_ref
-                    .as_ref()
-                    .map(|type_ref| {
-                        index.contract_type_identity_with_budget(
-                            &self.candidate.uri,
-                            type_ref,
-                            &self.substitution,
-                            cancel,
-                            budget,
-                        )
-                    })
-                    .transpose()?
-                    .flatten(),
-            );
-            parameter_fingerprints.push(
-                parameter
-                    .type_ref
-                    .as_ref()
-                    .map(|type_ref| {
-                        index.contract_type_fingerprint_with_budget(
-                            &self.candidate.uri,
-                            type_ref,
-                            &self.substitution,
-                            cancel,
-                            budget,
-                        )
-                    })
-                    .transpose()?
-                    .flatten(),
-            );
+            let Some(type_ref) = parameter.type_ref.as_ref() else {
+                return Ok(None);
+            };
+            let Some(type_identity) = index.contract_type_identity_with_budget(
+                &self.candidate.uri,
+                type_ref,
+                &self.substitution,
+                cancel,
+                budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(type_fingerprint) = index.contract_type_fingerprint_with_budget(
+                &self.candidate.uri,
+                type_ref,
+                &self.substitution,
+                cancel,
+                budget,
+            )?
+            else {
+                // A missing structural identity is not a reusable identity.
+                // Treat it as unsupported generation rather than allowing two
+                // independently unknown snapshots to compare equal.
+                return Ok(None);
+            };
+            parameter_types.push(type_identity);
+            parameter_fingerprints.push(type_fingerprint);
         }
-        let result_type = symbol
-            .result_type_ref
-            .as_ref()
-            .map(|type_ref| {
-                index.contract_type_identity_with_budget(
+        let (result_type, result_fingerprint) =
+            if let Some(type_ref) = symbol.result_type_ref.as_ref() {
+                let Some(result_type) = index.contract_type_identity_with_budget(
                     &self.candidate.uri,
                     type_ref,
                     &self.substitution,
                     cancel,
                     budget,
-                )
-            })
-            .transpose()?
-            .flatten();
-        let result_fingerprint = symbol
-            .result_type_ref
-            .as_ref()
-            .map(|type_ref| {
-                index.contract_type_fingerprint_with_budget(
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(result_fingerprint) = index.contract_type_fingerprint_with_budget(
                     &self.candidate.uri,
                     type_ref,
                     &self.substitution,
                     cancel,
                     budget,
-                )
-            })
-            .transpose()?
-            .flatten();
+                )?
+                else {
+                    return Ok(None);
+                };
+                (Some(result_type), Some(result_fingerprint))
+            } else {
+                (None, None)
+            };
         let header = symbol
             .routine_header_span
             .and_then(|_span| index.documents.get(&self.candidate.uri))
@@ -12710,7 +12914,7 @@ impl ContractRequirement {
                     .map_or(0, |_| std::mem::size_of::<ContractTypeFingerprint>()),
             cancel,
         )?;
-        Ok(ContractRequirementIdentity {
+        Ok(Some(ContractRequirementIdentity {
             name: symbol.key.clone(),
             signature: symbol.routine_signature.clone(),
             result: symbol.result_type_name.clone(),
@@ -12722,7 +12926,7 @@ impl ContractRequirement {
             parameter_fingerprints,
             result_fingerprint,
             header,
-        })
+        }))
     }
 }
 
@@ -12756,9 +12960,9 @@ struct ContractRequirementIdentity {
     routine_kind: RoutineKind,
     generic_shape: String,
     substitution: GenericSubstitution,
-    parameter_types: Vec<Option<TypeIdentity>>,
+    parameter_types: Vec<TypeIdentity>,
     result_type: Option<TypeIdentity>,
-    parameter_fingerprints: Vec<Option<ContractTypeFingerprint>>,
+    parameter_fingerprints: Vec<ContractTypeFingerprint>,
     result_fingerprint: Option<ContractTypeFingerprint>,
     header: Option<String>,
 }
@@ -12769,6 +12973,7 @@ struct ContractMissingInterfaceMethod {
     identity: ContractRequirementIdentity,
     method_name: String,
     implementation: ContractMatch,
+    unknown_only_because_of_open_compiler_root: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -16768,22 +16973,6 @@ fn ancestor_declared_type<'a>(
     Ok(None)
 }
 
-fn declared_type_node_for_span(root: Node<'_>, span: Span) -> Option<Node<'_>> {
-    let identifier = identifier_at(root, span.start)?;
-    let mut current = Some(identifier);
-    while let Some(node) = current {
-        if node.kind() == "declType"
-            && field_identifier_nodes(node, "name")
-                .iter()
-                .any(|name| Span::from_node(*name) == span)
-        {
-            return Some(node);
-        }
-        current = node.parent();
-    }
-    None
-}
-
 fn routine_declaration_node_for_symbol<'a>(
     document: &'a Document,
     symbol: &Symbol,
@@ -16918,13 +17107,13 @@ fn append_qualified_default_replacements(
         let Some(default) = group.child_by_field_name("defaultValue") else {
             continue;
         };
-        let mut identifiers = Vec::new();
-        collect_nodes(default, &mut |candidate| {
-            if candidate.kind() == "identifier" {
-                identifiers.push(candidate);
+        let identifiers = collect_identifier_nodes_with_budget(default, cancel, budget)?;
+        let mut roots = Vec::new();
+        for identifier in identifiers {
+            if !identifier_is_dot_rhs_with_budget(identifier, default, cancel, budget)? {
+                roots.push(identifier);
             }
-        });
-        budget.require_work(identifiers.len(), cancel)?;
+        }
 
         // A declaration and its implementing class can have different
         // lexical scopes even when they live in the same unit.  A named
@@ -16933,7 +17122,7 @@ fn append_qualified_default_replacements(
         // Pascal expression, so refuse non-literal same-unit defaults unless
         // there is no identifier to rebind.
         if source_uri == destination_uri
-            && identifiers.iter().any(|identifier| {
+            && roots.iter().any(|identifier| {
                 source
                     .get(identifier.start_byte()..identifier.end_byte())
                     .is_none_or(|name| !builtin_default_value(name))
@@ -16943,24 +17132,21 @@ fn append_qualified_default_replacements(
         }
 
         if source_uri != destination_uri {
-            // Qualified expressions were previously treated as self-proving
-            // and copied verbatim.  Resolve their left-most qualifier in the
-            // provider scope.  A source-backed type/value can be made stable
-            // by qualifying it with the provider unit; an already unit-
-            // qualified expression is stable as written.  Anything else is
-            // deliberately unsupported rather than guessed through a target
-            // scope shadow.
-            let Some(root) = identifiers
-                .iter()
-                .min_by_key(|identifier| identifier.start_byte())
-            else {
-                continue;
-            };
-            if identifier_is_qualified(*root, default) {
+            // Every identifier-rooted reference is resolved independently.
+            // Looking only at the first qualified term is unsound for
+            // expressions such as `A.Value + B.Value`: the later reference
+            // can still bind to a destination-unit declaration.  Rewrite the
+            // exact root spans, and fail closed when any root is ambiguous,
+            // destination-local, or unsupported.
+            for root in &roots {
+                check_navigation_cancel(cancel)?;
                 let root_span = Span::from_node(*root);
                 let Some(name) = source.get(root_span.start..root_span.end) else {
                     return Ok(false);
                 };
+                if builtin_default_value(name) {
+                    continue;
+                }
                 let mut state = ResolutionState::new();
                 let candidates = index.unqualified_references_with_budget_and_state(
                     source_uri,
@@ -16979,13 +17165,17 @@ fn append_qualified_default_replacements(
                 let Some(symbol) = index.symbol(candidate) else {
                     return Ok(false);
                 };
-                if candidate.uri != *source_uri {
+                if candidate.uri == *destination_uri {
                     return Ok(false);
                 }
                 if symbol.kind == SymbolKind::Unit {
-                    // `Provider.TDefaults.Value` already names the provider
-                    // unit and must not be qualified a second time.
-                } else if matches!(
+                    // `Provider.TDefaults.Value` already has a stable unit
+                    // root.  The remaining member path is deliberately left
+                    // intact; it cannot be rebound by a destination-unit
+                    // declaration once the unit root is proven.
+                    continue;
+                }
+                if !matches!(
                     symbol.kind,
                     SymbolKind::Constant
                         | SymbolKind::EnumValue
@@ -16994,87 +17184,137 @@ fn append_qualified_default_replacements(
                         | SymbolKind::Variable
                         | SymbolKind::Property
                 ) {
-                    let Some(unit) = index.unit_display_name(&candidate.uri) else {
-                        return Ok(false);
-                    };
-                    budget.require_bytes(
-                        unit.len().saturating_add(name.len()).saturating_add(1),
-                        cancel,
-                    )?;
-                    replacements.push((root_span.start, root_span.end, format!("{unit}.{name}")));
-                } else {
                     return Ok(false);
                 }
+                let Some(unit) = index.unit_display_name(&candidate.uri) else {
+                    return Ok(false);
+                };
+                budget.require_bytes(
+                    unit.len().saturating_add(name.len()).saturating_add(1),
+                    cancel,
+                )?;
+                replacements.push((root_span.start, root_span.end, format!("{unit}.{name}")));
             }
         }
 
-        for identifier in identifiers {
-            check_navigation_cancel(cancel)?;
-            let span = Span::from_node(identifier);
-            if span.start < header_start
-                || span.end > header_end
-                || identifier_is_qualified(identifier, default)
-            {
-                continue;
-            }
-            let Some(name) = source.get(span.start..span.end) else {
-                continue;
-            };
-            let mut state = ResolutionState::new();
-            let candidates = index.unqualified_references_with_budget_and_state(
-                source_uri, document, span.start, name, identifier, &mut state, cancel, budget,
-            )?;
-            if candidates.len() != 1 {
-                if builtin_default_value(name) {
+        if source_uri == destination_uri {
+            for identifier in roots {
+                check_navigation_cancel(cancel)?;
+                let span = Span::from_node(identifier);
+                if span.start < header_start || span.end > header_end {
                     continue;
                 }
-                return Ok(false);
-            }
-            let candidate = &candidates[0];
-            let Some(symbol) = index.symbol(candidate) else {
-                continue;
-            };
-            if candidate.uri == *destination_uri
-                || !matches!(
-                    symbol.kind,
-                    SymbolKind::Constant
-                        | SymbolKind::EnumValue
-                        | SymbolKind::Routine
-                        | SymbolKind::Type
-                        | SymbolKind::Variable
-                        | SymbolKind::Property
-                )
-            {
-                if candidate.uri == *destination_uri {
+                let Some(name) = source.get(span.start..span.end) else {
+                    continue;
+                };
+                let mut state = ResolutionState::new();
+                let candidates = index.unqualified_references_with_budget_and_state(
+                    source_uri, document, span.start, name, identifier, &mut state, cancel, budget,
+                )?;
+                if candidates.len() != 1 {
+                    if builtin_default_value(name) {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                let candidate = &candidates[0];
+                let Some(symbol) = index.symbol(candidate) else {
+                    continue;
+                };
+                if symbol.kind == SymbolKind::Unit {
                     continue;
                 }
-                return Ok(false);
+                if candidate.uri == *destination_uri
+                    || !matches!(
+                        symbol.kind,
+                        SymbolKind::Constant
+                            | SymbolKind::EnumValue
+                            | SymbolKind::Routine
+                            | SymbolKind::Type
+                            | SymbolKind::Variable
+                            | SymbolKind::Property
+                    )
+                {
+                    if candidate.uri == *destination_uri {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                let Some(unit) = index.unit_display_name(&candidate.uri) else {
+                    return Ok(false);
+                };
+                budget.require_bytes(
+                    unit.len().saturating_add(name.len()).saturating_add(1),
+                    cancel,
+                )?;
+                replacements.push((span.start, span.end, format!("{unit}.{name}")));
             }
-            let Some(unit) = index.unit_display_name(&candidate.uri) else {
-                return Ok(false);
-            };
-            budget.require_bytes(
-                unit.len().saturating_add(name.len()).saturating_add(1),
-                cancel,
-            )?;
-            replacements.push((span.start, span.end, format!("{unit}.{name}")));
         }
     }
     Ok(true)
 }
 
-fn identifier_is_qualified(identifier: Node<'_>, boundary: Node<'_>) -> bool {
+fn collect_identifier_nodes_with_budget<'a>(
+    root: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<Node<'a>>, String> {
+    let mut identifiers = Vec::new();
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if current.kind() == "identifier" {
+            identifiers.push(current);
+        }
+        let mut cursor = current.walk();
+        pending.extend(current.children(&mut cursor));
+    }
+    Ok(identifiers)
+}
+
+fn identifier_is_dot_rhs_with_budget(
+    identifier: Node<'_>,
+    boundary: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let identifier_span = Span::from_node(identifier);
     let mut current = identifier.parent();
     while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         if node.id() == boundary.id() {
-            return false;
+            return Ok(false);
         }
-        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot") {
-            return true;
+        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
+            && node
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs).contains(identifier_span))
+        {
+            return Ok(true);
         }
         current = node.parent();
     }
-    false
+    Ok(false)
+}
+
+fn identifier_is_decl_arg_name_with_budget(
+    identifier: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    let Some(parent) = identifier.parent() else {
+        return Ok(false);
+    };
+    if parent.kind() != "declArg" {
+        return Ok(false);
+    }
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    Ok(parent
+        .child_by_field_name("name")
+        .is_some_and(|name| Span::from_node(name).contains(Span::from_node(identifier))))
 }
 
 fn builtin_default_value(name: &str) -> bool {
@@ -18028,6 +18268,58 @@ fn identifier_at(root: Node<'_>, offset: usize) -> Option<Node<'_>> {
         pending.extend(children.into_iter().rev());
     }
     None
+}
+
+fn declared_type_node_for_span_with_budget<'a>(
+    root: Node<'a>,
+    span: Span,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let Some(identifier) = identifier_at_with_budget(root, span.start, cancel, budget)? else {
+        return Ok(None);
+    };
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if node.kind() == "declType"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| Span::from_node(name).contains(span))
+        {
+            return Ok(Some(node));
+        }
+        current = node.parent();
+    }
+    Ok(None)
+}
+
+fn identifier_at_with_budget<'a>(
+    root: Node<'a>,
+    offset: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    if !Span::from_node(root).contains_offset(offset) {
+        return Ok(None);
+    }
+
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if !Span::from_node(node).contains_offset(offset) {
+            continue;
+        }
+        if node.kind() == "identifier" {
+            return Ok(Some(node));
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
+    }
+    Ok(None)
 }
 
 pub(super) fn is_ignored_offset(root: Node<'_>, offset: usize) -> bool {

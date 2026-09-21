@@ -3,7 +3,7 @@
 Date: 2026-09-21
 Worktree: `/home/antoinegs/gits/lint4d/.worktrees/full-lsp`
 Base: `e5b904fb56c1edb8b86d306e5e8db86c47cab9bd`
-Commit: pending until the verified feature commit is created
+Feature commit: `4dbf280` (`feat(pascal-lsp): organize imports source actions`)
 
 ## Delivered
 

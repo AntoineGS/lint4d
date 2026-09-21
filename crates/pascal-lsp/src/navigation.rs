@@ -780,6 +780,16 @@ impl NavigationIndex {
         budget.require_owned_bytes(replacement.len(), cancel)?;
         budget.require_work(rebind_work_reservation(target), cancel)?;
         budget.require_owned_bytes(rebind_owned_reservation(target), cancel)?;
+        let target_import_state = result
+            .documents
+            .get_mut(uri)
+            .map(|document| {
+                (
+                    document.import_bindings.take(),
+                    document.import_binding_fingerprint,
+                )
+            })
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
         let replacement = replacement.to_owned();
         result.update_with_context_and_cached_with_cancel(
             uri.clone(),
@@ -788,6 +798,13 @@ impl NavigationIndex {
             None,
             cancel,
         )?;
+        check_navigation_cancel(cancel)?;
+        let rebound_target = result
+            .documents
+            .get_mut(uri)
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        rebound_target.import_bindings = target_import_state.0;
+        rebound_target.import_binding_fingerprint = target_import_state.1;
         Ok(result)
     }
 
@@ -19748,6 +19765,189 @@ mod tests {
             .expect("class-field references resolve");
         let root_lookups = OWNER_TYPE_ROOT_LOOKUPS.with(Cell::get);
         (locations.len(), root_lookups)
+    }
+
+    fn duplicate_provider_rebind_fixture(
+        bound_provider: Option<usize>,
+    ) -> (NavigationIndex, Url, Url, Url, String) {
+        let main = Url::parse("file:///tmp/rebind-imports/Main.pas").expect("main URI");
+        let provider_a =
+            Url::parse("file:///tmp/rebind-imports/A/Shared.pas").expect("provider A URI");
+        let provider_b =
+            Url::parse("file:///tmp/rebind-imports/B/Shared.pas").expect("provider B URI");
+        let source = concat!(
+            "unit Main;\n",
+            "interface\n",
+            "uses Shared;\n",
+            "implementation\n",
+            "procedure Work;\n",
+            "var my_var: Integer;\n",
+            "begin my_var := 1; end;\n",
+            "procedure Other;\n",
+            "begin\n",
+            "  WriteLn(MyVar);\n",
+            "end;\n",
+            "end.\n",
+        )
+        .to_owned();
+        let provider_source = "unit Shared;\ninterface\nconst MyVar = 1;\nimplementation\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(main.clone(), source.clone())
+            .expect("target fixture parses");
+        index
+            .update(provider_a.clone(), provider_source.to_owned())
+            .expect("provider A parses");
+        index
+            .update(provider_b.clone(), provider_source.to_owned())
+            .expect("provider B parses");
+        if let Some(provider) = match bound_provider {
+            Some(0) => Some(provider_a.clone()),
+            Some(1) => Some(provider_b.clone()),
+            Some(other) => panic!("unsupported provider fixture index {other}"),
+            None => None,
+        } {
+            index.bind_imports(&main, [("Shared".to_owned(), provider)]);
+        }
+        (index, main, provider_a, provider_b, source)
+    }
+
+    fn bounded_declaration_locations(
+        index: &NavigationIndex,
+        uri: &Url,
+        position: Position,
+    ) -> Result<Vec<Location>, String> {
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(
+            1_000_000,
+            32 * 1024 * 1024,
+            "rebind import preservation test",
+        );
+        index.navigate_with_cancel_and_budget(
+            uri,
+            position,
+            NavigationTarget::Declaration,
+            &cancel,
+            &mut budget,
+        )
+    }
+
+    #[test]
+    fn rebind_preserves_explicit_target_import_binding_for_bounded_navigation() {
+        let (index, main, provider_a, _provider_b, source) =
+            duplicate_provider_rebind_fixture(Some(0));
+        let before = bounded_declaration_locations(&index, &main, Position::new(9, 10))
+            .expect("original imported reference resolves");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].uri, provider_a);
+        let before_provider = index.import_provider_uri(&main, "Shared").cloned();
+        let before_fingerprint = index.import_binding_context_fingerprint(&main);
+
+        let transformed_source = source.replace("my_var", "MyVar");
+        let transformed = index
+            .rebind_with_replaced_source_for_fix_all(
+                &main,
+                &transformed_source,
+                &AtomicBool::new(false),
+                &mut AssistanceBudget::new(
+                    1_000_000,
+                    32 * 1024 * 1024,
+                    "rebind import preservation test",
+                ),
+            )
+            .expect("transformed target rebinds");
+        let after = bounded_declaration_locations(&transformed, &main, Position::new(9, 10))
+            .expect("unchanged imported reference resolves after rebind");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].uri, provider_a);
+        assert_eq!(
+            transformed.import_provider_uri(&main, "Shared").cloned(),
+            before_provider
+        );
+        assert_eq!(
+            transformed.import_binding_context_fingerprint(&main),
+            before_fingerprint
+        );
+
+        let local_rename = bounded_declaration_locations(&transformed, &main, Position::new(6, 6))
+            .expect("combined local rename remains resolvable");
+        assert_eq!(local_rename.len(), 1);
+        assert_eq!(local_rename[0].uri, main);
+        assert_eq!(local_rename[0].range.start.line, 5);
+    }
+
+    #[test]
+    fn rebind_keeps_ambiguous_original_imports_conservative() {
+        let (index, main, provider_a, provider_b, source) = duplicate_provider_rebind_fixture(None);
+        let before = bounded_declaration_locations(&index, &main, Position::new(9, 10))
+            .expect("ambiguous original import remains queryable");
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            before
+                .iter()
+                .map(|location| location.uri.clone())
+                .collect::<Vec<_>>(),
+            vec![provider_a.clone(), provider_b.clone()]
+        );
+        assert_eq!(index.import_binding_context_fingerprint(&main), None);
+
+        let transformed = index
+            .rebind_with_replaced_source_for_fix_all(
+                &main,
+                &source.replace("my_var", "MyVar"),
+                &AtomicBool::new(false),
+                &mut AssistanceBudget::new(
+                    1_000_000,
+                    32 * 1024 * 1024,
+                    "rebind import preservation test",
+                ),
+            )
+            .expect("ambiguous target rebinds");
+        let after = bounded_declaration_locations(&transformed, &main, Position::new(9, 10))
+            .expect("ambiguous transformed import remains queryable");
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after
+                .iter()
+                .map(|location| location.uri.clone())
+                .collect::<Vec<_>>(),
+            vec![provider_a, provider_b]
+        );
+        assert_eq!(transformed.import_binding_context_fingerprint(&main), None);
+    }
+
+    #[test]
+    fn rebind_keeps_changed_target_import_provider_conservative() {
+        let (index, main, provider_a, provider_b, source) =
+            duplicate_provider_rebind_fixture(Some(1));
+        let before = bounded_declaration_locations(&index, &main, Position::new(9, 10))
+            .expect("changed provider original import resolves");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].uri, provider_b);
+        let before_fingerprint = index.import_binding_context_fingerprint(&main);
+        assert!(before_fingerprint.is_some());
+
+        let transformed = index
+            .rebind_with_replaced_source_for_fix_all(
+                &main,
+                &source.replace("my_var", "MyVar"),
+                &AtomicBool::new(false),
+                &mut AssistanceBudget::new(
+                    1_000_000,
+                    32 * 1024 * 1024,
+                    "rebind import preservation test",
+                ),
+            )
+            .expect("changed provider target rebinds");
+        let after = bounded_declaration_locations(&transformed, &main, Position::new(9, 10))
+            .expect("changed provider transformed import resolves");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].uri, provider_b);
+        assert_ne!(after[0].uri, provider_a);
+        assert_eq!(
+            transformed.import_binding_context_fingerprint(&main),
+            before_fingerprint
+        );
     }
 
     fn deep_qualified_import_scan_source() -> String {

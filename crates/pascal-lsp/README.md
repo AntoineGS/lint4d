@@ -240,6 +240,42 @@ bounded by the assistance work/byte budgets and the 16 KiB method-header and
 64 KiB code-action response limits. Uncertain source ownership, imports,
 conditional state, physical mapping, or insertion safety produces no edit.
 
+### Generate missing interface-member implementations
+
+For a selected source-backed class declaration, code actions also offer one
+scoped `Implement 'TWidget.Run'` action per proven missing interface
+obligation. These actions use the custom kind `implement-interface-method`
+(and are included by a `quickfix` request); each action completes only its
+named obligation, not an unsupported or unproven "implement all" operation.
+The action is associated with `pascal-missing-interface-implementation` when
+the requesting context supplies the matching diagnostic. A declaration is
+added only when the exact class member is absent; an existing exact
+declaration receives only its missing body.
+
+The proof follows complete source-backed interface and class ancestry,
+instantiated generic substitutions, exact routine kind/parameters/modes/result,
+calling conventions, overload identity, method-resolution mappings, and
+supported interface delegation. Inherited concrete implementations suppress
+generation, while abstract, compiler-only, ambiguous, conditional, parser-
+recovery, incomplete-import, unresolved-type, unsupported-generic, and
+unsupported-calling-convention contexts remain silent. Standalone implicit
+`TObject` is treated only as an empty ancestry root; compiler-provided
+`IInterface`/`System` members are never invented. Interface diamonds are
+deduplicated only when their proven obligation and mapped implementation are
+identical.
+
+New declarations use or create a `public` class section without changing an
+existing member's visibility. Same-name fields, properties, private members,
+or incompatible routines require a safe exact collision/overload proof;
+otherwise the action is withheld. The bounded workspace edit is restricted to
+the authorized physical source, combines declaration and implementation
+insertions deterministically, preserves BOM/CRLF/UTF-16/comments, and is
+parsed and pair-checked before it is returned. No include, new file, existing
+body, return value, or partial uncertain obligation is written. Eager and
+deferred forms revalidate the selected class/interface, provider records,
+source/configuration generations, insertion structure, and negative missing-
+implementation proof; stale or cancelled resolution fails closed.
+
 ### Background analysis
 
 Navigation, formatting, and open-buffer diagnostics run as cancellable,

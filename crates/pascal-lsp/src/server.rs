@@ -9482,7 +9482,7 @@ fn server_capabilities(
         "documentFormattingProvider": {"workDoneProgress": true},
         "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
-            "codeActionKinds": ["quickfix"],
+            "codeActionKinds": ["quickfix", "implement-interface-method"],
             "resolveProvider": true,
             "workDoneProgress": true
         },

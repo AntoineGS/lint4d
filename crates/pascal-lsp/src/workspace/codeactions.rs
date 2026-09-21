@@ -12,7 +12,8 @@ use super::{
 use crate::configuration::{config_directories, resolve_lint};
 use crate::navigation::{
     AssistanceBudget, MAX_MISSING_UNIT_REQUEST_BYTES, MAX_MISSING_UNIT_REQUEST_WORK,
-    MissingMethodImplementationCandidate, MissingUnitCandidate, MissingUnitUseKind,
+    MissingInterfaceMethodImplementationCandidate, MissingMethodImplementationCandidate,
+    MissingUnitCandidate, MissingUnitUseKind,
 };
 use crate::text;
 use lint4d::config::{Config, RuleSeverityOverride};
@@ -44,6 +45,10 @@ const MAX_METHOD_HEADER_BYTES: usize = 16 * 1024;
 const MISSING_UNIT_ACTION_KIND: &str = "add-missing-unit";
 const METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-method";
 const METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
+const INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND: &str = "implement-interface-method";
+const INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION: u8 = 1;
+const INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND: CodeActionKind =
+    CodeActionKind::new(INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND);
 const CONSTANT_RULE: &str = "constant-naming";
 const LOCAL_RULE: &str = "local-variable-naming";
 
@@ -121,6 +126,33 @@ pub(crate) struct MethodImplementationActionData {
     pub(crate) source_hash: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InterfaceMethodImplementationActionData {
+    pub(crate) version: u8,
+    pub(crate) action_id: String,
+    pub(crate) kind: String,
+    pub(crate) uri: Url,
+    pub(crate) anchor: Range,
+    pub(crate) class_declaration: Range,
+    pub(crate) owner: String,
+    pub(crate) method: String,
+    pub(crate) interface_uri: Url,
+    pub(crate) interface_owner: String,
+    pub(crate) interface_method: String,
+    pub(crate) unit_name: String,
+    #[serde(with = "decimal_u64")]
+    pub(crate) identity: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) configuration_generation: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) config_fingerprint: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) source_hash: u64,
+}
+
 mod decimal_u64 {
     use super::*;
 
@@ -175,10 +207,21 @@ struct MethodImplementationPlan {
 }
 
 #[derive(Debug, Clone)]
+struct InterfaceMethodImplementationPlan {
+    candidate: MissingInterfaceMethodImplementationCandidate,
+    uri: Url,
+    source_hash: u64,
+    config_fingerprint: u64,
+    diagnostic: Option<Diagnostic>,
+    edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Clone)]
 enum ParsedActionData {
     Rename(RenameActionData),
     MissingUnit(MissingUnitActionData),
     MethodImplementation(MethodImplementationActionData),
+    InterfaceMethodImplementation(InterfaceMethodImplementationActionData),
 }
 
 struct CandidateRequest<'a> {
@@ -205,7 +248,9 @@ pub(crate) fn code_actions_from_input(
 ) -> Computed<Vec<CodeActionOrCommand>> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
-    if !requests_quickfix(&params.context) {
+    let requests_quickfix = requests_quickfix(&params.context);
+    let requests_interface_method = requests_interface_method(&params.context);
+    if !requests_quickfix && !requests_interface_method {
         return Computed {
             source_generation,
             configuration_generation,
@@ -244,42 +289,71 @@ pub(crate) fn code_actions_from_input(
             records,
         };
     }
-    let candidates = match naming_candidates(
-        &uri,
-        &source,
-        params.range,
-        &params.context,
-        &config,
-        config_fingerprint,
-    ) {
-        Ok(candidates) => candidates,
-        Err(error) => return failed(source_generation, configuration_generation, error),
+    let candidates = if requests_quickfix {
+        match naming_candidates(
+            &uri,
+            &source,
+            params.range,
+            &params.context,
+            &config,
+            config_fingerprint,
+        ) {
+            Ok(candidates) => candidates,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    } else {
+        Vec::new()
     };
-    let (missing_plans, missing_records) = match missing_unit_plans_from_input(
-        &input,
-        &uri,
-        &source,
-        &target_record,
-        &params,
-        config_fingerprint,
-        &configuration_records,
-        cancel,
-    ) {
-        Ok(result) => result,
-        Err(error) => return failed(source_generation, configuration_generation, error),
+    let (missing_plans, missing_records) = if requests_quickfix {
+        match missing_unit_plans_from_input(
+            &input,
+            &uri,
+            &source,
+            &target_record,
+            &params,
+            config_fingerprint,
+            &configuration_records,
+            cancel,
+        ) {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    } else {
+        (Vec::new(), Vec::new())
     };
-    let (method_plans, method_records) = match method_implementation_plans_from_input(
-        &input,
-        &uri,
-        &source,
-        &target_record,
-        &params,
-        config_fingerprint,
-        &configuration_records,
-        cancel,
-    ) {
-        Ok(result) => result,
-        Err(error) => return failed(source_generation, configuration_generation, error),
+    let (method_plans, method_records) = if requests_quickfix {
+        match method_implementation_plans_from_input(
+            &input,
+            &uri,
+            &source,
+            &target_record,
+            &params,
+            config_fingerprint,
+            &configuration_records,
+            cancel,
+        ) {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (interface_method_plans, interface_method_records) = if requests_interface_method {
+        match interface_method_implementation_plans_from_input(
+            &input,
+            &uri,
+            &source,
+            &target_record,
+            &params,
+            config_fingerprint,
+            &configuration_records,
+            cancel,
+        ) {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    } else {
+        (Vec::new(), Vec::new())
     };
     if features.resolve {
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
@@ -355,6 +429,31 @@ pub(crate) fn code_actions_from_input(
                 Err(error) => return failed(source_generation, configuration_generation, error),
             }
         }
+        for plan in &interface_method_plans {
+            let data = InterfaceMethodImplementationActionData::new(
+                plan,
+                source_generation,
+                configuration_generation,
+            );
+            let action = CodeActionOrCommand::CodeAction(CodeAction {
+                title: interface_method_implementation_action_title(&plan.candidate),
+                kind: Some(INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND),
+                diagnostics: plan.diagnostic.clone().map(|diagnostic| vec![diagnostic]),
+                edit: None,
+                command: None,
+                is_preferred: Some(interface_method_plans.len() == 1),
+                disabled: None,
+                data: Some(
+                    serde_json::to_value(&data)
+                        .expect("interface method implementation action data is serializable"),
+                ),
+            });
+            match push_bounded_code_action(&mut actions, action) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
         return Computed {
             source_generation,
             configuration_generation,
@@ -363,6 +462,7 @@ pub(crate) fn code_actions_from_input(
                 let mut records = vec![target_record];
                 append_records(&mut records, missing_records);
                 append_records(&mut records, method_records);
+                append_records(&mut records, interface_method_records);
                 append_records(&mut records, configuration_records);
                 records
             },
@@ -546,9 +646,52 @@ pub(crate) fn code_actions_from_input(
             Err(error) => return failed(source_generation, configuration_generation, error),
         }
     }
+    for plan in &interface_method_plans {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let data = InterfaceMethodImplementationActionData::new(
+            plan,
+            source_generation,
+            configuration_generation,
+        );
+        let mut action = CodeAction {
+            title: interface_method_implementation_action_title(&plan.candidate),
+            kind: Some(INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND),
+            diagnostics: plan.diagnostic.clone().map(|diagnostic| vec![diagnostic]),
+            edit: None,
+            command: None,
+            is_preferred: Some(interface_method_plans.len() == 1),
+            disabled: None,
+            data: Some(
+                serde_json::to_value(&data)
+                    .expect("interface method implementation action data is serializable"),
+            ),
+        };
+        if !features.resolve {
+            let mut raw_edits = std::collections::HashMap::new();
+            raw_edits.insert(uri.clone(), plan.edits.clone());
+            let mut records_by_uri = std::collections::HashMap::new();
+            records_by_uri.insert(uri.clone(), target_record.clone());
+            match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+                Ok(edit) => action.edit = Some(edit),
+                Err(error) => {
+                    if !set_disabled_or_skip(&mut action, features.disabled, error) {
+                        continue;
+                    }
+                }
+            }
+        }
+        match push_bounded_code_action(&mut actions, CodeActionOrCommand::CodeAction(action)) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        }
+    }
     let mut records = snapshot_records(&snapshot);
     append_records(&mut records, missing_records);
     append_records(&mut records, method_records);
+    append_records(&mut records, interface_method_records);
     append_records(&mut records, configuration_records);
     Computed {
         source_generation,
@@ -769,6 +912,102 @@ fn method_implementation_plans_from_input(
     Ok((plans, snapshot_records(&snapshot)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn interface_method_implementation_plans_from_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    source: &str,
+    target_record: &SourceRecord,
+    params: &CodeActionParams,
+    config_fingerprint: u64,
+    configuration_records: &[SourceRecord],
+    cancel: &AtomicBool,
+) -> Result<(Vec<InterfaceMethodImplementationPlan>, Vec<SourceRecord>), String> {
+    // A class declaration inside an include expansion has no unique physical
+    // owner. Interface generation deliberately refuses that case rather than
+    // writing a declaration or implementation into the including unit.
+    if may_contain_include_directive(source.as_bytes()) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let Some(identifier) = identifier_at_position(source, params.range.start) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let snapshot = match build_snapshot(
+        input,
+        std::slice::from_ref(uri),
+        std::slice::from_ref(&identifier),
+        SnapshotMode::Workspace,
+        Some(
+            SnapshotSeed::new(target_record.clone())
+                .with_consumed_configuration(configuration_records),
+        ),
+        &[],
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) if is_cancelled(cancel) => return Err(error),
+        // Interface generation is an optional assistance action. An
+        // incomplete project graph must not hide unrelated code actions.
+        Err(_) => return Ok((Vec::new(), Vec::new())),
+    };
+    if !snapshot.complete
+        || !snapshot.include_errors.is_empty()
+        || !snapshot.editable.contains(uri)
+        || snapshot
+            .sources
+            .get(uri)
+            .is_none_or(|indexed| indexed != source)
+        || snapshot
+            .index
+            .source_text(uri)
+            .is_none_or(|indexed| indexed != source)
+    {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut budget = AssistanceBudget::new(
+        MAX_MISSING_UNIT_REQUEST_WORK,
+        MAX_MISSING_UNIT_REQUEST_BYTES,
+        "interface method implementation request",
+    );
+    let candidates = snapshot
+        .index
+        .missing_interface_method_implementation_candidates_with_budget(
+            uri,
+            params.range.start,
+            cancel,
+            &mut budget,
+        )?;
+    let mut plans = Vec::new();
+    for candidate in candidates {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if !interface_method_candidate_identity_is_bounded(&candidate, uri) {
+            continue;
+        }
+        let diagnostic = matching_missing_interface_diagnostic(&candidate, &params.context);
+        if !params.context.diagnostics.is_empty() && diagnostic.is_none() {
+            continue;
+        }
+        let Some(edits) = interface_method_implementation_edits(uri, source, &candidate) else {
+            continue;
+        };
+        plans.push(InterfaceMethodImplementationPlan {
+            candidate,
+            uri: uri.clone(),
+            source_hash: source_hash(source),
+            config_fingerprint,
+            diagnostic,
+            edits,
+        });
+    }
+    if plans.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    Ok((plans, snapshot_records(&snapshot)))
+}
+
 fn method_candidate_identity_is_bounded(
     candidate: &MissingMethodImplementationCandidate,
     uri: &Url,
@@ -787,30 +1026,43 @@ fn method_implementation_edit(
     source: &str,
     candidate: &MissingMethodImplementationCandidate,
 ) -> Option<TextEdit> {
-    if candidate.owner.contains('\r')
-        || candidate.owner.contains('\n')
-        || candidate.method.contains('\r')
-        || candidate.method.contains('\n')
+    method_implementation_edit_for_header(
+        source,
+        candidate.insertion_offset,
+        &candidate.header,
+        &candidate.owner,
+        &candidate.method,
+    )
+}
+
+fn method_implementation_edit_for_header(
+    source: &str,
+    insertion_offset: usize,
+    header: &str,
+    owner: &str,
+    method: &str,
+) -> Option<TextEdit> {
+    if owner.contains(['\r', '\n', '\0'])
+        || method.contains(['\r', '\n', '\0'])
+        || header.contains('\0')
     {
         return None;
     }
-    if candidate.insertion_offset > source.len()
-        || !source.is_char_boundary(candidate.insertion_offset)
-    {
+    if insertion_offset > source.len() || !source.is_char_boundary(insertion_offset) {
         return None;
     }
-    let position = text::offset_to_position(source, candidate.insertion_offset)?;
-    let line_start = source[..candidate.insertion_offset]
+    let position = text::offset_to_position(source, insertion_offset)?;
+    let line_start = source[..insertion_offset]
         .rfind('\n')
         .map_or(0, |index| index.saturating_add(1));
-    let line_start = if source[line_start..candidate.insertion_offset].contains('\r') {
-        source[..candidate.insertion_offset]
+    let line_start = if source[line_start..insertion_offset].contains('\r') {
+        source[..insertion_offset]
             .rfind('\r')
             .map_or(0, |index| index.saturating_add(1))
     } else {
         line_start
     };
-    let current_prefix = source.get(line_start..candidate.insertion_offset)?;
+    let current_prefix = source.get(line_start..insertion_offset)?;
     if current_prefix.len() > MAX_METHOD_HEADER_BYTES {
         return None;
     }
@@ -819,20 +1071,8 @@ fn method_implementation_edit(
     } else {
         ""
     };
-    let line_ending = if source.contains("\r\n") {
-        "\r\n"
-    } else if source.contains('\n') {
-        "\n"
-    } else if source.contains('\r') {
-        "\r"
-    } else {
-        "\n"
-    };
-    let header = candidate
-        .header
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', line_ending);
+    let line_ending = source_line_ending(source);
+    let header = normalize_line_endings(header, line_ending);
     let leading = if current_prefix.trim().is_empty() {
         ""
     } else {
@@ -847,9 +1087,9 @@ fn method_implementation_edit(
     new_text.push_str(line_ending);
     new_text.push_str(indentation);
     new_text.push_str("  // TODO: Implement ");
-    new_text.push_str(&candidate.owner);
+    new_text.push_str(owner);
     new_text.push('.');
-    new_text.push_str(&candidate.method);
+    new_text.push_str(method);
     new_text.push('.');
     new_text.push_str(line_ending);
     new_text.push_str(indentation);
@@ -860,6 +1100,241 @@ fn method_implementation_edit(
         return None;
     }
     Some(TextEdit::new(Range::new(position, position), new_text))
+}
+
+fn interface_method_candidate_identity_is_bounded(
+    candidate: &MissingInterfaceMethodImplementationCandidate,
+    target_uri: &Url,
+) -> bool {
+    let bounded_name = |value: &str, limit: usize| {
+        !value.is_empty() && value.len() <= limit && !value.contains(['\r', '\n', '\0'])
+    };
+    bounded_name(&candidate.owner, MAX_ACTION_UNIT_BYTES)
+        && bounded_name(&candidate.method, MAX_ACTION_NAME_BYTES)
+        && bounded_name(&candidate.interface_owner, MAX_ACTION_UNIT_BYTES)
+        && bounded_name(&candidate.interface_method, MAX_ACTION_NAME_BYTES)
+        && bounded_name(&candidate.unit_name, MAX_ACTION_UNIT_BYTES)
+        && candidate
+            .declaration_header
+            .as_deref()
+            .is_none_or(|header| !header.contains('\0') && header.len() <= MAX_METHOD_HEADER_BYTES)
+        && candidate.implementation_header.len() <= MAX_METHOD_HEADER_BYTES
+        && candidate
+            .declaration_indent
+            .as_deref()
+            .is_none_or(|indent| indent.len() <= MAX_ACTION_UNIT_BYTES && indent.trim().is_empty())
+        && candidate
+            .declaration_owner_indent
+            .as_deref()
+            .is_none_or(|indent| indent.len() <= MAX_ACTION_UNIT_BYTES && indent.trim().is_empty())
+        && target_uri.as_str().len() <= MAX_ACTION_URI_BYTES
+        && candidate.interface_uri.as_str().len() <= MAX_ACTION_URI_BYTES
+}
+
+fn interface_method_implementation_edits(
+    uri: &Url,
+    source: &str,
+    candidate: &MissingInterfaceMethodImplementationCandidate,
+) -> Option<Vec<TextEdit>> {
+    let line_ending = source_line_ending(source);
+    let mut edits = Vec::with_capacity(2);
+    match (
+        candidate.declaration_header.as_deref(),
+        candidate.declaration_insert_start,
+        candidate.declaration_insert_end,
+        candidate.declaration_indent.as_deref(),
+        candidate.declaration_owner_indent.as_deref(),
+    ) {
+        (None, None, None, None, None) => {}
+        (Some(header), Some(start), Some(end), Some(indent), Some(owner_indent)) => {
+            if start > end
+                || end > source.len()
+                || !source.is_char_boundary(start)
+                || !source.is_char_boundary(end)
+                || !indent.trim().is_empty()
+                || !owner_indent.trim().is_empty()
+            {
+                return None;
+            }
+            let start_position = text::offset_to_position(source, start)?;
+            let end_position = text::offset_to_position(source, end)?;
+            let header = normalize_line_endings(header, line_ending);
+            let mut new_text = String::new();
+            if candidate.declaration_add_public {
+                new_text.push_str(owner_indent);
+                new_text.push_str("public");
+                new_text.push_str(line_ending);
+            }
+            new_text.push_str(indent);
+            new_text.push_str(&header);
+            new_text.push_str(line_ending);
+            new_text.push_str(owner_indent);
+            if new_text.len() > MAX_METHOD_HEADER_BYTES.saturating_mul(2) {
+                return None;
+            }
+            edits.push(TextEdit::new(
+                Range::new(start_position, end_position),
+                new_text,
+            ));
+        }
+        _ => return None,
+    }
+
+    let implementation = method_implementation_edit_for_header(
+        source,
+        candidate.implementation_insertion_offset,
+        &candidate.implementation_header,
+        &candidate.owner,
+        &candidate.method,
+    )?;
+    edits.push(implementation);
+    let updated = apply_text_edits(source, &edits)?;
+    if !validate_interface_method_generation(uri, &updated, candidate, &edits) {
+        return None;
+    }
+    // LSP clients interpret all ranges against the original document. Keep
+    // the order deterministic, including when a future renderer introduces
+    // same-offset insertions.
+    edits.sort_by(|left, right| {
+        left.range
+            .start
+            .cmp(&right.range.start)
+            .then_with(|| left.range.end.cmp(&right.range.end))
+            .then_with(|| left.new_text.cmp(&right.new_text))
+    });
+    Some(edits)
+}
+
+fn source_line_ending(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else if source.contains('\n') {
+        "\n"
+    } else if source.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    }
+}
+
+fn normalize_line_endings(text: &str, line_ending: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', line_ending)
+}
+
+fn apply_text_edits(source: &str, edits: &[TextEdit]) -> Option<String> {
+    let mut byte_edits = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let start = text::position_to_offset(source, edit.range.start)?;
+        let end = text::position_to_offset(source, edit.range.end)?;
+        if start > end {
+            return None;
+        }
+        byte_edits.push((start, end, edit.new_text.as_str()));
+    }
+    byte_edits.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    for pair in byte_edits.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return None;
+        }
+    }
+    let mut updated = source.to_owned();
+    byte_edits.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    for (start, end, text) in byte_edits {
+        updated.replace_range(start..end, text);
+    }
+    Some(updated)
+}
+
+fn validate_interface_method_generation(
+    uri: &Url,
+    updated_source: &str,
+    candidate: &MissingInterfaceMethodImplementationCandidate,
+    edits: &[TextEdit],
+) -> bool {
+    let Ok(path) = uri.to_file_path() else {
+        return false;
+    };
+    let Ok((tree, _)) = parser::parse_file(&FileInfo::new(path), updated_source.as_bytes()) else {
+        return false;
+    };
+    if tree.root_node().has_error() {
+        return false;
+    }
+    let implementation_header = normalize_line_endings(
+        &candidate.implementation_header,
+        source_line_ending(updated_source),
+    );
+    if !has_one_generated_interface_definition(
+        tree.root_node(),
+        updated_source,
+        &implementation_header,
+    ) {
+        return false;
+    }
+    if let Some(declaration) = candidate.declaration_header.as_deref() {
+        let declaration = normalize_line_endings(declaration, source_line_ending(updated_source));
+        if !has_interface_declaration(updated_source, &declaration) {
+            return false;
+        }
+    }
+    let todo_text = format!(
+        "// TODO: Implement {}.{}.",
+        candidate.owner, candidate.method
+    );
+    let Some(todo) = updated_source.find(&todo_text) else {
+        return false;
+    };
+    let Some(body_end) = updated_source[todo..].find("end;") else {
+        return false;
+    };
+    !edits.is_empty() && todo.saturating_add(body_end) > todo
+}
+
+fn has_one_generated_interface_definition(
+    root: Node<'_>,
+    source: &str,
+    expected_header: &str,
+) -> bool {
+    let mut definitions = 0usize;
+    walk(root, &mut |node| {
+        if node.kind() != "defProc" {
+            return;
+        }
+        let Some(header) = node.child_by_field_name("header") else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        if source
+            .get(header.start_byte()..header.end_byte())
+            .is_some_and(|text| text == expected_header)
+            && body.start_byte() > header.end_byte()
+        {
+            definitions = definitions.saturating_add(1);
+        }
+    });
+    definitions == 1
+}
+
+fn has_interface_declaration(source: &str, expected_header: &str) -> bool {
+    source.contains(expected_header)
+}
+
+fn matching_missing_interface_diagnostic(
+    candidate: &MissingInterfaceMethodImplementationCandidate,
+    context: &CodeActionContext,
+) -> Option<Diagnostic> {
+    context
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code(diagnostic) == Some("pascal-missing-interface-implementation")
+                && diagnostic.range == candidate.anchor
+        })
+        .cloned()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1029,6 +1504,11 @@ pub(crate) fn resolve_from_input(
         }
         ParsedActionData::MethodImplementation(data) => {
             return resolve_method_implementation_from_input(input, action, data, features, cancel);
+        }
+        ParsedActionData::InterfaceMethodImplementation(data) => {
+            return resolve_interface_method_implementation_from_input(
+                input, action, data, features, cancel,
+            );
         }
         ParsedActionData::Rename(data) => data,
     };
@@ -1498,6 +1978,146 @@ fn resolve_method_implementation_from_input(
     }
 }
 
+fn resolve_interface_method_implementation_from_input(
+    input: WorkspaceInput,
+    action: CodeAction,
+    data: InterfaceMethodImplementationActionData,
+    features: ClientActionFeatures,
+    cancel: &AtomicBool,
+) -> Computed<CodeAction> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    if let Err(error) = validate_interface_method_implementation_action_data(
+        &data,
+        &action,
+        source_generation,
+        configuration_generation,
+    ) {
+        return failed(source_generation, configuration_generation, error);
+    }
+
+    let target_uri = canonical_file_uri(&data.uri);
+    let (target_source, target_record) =
+        match source_for_input_with_cancel(&input, &target_uri, Some(cancel)) {
+            Ok(source) => source,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if !input_source_is_editable(&input, &target_uri) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("code-action document is outside configured workspace roots: {target_uri}"),
+        );
+    }
+    if source_hash(&target_source) != data.source_hash {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source changed; request code actions again".to_string(),
+        );
+    }
+    if identifier_at_position(&target_source, data.anchor.start)
+        .is_none_or(|identifier| identifier != data.owner.rsplit('<').next().unwrap_or(&data.owner))
+    {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "interface class declaration changed; request code actions again".to_string(),
+        );
+    }
+
+    let (_config, config_fingerprint, excluded, configuration_records) =
+        match lint_configuration_for_input(&input, &target_uri) {
+            Ok(config) => config,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if excluded {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action source is excluded by lint configuration".to_string(),
+        );
+    }
+    if config_fingerprint != data.config_fingerprint {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "code action configuration is stale; request code actions again".to_string(),
+        );
+    }
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+
+    let params = CodeActionParams {
+        text_document: lsp_types::TextDocumentIdentifier {
+            uri: target_uri.clone(),
+        },
+        range: data.anchor,
+        context: CodeActionContext {
+            diagnostics: action.diagnostics.clone().unwrap_or_default(),
+            only: Some(vec![CodeActionKind::QUICKFIX]),
+            trigger_kind: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    let (plans, interface_records) = match interface_method_implementation_plans_from_input(
+        &input,
+        &target_uri,
+        &target_source,
+        &target_record,
+        &params,
+        config_fingerprint,
+        &configuration_records,
+        cancel,
+    ) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let Some(plan) = plans.into_iter().find(|plan| {
+        plan.uri == target_uri
+            && plan.candidate.anchor == data.anchor
+            && plan.candidate.class_declaration == data.class_declaration
+            && plan.candidate.owner == data.owner
+            && plan.candidate.method == data.method
+            && plan.candidate.interface_uri == data.interface_uri
+            && plan.candidate.interface_owner == data.interface_owner
+            && plan.candidate.interface_method == data.interface_method
+            && plan.candidate.unit_name == data.unit_name
+            && plan.candidate.identity == data.identity
+            && plan.config_fingerprint == data.config_fingerprint
+            && plan.source_hash == data.source_hash
+    }) else {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "interface obligation or implementation proof is stale; request code actions again"
+                .to_string(),
+        );
+    };
+
+    let mut raw_edits = std::collections::HashMap::new();
+    raw_edits.insert(target_uri.clone(), plan.edits);
+    let mut records_by_uri = std::collections::HashMap::new();
+    records_by_uri.insert(target_uri, target_record);
+    let edit = match workspace_edit(raw_edits, &records_by_uri, features.document_changes) {
+        Ok(edit) => edit,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let mut resolved = action;
+    resolved.edit = Some(edit);
+    resolved.disabled = None;
+    let mut records = interface_records;
+    append_records(&mut records, configuration_records);
+    Computed {
+        source_generation,
+        configuration_generation,
+        value: Ok(resolved),
+        records,
+    }
+}
+
 fn failed<T>(source_generation: u64, configuration_generation: u64, error: String) -> Computed<T> {
     Computed {
         source_generation,
@@ -1581,6 +2201,15 @@ fn requests_quickfix(context: &CodeActionContext) -> bool {
         .only
         .as_ref()
         .is_none_or(|kinds| kinds.iter().any(|kind| kind == &CodeActionKind::QUICKFIX))
+}
+
+fn requests_interface_method(context: &CodeActionContext) -> bool {
+    context.only.as_ref().is_none_or(|kinds| {
+        kinds.iter().any(|kind| {
+            kind == &CodeActionKind::QUICKFIX
+                || kind == &INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND
+        })
+    })
 }
 
 fn plan_candidate(
@@ -1952,6 +2581,12 @@ fn method_implementation_action_title(candidate: &MissingMethodImplementationCan
     format!("Implement '{}.{}'", candidate.owner, candidate.method)
 }
 
+fn interface_method_implementation_action_title(
+    candidate: &MissingInterfaceMethodImplementationCandidate,
+) -> String {
+    format!("Implement '{}.{}'", candidate.owner, candidate.method)
+}
+
 impl RenameActionData {
     fn new(
         candidate: &NamingCandidate,
@@ -2029,6 +2664,36 @@ impl MethodImplementationActionData {
     }
 }
 
+impl InterfaceMethodImplementationActionData {
+    fn new(
+        plan: &InterfaceMethodImplementationPlan,
+        source_generation: u64,
+        configuration_generation: u64,
+    ) -> Self {
+        let mut data = Self {
+            version: INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION,
+            action_id: String::new(),
+            kind: INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND.to_string(),
+            uri: plan.uri.clone(),
+            anchor: plan.candidate.anchor,
+            class_declaration: plan.candidate.class_declaration,
+            owner: plan.candidate.owner.clone(),
+            method: plan.candidate.method.clone(),
+            interface_uri: plan.candidate.interface_uri.clone(),
+            interface_owner: plan.candidate.interface_owner.clone(),
+            interface_method: plan.candidate.interface_method.clone(),
+            unit_name: plan.candidate.unit_name.clone(),
+            identity: plan.candidate.identity,
+            source_generation,
+            configuration_generation,
+            config_fingerprint: plan.config_fingerprint,
+            source_hash: plan.source_hash,
+        };
+        data.action_id = interface_method_implementation_action_id(&data);
+        data
+    }
+}
+
 fn action_id(data: &RenameActionData) -> String {
     let mut hasher = DefaultHasher::new();
     data.version.hash(&mut hasher);
@@ -2095,6 +2760,35 @@ fn method_implementation_action_id(data: &MethodImplementationActionData) -> Str
     format!("pascal-lsp:{:016x}", hasher.finish())
 }
 
+fn interface_method_implementation_action_id(
+    data: &InterfaceMethodImplementationActionData,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    data.version.hash(&mut hasher);
+    data.kind.hash(&mut hasher);
+    data.uri.hash(&mut hasher);
+    data.anchor.start.line.hash(&mut hasher);
+    data.anchor.start.character.hash(&mut hasher);
+    data.anchor.end.line.hash(&mut hasher);
+    data.anchor.end.character.hash(&mut hasher);
+    data.class_declaration.start.line.hash(&mut hasher);
+    data.class_declaration.start.character.hash(&mut hasher);
+    data.class_declaration.end.line.hash(&mut hasher);
+    data.class_declaration.end.character.hash(&mut hasher);
+    data.owner.hash(&mut hasher);
+    data.method.hash(&mut hasher);
+    data.interface_uri.hash(&mut hasher);
+    data.interface_owner.hash(&mut hasher);
+    data.interface_method.hash(&mut hasher);
+    data.unit_name.hash(&mut hasher);
+    data.identity.hash(&mut hasher);
+    data.source_generation.hash(&mut hasher);
+    data.configuration_generation.hash(&mut hasher);
+    data.config_fingerprint.hash(&mut hasher);
+    data.source_hash.hash(&mut hasher);
+    format!("pascal-lsp:{:016x}", hasher.finish())
+}
+
 fn source_hash(source: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
@@ -2105,7 +2799,31 @@ fn parse_action_data(value: Option<&Value>) -> Result<ParsedActionData, String> 
     let Some(value) = value else {
         return Err("code action has no resolve data".to_string());
     };
-    if value.get("kind").and_then(Value::as_str) == Some(METHOD_IMPLEMENTATION_ACTION_KIND) {
+    if value.get("kind").and_then(Value::as_str)
+        == Some(INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND)
+    {
+        let mut data: InterfaceMethodImplementationActionData =
+            serde_json::from_value(value.clone()).map_err(|error| {
+                format!("invalid interface method implementation resolve data: {error}")
+            })?;
+        data.uri = canonical_file_uri(&data.uri);
+        data.interface_uri = canonical_file_uri(&data.interface_uri);
+        if data.action_id.len() > MAX_ACTION_ID_BYTES
+            || data.owner.len() > MAX_ACTION_UNIT_BYTES
+            || data.method.len() > MAX_ACTION_NAME_BYTES
+            || data.interface_owner.len() > MAX_ACTION_UNIT_BYTES
+            || data.interface_method.len() > MAX_ACTION_NAME_BYTES
+            || data.unit_name.len() > MAX_ACTION_UNIT_BYTES
+            || data.uri.as_str().len() > MAX_ACTION_URI_BYTES
+            || data.interface_uri.as_str().len() > MAX_ACTION_URI_BYTES
+        {
+            return Err(
+                "interface method implementation resolve data exceeds its bounded identity limits"
+                    .to_string(),
+            );
+        }
+        Ok(ParsedActionData::InterfaceMethodImplementation(data))
+    } else if value.get("kind").and_then(Value::as_str) == Some(METHOD_IMPLEMENTATION_ACTION_KIND) {
         let mut data: MethodImplementationActionData = serde_json::from_value(value.clone())
             .map_err(|error| format!("invalid method implementation resolve data: {error}"))?;
         data.uri = canonical_file_uri(&data.uri);
@@ -2232,6 +2950,49 @@ fn validate_method_implementation_action_data(
         || action.kind.as_ref() != Some(&CodeActionKind::QUICKFIX)
     {
         return Err("method implementation action identity was modified by the client".to_string());
+    }
+    if action.data.as_ref().is_none_or(|value| value.is_null()) {
+        return Err("code action resolve data is missing".to_string());
+    }
+    Ok(())
+}
+
+fn validate_interface_method_implementation_action_data(
+    data: &InterfaceMethodImplementationActionData,
+    action: &CodeAction,
+    source_generation: u64,
+    configuration_generation: u64,
+) -> Result<(), String> {
+    if data.version != INTERFACE_METHOD_IMPLEMENTATION_ACTION_DATA_VERSION
+        || data.kind != INTERFACE_METHOD_IMPLEMENTATION_ACTION_KIND
+        || data.action_id != interface_method_implementation_action_id(data)
+        || data.source_generation != source_generation
+        || data.configuration_generation != configuration_generation
+    {
+        return Err(
+            "interface method implementation resolve data is stale or tampered".to_string(),
+        );
+    }
+    if data.owner.is_empty()
+        || data.owner.len() > MAX_ACTION_UNIT_BYTES
+        || data.method.is_empty()
+        || data.method.len() > MAX_ACTION_NAME_BYTES
+        || data.interface_owner.is_empty()
+        || data.interface_owner.len() > MAX_ACTION_UNIT_BYTES
+        || data.interface_method.is_empty()
+        || data.interface_method.len() > MAX_ACTION_NAME_BYTES
+        || data.unit_name.is_empty()
+        || data.unit_name.len() > MAX_ACTION_UNIT_BYTES
+    {
+        return Err("interface method implementation action identity is invalid".to_string());
+    }
+    if action.title != format!("Implement '{}.{}'", data.owner, data.method)
+        || action.kind.as_ref() != Some(&INTERFACE_METHOD_IMPLEMENTATION_CODE_ACTION_KIND)
+    {
+        return Err(
+            "interface method implementation action identity was modified by the client"
+                .to_string(),
+        );
     }
     if action.data.as_ref().is_none_or(|value| value.is_null()) {
         return Err("code action resolve data is missing".to_string());

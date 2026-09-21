@@ -28938,6 +28938,13 @@ fn rename_capabilities_and_unopened_consumer_are_supported() {
             .iter()
             .any(|kind| kind == "quickfix")
     );
+    assert!(
+        capabilities["codeActionProvider"]["codeActionKinds"]
+            .as_array()
+            .expect("code action kinds")
+            .iter()
+            .any(|kind| kind == "implement-interface-method")
+    );
 
     let rename_id = RequestId::from("rename-unopened-consumer".to_string());
     server.send_request(
@@ -31987,6 +31994,467 @@ fn method_code_actions_honor_quickfix_context_filter_and_capability_negotiation(
         .clone();
     assert_eq!(quickfix_actions.len(), 1);
     assert!(quickfix_actions[0]["edit"].is_object());
+    server.shutdown();
+}
+
+#[test]
+fn code_action_generates_a_missing_interface_method_declaration_and_implementation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer = 1);\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  public\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "missing-interface-method",
+    );
+    assert_eq!(actions.len(), 1, "missing interface action: {actions:?}");
+    assert_eq!(actions[0]["title"], "Implement 'TWidget.Run'");
+    assert_eq!(actions[0]["kind"], "implement-interface-method");
+    assert_eq!(actions[0]["data"]["kind"], "implement-interface-method");
+    assert_eq!(actions[0]["data"]["version"], 1);
+    let custom_filter_id = RequestId::from("missing-interface-method-kind-filter".to_string());
+    server.send_request(
+        custom_filter_id.clone(),
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": position_of(source, "TWidget", 0),
+                "end": position_after(source, "TWidget", 0),
+            },
+            "context": {
+                "diagnostics": [],
+                "only": ["implement-interface-method"]
+            }
+        }),
+    );
+    let custom_filter_response = server.response(&custom_filter_id);
+    assert!(custom_filter_response.error.is_none());
+    let custom_filter_actions = custom_filter_response
+        .result
+        .expect("custom interface action filter result");
+    assert_eq!(custom_filter_actions.as_array().unwrap().len(), 1);
+    assert_eq!(
+        custom_filter_actions[0]["kind"],
+        "implement-interface-method"
+    );
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert_eq!(
+        updated,
+        concat!(
+            "unit Widget;\n",
+            "interface\n",
+            "type\n",
+            "  IRunner = interface\n",
+            "    procedure Run(Value: Integer = 1);\n",
+            "  end;\n",
+            "  TWidget = class(TObject, IRunner)\n",
+            "  public\n",
+            "    procedure Run(Value: Integer = 1);\n",
+            "  end;\n",
+            "implementation\n",
+            "procedure TWidget.Run(Value: Integer);\n",
+            "begin\n",
+            "  // TODO: Implement TWidget.Run.\n",
+            "end;\n",
+            "end.\n",
+        )
+    );
+    assert_applied_method_source_parses(&updated, "missing-interface-method");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_generates_only_the_body_for_an_existing_interface_declaration() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  public\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "interface-body-only",
+    );
+    assert_eq!(actions.len(), 1, "interface body action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert_eq!(updated.matches("procedure Run;").count(), 2);
+    assert_eq!(
+        updated.matches("procedure TWidget.Run;").count(),
+        1,
+        "the existing class declaration must not be duplicated: {updated}"
+    );
+    assert_applied_method_source_parses(&updated, "interface-body-only");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_creates_a_public_section_when_the_class_has_no_visibility_section() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "interface-public-section",
+    );
+    assert_eq!(actions.len(), 1, "public section action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(updated.contains("  public\n    procedure Run;\n  end;"));
+    assert_applied_method_source_parses(&updated, "interface-public-section");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_withholds_an_interface_method_that_collides_with_a_field() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  private\n",
+        "    Run: Integer;\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "interface-field-collision",
+    );
+    assert!(
+        actions.is_empty(),
+        "a field collision must not be silently changed into a method: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_action_withholds_an_incompatible_inherited_interface_method_collision() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer);\n",
+        "  end;\n",
+        "  TBase = class\n",
+        "  public\n",
+        "    procedure Run(Value: string);\n",
+        "  end;\n",
+        "  TWidget = class(TBase, IRunner)\n",
+        "  end;\n",
+        "implementation\n",
+        "procedure TBase.Run(Value: string); begin end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "interface-inherited-collision",
+    );
+    assert!(
+        actions.is_empty(),
+        "an incompatible inherited method must not be hidden by generation: {actions:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deferred_interface_action_rejects_an_implementation_added_after_creation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    let changed = source.replace(
+        "implementation\nend.",
+        "implementation\nprocedure TWidget.Run; begin end;\nend.",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "stale-interface-action",
+    );
+    assert_eq!(actions.len(), 1, "stale interface setup: {actions:?}");
+    assert!(actions[0]["edit"].is_null());
+    write_file(&source_path, &changed);
+
+    let resolve_id = RequestId::from("stale-interface-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_some(),
+        "a newly appearing implementation must stale the interface action: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn deferred_interface_action_resolves_to_the_same_validated_workspace_edit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer = 1);\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  public\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "deferred-interface-action",
+    );
+    assert_eq!(actions.len(), 1, "deferred interface action: {actions:?}");
+    assert!(actions[0]["edit"].is_null());
+    let resolve_id = RequestId::from("deferred-interface-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeAction/resolve", actions[0].clone());
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "interface resolve failed: {response:?}"
+    );
+    let resolved = response.result.expect("resolved interface action");
+    let updated = apply_workspace_edit_to_source(source, &resolved["edit"], &uri(&source_path));
+    assert!(updated.contains("procedure Run(Value: Integer = 1);"));
+    assert!(updated.contains("procedure TWidget.Run(Value: Integer);"));
+    assert!(!updated.contains("procedure TWidget.Run(Value: Integer = 1);"));
+    assert_applied_method_source_parses(&updated, "deferred-interface-action");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_renders_an_instantiated_generic_interface_signature() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner<T> = interface\n",
+        "    procedure Run(Value: T);\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner<Integer>)\n",
+        "  end;\n",
+        "implementation\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "generic-interface-action",
+    );
+    assert_eq!(actions.len(), 1, "generic interface action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(
+        updated.contains("procedure Run(Value: Integer);"),
+        "{updated}"
+    );
+    assert!(
+        updated.contains("procedure TWidget.Run(Value: Integer);"),
+        "{updated}"
+    );
+    assert!(
+        !updated.contains("procedure TWidget.Run(Value: T);"),
+        "{updated}"
+    );
+    assert_applied_method_source_parses(&updated, "generic-interface-action");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_keeps_distinct_supported_interface_overloads_distinct() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "unit Widget;\n",
+        "interface\n",
+        "type\n",
+        "  IRunner = interface\n",
+        "    procedure Run(Value: Integer); overload;\n",
+        "    procedure Run(Value: string); overload;\n",
+        "  end;\n",
+        "  TWidget = class(TObject, IRunner)\n",
+        "  public\n",
+        "    procedure Run(Value: string); overload;\n",
+        "  end;\n",
+        "implementation\n",
+        "procedure TWidget.Run(Value: string); begin end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "interface-overload-action",
+    );
+    assert_eq!(actions.len(), 1, "overload action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(updated.contains("procedure Run(Value: Integer); overload;"));
+    assert!(updated.contains("procedure TWidget.Run(Value: Integer);"));
+    assert_eq!(updated.matches("procedure TWidget.Run").count(), 2);
+    assert_applied_method_source_parses(&updated, "interface-overload-action");
+    server.shutdown();
+}
+
+#[test]
+fn code_action_preserves_bom_crlf_and_utf16_class_ranges() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let source_path = root.join("Widget.pas");
+    let source = concat!(
+        "\u{feff}unit Widget;\r\n",
+        "interface\r\n",
+        "type\r\n",
+        "  IRunner = interface\r\n",
+        "    procedure Run;\r\n",
+        "  end;\r\n",
+        "  TWidget = class(TObject, IRunner)\r\n",
+        "  public\r\n",
+        "  end;\r\n",
+        "implementation\r\n",
+        "end.\r\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_without_document_changes(&root, Value::Null);
+    let actions = request_missing_unit_actions(
+        &mut server,
+        &source_path,
+        source,
+        "TWidget",
+        "interface-crlf-bom",
+    );
+    assert_eq!(actions.len(), 1, "CRLF/BOM action: {actions:?}");
+    let updated = apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&source_path));
+    assert!(updated.starts_with('\u{feff}'));
+    assert!(updated.contains("procedure Run;\r\n"));
+    assert!(updated.contains("procedure TWidget.Run;\r\n"));
+    assert!(
+        !updated.contains("\n") || updated.matches('\n').count() == updated.matches("\r\n").count()
+    );
+    assert_applied_method_source_parses(&updated, "interface-crlf-bom");
     server.shutdown();
 }
 

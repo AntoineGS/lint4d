@@ -5771,7 +5771,7 @@ struct LabelReplacement {
     text: String,
 }
 
-fn specialized_type_text(
+pub(super) fn specialized_type_text(
     index: &NavigationIndex,
     _symbol: &Symbol,
     type_ref: Option<&super::TypeRef>,

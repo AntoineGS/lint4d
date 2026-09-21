@@ -53,6 +53,32 @@ pub(crate) struct MissingMethodImplementationCandidate {
     pub(crate) insertion_offset: usize,
     pub(crate) identity: u64,
 }
+
+/// A proven interface obligation whose class member declaration and/or body
+/// can be generated without changing an existing member.  The candidate keeps
+/// the physical insertion facts beside the contract proof so the workspace
+/// layer does not have to reconstruct an interface signature from display
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingInterfaceMethodImplementationCandidate {
+    pub(crate) anchor: Range,
+    pub(crate) class_declaration: Range,
+    pub(crate) owner: String,
+    pub(crate) method: String,
+    pub(crate) interface_uri: Url,
+    pub(crate) interface_owner: String,
+    pub(crate) interface_method: String,
+    pub(crate) unit_name: String,
+    pub(crate) declaration_header: Option<String>,
+    pub(crate) declaration_insert_start: Option<usize>,
+    pub(crate) declaration_insert_end: Option<usize>,
+    pub(crate) declaration_indent: Option<String>,
+    pub(crate) declaration_owner_indent: Option<String>,
+    pub(crate) declaration_add_public: bool,
+    pub(crate) implementation_header: String,
+    pub(crate) implementation_insertion_offset: usize,
+    pub(crate) identity: u64,
+}
 pub(crate) use folding::{
     FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
 };
@@ -838,9 +864,12 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
         let Some(header) = method_implementation_header(
+            self,
+            declaration,
             declaration_node,
             document.source.as_ref(),
             &owner_name,
+            &GenericSubstitution::empty(),
             cancel,
             budget,
         )?
@@ -893,6 +922,330 @@ impl NavigationIndex {
             insertion_offset,
             identity,
         }])
+    }
+
+    /// Find interface obligations for the concrete class selected at
+    /// `position` and retain only obligations for which a safe declaration and
+    /// implementation edit can be described. The contract traversal is the
+    /// same bounded proof used by missing-interface diagnostics.
+    pub(crate) fn missing_interface_method_implementation_candidates_with_budget(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<MissingInterfaceMethodImplementationCandidate>, String> {
+        check_navigation_cancel(cancel)?;
+        let Some(document) = self.documents.get(uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(offset) = text::position_to_offset(&document.source, position) else {
+            return Ok(Vec::new());
+        };
+        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+            return Ok(Vec::new());
+        };
+        if is_ignored_offset(document.tree.root_node(), offset)
+            || !is_declaration_identifier(identifier)
+        {
+            return Ok(Vec::new());
+        }
+        let identifier_span = Span::from_node(identifier);
+        let mut class_symbol_index = None;
+        for (index, symbol) in document.symbols.iter().enumerate() {
+            check_navigation_cancel(cancel)?;
+            if !budget.take_work(1, cancel)? {
+                return Ok(Vec::new());
+            }
+            if symbol.kind == SymbolKind::Type
+                && symbol.origin == Origin::Declaration
+                && symbol.type_kind == TypeKind::Class
+                && symbol.owner_type.is_none()
+                && symbol.generic_parameter.is_none()
+                && symbol.span == identifier_span
+                && class_symbol_index.replace(index).is_some()
+            {
+                return Ok(Vec::new());
+            }
+        }
+        let Some(class_symbol_index) = class_symbol_index else {
+            return Ok(Vec::new());
+        };
+        if document
+            .conditional_unknown_symbols
+            .get(class_symbol_index)
+            .copied()
+            .unwrap_or(true)
+        {
+            return Ok(Vec::new());
+        }
+        let class_symbol = &document.symbols[class_symbol_index];
+        let Some(class_instance) = self.contract_type_instance(uri, &class_symbol.key) else {
+            return Ok(Vec::new());
+        };
+        if !contract_substitution_is_complete(&class_instance) {
+            return Ok(Vec::new());
+        }
+        let Some(class_declaration_node) =
+            declared_type_node_for_span(document.tree.root_node(), identifier_span)
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(class_type_node) = class_declaration_node.child_by_field_name("type") else {
+            return Ok(Vec::new());
+        };
+        if class_type_node.kind() != "declClass"
+            || class_type_node
+                .children(&mut class_type_node.walk())
+                .any(|child| child.kind() == "declHelper")
+        {
+            return Ok(Vec::new());
+        }
+        let Some(owner_name) = declared_type_qualification(
+            class_declaration_node,
+            document.source.as_ref(),
+            cancel,
+            budget,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(class_declaration_range) =
+            range_for_span(&document.source, class_symbol.declaration_span)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut ancestry = ContractAncestryState::new();
+        let Some((missing, class_surface)) = self
+            .missing_interface_contracts_for_class_with_budget(
+                &class_instance,
+                &mut ancestry,
+                cancel,
+                budget,
+            )?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = Vec::new();
+        for obligation in missing {
+            check_navigation_cancel(cancel)?;
+            let Some(interface_method_symbol) = self.symbol(&obligation.requirement.candidate)
+            else {
+                continue;
+            };
+            if !method_signature_is_supported(interface_method_symbol) {
+                continue;
+            }
+            let Some(interface_document) =
+                self.documents.get(&obligation.requirement.candidate.uri)
+            else {
+                continue;
+            };
+            let Some(interface_node) = routine_declaration_node_for_symbol(
+                interface_document,
+                interface_method_symbol,
+                cancel,
+                budget,
+            )?
+            else {
+                continue;
+            };
+            if interface_method_symbol.routine_directives.abstract_
+                || interface_method_symbol.routine_directives.forward
+                || interface_method_symbol.unresolved_abbreviated
+                || routine_declaration_is_external(interface_node)
+            {
+                continue;
+            }
+            let Some(interface_header) = method_implementation_header(
+                self,
+                interface_method_symbol,
+                interface_node,
+                interface_document.source.as_ref(),
+                &owner_name,
+                &obligation.requirement.substitution,
+                cancel,
+                budget,
+            )?
+            else {
+                continue;
+            };
+            let method_name = if obligation.method_name == interface_method_symbol.key {
+                interface_method_symbol.name.clone()
+            } else {
+                obligation.method_name.clone()
+            };
+            let Some(implementation_header) =
+                replace_method_header_name(&interface_header, &owner_name, &method_name)
+            else {
+                continue;
+            };
+
+            let direct_declaration = self.direct_interface_method_declaration(
+                &obligation,
+                &class_instance,
+                cancel,
+                budget,
+            )?;
+            if obligation.implementation == ContractMatch::Yes
+                && matches!(
+                    direct_declaration,
+                    DirectInterfaceMethodDeclaration::Missing
+                )
+            {
+                continue;
+            }
+            let (declaration_header, declaration_insert, implementation_header) =
+                match direct_declaration {
+                    DirectInterfaceMethodDeclaration::Missing => {
+                        if !self.interface_method_name_collision_is_safe(
+                            &obligation,
+                            &class_surface,
+                            &method_name,
+                            cancel,
+                            budget,
+                        )? {
+                            continue;
+                        }
+                        let Some(declaration_header) = method_declaration_header(
+                            self,
+                            interface_method_symbol,
+                            interface_node,
+                            interface_document.source.as_ref(),
+                            &method_name,
+                            &obligation.requirement.substitution,
+                            cancel,
+                            budget,
+                        )?
+                        else {
+                            continue;
+                        };
+                        let Some(insert) = class_member_insertion(
+                            class_type_node,
+                            document.source.as_ref(),
+                            cancel,
+                            budget,
+                        )?
+                        else {
+                            continue;
+                        };
+                        (
+                            Some(declaration_header),
+                            Some(insert),
+                            implementation_header,
+                        )
+                    }
+                    DirectInterfaceMethodDeclaration::Present { index } => {
+                        let Some(symbol) = document.symbols.get(index) else {
+                            continue;
+                        };
+                        match method_definition_proof(document, symbol, index, cancel, budget)? {
+                            ContractMatch::No => {}
+                            ContractMatch::Yes | ContractMatch::Unknown => continue,
+                        }
+                        let Some(node) =
+                            routine_declaration_node_for_symbol(document, symbol, cancel, budget)?
+                        else {
+                            continue;
+                        };
+                        if symbol.routine_directives.abstract_
+                            || symbol.routine_directives.forward
+                            || symbol.unresolved_abbreviated
+                            || routine_declaration_is_external(node)
+                        {
+                            continue;
+                        }
+                        let Some(header) = method_implementation_header(
+                            self,
+                            symbol,
+                            node,
+                            document.source.as_ref(),
+                            &owner_name,
+                            &class_instance.substitution,
+                            cancel,
+                            budget,
+                        )?
+                        else {
+                            continue;
+                        };
+                        (None, None, header)
+                    }
+                    DirectInterfaceMethodDeclaration::Ambiguous => continue,
+                };
+            let (
+                declaration_insert_start,
+                declaration_insert_end,
+                declaration_indent,
+                declaration_owner_indent,
+                declaration_add_public,
+            ) = declaration_insert
+                .map(|insert| {
+                    (
+                        Some(insert.start),
+                        Some(insert.end),
+                        Some(insert.indent),
+                        Some(insert.owner_indent),
+                        insert.add_public,
+                    )
+                })
+                .unwrap_or((None, None, None, None, false));
+            let Some(method_name_node) =
+                declaration_name_identifiers(interface_node).last().copied()
+            else {
+                continue;
+            };
+            let interface_method_name = interface_document
+                .source
+                .get(method_name_node.start_byte()..method_name_node.end_byte())
+                .unwrap_or_default()
+                .to_owned();
+            if interface_method_name.is_empty() {
+                continue;
+            }
+            let mut hasher = DefaultHasher::new();
+            obligation.identity.hash(&mut hasher);
+            obligation.requirement.candidate.hash(&mut hasher);
+            obligation.requirement.substitution.hash(&mut hasher);
+            obligation.requirement.interface.hash(&mut hasher);
+            class_symbol.key.hash(&mut hasher);
+            class_symbol.declaration_span.hash(&mut hasher);
+            owner_name.hash(&mut hasher);
+            method_name.hash(&mut hasher);
+            interface_method_name.hash(&mut hasher);
+            declaration_header.hash(&mut hasher);
+            declaration_insert_start.hash(&mut hasher);
+            declaration_insert_end.hash(&mut hasher);
+            implementation_header.hash(&mut hasher);
+            let identity = hasher.finish();
+            candidates.push(MissingInterfaceMethodImplementationCandidate {
+                anchor: Range::new(
+                    text::offset_to_position(&document.source, class_symbol.span.start)
+                        .ok_or_else(|| "class name is not a UTF-16 boundary".to_string())?,
+                    text::offset_to_position(&document.source, class_symbol.span.end)
+                        .ok_or_else(|| "class name is not a UTF-16 boundary".to_string())?,
+                ),
+                class_declaration: class_declaration_range,
+                owner: owner_name.clone(),
+                method: method_name,
+                interface_uri: obligation.requirement.candidate.uri.clone(),
+                interface_owner: obligation.requirement.interface.key.clone(),
+                interface_method: interface_method_name,
+                unit_name: document.unit_name.clone(),
+                declaration_header,
+                declaration_insert_start,
+                declaration_insert_end,
+                declaration_indent,
+                declaration_owner_indent,
+                declaration_add_public,
+                implementation_header,
+                implementation_insertion_offset: method_implementation_insertion_offset(
+                    document, cancel, budget,
+                )?
+                .ok_or_else(|| "implementation insertion point is unavailable".to_string())?,
+                identity,
+            });
+        }
+        Ok(candidates)
     }
 
     /// Bind a document's imports to the workspace-selected unit documents.
@@ -1500,6 +1853,150 @@ impl NavigationIndex {
         Ok(diagnostics)
     }
 
+    /// Return the contract-proven interface obligations for one concrete
+    /// class. `None` means that the class contract is incomplete or otherwise
+    /// uncertain; an empty list is a complete class with no missing
+    /// obligations. The returned class surface is the same ancestry-aware
+    /// member surface used for collision analysis. Both diagnostics and code
+    /// actions use this proof so they cannot drift into separate, weaker
+    /// interface checkers.
+    #[allow(clippy::too_many_arguments)]
+    fn missing_interface_contracts_for_class_with_budget(
+        &self,
+        class_instance: &TypeInstance,
+        ancestry: &mut ContractAncestryState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<(Vec<ContractMissingInterfaceMethod>, ContractClassSurface)>, String> {
+        let class_resolution =
+            self.resolve_contract_type_with_budget(class_instance, ancestry, cancel, budget)?;
+        if class_resolution.status == AncestryStatus::Unknown {
+            return Ok(None);
+        }
+
+        let inherited_from_abstract_parent = if class_resolution.interfaces.is_empty() {
+            class_resolution
+                .superclass
+                .as_ref()
+                .map(|parent| self.contract_type_is_abstract_with_budget(parent, cancel, budget))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if class_resolution.interfaces.is_empty() && !inherited_from_abstract_parent {
+            return Ok(Some((Vec::new(), ContractClassSurface::default())));
+        }
+        if self.contract_type_is_abstract_with_budget(class_instance, cancel, budget)? {
+            return Ok(Some((Vec::new(), ContractClassSurface::default())));
+        }
+
+        let mut requirements = Vec::new();
+        let mut collected_requirements = HashSet::new();
+        let mut interfaces = class_resolution.interfaces.clone();
+        if let Some(superclass) = class_resolution.superclass.clone() {
+            if self
+                .resolve_contract_type_with_budget(&superclass, ancestry, cancel, budget)?
+                .status
+                == AncestryStatus::Unknown
+            {
+                return Ok(None);
+            }
+            interfaces.extend(self.contract_interfaces_from_class_with_budget(
+                &superclass,
+                ancestry,
+                cancel,
+                budget,
+            )?);
+        }
+
+        for interface in interfaces {
+            let interface_requirements = self
+                .collect_interface_requirements_with_budget(&interface, ancestry, cancel, budget)?;
+            if interface_requirements.status == AncestryStatus::Unknown {
+                return Ok(None);
+            }
+            budget.require_work(interface_requirements.requirements.len(), cancel)?;
+            for requirement in interface_requirements.requirements {
+                let identity = (
+                    requirement.candidate.clone(),
+                    requirement.substitution.clone(),
+                );
+                if collected_requirements.insert(identity) {
+                    requirements.push(requirement);
+                }
+            }
+        }
+
+        let mut surface = ContractClassSurface::default();
+        if self.collect_class_surface_with_budget(
+            class_instance,
+            ancestry,
+            &mut surface,
+            cancel,
+            budget,
+        )? == AncestryStatus::Unknown
+        {
+            return Ok(None);
+        }
+
+        let mut missing = Vec::new();
+        let mut emitted_requirements = HashSet::new();
+        for requirement in requirements {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let identity = requirement.identity(self, cancel, budget)?;
+            if self.contract_delegation_status(
+                &requirement,
+                class_instance,
+                &surface.delegations,
+                ancestry,
+                cancel,
+                budget,
+            )? != ContractMatch::No
+            {
+                continue;
+            }
+            let Some(interface_method) = self.symbol(&requirement.candidate) else {
+                continue;
+            };
+            let method_name = match self
+                .contract_method_resolution_name(&requirement, &surface.method_resolutions)
+            {
+                Ok(Some(name)) => name,
+                Ok(None) => interface_method.key.clone(),
+                Err(_) => continue,
+            };
+            // A diamond may replay the same source declaration through more
+            // than one interface path.  Those are one obligation when they
+            // resolve to the same implementation name, but a method-
+            // resolution clause can make the paths materially different.
+            // Deduplicate only after the mapped implementation identity is
+            // known so two distinct obligations are never merged by spelling
+            // alone.
+            if !emitted_requirements.insert((identity.clone(), method_name.clone())) {
+                continue;
+            }
+            let implementation = self.contract_method_implementation_status(
+                &requirement,
+                &method_name,
+                &surface.routines,
+                cancel,
+                budget,
+            )?;
+            if implementation == ContractMatch::Unknown {
+                continue;
+            }
+            missing.push(ContractMissingInterfaceMethod {
+                requirement,
+                identity,
+                method_name,
+                implementation,
+            });
+        }
+        Ok(Some((missing, surface)))
+    }
+
     /// Check source-backed override and interface contracts.  The pass is
     /// deliberately separate from ordinary member lookup because implemented
     /// interfaces are not ordinary class members.  Unknown ancestry,
@@ -1696,131 +2193,25 @@ impl NavigationIndex {
             if !contract_substitution_is_complete(&class_instance) {
                 continue;
             }
-            let class_resolution = self.resolve_contract_type_with_budget(
-                &class_instance,
-                &mut ancestry,
-                cancel,
-                budget,
-            )?;
-            if class_resolution.status == AncestryStatus::Unknown {
+            let Some((missing, _surface)) = self
+                .missing_interface_contracts_for_class_with_budget(
+                    &class_instance,
+                    &mut ancestry,
+                    cancel,
+                    budget,
+                )?
+            else {
                 continue;
-            }
-
-            let inherited_from_abstract_parent = if class_resolution.interfaces.is_empty() {
-                class_resolution
-                    .superclass
-                    .as_ref()
-                    .map(|parent| {
-                        self.contract_type_is_abstract_with_budget(parent, cancel, budget)
-                    })
-                    .transpose()?
-                    .unwrap_or(false)
-            } else {
-                false
             };
-            if class_resolution.interfaces.is_empty() && !inherited_from_abstract_parent {
-                continue;
-            }
-            if self.contract_type_is_abstract_with_budget(&class_instance, cancel, budget)? {
-                continue;
-            }
-
-            let mut requirements = Vec::new();
-            let mut collected_requirements = HashSet::new();
-            let mut interfaces = class_resolution.interfaces.clone();
-            if let Some(superclass) = class_resolution.superclass.clone() {
-                if self
-                    .resolve_contract_type_with_budget(&superclass, &mut ancestry, cancel, budget)?
-                    .status
-                    == AncestryStatus::Unknown
-                {
-                    continue;
-                }
-                interfaces.extend(self.contract_interfaces_from_class_with_budget(
-                    &superclass,
-                    &mut ancestry,
-                    cancel,
-                    budget,
-                )?);
-            }
-            let mut requirements_complete = true;
-            for interface in interfaces {
-                let interface_requirements = self.collect_interface_requirements_with_budget(
-                    &interface,
-                    &mut ancestry,
-                    cancel,
-                    budget,
-                )?;
-                if interface_requirements.status == AncestryStatus::Unknown {
-                    requirements_complete = false;
-                    break;
-                }
-                budget.require_work(interface_requirements.requirements.len(), cancel)?;
-                for requirement in interface_requirements.requirements {
-                    let identity = (
-                        requirement.candidate.clone(),
-                        requirement.substitution.clone(),
-                    );
-                    if collected_requirements.insert(identity) {
-                        requirements.push(requirement);
-                    }
-                }
-            }
-            if !requirements_complete {
-                continue;
-            }
-
-            let mut surface = ContractClassSurface::default();
-            if self.collect_class_surface_with_budget(
-                &class_instance,
-                &mut ancestry,
-                &mut surface,
-                cancel,
-                budget,
-            )? == AncestryStatus::Unknown
-            {
-                continue;
-            }
-
-            let mut emitted_requirements = HashSet::new();
-            for requirement in requirements {
+            for obligation in missing {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
-                let identity = requirement.identity(self, cancel, budget)?;
-                if !emitted_requirements.insert(identity) {
+                if obligation.implementation != ContractMatch::No {
                     continue;
                 }
-                if self.contract_delegation_status(
-                    &requirement,
-                    &class_instance,
-                    &surface.delegations,
-                    &mut ancestry,
-                    cancel,
-                    budget,
-                )? != ContractMatch::No
-                {
-                    continue;
-                }
-                let Some(interface_method) = self.symbol(&requirement.candidate) else {
+                let Some(interface_method) = self.symbol(&obligation.requirement.candidate) else {
                     continue;
                 };
-                let method_name = match self
-                    .contract_method_resolution_name(&requirement, &surface.method_resolutions)
-                {
-                    Ok(Some(name)) => name,
-                    Ok(None) => interface_method.key.clone(),
-                    Err(_) => continue,
-                };
-                if self.contract_method_implementation_status(
-                    &requirement,
-                    &method_name,
-                    &surface.routines,
-                    cancel,
-                    budget,
-                )? != ContractMatch::No
-                {
-                    continue;
-                }
                 if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
                     return Err("semantic diagnostics limit".to_owned());
                 }
@@ -1965,7 +2356,20 @@ impl NavigationIndex {
             }
         }
         let Some(urls) = self.units.get("system") else {
-            return Ok(None);
+            // A standalone source file may use Delphi's compiler-provided
+            // TObject without a source-backed System unit.  The root itself
+            // contributes no interface obligations; keeping a synthetic,
+            // source-local root lets us prove the explicit interfaces on the
+            // class without inventing any implicit System members.
+            return Ok(Some(TypeInstance {
+                uri: owner_uri.clone(),
+                key: "tobject".to_owned(),
+                kind: TypeKind::Class,
+                scope: 0,
+                parameter_names: Vec::new(),
+                substitution: GenericSubstitution::empty(),
+                helper_owner: None,
+            }));
         };
         if urls.len() != 1 {
             return Ok(None);
@@ -2034,10 +2438,31 @@ impl NavigationIndex {
             .is_some_and(|root| root == *instance))
     }
 
+    fn contract_instance_is_synthetic_tobject_with_budget(
+        &self,
+        instance: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if instance.key != "tobject" || instance.kind != TypeKind::Class {
+            return Ok(false);
+        }
+        let Some(document) = self.documents.get(&instance.uri) else {
+            return Ok(true);
+        };
+        Ok(document
+            .type_symbol_indices
+            .get("tobject")
+            .is_none_or(|indices| indices.is_empty()))
+    }
+
     fn resolve_contract_parent_with_budget(
         &self,
         owner: &TypeInstance,
         parent: &ParentType,
+        ancestry: &mut ContractAncestryState,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Option<TypeInstance>, String> {
@@ -2047,6 +2472,13 @@ impl NavigationIndex {
         let Some(document) = self.documents.get(&owner.uri) else {
             return Ok(None);
         };
+        if canonical_path(&type_ref.path) == "tobject"
+            && !document.type_symbol_indices.contains_key("tobject")
+            && type_ref.args.is_empty()
+        {
+            return self
+                .authoritative_tobject_instance_with_budget(&owner.uri, ancestry, cancel, budget);
+        }
         let Some(lookup_identifier) = self.contract_lookup_identifier_with_budget(
             document,
             type_ref.span,
@@ -2133,8 +2565,9 @@ impl NavigationIndex {
             {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
-                let Some(parent_instance) =
-                    self.resolve_contract_parent_with_budget(instance, parent, cancel, budget)?
+                let Some(parent_instance) = self.resolve_contract_parent_with_budget(
+                    instance, parent, ancestry, cancel, budget,
+                )?
                 else {
                     return Ok(ContractParentResolution::Unknown);
                 };
@@ -2196,6 +2629,12 @@ impl NavigationIndex {
             return Ok(AncestryStatus::Unknown);
         }
         let result = (|| {
+            // A compiler-provided TObject has unknown virtual members.  It is
+            // safe as an empty root for interface obligations, but it cannot
+            // prove that an `override` is invalid.
+            if self.contract_instance_is_synthetic_tobject_with_budget(instance, cancel, budget)? {
+                return Ok(AncestryStatus::Unknown);
+            }
             let parent =
                 match self.resolve_superclass_with_budget(instance, ancestry, cancel, budget)? {
                     ContractParentResolution::Resolved(parent) => parent,
@@ -2283,8 +2722,9 @@ impl NavigationIndex {
             for parent in &entry.parents {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
-                let Some(parent_instance) =
-                    self.resolve_contract_parent_with_budget(instance, parent, cancel, budget)?
+                let Some(parent_instance) = self.resolve_contract_parent_with_budget(
+                    instance, parent, ancestry, cancel, budget,
+                )?
                 else {
                     return Ok(ContractTypeResolution::unknown());
                 };
@@ -2435,6 +2875,7 @@ impl NavigationIndex {
                 return Ok(AncestryStatus::Unknown);
             }
             self.direct_contract_routines(instance, &mut surface.routines, cancel, budget)?;
+            self.direct_contract_nonroutine_names(instance, surface, cancel, budget)?;
             let Some(document) = self.documents.get(&instance.uri) else {
                 return Ok(AncestryStatus::Unknown);
             };
@@ -2473,6 +2914,36 @@ impl NavigationIndex {
         })();
         ancestry.active_class_surfaces.remove(instance);
         result
+    }
+
+    fn direct_contract_nonroutine_names(
+        &self,
+        instance: &TypeInstance,
+        surface: &mut ContractClassSurface,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<(), String> {
+        let Some(document) = self.documents.get(&instance.uri) else {
+            return Err("contract document is unavailable".to_owned());
+        };
+        let indices = document
+            .member_symbol_indices_by_owner
+            .get(&instance.key)
+            .cloned()
+            .unwrap_or_default();
+        budget.require_work(indices.len(), cancel)?;
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(index) else {
+                return Err("contract member disappeared".to_owned());
+            };
+            if symbol.owner_type.as_deref() == Some(instance.key.as_str())
+                && symbol.kind != SymbolKind::Routine
+            {
+                surface.nonroutine_names.insert(symbol.key.clone());
+            }
+        }
+        Ok(())
     }
 
     fn collect_interface_requirements_with_budget(
@@ -2985,7 +3456,6 @@ impl NavigationIndex {
             return Ok(ContractMatch::Unknown);
         };
         let mut unknown = false;
-        let mut overloaded = false;
         let mut abstract_match = false;
         for candidate in candidates {
             check_navigation_cancel(cancel)?;
@@ -2998,14 +3468,13 @@ impl NavigationIndex {
                 unknown = true;
                 continue;
             };
-            if matches!(
+            if !matches!(
                 symbol.visibility,
-                Visibility::Private | Visibility::StrictPrivate
+                Visibility::Public | Visibility::Published
             ) {
                 unknown = true;
                 continue;
             }
-            overloaded |= symbol.routine_directives.overload;
             match self.routines_contract_match(
                 requirement_symbol,
                 &requirement.candidate.uri,
@@ -3024,11 +3493,119 @@ impl NavigationIndex {
                 ContractMatch::Unknown => unknown = true,
             }
         }
-        Ok(if unknown || overloaded || abstract_match {
+        Ok(if unknown || abstract_match {
             ContractMatch::Unknown
         } else {
             ContractMatch::No
         })
+    }
+
+    fn direct_interface_method_declaration(
+        &self,
+        obligation: &ContractMissingInterfaceMethod,
+        class: &TypeInstance,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<DirectInterfaceMethodDeclaration, String> {
+        let Some(document) = self.documents.get(&class.uri) else {
+            return Ok(DirectInterfaceMethodDeclaration::Ambiguous);
+        };
+        let indices = document
+            .member_symbol_indices_by_owner
+            .get(&class.key)
+            .cloned()
+            .unwrap_or_default();
+        budget.require_work(indices.len(), cancel)?;
+        let Some(requirement_symbol) = self.symbol(&obligation.requirement.candidate) else {
+            return Ok(DirectInterfaceMethodDeclaration::Ambiguous);
+        };
+        let mut exact = Vec::new();
+        let mut uncertain = false;
+        let mut nonroutine_collision = false;
+        for index in indices {
+            check_navigation_cancel(cancel)?;
+            let Some(symbol) = document.symbols.get(index) else {
+                uncertain = true;
+                continue;
+            };
+            if symbol.owner_type.as_deref() != Some(class.key.as_str())
+                || symbol.key != obligation.method_name
+            {
+                continue;
+            }
+            if symbol.kind != SymbolKind::Routine {
+                nonroutine_collision = true;
+                continue;
+            }
+            if symbol.origin != Origin::Declaration {
+                continue;
+            }
+            match self.routines_contract_match(
+                requirement_symbol,
+                &obligation.requirement.candidate.uri,
+                &obligation.requirement.substitution,
+                symbol,
+                &class.uri,
+                &class.substitution,
+                cancel,
+                budget,
+            )? {
+                ContractMatch::Yes => exact.push(index),
+                ContractMatch::No => {}
+                ContractMatch::Unknown => uncertain = true,
+            }
+        }
+        if uncertain || nonroutine_collision || exact.len() > 1 {
+            return Ok(DirectInterfaceMethodDeclaration::Ambiguous);
+        }
+        if let Some(index) = exact.first().copied() {
+            Ok(DirectInterfaceMethodDeclaration::Present { index })
+        } else {
+            Ok(DirectInterfaceMethodDeclaration::Missing)
+        }
+    }
+
+    fn interface_method_name_collision_is_safe(
+        &self,
+        obligation: &ContractMissingInterfaceMethod,
+        surface: &ContractClassSurface,
+        method_name: &str,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<bool, String> {
+        if surface
+            .nonroutine_names
+            .contains(&canonical_name(method_name))
+        {
+            return Ok(false);
+        }
+        let mut same_name_routines = Vec::new();
+        let method_key = canonical_name(method_name);
+        for candidate in &surface.routines {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(symbol) = self.symbol(&candidate.candidate) else {
+                return Ok(false);
+            };
+            if symbol.key != method_key {
+                continue;
+            }
+            same_name_routines.push(symbol);
+        }
+        if same_name_routines.is_empty() {
+            return Ok(true);
+        }
+        // A new overload is safe only when every existing same-name routine
+        // explicitly belongs to an overload group and the obligation itself
+        // is also marked overload. Otherwise this would silently change the
+        // class's member binding or hide an incompatible member.
+        let Some(interface_method) = self.symbol(&obligation.requirement.candidate) else {
+            return Ok(false);
+        };
+        Ok(interface_method.routine_directives.overload
+            && same_name_routines
+                .iter()
+                .all(|symbol| symbol.routine_directives.overload))
     }
 
     fn contract_method_resolution_name(
@@ -11442,9 +12019,34 @@ struct ContractRequirementIdentity {
     substitution: GenericSubstitution,
 }
 
+#[derive(Debug, Clone)]
+struct ContractMissingInterfaceMethod {
+    requirement: ContractRequirement,
+    identity: ContractRequirementIdentity,
+    method_name: String,
+    implementation: ContractMatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DirectInterfaceMethodDeclaration {
+    Missing,
+    Present { index: usize },
+    Ambiguous,
+}
+
+#[derive(Debug, Clone)]
+struct InterfaceDeclarationInsertion {
+    start: usize,
+    end: usize,
+    indent: String,
+    owner_indent: String,
+    add_public: bool,
+}
+
 #[derive(Debug, Default)]
 struct ContractClassSurface {
     routines: Vec<ContractRoutineCandidate>,
+    nonroutine_names: HashSet<String>,
     method_resolutions: Vec<MethodResolution>,
     delegations: Vec<InterfaceDelegation>,
 }
@@ -15363,6 +15965,203 @@ fn ancestor_declared_type<'a>(
     Ok(None)
 }
 
+fn declared_type_node_for_span(root: Node<'_>, span: Span) -> Option<Node<'_>> {
+    let identifier = identifier_at(root, span.start)?;
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        if node.kind() == "declType"
+            && field_identifier_nodes(node, "name")
+                .iter()
+                .any(|name| Span::from_node(*name) == span)
+        {
+            return Some(node);
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn routine_declaration_node_for_symbol<'a>(
+    document: &'a Document,
+    symbol: &Symbol,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let Some(identifier) = identifier_at(document.tree.root_node(), symbol.span.start) else {
+        return Ok(None);
+    };
+    ancestor_routine_declaration(identifier, symbol.declaration_span, cancel, budget)
+}
+
+fn range_for_span(source: &str, span: Span) -> Option<Range> {
+    Some(Range::new(
+        text::offset_to_position(source, span.start)?,
+        text::offset_to_position(source, span.end)?,
+    ))
+}
+
+fn replace_method_header_name(header: &str, owner: &str, method: &str) -> Option<String> {
+    let prefix = format!("{owner}.");
+    let start = header.find(&prefix)?.saturating_add(prefix.len());
+    let end = header[start..]
+        .find(['(', '<', ';'])
+        .map_or(header.len(), |offset| start.saturating_add(offset));
+    if start >= end {
+        return None;
+    }
+    let mut result = String::with_capacity(header.len());
+    result.push_str(&header[..start]);
+    result.push_str(method);
+    result.push_str(&header[end..]);
+    Some(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn method_declaration_header(
+    index: &NavigationIndex,
+    symbol: &Symbol,
+    node: Node<'_>,
+    source: &str,
+    method_name: &str,
+    substitution: &GenericSubstitution,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<String>, String> {
+    let Some(name) = node.child_by_field_name("name") else {
+        return Ok(None);
+    };
+    let Some(header_end) = first_uncommented_semicolon(source, node.start_byte(), node.end_byte())
+    else {
+        return Ok(None);
+    };
+    if header_end < name.end_byte() {
+        return Ok(None);
+    }
+    check_navigation_cancel(cancel)?;
+    if !budget.take_work(1, cancel)? {
+        return Ok(None);
+    }
+    let mut replacements = vec![(name.start_byte(), name.end_byte(), method_name.to_owned())];
+    append_specialized_routine_replacements(
+        index,
+        symbol,
+        source,
+        substitution,
+        node.start_byte(),
+        header_end.saturating_add(1),
+        cancel,
+        budget,
+        &mut replacements,
+    )?;
+    let Some(mut rendered) = apply_source_replacements(
+        source,
+        node.start_byte(),
+        header_end.saturating_add(1),
+        replacements,
+    ) else {
+        return Ok(None);
+    };
+    if routine_directives(node).overload {
+        rendered.push_str(" overload;");
+    }
+    if let Some(convention) = routine_calling_convention_keyword(node) {
+        rendered.push(' ');
+        rendered.push_str(convention);
+        rendered.push(';');
+    }
+    Ok(Some(rendered))
+}
+
+fn class_member_insertion(
+    class_node: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<InterfaceDeclarationInsertion>, String> {
+    let mut cursor = class_node.walk();
+    let children = class_node.children(&mut cursor).collect::<Vec<_>>();
+    budget.require_work(children.len(), cancel)?;
+    let Some(end_node) = children
+        .iter()
+        .copied()
+        .find(|child| child.kind() == "kEnd")
+    else {
+        return Ok(None);
+    };
+    let public_section = children
+        .iter()
+        .copied()
+        .find(|child| child.kind() == "declSection" && has_direct_child_kind(*child, "kPublic"));
+    let target = if let Some(section) = public_section {
+        let Some(section_index) = children
+            .iter()
+            .position(|child| Span::from_node(*child) == Span::from_node(section))
+        else {
+            return Ok(None);
+        };
+        children
+            .iter()
+            .skip(section_index.saturating_add(1))
+            .copied()
+            .find(|child| matches!(child.kind(), "declSection" | "kEnd"))
+            .unwrap_or(end_node)
+    } else {
+        end_node
+    };
+    let line_start = source[..target.start_byte()]
+        .rfind('\n')
+        .map_or(0, |offset| offset.saturating_add(1));
+    let Some(prefix) = source.get(line_start..target.start_byte()) else {
+        return Ok(None);
+    };
+    if !prefix.trim().is_empty() {
+        return Ok(None);
+    }
+    let owner_indent = prefix.to_owned();
+    if let Some(section) = public_section {
+        let section_line_start = source[..section.start_byte()]
+            .rfind('\n')
+            .map_or(0, |offset| offset.saturating_add(1));
+        let Some(section_prefix) = source.get(section_line_start..section.start_byte()) else {
+            return Ok(None);
+        };
+        let section_indent = section_prefix.to_owned();
+        let member_indent = first_section_member_indent(section, source)
+            .unwrap_or_else(|| format!("{section_indent}  "));
+        return Ok(Some(InterfaceDeclarationInsertion {
+            start: line_start,
+            end: target.start_byte(),
+            indent: member_indent,
+            owner_indent,
+            add_public: false,
+        }));
+    }
+    Ok(Some(InterfaceDeclarationInsertion {
+        start: line_start,
+        end: target.start_byte(),
+        indent: format!("{owner_indent}  "),
+        owner_indent: owner_indent.clone(),
+        add_public: true,
+    }))
+}
+
+fn first_section_member_indent(section: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = section.walk();
+    section.children(&mut cursor).find_map(|child| {
+        if !matches!(
+            child.kind(),
+            "declProc" | "declField" | "declProp" | "declConst" | "declType"
+        ) {
+            return None;
+        }
+        let line_start = source[..child.start_byte()]
+            .rfind('\n')
+            .map_or(0, |offset| offset.saturating_add(1));
+        let prefix = source.get(line_start..child.start_byte())?;
+        prefix.trim().is_empty().then(|| prefix.to_owned())
+    })
+}
+
 fn declared_type_qualification(
     node: Node<'_>,
     source: &str,
@@ -15497,7 +16296,6 @@ fn method_definition_proof(
             || definition.owner_type != declaration.owner_type
             || definition.scope != declaration.scope
             || definition.key != declaration.key
-            || definition.routine_kind != declaration.routine_kind
             || definition.is_static != declaration.is_static
         {
             continue;
@@ -15511,6 +16309,10 @@ fn method_definition_proof(
             .copied()
             .unwrap_or(true)
             || document.has_parser_recovery_near(definition_span);
+        if definition.routine_kind != declaration.routine_kind {
+            uncertain = true;
+            continue;
+        }
         if definition.routine_key == declaration.routine_key {
             if definition_unknown {
                 uncertain = true;
@@ -15539,6 +16341,14 @@ fn method_definition_proof(
                         .any(|part| part.trim_end().ends_with('?'))
                 })
         {
+            uncertain = true;
+        } else if !declaration.routine_directives.overload
+            || !definition.routine_directives.overload
+        {
+            // A known but differently-shaped implementation with the same
+            // owner/name is still a collision for a non-overload declaration.
+            // Do not append a second body unless the source explicitly proves
+            // that both routines belong to one overload group.
             uncertain = true;
         }
     }
@@ -15597,10 +16407,14 @@ fn method_implementation_insertion_offset(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn method_implementation_header(
+    index: &NavigationIndex,
+    symbol: &Symbol,
     node: Node<'_>,
     source: &str,
     owner_name: &str,
+    substitution: &GenericSubstitution,
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<String>, String> {
@@ -15640,24 +16454,25 @@ fn method_implementation_header(
             replacements.push((start, default.end_byte(), String::new()));
         }
     }
-    replacements.sort_by_key(|replacement| replacement.0);
-    let mut rendered = String::new();
-    let mut cursor = node.start_byte();
-    for (start, end, replacement) in replacements {
-        if start < cursor || end > header_end {
-            return Ok(None);
-        }
-        let Some(prefix) = source.get(cursor..start) else {
-            return Ok(None);
-        };
-        rendered.push_str(prefix);
-        rendered.push_str(&replacement);
-        cursor = end;
-    }
-    let Some(suffix) = source.get(cursor..header_end.saturating_add(1)) else {
+    append_specialized_routine_replacements(
+        index,
+        symbol,
+        source,
+        substitution,
+        node.start_byte(),
+        header_end.saturating_add(1),
+        cancel,
+        budget,
+        &mut replacements,
+    )?;
+    let Some(mut rendered) = apply_source_replacements(
+        source,
+        node.start_byte(),
+        header_end.saturating_add(1),
+        replacements,
+    ) else {
         return Ok(None);
     };
-    rendered.push_str(suffix);
 
     if let Some(convention) = routine_calling_convention_keyword(node) {
         rendered.push(' ');
@@ -15665,6 +16480,86 @@ fn method_implementation_header(
         rendered.push(';');
     }
     Ok(Some(rendered))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_specialized_routine_replacements(
+    index: &NavigationIndex,
+    symbol: &Symbol,
+    source: &str,
+    substitution: &GenericSubstitution,
+    header_start: usize,
+    header_end: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    replacements: &mut Vec<(usize, usize, String)>,
+) -> Result<(), String> {
+    for parameter in &symbol.routine_parameters {
+        let Some(span) = parameter.type_span else {
+            continue;
+        };
+        if span.start < header_start || span.end > header_end {
+            continue;
+        }
+        let Some(text) = assistance::specialized_type_text(
+            index,
+            symbol,
+            parameter.type_ref.as_ref(),
+            substitution,
+            cancel,
+            budget,
+        )?
+        else {
+            continue;
+        };
+        replacements.push((span.start, span.end, text));
+    }
+    if let (Some(span), Some(type_ref)) = (symbol.result_type_span, symbol.result_type_ref.as_ref())
+    {
+        if span.start >= header_start && span.end <= header_end {
+            if let Some(text) = assistance::specialized_type_text(
+                index,
+                symbol,
+                Some(type_ref),
+                substitution,
+                cancel,
+                budget,
+            )? {
+                replacements.push((span.start, span.end, text));
+            }
+        }
+    }
+    let _ = source;
+    Ok(())
+}
+
+fn apply_source_replacements(
+    source: &str,
+    start: usize,
+    end: usize,
+    mut replacements: Vec<(usize, usize, String)>,
+) -> Option<String> {
+    replacements.sort_by_key(|replacement| (replacement.0, replacement.1));
+    for pair in replacements.windows(2) {
+        if pair[0].1 > pair[1].0 || pair[0].0 < start || pair[1].1 > end {
+            return None;
+        }
+    }
+    if replacements
+        .first()
+        .is_some_and(|replacement| replacement.0 < start || replacement.1 > end)
+    {
+        return None;
+    }
+    let mut rendered = String::new();
+    let mut cursor = start;
+    for (replacement_start, replacement_end, replacement) in replacements {
+        rendered.push_str(source.get(cursor..replacement_start)?);
+        rendered.push_str(&replacement);
+        cursor = replacement_end;
+    }
+    rendered.push_str(source.get(cursor..end)?);
+    Some(rendered)
 }
 
 fn reference_name_with_budget(

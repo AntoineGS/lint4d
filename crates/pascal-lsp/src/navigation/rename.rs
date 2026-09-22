@@ -2664,7 +2664,7 @@ fn binding_from_candidates(
     let kind = kind.ok_or_else(|| "rename target is unresolved".to_string())?;
     let old_key = old_key.ok_or_else(|| "rename target is unresolved".to_string())?;
 
-    if let BindingGroup::Routine { uri, key } = &group {
+    if let BindingGroup::Routine { uri, .. } = &group {
         let Some(document) = index.documents.get(uri) else {
             return Err("routine binding document disappeared".to_string());
         };
@@ -2686,24 +2686,6 @@ fn binding_from_candidates(
         if declarations > 1 || definitions > 1 {
             return Err("routine binding has multiple declarations and definitions".to_string());
         }
-        let Some(target) = members.iter().find_map(|id| {
-            document
-                .symbols
-                .iter()
-                .find(|symbol| symbol_id(uri, symbol) == *id)
-        }) else {
-            return Err("routine binding declaration disappeared".to_string());
-        };
-        if document.symbols.iter().any(|symbol| {
-            symbol.kind == SymbolKind::Routine
-                && symbol.key == target.key
-                && symbol.scope == target.scope
-                && symbol.owner_type == target.owner_type
-                && symbol.routine_key.as_deref() != Some(key.as_str())
-        }) {
-            return Err("overloaded routine bindings are not supported".to_string());
-        }
-
         // A virtual/dynamic routine is a slot rather than an ordinary
         // same-named routine.  Expand only an explicitly proven override
         // family here.  In particular, do not widen by name: reintroduced
@@ -2792,6 +2774,17 @@ fn expand_override_family(
         && !selected_symbol.routine_directives.override_
     {
         return Ok(initial_members);
+    }
+
+    // A selected virtual/override routine is itself an ancestry-sensitive
+    // proof anchor.  Validate the complete selected owner ancestry even when
+    // no explicit override candidate is currently indexed; an unavailable
+    // parent may carry another slot or an interface obligation.
+    let mut selected_ancestry = super::AncestryResolutionState::new();
+    let selected_ancestry_result =
+        index.resolve_type_ancestry(&selected.uri, &selected_owner, &mut selected_ancestry);
+    if selected_ancestry_result.status != super::AncestryStatus::Complete {
+        return Err("override family selected root ancestry is unknown".to_string());
     }
 
     let selected_name = selected_symbol.key.clone();
@@ -2962,17 +2955,23 @@ fn expand_override_family(
             continue;
         };
         if candidate_uri == selected.uri && candidate_owner == selected_owner {
-            family.insert(candidate_id);
+            if candidate_symbol.routine_key.as_deref() == selected_symbol.routine_key.as_deref() {
+                family.insert(candidate_id);
+            }
+            continue;
+        }
+        if candidate_uri == anchor_uri && candidate_owner == anchor_owner {
+            if candidate_symbol.routine_key.as_deref() == anchor_symbol.routine_key.as_deref() {
+                family.insert(candidate_id);
+            }
             continue;
         }
 
         // A same-named routine is eligible only when it is an explicit
         // override.  `reintroduce` and a plain same-signature declaration are
         // intentionally excluded even when the classes are related.
-        let is_anchor = candidate_uri == anchor_uri && candidate_owner == anchor_owner;
-        if !is_anchor
-            && (candidate_symbol.routine_directives.reintroduce
-                || !candidate_symbol.routine_directives.override_)
+        if candidate_symbol.routine_directives.reintroduce
+            || !candidate_symbol.routine_directives.override_
         {
             continue;
         }
@@ -2986,8 +2985,7 @@ fn expand_override_family(
             cancel,
             shared_work_budget,
         )?;
-        let ancestor_relation = candidate_uri == anchor_uri && candidate_owner == anchor_owner;
-        if !descendant_relation && !ancestor_relation {
+        if !descendant_relation {
             continue;
         }
         if descendant_relation
@@ -3009,37 +3007,19 @@ fn expand_override_family(
         // For `TBase<T>.Work(T)` overridden by `TChild.Work(Integer)`, the
         // parent substitution is part of the proof.  Unknown type identity or
         // generic constraints fail closed instead of widening by name.
-        let signature_match = if ancestor_relation {
-            super::ContractMatch::Yes
-        } else {
-            override_contract_match(
-                index,
-                candidate_symbol,
-                &candidate_uri,
-                candidate_owner,
-                anchor_symbol,
-                &anchor_uri,
-                anchor_owner.as_str(),
-                cancel,
-                shared_work_budget,
-            )?
-        };
+        let signature_match = override_contract_match(
+            index,
+            candidate_symbol,
+            &candidate_uri,
+            candidate_owner,
+            anchor_symbol,
+            &anchor_uri,
+            anchor_owner.as_str(),
+            cancel,
+            shared_work_budget,
+        )?;
         if signature_match != super::ContractMatch::Yes {
             return Err("override family signature is unknown or incompatible".to_string());
-        }
-        let candidate_is_override = candidate_symbol.routine_directives.override_;
-        // A root virtual is allowed as the ancestor of an override.  Every
-        // other family member must itself prove the slot with `override`.
-        if !candidate_is_override {
-            let Some(root_document) = index.documents.get(&candidate_uri) else {
-                return Err("override family member document disappeared".to_string());
-            };
-            let Some(root_symbol) = root_document.symbols.get(candidate_index) else {
-                return Err("override family member disappeared".to_string());
-            };
-            if !root_symbol.routine_directives.virtual_ && !root_symbol.routine_directives.dynamic {
-                continue;
-            }
         }
         family.insert(candidate_id);
     }

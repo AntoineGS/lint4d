@@ -2259,6 +2259,188 @@ impl NavigationIndex {
         Ok(diagnostics)
     }
 
+    /// Return stable identities for interface obligations affected by a
+    /// source-backed rename.  The identity records the requirement source
+    /// declaration and the source implementation(s) that satisfy it, rather
+    /// than spelling: an explicit resolution clause may legitimately change
+    /// its mapped name while retaining the same implementation identity.
+    pub(crate) fn rename_interface_contract_fingerprints_with_budget(
+        &self,
+        edited_uris: &HashSet<Url>,
+        binding_names: &HashSet<String>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Vec<String>, String> {
+        let binding_names = binding_names
+            .iter()
+            .map(|name| canonical_name(name))
+            .collect::<HashSet<_>>();
+        let mut affected_owners = Vec::<(Url, String)>::new();
+        for (uri, document) in &self.documents {
+            if !edited_uris.contains(uri) {
+                continue;
+            }
+            for symbol in &document.symbols {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if symbol.kind == SymbolKind::Type
+                    && symbol.type_kind == TypeKind::Class
+                    && symbol.owner_type.is_none()
+                    && symbol.generic_parameter.is_none()
+                    && document.symbols.iter().any(|member| {
+                        member.owner_type.as_deref() == Some(symbol.key.as_str())
+                            && member.kind == SymbolKind::Routine
+                            && binding_names.contains(&member.key)
+                    })
+                {
+                    affected_owners.push((uri.clone(), symbol.key.clone()));
+                }
+            }
+        }
+        if affected_owners.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut fingerprints = Vec::new();
+        for (uri, document) in &self.documents {
+            for symbol in &document.symbols {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                if symbol.kind != SymbolKind::Type
+                    || symbol.type_kind != TypeKind::Class
+                    || symbol.owner_type.is_some()
+                    || symbol.generic_parameter.is_some()
+                {
+                    continue;
+                }
+                let owner = (uri.clone(), symbol.key.clone());
+                let direct_member = document.symbols.iter().any(|member| {
+                    member.owner_type.as_deref() == Some(symbol.key.as_str())
+                        && member.kind == SymbolKind::Routine
+                        && binding_names.contains(&member.key)
+                });
+                let mut related = direct_member;
+                for target in &affected_owners {
+                    if related {
+                        break;
+                    }
+                    if owner == *target {
+                        related = true;
+                        break;
+                    }
+                    let mut ancestry = AncestryResolutionState::new();
+                    let resolution = self.resolve_type_ancestry(&owner.0, &owner.1, &mut ancestry);
+                    if resolution.status == AncestryStatus::Complete
+                        && type_ancestry_contains(
+                            self,
+                            &resolution.parents,
+                            target,
+                            cancel,
+                            budget,
+                        )?
+                    {
+                        related = true;
+                    }
+                }
+                if !related {
+                    continue;
+                }
+                let Some(class_instance) = self.contract_type_instance(uri, &symbol.key) else {
+                    return Err("rename interface contract owner disappeared".to_string());
+                };
+                if !contract_substitution_is_complete(&class_instance) {
+                    return Err("rename interface contract substitution is incomplete".to_string());
+                }
+                let mut ancestry = ContractAncestryState::new();
+                let Some((obligations, surface)) = self
+                    .missing_interface_contracts_for_class_with_budget(
+                        &class_instance,
+                        &mut ancestry,
+                        cancel,
+                        budget,
+                    )?
+                else {
+                    return Err("rename interface contract ancestry is unknown".to_string());
+                };
+                for obligation in obligations {
+                    check_navigation_cancel(cancel)?;
+                    let Some(requirement_symbol) = self.symbol(&obligation.requirement.candidate)
+                    else {
+                        return Err("rename interface requirement disappeared".to_string());
+                    };
+                    let requirement_id = self.source_symbol_fingerprint(
+                        &obligation.requirement.candidate.uri,
+                        requirement_symbol,
+                        &binding_names,
+                    );
+                    let mut matches = Vec::new();
+                    let mut unknown = false;
+                    for candidate in surface
+                        .routines
+                        .iter()
+                        .filter(|candidate| candidate.symbol_key == obligation.method_name)
+                    {
+                        check_navigation_cancel(cancel)?;
+                        budget.require_work(1, cancel)?;
+                        if candidate.conditional_unknown(self) {
+                            unknown = true;
+                            continue;
+                        }
+                        let Some(candidate_symbol) = self.symbol(&candidate.candidate) else {
+                            unknown = true;
+                            continue;
+                        };
+                        if !matches!(
+                            candidate_symbol.visibility,
+                            Visibility::Public | Visibility::Published
+                        ) {
+                            unknown = true;
+                            continue;
+                        }
+                        match self.routines_contract_match(
+                            requirement_symbol,
+                            &obligation.requirement.candidate.uri,
+                            &obligation.requirement.substitution,
+                            candidate_symbol,
+                            &candidate.candidate.uri,
+                            &candidate.substitution,
+                            cancel,
+                            budget,
+                        )? {
+                            ContractMatch::Yes if candidate_symbol.routine_directives.abstract_ => {
+                                unknown = true;
+                            }
+                            ContractMatch::Yes => matches.push(self.source_symbol_fingerprint(
+                                &candidate.candidate.uri,
+                                candidate_symbol,
+                                &binding_names,
+                            )),
+                            ContractMatch::No => {}
+                            ContractMatch::Unknown => unknown = true,
+                        }
+                    }
+                    matches.sort();
+                    let status = if unknown {
+                        "unknown"
+                    } else if matches.is_empty() {
+                        "missing"
+                    } else {
+                        "implemented"
+                    };
+                    fingerprints.push(format!(
+                        "{}|{}|{}|{}",
+                        uri,
+                        symbol.key,
+                        requirement_id,
+                        format_args!("{status}:{matches:?}")
+                    ));
+                }
+            }
+        }
+        fingerprints.sort();
+        Ok(fingerprints)
+    }
+
     /// Return the contract-proven interface obligations for one concrete
     /// class. `None` means that the class contract is incomplete or otherwise
     /// uncertain; an empty list is a complete class with no missing
@@ -2353,8 +2535,10 @@ impl NavigationIndex {
             budget.require_work(1, cancel)?;
             let Some(identity) = requirement.identity(self, cancel, budget)? else {
                 // Deferred identity must be complete before it can authorize
-                // either generation or later resolve-time reuse.
-                continue;
+                // either generation or later resolve-time reuse.  Treat the
+                // whole class contract as uncertain rather than silently
+                // dropping one obligation from a rename proof.
+                return Ok(None);
             };
             if self.contract_delegation_status(
                 &requirement,
@@ -14412,6 +14596,78 @@ enum AncestryStatus {
 struct TypeAncestryResolution {
     status: AncestryStatus,
     parents: Vec<(Url, String)>,
+}
+
+fn type_ancestry_contains(
+    index: &NavigationIndex,
+    parents: &[(Url, String)],
+    target: &(Url, String),
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    for (parent_uri, parent_key) in parents {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if parent_uri == &target.0 && parent_key == &target.1 {
+            return Ok(true);
+        }
+        let mut state = AncestryResolutionState::new();
+        let resolution = index.resolve_type_ancestry(parent_uri, parent_key, &mut state);
+        if resolution.status == AncestryStatus::Complete
+            && type_ancestry_contains(index, &resolution.parents, target, cancel, budget)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_fingerprint_header(source: &str, binding_names: &HashSet<String>) -> String {
+    let mut normalized = String::with_capacity(source.len());
+    let mut cursor = 0;
+    let bytes = source.as_bytes();
+    while cursor < bytes.len() {
+        let is_identifier_start = bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_';
+        if !is_identifier_start {
+            let next = cursor + source[cursor..].chars().next().unwrap().len_utf8();
+            normalized.push_str(&source[cursor..next]);
+            cursor = next;
+            continue;
+        }
+        let start = cursor;
+        cursor += 1;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        let token = &source[start..cursor];
+        if binding_names.contains(&canonical_name(token)) {
+            normalized.push_str("<renamed>");
+        } else {
+            normalized.push_str(token);
+        }
+    }
+    normalized
+}
+
+impl NavigationIndex {
+    fn source_symbol_fingerprint(
+        &self,
+        uri: &Url,
+        symbol: &Symbol,
+        binding_names: &HashSet<String>,
+    ) -> String {
+        let header = symbol
+            .routine_header_span
+            .and_then(|span| self.documents.get(uri)?.source.get(span.start..span.end))
+            .map(|source| normalize_fingerprint_header(source, binding_names))
+            .unwrap_or_default();
+        format!(
+            "{uri}|owner={:?}|origin={:?}|kind={:?}|header={header}",
+            symbol.owner_type, symbol.origin, symbol.kind
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

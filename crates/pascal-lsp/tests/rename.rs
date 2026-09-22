@@ -1942,7 +1942,7 @@ end.
 }
 
 #[test]
-fn selecting_one_overload_without_a_call_still_aborts_conservatively() {
+fn selecting_one_overload_without_a_call_renames_its_exact_pair() {
     let source = "unit OverloadedDeclarationRename;
 interface
 procedure Do(Value: Integer); overload;
@@ -1959,11 +1959,23 @@ end.
     let mut index = NavigationIndex::new();
     let source_uri = update(&mut index, "OverloadedDeclarationRename", source);
 
-    assert!(
-        index
-            .rename_edits(&source_uri, position_of(source, "Do", 0), "RenamedDo",)
-            .is_err(),
-        "overloaded declarations must not yield a partial rename"
+    let edits = index
+        .rename_edits(&source_uri, position_of(source, "Do", 0), "RenamedDo")
+        .expect("an unambiguous overload declaration has an exact pair");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Do", 0),
+                "RenamedDo".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Do", 2),
+                "RenamedDo".to_owned(),
+            ),
+        ],
     );
 }
 

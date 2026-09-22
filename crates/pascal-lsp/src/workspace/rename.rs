@@ -20,7 +20,7 @@ use crate::include_expansion::{
 };
 use crate::navigation::ParsedDocument;
 use crate::navigation::{AssistanceBudget, BindingWorkBudget};
-use crate::text;
+use crate::text::{self, PositionIndex};
 use lsp_types::{
     DocumentChanges, DocumentHighlight, Location, OneOf, OptionalVersionedTextDocumentIdentifier,
     Position, PrepareRenameResponse, Range, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
@@ -3333,9 +3333,15 @@ pub(crate) fn rename_from_input(
             };
         }
     }
-    if let Err(error) =
-        post_edit_rebind_proof(&snapshot, &raw_edits, new_name, &uri, position, cancel)
-    {
+    if let Err(error) = post_edit_rebind_proof(
+        &snapshot,
+        &raw_edits,
+        &candidate_names,
+        new_name,
+        &uri,
+        position,
+        cancel,
+    ) {
         let disk_changed = uri
             .to_file_path()
             .ok()
@@ -3381,6 +3387,7 @@ pub(crate) fn rename_from_input(
 fn post_edit_rebind_proof(
     snapshot: &RenameSnapshot,
     raw_edits: &HashMap<Url, Vec<TextEdit>>,
+    binding_names: &[String],
     _new_name: &str,
     _requested_uri: &Url,
     _requested_position: Position,
@@ -3391,12 +3398,40 @@ fn post_edit_rebind_proof(
         MAX_SNAPSHOT_SEMANTIC_BYTES,
         "rename post-edit rebind proof",
     );
-    let mut transformed = HashMap::<Url, String>::new();
-    let mut expected = HashSet::<(String, u32, u32, u32, u32)>::new();
-    let mut query_target = None;
     let mut mapping_budget =
         include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+    let raw_edit_owned_bytes = raw_edits.iter().fold(0usize, |bytes, (uri, edits)| {
+        bytes
+            .saturating_add(uri.as_str().len())
+            .saturating_add(edits.len().saturating_mul(std::mem::size_of::<TextEdit>()))
+            .saturating_add(edits.iter().map(|edit| edit.new_text.len()).sum::<usize>())
+    });
+    budget.require_work(
+        raw_edits
+            .values()
+            .map(|edits| edits.len().saturating_add(1))
+            .sum(),
+        cancel,
+    )?;
+    budget.require_owned_bytes(raw_edit_owned_bytes, cancel)?;
+    let edited_uris = raw_edits.keys().cloned().collect::<HashSet<_>>();
+    let binding_names = binding_names.iter().cloned().collect::<HashSet<_>>();
+    let expected_contracts = snapshot
+        .index
+        .rename_interface_contract_fingerprints_with_budget(
+            &edited_uris,
+            &binding_names,
+            cancel,
+            &mut budget,
+        )?;
     let mut ordered = raw_edits.keys().cloned().collect::<Vec<_>>();
+    budget.require_owned_bytes(
+        ordered
+            .len()
+            .saturating_mul(std::mem::size_of::<Url>())
+            .saturating_add(ordered.iter().map(|uri| uri.as_str().len()).sum::<usize>()),
+        cancel,
+    )?;
     ordered.sort_by(|left, right| left.as_str().cmp(right.as_str()));
 
     // Included physical sources are deliberately not standalone navigation
@@ -3406,6 +3441,11 @@ fn post_edit_rebind_proof(
     // repeated or ambiguous include contexts remain fail-closed.
     let mut expansion_edits = HashMap::<Url, Vec<TextEdit>>::new();
     let mut direct_edits = Vec::<(Url, Vec<TextEdit>)>::new();
+    let mut source_indices = HashMap::<Url, PositionIndex>::new();
+    let mut virtual_indices = HashMap::<Url, PositionIndex>::new();
+    let mut transformed = HashMap::<Url, String>::new();
+    let mut expected = HashSet::<(String, u32, u32, u32, u32)>::new();
+    let mut query_target = None;
     for edit_uri in ordered {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
@@ -3417,18 +3457,36 @@ fn post_edit_rebind_proof(
             .sources
             .get(&edit_uri)
             .ok_or_else(|| format!("rename post-edit source was not retained: {edit_uri}"))?;
+        if !source_indices.contains_key(&edit_uri) {
+            budget.require_work(source.len(), cancel)?;
+            budget.require_owned_bytes(
+                source
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>() * 2),
+                cancel,
+            )?;
+            let index = PositionIndex::new_with_cancel(source, cancel)
+                .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
+            source_indices.insert(edit_uri.clone(), index);
+        }
+        let source_index = source_indices
+            .get(&edit_uri)
+            .expect("source position index was inserted");
         let mut owner = None;
         let mut virtual_edits = Vec::with_capacity(edits.len());
         for edit in edits {
-            let start = text::position_to_offset(source, edit.range.start)
+            let start = source_index
+                .position_to_offset(source, edit.range.start)
                 .ok_or_else(|| "rename post-edit start is not a UTF-16 boundary".to_string())?;
-            let end = text::position_to_offset(source, edit.range.end)
+            let end = source_index
+                .position_to_offset(source, edit.range.end)
                 .ok_or_else(|| "rename post-edit end is not a UTF-16 boundary".to_string())?;
             if start >= end || end > source.len() {
                 return Err("rename post-edit range is invalid".to_string());
             }
             let mut matches = Vec::new();
             for (root_uri, expansion) in &snapshot.expansions {
+                budget.require_work(1, cancel)?;
                 if !expansion.source_texts.contains_key(&edit_uri) {
                     continue;
                 }
@@ -3468,9 +3526,27 @@ fn post_edit_rebind_proof(
                 .get(owner.as_ref().expect("include owner was set"))
                 .expect("include owner expansion was retained");
             let virtual_source = expansion.expanded.text();
-            let virtual_start = text::offset_to_position(virtual_source, virtual_range.start)
+            let owner_uri = owner.as_ref().expect("include owner was set");
+            if !virtual_indices.contains_key(owner_uri) {
+                budget.require_work(virtual_source.len(), cancel)?;
+                budget.require_owned_bytes(
+                    virtual_source
+                        .len()
+                        .saturating_mul(std::mem::size_of::<usize>() * 2),
+                    cancel,
+                )?;
+                let index = PositionIndex::new_with_cancel(virtual_source, cancel)
+                    .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
+                virtual_indices.insert(owner_uri.clone(), index);
+            }
+            let virtual_index = virtual_indices
+                .get(owner_uri)
+                .expect("virtual position index was inserted");
+            let virtual_start = virtual_index
+                .offset_to_position(virtual_source, virtual_range.start)
                 .ok_or_else(|| "rename post-edit virtual start is invalid".to_string())?;
-            let virtual_end = text::offset_to_position(virtual_source, virtual_range.end)
+            let virtual_end = virtual_index
+                .offset_to_position(virtual_source, virtual_range.end)
                 .ok_or_else(|| "rename post-edit virtual end is invalid".to_string())?;
             virtual_edits.push(TextEdit::new(
                 Range::new(virtual_start, virtual_end),
@@ -3560,6 +3636,17 @@ fn post_edit_rebind_proof(
         &mut binding_budget,
         &mut budget,
     )?;
+    let actual_contracts = rebound.rename_interface_contract_fingerprints_with_budget(
+        &edited_uris,
+        &binding_names,
+        cancel,
+        &mut budget,
+    )?;
+    if actual_contracts != expected_contracts {
+        return Err(
+            "rename post-edit interface contract proof did not preserve obligations".to_string(),
+        );
+    }
     let actual = locations
         .into_iter()
         .map(|location| {
@@ -3596,21 +3683,42 @@ fn apply_text_edits_for_proof(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<(String, Vec<Range>), String> {
+    let replacement_bytes = edits.iter().map(|edit| edit.new_text.len()).sum::<usize>();
+    budget.require_work(source.len(), cancel)?;
+    budget.require_work(edits.len(), cancel)?;
+    budget.require_owned_bytes(
+        source
+            .len()
+            .saturating_mul(std::mem::size_of::<usize>() * 2)
+            .saturating_add(edits.len().saturating_mul(std::mem::size_of::<(
+                usize,
+                usize,
+                String,
+                Range,
+            )>()))
+            .saturating_add(replacement_bytes),
+        cancel,
+    )?;
+    let source_index = PositionIndex::new_with_cancel(source, cancel)
+        .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
     let mut replacements = Vec::<(usize, usize, String, Range)>::with_capacity(edits.len());
     for edit in edits {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         budget.require_work(1, cancel)?;
-        let start = text::position_to_offset(source, edit.range.start)
+        let start = source_index
+            .position_to_offset(source, edit.range.start)
             .ok_or_else(|| "rename post-edit start is not a UTF-16 boundary".to_string())?;
-        let end = text::position_to_offset(source, edit.range.end)
+        let end = source_index
+            .position_to_offset(source, edit.range.end)
             .ok_or_else(|| "rename post-edit end is not a UTF-16 boundary".to_string())?;
         if start >= end || end > source.len() {
             return Err("rename post-edit range is invalid".to_string());
         }
         replacements.push((start, end, edit.new_text.clone(), edit.range));
     }
+    budget.require_work(comparison_sort_work(replacements.len()), cancel)?;
     replacements.sort_by_key(|(start, end, _, _)| (*start, *end));
     for (index, pair) in replacements.windows(2).enumerate() {
         if is_cancelled(cancel) {
@@ -3621,11 +3729,38 @@ fn apply_text_edits_for_proof(
             return Err("rename post-edit edits overlap".to_string());
         }
     }
-    let mut result = source.to_owned();
-    for (start, end, replacement, _) in replacements.iter().rev() {
-        budget.require_work(1, cancel)?;
-        result.replace_range(*start..*end, replacement);
+    let removed_bytes = replacements
+        .iter()
+        .map(|(start, end, _, _)| end.saturating_sub(*start))
+        .sum::<usize>();
+    let result_len = source
+        .len()
+        .saturating_sub(removed_bytes)
+        .saturating_add(replacement_bytes);
+    budget.require_work(result_len, cancel)?;
+    budget.require_owned_bytes(
+        result_len
+            .saturating_add(result_len.saturating_mul(std::mem::size_of::<usize>() * 2))
+            .saturating_add(
+                replacements
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Range>()),
+            ),
+        cancel,
+    )?;
+    let mut result = String::with_capacity(result_len);
+    let mut cursor = 0;
+    for (start, end, replacement, _) in &replacements {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        result.push_str(&source[cursor..*start]);
+        result.push_str(replacement);
+        cursor = *end;
     }
+    result.push_str(&source[cursor..]);
+    let result_index = PositionIndex::new_with_cancel(&result, cancel)
+        .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
     let mut ranges = Vec::with_capacity(replacements.len());
     let mut delta = 0isize;
     for (start, end, replacement, _) in replacements {
@@ -3637,9 +3772,11 @@ fn apply_text_edits_for_proof(
         let original_end = end;
         let mapped_start = start.saturating_add_signed(delta);
         let mapped_end = mapped_start.saturating_add(replacement.len());
-        let start = text::offset_to_position(&result, mapped_start)
+        let start = result_index
+            .offset_to_position(&result, mapped_start)
             .ok_or_else(|| "rename post-edit mapped start is invalid".to_string())?;
-        let end = text::offset_to_position(&result, mapped_end)
+        let end = result_index
+            .offset_to_position(&result, mapped_end)
             .ok_or_else(|| "rename post-edit mapped end is invalid".to_string())?;
         ranges.push(Range::new(start, end));
         delta = delta
@@ -8640,16 +8777,16 @@ mod tests {
     use super::super::FileChange;
     use super::super::MetadataObservation;
     use super::{
-        BaselineAccumulator, ContextKey, ContextState, DirectiveKind, Enumeration, PathStamp,
-        ProjectCandidateMembership, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
-        ReadPolicy, SnapshotMode, Workspace, WorkspaceOptions, build_snapshot,
-        capture_consumed_configuration_baseline, capture_context_baseline, contains_any_identifier,
-        directive_kind, enumerate_external_overlays, file_content_hash,
-        install_snapshot_priority_barrier, path_key, path_record_at, read_exact_file_bytes,
-        read_record_content_hash, rename_from_input, revalidate_input, snapshot_records,
-        test_cancel_in_include_analysis,
+        AssistanceBudget, BaselineAccumulator, ContextKey, ContextState, DirectiveKind,
+        Enumeration, PathStamp, ProjectCandidateMembership, ProjectContext, ProjectPathEntry,
+        ProjectPathProvenance, ReadPolicy, SnapshotMode, Workspace, WorkspaceOptions,
+        apply_text_edits_for_proof, build_snapshot, capture_consumed_configuration_baseline,
+        capture_context_baseline, contains_any_identifier, directive_kind,
+        enumerate_external_overlays, file_content_hash, install_snapshot_priority_barrier,
+        path_key, path_record_at, read_exact_file_bytes, read_record_content_hash,
+        rename_from_input, revalidate_input, snapshot_records, test_cancel_in_include_analysis,
     };
-    use lsp_types::{Position, Url};
+    use lsp_types::{Position, Range, TextEdit, Url};
     use pascal_core::resolver::{
         ResolutionObservation, ResolutionReport, SourceId, SourceRevision,
     };
@@ -8711,6 +8848,27 @@ mod tests {
         assert!(
             Arc::ptr_eq(&cached, &snapshot_document),
             "unchanged snapshot input should reuse the immutable parsed model"
+        );
+    }
+
+    #[test]
+    fn post_edit_proof_charges_source_scan_work_before_many_position_lookups() {
+        let source = "x\n".repeat(4096);
+        let edits = (0..32)
+            .map(|line| {
+                TextEdit::new(
+                    Range::new(Position::new(line, 0), Position::new(line, 1)),
+                    "y".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+        let mut budget = AssistanceBudget::new(1_024, 1_024 * 1_024, "post-edit budget test");
+        let error = apply_text_edits_for_proof(&source, &edits, &cancel, &mut budget)
+            .expect_err("large source scanning must consume actual byte work");
+        assert!(
+            error.contains("post-edit budget test") || error.contains("traversal limit"),
+            "unexpected bounded-work error: {error}"
         );
     }
 

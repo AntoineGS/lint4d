@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
-use lsp_types::{Position, TextEdit, Url};
+use lsp_types::{Position, Range, TextEdit, Url};
 use pascal_core::FileInfo;
 use pascal_lsp::workspace::{FileChange, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationTarget, ProjectContext, text};
@@ -19802,6 +19802,220 @@ end.
     assert!(
         result.is_err(),
         "an unknown intermediate slot signature must not admit a partial rename"
+    );
+}
+
+#[test]
+fn workspace_rename_rejects_an_unknown_selected_virtual_root_ancestry() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("UnknownRoot.pas");
+    let source = "unit UnknownRoot;
+interface
+type
+  TBase = class(TMissing)
+    procedure Work; virtual;
+  end;
+implementation
+procedure TBase.Work; begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work; virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "an unknown selected virtual root ancestry must fail closed"
+    );
+}
+
+#[test]
+fn workspace_rename_rejects_breaking_an_implicit_interface_obligation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ImplicitInterface.pas");
+    let source = "unit ImplicitInterface;
+interface
+type
+  IFoo = interface
+    procedure Work;
+  end;
+  TBase = class(TInterfacedObject, IFoo)
+    procedure Work; virtual;
+  end;
+implementation
+procedure TBase.Work; begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work; virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "renaming an implicit interface implementation must preserve the obligation"
+    );
+}
+
+#[test]
+fn workspace_rename_rejects_breaking_an_unopened_inherited_interface_obligation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let base_path = root.join("Base.pas");
+    let child_path = root.join("Child.pas");
+    let base = "unit Base;
+interface
+type
+  TObject = class
+  end;
+  IFoo = interface
+    procedure Work;
+  end;
+  TBase = class(TObject, IFoo)
+    procedure Work; virtual;
+  end;
+implementation
+procedure TBase.Work; begin end;
+end.
+";
+    let child = "unit Child;
+interface
+uses Base;
+type
+  TChild = class(TBase)
+  end;
+implementation
+end.
+";
+    write_file(&base_path, base);
+    write_file(&child_path, child);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&base_path),
+        position_of(base, "Work; virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "an unopened descendant must retain its inherited interface obligation"
+    );
+}
+
+#[test]
+fn workspace_rename_preserves_an_explicit_interface_resolution_mapping() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ResolvedInterface.pas");
+    let source = "unit ResolvedInterface;
+interface
+type
+  TObject = class
+  end;
+  IFoo = interface
+    procedure Execute;
+  end;
+  TBase = class(TObject, IFoo)
+    procedure Work; virtual;
+    procedure IFoo.Execute = Work;
+  end;
+implementation
+procedure TBase.Work; begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work; virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_ok(),
+        "an explicit interface resolution clause should follow the exact implementation: {result:?}"
+    );
+}
+
+#[test]
+fn workspace_rename_supports_an_exact_virtual_overload_slot() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("OverloadedVirtual.pas");
+    let source = "unit OverloadedVirtual;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); overload; virtual;
+    procedure Work(Value: string); overload; virtual;
+  end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TBase.Work(Value: string); begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work(Value: Integer)", 0),
+        "RunWork",
+        true,
+    );
+    let edit = result.expect("an unambiguous overload declaration has an exact family");
+    let integer_declaration_start = position_of(source, "Work(Value: Integer)", 0);
+    let integer_declaration = Range::new(
+        integer_declaration_start,
+        Position::new(
+            integer_declaration_start.line,
+            integer_declaration_start.character + "Work".encode_utf16().count() as u32,
+        ),
+    );
+    let integer_definition_start = position_of(source, "Work(Value: Integer)", 1);
+    let integer_definition = Range::new(
+        integer_definition_start,
+        Position::new(
+            integer_definition_start.line,
+            integer_definition_start.character + "Work".encode_utf16().count() as u32,
+        ),
+    );
+    assert_exact_workspace_edit(
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        vec![
+            (
+                uri(&source_path).to_string(),
+                integer_declaration.start,
+                integer_declaration.end,
+                "RunWork".to_owned(),
+            ),
+            (
+                uri(&source_path).to_string(),
+                integer_definition.start,
+                integer_definition.end,
+                "RunWork".to_owned(),
+            ),
+        ],
+    );
+    assert_eq!(
+        source
+            .matches("procedure TBase.Work(Value: string)")
+            .count(),
+        1,
+        "the independent overload remains untouched"
     );
 }
 

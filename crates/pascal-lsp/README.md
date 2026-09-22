@@ -16,10 +16,11 @@ and overload signature already resolved by the source index. A `virtual` or
 `dynamic` class routine and source-backed descendants marked `override` form
 one coordinated slot family; class/static distinctions, routine kind, result,
 parameter modes/types, generic shape, and calling convention must match.
-Same-name overloads, hiding/reintroduced methods, helpers, unknown ancestry,
-ambiguous calls, compiler-only consumers, and conditional-unknown members are
-not guessed into the family. A name-free `inherited;` call is accounted for
-semantically but has no invented text edit.
+Unresolved or ambiguous overloads, hiding/reintroduced methods, helpers, unknown
+ancestry, compiler-only consumers, and conditional-unknown members are not
+guessed into the family; an unambiguous declaration or call retains its exact
+overload slot. A name-free `inherited;` call is accounted for semantically but
+has no invented text edit.
 
 Workspace rename discovers authorized unopened sources and overlays before
 publishing one atomic edit. Missing providers, read-only or conflicting
@@ -1495,9 +1496,10 @@ block. Pascal-dependent conditional expressions and incomplete include audits
 remain unsupported; missing or unreadable includes cannot be treated as
 evidence that no reference exists. Source conditional compilation is projected
 for analysis rather than textually expanded. Unit/module renames (which require
-`RenameFile`), inherited or `with`-dependent lookup, overloaded/override relationships,
-compiled-only consumers, and other unsupported bindings are also rejected by
-the shared planner. Name collisions and reference capture are rejected before
+`RenameFile`), inherited or `with`-dependent lookup, relationships whose exact
+overload/override slot cannot be proven, compiled-only consumers, and other
+unsupported bindings are also rejected by the shared planner. Name collisions
+and reference capture are rejected before
 any edit is returned. Unresolved imports can be irrelevant when all candidate
 references are proven to bind within the source document without imports;
 import-dependent references still require complete bindings. Unqualified global

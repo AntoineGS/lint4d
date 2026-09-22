@@ -118,6 +118,8 @@ thread_local! {
     static TEST_CANCEL_AFTER_QUALIFIED_IDENTIFIER_NODE_VISITS: Cell<Option<usize>> =
         const { Cell::new(None) };
     static TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static TEST_UNIT_PATH_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static TEST_CANCEL_AFTER_UNIT_PATH_NODE_VISITS: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -159,6 +161,36 @@ fn test_record_qualified_identifier_node_visit() {
             TEST_QUALIFIED_IDENTIFIER_CANCEL_REQUESTED.with(|requested| requested.set(true));
         }
     });
+}
+
+#[cfg(test)]
+fn test_reset_unit_path_work() {
+    TEST_UNIT_PATH_NODE_VISITS.with(|value| value.set(0));
+    TEST_CANCEL_AFTER_UNIT_PATH_NODE_VISITS.with(|value| value.set(None));
+}
+
+#[cfg(test)]
+fn test_unit_path_node_visits() -> usize {
+    TEST_UNIT_PATH_NODE_VISITS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn test_cancel_after_unit_path_node_visits(visits: usize) {
+    TEST_CANCEL_AFTER_UNIT_PATH_NODE_VISITS.with(|value| value.set(Some(visits)));
+}
+
+#[cfg(test)]
+fn test_record_unit_path_nodes(nodes: usize, cancel: &AtomicBool) {
+    let visits = TEST_UNIT_PATH_NODE_VISITS.with(|value| {
+        let visits = value.get().saturating_add(nodes);
+        value.set(visits);
+        visits
+    });
+    if TEST_CANCEL_AFTER_UNIT_PATH_NODE_VISITS
+        .with(|limit| limit.get().is_some_and(|limit| visits >= limit))
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -5991,6 +6023,7 @@ impl NavigationIndex {
         document: &Document,
         identifier: Node<'_>,
         offset: usize,
+        _cancel: Option<&AtomicBool>,
     ) -> Option<Span> {
         if let Some(module_name) = enclosing_module_name(identifier) {
             if is_unit_declaration_module(module_name) || has_ancestor_kind(module_name, "declUses")
@@ -6005,6 +6038,10 @@ impl NavigationIndex {
             return None;
         }
         let identifiers = identifier_nodes(path_node);
+        #[cfg(test)]
+        if let Some(cancel) = _cancel {
+            test_record_unit_path_nodes(identifiers.len(), cancel);
+        }
         let first = identifiers.first()?;
         let last = identifiers.get(prefix_len.saturating_sub(1))?;
         Some(Span {
@@ -6013,61 +6050,93 @@ impl NavigationIndex {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn unit_occurrence_span_with_budget(
+    fn unit_occurrence_spans_with_budget(
         &self,
         uri: &Url,
         document: &Document,
-        identifier: Node<'_>,
-        offset: usize,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
-    ) -> Result<Option<Span>, String> {
-        budget.require_work(1, cancel)?;
-        let mut current = Some(identifier);
-        while let Some(node) = current {
+    ) -> Result<HashMap<Span, Span>, String> {
+        let mut spans = HashMap::new();
+        let mut cursor = document.tree.root_node().walk();
+        loop {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
+            let node = cursor.node();
             if node.kind() == "moduleName"
-                && (is_unit_declaration_module(node) || has_ancestor_kind(node, "declUses"))
+                && (is_unit_declaration_module(node)
+                    || has_ancestor_kind_with_budget(node, "declUses", cancel, budget)?)
             {
-                return Ok(Some(Span::from_node(node)));
+                let identifiers = identifier_nodes_with_budget(node, cancel, budget)?;
+                if let (Some(first), Some(last)) = (identifiers.first(), identifiers.last()) {
+                    let span = Span {
+                        start: first.start_byte(),
+                        end: last.end_byte(),
+                    };
+                    budget.require_bytes(
+                        identifiers
+                            .len()
+                            .saturating_mul(std::mem::size_of::<(Span, Span)>()),
+                        cancel,
+                    )?;
+                    for identifier in identifiers {
+                        check_navigation_cancel(cancel)?;
+                        spans.insert(Span::from_node(identifier), span);
+                    }
+                }
+            } else if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
+                && !is_nested_qualified_identifier_node(node)
+            {
+                if let Some(parts) =
+                    qualified_name_parts_with_budget(node, &document.source, cancel, budget)?
+                        .filter(|parts| parts.len() > 1)
+                {
+                    if let Some((prefix_len, _)) = self.longest_visible_unit_prefix_with_budget(
+                        uri,
+                        document,
+                        node.start_byte(),
+                        &parts,
+                        cancel,
+                        budget,
+                    )? {
+                        let identifiers = identifier_nodes_with_budget(node, cancel, budget)?;
+                        if prefix_len <= identifiers.len() {
+                            if let (Some(first), Some(last)) = (
+                                identifiers.first(),
+                                identifiers.get(prefix_len.saturating_sub(1)),
+                            ) {
+                                let span = Span {
+                                    start: first.start_byte(),
+                                    end: last.end_byte(),
+                                };
+                                budget.require_bytes(
+                                    prefix_len.saturating_mul(std::mem::size_of::<(Span, Span)>()),
+                                    cancel,
+                                )?;
+                                for identifier in identifiers.into_iter().take(prefix_len) {
+                                    #[cfg(test)]
+                                    test_record_unit_path_nodes(1, cancel);
+                                    check_navigation_cancel(cancel)?;
+                                    spans.insert(Span::from_node(identifier), span);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            current = node.parent();
+
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return Ok(spans);
+                }
+            }
         }
-        let Some((path_node, parts, cursor_index)) =
-            qualified_path_at_with_budget(identifier, &document.source, cancel, budget)?
-        else {
-            return Ok(None);
-        };
-        let Some((prefix_len, _)) = self.longest_visible_unit_prefix_with_budget(
-            uri, document, offset, &parts, cancel, budget,
-        )?
-        else {
-            return Ok(None);
-        };
-        if cursor_index >= prefix_len {
-            return Ok(None);
-        }
-        let identifiers = identifier_nodes(path_node);
-        budget.require_work(identifiers.len(), cancel)?;
-        budget.require_bytes(
-            identifiers
-                .iter()
-                .map(|node| node.end_byte().saturating_sub(node.start_byte()))
-                .sum(),
-            cancel,
-        )?;
-        let Some(first) = identifiers.first() else {
-            return Ok(None);
-        };
-        let Some(last) = identifiers.get(prefix_len.saturating_sub(1)) else {
-            return Ok(None);
-        };
-        Ok(Some(Span {
-            start: first.start_byte(),
-            end: last.end_byte(),
-        }))
     }
 
     fn resolve_candidates_at_with_state(
@@ -6265,7 +6334,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Candidate>, String> {
-        budget.require_bytes(name.len(), cancel)?;
+        budget.require_owned_bytes(name.len(), cancel)?;
         let key = canonical_name(name);
         let urls = self.unit_urls_for_import_with_budget(current_document, &key, cancel, budget)?;
         let mut result_capacity = 0usize;
@@ -6970,6 +7039,7 @@ impl NavigationIndex {
         let mut result = Vec::new();
         for uri in unit_uris {
             budget.require_work(1, cancel)?;
+            budget.require_bytes(uri.as_str().len(), cancel)?;
             let Some(document) = self.documents.get(&uri) else {
                 continue;
             };
@@ -15194,6 +15264,7 @@ impl Document {
                 .saturating_add(self.implementation_uses.len()),
         };
         budget.require_work(count, cancel)?;
+        budget.require_bytes(count.saturating_mul(std::mem::size_of::<&String>()), cancel)?;
         Ok(match region {
             Region::Interface => self.interface_uses.iter().collect(),
             Region::Implementation | Region::Other => self
@@ -17743,6 +17814,54 @@ fn identifier_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     result
 }
 
+pub(super) fn identifier_nodes_with_budget<'a>(
+    root: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Vec<Node<'a>>, String> {
+    Ok(identifier_nodes_with_budget_and_count(root, cancel, budget)?.0)
+}
+
+fn identifier_nodes_with_budget_and_count<'a>(
+    root: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<(Vec<Node<'a>>, usize), String> {
+    let mut cursor = root.walk();
+    let mut result = Vec::new();
+    let mut visited = 0usize;
+    loop {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        visited = visited.saturating_add(1);
+        let node = cursor.node();
+        #[cfg(test)]
+        TEST_SEMANTIC_OWNER_HEADER_NODE_VISITS.with(|value| {
+            value.set(value.get().saturating_add(1));
+        });
+        if node.kind() == "identifier" {
+            let span = Span::from_node(node);
+            budget.require_bytes(
+                std::mem::size_of::<Node<'_>>().saturating_add(span.end.saturating_sub(span.start)),
+                cancel,
+            )?;
+            result.push(node);
+        }
+
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok((result, visited));
+            }
+        }
+    }
+}
+
 fn field_identifier_nodes<'a>(node: Node<'a>, field: &str) -> Vec<Node<'a>> {
     let mut result = Vec::new();
     let mut cursor = node.walk();
@@ -17806,21 +17925,12 @@ fn qualified_path_at_with_budget<'a>(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(Node<'a>, Vec<String>, usize)>, String> {
-    let mut current = identifier.parent();
-    let mut qualified_node = None;
-    while let Some(node) = current {
-        check_navigation_cancel(cancel)?;
-        budget.require_work(1, cancel)?;
-        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot") {
-            if let Some(parts) = qualified_name_parts_with_budget(node, source, cancel, budget)? {
-                if parts.len() > 1 {
-                    qualified_node = Some((node, parts));
-                }
-            }
-        }
-        current = node.parent();
-    }
-    let Some((node, parts)) = qualified_node else {
+    let Some(node) = qualified_node_at_with_budget(identifier, cancel, budget)? else {
+        return Ok(None);
+    };
+    let Some(parts) = qualified_name_parts_with_budget(node, source, cancel, budget)?
+        .filter(|parts| parts.len() > 1)
+    else {
         return Ok(None);
     };
     let Some(cursor_index) =
@@ -18117,11 +18227,17 @@ fn qualified_name_parts_with_budget(
     let mut pending = vec![node];
     let mut parts = Vec::new();
     while let Some(current) = pending.pop() {
+        #[cfg(test)]
+        test_record_unit_path_nodes(1, cancel);
         check_navigation_cancel(cancel)?;
         budget.require_work(1, cancel)?;
         match current.kind() {
             "identifier" => {
                 let text = node_text_with_budget(current, source, cancel, budget)?;
+                budget.require_owned_bytes(
+                    text.len().saturating_add(std::mem::size_of::<String>()),
+                    cancel,
+                )?;
                 parts.push(text.to_owned());
             }
             "exprDot" | "genericDot" | "typerefDot" => {
@@ -18185,13 +18301,29 @@ fn use_name_at_with_budget(
             && has_ancestor_kind_with_budget(node, "declUses", cancel, budget)?
         {
             let span = Span::from_node(node);
-            let node_count = count_nodes_with_budget(node, cancel, budget)?;
+            let (identifiers, node_count) =
+                identifier_nodes_with_budget_and_count(node, cancel, budget)?;
             budget.require_work(node_count.saturating_mul(3).saturating_add(1), cancel)?;
             budget.require_bytes(
-                span.end.saturating_sub(span.start).saturating_mul(2),
+                identifiers
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>()),
                 cancel,
             )?;
-            return Ok(Some(canonical_path(&identifier_texts(node, source))));
+            let names = identifiers
+                .into_iter()
+                .map(|identifier| {
+                    let text = node_text_with_budget(identifier, source, cancel, budget)?;
+                    budget.require_owned_bytes(text.len(), cancel)?;
+                    Ok(text.to_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let path_bytes = span
+                .end
+                .saturating_sub(span.start)
+                .saturating_add(names.len().saturating_sub(1));
+            budget.require_owned_bytes(path_bytes, cancel)?;
+            return Ok(Some(canonical_path(&names)));
         }
         current = node.parent();
     }
@@ -18216,6 +18348,7 @@ fn has_ancestor_kind_with_budget(
     Ok(false)
 }
 
+#[cfg(test)]
 fn count_nodes_with_budget(
     node: Node<'_>,
     cancel: &AtomicBool,
@@ -18257,20 +18390,15 @@ fn qualified_type_path_at_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<(Vec<String>, usize)>, String> {
-    let mut current = identifier.parent();
-    let mut qualified_node = None;
-    while let Some(node) = current {
-        check_navigation_cancel(cancel)?;
-        if matches!(node.kind(), "typerefDot" | "genericDot") {
-            if let Some(parts) = qualified_name_parts_with_budget(node, source, cancel, budget)? {
-                if parts.len() > 1 {
-                    qualified_node = Some((node, parts));
-                }
-            }
-        }
-        current = node.parent();
+    let Some(node) = qualified_node_at_with_budget(identifier, cancel, budget)? else {
+        return Ok(None);
+    };
+    if !matches!(node.kind(), "typerefDot" | "genericDot") {
+        return Ok(None);
     }
-    let Some((node, parts)) = qualified_node else {
+    let Some(parts) = qualified_name_parts_with_budget(node, source, cancel, budget)?
+        .filter(|parts| parts.len() > 1)
+    else {
         return Ok(None);
     };
     let Some(cursor_index) =
@@ -18279,6 +18407,34 @@ fn qualified_type_path_at_with_budget(
         return Ok(None);
     };
     Ok(Some((parts, cursor_index)))
+}
+
+fn qualified_node_at_with_budget<'a>(
+    identifier: Node<'a>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Node<'a>>, String> {
+    let mut current = identifier;
+    let mut qualified_node = None;
+    while let Some(parent) = current.parent() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if !matches!(parent.kind(), "exprDot" | "genericDot" | "typerefDot") {
+            break;
+        }
+        let is_child = parent
+            .child_by_field_name("lhs")
+            .is_some_and(|lhs| Span::from_node(lhs) == Span::from_node(current))
+            || parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| Span::from_node(rhs) == Span::from_node(current));
+        if !is_child {
+            break;
+        }
+        qualified_node = Some(parent);
+        current = parent;
+    }
+    Ok(qualified_node)
 }
 
 fn qualified_identifier_index_with_budget(
@@ -20481,6 +20637,102 @@ mod tests {
         assert!(
             byte_error.contains("qualified-alias test exceeds the 1-byte scan limit"),
             "unexpected byte-budget error: {byte_error}"
+        );
+    }
+
+    #[test]
+    fn binding_reference_unit_path_work_is_bounded_before_materialization() {
+        let provider_uri =
+            Url::parse("file:///tmp/bounded-unit-path/provider.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/bounded-unit-path/consumer.pas").expect("consumer URI");
+        let provider = "unit Ns.Provider;\ninterface\nconst Value = 1;\nimplementation\nend.\n";
+        let mut consumer = String::from(
+            "unit Consumer;\ninterface\nuses Ns.Provider;\nimplementation\nprocedure Run;\nbegin\n  Ns.Provider",
+        );
+        for index in 0..600 {
+            write!(&mut consumer, ".Member{index}").expect("write qualified path");
+        }
+        consumer.push_str(";\nend;\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer)
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("Ns.Provider".to_owned(), provider_uri.clone())],
+        );
+
+        let mut work_budget = BindingWorkBudget::new(1_000);
+        let mut semantic_budget = AssistanceBudget::new(1_000, 8 * 1024 * 1024, "unit-path test");
+        let error = index
+            .binding_locations_with_cancel_and_work_budget(
+                &provider_uri,
+                Position::new(0, 8),
+                true,
+                &AtomicBool::new(false),
+                &mut work_budget,
+                &mut semantic_budget,
+            )
+            .expect_err("qualified unit-path work must be charged before it completes");
+        assert!(
+            error.contains("unit-path test exceeds"),
+            "unexpected bounded-path error: {error}"
+        );
+    }
+
+    #[test]
+    fn binding_reference_unit_path_honors_cancellation_during_materialization() {
+        let provider_uri =
+            Url::parse("file:///tmp/cancellable-unit-path/provider.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/cancellable-unit-path/consumer.pas").expect("consumer URI");
+        let provider = "unit Ns.Provider;\ninterface\nconst Value = 1;\nimplementation\nend.\n";
+        let mut consumer = String::from(
+            "unit Consumer;\ninterface\nuses Ns.Provider;\nimplementation\nprocedure Run;\nbegin\n  Ns.Provider",
+        );
+        for index in 0..180 {
+            write!(&mut consumer, ".Member{index}").expect("write qualified path");
+        }
+        consumer.push_str(";\nend;\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer)
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("Ns.Provider".to_owned(), provider_uri.clone())],
+        );
+
+        test_reset_unit_path_work();
+        test_cancel_after_unit_path_node_visits(8);
+        let mut semantic_budget =
+            AssistanceBudget::new(100_000, 8 * 1024 * 1024, "cancellable unit-path test");
+        let error = index
+            .binding_locations_with_cancel_and_work_budget(
+                &provider_uri,
+                Position::new(0, 8),
+                true,
+                &AtomicBool::new(false),
+                &mut BindingWorkBudget::new(100_000),
+                &mut semantic_budget,
+            )
+            .expect_err("unit-path cancellation must interrupt the inner traversal");
+        let visits = test_unit_path_node_visits();
+        test_reset_unit_path_work();
+
+        assert_eq!(error, "request cancelled");
+        assert!(
+            visits <= 16,
+            "inner unit-path traversal ignored cancellation until {visits} nodes"
         );
     }
 
@@ -25328,6 +25580,120 @@ mod tests {
                     kind: Some(lsp_types::DocumentHighlightKind::READ),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_resolve_call_identity_before_intrinsic_names() {
+        let uri =
+            Url::parse("file:///workspace/highlight-intrinsic-shadow.pas").expect("source URI");
+        let source = "unit HighlightIntrinsicShadow;\ninterface\ntype\n  TBox = class\n    procedure Inc(const V: Integer);\n  end;\nprocedure Inc(const V: Integer);\nimplementation\nprocedure TBox.Inc(const V: Integer);\nbegin\nend;\nprocedure Inc(const V: Integer);\nbegin\nend;\nprocedure Run;\nvar\n  B: TBox;\n  X: Integer;\nbegin\n  Inc(X);\n  B.Inc(X);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("intrinsic-shadow source parses");
+        let mut budget = BindingWorkBudget::new(100_000);
+        let highlights = index
+            .binding_highlights_in_document_with_cancel_and_work_budget(
+                &uri,
+                Position::new(17, 2),
+                &AtomicBool::new(false),
+                &mut budget,
+            )
+            .expect("resolved call identities classify highlights");
+
+        assert_eq!(
+            highlights,
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(17, 2), Position::new(17, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(19, 6), Position::new(19, 7)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(20, 8), Position::new(20, 9)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_preserve_nested_call_storage_semantics() {
+        let uri = Url::parse("file:///workspace/highlight-nested-call.pas").expect("source URI");
+        let source = "unit HighlightNestedCall;\ninterface\nimplementation\nfunction Change(var V: Integer): Integer;\nbegin\n  Result := V;\nend;\nprocedure Run;\nvar\n  X: Integer;\n  A: array[0..4] of Integer;\nbegin\n  A[Change(X)] := 1;\n  A[Unknown(X)] := 1;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("nested-call source parses");
+        let mut budget = BindingWorkBudget::new(100_000);
+        let highlights = index
+            .binding_highlights_in_document_with_cancel_and_work_budget(
+                &uri,
+                Position::new(9, 2),
+                &AtomicBool::new(false),
+                &mut budget,
+            )
+            .expect("nested call roles resolve");
+
+        assert_eq!(
+            highlights,
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(9, 2), Position::new(9, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(12, 11), Position::new(12, 12)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(13, 12), Position::new(13, 13)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_bound_late_writable_binding_work_once() {
+        let uri = Url::parse("file:///workspace/highlight-late-writable.pas").expect("source URI");
+        let mut source = String::from(
+            "unit HighlightLateWritable;\ninterface\nimplementation\nprocedure Run;\nvar\n",
+        );
+        for index in 0..256 {
+            writeln!(&mut source, "  Before{index}: Integer;").expect("write preceding symbol");
+        }
+        source.push_str("  Target: Integer;\nbegin\n");
+        for _ in 0..64 {
+            source.push_str("  Target := Target + 1;\n");
+        }
+        source.push_str("end;\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("late-writable source parses");
+        let mut occurrence_budget = BindingWorkBudget::new(100_000);
+        let mut semantic_budget =
+            AssistanceBudget::new(10_000, 8 * 1024 * 1024, "late writable highlights");
+        let highlights = index
+            .binding_highlights_in_document_with_cancel_and_work_budget_and_shared_budget(
+                &uri,
+                Position::new(261, 2),
+                &AtomicBool::new(false),
+                &mut occurrence_budget,
+                &mut semantic_budget,
+            )
+            .expect("late writable binding should stay within the shared budget");
+
+        assert_eq!(highlights.len(), 129);
+        assert!(
+            semantic_budget.remaining_work > 0,
+            "writability must be charged once, not once per occurrence"
         );
     }
 

@@ -175,6 +175,10 @@ pub(super) enum ParameterModeResolution {
     /// The target was resolved, but overload selection may still be
     /// ambiguous or have no parameter at the requested index.
     Resolved(Option<ParameterMode>),
+    /// The resolver proved that no source-backed callable shadows this
+    /// unqualified compiler intrinsic, and the intrinsic signature supplies
+    /// the requested mode.
+    Intrinsic(Option<ParameterMode>),
 }
 
 /// Resolve the parameter mode used by one call argument.  A missing mode is
@@ -213,6 +217,28 @@ pub(super) fn parameter_mode_for_argument(
     {
         return Ok(ParameterModeResolution::Unresolved);
     }
+    if candidates.is_empty() {
+        return Ok(intrinsic_parameter_mode_for_entity(
+            entity,
+            current_document,
+            argument_index,
+            cancel,
+            budget,
+        )?
+        .map_or(ParameterModeResolution::Unresolved, |mode| {
+            ParameterModeResolution::Intrinsic(Some(mode))
+        }));
+    }
+    budget.require_work(candidates.len(), cancel)?;
+    budget.require_bytes(
+        candidates.iter().fold(
+            candidates
+                .len()
+                .saturating_mul(std::mem::size_of::<Candidate>()),
+            |bytes, candidate| bytes.saturating_add(candidate.uri.as_str().len()),
+        ),
+        cancel,
+    )?;
     candidates.retain(|candidate| {
         index.symbol(candidate).is_some_and(|symbol| {
             symbol.kind == SymbolKind::Routine && !symbol.unresolved_abbreviated
@@ -272,6 +298,34 @@ pub(super) fn parameter_mode_for_argument(
             .and_then(|symbol| symbol.routine_parameters.get(argument_index))
             .map(|parameter| parameter.mode),
     ))
+}
+
+fn intrinsic_parameter_mode_for_entity(
+    entity: Node<'_>,
+    document: &Document,
+    argument_index: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<ParameterMode>, String> {
+    // Intrinsics are only proven by the resolver's empty, uncertainty-free
+    // result above.  A qualified/member spelling is never treated as an
+    // intrinsic merely because its terminal component has a familiar name.
+    let identifier = super::callable_lookup_identifier(entity);
+    if identifier.kind() != "identifier" || super::callable_owner_node(entity).is_some() {
+        return Ok(None);
+    }
+    let name = canonical_name(super::node_text_with_budget(
+        identifier,
+        &document.source,
+        cancel,
+        budget,
+    )?);
+    Ok(match name.as_str() {
+        "inc" | "dec" if argument_index == 0 => Some(ParameterMode::Var),
+        "read" | "readln" => Some(ParameterMode::Var),
+        "write" | "writeln" => Some(ParameterMode::Const),
+        _ => None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -76,6 +76,10 @@ const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_INCLUDE_OWNER_DISCOVERY: usize = 256;
 const MAX_SNAPSHOT_PHYSICAL_LOCATIONS: usize = 10_000;
 const MAX_SNAPSHOT_MAPPING_WORK: usize = 1_000_000;
+// A snapshot may evaluate the same source-bearing include through several
+// virtual roots before physical deduplication. Keep semantic materialization
+// bounded without rejecting the existing 10,000-location response boundary.
+const MAX_SNAPSHOT_SEMANTIC_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RENAME_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AUTO_IMPORT_PROVIDER_SOURCES: usize = 512;
 const INCLUDE_BYTE_BUDGET_ERROR: &str =
@@ -734,6 +738,11 @@ impl RenameSnapshot {
         let mut physical_indexes = HashMap::new();
         let mut resolution_budget =
             crate::navigation::BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
+        let mut semantic_budget = AssistanceBudget::new(
+            MAX_SNAPSHOT_MAPPING_WORK,
+            MAX_SNAPSHOT_SEMANTIC_BYTES,
+            "binding references",
+        );
         let query_positions =
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         for (query_uri, query_position) in query_positions {
@@ -744,6 +753,7 @@ impl RenameSnapshot {
                 include_declaration,
                 cancel,
                 &mut resolution_budget,
+                &mut semantic_budget,
             )?;
             for location in query_locations {
                 for mapped in self.map_location_with_budget(
@@ -796,17 +806,23 @@ impl RenameSnapshot {
         let mut physical_indexes = HashMap::new();
         let mut resolution_budget =
             crate::navigation::BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
+        let mut semantic_budget = AssistanceBudget::new(
+            MAX_SNAPSHOT_MAPPING_WORK,
+            MAX_SNAPSHOT_SEMANTIC_BYTES,
+            "document highlights",
+        );
         let query_positions =
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         for (query_uri, query_position) in query_positions {
             resolution_budget.charge()?;
             let query_highlights = self
                 .index
-                .binding_highlights_in_document_with_cancel_and_work_budget(
+                .binding_highlights_in_document_with_cancel_and_work_budget_and_shared_budget(
                     &query_uri,
                     query_position,
                     cancel,
                     &mut resolution_budget,
+                    &mut semantic_budget,
                 )?;
             for highlight in query_highlights {
                 for mapped in self.map_location_with_budget(
@@ -2406,6 +2422,19 @@ fn add_project_unit_alias_names(
             info.names.push(alias.clone());
         }
     }
+    // Workspace discovery is allowed to use conservative spelling hints, but
+    // the navigation index remains the identity authority.  A namespaced
+    // declaration such as `Ns.Provider` must therefore retain both its full
+    // spelling and its components so unopened consumers can survive the byte
+    // prefilter before identity-based occurrence resolution runs.
+    let component_names = info
+        .names
+        .iter()
+        .flat_map(|name| name.split('.'))
+        .filter(|component| !component.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    info.names.extend(component_names);
     info.names.sort_by_key(|name| name.to_ascii_lowercase());
     info.names
         .dedup_by(|left, right| left.eq_ignore_ascii_case(right));

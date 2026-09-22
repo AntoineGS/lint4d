@@ -20717,6 +20717,159 @@ fn unit_references_and_highlights_use_bound_alias_identity_and_complete_prefixes
 }
 
 #[test]
+fn namespaced_unit_references_cover_each_declaration_component_and_unopened_consumers() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Ns.Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let shortened = temp.path().join("ShortConsumer.pas");
+    let provider_source = "unit Ns.Provider;\ninterface\nconst Value = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Ns.Provider;\nimplementation\nprocedure Run;\nbegin\n  Ns.Provider.Value;\nend;\nend.\n";
+    let shortened_source = "unit ShortConsumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Provider.Value;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&shortened, shortened_source);
+    write_file(
+        &temp.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_Namespace>Ns</DCC_Namespace></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let mut expected = vec![
+        json!({
+            "uri": uri(&consumer).to_string(),
+            "range": {
+                "start": {"line": 2, "character": 5},
+                "end": {"line": 2, "character": 16}
+            }
+        }),
+        json!({
+            "uri": uri(&consumer).to_string(),
+            "range": {
+                "start": {"line": 6, "character": 2},
+                "end": {"line": 6, "character": 13}
+            }
+        }),
+        json!({
+            "uri": uri(&shortened).to_string(),
+            "range": {
+                "start": {"line": 2, "character": 5},
+                "end": {"line": 2, "character": 13}
+            }
+        }),
+        json!({
+            "uri": uri(&shortened).to_string(),
+            "range": {
+                "start": {"line": 6, "character": 2},
+                "end": {"line": 6, "character": 10}
+            }
+        }),
+    ];
+    expected.sort_by_key(|value| value.to_string());
+
+    for (component, component_position) in [("Ns", 5_u32), ("Provider", 8_u32)] {
+        for include_declaration in [false, true] {
+            let id = RequestId::from(format!(
+                "namespaced-provider-{component}-{include_declaration}"
+            ));
+            server.send_request(
+                id.clone(),
+                "textDocument/references",
+                json!({
+                    "textDocument": {"uri": uri(&provider)},
+                    "position": {"line": 0, "character": component_position},
+                    "context": {"includeDeclaration": include_declaration}
+                }),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "{component} response: {response:?}"
+            );
+            let mut actual = result_locations(response);
+            let mut expected_for_request = expected.clone();
+            if include_declaration {
+                expected_for_request.push(json!({
+                    "uri": uri(&provider).to_string(),
+                    "range": {
+                        "start": {"line": 0, "character": 5},
+                        "end": {"line": 0, "character": 16}
+                    }
+                }));
+            }
+            assert_eq!(actual.len(), expected_for_request.len());
+            actual.sort_by_key(|value| value.to_string());
+            expected_for_request.sort_by_key(|value| value.to_string());
+            assert_eq!(actual, expected_for_request, "component {component}");
+        }
+    }
+    server.shutdown();
+}
+
+#[test]
+fn namespaced_unit_references_follow_project_alias_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("Ns.Provider.pas");
+    let consumer = temp.path().join("AliasConsumer.pas");
+    let provider_source = "unit Ns.Provider;\ninterface\nconst Value = 1;\nimplementation\nend.\n";
+    let consumer_source = "unit AliasConsumer;\ninterface\nuses Legacy;\nimplementation\nprocedure Run;\nbegin\n  Legacy.Value;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &temp.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>AliasConsumer.pas</MainSource><DCC_Namespace>Ns</DCC_Namespace><DCC_UnitAlias>Legacy=Ns.Provider</DCC_UnitAlias></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for include_declaration in [false, true] {
+        let id = RequestId::from(format!("namespaced-provider-alias-{include_declaration}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri(&provider)},
+                "position": {"line": 0, "character": 8},
+                "context": {"includeDeclaration": include_declaration}
+            }),
+        );
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "alias response: {response:?}");
+        let mut actual = result_locations(response);
+        let mut expected = vec![
+            json!({
+                "uri": uri(&consumer).to_string(),
+                "range": {
+                    "start": {"line": 2, "character": 5},
+                    "end": {"line": 2, "character": 11}
+                }
+            }),
+            json!({
+                "uri": uri(&consumer).to_string(),
+                "range": {
+                    "start": {"line": 6, "character": 2},
+                    "end": {"line": 6, "character": 8}
+                }
+            }),
+        ];
+        if include_declaration {
+            expected.push(json!({
+                "uri": uri(&provider).to_string(),
+                "range": {
+                    "start": {"line": 0, "character": 5},
+                    "end": {"line": 0, "character": 16}
+                }
+            }));
+        }
+        actual.sort_by_key(|value| value.to_string());
+        expected.sort_by_key(|value| value.to_string());
+        assert_eq!(actual, expected);
+    }
+    server.shutdown();
+}
+
+#[test]
 fn document_highlights_ignore_huge_unreadable_unrelated_trees_and_dependency_occurrences() {
     let temp = tempfile::tempdir().unwrap();
     let provider = temp.path().join("Provider.pas");

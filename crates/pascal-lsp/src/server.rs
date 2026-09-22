@@ -893,6 +893,7 @@ struct ClientFeatures {
     action_resolve: bool,
     action_disabled: bool,
     document_changes: bool,
+    will_rename_files: bool,
     hierarchical_document_symbols: bool,
     hover_format: DocumentationFormat,
     completion_format: DocumentationFormat,
@@ -1516,6 +1517,7 @@ enum AnalysisRequest {
         uri: Url,
         position: Position,
         new_name: String,
+        new_uri: Option<Url>,
     },
     CodeActions(CodeActionParams),
     Resolve(CodeAction),
@@ -4790,6 +4792,7 @@ impl AnalysisJobs {
                             uri,
                             position,
                             new_name,
+                            new_uri,
                         } => {
                             if let Err(error) = wait_at_test_barrier(
                                 TestBarrier::Navigation,
@@ -4804,14 +4807,25 @@ impl AnalysisJobs {
                                     value: AnalysisResultValue::Rename(Box::new(Err(error))),
                                 }
                             } else {
-                                let computed = rename::rename_from_input(
-                                    input,
-                                    &uri,
-                                    position,
-                                    &new_name,
-                                    features.document_changes,
-                                    &worker_cancellation,
-                                );
+                                let computed = if let Some(new_uri) = new_uri {
+                                    rename::unit_rename_from_input(
+                                        input,
+                                        &uri,
+                                        &new_uri,
+                                        position,
+                                        &new_name,
+                                        &worker_cancellation,
+                                    )
+                                } else {
+                                    rename::rename_from_input(
+                                        input,
+                                        &uri,
+                                        position,
+                                        &new_name,
+                                        features.document_changes,
+                                        &worker_cancellation,
+                                    )
+                                };
                                 AnalysisResult {
                                     id: worker_id,
                                     source_generation: computed.source_generation,
@@ -6702,6 +6716,7 @@ fn diagnostic_features() -> ClientFeatures {
         action_resolve: false,
         action_disabled: false,
         document_changes: false,
+        will_rename_files: false,
         hierarchical_document_symbols: false,
         hover_format: DocumentationFormat::PlainText,
         completion_format: DocumentationFormat::PlainText,
@@ -8434,15 +8449,6 @@ fn handle_request(
         connection.send_result(Message::Response(Response::new_ok(request.id, Value::Null)))?;
         return Ok(());
     }
-    if request.method == "workspace/willRenameFiles" {
-        send_error(
-            connection,
-            request.id,
-            ErrorCode::RequestFailed,
-            "file rename cannot be proven as a complete coordinated unit rename",
-        )?;
-        return Ok(());
-    }
     let work_done_token = match request_work_done_token(&request) {
         Ok(token) => token,
         Err(error) => {
@@ -8474,6 +8480,85 @@ fn handle_request(
     } else {
         None
     };
+    if request.method == "workspace/willRenameFiles" {
+        if !client_features.will_rename_files || !client_features.document_changes {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::RequestFailed,
+                "unit file rename requires client willRename and versioned documentChanges support",
+            )?;
+            return Ok(());
+        }
+        let Some(files) = request.params.get("files").and_then(Value::as_array) else {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::InvalidParams,
+                "files must be an array",
+            )?;
+            return Ok(());
+        };
+        if files.len() != 1 {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::RequestFailed,
+                "atomic multi-file and directory unit renames are unsupported",
+            )?;
+            return Ok(());
+        }
+        let Some(old_uri) = files[0]
+            .get("oldUri")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Url>(value).ok())
+        else {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::InvalidParams,
+                "oldUri must be a valid URI",
+            )?;
+            return Ok(());
+        };
+        let Some(new_uri) = files[0]
+            .get("newUri")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Url>(value).ok())
+        else {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::InvalidParams,
+                "newUri must be a valid URI",
+            )?;
+            return Ok(());
+        };
+        let old_uri = canonical_file_uri(&old_uri);
+        let new_uri = canonical_file_uri(&new_uri);
+        let (position, new_name) = match workspace.unit_rename_position(&old_uri, &new_uri) {
+            Ok(value) => value,
+            Err(error) => {
+                send_error(connection, request.id, ErrorCode::RequestFailed, error)?;
+                return Ok(());
+            }
+        };
+        start_analysis(
+            connection,
+            workspace,
+            jobs,
+            request.id,
+            AnalysisRequest::Rename {
+                uri: old_uri,
+                position,
+                new_name,
+                new_uri: Some(new_uri),
+            },
+            client_features,
+            work_done_token,
+        )?;
+        return Ok(());
+    }
     match request.method.as_str() {
         "workspace/diagnostic" => {
             if !pull_diagnostics_supported {
@@ -8964,6 +9049,7 @@ fn handle_request(
                     uri: canonical_file_uri(&params.text_document.uri),
                     position: params.position,
                     new_name: params.new_name,
+                    new_uri: None,
                 },
                 client_features,
                 work_done_token.clone(),
@@ -9615,6 +9701,10 @@ fn server_capabilities(
 
 fn client_features(client: &ClientCapabilities) -> ClientFeatures {
     let value = serde_json::to_value(client).unwrap_or(Value::Null);
+    let will_rename_files = value
+        .pointer("/workspace/fileOperations/willRename")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let code_action = &value["textDocument"]["codeAction"];
     let action_resolve = code_action["dataSupport"].as_bool().unwrap_or(false)
         && code_action["resolveSupport"]["properties"]
@@ -9696,6 +9786,7 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         action_resolve,
         action_disabled,
         document_changes,
+        will_rename_files,
         hierarchical_document_symbols,
         hover_format,
         completion_format,
@@ -9907,6 +9998,7 @@ mod tests {
             action_resolve: false,
             action_disabled: false,
             document_changes: false,
+            will_rename_files: false,
             hierarchical_document_symbols: false,
             hover_format: DocumentationFormat::PlainText,
             completion_format: DocumentationFormat::PlainText,

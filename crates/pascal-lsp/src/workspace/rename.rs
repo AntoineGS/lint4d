@@ -622,6 +622,7 @@ impl RenameSnapshot {
         position: Position,
         new_name: &str,
         cancel: &AtomicBool,
+        allow_unit: bool,
     ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
         let mut virtual_indexes = HashMap::new();
@@ -630,9 +631,13 @@ impl RenameSnapshot {
         let query_positions =
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         for (query_uri, query_position) in query_positions {
-            let raw = self
-                .index
-                .rename_edits(&query_uri, query_position, new_name)?;
+            let raw = if allow_unit {
+                self.index
+                    .unit_rename_edits(&query_uri, query_position, new_name)?
+            } else {
+                self.index
+                    .rename_edits(&query_uri, query_position, new_name)?
+            };
             for (edit_uri, document_edits) in raw {
                 for edit in document_edits {
                     let Some(expansion) = self.expansions.get(&edit_uri) else {
@@ -3135,6 +3140,49 @@ pub(crate) fn rename_from_input(
     document_changes: bool,
     cancel: &AtomicBool,
 ) -> Computed<WorkspaceEdit> {
+    rename_from_input_impl(
+        input,
+        uri,
+        position,
+        new_name,
+        document_changes,
+        cancel,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn unit_rename_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    new_uri: &Url,
+    position: Position,
+    new_name: &str,
+    cancel: &AtomicBool,
+) -> Computed<WorkspaceEdit> {
+    rename_from_input_impl(
+        input,
+        uri,
+        position,
+        new_name,
+        true,
+        cancel,
+        true,
+        Some(new_uri),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rename_from_input_impl(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    new_name: &str,
+    document_changes: bool,
+    cancel: &AtomicBool,
+    allow_unit: bool,
+    new_uri: Option<&Url>,
+) -> Computed<WorkspaceEdit> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = canonical_file_uri(uri);
@@ -3261,7 +3309,7 @@ pub(crate) fn rename_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel) {
+    let raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel, allow_unit) {
         Ok(edits) => edits,
         Err(error) => {
             let source_changed = source_for_input_with_cancel(&input, &uri, Some(cancel))
@@ -3341,6 +3389,7 @@ pub(crate) fn rename_from_input(
         &uri,
         position,
         cancel,
+        if allow_unit { new_uri } else { None },
     ) {
         let disk_changed = uri
             .to_file_path()
@@ -3365,10 +3414,182 @@ pub(crate) fn rename_from_input(
             records: Vec::new(),
         };
     }
+    if allow_unit {
+        let Some(new_uri) = new_uri.map(canonical_file_uri) else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename requires a target URI".to_string(),
+            );
+        };
+        let (Some(old_path), Some(new_path)) = (
+            uri.to_file_path().ok().map(absolute_path),
+            new_uri.to_file_path().ok().map(absolute_path),
+        ) else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit file rename requires file URIs".to_string(),
+            );
+        };
+        if old_path.parent() != new_path.parent() || new_path.as_os_str().len() > 4096 {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename target must remain in the same authorized directory and path bound"
+                    .to_string(),
+            );
+        }
+        if input.overlays.contains_key(&new_uri) || input.rejected_documents.contains(&new_uri) {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename target has a competing open or rejected document".to_string(),
+            );
+        }
+        if !snapshot.editable.contains(&uri) {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit declaration is not an editable authorized workspace source".to_string(),
+            );
+        }
+        if snapshot.records.get(&uri).is_some_and(|record| {
+            record
+                .read_policy
+                .as_ref()
+                .zip(record.path_entry.as_ref())
+                .is_some_and(|(policy, entry)| {
+                    !policy.allows_path_without_filesystem(&new_path, &entry.provenance)
+                })
+        }) {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename target is outside the authorized project read roots".to_string(),
+            );
+        }
+        match std::fs::symlink_metadata(&new_path) {
+            Ok(_) => {
+                return failed(
+                    source_generation,
+                    configuration_generation,
+                    "unit rename target already exists".to_string(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return failed(
+                    source_generation,
+                    configuration_generation,
+                    format!("cannot prove unit rename target is absent: {error}"),
+                );
+            }
+        }
+        let Ok(old_metadata) = std::fs::symlink_metadata(&old_path) else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename source cannot be statted".to_string(),
+            );
+        };
+        if old_metadata.file_type().is_symlink() || !old_metadata.is_file() {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename source must be a regular non-symlink file".to_string(),
+            );
+        }
+        #[cfg(unix)]
+        if !effective_unix_write_access(&old_path, &old_metadata)
+            || old_path.parent().is_none_or(|parent| {
+                std::fs::metadata(parent).map_or(true, |metadata| {
+                    !effective_unix_write_access(parent, &metadata)
+                })
+            })
+        {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename source or containing directory is read-only".to_string(),
+            );
+        }
+        #[cfg(not(unix))]
+        if old_metadata.permissions().readonly()
+            || old_path
+                .parent()
+                .and_then(|parent| std::fs::metadata(parent).ok())
+                .is_none_or(|metadata| metadata.permissions().readonly())
+        {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename source or containing directory is read-only".to_string(),
+            );
+        }
+        #[cfg(unix)]
+        let has_multiple_hard_links = {
+            use std::os::unix::fs::MetadataExt;
+            old_metadata.nlink() != 1
+        };
+        #[cfg(unix)]
+        if has_multiple_hard_links {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename source has multiple hard links".to_string(),
+            );
+        }
+        let mut in_path_scan_work = 0usize;
+        for source in snapshot.sources.values() {
+            match source_has_in_path_literal(source, cancel, &mut in_path_scan_work) {
+                Ok(true) => {
+                    return failed(
+                        source_generation,
+                        configuration_generation,
+                        "unit rename with explicit uses in-paths is unsupported".to_string(),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => return failed(source_generation, configuration_generation, error),
+            }
+        }
+    }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let records = snapshot_records(&snapshot);
+    let mut records = snapshot_records(&snapshot);
+    if allow_unit {
+        let Some(target_uri) = new_uri.map(canonical_file_uri) else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename target URI disappeared".to_string(),
+            );
+        };
+        let Some(target_path) = target_uri.to_file_path().ok().map(absolute_path) else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename target is not a file URI".to_string(),
+            );
+        };
+        let Some(mut absent_target) = snapshot.records.get(&uri).cloned() else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename provider record disappeared".to_string(),
+            );
+        };
+        absent_target.uri = target_uri;
+        absent_target.path = Some(target_path);
+        absent_target.path_stamp = None;
+        absent_target.candidate_membership = None;
+        // Keep this as an ordinary negative path observation so delivery
+        // revalidation rejects a target that appeared after the plan.
+        absent_target.missing_provider_candidate = false;
+        records.push(absent_target);
+    }
     let value = workspace_edit(raw_edits, &snapshot.records, document_changes);
     Computed {
         source_generation,
@@ -3378,20 +3599,58 @@ pub(crate) fn rename_from_input(
     }
 }
 
+fn source_has_in_path_literal(
+    source: &str,
+    cancel: &AtomicBool,
+    work: &mut usize,
+) -> Result<bool, String> {
+    *work = work
+        .checked_add(source.len())
+        .ok_or_else(|| "unit rename path scan work accounting overflowed".to_string())?;
+    if *work > MAX_SNAPSHOT_MAPPING_WORK {
+        return Err("unit rename path scan work limit reached".to_string());
+    }
+    let bytes = source.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if index % 1024 == 0 && is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if *byte != b'\'' {
+            continue;
+        }
+        let mut before = index;
+        while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+            before -= 1;
+        }
+        if before < 2 || !bytes[before - 2..before].eq_ignore_ascii_case(b"in") {
+            continue;
+        }
+        let token_start = before - 2;
+        if token_start == 0
+            || !(bytes[token_start - 1].is_ascii_alphanumeric() || bytes[token_start - 1] == b'_')
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Apply the proposed source edits to immutable proof snapshots, reparse every
 /// changed document, and resolve the renamed binding again.  Static range and
 /// collision checks are necessary but not sufficient: a parser/rebinding
 /// change can make a formerly exact family split or capture an overload.  No
 /// workspace edit is admitted until the post-edit binding has exactly the
 /// same source-backed edit set.
+#[allow(clippy::too_many_arguments)]
 fn post_edit_rebind_proof(
     snapshot: &RenameSnapshot,
     raw_edits: &HashMap<Url, Vec<TextEdit>>,
     binding_names: &[String],
-    _new_name: &str,
-    _requested_uri: &Url,
+    new_name: &str,
+    requested_uri: &Url,
     _requested_position: Position,
     cancel: &AtomicBool,
+    moved_file: Option<&Url>,
 ) -> Result<(), String> {
     let mut budget = AssistanceBudget::new(
         MAX_SNAPSHOT_MAPPING_WORK,
@@ -3670,9 +3929,18 @@ fn post_edit_rebind_proof(
         budget.require_owned_bytes(replacement.len(), cancel)?;
         for range in mapped_ranges {
             if query_target.is_none() {
-                query_target = Some((edit_uri.clone(), range.start));
+                query_target = Some((
+                    moved_file
+                        .filter(|_| &edit_uri == requested_uri)
+                        .cloned()
+                        .unwrap_or_else(|| edit_uri.clone()),
+                    range.start,
+                ));
             }
-            expected.insert(location_key(&edit_uri, range));
+            let expected_uri = moved_file
+                .filter(|_| &edit_uri == requested_uri)
+                .unwrap_or(&edit_uri);
+            expected.insert(location_key(expected_uri, range));
         }
         transformed.insert(edit_uri, replacement);
     }
@@ -3692,6 +3960,22 @@ fn post_edit_rebind_proof(
             cancel,
             &mut budget,
         )?);
+    }
+    if let Some(new_uri) = moved_file {
+        let old_name = snapshot
+            .index
+            .unit_name(requested_uri)
+            .ok_or_else(|| "unit rename source has no indexed unit identity".to_string())?;
+        let replacement = transformed
+            .get(requested_uri)
+            .ok_or_else(|| "unit rename did not edit the provider declaration".to_string())?;
+        let mut moved = rebound
+            .take()
+            .ok_or_else(|| "unit rename produced no rebound index".to_string())?;
+        moved.remove(requested_uri);
+        moved.update(new_uri.clone(), replacement.clone())?;
+        moved.rename_bound_unit_provider(requested_uri, new_uri, &old_name, new_name)?;
+        rebound = Some(moved);
     }
     let rebound = rebound.ok_or_else(|| "rename produced no rebound index".to_string())?;
 

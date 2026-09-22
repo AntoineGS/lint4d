@@ -2467,6 +2467,78 @@ impl Workspace {
         diagnostic_uris
     }
 
+    pub(crate) fn unit_rename_position(
+        &self,
+        old_uri: &Url,
+        new_uri: &Url,
+    ) -> Result<(Position, String), String> {
+        let old_uri = canonical_file_uri(old_uri);
+        let new_uri = canonical_file_uri(new_uri);
+        if self.open_documents.contains_key(&old_uri) {
+            return Err(
+                "unit rename of an open provider overlay is unsupported until exact didRename overlay transfer is available"
+                    .to_string(),
+            );
+        }
+        let old_path = old_uri
+            .to_file_path()
+            .map_err(|_| "unit file rename requires file URIs".to_string())?;
+        let new_path = new_uri
+            .to_file_path()
+            .map_err(|_| "unit file rename requires file URIs".to_string())?;
+        if old_path.parent() != new_path.parent() {
+            return Err("unit file rename currently requires the same directory".to_string());
+        }
+        let supported_extension = |path: &Path| {
+            path.extension().is_some_and(|extension| {
+                ["pas", "pp", "pascal"]
+                    .iter()
+                    .any(|supported| extension.to_string_lossy().eq_ignore_ascii_case(supported))
+            })
+        };
+        if !supported_extension(&old_path)
+            || !supported_extension(&new_path)
+            || !old_path
+                .extension()
+                .zip(new_path.extension())
+                .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new))
+        {
+            return Err(
+                "unit file rename requires a supported Pascal extension preserved exactly"
+                    .to_string(),
+            );
+        }
+        let old_stem = old_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| "unit filename is not valid UTF-8".to_string())?;
+        let new_name = new_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| "new unit filename is not valid UTF-8".to_string())?;
+        if new_name.is_empty() || old_stem.eq_ignore_ascii_case(new_name) {
+            return Err("case-only and empty-basename unit renames are unsupported".to_string());
+        }
+        if self.open_documents.contains_key(&new_uri) {
+            return Err("unit rename target already has an open document".to_string());
+        }
+        let declared_name = self
+            .index
+            .unit_name(&old_uri)
+            .ok_or_else(|| "unit rename requires an indexed source declaration".to_string())?;
+        if declared_name.contains('.') || !declared_name.eq_ignore_ascii_case(old_stem) {
+            return Err(
+                "unit rename requires an unnamespaced declaration matching its filename"
+                    .to_string(),
+            );
+        }
+        let position = self
+            .index
+            .unit_declaration_position(&old_uri)
+            .ok_or_else(|| "unit rename requires one parsed unit declaration".to_string())?;
+        Ok((position, new_name.to_string()))
+    }
+
     pub fn update_workspace_folders(
         &mut self,
         added: impl IntoIterator<Item = PathBuf>,

@@ -1675,11 +1675,68 @@ impl NavigationIndex {
         }
     }
 
+    pub(crate) fn rename_bound_unit_provider(
+        &mut self,
+        old_uri: &Url,
+        new_uri: &Url,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), String> {
+        let old_key = canonical_name(old_name);
+        let new_key = canonical_name(new_name);
+        for document in self.documents.values() {
+            let Some(bindings) = document.import_bindings.as_ref() else {
+                continue;
+            };
+            for (key, uri) in bindings {
+                if uri == old_uri && key != &old_key {
+                    return Err(
+                        "unit rename cannot prove a project or namespace alias binding".to_string(),
+                    );
+                }
+                if key == &new_key && uri != old_uri && uri != new_uri {
+                    return Err(
+                        "unit rename target collides with an existing project alias".to_string()
+                    );
+                }
+            }
+        }
+        for document in self.documents.values_mut() {
+            let conditional_context = document.conditional_context.clone();
+            let Some(bindings) = document.import_bindings.as_mut() else {
+                continue;
+            };
+            let Some(uri) = bindings.remove(&old_key) else {
+                continue;
+            };
+            if &uri == old_uri {
+                bindings.insert(new_key.clone(), new_uri.clone());
+            } else {
+                bindings.insert(old_key.clone(), uri);
+            }
+            document.import_binding_fingerprint =
+                Some(import_binding_fingerprint(&conditional_context, bindings));
+        }
+        Ok(())
+    }
+
     /// Return the unit name declared by a parsed document.
     pub fn unit_name(&self, uri: &Url) -> Option<String> {
         self.documents
             .get(uri)
             .map(|document| document.unit_name.clone())
+    }
+
+    pub(crate) fn unit_declaration_position(&self, uri: &Url) -> Option<lsp_types::Position> {
+        let document = self.documents.get(uri)?;
+        let declarations = identifier_nodes(document.tree.root_node())
+            .into_iter()
+            .filter(|node| is_unit_declaration_identifier(*node))
+            .collect::<Vec<_>>();
+        if declarations.len() != 1 {
+            return None;
+        }
+        text::offset_to_position(&document.source, declarations[0].start_byte())
     }
 
     pub(crate) fn unit_display_name(&self, uri: &Url) -> Option<String> {

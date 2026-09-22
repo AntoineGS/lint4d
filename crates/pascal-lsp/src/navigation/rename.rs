@@ -792,7 +792,7 @@ impl NavigationIndex {
             return false;
         }
         self.bind_imports(uri, std::iter::empty::<(String, Url)>());
-        let Ok(plan) = self.rename_plan_with_cancel(uri, position, Some(cancel)) else {
+        let Ok(plan) = self.rename_plan_with_cancel(uri, position, Some(cancel), false) else {
             return false;
         };
         let Some(document) = self.documents.get(uri) else {
@@ -936,7 +936,26 @@ impl NavigationIndex {
         position: lsp_types::Position,
         new_name: &str,
     ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
-        let plan = self.rename_plan(uri, position)?;
+        self.rename_edits_with_unit(uri, position, new_name, false)
+    }
+
+    pub(crate) fn unit_rename_edits(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        new_name: &str,
+    ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
+        self.rename_edits_with_unit(uri, position, new_name, true)
+    }
+
+    fn rename_edits_with_unit(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        new_name: &str,
+        allow_unit: bool,
+    ) -> Result<HashMap<Url, Vec<TextEdit>>, String> {
+        let plan = self.rename_plan_with_cancel(uri, position, None, allow_unit)?;
         validate_new_name(new_name)?;
         let new_key = canonical_name(new_name);
         self.check_proposed_name_references(&plan, &new_key)?;
@@ -1300,7 +1319,7 @@ impl NavigationIndex {
     }
 
     fn rename_plan(&self, uri: &Url, position: lsp_types::Position) -> Result<RenamePlan, String> {
-        self.rename_plan_with_cancel(uri, position, None)
+        self.rename_plan_with_cancel(uri, position, None, false)
     }
 
     fn rename_plan_with_cancel(
@@ -1308,10 +1327,11 @@ impl NavigationIndex {
         uri: &Url,
         position: lsp_types::Position,
         cancel: Option<&AtomicBool>,
+        allow_unit: bool,
     ) -> Result<RenamePlan, String> {
         check_cancel(cancel)?;
         let (binding, selected_span) =
-            self.binding_plan_with_cancel(uri, position, cancel, false)?;
+            self.binding_plan_with_cancel(uri, position, cancel, allow_unit)?;
         let mut occurrence_options = OccurrenceCollectionOptions {
             document_uri: None,
             include_declaration: true,
@@ -1366,14 +1386,33 @@ impl NavigationIndex {
         }
         let identifier = identifier_at(document.tree.root_node(), offset)
             .ok_or_else(|| "no renameable identifier at position".to_string())?;
-        let candidates = self.resolve_candidates_at_with_shared_budget(
-            uri,
-            document,
-            offset,
-            identifier,
-            cancel,
-            &mut shared_work_budget,
-        )?;
+        let unit_candidates = if is_unit_declaration_identifier(identifier) {
+            None
+        } else if let Some(budget) = shared_work_budget.as_deref_mut() {
+            let fallback_cancel = AtomicBool::new(false);
+            self.unit_reference_candidates_at_with_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                cancel.unwrap_or(&fallback_cancel),
+                budget,
+            )?
+        } else {
+            self.unit_reference_candidates_at(uri, document, offset, identifier)
+        };
+        let candidates = if let Some(candidates) = unit_candidates {
+            candidates
+        } else {
+            self.resolve_candidates_at_with_shared_budget(
+                uri,
+                document,
+                offset,
+                identifier,
+                cancel,
+                &mut shared_work_budget,
+            )?
+        };
         let candidates = self.select_rename_overload_candidates(
             uri,
             document,

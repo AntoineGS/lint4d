@@ -1175,16 +1175,35 @@ rename remains unsupported because it requires `RenameFile` support.
 
 The server advertises LSP file-operation filters for file URIs ending in
 `.pas`, `.pp`, or `.pascal` (case behavior follows the client's glob matcher).
-`willCreateFiles` and `willDeleteFiles` return no additional edits. A
-`willRenameFiles` request fails closed: no edit or resource operation is
-returned, since complete provider/consumer identity and open-overlay transfer
-are not yet proven for an atomic unit move. The server never moves files itself.
+Directory operations are not matched. `willCreateFiles` and `willDeleteFiles`
+return no additional source edits. A single-file `willRenameFiles` request is
+supported only when the client advertises both
+`workspace.fileOperations.willRename` and
+`workspace.workspaceEdit.documentChanges`. The provider declaration must
+already be indexed, be a writable, regular, non-symlink, non-hard-linked file,
+and match a simple unnamespaced unit name and basename. The new basename must be
+a valid unit identifier, the extension must be one of `.pas`, `.pp`, or
+`.pascal` and remain unchanged, the destination must be in the same authorized
+directory and not exist, and one complete unambiguous project-selected binding
+family must be provable. Explicit `uses ... in 'path'` files, aliases, namespace
+declarations, cross-directory moves, case-only renames, multi-file/directory
+moves, open/rejected destination overlays, and unresolved includes/conditional
+or ownership uncertainty fail as a whole. The returned `documentChanges` are
+versioned for open documents; closed documents carry the LSP null version.
+There is no `RenameFile` resource operation: in this file-operation handshake
+the client owns and performs the requested physical move after applying the
+returned source edits. The server never moves files itself. `textDocument/rename`
+for unit symbols remains unsupported.
+
 After `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`, catalogues,
 loaded-source observations, and affected diagnostics are invalidated/refreshed;
 rename is processed as old-path deletion plus new-path creation. These events
-do not synthesize/delete imports and do not transfer an open overlay to a new
-URI. Clients should continue to use watched-file notifications for changes not
-covered by these Pascal source filters. Directory operations are not advertised.
+do not synthesize/delete imports. Open-overlay transfer across a file rename is
+not yet implemented, so callers must close/reopen affected documents; this
+limitation also means file-operation rename is not safe for a provider with an
+open overlay until the follow-up transition lifecycle is completed. Clients
+should continue to use watched-file notifications for changes not covered by
+these Pascal source filters.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial

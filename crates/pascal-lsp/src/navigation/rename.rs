@@ -1,12 +1,14 @@
 use super::{
     Candidate, Document, NavigationIndex, ROOT_SCOPE, ResolutionState, Span, Symbol, SymbolKind,
     canonical_name, collect_nodes_matching, field_identifier_nodes, has_ancestor_kind,
-    identifier_at, identifier_nodes, is_ignored_offset, is_right_hand_member, member_expression_at,
-    node_text, qualified_type_path_at, qualified_type_path_at_with_budget, routine_name,
-    routine_signature, use_name_at,
+    identifier_at, identifier_nodes, is_ignored_offset, is_right_hand_member,
+    is_unit_declaration_identifier, member_expression_at, node_text, qualified_type_path_at,
+    qualified_type_path_at_with_budget, routine_name, routine_signature, use_name_at,
 };
 use crate::text::PositionIndex;
-use lsp_types::{PrepareRenameResponse, Range, TextEdit, Url};
+use lsp_types::{
+    DocumentHighlight, DocumentHighlightKind, PrepareRenameResponse, Range, TextEdit, Url,
+};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::Node;
 
 const MAX_BINDING_LOCATIONS: usize = 10_000;
+const MAX_HIGHLIGHT_WORK: usize = 1_000_000;
+const MAX_HIGHLIGHT_BYTES: usize = 8 * 1024 * 1024;
 const CANCELLATION_MESSAGE: &str = "request cancelled";
 
 /// Shared work accounting for snapshot queries that combine several virtual
@@ -242,6 +246,7 @@ struct Binding {
 #[derive(Debug, Clone)]
 pub(crate) struct RenameBindingInfo {
     pub(crate) local: bool,
+    pub(crate) unit: bool,
     pub(crate) names: Vec<String>,
 }
 
@@ -260,11 +265,37 @@ struct UnqualifiedReferenceCacheKey {
     owner_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UnresolvedCallTargetCacheKey {
+    uri: Url,
+    name: String,
+    scope: usize,
+    region: super::Region,
+    owner_type: Option<String>,
+}
+
 #[derive(Debug)]
 struct RenamePlan {
     binding: Binding,
     selected_span: Span,
     occurrences: Vec<Occurrence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HighlightRole {
+    Text,
+    Read,
+    Write,
+}
+
+impl HighlightRole {
+    fn document_kind(self) -> DocumentHighlightKind {
+        match self {
+            Self::Text => DocumentHighlightKind::TEXT,
+            Self::Read => DocumentHighlightKind::READ,
+            Self::Write => DocumentHighlightKind::WRITE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -277,6 +308,7 @@ enum BindingGroup {
 struct BindingLocationOptions<'a> {
     document_uri: Option<&'a Url>,
     strict_resolution: bool,
+    allow_unit: bool,
     cancel: Option<&'a AtomicBool>,
     result_limit: Option<usize>,
     work_budget: Option<&'a mut BindingWorkBudget>,
@@ -308,6 +340,7 @@ impl NavigationIndex {
             BindingLocationOptions {
                 document_uri: None,
                 strict_resolution: true,
+                allow_unit: true,
                 cancel: None,
                 result_limit: Some(MAX_BINDING_LOCATIONS),
                 work_budget: None,
@@ -334,6 +367,7 @@ impl NavigationIndex {
             BindingLocationOptions {
                 document_uri: None,
                 strict_resolution: true,
+                allow_unit: true,
                 cancel: Some(cancel),
                 result_limit: None,
                 work_budget: Some(work_budget),
@@ -341,28 +375,240 @@ impl NavigationIndex {
         )
     }
 
-    /// As above, but restrict occurrence collection to one virtual document.
-    /// The shared work budget remains the traversal and memory bound while the
-    /// caller owns the final physical-result limit.
-    pub(crate) fn binding_locations_in_document_with_cancel_and_work_budget(
+    /// Return binding-resolved highlights for one document.  The occurrence
+    /// walk is shared with references; only the final role classification is
+    /// specific to highlights.
+    pub(crate) fn binding_highlights_in_document_with_cancel_and_work_budget(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         cancel: &AtomicBool,
         work_budget: &mut BindingWorkBudget,
-    ) -> Result<Vec<lsp_types::Location>, String> {
-        self.binding_locations_impl(
+    ) -> Result<Vec<DocumentHighlight>, String> {
+        check_cancel(Some(cancel))?;
+        let document = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| format!("document is not indexed: {uri}"))?;
+        let offset = super::text::position_to_offset(&document.source, position)
+            .ok_or_else(|| "position is outside the source document".to_string())?;
+        if document.conditionals.is_unknown_at(offset)
+            || is_ignored_offset(document.tree.root_node(), offset)
+            || identifier_at(document.tree.root_node(), offset).is_none()
+        {
+            return Ok(Vec::new());
+        }
+
+        let mut semantic_budget = super::AssistanceBudget::new(
+            MAX_HIGHLIGHT_WORK,
+            MAX_HIGHLIGHT_BYTES,
+            "document highlights",
+        );
+        semantic_budget.require_work(1, cancel)?;
+        let (binding, _) = self.binding_plan_with_cancel_and_budget(
             uri,
             position,
+            Some(cancel),
+            Some(&mut semantic_budget),
             true,
-            BindingLocationOptions {
-                document_uri: Some(uri),
-                strict_resolution: false,
-                cancel: Some(cancel),
-                result_limit: None,
-                work_budget: Some(work_budget),
-            },
-        )
+        )?;
+        let mut unresolved_call_targets = HashSet::new();
+        let mut occurrence_options = OccurrenceCollectionOptions {
+            document_uri: Some(uri),
+            include_declaration: true,
+            strict_resolution: false,
+            result_limit: None,
+            cancel: Some(cancel),
+            work_budget: Some(work_budget),
+            shared_work_budget: Some(&mut semantic_budget),
+        };
+        let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
+        let position_index = PositionIndex::new_with_cancel(&document.source, cancel)
+            .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+        let identifiers = identifier_nodes(document.tree.root_node());
+        semantic_budget.require_work(identifiers.len(), cancel)?;
+        semantic_budget.require_bytes(
+            identifiers.len().saturating_mul(
+                std::mem::size_of::<Span>() + std::mem::size_of::<tree_sitter::Node<'_>>() + 32,
+            ),
+            cancel,
+        )?;
+        let mut identifiers_by_span = HashMap::with_capacity(identifiers.len());
+        for identifier in identifiers {
+            check_cancel(Some(cancel))?;
+            identifiers_by_span.insert(Span::from_node(identifier), identifier);
+        }
+        let mut highlights = Vec::with_capacity(occurrences.len());
+        for occurrence in occurrences {
+            check_location_cancel(Some(cancel))?;
+            work_budget.charge()?;
+            if occurrence.uri != *uri {
+                continue;
+            }
+            let role = self.highlight_role_for_occurrence(
+                &binding,
+                uri,
+                document,
+                occurrence.span,
+                cancel,
+                &mut semantic_budget,
+                &mut unresolved_call_targets,
+                &identifiers_by_span,
+            )?;
+            let start = position_index
+                .offset_to_position(&document.source, occurrence.span.start)
+                .ok_or_else(|| "cannot map highlight start to an LSP position".to_string())?;
+            let end = position_index
+                .offset_to_position(&document.source, occurrence.span.end)
+                .ok_or_else(|| "cannot map highlight end to an LSP position".to_string())?;
+            highlights.push(DocumentHighlight {
+                range: Range { start, end },
+                kind: Some(role.document_kind()),
+            });
+        }
+        highlights.sort_by_key(|highlight| {
+            (
+                highlight.range.start.line,
+                highlight.range.start.character,
+                highlight.range.end.line,
+                highlight.range.end.character,
+            )
+        });
+        Ok(highlights)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn highlight_role_for_occurrence(
+        &self,
+        binding: &Binding,
+        current_uri: &Url,
+        document: &Document,
+        span: Span,
+        cancel: &AtomicBool,
+        budget: &mut super::AssistanceBudget,
+        unresolved_call_targets: &mut HashSet<UnresolvedCallTargetCacheKey>,
+        identifiers_by_span: &HashMap<Span, Node<'_>>,
+    ) -> Result<HighlightRole, String> {
+        check_cancel(Some(cancel))?;
+        budget.require_work(1, cancel)?;
+        if binding.kind == SymbolKind::Unit {
+            return Ok(HighlightRole::Text);
+        }
+        let Some(identifier) = identifiers_by_span.get(&span).copied() else {
+            return Ok(HighlightRole::Text);
+        };
+        let non_value = super::is_non_value_identifier_with_budget_and_declaration(
+            identifier,
+            &document.source,
+            cancel,
+            budget,
+            binding.contains_span(current_uri, span),
+        )?;
+        if Span::from_node(identifier) != span || non_value {
+            return Ok(HighlightRole::Text);
+        }
+
+        if let Some((assignment, lhs)) = assignment_lhs_for_identifier(identifier) {
+            let operator = assignment
+                .child_by_field_name("operator")
+                .map(|operator| {
+                    super::node_text_with_budget(operator, &document.source, cancel, budget)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if Span::from_node(lhs).contains(span) {
+                if !lvalue_terminal_for_identifier(lhs, identifier) {
+                    return Ok(HighlightRole::Read);
+                }
+                return Ok(if binding_is_writable(self, binding) {
+                    HighlightRole::Write
+                } else if operator == ":=" {
+                    HighlightRole::Text
+                } else {
+                    // A compound assignment is still a storage operation, but
+                    // the selected binding must prove that it is writable.
+                    HighlightRole::Text
+                });
+            }
+        }
+        if identifier_is_foreach_iterator(identifier) {
+            return Ok(if binding_is_writable(self, binding) {
+                HighlightRole::Write
+            } else {
+                HighlightRole::Text
+            });
+        }
+        if let Some((call, argument_index, argument)) = call_argument_for_identifier(identifier) {
+            let mode = if let Some(mode) =
+                known_builtin_parameter_mode(call, &document.source, argument_index)
+            {
+                Some(mode)
+            } else {
+                let cache_key = unresolved_call_target_cache_key(current_uri, document, call);
+                if cache_key
+                    .as_ref()
+                    .is_some_and(|key| unresolved_call_targets.contains(key))
+                {
+                    None
+                } else {
+                    match super::overload::parameter_mode_for_argument(
+                        self,
+                        current_uri,
+                        document,
+                        call,
+                        argument_index,
+                        cancel,
+                        budget,
+                    )? {
+                        super::overload::ParameterModeResolution::Unresolved => {
+                            if let Some(key) = cache_key {
+                                if !unresolved_call_targets.contains(&key) {
+                                    budget.require_bytes(
+                                        unresolved_call_target_cache_bytes(&key),
+                                        cancel,
+                                    )?;
+                                    unresolved_call_targets.insert(key);
+                                }
+                            }
+                            None
+                        }
+                        super::overload::ParameterModeResolution::Resolved(mode) => mode,
+                    }
+                }
+            };
+            let Some(mode) = mode else {
+                return Ok(HighlightRole::Text);
+            };
+            return Ok(match mode {
+                super::ParameterMode::Var | super::ParameterMode::Out => {
+                    if lvalue_terminal_for_identifier(argument, identifier) {
+                        if binding_is_writable(self, binding) {
+                            HighlightRole::Write
+                        } else {
+                            HighlightRole::Text
+                        }
+                    } else {
+                        HighlightRole::Read
+                    }
+                }
+                super::ParameterMode::Value
+                | super::ParameterMode::Const
+                | super::ParameterMode::ConstRef => HighlightRole::Read,
+            });
+        }
+        if is_address_operand(identifier) {
+            return Ok(HighlightRole::Text);
+        }
+
+        Ok(match binding.kind {
+            SymbolKind::Variable
+            | SymbolKind::Parameter
+            | SymbolKind::Field
+            | SymbolKind::Property
+            | SymbolKind::Constant
+            | SymbolKind::EnumValue => HighlightRole::Read,
+            _ => HighlightRole::Text,
+        })
     }
 
     fn binding_locations_impl(
@@ -397,7 +643,8 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
 
-        let (binding, _) = self.binding_plan(uri, position)?;
+        let (binding, _) =
+            self.binding_plan_with_cancel(uri, position, options.cancel, options.allow_unit)?;
         let mut occurrence_options = OccurrenceCollectionOptions {
             document_uri: options.document_uri,
             include_declaration,
@@ -448,7 +695,7 @@ impl NavigationIndex {
         cancel: &AtomicBool,
     ) -> Result<RenameBindingInfo, String> {
         check_cancel(Some(cancel))?;
-        let (binding, _) = self.binding_plan_with_cancel(uri, position, Some(cancel))?;
+        let (binding, _) = self.binding_plan_with_cancel(uri, position, Some(cancel), true)?;
         let mut names = binding.names.iter().cloned().collect::<Vec<_>>();
         names.sort_by_key(|name| canonical_name(name));
         names.dedup_by(|left, right| canonical_name(left) == canonical_name(right));
@@ -466,7 +713,11 @@ impl NavigationIndex {
                     )
             });
         check_cancel(Some(cancel))?;
-        Ok(RenameBindingInfo { local, names })
+        Ok(RenameBindingInfo {
+            local,
+            unit: binding.kind == SymbolKind::Unit,
+            names,
+        })
     }
 
     /// Prove that the rename target can be resolved without any imported
@@ -673,8 +924,13 @@ impl NavigationIndex {
         check_cancel(Some(cancel))?;
         let mut binding_budget = BindingWorkBudget::new(MAX_BINDING_LOCATIONS);
         budget.require_work(1, cancel)?;
-        let (binding, selected_span) =
-            self.binding_plan_with_cancel_and_budget(uri, position, Some(cancel), Some(budget))?;
+        let (binding, selected_span) = self.binding_plan_with_cancel_and_budget(
+            uri,
+            position,
+            Some(cancel),
+            Some(budget),
+            false,
+        )?;
         let mut occurrence_options = OccurrenceCollectionOptions {
             document_uri: None,
             include_declaration: true,
@@ -997,7 +1253,8 @@ impl NavigationIndex {
         cancel: Option<&AtomicBool>,
     ) -> Result<RenamePlan, String> {
         check_cancel(cancel)?;
-        let (binding, selected_span) = self.binding_plan_with_cancel(uri, position, cancel)?;
+        let (binding, selected_span) =
+            self.binding_plan_with_cancel(uri, position, cancel, false)?;
         let mut occurrence_options = OccurrenceCollectionOptions {
             document_uri: None,
             include_declaration: true,
@@ -1018,21 +1275,14 @@ impl NavigationIndex {
         })
     }
 
-    fn binding_plan(
-        &self,
-        uri: &Url,
-        position: lsp_types::Position,
-    ) -> Result<(Binding, Span), String> {
-        self.binding_plan_with_cancel(uri, position, None)
-    }
-
     fn binding_plan_with_cancel(
         &self,
         uri: &Url,
         position: lsp_types::Position,
         cancel: Option<&AtomicBool>,
+        allow_unit: bool,
     ) -> Result<(Binding, Span), String> {
-        self.binding_plan_with_cancel_and_budget(uri, position, cancel, None)
+        self.binding_plan_with_cancel_and_budget(uri, position, cancel, None, allow_unit)
     }
 
     fn binding_plan_with_cancel_and_budget(
@@ -1041,6 +1291,7 @@ impl NavigationIndex {
         position: lsp_types::Position,
         cancel: Option<&AtomicBool>,
         shared_work_budget: Option<&mut super::AssistanceBudget>,
+        allow_unit: bool,
     ) -> Result<(Binding, Span), String> {
         let mut shared_work_budget = shared_work_budget;
         check_cancel(cancel)?;
@@ -1086,7 +1337,7 @@ impl NavigationIndex {
             binding.members.len().saturating_add(binding.names.len()),
         )?;
         check_cancel(cancel)?;
-        if binding.kind == SymbolKind::Unit {
+        if binding.kind == SymbolKind::Unit && !allow_unit {
             return Err("unit/module rename requires RenameFile support".to_string());
         }
         if binding.members.iter().any(|member| {
@@ -1201,7 +1452,25 @@ impl NavigationIndex {
                 let span = Span::from_node(identifier);
                 let name = canonical_name(&node_text(identifier, &document.source));
                 let is_binding_member = binding.contains_span(uri, span);
-                if !is_binding_member && !binding.names.contains(&name) {
+                let unit_span = if binding.kind == SymbolKind::Unit {
+                    if let Some(shared_work_budget) = options.shared_work_budget.as_deref_mut() {
+                        let fallback_cancel = AtomicBool::new(false);
+                        let cancel = options.cancel.unwrap_or(&fallback_cancel);
+                        self.unit_occurrence_span_with_budget(
+                            uri,
+                            document,
+                            identifier,
+                            span.start,
+                            cancel,
+                            shared_work_budget,
+                        )?
+                    } else {
+                        self.unit_occurrence_span(uri, document, identifier, span.start)
+                    }
+                } else {
+                    None
+                };
+                if !is_binding_member && !binding.names.contains(&name) && unit_span.is_none() {
                     continue;
                 }
                 if has_ancestor_kind(identifier, "ppDirective") {
@@ -1232,7 +1501,10 @@ impl NavigationIndex {
                         ));
                     }
                 }
-                if !options.include_declaration && is_binding_member {
+                let is_unit_declaration = binding.kind == SymbolKind::Unit
+                    && unit_span.is_some()
+                    && is_unit_declaration_identifier(identifier);
+                if !options.include_declaration && (is_binding_member || is_unit_declaration) {
                     continue;
                 }
                 let is_direct_declaration =
@@ -1397,7 +1669,7 @@ impl NavigationIndex {
                     }
                     let occurrence = Occurrence {
                         uri: uri.clone(),
-                        span,
+                        span: unit_span.unwrap_or(span),
                     };
                     if seen.insert((occurrence.uri.clone(), occurrence.span)) {
                         if options
@@ -1891,6 +2163,190 @@ impl NavigationIndex {
             .ok_or_else(|| "cannot map rename end to an LSP position".to_string())?;
         Ok(Range { start, end })
     }
+}
+
+fn call_argument_for_identifier(identifier: Node<'_>) -> Option<(Node<'_>, usize, Node<'_>)> {
+    let span = Span::from_node(identifier);
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.kind() == "exprCall" {
+            let arguments = node.child_by_field_name("args")?;
+            if !Span::from_node(arguments).contains(span) {
+                return None;
+            }
+            let mut argument_index = 0usize;
+            for index in 0..arguments.named_child_count() {
+                let Some(argument) = arguments.named_child(index) else {
+                    continue;
+                };
+                if argument.kind() == "legacyFormat" {
+                    continue;
+                }
+                if Span::from_node(argument).contains(span) {
+                    return Some((node, argument_index, argument));
+                }
+                argument_index = argument_index.saturating_add(1);
+            }
+            return None;
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn known_builtin_parameter_mode(
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+) -> Option<super::ParameterMode> {
+    let entity = call.child_by_field_name("entity")?;
+    let identifier = super::callable_lookup_identifier(entity);
+    let name = super::canonical_name(&super::node_text(identifier, source));
+    match name.as_str() {
+        "inc" | "dec" if argument_index == 0 => Some(super::ParameterMode::Var),
+        "read" | "readln" => Some(super::ParameterMode::Var),
+        "write" | "writeln" => Some(super::ParameterMode::Const),
+        _ => None,
+    }
+}
+
+fn unresolved_call_target_cache_key(
+    current_uri: &Url,
+    document: &Document,
+    call: Node<'_>,
+) -> Option<UnresolvedCallTargetCacheKey> {
+    let entity = call.child_by_field_name("entity")?;
+    if super::callable_owner_node(entity).is_some() {
+        return None;
+    }
+    let identifier = super::callable_lookup_identifier(entity);
+    if identifier.kind() != "identifier" {
+        return None;
+    }
+    let offset = identifier.start_byte();
+    let scope = document.scope_at(offset);
+    if !cacheable_unqualified_use(document, identifier, scope) {
+        return None;
+    }
+    Some(UnresolvedCallTargetCacheKey {
+        uri: current_uri.clone(),
+        name: canonical_name(&node_text(identifier, &document.source)),
+        scope,
+        region: document.region_at(offset),
+        owner_type: document.owner_type_at_identifier(identifier, scope),
+    })
+}
+
+fn unresolved_call_target_cache_bytes(key: &UnresolvedCallTargetCacheKey) -> usize {
+    std::mem::size_of::<UnresolvedCallTargetCacheKey>()
+        .saturating_add(64)
+        .saturating_add(key.uri.as_str().len())
+        .saturating_add(key.name.len())
+        .saturating_add(key.owner_type.as_deref().map_or(0, str::len))
+}
+
+fn assignment_lhs_for_identifier(identifier: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let span = Span::from_node(identifier);
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.kind() == "assignment" {
+            let lhs = node.child_by_field_name("lhs")?;
+            return Span::from_node(lhs).contains(span).then_some((node, lhs));
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn lvalue_terminal_for_identifier(lhs: Node<'_>, identifier: Node<'_>) -> bool {
+    let target = Span::from_node(identifier);
+    let mut current = lhs;
+    loop {
+        match current.kind() {
+            "identifier" => return Span::from_node(current) == target,
+            "exprParens" => {
+                let Some(operand) = current.named_child(0) else {
+                    return false;
+                };
+                current = operand;
+            }
+            // The receiver and every index expression are read in order to
+            // locate the assigned element; the element itself has no separate
+            // identifier node in these forms.
+            "exprSubscript" | "exprUnary" => return false,
+            "exprDot" | "genericDot" => {
+                let Some(rhs) = current.child_by_field_name("rhs") else {
+                    return false;
+                };
+                if !Span::from_node(rhs).contains(target) {
+                    return false;
+                }
+                current = rhs;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn identifier_is_foreach_iterator(identifier: Node<'_>) -> bool {
+    let span = Span::from_node(identifier);
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.kind() == "foreach"
+            && node
+                .child_by_field_name("iterator")
+                .is_some_and(|iterator| Span::from_node(iterator).contains(span))
+        {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn is_address_operand(identifier: Node<'_>) -> bool {
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        if node.kind() == "exprUnary"
+            && node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "kAt")
+        {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn binding_is_writable(index: &NavigationIndex, binding: &Binding) -> bool {
+    if binding.members.is_empty() {
+        return false;
+    }
+    binding.members.iter().all(|member| {
+        let Some(document) = index.documents.get(&member.uri) else {
+            return false;
+        };
+        let Some(symbol) = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol_id(&member.uri, symbol) == *member)
+        else {
+            return false;
+        };
+        match symbol.kind {
+            SymbolKind::Variable | SymbolKind::Field => true,
+            SymbolKind::Parameter => matches!(
+                symbol.parameter_mode,
+                Some(
+                    super::ParameterMode::Value
+                        | super::ParameterMode::Var
+                        | super::ParameterMode::Out
+                )
+            ),
+            _ => false,
+        }
+    })
 }
 
 impl Binding {

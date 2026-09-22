@@ -712,8 +712,8 @@ pub(crate) fn highlights_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let locations = match snapshot.binding_locations_in_document(&uri, position, cancel) {
-        Ok(locations) => locations,
+    let value = match snapshot.binding_highlights_in_document(&uri, position, cancel) {
+        Ok(highlights) => highlights,
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
         }
@@ -737,14 +737,6 @@ pub(crate) fn highlights_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let value = locations
-        .into_iter()
-        .filter(|location| location.uri == uri)
-        .map(|location| DocumentHighlight {
-            range: location.range,
-            kind: None,
-        })
-        .collect();
     with_records(
         source_generation,
         configuration_generation,

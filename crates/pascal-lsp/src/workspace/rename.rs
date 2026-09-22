@@ -22,8 +22,8 @@ use crate::navigation::AssistanceBudget;
 use crate::navigation::ParsedDocument;
 use crate::text;
 use lsp_types::{
-    DocumentChanges, Location, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
-    PrepareRenameResponse, Range, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    DocumentChanges, DocumentHighlight, Location, OneOf, OptionalVersionedTextDocumentIdentifier,
+    Position, PrepareRenameResponse, Range, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::conditional::{
     self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind,
@@ -539,33 +539,6 @@ impl RenameSnapshot {
         Ok(mapped)
     }
 
-    fn map_locations_with_budget(
-        &self,
-        locations: Vec<Location>,
-        budget: &mut include_expansion::MappingBudget<'_>,
-        virtual_indexes: &mut HashMap<Url, text::PositionIndex>,
-        physical_indexes: &mut HashMap<Url, text::PositionIndex>,
-    ) -> Result<Vec<Location>, String> {
-        let mut mapped = locations
-            .into_iter()
-            .map(|location| {
-                self.map_location_with_budget(location, budget, virtual_indexes, physical_indexes)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        mapped.sort_by(|left, right| {
-            left.uri
-                .as_str()
-                .cmp(right.uri.as_str())
-                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
-                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
-        });
-        mapped.dedup();
-        Ok(mapped)
-    }
-
     fn physical_span_is_contextually_repeated(
         &self,
         uri: &Url,
@@ -810,13 +783,14 @@ impl RenameSnapshot {
         Ok(locations)
     }
 
-    pub(crate) fn binding_locations_in_document(
+    pub(crate) fn binding_highlights_in_document(
         &self,
         uri: &Url,
         position: Position,
         cancel: &AtomicBool,
-    ) -> Result<Vec<Location>, String> {
-        let mut locations = Vec::new();
+    ) -> Result<Vec<DocumentHighlight>, String> {
+        let mut highlights = Vec::new();
+        let mut seen = HashSet::new();
         let mut budget = include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
         let mut virtual_indexes = HashMap::new();
         let mut physical_indexes = HashMap::new();
@@ -826,30 +800,56 @@ impl RenameSnapshot {
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         for (query_uri, query_position) in query_positions {
             resolution_budget.charge()?;
-            let query_locations = self
+            let query_highlights = self
                 .index
-                .binding_locations_in_document_with_cancel_and_work_budget(
+                .binding_highlights_in_document_with_cancel_and_work_budget(
                     &query_uri,
                     query_position,
                     cancel,
                     &mut resolution_budget,
                 )?;
-            locations.extend(query_locations);
+            for highlight in query_highlights {
+                for mapped in self.map_location_with_budget(
+                    Location::new(query_uri.clone(), highlight.range),
+                    &mut budget,
+                    &mut virtual_indexes,
+                    &mut physical_indexes,
+                )? {
+                    if is_cancelled(cancel) {
+                        return Err(CANCELLATION_MESSAGE.to_string());
+                    }
+                    if mapped.uri != *uri {
+                        continue;
+                    }
+                    let key = (
+                        mapped.range.start.line,
+                        mapped.range.start.character,
+                        mapped.range.end.line,
+                        mapped.range.end.character,
+                    );
+                    if seen.insert(key) {
+                        if highlights.len() >= MAX_SNAPSHOT_PHYSICAL_LOCATIONS {
+                            return Err(format!(
+                                "binding reference result exceeds the {MAX_SNAPSHOT_PHYSICAL_LOCATIONS}-entry limit"
+                            ));
+                        }
+                        highlights.push(DocumentHighlight {
+                            range: mapped.range,
+                            kind: highlight.kind,
+                        });
+                    }
+                }
+            }
         }
-        let locations = self.map_locations_with_budget(
-            locations,
-            &mut budget,
-            &mut virtual_indexes,
-            &mut physical_indexes,
-        )?;
-        // This is deliberately after physical mapping/deduplication: one
-        // source occurrence can be visited by several virtual include roots.
-        if locations.len() > MAX_SNAPSHOT_PHYSICAL_LOCATIONS {
-            return Err(format!(
-                "binding reference result exceeds the {MAX_SNAPSHOT_PHYSICAL_LOCATIONS}-entry limit"
-            ));
-        }
-        Ok(locations)
+        highlights.sort_by_key(|highlight| {
+            (
+                highlight.range.start.line,
+                highlight.range.start.character,
+                highlight.range.end.line,
+                highlight.range.end.character,
+            )
+        });
+        Ok(highlights)
     }
 }
 
@@ -2368,7 +2368,7 @@ fn binding_classification_for_input(
         self_contained_mode,
         cancel,
     )?;
-    let (info, ignored_or_empty) = expanded_info.unwrap_or(binding_info_for_source(
+    let (mut info, ignored_or_empty) = expanded_info.unwrap_or(binding_info_for_source(
         uri,
         &source,
         position,
@@ -2377,6 +2377,9 @@ fn binding_classification_for_input(
         self_contained_mode,
         cancel,
     )?);
+    if let Some((info, _)) = info.as_mut() {
+        add_project_unit_alias_names(info, &context);
+    }
     Ok(BindingClassification {
         source,
         record,
@@ -2384,6 +2387,28 @@ fn binding_classification_for_input(
         ignored_or_empty,
         consumed_configuration,
     })
+}
+
+fn add_project_unit_alias_names(
+    info: &mut crate::navigation::RenameBindingInfo,
+    context: &ProjectContext,
+) {
+    if !info.unit {
+        return;
+    }
+    let names = info
+        .names
+        .iter()
+        .map(|name| name.trim_start_matches('&').to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for (alias, target) in &context.unit_aliases {
+        if names.contains(&target.trim_start_matches('&').to_ascii_lowercase()) {
+            info.names.push(alias.clone());
+        }
+    }
+    info.names.sort_by_key(|name| name.to_ascii_lowercase());
+    info.names
+        .dedup_by(|left, right| left.eq_ignore_ascii_case(right));
 }
 
 fn expanded_binding_info_for_input(

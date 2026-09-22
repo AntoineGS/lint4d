@@ -20531,9 +20531,11 @@ fn document_highlights_are_local_and_include_declaration() {
     assert!(response.error.is_none(), "{response:?}");
     let highlights = response.result.unwrap().as_array().unwrap().clone();
     assert_eq!(highlights.len(), 3);
-    assert!(highlights.iter().all(|highlight| {
-        highlight["uri"].is_null() && highlight["kind"].is_null() && highlight["range"].is_object()
-    }));
+    assert!(
+        highlights
+            .iter()
+            .all(|highlight| { highlight["uri"].is_null() && highlight["range"].is_object() })
+    );
     let starts = highlights
         .iter()
         .map(|highlight| {
@@ -20544,6 +20546,9 @@ fn document_highlights_are_local_and_include_declaration() {
         })
         .collect::<Vec<_>>();
     assert_eq!(starts, vec![(2, 6), (6, 12), (7, 12)]);
+    assert_eq!(highlights[0]["kind"], json!(1));
+    assert_eq!(highlights[1]["kind"], json!(1));
+    assert_eq!(highlights[2]["kind"], json!(1));
     assert!(!highlights.iter().any(|highlight| {
         highlight["range"]["start"]["line"] == 7
             && highlight["range"]["start"]["character"] == 6
@@ -20589,45 +20594,125 @@ fn document_highlights_retain_needed_import_bindings_without_consumer_scan() {
 }
 
 #[test]
-fn unit_module_reference_queries_fail_and_unit_highlights_are_empty() {
+fn unit_references_and_highlights_use_bound_alias_identity_and_complete_prefixes() {
     let temp = tempfile::tempdir().unwrap();
-    let source_path = temp.path().join("ReviewUnit.pas");
-    let source = "unit ReviewUnit;\ninterface\nimplementation\nend.\n";
-    write_file(&source_path, source);
+    let provider = temp.path().join("Vendor.Core.pas");
+    let decoy = temp.path().join("Legacy.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let provider_source =
+        "unit Vendor.Core;\ninterface\ntype\n  TThing = class\n  end;\nimplementation\nend.\n";
+    let decoy_source =
+        "unit Legacy;\ninterface\ntype\n  TThing = class\n  end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Legacy;\nimplementation\nprocedure Run;\nbegin\n  Legacy.TThing;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&decoy, decoy_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &temp.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_Namespace>Vendor</DCC_Namespace><DCC_UnitAlias>Legacy=Vendor.Core</DCC_UnitAlias></PropertyGroup></Project>",
+    );
 
     let mut server = TestServer::launch();
     server.initialize(temp.path(), Value::Null);
 
-    let references_id = RequestId::from("unit-module-references".to_string());
+    let references_id = RequestId::from("bound-unit-references".to_string());
     server.send_request(
         references_id.clone(),
         "textDocument/references",
         json!({
-            "textDocument": {"uri": uri(&source_path)},
-            "position": position_of(source, "ReviewUnit", 0),
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "Vendor.Core", 0),
             "context": {"includeDeclaration": true}
         }),
     );
-    let references = server.response(&references_id);
-    let error = references
-        .error
-        .expect("unit/module references are outside the supported binding subset");
-    assert_eq!(error.code, -32803);
-    assert!(error.message.contains("unit/module"));
-    assert!(references.result.is_none());
+    let references = result_locations(server.response(&references_id));
+    assert_eq!(
+        references,
+        vec![
+            json!({
+                "uri": uri(&consumer).to_string(),
+                "range": {
+                    "start": {"line": 2, "character": 5},
+                    "end": {"line": 2, "character": 11}
+                }
+            }),
+            json!({
+                "uri": uri(&consumer).to_string(),
+                "range": {
+                    "start": {"line": 6, "character": 2},
+                    "end": {"line": 6, "character": 8}
+                }
+            }),
+            json!({
+                "uri": uri(&provider).to_string(),
+                "range": {
+                    "start": {"line": 0, "character": 5},
+                    "end": {"line": 0, "character": 16}
+                }
+            })
+        ]
+    );
 
-    let highlights_id = RequestId::from("unit-module-highlights".to_string());
+    let highlights_id = RequestId::from("bound-unit-highlights".to_string());
     server.send_request(
         highlights_id.clone(),
         "textDocument/documentHighlight",
         json!({
-            "textDocument": {"uri": uri(&source_path)},
-            "position": position_of(source, "ReviewUnit", 0)
+            "textDocument": {"uri": uri(&consumer)},
+            "position": position_of(consumer_source, "Legacy", 0)
         }),
     );
     let highlights = server.response(&highlights_id);
     assert!(highlights.error.is_none(), "{highlights:?}");
-    assert!(highlights.result.unwrap().as_array().unwrap().is_empty());
+    assert_eq!(
+        highlights.result.unwrap().as_array().unwrap().clone(),
+        vec![
+            json!({
+                "range": {
+                    "start": {"line": 2, "character": 5},
+                    "end": {"line": 2, "character": 11}
+                },
+                "kind": 1
+            }),
+            json!({
+                "range": {
+                    "start": {"line": 6, "character": 2},
+                    "end": {"line": 6, "character": 8}
+                },
+                "kind": 1
+            })
+        ]
+    );
+
+    let provider_highlights_id = RequestId::from("bound-provider-unit-highlights".to_string());
+    server.send_request(
+        provider_highlights_id.clone(),
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "Vendor.Core", 0)
+        }),
+    );
+    let provider_highlights = server.response(&provider_highlights_id);
+    assert!(
+        provider_highlights.error.is_none(),
+        "{provider_highlights:?}"
+    );
+    assert_eq!(
+        provider_highlights
+            .result
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone(),
+        vec![json!({
+            "range": {
+                "start": {"line": 0, "character": 5},
+                "end": {"line": 0, "character": 16}
+            },
+            "kind": 1
+        })]
+    );
     server.shutdown();
 }
 

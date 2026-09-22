@@ -5857,6 +5857,219 @@ impl NavigationIndex {
         self.resolve_candidates_at_with_state(uri, document, offset, identifier, &mut state)
     }
 
+    fn unit_reference_candidates_at(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+    ) -> Option<Vec<Candidate>> {
+        if let Some(unit_name) = use_name_at(identifier, &document.source) {
+            return Some(self.unit_references(document, &unit_name));
+        }
+
+        if is_unit_declaration_identifier(identifier) {
+            let index = document
+                .symbols
+                .iter()
+                .position(|symbol| symbol.kind == SymbolKind::Unit)?;
+            return Some(vec![Candidate {
+                uri: uri.clone(),
+                index,
+            }]);
+        }
+
+        let (path_node, parts, cursor_index) = qualified_path_at(identifier, &document.source)?;
+        let first = identifier_nodes(path_node).first().copied()?;
+        let mut state = ResolutionState::new();
+        if !self
+            .unqualified_references_with_state(
+                uri,
+                document,
+                first.start_byte(),
+                parts.first()?,
+                &mut state,
+            )
+            .is_empty()
+            || state.member_lookup_incomplete
+            || state.receiver_resolution_uncertain()
+        {
+            return None;
+        }
+        let (prefix_len, unit_uris) =
+            self.longest_visible_unit_prefix(uri, document, offset, &parts)?;
+        (cursor_index < prefix_len).then(|| self.unit_candidates(unit_uris))
+    }
+
+    fn unit_reference_candidates_at_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        offset: usize,
+        identifier: Node<'_>,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Vec<Candidate>>, String> {
+        if let Some(unit_name) =
+            use_name_at_with_budget(identifier, &document.source, cancel, budget)?
+        {
+            return Ok(Some(self.unit_references_with_budget(
+                document, &unit_name, cancel, budget,
+            )?));
+        }
+
+        if is_unit_declaration_identifier(identifier) {
+            budget.require_work(1, cancel)?;
+            budget.require_bytes(uri.as_str().len(), cancel)?;
+            let Some(index) = document
+                .symbols
+                .iter()
+                .position(|symbol| symbol.kind == SymbolKind::Unit)
+            else {
+                return Ok(Some(Vec::new()));
+            };
+            return Ok(Some(vec![Candidate {
+                uri: uri.clone(),
+                index,
+            }]));
+        }
+
+        let Some((path_node, parts, cursor_index)) =
+            qualified_path_at_with_budget(identifier, &document.source, cancel, budget)?
+        else {
+            return Ok(None);
+        };
+        let identifiers = identifier_nodes(path_node);
+        budget.require_work(identifiers.len(), cancel)?;
+        let Some(first) = identifiers.first().copied() else {
+            return Ok(None);
+        };
+        let Some(first_name) = parts.first() else {
+            return Ok(None);
+        };
+        let mut state = ResolutionState::new();
+        if !self
+            .unqualified_references_with_budget_and_state(
+                uri,
+                document,
+                first.start_byte(),
+                first_name,
+                first,
+                &mut state,
+                cancel,
+                budget,
+            )?
+            .is_empty()
+            || state.member_lookup_incomplete
+            || state.receiver_resolution_uncertain()
+        {
+            return Ok(None);
+        }
+        let Some((prefix_len, unit_uris)) = self.longest_visible_unit_prefix_with_budget(
+            uri, document, offset, &parts, cancel, budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        if cursor_index >= prefix_len {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.unit_candidates_with_budget(unit_uris, cancel, budget)?,
+        ))
+    }
+
+    /// Return the physical byte span of the selected unit spelling.  Unit
+    /// references deliberately use the complete bound prefix (for example
+    /// `Ns.Provider` in `Ns.Provider.TThing`) rather than one arbitrary
+    /// component.  This keeps declaration, `uses`, and qualified references
+    /// stable for clients and lets the caller map one semantic occurrence to
+    /// one exact UTF-16 range.
+    fn unit_occurrence_span(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        offset: usize,
+    ) -> Option<Span> {
+        if let Some(module_name) = enclosing_module_name(identifier) {
+            if is_unit_declaration_module(module_name) || has_ancestor_kind(module_name, "declUses")
+            {
+                return Some(Span::from_node(module_name));
+            }
+        }
+
+        let (path_node, parts, cursor_index) = qualified_path_at(identifier, &document.source)?;
+        let (prefix_len, _) = self.longest_visible_unit_prefix(uri, document, offset, &parts)?;
+        if cursor_index >= prefix_len {
+            return None;
+        }
+        let identifiers = identifier_nodes(path_node);
+        let first = identifiers.first()?;
+        let last = identifiers.get(prefix_len.saturating_sub(1))?;
+        Some(Span {
+            start: first.start_byte(),
+            end: last.end_byte(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unit_occurrence_span_with_budget(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        offset: usize,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<Option<Span>, String> {
+        budget.require_work(1, cancel)?;
+        let mut current = Some(identifier);
+        while let Some(node) = current {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            if node.kind() == "moduleName"
+                && (is_unit_declaration_module(node) || has_ancestor_kind(node, "declUses"))
+            {
+                return Ok(Some(Span::from_node(node)));
+            }
+            current = node.parent();
+        }
+        let Some((path_node, parts, cursor_index)) =
+            qualified_path_at_with_budget(identifier, &document.source, cancel, budget)?
+        else {
+            return Ok(None);
+        };
+        let Some((prefix_len, _)) = self.longest_visible_unit_prefix_with_budget(
+            uri, document, offset, &parts, cancel, budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        if cursor_index >= prefix_len {
+            return Ok(None);
+        }
+        let identifiers = identifier_nodes(path_node);
+        budget.require_work(identifiers.len(), cancel)?;
+        budget.require_bytes(
+            identifiers
+                .iter()
+                .map(|node| node.end_byte().saturating_sub(node.start_byte()))
+                .sum(),
+            cancel,
+        )?;
+        let Some(first) = identifiers.first() else {
+            return Ok(None);
+        };
+        let Some(last) = identifiers.get(prefix_len.saturating_sub(1)) else {
+            return Ok(None);
+        };
+        Ok(Some(Span {
+            start: first.start_byte(),
+            end: last.end_byte(),
+        }))
+    }
+
     fn resolve_candidates_at_with_state(
         &self,
         uri: &Url,
@@ -5872,7 +6085,11 @@ impl NavigationIndex {
             } else {
                 None
             };
-        let candidates = if let Some(unit_name) = use_name_at(identifier, &document.source) {
+        let candidates = if let Some(unit_references) =
+            self.unit_reference_candidates_at(uri, document, offset, identifier)
+        {
+            unit_references
+        } else if let Some(unit_name) = use_name_at(identifier, &document.source) {
             self.unit_references(document, &unit_name)
         } else if let Some(direct) = direct {
             direct
@@ -5919,7 +6136,12 @@ impl NavigationIndex {
             } else {
                 None
             };
-        let candidates = if let Some(unit_name) =
+        let candidates = if let Some(unit_references) = self
+            .unit_reference_candidates_at_with_budget(
+                uri, document, offset, identifier, cancel, budget,
+            )? {
+            Ok(unit_references)
+        } else if let Some(unit_name) =
             use_name_at_with_budget(identifier, &document.source, cancel, budget)?
         {
             self.unit_references_with_budget(document, &unit_name, cancel, budget)
@@ -17100,8 +17322,11 @@ pub(super) fn is_declaration_identifier(identifier: Node<'_>) -> bool {
     let identifier_span = Span::from_node(identifier);
     let mut current = Some(identifier);
     while let Some(node) = current {
-        if declaration_name_identifiers(node)
+        let named = declaration_name_identifiers(node);
+        let field_named = field_identifier_nodes(node, "name");
+        if named
             .into_iter()
+            .chain(field_named)
             .any(|name| Span::from_node(name) == identifier_span)
         {
             return true;
@@ -17109,6 +17334,27 @@ pub(super) fn is_declaration_identifier(identifier: Node<'_>) -> bool {
         current = node.parent();
     }
     false
+}
+
+fn enclosing_module_name(identifier: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(identifier);
+    while let Some(node) = current {
+        if node.kind() == "moduleName" {
+            return Some(node);
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn is_unit_declaration_module(module_name: Node<'_>) -> bool {
+    module_name.kind() == "moduleName"
+        && !has_ancestor_kind(module_name, "declUses")
+        && has_ancestor_kind(module_name, "unit")
+}
+
+fn is_unit_declaration_identifier(identifier: Node<'_>) -> bool {
+    enclosing_module_name(identifier).is_some_and(is_unit_declaration_module)
 }
 
 fn collect_name_identifiers<'a>(node: Node<'a>, result: &mut Vec<Node<'a>>) {
@@ -17529,6 +17775,60 @@ fn qualified_name_parts(node: &Node<'_>, source: &str) -> Option<Vec<String>> {
         }
     }
     Some(parts)
+}
+
+fn qualified_path_at<'a>(
+    identifier: Node<'a>,
+    source: &str,
+) -> Option<(Node<'a>, Vec<String>, usize)> {
+    let target_span = Span::from_node(identifier);
+    let mut current = identifier.parent();
+    let mut qualified_node = None;
+    while let Some(node) = current {
+        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
+            && qualified_name_parts(&node, source).is_some_and(|parts| parts.len() > 1)
+        {
+            qualified_node = Some(node);
+        }
+        current = node.parent();
+    }
+    let node = qualified_node?;
+    let parts = qualified_name_parts(&node, source)?;
+    let cursor_index = identifier_nodes(node)
+        .into_iter()
+        .position(|candidate| Span::from_node(candidate) == target_span)?;
+    Some((node, parts, cursor_index))
+}
+
+fn qualified_path_at_with_budget<'a>(
+    identifier: Node<'a>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<(Node<'a>, Vec<String>, usize)>, String> {
+    let mut current = identifier.parent();
+    let mut qualified_node = None;
+    while let Some(node) = current {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot") {
+            if let Some(parts) = qualified_name_parts_with_budget(node, source, cancel, budget)? {
+                if parts.len() > 1 {
+                    qualified_node = Some((node, parts));
+                }
+            }
+        }
+        current = node.parent();
+    }
+    let Some((node, parts)) = qualified_node else {
+        return Ok(None);
+    };
+    let Some(cursor_index) =
+        qualified_identifier_index_with_budget(node, identifier, cancel, budget)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((node, parts, cursor_index)))
 }
 
 fn is_qualified_identifier_node_kind(kind: &str) -> bool {
@@ -19537,8 +19837,24 @@ fn is_non_value_identifier_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
+    is_non_value_identifier_with_budget_and_declaration(
+        identifier,
+        source,
+        cancel,
+        budget,
+        is_declaration_identifier(identifier),
+    )
+}
+
+pub(super) fn is_non_value_identifier_with_budget_and_declaration(
+    identifier: Node<'_>,
+    source: &str,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+    declaration: bool,
+) -> Result<bool, String> {
     let name = canonical_name(node_text_with_budget(identifier, source, cancel, budget)?);
-    if is_declaration_identifier(identifier)
+    if declaration
         || is_implicit_or_intrinsic_name(&name)
         || is_type_valued_intrinsic_argument_with_budget(identifier, source, cancel, budget)?
     {
@@ -24832,6 +25148,382 @@ mod tests {
             state.remaining_work,
             MAX_ANCESTRY_WORK.saturating_sub(DAG_WIDTH.saturating_mul(2)),
             "each type and type/member pair must consume one bounded expansion"
+        );
+    }
+
+    #[test]
+    fn unit_binding_locations_use_selected_provider_identity_and_bound_prefix_ranges() {
+        let provider_uri = Url::parse("file:///workspace/provider.pas").expect("provider URI");
+        let consumer_uri = Url::parse("file:///workspace/consumer.pas").expect("consumer URI");
+        let provider =
+            "unit Ns.Provider;\ninterface\ntype\n  TThing = class\n  end;\nimplementation\nend.\n";
+        let consumer = "unit Consumer;\ninterface\nuses Alias;\nimplementation\nprocedure Run;\nbegin\n  Alias.TThing;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+        index.bind_imports(&consumer_uri, [("Alias".to_owned(), provider_uri.clone())]);
+
+        let locations = index
+            .binding_locations(&provider_uri, Position::new(0, 8), true)
+            .expect("unit references resolve");
+
+        assert_eq!(
+            locations,
+            vec![
+                Location::new(
+                    consumer_uri.clone(),
+                    Range::new(Position::new(2, 5), Position::new(2, 10)),
+                ),
+                Location::new(
+                    consumer_uri,
+                    Range::new(Position::new(6, 2), Position::new(6, 7)),
+                ),
+                Location::new(
+                    provider_uri,
+                    Range::new(Position::new(0, 5), Position::new(0, 16)),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_follow_selected_binding_and_classify_assignments() {
+        let uri = Url::parse("file:///workspace/highlight-kinds.pas").expect("source URI");
+        let source = "unit HighlightKinds;\ninterface\nimplementation\nprocedure Run;\nvar\n  X, Y: Integer;\nbegin\n  X := Y;\n  Y := X;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("highlight source parses");
+        let highlights_for = |position| {
+            let mut budget = BindingWorkBudget::new(100_000);
+            index
+                .binding_highlights_in_document_with_cancel_and_work_budget(
+                    &uri,
+                    position,
+                    &AtomicBool::new(false),
+                    &mut budget,
+                )
+                .expect("highlight roles resolve")
+        };
+
+        assert_eq!(
+            highlights_for(Position::new(5, 2)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(5, 2), Position::new(5, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(7, 2), Position::new(7, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(8, 7), Position::new(8, 8)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(Position::new(5, 5)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(5, 5), Position::new(5, 6)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(7, 7), Position::new(7, 8)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(8, 2), Position::new(8, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_classify_ast_storage_and_call_modes() {
+        let uri = Url::parse("file:///workspace/highlight-debug.pas").expect("source URI");
+        let source = "unit HighlightDebug;\ninterface\nimplementation\nprocedure Take(var V: Integer; const C: Integer; out O: Integer);\nbegin\nend;\nprocedure Run;\nvar\n  X, Y, Z: Integer;\n  A: array[0..3] of Integer;\n  P: ^Integer;\nbegin\n  X := Y;\n  Take(X, Y, Z);\n  A[X] := Y;\n  P^ := X;\n  for X := Y to Z do\n    Y := X;\n  Inc(X);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("highlight source parses");
+        let highlights_for = |position| {
+            let mut budget = BindingWorkBudget::new(100_000);
+            index
+                .binding_highlights_in_document_with_cancel_and_work_budget(
+                    &uri,
+                    position,
+                    &AtomicBool::new(false),
+                    &mut budget,
+                )
+                .expect("highlight roles resolve")
+        };
+
+        assert_eq!(
+            highlights_for(Position::new(8, 2)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(8, 2), Position::new(8, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(12, 2), Position::new(12, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(13, 7), Position::new(13, 8)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(14, 4), Position::new(14, 5)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(15, 8), Position::new(15, 9)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(16, 6), Position::new(16, 7)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(17, 9), Position::new(17, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(18, 6), Position::new(18, 7)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(Position::new(9, 2)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(9, 2), Position::new(9, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(14, 2), Position::new(14, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(Position::new(10, 2)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(10, 2), Position::new(10, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(15, 2), Position::new(15, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_keep_uncertain_property_storage_text() {
+        let uri = Url::parse("file:///workspace/highlight-members-debug.pas").expect("source URI");
+        let source = "unit HighlightMembersDebug;\ninterface\ntype\n  TBox = class\n    F: Integer;\n    procedure SetP(Value: Integer);\n    function GetP: Integer;\n    property P: Integer read GetP write SetP;\n    property ReadOnly: Integer read GetP;\n  end;\nimplementation\nprocedure TBox.SetP(Value: Integer);\nbegin\nend;\nfunction TBox.GetP: Integer;\nbegin\n  Result := 0;\nend;\nprocedure Run;\nvar\n  B: TBox;\n  X: Integer;\nbegin\n  B.F := X;\n  X := B.F;\n  B.P := X;\n  X := B.P;\n  B.ReadOnly := X;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("highlight source parses");
+        let highlights_for = |position| {
+            let mut budget = BindingWorkBudget::new(100_000);
+            index
+                .binding_highlights_in_document_with_cancel_and_work_budget(
+                    &uri,
+                    position,
+                    &AtomicBool::new(false),
+                    &mut budget,
+                )
+                .expect("highlight roles resolve")
+        };
+
+        assert_eq!(
+            highlights_for(Position::new(21, 2)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(21, 2), Position::new(21, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(23, 9), Position::new(23, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(24, 2), Position::new(24, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(25, 9), Position::new(25, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(26, 2), Position::new(26, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(27, 16), Position::new(27, 17)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(Position::new(4, 4)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(4, 4), Position::new(4, 5)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(23, 4), Position::new(23, 5)),
+                    kind: Some(lsp_types::DocumentHighlightKind::WRITE),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(24, 9), Position::new(24, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(Position::new(7, 13)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(7, 13), Position::new(7, 14)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(25, 4), Position::new(25, 5)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(26, 9), Position::new(26, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(Position::new(8, 13)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(8, 13), Position::new(8, 21)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(27, 4), Position::new(27, 12)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_keep_ambiguous_overload_arguments_text() {
+        let uri = Url::parse("file:///workspace/highlight-overload.pas").expect("source URI");
+        let source = "unit HighlightOverload;\ninterface\nprocedure Ambiguous(var V: Integer); overload;\nprocedure Ambiguous(const V: Integer); overload;\nimplementation\nprocedure Ambiguous(var V: Integer);\nbegin\nend;\nprocedure Ambiguous(const V: Integer);\nbegin\nend;\nprocedure Run;\nvar\n  X: Integer;\nbegin\n  Ambiguous(X);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("overload fixture parses");
+        let mut budget = BindingWorkBudget::new(100_000);
+        let highlights = index
+            .binding_highlights_in_document_with_cancel_and_work_budget(
+                &uri,
+                Position::new(15, 12),
+                &AtomicBool::new(false),
+                &mut budget,
+            )
+            .expect("ambiguous overload highlight roles resolve");
+
+        assert_eq!(
+            highlights,
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(13, 2), Position::new(13, 3)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(15, 12), Position::new(15, 13)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn document_highlights_use_complete_unit_prefixes() {
+        let provider_uri =
+            Url::parse("file:///workspace/highlight-provider.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///workspace/highlight-consumer.pas").expect("consumer URI");
+        let provider =
+            "unit Ns.Provider;\ninterface\ntype\n  TThing = class\n  end;\nimplementation\nend.\n";
+        let consumer = "unit Consumer;\ninterface\nuses Alias;\nimplementation\nprocedure Run;\nbegin\n  Alias.TThing;\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer parses");
+        index.bind_imports(&consumer_uri, [("Alias".to_owned(), provider_uri.clone())]);
+
+        let highlights_for = |uri: &Url, position| {
+            let mut budget = BindingWorkBudget::new(100_000);
+            index
+                .binding_highlights_in_document_with_cancel_and_work_budget(
+                    uri,
+                    position,
+                    &AtomicBool::new(false),
+                    &mut budget,
+                )
+                .expect("unit highlight roles resolve")
+        };
+
+        assert_eq!(
+            highlights_for(&provider_uri, Position::new(0, 8)),
+            vec![lsp_types::DocumentHighlight {
+                range: Range::new(Position::new(0, 5), Position::new(0, 16)),
+                kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+            }]
+        );
+        assert_eq!(
+            highlights_for(&consumer_uri, Position::new(2, 5)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(2, 5), Position::new(2, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(6, 2), Position::new(6, 7)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+            ]
+        );
+        assert_eq!(
+            highlights_for(&consumer_uri, Position::new(6, 2)),
+            vec![
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(2, 5), Position::new(2, 10)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+                lsp_types::DocumentHighlight {
+                    range: Range::new(Position::new(6, 2), Position::new(6, 7)),
+                    kind: Some(lsp_types::DocumentHighlightKind::TEXT),
+                },
+            ]
         );
     }
 }

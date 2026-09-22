@@ -167,6 +167,113 @@ pub(super) fn candidate_in_group(
     key_for_candidate(index, candidate).is_some_and(|key| key == *group)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ParameterModeResolution {
+    /// The callable target itself could not be resolved with sufficient
+    /// certainty. This result is safe to cache by callable lookup context.
+    Unresolved,
+    /// The target was resolved, but overload selection may still be
+    /// ambiguous or have no parameter at the requested index.
+    Resolved(Option<ParameterMode>),
+}
+
+/// Resolve the parameter mode used by one call argument.  A missing mode is
+/// intentional: overloaded, unsupported, or otherwise uncertain calls must
+/// not make document highlights claim a read or write that the resolver has
+/// not proved.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn parameter_mode_for_argument(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    call: Node<'_>,
+    argument_index: usize,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<ParameterModeResolution, String> {
+    let Some(entity) = call.child_by_field_name("entity") else {
+        return Ok(ParameterModeResolution::Unresolved);
+    };
+    let lookup_identifier = super::callable_lookup_identifier(entity);
+    let mut state = ResolutionState::new();
+    let mut candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        current_document,
+        lookup_identifier.start_byte(),
+        lookup_identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    if candidates
+        .iter()
+        .any(|candidate| index.candidate_is_conditionally_unknown(candidate))
+        || state_has_uncertainty(&state)
+    {
+        return Ok(ParameterModeResolution::Unresolved);
+    }
+    candidates.retain(|candidate| {
+        index.symbol(candidate).is_some_and(|symbol| {
+            symbol.kind == SymbolKind::Routine && !symbol.unresolved_abbreviated
+        })
+    });
+    if candidates.is_empty() {
+        return Ok(ParameterModeResolution::Unresolved);
+    }
+    let owner_receivers = super::callable_owner_node(entity)
+        .map(|owner| {
+            index.resolve_receivers_with_state_and_budget(
+                current_uri,
+                current_document,
+                entity.start_byte(),
+                owner,
+                owner,
+                &mut state,
+                cancel,
+                budget,
+                0,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let owner_instances = owner_receivers
+        .into_iter()
+        .filter_map(|receiver| match receiver {
+            Receiver::Type(instance) => Some(instance),
+            Receiver::Unit(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if state_has_uncertainty(&state) {
+        return Ok(ParameterModeResolution::Unresolved);
+    }
+    let selection = select(
+        index,
+        current_uri,
+        current_document,
+        call,
+        &candidates,
+        &GenericSubstitution::empty(),
+        &owner_instances,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let Some(group) = selection.selected_group else {
+        return Ok(ParameterModeResolution::Resolved(None));
+    };
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate_in_group(index, candidate, &group));
+    Ok(ParameterModeResolution::Resolved(
+        selected
+            .and_then(|candidate| index.symbol(candidate))
+            .and_then(|symbol| symbol.routine_parameters.get(argument_index))
+            .map(|parameter| parameter.mode),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select(
     index: &NavigationIndex,

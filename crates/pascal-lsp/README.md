@@ -1144,11 +1144,11 @@ resolver rather than textual matching or a rename-to-a-dummy-name probe.
 `context.includeDeclaration = false` excludes the binding's declaration sites;
 `true` includes every supported declaration site as well as its references.
 Open overlays are authoritative, and unopened consumers may be included. Unit
-and module identifiers are outside the supported binding subset: a references
-request returns an unsupported-binding error, while a document-highlight
-request at a unit or module identifier returns an empty list. The separate
-`textDocument/rename` limitation for units remains guarded by `RenameFile`
-support.
+and module identifiers are supported when the resolver proves the selected
+unit identity, including explicit project aliases. Unit declarations, `uses`
+entries, and qualified references use the complete bound prefix (`Ns.Provider`
+or `Alias` in `Alias.TThing`) rather than an arbitrary component. Unit/module
+rename remains unsupported because it requires `RenameFile` support.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial
@@ -1202,12 +1202,18 @@ lifecycles.
 ### Document highlights
 
 `textDocument/documentHighlight` is restricted to the requested document and,
-for supported bindings, includes its declaration. Unit and module identifiers
-are unsupported and return an empty list. Highlight `kind` is intentionally unspecified
-(`None`) until a reliable read/write classifier exists. The shipped Neovim
-configuration does not install `CursorHold` or `CursorMoved` autocmds; clients
-request highlights explicitly, for example with
-`vim.lsp.buf.document_highlight()`.
+for supported bindings, includes its declaration. Unit/module bindings use the
+same selected identity and complete bound-prefix ranges as references,
+including project aliases. Every returned highlight has a classified `kind`:
+declarations and routine/type/unit references are `Text`; proven right-hand
+values, bases, indices, receivers, and value arguments are `Read`; proven
+storage assignments and `var`/`out` arguments are `Write`. Ambiguous or
+unsupported calls, properties, addresses, and other uncertain storage remain
+`Text` rather than being guessed. Both references and highlights fail closed at
+the 10,000-entry response bound and honor cancellation and bounded snapshot
+freshness. The shipped Neovim configuration does not install `CursorHold` or
+`CursorMoved` autocmds; clients request highlights explicitly, for example
+with `vim.lsp.buf.document_highlight()`.
 
 ### Semantic tokens
 
@@ -1327,6 +1333,8 @@ Implemented and covered by tests:
 - Lexical local/parameter shadowing and nested routines.
 - Cross-unit references restricted by `uses` visibility, including separate
   interface/implementation uses clauses; `uses` entries navigate to units.
+- Unit references and highlights preserve selected provider identity, explicit
+  project aliases, and complete bound prefixes; unit rename remains unsupported.
 - Routine and class-method declaration/implementation pairing, including unique
   abbreviated implementation headers.
 - Qualified unit/type names, namespaced units, straightforward declared-type

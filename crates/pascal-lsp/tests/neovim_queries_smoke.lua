@@ -241,7 +241,7 @@ local function run()
 	}, provider)
 	assert(#highlights == 2, vim.inspect(highlights))
 	for _, highlight in ipairs(highlights) do
-		assert(highlight.kind == nil, vim.inspect(highlight))
+		assert(highlight.kind == 1, vim.inspect(highlight))
 		assert(highlight.uri == nil, vim.inspect(highlight))
 	end
 	assert_range(highlights[1].range, 11, 2, 11, 13)

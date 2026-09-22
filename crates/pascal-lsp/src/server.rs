@@ -1589,7 +1589,10 @@ enum AnalysisResultValue {
     WorkspaceDiagnostics(Result<WorkspaceDiagnosticsAnalysis, String>),
     TypeDefinitions(Result<Vec<lsp_types::Location>, String>),
     Prepare(Result<PrepareRenameResponse, String>),
-    Rename(Box<Result<WorkspaceEdit, String>>),
+    Rename {
+        value: Box<Result<WorkspaceEdit, String>>,
+        unit_file_move: Option<(Url, Url)>,
+    },
     CodeActions(Result<Vec<CodeActionOrCommand>, String>),
     Resolve(Box<Result<CodeAction, String>>),
     DocumentSymbols {
@@ -4339,9 +4342,12 @@ impl AnalysisJobs {
             AnalysisRequest::Prepare { .. } => AnalysisResultValue::Prepare(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
-            AnalysisRequest::Rename { .. } => AnalysisResultValue::Rename(Box::new(Err(
-                "analysis worker failed without changing workspace state".to_string(),
-            ))),
+            AnalysisRequest::Rename { uri, new_uri, .. } => AnalysisResultValue::Rename {
+                value: Box::new(Err(
+                    "analysis worker failed without changing workspace state".to_string(),
+                )),
+                unit_file_move: new_uri.clone().map(|new_uri| (uri.clone(), new_uri)),
+            },
             AnalysisRequest::CodeActions(_) => AnalysisResultValue::CodeActions(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
@@ -4794,6 +4800,9 @@ impl AnalysisJobs {
                             new_name,
                             new_uri,
                         } => {
+                            let unit_file_move = new_uri
+                                .as_ref()
+                                .map(|new_uri| (uri.clone(), new_uri.clone()));
                             if let Err(error) = wait_at_test_barrier(
                                 TestBarrier::Navigation,
                                 &test_barriers,
@@ -4804,7 +4813,10 @@ impl AnalysisJobs {
                                     source_generation,
                                     configuration_generation,
                                     records: Vec::new(),
-                                    value: AnalysisResultValue::Rename(Box::new(Err(error))),
+                                    value: AnalysisResultValue::Rename {
+                                        value: Box::new(Err(error)),
+                                        unit_file_move,
+                                    },
                                 }
                             } else {
                                 let computed = if let Some(new_uri) = new_uri {
@@ -4831,7 +4843,10 @@ impl AnalysisJobs {
                                     source_generation: computed.source_generation,
                                     configuration_generation: computed.configuration_generation,
                                     records: computed.records,
-                                    value: AnalysisResultValue::Rename(Box::new(computed.value)),
+                                    value: AnalysisResultValue::Rename {
+                                        value: Box::new(computed.value),
+                                        unit_file_move,
+                                    },
                                 }
                             }
                         }
@@ -6998,8 +7013,30 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-        AnalysisResultValue::Rename(value) => match *value {
-            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+        AnalysisResultValue::Rename {
+            value,
+            unit_file_move,
+        } => match *value {
+            Ok(value) => {
+                if let Some((old_uri, new_uri)) = unit_file_move {
+                    if let Err(error) = workspace.stage_unit_file_rename(&old_uri, &new_uri, &value)
+                    {
+                        return send_analysis_error(
+                            connection,
+                            client_id.clone().expect("client result"),
+                            error,
+                        );
+                    }
+                    let response =
+                        send_ok(connection, client_id.clone().expect("client result"), value);
+                    if response.is_err() {
+                        workspace.cancel_staged_unit_file_rename(&old_uri, &new_uri);
+                    }
+                    response
+                } else {
+                    send_ok(connection, client_id.clone().expect("client result"), value)
+                }
+            }
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
@@ -7368,7 +7405,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::WorkspaceDiagnostics(value) => *value = Err(error),
         AnalysisResultValue::TypeDefinitions(value) => *value = Err(error),
         AnalysisResultValue::Prepare(value) => *value = Err(error),
-        AnalysisResultValue::Rename(value) => **value = Err(error),
+        AnalysisResultValue::Rename { value, .. } => **value = Err(error),
         AnalysisResultValue::CodeActions(value) => *value = Err(error),
         AnalysisResultValue::Resolve(value) => **value = Err(error),
         AnalysisResultValue::DocumentSymbols { value, .. } => *value = Err(error),
@@ -9311,16 +9348,25 @@ fn handle_notification(
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 return Err("file operation notification requires a files array".into());
             };
-            let mut effect = DiagnosticNotificationEffect::default();
+            if files.is_empty() || files.len() > 64 {
+                return Err("file operation batch must contain between 1 and 64 entries".into());
+            }
+            let mut uris = Vec::with_capacity(files.len());
+            let mut unique = HashSet::with_capacity(files.len());
             for file in files {
-                let Some(uri) = file
+                let uri = file
                     .get("uri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                else {
-                    return Err("file operation entry requires a valid uri".into());
-                };
+                    .ok_or_else(|| "file operation entry requires a valid uri".to_string())?;
                 let uri = canonical_file_uri(&uri);
+                if uri.to_file_path().is_err() || !unique.insert(uri.clone()) {
+                    return Err("file operation batch contains a non-file or duplicate URI".into());
+                }
+                uris.push(uri);
+            }
+            let mut effect = DiagnosticNotificationEffect::default();
+            for uri in uris {
                 let change = if created {
                     FileChange::Created
                 } else {
@@ -9338,28 +9384,43 @@ fn handle_notification(
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 return Err("file operation notification requires a files array".into());
             };
-            let mut effect = DiagnosticNotificationEffect::default();
+            if files.is_empty() || files.len() > 64 {
+                return Err("file rename batch must contain between 1 and 64 entries".into());
+            }
+            let mut renames = Vec::with_capacity(files.len());
+            let mut old_uris = HashSet::with_capacity(files.len());
+            let mut new_uris = HashSet::with_capacity(files.len());
             for file in files {
-                let Some(old_uri) = file
+                let old_uri = file
                     .get("oldUri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                else {
-                    return Err("file rename entry requires a valid oldUri".into());
-                };
-                let Some(new_uri) = file
+                    .ok_or_else(|| "file rename entry requires a valid oldUri".to_string())?;
+                let new_uri = file
                     .get("newUri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                else {
-                    return Err("file rename entry requires a valid newUri".into());
-                };
+                    .ok_or_else(|| "file rename entry requires a valid newUri".to_string())?;
                 let old_uri = canonical_file_uri(&old_uri);
                 let new_uri = canonical_file_uri(&new_uri);
-                for affected in workspace.file_event(&old_uri, FileChange::Deleted) {
-                    effect.refresh_uri(affected);
+                if old_uri.to_file_path().is_err()
+                    || new_uri.to_file_path().is_err()
+                    || old_uri == new_uri
+                    || !old_uris.insert(old_uri.clone())
+                    || !new_uris.insert(new_uri.clone())
+                {
+                    return Err(
+                        "file rename batch contains invalid, duplicate, or identical URIs".into(),
+                    );
                 }
-                for affected in workspace.file_event(&new_uri, FileChange::Created) {
+                renames.push((old_uri, new_uri));
+            }
+            if old_uris.iter().any(|uri| new_uris.contains(uri)) {
+                return Err("file rename batch contains chained or cyclic URI transitions".into());
+            }
+            let mut effect = DiagnosticNotificationEffect::default();
+            for (old_uri, new_uri) in renames {
+                for affected in workspace.did_rename_file(&old_uri, &new_uri) {
                     effect.refresh_uri(affected);
                 }
                 effect.refresh_uri(old_uri.clone());

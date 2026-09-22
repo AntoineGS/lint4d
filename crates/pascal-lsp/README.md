@@ -1186,8 +1186,8 @@ a valid unit identifier, the extension must be one of `.pas`, `.pp`, or
 `.pascal` and remain unchanged, the destination must be in the same authorized
 directory and not exist, and one complete unambiguous project-selected binding
 family must be provable. Explicit `uses ... in 'path'` files, aliases, namespace
-declarations, cross-directory moves, case-only renames, multi-file/directory
-moves, open/rejected destination overlays, and unresolved includes/conditional
+  declarations, cross-directory moves, case-only renames, multi-file/directory
+  moves, open/rejected destination overlays, and unresolved includes/conditional
 or ownership uncertainty fail as a whole. The returned `documentChanges` are
 versioned for open documents; closed documents carry the LSP null version.
 There is no `RenameFile` resource operation: in this file-operation handshake
@@ -1196,14 +1196,21 @@ returned source edits. The server never moves files itself. `textDocument/rename
 for unit symbols remains unsupported.
 
 After `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`, catalogues,
-loaded-source observations, and affected diagnostics are invalidated/refreshed;
-rename is processed as old-path deletion plus new-path creation. These events
-do not synthesize/delete imports. Open-overlay transfer across a file rename is
-not yet implemented, so callers must close/reopen affected documents; this
-limitation also means file-operation rename is not safe for a provider with an
-open overlay until the follow-up transition lifecycle is completed. Clients
-should continue to use watched-file notifications for changes not covered by
-these Pascal source filters.
+loaded-source observations, negative path observations, and affected
+diagnostics are invalidated/refreshed, including for unopened sources; events
+do not synthesize/delete imports or mutate physical files. File-operation
+notifications accept bounded batches of at most 64 unique file URIs and reject
+malformed batches before applying any entry. `didRenameFiles` is idempotent for
+recent duplicate old/new pairs. A pending, successful unit `willRenameFiles`
+plan can transfer an open provider overlay only when the current text exactly
+matches the planned edits, the source identity is unchanged, and the document
+version advanced beyond its planned version before `didRenameFiles`. Keep the
+provider open through the notification; a close-before-notification or a
+mismatched/out-of-order transition is invalidated and must be reopened rather
+than guessed. A delayed `didClose` for the old URI cannot close the transferred
+new-URI overlay. Unmatched late rename notifications invalidate old/new path
+state conservatively. Clients should continue to use watched-file
+notifications for changes not covered by these Pascal source filters.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial

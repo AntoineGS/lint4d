@@ -7,8 +7,8 @@ use crate::navigation::{SemanticDiagnostic, SemanticDiagnosticKind};
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{GlobSet, GlobSetBuilder};
 use lsp_types::{
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, Location, NumberOrString, Position, Range,
-    TextDocumentContentChangeEvent, TextEdit, Url,
+    Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentChanges, Location, NumberOrString,
+    Position, Range, TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::{FileInfo, Severity, parser};
 pub(crate) use pascal_project::content_hash_bytes;
@@ -52,6 +52,9 @@ const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
+const MAX_PENDING_FILE_RENAMES: usize = 64;
+const MAX_PENDING_FILE_RENAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COMPLETED_FILE_RENAMES: usize = 128;
 const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -973,6 +976,55 @@ pub enum FileChange {
     Deleted,
 }
 
+fn expected_renamed_document_text(
+    edit: &WorkspaceEdit,
+    uri: &Url,
+    source: &str,
+    version: i32,
+) -> Result<String, String> {
+    let Some(DocumentChanges::Edits(documents)) = edit.document_changes.as_ref() else {
+        return Err("unit rename transition requires text-only documentChanges".to_string());
+    };
+    let document = documents
+        .iter()
+        .find(|document| document.text_document.uri == *uri)
+        .ok_or_else(|| "unit rename edit omitted the open provider source".to_string())?;
+    if document.text_document.version != Some(version) {
+        return Err("unit rename edit version does not match the provider overlay".to_string());
+    }
+    if document.edits.is_empty() || document.edits.len() > 10_000 {
+        return Err("unit rename provider edit count is empty or over its bound".to_string());
+    }
+    let mut edits = Vec::with_capacity(document.edits.len());
+    for annotated in &document.edits {
+        let lsp_types::OneOf::Left(edit) = annotated else {
+            return Err(
+                "annotated provider edits are unsupported in rename transitions".to_string(),
+            );
+        };
+        let start = text::position_to_offset(source, edit.range.start)
+            .ok_or_else(|| "provider rename edit has an invalid start position".to_string())?;
+        let end = text::position_to_offset(source, edit.range.end)
+            .ok_or_else(|| "provider rename edit has an invalid end position".to_string())?;
+        if start > end {
+            return Err("provider rename edit range is reversed".to_string());
+        }
+        edits.push((start, end, edit.new_text.as_str()));
+    }
+    edits.sort_by_key(|(start, end, _)| (*start, *end));
+    if edits.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err("provider rename edits overlap".to_string());
+    }
+    let mut updated = source.to_owned();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        updated.replace_range(start..end, replacement);
+        if updated.len() > MAX_PENDING_FILE_RENAME_BYTES {
+            return Err("expected renamed provider text exceeds the transition bound".to_string());
+        }
+    }
+    Ok(updated)
+}
+
 #[derive(Debug)]
 struct OpenDocument {
     text: Option<String>,
@@ -982,6 +1034,14 @@ struct OpenDocument {
     /// incarnation. A close followed by an open receives a new watermark
     /// even when the client reuses a version.
     identity_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingUnitFileRename {
+    new_uri: Url,
+    original_identity_generation: Option<u64>,
+    original_version: Option<i32>,
+    expected_text: Option<String>,
 }
 
 struct DiskSource {
@@ -1406,6 +1466,9 @@ pub struct Workspace {
     index: NavigationIndex,
     cached_documents: HashMap<Url, rename::CachedDocument>,
     open_documents: HashMap<Url, OpenDocument>,
+    pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
+    pending_unit_file_rename_bytes: usize,
+    completed_file_renames: VecDeque<(Url, Url)>,
     indexed_files: HashSet<Url>,
     indexed_sizes: HashMap<Url, usize>,
     indexed_bytes: usize,
@@ -2056,7 +2119,7 @@ impl Workspace {
             self.reject_open_document(uri, version, reason);
             return Ok(());
         }
-        self.accept_open_document(uri, text, version, context_key)
+        self.accept_open_document(uri, text, version, context_key, false)
     }
 
     pub fn change_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
@@ -2208,7 +2271,7 @@ impl Workspace {
             self.reject_open_document(uri, version, reason);
             return Ok(());
         }
-        self.accept_open_document(uri, candidate, version, context_key)
+        self.accept_open_document(uri, candidate, version, context_key, true)
     }
 
     pub(crate) fn reject_malformed_change(
@@ -2248,7 +2311,7 @@ impl Workspace {
                         "retaining the saved document would exceed the configured source limits for {uri}"
                     ));
                 }
-                self.accept_open_document(uri.clone(), text, version, context_key)?;
+                self.accept_open_document(uri.clone(), text, version, context_key, true)?;
             } else {
                 self.refresh_loaded_disk(uri);
                 self.schedule_diagnostics(uri.clone());
@@ -2296,6 +2359,7 @@ impl Workspace {
         text: String,
         version: i32,
         context_key: ContextKey,
+        preserve_identity: bool,
     ) -> Result<(), String> {
         self.bump_source_generation();
         self.mark_source_change(&uri, false);
@@ -2307,13 +2371,22 @@ impl Workspace {
             }
         }
         self.open_text_bytes = self.open_text_bytes.saturating_add(text_len);
+        let identity_generation = if preserve_identity {
+            self.open_documents
+                .get(&uri)
+                .map_or(self.source_generation, |previous| {
+                    previous.identity_generation
+                })
+        } else {
+            self.source_generation
+        };
         self.open_documents.insert(
             uri.clone(),
             OpenDocument {
                 text: Some(text),
                 version,
                 rejection: None,
-                identity_generation: self.source_generation,
+                identity_generation,
             },
         );
         self.disk_stamps.remove(&uri);
@@ -2474,12 +2547,6 @@ impl Workspace {
     ) -> Result<(Position, String), String> {
         let old_uri = canonical_file_uri(old_uri);
         let new_uri = canonical_file_uri(new_uri);
-        if self.open_documents.contains_key(&old_uri) {
-            return Err(
-                "unit rename of an open provider overlay is unsupported until exact didRename overlay transfer is available"
-                    .to_string(),
-            );
-        }
         let old_path = old_uri
             .to_file_path()
             .map_err(|_| "unit file rename requires file URIs".to_string())?;
@@ -2537,6 +2604,197 @@ impl Workspace {
             .unit_declaration_position(&old_uri)
             .ok_or_else(|| "unit rename requires one parsed unit declaration".to_string())?;
         Ok((position, new_name.to_string()))
+    }
+
+    pub(crate) fn stage_unit_file_rename(
+        &mut self,
+        old_uri: &Url,
+        new_uri: &Url,
+        edit: &WorkspaceEdit,
+    ) -> Result<(), String> {
+        let old_uri = canonical_file_uri(old_uri);
+        let new_uri = canonical_file_uri(new_uri);
+        if self.pending_unit_file_renames.contains_key(&old_uri) {
+            return Err(
+                "another unit file rename transition is already pending for this source"
+                    .to_string(),
+            );
+        }
+        if self.pending_unit_file_renames.len() >= MAX_PENDING_FILE_RENAMES {
+            return Err("pending unit file rename transition limit reached".to_string());
+        }
+        let old_path = old_uri
+            .to_file_path()
+            .map_err(|_| "unit rename transition requires a file URI".to_string())?;
+        let new_path = new_uri
+            .to_file_path()
+            .map_err(|_| "unit rename transition target requires a file URI".to_string())?;
+        if old_path.parent() != new_path.parent() {
+            return Err("unit rename transition must remain in one directory".to_string());
+        }
+        let (original_identity_generation, original_version, expected_text) = if let Some(open) =
+            self.open_documents.get(&old_uri)
+        {
+            let Some(source) = open.text.as_deref() else {
+                return Err(
+                    "rejected open provider cannot participate in a file rename".to_string()
+                );
+            };
+            let expected = expected_renamed_document_text(edit, &old_uri, source, open.version)?;
+            let added_bytes = expected.len();
+            let total_bytes = self
+                .pending_unit_file_rename_bytes
+                .checked_add(added_bytes)
+                .ok_or_else(|| "pending unit rename bytes overflow".to_string())?;
+            if total_bytes > MAX_PENDING_FILE_RENAME_BYTES {
+                return Err("pending unit file rename text limit reached".to_string());
+            }
+            self.pending_unit_file_rename_bytes = total_bytes;
+            (
+                Some(open.identity_generation),
+                Some(open.version),
+                Some(expected),
+            )
+        } else {
+            (None, None, None)
+        };
+        self.completed_file_renames
+            .retain(|(old, new)| old != &old_uri || new != &new_uri);
+        self.pending_unit_file_renames.insert(
+            old_uri,
+            PendingUnitFileRename {
+                new_uri,
+                original_identity_generation,
+                original_version,
+                expected_text,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn cancel_staged_unit_file_rename(&mut self, old_uri: &Url, new_uri: &Url) {
+        let old_uri = canonical_file_uri(old_uri);
+        let new_uri = canonical_file_uri(new_uri);
+        if self
+            .pending_unit_file_renames
+            .get(&old_uri)
+            .is_some_and(|pending| pending.new_uri == new_uri)
+        {
+            if let Some(pending) = self.pending_unit_file_renames.remove(&old_uri) {
+                self.pending_unit_file_rename_bytes = self
+                    .pending_unit_file_rename_bytes
+                    .saturating_sub(pending.expected_text.as_ref().map_or(0, String::len));
+            }
+        }
+    }
+
+    pub(crate) fn did_rename_file(&mut self, old_uri: &Url, new_uri: &Url) -> Vec<Url> {
+        let old_uri = canonical_file_uri(old_uri);
+        let new_uri = canonical_file_uri(new_uri);
+        if self
+            .completed_file_renames
+            .iter()
+            .any(|(old, new)| old == &old_uri && new == &new_uri)
+        {
+            return Vec::new();
+        }
+        let pending = self
+            .pending_unit_file_renames
+            .get(&old_uri)
+            .filter(|pending| pending.new_uri == new_uri)
+            .cloned();
+        if let Some(pending) = pending.as_ref() {
+            if self.try_transfer_renamed_overlay(&old_uri, &new_uri, pending) {
+                if let Some(removed) = self.pending_unit_file_renames.remove(&old_uri) {
+                    self.pending_unit_file_rename_bytes = self
+                        .pending_unit_file_rename_bytes
+                        .saturating_sub(removed.expected_text.as_ref().map_or(0, String::len));
+                }
+            } else {
+                if let Some(document) = self.open_documents.get(&old_uri) {
+                    let version = document.version;
+                    self.reject_open_document(
+                        old_uri.clone(),
+                        version,
+                        "file rename transition did not match the planned provider overlay; close and reopen the document".to_string(),
+                    );
+                }
+                if let Some(removed) = self.pending_unit_file_renames.remove(&old_uri) {
+                    self.pending_unit_file_rename_bytes = self
+                        .pending_unit_file_rename_bytes
+                        .saturating_sub(removed.expected_text.as_ref().map_or(0, String::len));
+                }
+            }
+        } else if let Some(document) = self.open_documents.get(&old_uri) {
+            let version = document.version;
+            self.reject_open_document(
+                old_uri.clone(),
+                version,
+                "unmatched workspace file rename invalidated this open document; close and reopen it".to_string(),
+            );
+        }
+        let mut affected = self.file_event(&old_uri, FileChange::Deleted);
+        affected.extend(self.file_event(&new_uri, FileChange::Created));
+        self.completed_file_renames.push_back((old_uri, new_uri));
+        while self.completed_file_renames.len() > MAX_COMPLETED_FILE_RENAMES {
+            self.completed_file_renames.pop_front();
+        }
+        affected
+    }
+
+    fn try_transfer_renamed_overlay(
+        &mut self,
+        old_uri: &Url,
+        new_uri: &Url,
+        pending: &PendingUnitFileRename,
+    ) -> bool {
+        let Some(expected_text) = pending.expected_text.as_deref() else {
+            return false;
+        };
+        if self.open_documents.contains_key(new_uri) {
+            return false;
+        }
+        let Some(source_document) = self.open_documents.get(old_uri) else {
+            return false;
+        };
+        if source_document.text.as_deref() != Some(expected_text)
+            || source_document.identity_generation
+                != pending.original_identity_generation.unwrap_or_default()
+            || source_document.version <= pending.original_version.unwrap_or(i32::MAX)
+        {
+            return false;
+        }
+        let context_key = self
+            .open_document_contexts
+            .get(old_uri)
+            .or_else(|| self.document_contexts.get(old_uri))
+            .cloned();
+        let Some(context_key) = context_key else {
+            return false;
+        };
+        let version = source_document.version;
+        let source = expected_text.to_owned();
+        let owner = self.document_owners.remove(old_uri).map(|mut owner| {
+            owner.legacy_route = None;
+            owner.needs_revalidation = true;
+            owner
+        });
+        self.close_document(old_uri);
+        if let Some(owner) = owner {
+            self.document_owners.insert(new_uri.clone(), owner);
+        }
+        if self
+            .accept_open_document(new_uri.clone(), source, version, context_key, false)
+            .is_err()
+        {
+            self.reject_open_document(
+                new_uri.clone(),
+                version,
+                "transferred unit overlay failed workspace admission".to_string(),
+            );
+            return false;
+        }
+        true
     }
 
     pub fn update_workspace_folders(

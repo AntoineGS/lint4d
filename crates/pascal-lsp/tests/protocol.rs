@@ -30039,6 +30039,118 @@ fn bounded_package_catalogue_finds_late_packages_and_rejects_late_duplicates() {
 }
 
 #[test]
+fn did_rename_transfers_an_open_unit_overlay_only_after_will_rename_and_preserves_sync_order() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Provider;\r\ninterface\r\ntype TThing = class end;\r\nimplementation\r\nend.\r\n";
+    let consumer_source = "unit Consumer;\r\ninterface\r\nuses Provider;\r\ntype TAlias = Provider.TThing;\r\nimplementation\r\nend.\r\n";
+    write_file(&provider, source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &main,
+        "unit Main;\r\ninterface\r\nuses Consumer;\r\nimplementation\r\nend.\r\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("open-file-rename-init".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}}}),
+    );
+    assert!(server.response(&initialize_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+    );
+
+    let new_provider = root.join("Renamed.pas");
+    let request_id = RequestId::from("open-file-rename".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "open source overlay should participate in safe willRename: {:?}",
+        response.error
+    );
+    let edit = response.result.expect("coordinated source edits");
+    assert!(
+        edit["documentChanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["textDocument"]["uri"] == uri(&provider).to_string()
+                    && change["textDocument"]["version"] == 5
+            })
+    );
+    let provider_updated = apply_workspace_edit_to_source(source, &edit, &uri(&provider));
+    let consumer_updated = apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    write_file(&provider, &provider_updated);
+    write_file(&consumer, &consumer_updated);
+    // Client applies WorkspaceEdit to the old URI, advances the version,
+    // performs the physical move, then reports the file operation.
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+    );
+    fs::rename(&provider, &new_provider).expect("client-owned move");
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    // A duplicate notification is idempotent: it must not evict or recreate
+    // the transferred authoritative overlay.
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    // Distinguish a transferred overlay from a path-only reload, then probe
+    // the carried version: an equal-version didChange must not replace it.
+    write_file(&new_provider, &provider_updated.replace("TThing", "TStale"));
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&new_provider),"version":6},"contentChanges":[{"text":provider_updated.replace("TThing", "TNewer")}]}),
+    );
+    // A delayed close for the old URI must not close the transferred new URI.
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    let definition_id = RequestId::from("open-file-rename-reanalysis".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&new_provider).to_string());
+    server.shutdown();
+}
+
+#[test]
 fn will_rename_unit_returns_versioned_atomic_edits_before_client_owned_move() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -30330,7 +30442,7 @@ fn will_rename_unit_rejects_ambiguous_same_name_providers() {
 }
 
 #[test]
-fn will_rename_unit_refuses_an_open_provider_overlay_without_transition_proof() {
+fn will_rename_unit_plans_a_versioned_open_provider_overlay_transition() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
     let provider = root.join("Provider.pas");
@@ -30361,10 +30473,18 @@ fn will_rename_unit_refuses_an_open_provider_overlay_without_transition_proof() 
     );
     let response = server.response(&request_id);
     assert!(
-        response.error.is_some(),
-        "open provider requires verified overlay migration"
+        response.error.is_none(),
+        "open provider overlay should be planned: {:?}",
+        response.error
     );
-    assert!(response.result.is_none());
+    let result = response.result.expect("workspace edit");
+    let changes = result["documentChanges"]
+        .as_array()
+        .expect("versioned document changes");
+    assert!(changes.iter().any(|change| {
+        change["textDocument"]["uri"] == uri(&provider).to_string()
+            && change["textDocument"]["version"] == 1
+    }));
     server.shutdown();
 }
 

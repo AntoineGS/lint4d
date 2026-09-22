@@ -1374,6 +1374,14 @@ impl NavigationIndex {
             cancel,
             &mut shared_work_budget,
         )?;
+        let candidates = self.select_rename_overload_candidates(
+            uri,
+            document,
+            identifier,
+            candidates,
+            cancel,
+            &mut shared_work_budget,
+        )?;
         charge_shared_work(
             &mut shared_work_budget,
             cancel,
@@ -1466,6 +1474,98 @@ impl NavigationIndex {
         } else {
             Ok(self.resolve_candidates_at(uri, document, offset, identifier))
         }
+    }
+
+    /// Apply the same call-site overload proof used by navigation before
+    /// rename compares occurrence candidates. A raw member lookup contains
+    /// every same-named overload; retaining that set makes a proven call look
+    /// ambiguous and either rejects or widens an exact slot.
+    fn select_rename_overload_candidates(
+        &self,
+        uri: &Url,
+        document: &Document,
+        identifier: Node<'_>,
+        mut candidates: Vec<Candidate>,
+        cancel: Option<&AtomicBool>,
+        shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    ) -> Result<Vec<Candidate>, String> {
+        let Some(call) = super::overload::call_for_identifier(identifier) else {
+            return Ok(candidates);
+        };
+        let fallback_cancel = AtomicBool::new(false);
+        let cancel = cancel.unwrap_or(&fallback_cancel);
+        let entity = call.child_by_field_name("entity");
+        if entity.and_then(super::callable_owner_node).is_none() {
+            // Unqualified/global overloads remain conservative here. Their
+            // declaration family may be exact while a call-site binding lacks
+            // the receiver proof required to safely narrow every occurrence.
+            return Ok(candidates);
+        }
+
+        let mut select = |budget: &mut super::AssistanceBudget| {
+            let mut state = ResolutionState::new();
+            let owner_receivers = entity
+                .and_then(super::callable_owner_node)
+                .map(|owner| {
+                    self.resolve_receivers_with_state_and_budget(
+                        uri,
+                        document,
+                        identifier.start_byte(),
+                        owner,
+                        owner,
+                        &mut state,
+                        cancel,
+                        budget,
+                        0,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let owner_instances = owner_receivers
+                .iter()
+                .filter_map(|receiver| match receiver {
+                    super::Receiver::Type(instance) => Some(instance.clone()),
+                    super::Receiver::Unit(_)
+                    | super::Receiver::Builtin(_)
+                    | super::Receiver::IntegerLiteral(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let selection = super::overload::select(
+                self,
+                uri,
+                document,
+                call,
+                &candidates,
+                &super::GenericSubstitution::empty(),
+                &owner_instances,
+                &mut state,
+                0,
+                cancel,
+                budget,
+            )?;
+            if let Some(group) = selection.selected_group {
+                candidates.retain(|candidate| {
+                    super::overload::candidate_in_group(self, candidate, &group)
+                });
+            } else if selection.no_viable_group {
+                candidates.retain(|candidate| {
+                    super::overload::key_for_candidate(self, candidate).is_none()
+                });
+            }
+            Ok::<(), String>(())
+        };
+
+        if let Some(budget) = shared_work_budget.as_deref_mut() {
+            select(budget)?;
+        } else {
+            let mut budget = super::AssistanceBudget::new(
+                super::MAX_NAVIGATION_OVERLOAD_WORK,
+                super::MAX_NAVIGATION_OVERLOAD_BYTES,
+                "rename overload selection",
+            );
+            select(&mut budget)?;
+        }
+        Ok(candidates)
     }
 
     fn collect_occurrences_bounded(
@@ -1680,6 +1780,14 @@ impl NavigationIndex {
                         );
                         (candidates, unknown_global_fallback)
                     };
+                let candidates = self.select_rename_overload_candidates(
+                    uri,
+                    document,
+                    identifier,
+                    candidates,
+                    options.cancel,
+                    &mut options.shared_work_budget,
+                )?;
                 charge_shared_work(
                     &mut options.shared_work_budget,
                     options.cancel,
@@ -3007,7 +3115,7 @@ fn expand_override_family(
         // For `TBase<T>.Work(T)` overridden by `TChild.Work(Integer)`, the
         // parent substitution is part of the proof.  Unknown type identity or
         // generic constraints fail closed instead of widening by name.
-        let signature_match = override_contract_match(
+        match override_contract_match(
             index,
             candidate_symbol,
             &candidate_uri,
@@ -3017,11 +3125,15 @@ fn expand_override_family(
             anchor_owner.as_str(),
             cancel,
             shared_work_budget,
-        )?;
-        if signature_match != super::ContractMatch::Yes {
-            return Err("override family signature is unknown or incompatible".to_string());
-        }
-        family.insert(candidate_id);
+        )? {
+            // An independent overload slot is not part of this exact family.
+            // It must not make a proven selected slot fail or get merged.
+            super::ContractMatch::No => continue,
+            super::ContractMatch::Unknown => {
+                return Err("override family signature is unknown".to_string());
+            }
+            super::ContractMatch::Yes => family.insert(candidate_id),
+        };
     }
 
     // Ensure every source-backed family routine has at most one declaration

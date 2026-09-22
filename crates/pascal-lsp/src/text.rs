@@ -168,6 +168,47 @@ struct IndexedLine {
 }
 
 impl PositionIndex {
+    pub(crate) fn owned_bytes_upper_bound_with_cancel(
+        source: &str,
+        cancel: &AtomicBool,
+    ) -> Result<usize, ()> {
+        let mut line_count = 1usize;
+        let mut content_char_count = 0usize;
+        let bytes = source.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if is_cancelled(Some(cancel)) {
+                return Err(());
+            }
+            let break_len = match bytes[index] {
+                b'\n' => 1,
+                b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
+                b'\r' => 1,
+                _ => {
+                    let width = source[index..].chars().next().ok_or(())?.len_utf8();
+                    content_char_count = content_char_count.saturating_add(1);
+                    index = index.saturating_add(width);
+                    continue;
+                }
+            };
+            line_count = line_count.saturating_add(1);
+            index = index.saturating_add(break_len);
+        }
+        Ok(line_count
+            .saturating_mul(std::mem::size_of::<IndexedLine>())
+            .saturating_add(
+                content_char_count
+                    .saturating_add(line_count)
+                    .saturating_mul(std::mem::size_of::<usize>() * 2),
+            )
+            .saturating_add(
+                line_count
+                    .saturating_mul(2)
+                    .saturating_mul(2 * std::mem::size_of::<usize>()),
+            )
+            .saturating_add(2 * std::mem::size_of::<usize>()))
+    }
+
     pub(crate) fn new(source: &str) -> Self {
         #[cfg(test)]
         POSITION_INDEX_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
@@ -179,8 +220,26 @@ impl PositionIndex {
     }
 
     fn build(source: &str, cancel: Option<&AtomicBool>) -> Result<Self, ()> {
-        let mut lines = Vec::new();
         let bytes = source.as_bytes();
+        let mut line_count = 1usize;
+        let mut line_scan = 0usize;
+        while line_scan < bytes.len() {
+            if is_cancelled(cancel) {
+                return Err(());
+            }
+            let break_len = match bytes[line_scan] {
+                b'\n' => 1,
+                b'\r' if bytes.get(line_scan + 1) == Some(&b'\n') => 2,
+                b'\r' => 1,
+                _ => {
+                    line_scan += 1;
+                    continue;
+                }
+            };
+            line_count = line_count.saturating_add(1);
+            line_scan += break_len;
+        }
+        let mut lines = Vec::with_capacity(line_count);
         let mut start = 0;
         let mut index = 0;
 
@@ -270,8 +329,17 @@ fn build_line(
     break_end: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<IndexedLine, ()> {
-    let mut byte_offsets = vec![0];
-    let mut utf16_offsets = vec![0];
+    let mut character_count = 0usize;
+    for _character in source[start..end].chars() {
+        if is_cancelled(cancel) {
+            return Err(());
+        }
+        character_count = character_count.saturating_add(1);
+    }
+    let mut byte_offsets = Vec::with_capacity(character_count.saturating_add(1));
+    let mut utf16_offsets = Vec::with_capacity(character_count.saturating_add(1));
+    byte_offsets.push(0);
+    utf16_offsets.push(0);
     let mut utf16 = 0;
     for (relative, character) in source[start..end].char_indices() {
         if is_cancelled(cancel) {

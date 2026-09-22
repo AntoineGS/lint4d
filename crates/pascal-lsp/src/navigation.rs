@@ -2271,15 +2271,33 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<String>, String> {
-        let binding_names = binding_names
-            .iter()
-            .map(|name| canonical_name(name))
-            .collect::<HashSet<_>>();
-        let mut affected_owners = Vec::<(Url, String)>::new();
-        for (uri, document) in &self.documents {
-            if !edited_uris.contains(uri) {
-                continue;
-            }
+        let normalized_name_bytes = binding_names.iter().map(|name| name.len()).sum::<usize>();
+        budget.require_work(binding_names.len(), cancel)?;
+        budget.require_owned_bytes(
+            normalized_name_bytes
+                .saturating_add(
+                    binding_names
+                        .len()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    binding_names
+                        .len()
+                        .saturating_mul(2 * std::mem::size_of::<usize>()),
+                ),
+            cancel,
+        )?;
+        let mut normalized_names = HashSet::with_capacity(binding_names.len());
+        for name in binding_names {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let normalized = canonical_name(name);
+            budget.require_owned_bytes(normalized.len(), cancel)?;
+            normalized_names.insert(normalized);
+        }
+        let binding_names = normalized_names;
+        let mut class_capacity = 0usize;
+        for document in self.documents.values() {
             for symbol in &document.symbols {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
@@ -2287,12 +2305,47 @@ impl NavigationIndex {
                     && symbol.type_kind == TypeKind::Class
                     && symbol.owner_type.is_none()
                     && symbol.generic_parameter.is_none()
-                    && document.symbols.iter().any(|member| {
-                        member.owner_type.as_deref() == Some(symbol.key.as_str())
-                            && member.kind == SymbolKind::Routine
-                            && binding_names.contains(&member.key)
-                    })
                 {
+                    class_capacity = class_capacity.saturating_add(1);
+                }
+            }
+        }
+        budget.require_owned_bytes(
+            class_capacity.saturating_mul(std::mem::size_of::<(Url, String)>()),
+            cancel,
+        )?;
+        let mut affected_owners = Vec::<(Url, String)>::with_capacity(class_capacity);
+        for (uri, document) in &self.documents {
+            if !edited_uris.contains(uri) {
+                continue;
+            }
+            for symbol in &document.symbols {
+                check_navigation_cancel(cancel)?;
+                budget.require_work(1, cancel)?;
+                let mut has_binding_member = false;
+                for member in &document.symbols {
+                    check_navigation_cancel(cancel)?;
+                    budget.require_work(1, cancel)?;
+                    if member.owner_type.as_deref() == Some(symbol.key.as_str())
+                        && member.kind == SymbolKind::Routine
+                        && binding_names.contains(&member.key)
+                    {
+                        has_binding_member = true;
+                        break;
+                    }
+                }
+                if symbol.kind == SymbolKind::Type
+                    && symbol.type_kind == TypeKind::Class
+                    && symbol.owner_type.is_none()
+                    && symbol.generic_parameter.is_none()
+                    && has_binding_member
+                {
+                    budget.require_owned_bytes(
+                        std::mem::size_of::<(Url, String)>()
+                            .saturating_add(uri.as_str().len())
+                            .saturating_add(symbol.key.len()),
+                        cancel,
+                    )?;
                     affected_owners.push((uri.clone(), symbol.key.clone()));
                 }
             }
@@ -2301,7 +2354,11 @@ impl NavigationIndex {
             return Ok(Vec::new());
         }
 
-        let mut fingerprints = Vec::new();
+        budget.require_owned_bytes(
+            class_capacity.saturating_mul(std::mem::size_of::<String>()),
+            cancel,
+        )?;
+        let mut fingerprints = Vec::with_capacity(class_capacity);
         for (uri, document) in &self.documents {
             for symbol in &document.symbols {
                 check_navigation_cancel(cancel)?;
@@ -2313,14 +2370,29 @@ impl NavigationIndex {
                 {
                     continue;
                 }
+                budget.require_owned_bytes(
+                    std::mem::size_of::<(Url, String)>()
+                        .saturating_add(uri.as_str().len())
+                        .saturating_add(symbol.key.len()),
+                    cancel,
+                )?;
                 let owner = (uri.clone(), symbol.key.clone());
-                let direct_member = document.symbols.iter().any(|member| {
-                    member.owner_type.as_deref() == Some(symbol.key.as_str())
+                let mut direct_member = false;
+                for member in &document.symbols {
+                    check_navigation_cancel(cancel)?;
+                    budget.require_work(1, cancel)?;
+                    if member.owner_type.as_deref() == Some(symbol.key.as_str())
                         && member.kind == SymbolKind::Routine
                         && binding_names.contains(&member.key)
-                });
+                    {
+                        direct_member = true;
+                        break;
+                    }
+                }
                 let mut related = direct_member;
                 for target in &affected_owners {
+                    check_navigation_cancel(cancel)?;
+                    budget.require_work(1, cancel)?;
                     if related {
                         break;
                     }
@@ -2368,12 +2440,21 @@ impl NavigationIndex {
                     else {
                         return Err("rename interface requirement disappeared".to_string());
                     };
-                    let requirement_id = self.source_symbol_fingerprint(
+                    let requirement_id = self.source_symbol_fingerprint_with_budget(
                         &obligation.requirement.candidate.uri,
                         requirement_symbol,
                         &binding_names,
-                    );
-                    let mut matches = Vec::new();
+                        cancel,
+                        budget,
+                    )?;
+                    budget.require_owned_bytes(
+                        surface
+                            .routines
+                            .len()
+                            .saturating_mul(std::mem::size_of::<String>()),
+                        cancel,
+                    )?;
+                    let mut matches = Vec::with_capacity(surface.routines.len());
                     let mut unknown = false;
                     for candidate in surface
                         .routines
@@ -2410,11 +2491,15 @@ impl NavigationIndex {
                             ContractMatch::Yes if candidate_symbol.routine_directives.abstract_ => {
                                 unknown = true;
                             }
-                            ContractMatch::Yes => matches.push(self.source_symbol_fingerprint(
-                                &candidate.candidate.uri,
-                                candidate_symbol,
-                                &binding_names,
-                            )),
+                            ContractMatch::Yes => {
+                                matches.push(self.source_symbol_fingerprint_with_budget(
+                                    &candidate.candidate.uri,
+                                    candidate_symbol,
+                                    &binding_names,
+                                    cancel,
+                                    budget,
+                                )?)
+                            }
                             ContractMatch::No => {}
                             ContractMatch::Unknown => unknown = true,
                         }
@@ -2427,6 +2512,21 @@ impl NavigationIndex {
                     } else {
                         "implemented"
                     };
+                    budget.require_owned_bytes(
+                        std::mem::size_of::<String>()
+                            .saturating_add(uri.as_str().len())
+                            .saturating_add(symbol.key.len())
+                            .saturating_add(requirement_id.len())
+                            .saturating_add(status.len())
+                            .saturating_add(
+                                matches
+                                    .iter()
+                                    .map(|matched| matched.len().saturating_add(4))
+                                    .sum::<usize>(),
+                            )
+                            .saturating_add(32),
+                        cancel,
+                    )?;
                     fingerprints.push(format!(
                         "{}|{}|{}|{}",
                         uri,
@@ -14622,11 +14722,22 @@ fn type_ancestry_contains(
     Ok(false)
 }
 
-fn normalize_fingerprint_header(source: &str, binding_names: &HashSet<String>) -> String {
+fn normalize_fingerprint_header_with_budget(
+    source: &str,
+    binding_names: &HashSet<String>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<String, String> {
+    budget.require_owned_bytes(
+        source.len().saturating_add(std::mem::size_of::<String>()),
+        cancel,
+    )?;
     let mut normalized = String::with_capacity(source.len());
     let mut cursor = 0;
     let bytes = source.as_bytes();
     while cursor < bytes.len() {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
         let is_identifier_start = bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_';
         if !is_identifier_start {
             let next = cursor + source[cursor..].chars().next().unwrap().len_utf8();
@@ -14642,31 +14753,47 @@ fn normalize_fingerprint_header(source: &str, binding_names: &HashSet<String>) -
             cursor += 1;
         }
         let token = &source[start..cursor];
-        if binding_names.contains(&canonical_name(token)) {
+        budget.require_owned_bytes(token.len(), cancel)?;
+        let canonical = canonical_name(token);
+        if binding_names.contains(&canonical) {
             normalized.push_str("<renamed>");
         } else {
             normalized.push_str(token);
         }
     }
-    normalized
+    Ok(normalized)
 }
 
 impl NavigationIndex {
-    fn source_symbol_fingerprint(
+    fn source_symbol_fingerprint_with_budget(
         &self,
         uri: &Url,
         symbol: &Symbol,
         binding_names: &HashSet<String>,
-    ) -> String {
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<String, String> {
         let header = symbol
             .routine_header_span
             .and_then(|span| self.documents.get(uri)?.source.get(span.start..span.end))
-            .map(|source| normalize_fingerprint_header(source, binding_names))
+            .map(|source| {
+                normalize_fingerprint_header_with_budget(source, binding_names, cancel, budget)
+            })
+            .transpose()?
             .unwrap_or_default();
-        format!(
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(
+            std::mem::size_of::<String>()
+                .saturating_add(uri.as_str().len())
+                .saturating_add(header.len())
+                .saturating_add(symbol.owner_type.as_ref().map_or(0, String::len))
+                .saturating_add(128),
+            cancel,
+        )?;
+        Ok(format!(
             "{uri}|owner={:?}|origin={:?}|kind={:?}|header={header}",
             symbol.owner_type, symbol.origin, symbol.kind
-        )
+        ))
     }
 }
 

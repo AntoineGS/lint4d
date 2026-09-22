@@ -3413,13 +3413,78 @@ fn post_edit_rebind_proof(
             .sum(),
         cancel,
     )?;
-    budget.require_owned_bytes(raw_edit_owned_bytes, cancel)?;
+    budget.require_owned_bytes(
+        raw_edit_owned_bytes.saturating_add(
+            raw_edits
+                .len()
+                .saturating_mul(std::mem::size_of::<Url>() * 2),
+        ),
+        cancel,
+    )?;
+    budget.require_owned_bytes(
+        raw_edits
+            .keys()
+            .map(|uri| uri.as_str().len())
+            .sum::<usize>()
+            .saturating_add(
+                raw_edits
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Url>() * 2),
+            ),
+        cancel,
+    )?;
     let edited_uris = raw_edits.keys().cloned().collect::<HashSet<_>>();
+    // Physical include edits affect every expanded root that retained the
+    // source. Contract proof must use those semantic roots, not only the
+    // physical files that receive text edits.
+    budget.require_owned_bytes(
+        edited_uris
+            .iter()
+            .map(|uri| uri.as_str().len())
+            .sum::<usize>()
+            .saturating_add(
+                edited_uris
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Url>() * 2),
+            ),
+        cancel,
+    )?;
+    let mut contract_edited_uris = edited_uris.clone();
+    for edit_uri in &edited_uris {
+        budget.require_work(1, cancel)?;
+        for (root_uri, expansion) in &snapshot.expansions {
+            budget.require_work(1, cancel)?;
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if expansion.source_texts.contains_key(edit_uri)
+                && !contract_edited_uris.contains(root_uri)
+            {
+                budget.require_owned_bytes(
+                    std::mem::size_of::<Url>().saturating_add(root_uri.as_str().len()),
+                    cancel,
+                )?;
+                contract_edited_uris.insert(root_uri.clone());
+            }
+        }
+    }
+    budget.require_owned_bytes(
+        binding_names
+            .iter()
+            .map(|name| name.len())
+            .sum::<usize>()
+            .saturating_add(
+                binding_names
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>() * 2),
+            ),
+        cancel,
+    )?;
     let binding_names = binding_names.iter().cloned().collect::<HashSet<_>>();
     let expected_contracts = snapshot
         .index
         .rename_interface_contract_fingerprints_with_budget(
-            &edited_uris,
+            &contract_edited_uris,
             &binding_names,
             cancel,
             &mut budget,
@@ -3458,13 +3523,10 @@ fn post_edit_rebind_proof(
             .get(&edit_uri)
             .ok_or_else(|| format!("rename post-edit source was not retained: {edit_uri}"))?;
         if !source_indices.contains_key(&edit_uri) {
-            budget.require_work(source.len(), cancel)?;
-            budget.require_owned_bytes(
-                source
-                    .len()
-                    .saturating_mul(std::mem::size_of::<usize>() * 2),
-                cancel,
-            )?;
+            budget.require_work(source.len().saturating_mul(2), cancel)?;
+            let index_bytes = PositionIndex::owned_bytes_upper_bound_with_cancel(source, cancel)
+                .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+            budget.require_owned_bytes(index_bytes, cancel)?;
             let index = PositionIndex::new_with_cancel(source, cancel)
                 .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
             source_indices.insert(edit_uri.clone(), index);
@@ -3485,6 +3547,10 @@ fn post_edit_rebind_proof(
                 return Err("rename post-edit range is invalid".to_string());
             }
             let mut matches = Vec::new();
+            let expansion_has_source = snapshot
+                .expansions
+                .values()
+                .any(|expansion| expansion.source_texts.contains_key(&edit_uri));
             for (root_uri, expansion) in &snapshot.expansions {
                 budget.require_work(1, cancel)?;
                 if !expansion.source_texts.contains_key(&edit_uri) {
@@ -3512,6 +3578,12 @@ fn post_edit_rebind_proof(
                 );
             }
             let Some((root_uri, virtual_range)) = matches.into_iter().next() else {
+                if expansion_has_source {
+                    return Err(
+                        "rename post-edit physical include range has an unknown virtual owner"
+                            .to_string(),
+                    );
+                }
                 if owner.is_some() {
                     return Err("rename post-edit edits have mixed include ownership".to_string());
                 }
@@ -3528,13 +3600,11 @@ fn post_edit_rebind_proof(
             let virtual_source = expansion.expanded.text();
             let owner_uri = owner.as_ref().expect("include owner was set");
             if !virtual_indices.contains_key(owner_uri) {
-                budget.require_work(virtual_source.len(), cancel)?;
-                budget.require_owned_bytes(
-                    virtual_source
-                        .len()
-                        .saturating_mul(std::mem::size_of::<usize>() * 2),
-                    cancel,
-                )?;
+                budget.require_work(virtual_source.len().saturating_mul(2), cancel)?;
+                let index_bytes =
+                    PositionIndex::owned_bytes_upper_bound_with_cancel(virtual_source, cancel)
+                        .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
+                budget.require_owned_bytes(index_bytes, cancel)?;
                 let index = PositionIndex::new_with_cancel(virtual_source, cancel)
                     .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
                 virtual_indices.insert(owner_uri.clone(), index);
@@ -3637,7 +3707,7 @@ fn post_edit_rebind_proof(
         &mut budget,
     )?;
     let actual_contracts = rebound.rename_interface_contract_fingerprints_with_budget(
-        &edited_uris,
+        &contract_edited_uris,
         &binding_names,
         cancel,
         &mut budget,
@@ -3684,8 +3754,10 @@ fn apply_text_edits_for_proof(
     budget: &mut AssistanceBudget,
 ) -> Result<(String, Vec<Range>), String> {
     let replacement_bytes = edits.iter().map(|edit| edit.new_text.len()).sum::<usize>();
-    budget.require_work(source.len(), cancel)?;
+    budget.require_work(source.len().saturating_mul(2), cancel)?;
     budget.require_work(edits.len(), cancel)?;
+    let source_index_bytes = PositionIndex::owned_bytes_upper_bound_with_cancel(source, cancel)
+        .map_err(|()| CANCELLATION_MESSAGE.to_string())?;
     budget.require_owned_bytes(
         source
             .len()
@@ -3699,6 +3771,7 @@ fn apply_text_edits_for_proof(
             .saturating_add(replacement_bytes),
         cancel,
     )?;
+    budget.require_owned_bytes(source_index_bytes, cancel)?;
     let source_index = PositionIndex::new_with_cancel(source, cancel)
         .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
     let mut replacements = Vec::<(usize, usize, String, Range)>::with_capacity(edits.len());
@@ -3759,6 +3832,10 @@ fn apply_text_edits_for_proof(
         cursor = *end;
     }
     result.push_str(&source[cursor..]);
+    budget.require_work(result_len.saturating_mul(2), cancel)?;
+    let result_index_bytes = PositionIndex::owned_bytes_upper_bound_with_cancel(&result, cancel)
+        .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
+    budget.require_owned_bytes(result_index_bytes, cancel)?;
     let result_index = PositionIndex::new_with_cancel(&result, cancel)
         .map_err(|_| CANCELLATION_MESSAGE.to_string())?;
     let mut ranges = Vec::with_capacity(replacements.len());
@@ -8868,6 +8945,26 @@ mod tests {
             .expect_err("large source scanning must consume actual byte work");
         assert!(
             error.contains("post-edit budget test") || error.contains("traversal limit"),
+            "unexpected bounded-work error: {error}"
+        );
+    }
+
+    #[test]
+    fn post_edit_proof_admits_position_index_storage_before_building_it() {
+        let source = format!("{}x\n", "\n".repeat(2_048));
+        let edits = vec![TextEdit::new(
+            Range::new(Position::new(2_048, 0), Position::new(2_048, 1)),
+            "y".to_string(),
+        )];
+        let cancel = AtomicBool::new(false);
+        let mut budget =
+            AssistanceBudget::new(32_768, 100_000, "position-index allocation budget test");
+        let error = apply_text_edits_for_proof(&source, &edits, &cancel, &mut budget)
+            .expect_err("line-heavy position indexes must be admitted before allocation");
+        assert!(
+            error.contains("position-index allocation budget test")
+                || error.contains("byte")
+                || error.contains("limit"),
             "unexpected bounded-work error: {error}"
         );
     }

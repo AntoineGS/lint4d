@@ -19951,6 +19951,202 @@ end.
 }
 
 #[test]
+fn workspace_rename_rejects_an_applied_include_interface_break() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main_path = root.join("Probe.pas");
+    let declarations_path = root.join("Decls.inc");
+    let bodies_path = root.join("Bodies.inc");
+    let main = "unit Probe;
+interface
+{$I Decls.inc}
+implementation
+{$I Bodies.inc}
+end.
+";
+    let declarations = "type
+  TObject = class
+  end;
+  IFoo = interface
+    procedure Work;
+  end;
+  TBase = class(TObject, IFoo)
+    procedure Work; virtual;
+  end;
+";
+    let bodies = "procedure TBase.Work; begin end;
+";
+    write_file(&main_path, main);
+    write_file(&declarations_path, declarations);
+    write_file(&bodies_path, bodies);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&declarations_path),
+        position_of(declarations, "Work; virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "applying include-only edits must preserve the expanded interface contract"
+    );
+}
+
+#[test]
+fn workspace_rename_accepts_a_valid_same_owner_include_edit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main_path = root.join("Probe.pas");
+    let declarations_path = root.join("Decls.inc");
+    let bodies_path = root.join("Bodies.inc");
+    let main = "unit Probe;
+interface
+{$I Decls.inc}
+implementation
+{$I Bodies.inc}
+end.
+";
+    let declarations = "type
+  TBase = class
+    procedure Work; virtual;
+  end;
+";
+    let bodies = "procedure TBase.Work; begin end;
+";
+    write_file(&main_path, main);
+    write_file(&declarations_path, declarations);
+    write_file(&bodies_path, bodies);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&declarations_path),
+            position_of(declarations, "Work; virtual", 0),
+            "RunWork",
+            false,
+        )
+        .expect("a valid same-owner include edit should succeed");
+    let edit = serde_json::to_value(edit).expect("workspace edit serialization");
+    assert_eq!(
+        workspace_edit_uris(&edit),
+        HashSet::from([
+            uri(&declarations_path).to_string(),
+            uri(&bodies_path).to_string(),
+        ])
+    );
+    assert_eq!(
+        apply_workspace_edit_to_source(declarations, &edit, &uri(&declarations_path),)
+            .matches("RunWork")
+            .count(),
+        1
+    );
+    assert_eq!(
+        apply_workspace_edit_to_source(bodies, &edit, &uri(&bodies_path))
+            .matches("RunWork")
+            .count(),
+        1
+    );
+}
+
+fn two_virtual_overload_slots_source() -> &'static str {
+    "unit TwoVirtualOverloads;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); overload; virtual;
+    procedure Work(Value: string); overload; virtual;
+  end;
+  TChild = class(TBase)
+    procedure Work(Value: Integer); overload; override;
+    procedure Work(Value: string); overload; override;
+  end;
+procedure Exercise(B: TBase);
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TBase.Work(Value: string); begin end;
+procedure TChild.Work(Value: Integer); begin end;
+procedure TChild.Work(Value: string); begin end;
+procedure Exercise(B: TBase);
+begin
+  B.Work(1);
+  B.Work('x');
+end;
+end.
+"
+}
+
+#[test]
+fn workspace_rename_selects_one_virtual_overload_slot_across_overrides() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("TwoVirtualOverloads.pas");
+    let source = two_virtual_overload_slots_source();
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(source, "Work(Value: Integer)", 0),
+            "RunWork",
+            true,
+        )
+        .expect("the selected integer virtual slot is exact");
+    let updated = apply_workspace_edit_to_source(
+        source,
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        &uri(&source_path),
+    );
+    assert_eq!(
+        updated.matches("procedure RunWork(Value: Integer)").count(),
+        2
+    );
+    assert_eq!(
+        updated
+            .matches("procedure TBase.RunWork(Value: Integer)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        updated
+            .matches("procedure TChild.RunWork(Value: Integer)")
+            .count(),
+        1
+    );
+    assert_eq!(updated.matches("procedure Work(Value: string)").count(), 2);
+    assert!(updated.contains("B.RunWork(1)"));
+    assert!(updated.contains("B.Work('x')"));
+}
+
+#[test]
+fn workspace_rename_resolves_a_virtual_overload_call_to_one_slot() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("TwoVirtualOverloads.pas");
+    let source = two_virtual_overload_slots_source();
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(source, "Work(1)", 0),
+            "RunWork",
+            true,
+        )
+        .expect("the integer call resolves to one virtual overload slot");
+    let updated = apply_workspace_edit_to_source(
+        source,
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        &uri(&source_path),
+    );
+    assert!(updated.contains("B.RunWork(1)"));
+    assert!(updated.contains("B.Work('x')"));
+    assert_eq!(updated.matches("procedure Work(Value: string)").count(), 2);
+}
+
+#[test]
 fn workspace_rename_supports_an_exact_virtual_overload_slot() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace");

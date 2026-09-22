@@ -10693,7 +10693,12 @@ impl NavigationIndex {
 
         let region = current_document.region_at(offset);
         let mut best = None;
-        if let Some(prefix_len) = matching_unit_prefix_len(&current_document.unit_name, parts) {
+        if let Some(prefix_len) = matching_unit_prefix_len_with_budget(
+            &current_document.unit_name,
+            parts,
+            cancel,
+            budget,
+        )? {
             budget.require_work(1, cancel)?;
             budget.require_bytes(current_uri.as_str().len(), cancel)?;
             best = Some((prefix_len, vec![current_uri.clone()]));
@@ -10702,7 +10707,9 @@ impl NavigationIndex {
         let active_uses = current_document.active_uses_with_budget(region, cancel, budget)?;
         for used in active_uses {
             check_navigation_cancel(cancel)?;
-            let Some(prefix_len) = matching_unit_prefix_len(used, parts) else {
+            let Some(prefix_len) =
+                matching_unit_prefix_len_with_budget(used, parts, cancel, budget)?
+            else {
                 continue;
             };
             if best
@@ -18256,22 +18263,57 @@ fn qualified_name_parts_with_budget(
     Ok(Some(parts))
 }
 
-fn matching_unit_prefix_len(unit_name: &str, parts: &[String]) -> Option<usize> {
-    let unit_parts = unit_name.split('.').filter(|part| !part.is_empty());
-    let unit_part_count = unit_parts.clone().count();
-    if unit_part_count >= parts.len()
-        || !unit_parts
-            .zip(parts)
-            .all(|(unit_part, path_part)| canonical_name_eq(unit_part, path_part))
-    {
-        return None;
+fn matching_unit_prefix_len_with_budget(
+    unit_name: &str,
+    parts: &[String],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<usize>, String> {
+    if parts.is_empty() {
+        return Ok(None);
     }
-    Some(unit_part_count)
+
+    // The spelling is already owned by the parsed document. Charge its full
+    // source representation before walking it, rather than allocating a
+    // normalized component vector and charging after the fact. This makes
+    // repeated prefix probes consume the shared request byte budget.
+    budget.require_bytes(unit_name.len(), cancel)?;
+
+    let mut unit_part_count = 0;
+    for unit_part in unit_name.split('.').filter(|part| !part.is_empty()) {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        check_navigation_cancel(cancel)?;
+        if unit_part_count >= parts.len() {
+            return Ok(None);
+        }
+        if !canonical_name_eq_with_cancel(unit_part, &parts[unit_part_count], cancel)? {
+            return Ok(None);
+        }
+        unit_part_count = unit_part_count.saturating_add(1);
+        check_navigation_cancel(cancel)?;
+    }
+
+    Ok((unit_part_count < parts.len()).then_some(unit_part_count))
 }
 
-fn canonical_name_eq(left: &str, right: &str) -> bool {
-    left.trim_start_matches('&')
-        .eq_ignore_ascii_case(right.trim_start_matches('&'))
+fn canonical_name_eq_with_cancel(
+    left: &str,
+    right: &str,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let mut left = left.trim_start_matches('&').chars();
+    let mut right = right.trim_start_matches('&').chars();
+    loop {
+        check_navigation_cancel(cancel)?;
+        match (left.next(), right.next()) {
+            (Some(left), Some(right)) if left == right => {}
+            (Some(left), Some(right))
+                if left.is_ascii() && right.is_ascii() && left.eq_ignore_ascii_case(&right) => {}
+            (None, None) => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
 }
 
 pub(super) fn node_text_with_budget<'a>(
@@ -20734,6 +20776,161 @@ mod tests {
             visits <= 16,
             "inner unit-path traversal ignored cancellation until {visits} nodes"
         );
+    }
+
+    #[test]
+    fn unit_prefix_matching_charges_long_import_spellings_before_repeated_scans() {
+        let uri = Url::parse("file:///tmp/long-unit-prefix-spellings.pas").expect("fixture URI");
+        let import_names = (0..4)
+            .map(|index| {
+                format!(
+                    "LongNamespaceComponentThatIsNotTheQuery{index}.LongProviderComponentThatIsAlsoNotTheQuery{index}"
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut source = String::from("unit PrefixBudgetConsumer;\ninterface\nuses ");
+        source.push_str(&import_names.join(", "));
+        source.push_str(";\nimplementation\nend.\n");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source)
+            .expect("long import spelling fixture parses");
+        let document = index.documents.get(&uri).expect("consumer document");
+        let parts = vec!["MissingQueryPrefix".to_owned(), "Member".to_owned()];
+        let existing_bytes = document.unit_name.len().saturating_add(
+            document
+                .interface_uses
+                .len()
+                .saturating_mul(std::mem::size_of::<&String>()),
+        );
+        let spelling_bytes = document
+            .interface_uses
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        let per_scan_bytes = existing_bytes.saturating_add(spelling_bytes);
+        let mut budget = AssistanceBudget::new(
+            100_000,
+            per_scan_bytes.saturating_mul(2).saturating_sub(1),
+            "unit-prefix spelling test",
+        );
+        let cancel = AtomicBool::new(false);
+
+        let first_scan = index
+            .longest_visible_unit_prefix_with_budget(
+                &uri,
+                document,
+                0,
+                &parts,
+                &cancel,
+                &mut budget,
+            )
+            .expect("the first full spelling scan fits its byte allowance");
+        assert_eq!(first_scan, None);
+
+        let error = index
+            .longest_visible_unit_prefix_with_budget(
+                &uri,
+                document,
+                0,
+                &parts,
+                &cancel,
+                &mut budget,
+            )
+            .expect_err("repeated long import spellings must consume scan bytes");
+        assert!(
+            error.contains("unit-prefix spelling test exceeds"),
+            "unexpected spelling-budget error: {error}"
+        );
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn unit_prefix_matching_honors_cancellation_during_component_comparison() {
+        let uri =
+            Url::parse("file:///tmp/cancellable-unit-prefix-spelling.pas").expect("fixture URI");
+        let source = concat!(
+            "unit Current.Namespace;\n",
+            "interface\n",
+            "uses First.Long.Import, Second.Long.Import;\n",
+            "implementation\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("cancellable import spelling fixture parses");
+        let document = index.documents.get(&uri).expect("consumer document");
+        let parts = vec![
+            "Current".to_owned(),
+            "Other".to_owned(),
+            "Member".to_owned(),
+        ];
+        let pre_match_work = parts.len().saturating_add(1) + document.interface_uses.len();
+        let mut budget = AssistanceBudget::new(
+            100_000,
+            8 * 1024 * 1024,
+            "cancellable unit-prefix spelling test",
+        );
+        budget.cancel_after_work(pre_match_work.saturating_add(1));
+        let error = index
+            .longest_visible_unit_prefix_with_budget(
+                &uri,
+                document,
+                0,
+                &parts,
+                &AtomicBool::new(false),
+                &mut budget,
+            )
+            .expect_err("matching must poll cancellation during spelling comparison");
+        assert_eq!(error, "request cancelled");
+    }
+
+    #[test]
+    fn unit_prefix_matching_preserves_short_case_alias_and_namespaced_mapping() {
+        let provider_uri =
+            Url::parse("file:///tmp/unit-prefix-controls/Vendor.Core.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/unit-prefix-controls/Consumer.pas").expect("consumer URI");
+        let provider = "unit Vendor.Core;\ninterface\nconst Value = 1;\nimplementation\nend.\n";
+        let consumer = concat!(
+            "unit Consumer;\n",
+            "interface\n",
+            "uses Alias.Core;\n",
+            "implementation\n",
+            "end.\n",
+        );
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider.to_owned())
+            .expect("provider fixture parses");
+        index
+            .update(consumer_uri.clone(), consumer.to_owned())
+            .expect("consumer fixture parses");
+        index.bind_imports(
+            &consumer_uri,
+            [("Alias.Core".to_owned(), provider_uri.clone())],
+        );
+
+        let document = index
+            .documents
+            .get(&consumer_uri)
+            .expect("consumer document");
+        let parts = vec!["alias".to_owned(), "CORE".to_owned(), "Value".to_owned()];
+        let mut budget = AssistanceBudget::new(100_000, 8 * 1024 * 1024, "unit-prefix control");
+        let result = index
+            .longest_visible_unit_prefix_with_budget(
+                &consumer_uri,
+                document,
+                0,
+                &parts,
+                &AtomicBool::new(false),
+                &mut budget,
+            )
+            .expect("short case-insensitive alias path resolves");
+        assert_eq!(result, Some((2, vec![provider_uri])));
     }
 
     #[test]

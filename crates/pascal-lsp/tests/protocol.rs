@@ -30262,6 +30262,29 @@ fn will_rename_unit_returns_versioned_atomic_edits_before_client_owned_move() {
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0]["uri"], uri(&new_provider).to_string());
     server.shutdown();
+
+    // Verify the client-applied edits and physical move against a fresh
+    // project discovery/index, not the prior workspace's synthetic rebind.
+    let mut fresh_server = TestServer::launch();
+    let fresh_initialize_id = RequestId::from("fresh-project-after-unit-move-init".to_string());
+    fresh_server.send_request(
+        fresh_initialize_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{}}),
+    );
+    assert!(fresh_server.response(&fresh_initialize_id).error.is_none());
+    fresh_server.send_notification("initialized", json!({}));
+    let fresh_definition_id =
+        RequestId::from("fresh-project-after-unit-move-definition".to_string());
+    fresh_server.send_request(
+        fresh_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let fresh_locations = result_locations(fresh_server.response(&fresh_definition_id));
+    assert_eq!(fresh_locations.len(), 1);
+    assert_eq!(fresh_locations[0]["uri"], uri(&new_provider).to_string());
+    fresh_server.shutdown();
 }
 
 #[test]
@@ -30449,8 +30472,12 @@ fn will_rename_unit_plans_a_versioned_open_provider_overlay_transition() {
     let source = "unit Provider;\ninterface\nimplementation\nend.\n";
     write_file(&provider, source);
     write_file(
+        &root.join("Main.pas"),
+        "unit Main;\ninterface\nimplementation\nend.\n",
+    );
+    write_file(
         &root.join("App.dproj"),
-        "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
     );
     let mut server = TestServer::launch();
     let initialize_id = RequestId::from("file-rename-open-provider-init".to_string());
@@ -30485,6 +30512,192 @@ fn will_rename_unit_plans_a_versioned_open_provider_overlay_transition() {
         change["textDocument"]["uri"] == uri(&provider).to_string()
             && change["textDocument"]["version"] == 1
     }));
+    server.shutdown();
+}
+
+#[test]
+fn will_rename_unit_rejects_provider_paths_owned_by_project_metadata() {
+    let cases = [
+        (
+            "main-source",
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+            false,
+            false,
+        ),
+        (
+            "explicit-unit-reference",
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Provider.pas\" /></ItemGroup></Project>",
+            true,
+            false,
+        ),
+        (
+            "package-contains-path",
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UsePackage>MyPackage</DCC_UsePackage></PropertyGroup></Project>",
+            true,
+            true,
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for (case_name, project_xml, has_main, has_package) in cases {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let source = "unit Provider;\ninterface\nimplementation\nend.\n";
+        write_file(&provider, source);
+        if has_main {
+            write_file(
+                &root.join("Main.pas"),
+                "unit Main;\ninterface\nimplementation\nend.\n",
+            );
+        }
+        if has_package {
+            write_file(
+                &root.join("MyPackage.dpk"),
+                "package MyPackage; contains Provider in 'Provider.pas'; end.",
+            );
+        }
+        write_file(&root.join("App.dproj"), project_xml);
+        let mut server = TestServer::launch();
+        let initialize_id = RequestId::from(format!("metadata-rename-init-{case_name}"));
+        server.send_request(
+            initialize_id.clone(),
+            "initialize",
+            json!({"processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}}}),
+        );
+        assert!(server.response(&initialize_id).error.is_none());
+        server.send_notification("initialized", json!({}));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":source}}),
+        );
+        let request_id = RequestId::from(format!("metadata-rename-{case_name}"));
+        server.send_request(
+            request_id.clone(),
+            "workspace/willRenameFiles",
+            json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&root.join("Renamed.pas"))}]}),
+        );
+        let response = server.response(&request_id);
+        outcomes.push((
+            case_name,
+            response.error.is_some(),
+            response.result.is_none(),
+        ));
+        server.shutdown();
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            ("main-source", true, true),
+            ("explicit-unit-reference", true, true),
+            ("package-contains-path", true, true),
+        ],
+        "file rename must fail atomically while project metadata still names the old provider: {outcomes:?}"
+    );
+}
+
+#[test]
+fn did_rename_round_trip_revalidates_a_reused_uri_pair_without_will_plan() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let path_a = root.join("A.pas");
+    let path_b = root.join("B.pas");
+    let consumer = root.join("Consumer.pas");
+    let main = root.join("Main.pas");
+    let source_a = "unit A;\ninterface\ntype TIdentity = class end;\nimplementation\nend.\n{one}\n";
+    let source_b = source_a.replace("unit A;", "unit B;");
+    let consumer_a =
+        "unit Consumer;\ninterface\nuses A;\ntype TAlias = A.TIdentity;\nimplementation\nend.\n";
+    let consumer_b = consumer_a.replace("A", "B");
+    write_file(&path_a, source_a);
+    write_file(&consumer, consumer_a);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("rename-round-trip-init".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{}}),
+    );
+    assert!(server.response(&initialize_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_a}}),
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":2},"contentChanges":[{"text":consumer_b}]}),
+    );
+    write_file(&path_a, &source_b);
+    fs::rename(&path_a, &path_b).expect("client-owned A-to-B move");
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&path_a),"newUri":uri(&path_b)}]}),
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":3},"contentChanges":[{"text":consumer_a}]}),
+    );
+    write_file(&path_b, source_a);
+    fs::rename(&path_b, &path_a).expect("client-owned B-to-A move");
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&path_b),"newUri":uri(&path_a)}]}),
+    );
+
+    // A late duplicate of the original A-to-B event arrives after the
+    // round-trip; it must not poison freshness for the upcoming real reuse.
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&path_a),"newUri":uri(&path_b)}]}),
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":4},"contentChanges":[{"text":consumer_b}]}),
+    );
+    write_file(&path_a, &source_b);
+    fs::rename(&path_a, &path_b).expect("client-owned repeated A-to-B move");
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&path_a),"newUri":uri(&path_b)}]}),
+    );
+
+    let same_size_changed_source = source_b.replace("{one}", "{two}");
+    assert_eq!(same_size_changed_source.len(), source_b.len());
+    write_file(&path_b, &same_size_changed_source);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&path_b),"type":2}]}),
+    );
+
+    let definition_id = RequestId::from("rename-round-trip-final-provider".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_b, "TIdentity", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "final provider identity must refresh after A→B→A→B"
+    );
+    assert_eq!(locations[0]["uri"], uri(&path_b).to_string());
+    assert!(!path_a.exists());
+    assert_eq!(
+        fs::read_to_string(&path_b).expect("final provider file"),
+        same_size_changed_source
+    );
     server.shutdown();
 }
 

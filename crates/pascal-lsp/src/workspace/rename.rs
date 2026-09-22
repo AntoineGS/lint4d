@@ -3132,6 +3132,27 @@ pub(crate) fn prepare_from_input(
     }
 }
 
+fn unit_provider_path_is_project_metadata(context: &ProjectContext, provider_uri: &Url) -> bool {
+    let Some(provider_path) = provider_uri.to_file_path().ok().map(absolute_path) else {
+        return true;
+    };
+    let provider_key = path_key(&provider_path);
+    context
+        .main_source
+        .as_deref()
+        .is_some_and(|path| path_key(&absolute_path(path.to_path_buf())) == provider_key)
+        || context
+            .explicit_units
+            .values()
+            .flatten()
+            .any(|path| path_key(&absolute_path(path.clone())) == provider_key)
+}
+
+fn is_package_descriptor_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dpk"))
+}
+
 pub(crate) fn rename_from_input(
     input: WorkspaceInput,
     uri: &Url,
@@ -3278,7 +3299,7 @@ fn rename_from_input_impl(
     } else {
         &[]
     };
-    let snapshot = match build_snapshot(
+    let mut snapshot = match build_snapshot(
         &input,
         std::slice::from_ref(&uri),
         &candidate_names,
@@ -3304,6 +3325,41 @@ fn rename_from_input_impl(
             value: Err(error),
             records: Vec::new(),
         };
+    }
+    if allow_unit {
+        let (context, project_records) =
+            match project_context_and_metadata_for_input(&input, &uri, cancel) {
+                Ok(result) => result,
+                Err(error) => {
+                    return failed(
+                        source_generation,
+                        configuration_generation,
+                        format!(
+                            "unit rename cannot prove selected project path membership: {error}"
+                        ),
+                    );
+                }
+            };
+        // Project/package source-path references are not part of the semantic
+        // text edit plan. Fail closed instead of leaving `MainSource`, an
+        // explicit unit path, or a package `contains ... in` path pointing at
+        // the pre-move URI.
+        if unit_provider_path_is_project_metadata(&context, &uri)
+            || !context.packages.is_empty()
+            || project_records.iter().any(|record| {
+                record
+                    .path
+                    .as_deref()
+                    .is_some_and(is_package_descriptor_path)
+            })
+        {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit provider is named by project main/reference/package metadata; updating those path consumers is unsupported".to_string(),
+            );
+        }
+        snapshot.baseline_records.extend(project_records);
     }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);

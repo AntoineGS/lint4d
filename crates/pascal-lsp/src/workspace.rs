@@ -54,7 +54,6 @@ const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
 const MAX_PENDING_FILE_RENAMES: usize = 64;
 const MAX_PENDING_FILE_RENAME_BYTES: usize = 8 * 1024 * 1024;
-const MAX_COMPLETED_FILE_RENAMES: usize = 128;
 const MAX_INCLUDE_OWNER_DISCOVERY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1468,7 +1467,6 @@ pub struct Workspace {
     open_documents: HashMap<Url, OpenDocument>,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
     pending_unit_file_rename_bytes: usize,
-    completed_file_renames: VecDeque<(Url, Url)>,
     indexed_files: HashSet<Url>,
     indexed_sizes: HashMap<Url, usize>,
     indexed_bytes: usize,
@@ -2658,8 +2656,6 @@ impl Workspace {
         } else {
             (None, None, None)
         };
-        self.completed_file_renames
-            .retain(|(old, new)| old != &old_uri || new != &new_uri);
         self.pending_unit_file_renames.insert(
             old_uri,
             PendingUnitFileRename {
@@ -2691,13 +2687,6 @@ impl Workspace {
     pub(crate) fn did_rename_file(&mut self, old_uri: &Url, new_uri: &Url) -> Vec<Url> {
         let old_uri = canonical_file_uri(old_uri);
         let new_uri = canonical_file_uri(new_uri);
-        if self
-            .completed_file_renames
-            .iter()
-            .any(|(old, new)| old == &old_uri && new == &new_uri)
-        {
-            return Vec::new();
-        }
         let pending = self
             .pending_unit_file_renames
             .get(&old_uri)
@@ -2735,10 +2724,6 @@ impl Workspace {
         }
         let mut affected = self.file_event(&old_uri, FileChange::Deleted);
         affected.extend(self.file_event(&new_uri, FileChange::Created));
-        self.completed_file_renames.push_back((old_uri, new_uri));
-        while self.completed_file_renames.len() > MAX_COMPLETED_FILE_RENAMES {
-            self.completed_file_renames.pop_front();
-        }
         affected
     }
 

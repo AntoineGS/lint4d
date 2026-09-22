@@ -1185,7 +1185,10 @@ and match a simple unnamespaced unit name and basename. The new basename must be
 a valid unit identifier, the extension must be one of `.pas`, `.pp`, or
 `.pascal` and remain unchanged, the destination must be in the same authorized
 directory and not exist, and one complete unambiguous project-selected binding
-family must be provable. Explicit `uses ... in 'path'` files, aliases, namespace
+family must be provable. Providers that are a selected `MainSource`, a
+`DCCReference`/explicit unit path, or belong to a project with package metadata
+are rejected because updating those project/package path consumers is not yet
+supported. Explicit `uses ... in 'path'` files, aliases, namespace
   declarations, cross-directory moves, case-only renames, multi-file/directory
   moves, open/rejected destination overlays, and unresolved includes/conditional
 or ownership uncertainty fail as a whole. The returned `documentChanges` are
@@ -1200,8 +1203,10 @@ loaded-source observations, negative path observations, and affected
 diagnostics are invalidated/refreshed, including for unopened sources; events
 do not synthesize/delete imports or mutate physical files. File-operation
 notifications accept bounded batches of at most 64 unique file URIs and reject
-malformed batches before applying any entry. `didRenameFiles` is idempotent for
-recent duplicate old/new pairs. A pending, successful unit `willRenameFiles`
+malformed batches before applying any entry. Repeated old/new rename pairs
+conservatively invalidate and refresh again instead of being suppressed by URI
+pair alone; a later real reuse of those paths therefore cannot be mistaken for
+a stale duplicate. A pending, successful unit `willRenameFiles`
 plan can transfer an open provider overlay only when the current text exactly
 matches the planned edits, the source identity is unchanged, and the document
 version advanced beyond its planned version before `didRenameFiles`. Keep the

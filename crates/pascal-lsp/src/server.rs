@@ -8302,6 +8302,9 @@ fn request_requires_configuration(method: &str) -> bool {
             | "textDocument/definition"
             | "textDocument/implementation"
             | "textDocument/formatting"
+            | "workspace/willCreateFiles"
+            | "workspace/willRenameFiles"
+            | "workspace/willDeleteFiles"
     )
 }
 
@@ -8314,6 +8317,9 @@ fn notification_requires_configuration_ordering(method: &str) -> bool {
             | "textDocument/didSave"
             | "textDocument/didClose"
             | "workspace/didChangeWatchedFiles"
+            | "workspace/didCreateFiles"
+            | "workspace/didRenameFiles"
+            | "workspace/didDeleteFiles"
             | "workspace/didChangeWorkspaceFolders"
     )
 }
@@ -8326,6 +8332,9 @@ fn notification_may_change_document(method: &str) -> bool {
             | "textDocument/didSave"
             | "textDocument/didClose"
             | "workspace/didChangeWatchedFiles"
+            | "workspace/didCreateFiles"
+            | "workspace/didRenameFiles"
+            | "workspace/didDeleteFiles"
             | "workspace/didChangeWorkspaceFolders"
     )
 }
@@ -8417,6 +8426,23 @@ fn handle_request(
     pull_related_diagnostics_supported: bool,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if matches!(
+        request.method.as_str(),
+        "workspace/willCreateFiles" | "workspace/willDeleteFiles"
+    ) {
+        // These operations have no safe pre-operation source edits to offer.
+        connection.send_result(Message::Response(Response::new_ok(request.id, Value::Null)))?;
+        return Ok(());
+    }
+    if request.method == "workspace/willRenameFiles" {
+        send_error(
+            connection,
+            request.id,
+            ErrorCode::RequestFailed,
+            "file rename cannot be proven as a complete coordinated unit rename",
+        )?;
+        return Ok(());
+    }
     let work_done_token = match request_work_done_token(&request) {
         Ok(token) => token,
         Err(error) => {
@@ -9194,6 +9220,69 @@ fn handle_notification(
             }
             Ok(effect)
         }
+        "workspace/didCreateFiles" | "workspace/didDeleteFiles" => {
+            let created = notification.method == "workspace/didCreateFiles";
+            let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
+                return Err("file operation notification requires a files array".into());
+            };
+            let mut effect = DiagnosticNotificationEffect::default();
+            for file in files {
+                let Some(uri) = file
+                    .get("uri")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Url>(value).ok())
+                else {
+                    return Err("file operation entry requires a valid uri".into());
+                };
+                let uri = canonical_file_uri(&uri);
+                let change = if created {
+                    FileChange::Created
+                } else {
+                    FileChange::Deleted
+                };
+                for affected in workspace.file_event(&uri, change) {
+                    effect.refresh_uri(affected);
+                }
+                effect.refresh_uri(uri.clone());
+                effect.refresh_dependents(workspace, &uri, true);
+            }
+            Ok(effect)
+        }
+        "workspace/didRenameFiles" => {
+            let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
+                return Err("file operation notification requires a files array".into());
+            };
+            let mut effect = DiagnosticNotificationEffect::default();
+            for file in files {
+                let Some(old_uri) = file
+                    .get("oldUri")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Url>(value).ok())
+                else {
+                    return Err("file rename entry requires a valid oldUri".into());
+                };
+                let Some(new_uri) = file
+                    .get("newUri")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Url>(value).ok())
+                else {
+                    return Err("file rename entry requires a valid newUri".into());
+                };
+                let old_uri = canonical_file_uri(&old_uri);
+                let new_uri = canonical_file_uri(&new_uri);
+                for affected in workspace.file_event(&old_uri, FileChange::Deleted) {
+                    effect.refresh_uri(affected);
+                }
+                for affected in workspace.file_event(&new_uri, FileChange::Created) {
+                    effect.refresh_uri(affected);
+                }
+                effect.refresh_uri(old_uri.clone());
+                effect.refresh_uri(new_uri.clone());
+                effect.refresh_dependents(workspace, &old_uri, true);
+                effect.refresh_dependents(workspace, &new_uri, true);
+            }
+            Ok(effect)
+        }
         "workspace/didChangeWorkspaceFolders" if workspace_folders_supported => {
             let params: lsp_types::DidChangeWorkspaceFoldersParams =
                 parse_notification(&notification)?;
@@ -9505,6 +9594,14 @@ fn server_capabilities(
             }
         });
     }
+    capabilities["workspace"]["fileOperations"] = serde_json::json!({
+        "willCreate": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
+        "willRename": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
+        "willDelete": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
+        "didCreate": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
+        "didRename": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
+        "didDelete": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]
+    });
     if supports_pull_diagnostics(client) {
         capabilities["diagnosticProvider"] = serde_json::json!({
             "identifier": SERVER_NAME,
@@ -9847,6 +9944,33 @@ mod tests {
             features.signature_help_format,
             DocumentationFormat::Markdown
         );
+    }
+
+    #[test]
+    fn server_advertises_workspace_file_operations() {
+        let capabilities = super::server_capabilities(&ClientCapabilities::default(), false);
+        let file_operations = &capabilities["workspace"]["fileOperations"];
+        for operation in [
+            "willCreate",
+            "willRename",
+            "willDelete",
+            "didCreate",
+            "didRename",
+            "didDelete",
+        ] {
+            assert!(file_operations[operation].is_array(), "missing {operation}");
+            assert_eq!(file_operations[operation][0]["pattern"]["matches"], "file");
+            assert_eq!(
+                file_operations[operation][0]["pattern"]["glob"],
+                "**/*.{pas,pp,pascal}"
+            );
+        }
+        assert!(super::notification_requires_configuration_ordering(
+            "workspace/didRenameFiles"
+        ));
+        assert!(super::notification_may_change_document(
+            "workspace/didRenameFiles"
+        ));
     }
 
     #[test]

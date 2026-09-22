@@ -1171,6 +1171,21 @@ entries, and qualified references use the complete bound prefix (`Ns.Provider`
 or `Alias` in `Alias.TThing`) rather than an arbitrary component. Unit/module
 rename remains unsupported because it requires `RenameFile` support.
 
+### Workspace file operations
+
+The server advertises LSP file-operation filters for file URIs ending in
+`.pas`, `.pp`, or `.pascal` (case behavior follows the client's glob matcher).
+`willCreateFiles` and `willDeleteFiles` return no additional edits. A
+`willRenameFiles` request fails closed: no edit or resource operation is
+returned, since complete provider/consumer identity and open-overlay transfer
+are not yet proven for an atomic unit move. The server never moves files itself.
+After `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`, catalogues,
+loaded-source observations, and affected diagnostics are invalidated/refreshed;
+rename is processed as old-path deletion plus new-path creation. These events
+do not synthesize/delete imports and do not transfer an open overlay to a new
+URI. Clients should continue to use watched-file notifications for changes not
+covered by these Pascal source filters. Directory operations are not advertised.
+
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial
 location list. Unsupported or ambiguous bindings are rejected rather than

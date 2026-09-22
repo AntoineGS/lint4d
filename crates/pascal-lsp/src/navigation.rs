@@ -2311,43 +2311,60 @@ impl NavigationIndex {
             }
         }
         budget.require_owned_bytes(
-            class_capacity.saturating_mul(std::mem::size_of::<(Url, String)>()),
+            class_capacity.saturating_mul(std::mem::size_of::<(Url, String, usize, bool)>()),
             cancel,
         )?;
-        let mut affected_owners = Vec::<(Url, String)>::with_capacity(class_capacity);
+        let mut class_owners = Vec::<(Url, String, usize, bool)>::with_capacity(class_capacity);
         for (uri, document) in &self.documents {
-            if !edited_uris.contains(uri) {
-                continue;
-            }
-            for symbol in &document.symbols {
+            for (symbol_index, symbol) in document.symbols.iter().enumerate() {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
+                if symbol.kind != SymbolKind::Type
+                    || symbol.type_kind != TypeKind::Class
+                    || symbol.owner_type.is_some()
+                    || symbol.generic_parameter.is_some()
+                {
+                    continue;
+                }
                 let mut has_binding_member = false;
-                for member in &document.symbols {
-                    check_navigation_cancel(cancel)?;
-                    budget.require_work(1, cancel)?;
-                    if member.owner_type.as_deref() == Some(symbol.key.as_str())
-                        && member.kind == SymbolKind::Routine
-                        && binding_names.contains(&member.key)
-                    {
-                        has_binding_member = true;
-                        break;
+                if let Some(member_indices) =
+                    document.member_symbol_indices_by_owner.get(&symbol.key)
+                {
+                    for member_index in member_indices {
+                        check_navigation_cancel(cancel)?;
+                        budget.require_work(1, cancel)?;
+                        if document.symbols.get(*member_index).is_some_and(|member| {
+                            member.kind == SymbolKind::Routine
+                                && binding_names.contains(&member.key)
+                        }) {
+                            has_binding_member = true;
+                        }
                     }
                 }
-                if symbol.kind == SymbolKind::Type
-                    && symbol.type_kind == TypeKind::Class
-                    && symbol.owner_type.is_none()
-                    && symbol.generic_parameter.is_none()
-                    && has_binding_member
-                {
-                    budget.require_owned_bytes(
-                        std::mem::size_of::<(Url, String)>()
-                            .saturating_add(uri.as_str().len())
-                            .saturating_add(symbol.key.len()),
-                        cancel,
-                    )?;
-                    affected_owners.push((uri.clone(), symbol.key.clone()));
-                }
+                budget.require_owned_bytes(
+                    std::mem::size_of::<(Url, String, usize, bool)>()
+                        .saturating_add(uri.as_str().len())
+                        .saturating_add(symbol.key.len()),
+                    cancel,
+                )?;
+                class_owners.push((
+                    uri.clone(),
+                    symbol.key.clone(),
+                    symbol_index,
+                    has_binding_member,
+                ));
+            }
+        }
+        let mut affected_owners = Vec::<(Url, String)>::new();
+        for (uri, key, _, has_binding_member) in &class_owners {
+            if edited_uris.contains(uri) && *has_binding_member {
+                budget.require_owned_bytes(
+                    std::mem::size_of::<(Url, String)>()
+                        .saturating_add(uri.as_str().len())
+                        .saturating_add(key.len()),
+                    cancel,
+                )?;
+                affected_owners.push((uri.clone(), key.clone()));
             }
         }
         if affected_owners.is_empty() {
@@ -2359,182 +2376,167 @@ impl NavigationIndex {
             cancel,
         )?;
         let mut fingerprints = Vec::with_capacity(class_capacity);
-        for (uri, document) in &self.documents {
-            for symbol in &document.symbols {
+        let mut ancestry_resolution = AncestryResolutionState::new();
+        for (owner_uri, owner_key, symbol_index, direct_member) in &class_owners {
+            check_navigation_cancel(cancel)?;
+            budget.require_work(1, cancel)?;
+            let Some(document) = self.documents.get(owner_uri) else {
+                return Err("rename interface contract owner disappeared".to_string());
+            };
+            let Some(_symbol) = document.symbols.get(*symbol_index) else {
+                return Err("rename interface contract owner disappeared".to_string());
+            };
+            let mut related = *direct_member;
+            for target in &affected_owners {
                 check_navigation_cancel(cancel)?;
                 budget.require_work(1, cancel)?;
-                if symbol.kind != SymbolKind::Type
-                    || symbol.type_kind != TypeKind::Class
-                    || symbol.owner_type.is_some()
-                    || symbol.generic_parameter.is_some()
-                {
-                    continue;
+                if related {
+                    break;
                 }
+                if owner_uri == &target.0 && owner_key == &target.1 {
+                    related = true;
+                    break;
+                }
+                let resolution = self.resolve_type_ancestry_with_budget(
+                    owner_uri,
+                    owner_key,
+                    &mut ancestry_resolution,
+                    cancel,
+                    budget,
+                )?;
+                if resolution.status == AncestryStatus::Complete
+                    && type_ancestry_contains(
+                        self,
+                        &resolution.parents,
+                        target,
+                        cancel,
+                        budget,
+                        &mut ancestry_resolution,
+                    )?
+                {
+                    related = true;
+                }
+            }
+            if !related {
+                continue;
+            }
+            let Some(class_instance) = self.contract_type_instance(owner_uri, owner_key) else {
+                return Err("rename interface contract owner disappeared".to_string());
+            };
+            if !contract_substitution_is_complete(&class_instance) {
+                return Err("rename interface contract substitution is incomplete".to_string());
+            }
+            let mut ancestry = ContractAncestryState::new();
+            let Some((obligations, surface)) = self
+                .missing_interface_contracts_for_class_with_budget(
+                    &class_instance,
+                    &mut ancestry,
+                    cancel,
+                    budget,
+                )?
+            else {
+                return Err("rename interface contract ancestry is unknown".to_string());
+            };
+            for obligation in obligations {
+                check_navigation_cancel(cancel)?;
+                let Some(requirement_symbol) = self.symbol(&obligation.requirement.candidate)
+                else {
+                    return Err("rename interface requirement disappeared".to_string());
+                };
+                let requirement_id = self.source_symbol_fingerprint_with_budget(
+                    &obligation.requirement.candidate.uri,
+                    requirement_symbol,
+                    &binding_names,
+                    cancel,
+                    budget,
+                )?;
                 budget.require_owned_bytes(
-                    std::mem::size_of::<(Url, String)>()
-                        .saturating_add(uri.as_str().len())
-                        .saturating_add(symbol.key.len()),
+                    surface
+                        .routines
+                        .len()
+                        .saturating_mul(std::mem::size_of::<String>()),
                     cancel,
                 )?;
-                let owner = (uri.clone(), symbol.key.clone());
-                let mut direct_member = false;
-                for member in &document.symbols {
+                let mut matches = Vec::with_capacity(surface.routines.len());
+                let mut unknown = false;
+                for candidate in surface
+                    .routines
+                    .iter()
+                    .filter(|candidate| candidate.symbol_key == obligation.method_name)
+                {
                     check_navigation_cancel(cancel)?;
                     budget.require_work(1, cancel)?;
-                    if member.owner_type.as_deref() == Some(symbol.key.as_str())
-                        && member.kind == SymbolKind::Routine
-                        && binding_names.contains(&member.key)
-                    {
-                        direct_member = true;
-                        break;
+                    if candidate.conditional_unknown(self) {
+                        unknown = true;
+                        continue;
                     }
-                }
-                let mut related = direct_member;
-                for target in &affected_owners {
-                    check_navigation_cancel(cancel)?;
-                    budget.require_work(1, cancel)?;
-                    if related {
-                        break;
-                    }
-                    if owner == *target {
-                        related = true;
-                        break;
-                    }
-                    let mut ancestry = AncestryResolutionState::new();
-                    let resolution = self.resolve_type_ancestry(&owner.0, &owner.1, &mut ancestry);
-                    if resolution.status == AncestryStatus::Complete
-                        && type_ancestry_contains(
-                            self,
-                            &resolution.parents,
-                            target,
-                            cancel,
-                            budget,
-                        )?
-                    {
-                        related = true;
-                    }
-                }
-                if !related {
-                    continue;
-                }
-                let Some(class_instance) = self.contract_type_instance(uri, &symbol.key) else {
-                    return Err("rename interface contract owner disappeared".to_string());
-                };
-                if !contract_substitution_is_complete(&class_instance) {
-                    return Err("rename interface contract substitution is incomplete".to_string());
-                }
-                let mut ancestry = ContractAncestryState::new();
-                let Some((obligations, surface)) = self
-                    .missing_interface_contracts_for_class_with_budget(
-                        &class_instance,
-                        &mut ancestry,
-                        cancel,
-                        budget,
-                    )?
-                else {
-                    return Err("rename interface contract ancestry is unknown".to_string());
-                };
-                for obligation in obligations {
-                    check_navigation_cancel(cancel)?;
-                    let Some(requirement_symbol) = self.symbol(&obligation.requirement.candidate)
-                    else {
-                        return Err("rename interface requirement disappeared".to_string());
+                    let Some(candidate_symbol) = self.symbol(&candidate.candidate) else {
+                        unknown = true;
+                        continue;
                     };
-                    let requirement_id = self.source_symbol_fingerprint_with_budget(
-                        &obligation.requirement.candidate.uri,
+                    if !matches!(
+                        candidate_symbol.visibility,
+                        Visibility::Public | Visibility::Published
+                    ) {
+                        unknown = true;
+                        continue;
+                    }
+                    match self.routines_contract_match(
                         requirement_symbol,
-                        &binding_names,
+                        &obligation.requirement.candidate.uri,
+                        &obligation.requirement.substitution,
+                        candidate_symbol,
+                        &candidate.candidate.uri,
+                        &candidate.substitution,
                         cancel,
                         budget,
-                    )?;
-                    budget.require_owned_bytes(
-                        surface
-                            .routines
-                            .len()
-                            .saturating_mul(std::mem::size_of::<String>()),
-                        cancel,
-                    )?;
-                    let mut matches = Vec::with_capacity(surface.routines.len());
-                    let mut unknown = false;
-                    for candidate in surface
-                        .routines
-                        .iter()
-                        .filter(|candidate| candidate.symbol_key == obligation.method_name)
-                    {
-                        check_navigation_cancel(cancel)?;
-                        budget.require_work(1, cancel)?;
-                        if candidate.conditional_unknown(self) {
+                    )? {
+                        ContractMatch::Yes if candidate_symbol.routine_directives.abstract_ => {
                             unknown = true;
-                            continue;
                         }
-                        let Some(candidate_symbol) = self.symbol(&candidate.candidate) else {
-                            unknown = true;
-                            continue;
-                        };
-                        if !matches!(
-                            candidate_symbol.visibility,
-                            Visibility::Public | Visibility::Published
-                        ) {
-                            unknown = true;
-                            continue;
+                        ContractMatch::Yes => {
+                            matches.push(self.source_symbol_fingerprint_with_budget(
+                                &candidate.candidate.uri,
+                                candidate_symbol,
+                                &binding_names,
+                                cancel,
+                                budget,
+                            )?)
                         }
-                        match self.routines_contract_match(
-                            requirement_symbol,
-                            &obligation.requirement.candidate.uri,
-                            &obligation.requirement.substitution,
-                            candidate_symbol,
-                            &candidate.candidate.uri,
-                            &candidate.substitution,
-                            cancel,
-                            budget,
-                        )? {
-                            ContractMatch::Yes if candidate_symbol.routine_directives.abstract_ => {
-                                unknown = true;
-                            }
-                            ContractMatch::Yes => {
-                                matches.push(self.source_symbol_fingerprint_with_budget(
-                                    &candidate.candidate.uri,
-                                    candidate_symbol,
-                                    &binding_names,
-                                    cancel,
-                                    budget,
-                                )?)
-                            }
-                            ContractMatch::No => {}
-                            ContractMatch::Unknown => unknown = true,
-                        }
+                        ContractMatch::No => {}
+                        ContractMatch::Unknown => unknown = true,
                     }
-                    matches.sort();
-                    let status = if unknown {
-                        "unknown"
-                    } else if matches.is_empty() {
-                        "missing"
-                    } else {
-                        "implemented"
-                    };
-                    budget.require_owned_bytes(
-                        std::mem::size_of::<String>()
-                            .saturating_add(uri.as_str().len())
-                            .saturating_add(symbol.key.len())
-                            .saturating_add(requirement_id.len())
-                            .saturating_add(status.len())
-                            .saturating_add(
-                                matches
-                                    .iter()
-                                    .map(|matched| matched.len().saturating_add(4))
-                                    .sum::<usize>(),
-                            )
-                            .saturating_add(32),
-                        cancel,
-                    )?;
-                    fingerprints.push(format!(
-                        "{}|{}|{}|{}",
-                        uri,
-                        symbol.key,
-                        requirement_id,
-                        format_args!("{status}:{matches:?}")
-                    ));
                 }
+                matches.sort();
+                let status = if unknown {
+                    "unknown"
+                } else if matches.is_empty() {
+                    "missing"
+                } else {
+                    "implemented"
+                };
+                budget.require_owned_bytes(
+                    std::mem::size_of::<String>()
+                        .saturating_add(owner_uri.as_str().len())
+                        .saturating_add(owner_key.len())
+                        .saturating_add(requirement_id.len())
+                        .saturating_add(status.len())
+                        .saturating_add(
+                            matches
+                                .iter()
+                                .map(|matched| matched.len().saturating_add(4))
+                                .sum::<usize>(),
+                        )
+                        .saturating_add(32),
+                    cancel,
+                )?;
+                fingerprints.push(format!(
+                    "{}|{}|{}|{}",
+                    owner_uri,
+                    owner_key,
+                    requirement_id,
+                    format_args!("{status}:{matches:?}")
+                ));
             }
         }
         fingerprints.sort();
@@ -12703,8 +12705,17 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<TypeAncestryResolution, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_owned_bytes(
+            std::mem::size_of::<(Url, String)>()
+                .saturating_add(type_uri.as_str().len())
+                .saturating_add(type_key.len()),
+            cancel,
+        )?;
         let identity = (type_uri.clone(), type_key.to_owned());
         if let Some(resolved) = state.resolved_types.get(&identity) {
+            budget.require_owned_bytes(ancestry_resolution_owned_bytes(resolved), cancel)?;
             return Ok(resolved.clone());
         }
         if state.active_types.contains(&identity) {
@@ -12719,9 +12730,20 @@ impl NavigationIndex {
         if !state.take_work() {
             return Ok(unknown_ancestry());
         }
-        budget.require_work(1, cancel)?;
         budget.require_bytes(
             type_uri.as_str().len().saturating_add(type_key.len()),
+            cancel,
+        )?;
+        budget.require_owned_bytes(
+            std::mem::size_of::<(Url, String)>()
+                .saturating_add(type_uri.as_str().len())
+                .saturating_add(type_key.len()),
+            cancel,
+        )?;
+        budget.require_owned_bytes(
+            std::mem::size_of::<(Url, String)>()
+                .saturating_add(type_uri.as_str().len())
+                .saturating_add(type_key.len()),
             cancel,
         )?;
         state.active_types.insert(identity.clone());
@@ -12765,6 +12787,7 @@ impl NavigationIndex {
             }
         }
         state.active_types.remove(&identity);
+        budget.require_owned_bytes(ancestry_resolution_owned_bytes(&result), cancel)?;
         state.resolved_types.insert(identity, result.clone());
         Ok(result)
     }
@@ -12805,6 +12828,13 @@ impl NavigationIndex {
             return Ok(unknown_ancestry());
         }
 
+        budget.require_owned_bytes(
+            entry
+                .parents
+                .len()
+                .saturating_mul(std::mem::size_of::<(Url, String)>()),
+            cancel,
+        )?;
         let mut parents = Vec::with_capacity(entry.parents.len());
         for parent in entry.parents.iter().filter(|parent| {
             matches!(
@@ -12852,6 +12882,12 @@ impl NavigationIndex {
             if symbol.type_kind != expected_kind {
                 return Ok(unknown_ancestry());
             }
+            budget.require_owned_bytes(
+                std::mem::size_of::<(Url, String)>()
+                    .saturating_add(candidate.uri.as_str().len())
+                    .saturating_add(symbol.key.len()),
+                cancel,
+            )?;
             parents.push((candidate.uri.clone(), symbol.key.clone()));
         }
         Ok(complete_ancestry(parents))
@@ -14698,12 +14734,30 @@ struct TypeAncestryResolution {
     parents: Vec<(Url, String)>,
 }
 
+fn ancestry_resolution_owned_bytes(resolution: &TypeAncestryResolution) -> usize {
+    std::mem::size_of::<TypeAncestryResolution>()
+        .saturating_add(
+            resolution
+                .parents
+                .len()
+                .saturating_mul(std::mem::size_of::<(Url, String)>()),
+        )
+        .saturating_add(
+            resolution
+                .parents
+                .iter()
+                .map(|(uri, key)| uri.as_str().len().saturating_add(key.len()))
+                .sum::<usize>(),
+        )
+}
+
 fn type_ancestry_contains(
     index: &NavigationIndex,
     parents: &[(Url, String)],
     target: &(Url, String),
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
+    ancestry: &mut AncestryResolutionState,
 ) -> Result<bool, String> {
     for (parent_uri, parent_key) in parents {
         check_navigation_cancel(cancel)?;
@@ -14711,10 +14765,10 @@ fn type_ancestry_contains(
         if parent_uri == &target.0 && parent_key == &target.1 {
             return Ok(true);
         }
-        let mut state = AncestryResolutionState::new();
-        let resolution = index.resolve_type_ancestry(parent_uri, parent_key, &mut state);
+        let resolution = index
+            .resolve_type_ancestry_with_budget(parent_uri, parent_key, ancestry, cancel, budget)?;
         if resolution.status == AncestryStatus::Complete
-            && type_ancestry_contains(index, &resolution.parents, target, cancel, budget)?
+            && type_ancestry_contains(index, &resolution.parents, target, cancel, budget, ancestry)?
         {
             return Ok(true);
         }
@@ -14728,11 +14782,13 @@ fn normalize_fingerprint_header_with_budget(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<String, String> {
+    let output_capacity = source.len().saturating_mul(9);
+    budget.require_work(1, cancel)?;
     budget.require_owned_bytes(
-        source.len().saturating_add(std::mem::size_of::<String>()),
+        output_capacity.saturating_add(std::mem::size_of::<String>()),
         cancel,
     )?;
-    let mut normalized = String::with_capacity(source.len());
+    let mut normalized = String::with_capacity(output_capacity);
     let mut cursor = 0;
     let bytes = source.as_bytes();
     while cursor < bytes.len() {
@@ -14741,19 +14797,26 @@ fn normalize_fingerprint_header_with_budget(
         let is_identifier_start = bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_';
         if !is_identifier_start {
             let next = cursor + source[cursor..].chars().next().unwrap().len_utf8();
+            budget.require_bytes(next.saturating_sub(cursor), cancel)?;
             normalized.push_str(&source[cursor..next]);
             cursor = next;
             continue;
         }
         let start = cursor;
+        budget.require_bytes(1, cancel)?;
         cursor += 1;
         while cursor < bytes.len()
             && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
         {
+            check_navigation_cancel(cancel)?;
+            budget.require_bytes(1, cancel)?;
             cursor += 1;
         }
         let token = &source[start..cursor];
-        budget.require_owned_bytes(token.len(), cancel)?;
+        budget.require_owned_bytes(
+            token.len().saturating_add(std::mem::size_of::<String>()),
+            cancel,
+        )?;
         let canonical = canonical_name(token);
         if binding_names.contains(&canonical) {
             normalized.push_str("<renamed>");

@@ -20146,6 +20146,324 @@ fn workspace_rename_resolves_a_virtual_overload_call_to_one_slot() {
     assert_eq!(updated.matches("procedure Work(Value: string)").count(), 2);
 }
 
+fn implicit_self_overload_source() -> &'static str {
+    "unit ImplicitSelfOverloads;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); overload; virtual;
+    procedure Work(Value: string); overload; virtual;
+    procedure Test;
+  end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TBase.Work(Value: string); begin end;
+procedure TBase.Test;
+begin
+  Work(1);
+  Self.Work(1);
+end;
+end.
+"
+}
+
+#[test]
+fn workspace_rename_resolves_implicit_self_to_the_same_virtual_overload_slot() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ImplicitSelfOverloads.pas");
+    let source = implicit_self_overload_source();
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(source, "Work(Value: Integer)", 0),
+            "RunWork",
+            true,
+        )
+        .expect("implicit and explicit self calls resolve to one virtual slot");
+    let updated = apply_workspace_edit_to_source(
+        source,
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        &uri(&source_path),
+    );
+    assert_eq!(
+        updated.matches("procedure RunWork(Value: Integer)").count(),
+        1
+    );
+    assert_eq!(
+        updated
+            .matches("procedure TBase.RunWork(Value: Integer)")
+            .count(),
+        1
+    );
+    assert!(updated.contains("RunWork(1)"));
+    assert!(updated.contains("Self.RunWork(1)"));
+    assert_eq!(updated.matches("procedure Work(Value: string)").count(), 1);
+    assert_eq!(
+        updated
+            .matches("procedure TBase.Work(Value: string)")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn workspace_rename_rejects_an_ambiguous_implicit_self_method_value() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ImplicitSelfOverloads.pas");
+    let source = "unit ImplicitSelfOverloads;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); overload; virtual;
+    procedure Work(Value: string); overload; virtual;
+    procedure Test;
+  end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TBase.Work(Value: string); begin end;
+procedure TBase.Test;
+var Method: procedure(Value: Integer);
+begin
+  Method := Work;
+end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work(Value: Integer)", 0),
+        "RunWork",
+        true,
+    );
+    assert!(
+        result.is_err(),
+        "an implicit-self method value without a unique overload must fail closed"
+    );
+}
+
+#[test]
+fn workspace_rename_does_not_treat_a_lexical_shadow_as_implicit_self() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ImplicitSelfShadow.pas");
+    let source = "unit ImplicitSelfShadow;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); virtual;
+    procedure Test;
+  end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TBase.Test;
+  procedure Work(Value: Integer);
+  begin
+  end;
+begin
+  Work(1);
+end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(source, "Work(Value: Integer)", 0),
+            "RunWork",
+            true,
+        )
+        .expect("a shadowed local call must not be guessed as Self.Work");
+    let updated = apply_workspace_edit_to_source(
+        source,
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        &uri(&source_path),
+    );
+    assert!(updated.contains("procedure TBase.RunWork(Value: Integer)"));
+    assert!(updated.contains("procedure TBase.Test"));
+    assert!(updated.contains("procedure Work(Value: Integer)"));
+    assert!(updated.contains("  Work(1);"));
+}
+
+#[test]
+fn workspace_rename_rejects_an_ambiguous_with_receiver_for_implicit_self() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ImplicitSelfWith.pas");
+    let source = "unit ImplicitSelfWith;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); virtual;
+    procedure Test;
+  end;
+  TOther = class
+    procedure Work(Value: Integer); virtual;
+  end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TOther.Work(Value: Integer); begin end;
+procedure TBase.Test;
+var A: TBase; B: TOther;
+begin
+  with A, B do
+    Work(1);
+end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work(Value: Integer)", 0),
+        "RunWork",
+        true,
+    );
+    assert!(
+        result.is_err(),
+        "an ambiguous with receiver must not select lexical Self"
+    );
+}
+
+#[test]
+fn workspace_rename_resolves_implicit_self_inside_a_class_helper() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ImplicitSelfHelper.pas");
+    let source = "unit ImplicitSelfHelper;
+interface
+type
+  TWidget = class
+  end;
+  TWidgetHelper = class helper for TWidget
+    procedure Work(Value: Integer);
+    procedure Test;
+  end;
+implementation
+procedure TWidgetHelper.Work(Value: Integer); begin end;
+procedure TWidgetHelper.Test;
+begin
+  Work(1);
+  Self.Work(1);
+end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(source, "Work(Value: Integer)", 0),
+            "RunWork",
+            true,
+        )
+        .expect("helper Self and implicit calls share the resolved identity");
+    let updated = apply_workspace_edit_to_source(
+        source,
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        &uri(&source_path),
+    );
+    assert!(updated.contains("procedure TWidgetHelper.RunWork(Value: Integer)"));
+    assert!(updated.contains("  RunWork(1);"));
+    assert!(updated.contains("  Self.RunWork(1);"));
+}
+
+fn many_locals_source(count: usize) -> String {
+    let mut source = String::from(
+        "unit ManyLocals;
+interface
+implementation
+procedure Test;
+var
+",
+    );
+    for index in 0..count {
+        source.push_str(&format!("  V{index}: Integer;\n"));
+    }
+    source.push_str("begin\n  V0 := 1;\nend;\nend.\n");
+    source
+}
+
+#[test]
+fn workspace_rename_keeps_large_class_free_local_scan_bounded() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ManyLocals.pas");
+    let source = many_locals_source(1_050);
+    write_file(&source_path, &source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let edit = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(&source, "V0", 0),
+            "RunWork",
+            false,
+        )
+        .expect("class-free ordinary rename must not pay a quadratic contract scan");
+    let updated = apply_workspace_edit_to_source(
+        &source,
+        &serde_json::to_value(edit).expect("workspace edit serialization"),
+        &uri(&source_path),
+    );
+    assert_eq!(updated.matches("RunWork").count(), 2);
+}
+
+#[test]
+fn workspace_rename_still_checks_class_contracts_after_large_local_scan() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("ClassWithManyLocals.pas");
+    let mut source = String::from(
+        "unit ClassWithManyLocals;
+interface
+type
+  TObject = class
+  end;
+  IFoo = interface
+    procedure Work;
+  end;
+  TBase = class(TObject, IFoo)
+    procedure Work; virtual;
+    procedure Test;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TBase.Test;
+var
+",
+    );
+    for index in 0..1_050 {
+        source.push_str(&format!("  V{index}: Integer;\n"));
+    }
+    source.push_str("begin\n  V0 := 1;\nend;\nend.\n");
+    write_file(&source_path, &source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let error = workspace
+        .rename_edits(
+            &uri(&source_path),
+            position_of(&source, "Work; virtual", 0),
+            "RunWork",
+            false,
+        )
+        .expect_err("the broken interface contract must reject the edit");
+    assert!(
+        error.contains("interface contract"),
+        "large unrelated local content must not suppress class contract validation: {error}"
+    );
+}
+
 #[test]
 fn workspace_rename_supports_an_exact_virtual_overload_slot() {
     let temp = tempfile::tempdir().expect("temporary workspace");

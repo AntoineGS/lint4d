@@ -1495,18 +1495,13 @@ impl NavigationIndex {
         let fallback_cancel = AtomicBool::new(false);
         let cancel = cancel.unwrap_or(&fallback_cancel);
         let entity = call.child_by_field_name("entity");
-        if entity.and_then(super::callable_owner_node).is_none() {
-            // Unqualified/global overloads remain conservative here. Their
-            // declaration family may be exact while a call-site binding lacks
-            // the receiver proof required to safely narrow every occurrence.
-            return Ok(candidates);
-        }
+        let explicit_owner = entity.and_then(super::callable_owner_node);
 
         let mut select = |budget: &mut super::AssistanceBudget| {
             let mut state = ResolutionState::new();
-            let owner_receivers = entity
-                .and_then(super::callable_owner_node)
-                .map(|owner| {
+            let mut implicit_candidates = None;
+            let (owner_receivers, implicit_self) = if let Some(owner) = explicit_owner {
+                (
                     self.resolve_receivers_with_state_and_budget(
                         uri,
                         document,
@@ -1517,10 +1512,70 @@ impl NavigationIndex {
                         cancel,
                         budget,
                         0,
-                    )
-                })
-                .transpose()?
-                .unwrap_or_default();
+                    )?,
+                    false,
+                )
+            } else {
+                if document.has_with_context_at(identifier.start_byte()) {
+                    // An unqualified call inside `with` can have a receiver
+                    // other than lexical Self. The ordinary navigation
+                    // resolver owns that proof; do not guess one here.
+                    return Ok::<(), String>(());
+                }
+                let scope =
+                    self.budgeted_scope_at(document, identifier.start_byte(), cancel, budget)?;
+                let owner_type = document
+                    .owner_type_at_identifier_with_budget(identifier, scope, cancel, budget)?;
+                if owner_type.is_none() {
+                    // An unqualified global call has no lexical receiver proof;
+                    // keep the conservative behavior used before this helper.
+                    return Ok::<(), String>(());
+                }
+                let name = identifier
+                    .utf8_text(document.source.as_bytes())
+                    .map_err(|_| "implicit-self call name is not valid UTF-8".to_string())?;
+                let lexical_candidates = self.unqualified_references_with_budget_and_state(
+                    uri,
+                    document,
+                    identifier.start_byte(),
+                    name,
+                    identifier,
+                    &mut state,
+                    cancel,
+                    budget,
+                )?;
+                if lexical_candidates.is_empty()
+                    || lexical_candidates.iter().any(|candidate| {
+                        self.symbol(candidate).is_none_or(|symbol| {
+                            symbol.kind != SymbolKind::Routine
+                                || self.candidate_is_conditionally_unknown(candidate)
+                        })
+                    })
+                {
+                    // A local/parameter shadow, an unknown conditional, or a
+                    // missing lexical binding is not proof of an implicit
+                    // method call.
+                    return Ok::<(), String>(());
+                }
+                candidates.retain(|candidate| lexical_candidates.contains(candidate));
+                if candidates.is_empty() {
+                    return Ok::<(), String>(());
+                }
+                implicit_candidates = Some(lexical_candidates);
+                (
+                    self.resolve_identifier_receiver_with_budget(
+                        uri,
+                        document,
+                        identifier.start_byte(),
+                        "Self",
+                        identifier,
+                        &mut state,
+                        cancel,
+                        budget,
+                    )?,
+                    true,
+                )
+            };
             let owner_instances = owner_receivers
                 .iter()
                 .filter_map(|receiver| match receiver {
@@ -1530,6 +1585,16 @@ impl NavigationIndex {
                     | super::Receiver::IntegerLiteral(_) => None,
                 })
                 .collect::<Vec<_>>();
+            if let Some(lexical_candidates) = implicit_candidates.as_ref() {
+                if !lexical_candidates.iter().any(|candidate| {
+                    candidates.contains(candidate)
+                        && self
+                            .symbol(candidate)
+                            .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
+                }) {
+                    return Ok::<(), String>(());
+                }
+            }
             let selection = super::overload::select(
                 self,
                 uri,
@@ -1544,6 +1609,25 @@ impl NavigationIndex {
                 budget,
             )?;
             if let Some(group) = selection.selected_group {
+                if implicit_self
+                    && !candidates.iter().any(|candidate| {
+                        if !super::overload::candidate_in_group(self, candidate, &group) {
+                            return false;
+                        }
+                        let Some(symbol) = self.symbol(candidate) else {
+                            return false;
+                        };
+                        owner_instances
+                            .iter()
+                            .any(|owner| symbol.owner_type.as_deref() == Some(owner.key.as_str()))
+                    })
+                {
+                    // A lexical class context alone must not turn a global,
+                    // with-bound, or otherwise unrelated routine into a self
+                    // member. Only narrow when the selected group contains a
+                    // candidate owned by the proven implicit receiver.
+                    return Ok::<(), String>(());
+                }
                 candidates.retain(|candidate| {
                     super::overload::candidate_in_group(self, candidate, &group)
                 });

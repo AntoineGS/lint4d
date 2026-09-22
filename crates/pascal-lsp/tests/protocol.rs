@@ -19767,6 +19767,160 @@ fn exists_only_excluded_metadata_is_never_fingerprinted() {
     );
 }
 
+#[test]
+fn workspace_rename_rejects_an_unknown_intermediate_override_slot() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("Slots.pas");
+    let source = "unit Slots;
+interface
+type
+  TBase = class
+    procedure Work(Value: Integer); virtual;
+  end;
+  TMiddle = class(TBase)
+    procedure Work(Value: MissingType); reintroduce; virtual;
+  end;
+  TLeaf = class(TMiddle)
+    procedure Work(Value: Integer); override;
+  end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TMiddle.Work(Value: MissingType); begin end;
+procedure TLeaf.Work(Value: Integer); begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work(Value: Integer); virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "an unknown intermediate slot signature must not admit a partial rename"
+    );
+}
+
+#[test]
+fn workspace_rename_rejects_an_unknown_intermediate_calling_convention() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("CallingConventionSlots.pas");
+    let source = "unit CallingConventionSlots;
+interface
+type
+  TBase = class
+    procedure Work; virtual;
+  end;
+  TMiddle = class(TBase)
+    procedure Work; reintroduce; virtual; register;
+  end;
+  TLeaf = class(TMiddle)
+    procedure Work; override;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TMiddle.Work; begin end;
+procedure TLeaf.Work; begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let result = workspace.rename_edits(
+        &uri(&source_path),
+        position_of(source, "Work; virtual", 0),
+        "RunWork",
+        false,
+    );
+    assert!(
+        result.is_err(),
+        "an omitted-versus-explicit calling convention must remain unknown"
+    );
+}
+
+#[test]
+fn workspace_rename_rejects_a_selected_unknown_calling_convention() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("SelectedCallingConvention.pas");
+    let source = "unit SelectedCallingConvention;
+interface
+type
+  TBase = class
+    procedure Work; virtual; winapi;
+  end;
+  TChild = class(TBase)
+    procedure Work; override; winapi;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TChild.Work; begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    for needle in ["Work; virtual; winapi", "Work; override; winapi"] {
+        let mut workspace = test_workspace(
+            vec![source_path.parent().expect("source parent").to_path_buf()],
+            WorkspaceOptions::default(),
+        );
+        let result = workspace.rename_edits(
+            &uri(&source_path),
+            position_of(source, needle, 0),
+            "RunWork",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "an unsupported selected calling convention must fail closed: {needle}"
+        );
+    }
+}
+
+#[test]
+fn workspace_rename_rejects_selected_virtual_class_methods() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_path = root.join("VirtualClassMethods.pas");
+    let source = "unit VirtualClassMethods;
+interface
+type
+  TBase = class
+    class procedure Work; virtual;
+  end;
+  TChild = class(TBase)
+    class procedure Work; override;
+  end;
+implementation
+class procedure TBase.Work; begin end;
+class procedure TChild.Work; begin end;
+end.
+";
+    write_file(&source_path, source);
+
+    for needle in ["Work; virtual", "Work; override"] {
+        let mut workspace = test_workspace(
+            vec![source_path.parent().expect("source parent").to_path_buf()],
+            WorkspaceOptions::default(),
+        );
+        let result = workspace.rename_edits(
+            &uri(&source_path),
+            position_of(source, needle, 0),
+            "RunWork",
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "virtual class-method rename must fail closed: {needle}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn references_do_not_follow_mapped_symlink_escapes_or_sibling_prefixes() {

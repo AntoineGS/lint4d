@@ -413,7 +413,7 @@ pub(crate) enum SemanticTokenResolutionMode {
 /// The index deliberately has no filesystem policy: callers decide which
 /// documents belong to a workspace and feed disk or unsaved-buffer contents to
 /// [`NavigationIndex::update`].
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct NavigationIndex {
     documents: HashMap<Url, Document>,
     units: HashMap<String, Vec<Url>>,
@@ -14779,6 +14779,7 @@ pub(crate) struct ParsedDocument {
     documentation: Vec<Option<Arc<documentation::Documentation>>>,
 }
 
+#[derive(Debug, Clone)]
 struct Document {
     parsed: Arc<ParsedDocument>,
     import_bindings: Option<HashMap<String, Url>>,

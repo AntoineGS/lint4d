@@ -940,7 +940,7 @@ end.
 }
 
 #[test]
-fn cross_unit_same_named_class_owner_rejects_virtual_override_rename() {
+fn cross_unit_same_named_class_owner_uses_proven_override_identity() {
     let provider = "unit Provider;
 interface
 type TBox = class
@@ -968,15 +968,33 @@ end.
     index.bind_imports(&consumer_uri, bindings);
     let selected = position_of(provider, "Work; virtual", 0);
 
-    assert!(
-        index.prepare_rename(&provider_uri, selected).is_err(),
-        "same-named class owners in different units must not hide overrides"
-    );
-    assert!(
-        index
-            .rename_edits(&provider_uri, selected, "RunWork")
-            .is_err(),
-        "cross-unit virtual override families must be rejected"
+    let edits = index
+        .rename_edits(&provider_uri, selected, "RunWork")
+        .expect("cross-unit virtual override family is proven by the parent identity");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                provider_uri.clone(),
+                range_of(provider, "Work", 0),
+                "RunWork".to_owned(),
+            ),
+            (
+                provider_uri,
+                range_of(provider, "Work", 1),
+                "RunWork".to_owned(),
+            ),
+            (
+                consumer_uri.clone(),
+                range_of(consumer, "Work", 0),
+                "RunWork".to_owned(),
+            ),
+            (
+                consumer_uri,
+                range_of(consumer, "Work", 1),
+                "RunWork".to_owned(),
+            ),
+        ],
     );
 }
 
@@ -2215,7 +2233,7 @@ end.
 }
 
 #[test]
-fn virtual_override_family_rename_is_rejected_without_explicit_calls() {
+fn virtual_override_family_rename_updates_declarations_and_implementations() {
     let source = "unit VirtualOverrideRename;
 interface
 type TBase = class
@@ -2232,6 +2250,371 @@ end.
     let mut index = NavigationIndex::new();
     let source_uri = update(&mut index, "VirtualOverrideRename", source);
 
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; virtual", 0),
+            "RunWork",
+        )
+        .expect("virtual override family declarations are complete");
+    assert_eq!(edits[&source_uri].len(), 4);
+}
+
+#[test]
+fn virtual_override_family_renames_exact_slot_and_dispatch_calls() {
+    let source = "unit VirtualOverrideFamilyRename;
+interface
+type TBase = class
+ procedure Work(Value: Integer); virtual;
+end;
+TChild = class(TBase)
+ procedure Work(Value: Integer); override;
+end;
+implementation
+procedure TBase.Work(Value: Integer); begin Value := Value + 1; end;
+procedure TChild.Work(Value: Integer); begin Value := Value + 2; end;
+procedure Run(Base: TBase; Child: TChild);
+begin
+ Base.Work(1);
+ Child.Work(2);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualOverrideFamilyRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work(Value: Integer); virtual", 0),
+            "RunWork",
+        )
+        .expect("exact virtual override family can be renamed atomically");
+
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 0),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 1),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 2),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 3),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 4),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 5),
+                "RunWork".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn virtual_override_family_references_are_consistent_from_each_member() {
+    let source = "unit VirtualOverrideFamilyReferences;
+interface
+type TBase = class
+ procedure Work(Value: Integer); virtual;
+end;
+TChild = class(TBase)
+ procedure Work(Value: Integer); override;
+end;
+implementation
+procedure TBase.Work(Value: Integer); begin end;
+procedure TChild.Work(Value: Integer); begin end;
+procedure Run(Base: TBase; Child: TChild);
+begin
+ Base.Work(1);
+ Child.Work(2);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualOverrideFamilyReferences", source);
+    let expected = vec![
+        (source_uri.clone(), range_of(source, "Work", 0)),
+        (source_uri.clone(), range_of(source, "Work", 1)),
+        (source_uri.clone(), range_of(source, "Work", 2)),
+        (source_uri.clone(), range_of(source, "Work", 3)),
+        (source_uri.clone(), range_of(source, "Work", 4)),
+        (source_uri.clone(), range_of(source, "Work", 5)),
+    ];
+
+    for occurrence in 0..6 {
+        let locations = index
+            .binding_locations(&source_uri, position_of(source, "Work", occurrence), true)
+            .unwrap_or_else(|error| panic!("occurrence {occurrence}: {error}"));
+        assert_exact_locations(&locations, expected.clone());
+    }
+}
+
+#[test]
+fn reintroduced_same_signature_method_stays_outside_virtual_family() {
+    let source = "unit ReintroducedMethodRename;
+interface
+type TBase = class
+ procedure Work; virtual;
+end;
+TChild = class(TBase)
+ procedure Work; reintroduce;
+end;
+implementation
+procedure TBase.Work; begin end;
+procedure TChild.Work; begin end;
+procedure Run(Base: TBase; Child: TChild);
+begin
+ Base.Work;
+ Child.Work;
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ReintroducedMethodRename", source);
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; virtual", 0),
+            "RunWork",
+        )
+        .expect("reintroduced methods remain independent");
+    assert_exact_edits(
+        &edits,
+        vec![
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 0),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 2),
+                "RunWork".to_owned(),
+            ),
+            (
+                source_uri.clone(),
+                range_of(source, "Work", 4),
+                "RunWork".to_owned(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn generic_base_instantiation_uses_substituted_override_signature() {
+    let source = "unit GenericOverrideRename;
+interface
+type
+  TBase<T> = class
+    procedure Work(Value: T); virtual;
+  end;
+  TIntChild = class(TBase<Integer>)
+    procedure Work(Value: Integer); override;
+  end;
+implementation
+procedure TBase<T>.Work(Value: T); begin end;
+procedure TIntChild.Work(Value: Integer); begin end;
+procedure Run(Base: TBase<Integer>; Child: TIntChild);
+begin
+  Base.Work(1);
+  Child.Work(2);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "GenericOverrideRename", source);
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work(Value: T); virtual", 0),
+            "RunWork",
+        )
+        .expect("generic parent substitution proves the override slot");
+    assert_eq!(edits[&source_uri].len(), 6);
+}
+
+#[test]
+fn virtual_override_family_from_a_child_includes_sibling_branches() {
+    let source = "unit VirtualSiblingRename;
+interface
+type
+  TBase = class
+    procedure Work; virtual;
+  end;
+  TLeft = class(TBase)
+    procedure Work; override;
+  end;
+  TRight = class(TBase)
+    procedure Work; override;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TLeft.Work; begin end;
+procedure TRight.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualSiblingRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; override", 0),
+            "RunWork",
+        )
+        .expect("a child-selected virtual slot includes every proven sibling override");
+    assert_eq!(edits[&source_uri].len(), 6);
+}
+
+#[test]
+fn virtual_override_family_includes_transitive_descendants() {
+    let source = "unit VirtualTransitiveRename;
+interface
+type
+  TBase = class
+    procedure Work; virtual;
+  end;
+  TMiddle = class(TBase)
+    procedure Work; override;
+  end;
+  TLeaf = class(TMiddle)
+    procedure Work; override;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TMiddle.Work; begin end;
+procedure TLeaf.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualTransitiveRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; virtual", 0),
+            "RunWork",
+        )
+        .expect("a transitive override family is complete");
+    assert_eq!(edits[&source_uri].len(), 6);
+}
+
+#[test]
+fn same_named_virtual_hiding_method_stays_outside_the_override_family() {
+    let source = "unit VirtualHidingRename;
+interface
+type
+  TBase = class
+    procedure Work; virtual;
+  end;
+  TChild = class(TBase)
+    procedure Work; virtual;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TChild.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "VirtualHidingRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; virtual", 0),
+            "RunWork",
+        )
+        .expect("a same-named virtual hiding method is a distinct slot");
+    assert_eq!(edits[&source_uri].len(), 2);
+}
+
+#[test]
+fn reintroduced_virtual_slot_is_the_root_for_transitive_overrides() {
+    let source = "unit ReintroducedVirtualSlotRename;
+interface
+type
+  TBase = class
+    procedure Work; virtual;
+  end;
+  TMiddle = class(TBase)
+    procedure Work; reintroduce; virtual;
+  end;
+  TLeaf = class(TMiddle)
+    procedure Work; override;
+  end;
+implementation
+procedure TBase.Work; begin end;
+procedure TMiddle.Work; begin end;
+procedure TLeaf.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "ReintroducedVirtualSlotRename", source);
+
+    let base_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; virtual", 0),
+            "RunBaseWork",
+        )
+        .expect("the original root remains independently renameable");
+    assert_eq!(base_edits[&source_uri].len(), 2);
+
+    let middle_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; reintroduce; virtual", 0),
+            "RunWork",
+        )
+        .expect("the reintroduced root and its override form one slot");
+    assert_eq!(middle_edits[&source_uri].len(), 4);
+
+    let leaf_edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; override", 0),
+            "RunLeafWork",
+        )
+        .expect("the leaf keeps the reintroduced slot identity");
+    assert_eq!(leaf_edits[&source_uri].len(), 4);
+}
+
+#[test]
+fn incomplete_concrete_override_family_is_rejected() {
+    let source = "unit IncompleteOverrideRename;
+interface
+type
+  TBase = class
+    procedure Work; virtual;
+  end;
+  TChild = class(TBase)
+    procedure Work; override;
+  end;
+implementation
+procedure TBase.Work; begin end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "IncompleteOverrideRename", source);
+
     assert!(
         index
             .rename_edits(
@@ -2240,12 +2623,46 @@ end.
                 "RunWork",
             )
             .is_err(),
-        "virtual override families must not be partially renamed"
+        "a concrete override without a source implementation cannot be renamed atomically"
     );
 }
 
 #[test]
-fn virtual_override_family_with_implicit_inherited_call_is_rejected() {
+fn generic_override_family_from_concrete_child_uses_parent_substitution() {
+    let source = "unit GenericChildOverrideRename;
+interface
+type
+  TBase<T> = class
+    procedure Work(Value: T); virtual;
+  end;
+  TIntChild = class(TBase<Integer>)
+    procedure Work(Value: Integer); override;
+  end;
+implementation
+procedure TBase<T>.Work(Value: T); begin end;
+procedure TIntChild.Work(Value: Integer); begin end;
+procedure Run(Base: TBase<Integer>; Child: TIntChild);
+begin
+  Base.Work(1);
+  Child.Work(2);
+end;
+end.
+";
+    let mut index = NavigationIndex::new();
+    let source_uri = update(&mut index, "GenericChildOverrideRename", source);
+
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work(Value: Integer); override", 0),
+            "RunWork",
+        )
+        .expect("a concrete child selection uses the parent generic substitution");
+    assert_eq!(edits[&source_uri].len(), 6);
+}
+
+#[test]
+fn virtual_override_family_allows_name_free_inherited_calls() {
     let source = "unit VirtualInheritedRename;
 interface
 type TBase = class
@@ -2265,16 +2682,14 @@ end.
     let mut index = NavigationIndex::new();
     let source_uri = update(&mut index, "VirtualInheritedRename", source);
 
-    assert!(
-        index
-            .rename_edits(
-                &source_uri,
-                position_of(source, "Work; virtual", 0),
-                "RunWork",
-            )
-            .is_err(),
-        "implicit inherited calls must not preserve an incomplete override family rename"
-    );
+    let edits = index
+        .rename_edits(
+            &source_uri,
+            position_of(source, "Work; virtual", 0),
+            "RunWork",
+        )
+        .expect("name-free inherited calls require no invented text edit");
+    assert_eq!(edits[&source_uri].len(), 4);
 }
 
 #[test]

@@ -1,10 +1,10 @@
 use super::{
-    Candidate, Document, NavigationIndex, ROOT_SCOPE, ResolutionState, Span, Symbol, SymbolKind,
-    canonical_name, collect_nodes_matching, field_identifier_nodes, has_ancestor_kind,
-    identifier_at, identifier_nodes, identifier_nodes_with_budget, is_ignored_offset,
-    is_right_hand_member, is_unit_declaration_identifier, member_expression_at, node_text,
-    qualified_type_path_at, qualified_type_path_at_with_budget, routine_name, routine_signature,
-    use_name_at,
+    AssistanceBudget, Candidate, Document, GenericSubstitution, NavigationIndex, ROOT_SCOPE,
+    ResolutionState, Span, Symbol, SymbolKind, canonical_name, collect_nodes_matching,
+    field_identifier_nodes, has_ancestor_kind, identifier_at, identifier_nodes,
+    identifier_nodes_with_budget, is_ignored_offset, is_right_hand_member,
+    is_unit_declaration_identifier, member_expression_at, node_text, qualified_type_path_at,
+    qualified_type_path_at_with_budget, routine_name, routine_signature, use_name_at,
 };
 use crate::text::PositionIndex;
 use lsp_types::{
@@ -1392,7 +1392,7 @@ impl NavigationIndex {
                 "rename cannot prove the binding across an unknown conditional branch".to_string(),
             );
         }
-        let binding = binding_from_candidates(self, candidates)?;
+        let binding = binding_from_candidates(self, candidates, cancel, &mut shared_work_budget)?;
         charge_shared_work(
             &mut shared_work_budget,
             cancel,
@@ -1615,8 +1615,7 @@ impl NavigationIndex {
                 if binding_has_class_owner
                     && member_expression.is_none()
                     && qualified_type_path.is_none()
-                    && (!document.symbols.iter().any(|symbol| symbol.span == span)
-                        || binding.kind == SymbolKind::Routine)
+                    && !document.symbols.iter().any(|symbol| symbol.span == span)
                     && self.has_foreign_class_owner(binding, uri, document, span.start)
                 {
                     if !options.strict_resolution && !is_binding_member {
@@ -2619,7 +2618,11 @@ fn scope_is_ancestor(document: &Document, ancestor: usize, descendant: usize) ->
 fn binding_from_candidates(
     index: &NavigationIndex,
     candidates: Vec<Candidate>,
+    cancel: Option<&AtomicBool>,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
 ) -> Result<Binding, String> {
+    let fallback_cancel = AtomicBool::new(false);
+    let cancel = cancel.unwrap_or(&fallback_cancel);
     let mut groups: HashMap<BindingGroup, Vec<SymbolId>> = HashMap::new();
     let mut kind = None;
     let mut old_key = None;
@@ -2700,6 +2703,14 @@ fn binding_from_candidates(
         }) {
             return Err("overloaded routine bindings are not supported".to_string());
         }
+
+        // A virtual/dynamic routine is a slot rather than an ordinary
+        // same-named routine.  Expand only an explicitly proven override
+        // family here.  In particular, do not widen by name: reintroduced
+        // methods, hiding methods, and independent overloads remain separate
+        // bindings.  The expansion is performed before occurrence collection
+        // so declarations, implementations, and calls all use one identity.
+        members = expand_override_family(index, members, cancel, shared_work_budget)?;
     }
 
     if kind == SymbolKind::Parameter {
@@ -2724,6 +2735,617 @@ fn binding_from_candidates(
         members,
         names,
     })
+}
+
+/// Expand one routine binding to the source-backed virtual slot it belongs to.
+///
+/// This deliberately uses declaration identity, exact parameter/result shape,
+/// static-ness, and proven class ancestry.  A matching spelling is never
+/// enough: a method must explicitly be `override` (or be the selected virtual
+/// root), and an unknown ancestry result is an error rather than permission to
+/// guess.  This is the small semantic family needed by references/rename;
+/// ordinary overloads and `reintroduce` methods remain independent bindings.
+fn expand_override_family(
+    index: &NavigationIndex,
+    initial_members: HashSet<SymbolId>,
+    cancel: &AtomicBool,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+) -> Result<HashSet<SymbolId>, String> {
+    check_cancel(Some(cancel))?;
+    let Some(selected) = initial_members.iter().next().cloned() else {
+        return Err("routine binding is empty".to_string());
+    };
+    let Some(selected_document) = index.documents.get(&selected.uri) else {
+        return Err("routine binding document disappeared".to_string());
+    };
+    let Some(selected_symbol) = selected_document
+        .symbols
+        .iter()
+        .find(|symbol| symbol_id(&selected.uri, symbol) == selected)
+    else {
+        return Err("routine binding declaration disappeared".to_string());
+    };
+
+    let Some(selected_owner) = selected_symbol.owner_type.clone() else {
+        return Ok(initial_members);
+    };
+    if selected_symbol.is_static {
+        if selected_symbol.routine_directives.virtual_
+            || selected_symbol.routine_directives.dynamic
+            || selected_symbol.routine_directives.override_
+        {
+            return Err("static virtual override family is unsupported".to_string());
+        }
+        return Ok(initial_members);
+    }
+    if selected_symbol
+        .routine_directives
+        .calling_convention_unknown
+        && (selected_symbol.routine_directives.virtual_
+            || selected_symbol.routine_directives.dynamic
+            || selected_symbol.routine_directives.override_)
+    {
+        return Err("override family calling convention is unknown".to_string());
+    }
+    if !selected_symbol.routine_directives.virtual_
+        && !selected_symbol.routine_directives.dynamic
+        && !selected_symbol.routine_directives.override_
+    {
+        return Ok(initial_members);
+    }
+
+    let selected_name = selected_symbol.key.clone();
+    let selected_kind = selected_symbol.routine_kind;
+
+    let mut family = initial_members;
+    let mut candidates = Vec::<(Url, usize, SymbolId)>::new();
+    for (uri, document) in &index.documents {
+        for (symbol_index, symbol) in document.symbols.iter().enumerate() {
+            check_cancel(Some(cancel))?;
+            charge_shared_work(shared_work_budget, Some(cancel), 1)?;
+            if symbol.kind != SymbolKind::Routine
+                || symbol.key != selected_name
+                || symbol.owner_type.is_none()
+                || symbol.is_static
+                || symbol.routine_kind != selected_kind
+            {
+                continue;
+            }
+            let id = symbol_id(uri, symbol);
+            charge_shared_bytes(
+                shared_work_budget,
+                Some(cancel),
+                uri.as_str()
+                    .len()
+                    .saturating_add(std::mem::size_of::<SymbolId>()),
+            )?;
+            candidates.push((uri.clone(), symbol_index, id));
+        }
+    }
+
+    let anchor_id = if selected_symbol.routine_directives.override_ {
+        let mut roots = Vec::new();
+        for (candidate_uri, candidate_index, candidate_id) in &candidates {
+            check_cancel(Some(cancel))?;
+            charge_shared_work(shared_work_budget, Some(cancel), 1)?;
+            let Some(candidate_symbol) = index
+                .documents
+                .get(candidate_uri)
+                .and_then(|document| document.symbols.get(*candidate_index))
+            else {
+                return Err("override family member disappeared".to_string());
+            };
+            let Some(candidate_owner) = candidate_symbol.owner_type.as_deref() else {
+                continue;
+            };
+            if candidate_symbol.routine_directives.override_
+                || (!candidate_symbol.routine_directives.virtual_
+                    && !candidate_symbol.routine_directives.dynamic)
+                || candidate_uri == &selected.uri && candidate_owner == selected_owner.as_str()
+            {
+                continue;
+            }
+            let Some(distance) = proven_type_distance(
+                index,
+                &selected.uri,
+                selected_owner.as_str(),
+                candidate_uri,
+                candidate_owner,
+                cancel,
+                shared_work_budget,
+            )?
+            else {
+                continue;
+            };
+            if !proven_override_slot_path(
+                index,
+                selected_symbol,
+                &selected.uri,
+                selected_owner.as_str(),
+                candidate_uri,
+                candidate_owner,
+                cancel,
+                shared_work_budget,
+            )? {
+                continue;
+            }
+            match override_contract_match(
+                index,
+                selected_symbol,
+                &selected.uri,
+                selected_owner.as_str(),
+                candidate_symbol,
+                candidate_uri,
+                candidate_owner,
+                cancel,
+                shared_work_budget,
+            )? {
+                super::ContractMatch::Yes => {}
+                super::ContractMatch::No => continue,
+                super::ContractMatch::Unknown => {
+                    return Err("override family root signature is unknown".to_string());
+                }
+            }
+            let Some(routine_key) = candidate_symbol.routine_key.clone() else {
+                return Err("override family routine has no stable identity".to_string());
+            };
+            if !roots
+                .iter()
+                .any(|(_, uri, key, _)| uri == candidate_uri && key == &routine_key)
+            {
+                roots.push((
+                    distance,
+                    candidate_uri.clone(),
+                    routine_key,
+                    candidate_id.clone(),
+                ));
+            }
+        }
+        roots.sort_by_key(|(distance, _, _, _)| *distance);
+        let Some((distance, _, _, root)) = roots.first().cloned() else {
+            return Err("override family has no proven virtual root".to_string());
+        };
+        if roots
+            .get(1)
+            .is_some_and(|(other, _, _, _)| *other == distance)
+        {
+            return Err("override family has ambiguous virtual roots".to_string());
+        }
+        Some(root)
+    } else {
+        None
+    };
+    let (anchor_uri, anchor_owner, anchor_symbol) = if let Some(anchor_id) = anchor_id {
+        let anchor_uri = anchor_id.uri.clone();
+        let document = index
+            .documents
+            .get(&anchor_uri)
+            .ok_or_else(|| "override family member document disappeared".to_string())?;
+        let symbol = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol_id(&anchor_uri, symbol) == anchor_id)
+            .ok_or_else(|| "override family member disappeared".to_string())?;
+        let owner = symbol
+            .owner_type
+            .clone()
+            .ok_or_else(|| "override family root has no owner".to_string())?;
+        (anchor_uri, owner, symbol)
+    } else {
+        (
+            selected.uri.clone(),
+            selected_owner.clone(),
+            selected_symbol,
+        )
+    };
+
+    // The selected routine is itself a proof anchor.  A source-backed virtual
+    // root may have no override directive, while a selected override proves
+    // that its corresponding ancestor slot must be included.
+    let selected_is_root =
+        selected_symbol.routine_directives.virtual_ || selected_symbol.routine_directives.dynamic;
+    if !selected_is_root && !selected_symbol.routine_directives.override_ {
+        return Ok(family);
+    }
+
+    for (candidate_uri, candidate_index, candidate_id) in candidates {
+        check_cancel(Some(cancel))?;
+        charge_shared_work(shared_work_budget, Some(cancel), 1)?;
+        let Some(candidate_symbol) = index
+            .documents
+            .get(&candidate_uri)
+            .and_then(|document| document.symbols.get(candidate_index))
+        else {
+            return Err("override family member disappeared".to_string());
+        };
+        let Some(candidate_owner) = candidate_symbol.owner_type.as_deref() else {
+            continue;
+        };
+        if candidate_uri == selected.uri && candidate_owner == selected_owner {
+            family.insert(candidate_id);
+            continue;
+        }
+
+        // A same-named routine is eligible only when it is an explicit
+        // override.  `reintroduce` and a plain same-signature declaration are
+        // intentionally excluded even when the classes are related.
+        let is_anchor = candidate_uri == anchor_uri && candidate_owner == anchor_owner;
+        if !is_anchor
+            && (candidate_symbol.routine_directives.reintroduce
+                || !candidate_symbol.routine_directives.override_)
+        {
+            continue;
+        }
+
+        let descendant_relation = proven_type_descendant(
+            index,
+            &candidate_uri,
+            candidate_owner,
+            &anchor_uri,
+            anchor_owner.as_str(),
+            cancel,
+            shared_work_budget,
+        )?;
+        let ancestor_relation = candidate_uri == anchor_uri && candidate_owner == anchor_owner;
+        if !descendant_relation && !ancestor_relation {
+            continue;
+        }
+        if descendant_relation
+            && !proven_override_slot_path(
+                index,
+                candidate_symbol,
+                &candidate_uri,
+                candidate_owner,
+                &anchor_uri,
+                anchor_owner.as_str(),
+                cancel,
+                shared_work_budget,
+            )?
+        {
+            continue;
+        }
+
+        // Compare the instantiated signatures, not their source spelling.
+        // For `TBase<T>.Work(T)` overridden by `TChild.Work(Integer)`, the
+        // parent substitution is part of the proof.  Unknown type identity or
+        // generic constraints fail closed instead of widening by name.
+        let signature_match = if ancestor_relation {
+            super::ContractMatch::Yes
+        } else {
+            override_contract_match(
+                index,
+                candidate_symbol,
+                &candidate_uri,
+                candidate_owner,
+                anchor_symbol,
+                &anchor_uri,
+                anchor_owner.as_str(),
+                cancel,
+                shared_work_budget,
+            )?
+        };
+        if signature_match != super::ContractMatch::Yes {
+            return Err("override family signature is unknown or incompatible".to_string());
+        }
+        let candidate_is_override = candidate_symbol.routine_directives.override_;
+        // A root virtual is allowed as the ancestor of an override.  Every
+        // other family member must itself prove the slot with `override`.
+        if !candidate_is_override {
+            let Some(root_document) = index.documents.get(&candidate_uri) else {
+                return Err("override family member document disappeared".to_string());
+            };
+            let Some(root_symbol) = root_document.symbols.get(candidate_index) else {
+                return Err("override family member disappeared".to_string());
+            };
+            if !root_symbol.routine_directives.virtual_ && !root_symbol.routine_directives.dynamic {
+                continue;
+            }
+        }
+        family.insert(candidate_id);
+    }
+
+    // Ensure every source-backed family routine has at most one declaration
+    // and definition.  A missing implementation is allowed only for an
+    // abstract member; otherwise a rename would silently leave a required
+    // source spelling behind.
+    let mut sites: HashMap<(Url, String), (usize, usize, bool)> = HashMap::new();
+    for member in &family {
+        let Some(document) = index.documents.get(&member.uri) else {
+            return Err("override family member document disappeared".to_string());
+        };
+        let Some(symbol) = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol_id(&member.uri, symbol) == *member)
+        else {
+            return Err("override family member disappeared".to_string());
+        };
+        let Some(owner) = symbol.owner_type.clone() else {
+            continue;
+        };
+        let entry = sites.entry((member.uri.clone(), owner)).or_default();
+        match symbol.origin {
+            super::Origin::Declaration => entry.0 += 1,
+            super::Origin::Definition => entry.1 += 1,
+        }
+        entry.2 |= symbol.routine_directives.abstract_;
+    }
+    if sites
+        .values()
+        .any(|(declarations, definitions, abstract_)| {
+            *declarations > 1
+                || *definitions > 1
+                || *declarations != 1
+                || (!*abstract_ && *definitions != 1)
+        })
+    {
+        return Err("override family has incomplete or duplicate source members".to_string());
+    }
+    Ok(family)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn override_contract_match(
+    index: &NavigationIndex,
+    descendant_symbol: &Symbol,
+    descendant_uri: &Url,
+    descendant_owner: &str,
+    ancestor_symbol: &Symbol,
+    ancestor_uri: &Url,
+    ancestor_owner: &str,
+    cancel: &AtomicBool,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+) -> Result<super::ContractMatch, String> {
+    check_cancel(Some(cancel))?;
+    let descendant_substitution = index
+        .owner_type_substitution(descendant_uri, descendant_owner)
+        .unwrap_or_else(GenericSubstitution::empty);
+    let mut state = ResolutionState::new();
+    let ancestor_substitution = index
+        .member_owner_substitution(
+            descendant_uri,
+            descendant_owner,
+            &descendant_substitution,
+            ancestor_uri,
+            ancestor_owner,
+            &mut state,
+        )
+        .ok_or_else(|| "override family generic substitution is unknown".to_string())?;
+    if let Some(budget) = shared_work_budget.as_deref_mut() {
+        index.routines_contract_match(
+            descendant_symbol,
+            descendant_uri,
+            &descendant_substitution,
+            ancestor_symbol,
+            ancestor_uri,
+            &ancestor_substitution,
+            cancel,
+            budget,
+        )
+    } else {
+        let mut budget =
+            AssistanceBudget::new(16_384, 2 * 1024 * 1024, "override family signature proof");
+        index.routines_contract_match(
+            descendant_symbol,
+            descendant_uri,
+            &descendant_substitution,
+            ancestor_symbol,
+            ancestor_uri,
+            &ancestor_substitution,
+            cancel,
+            &mut budget,
+        )
+    }
+}
+
+fn proven_type_distance(
+    index: &NavigationIndex,
+    descendant_uri: &Url,
+    descendant: &str,
+    ancestor_uri: &Url,
+    ancestor: &str,
+    cancel: &AtomicBool,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+) -> Result<Option<usize>, String> {
+    if descendant_uri == ancestor_uri && descendant == ancestor {
+        return Ok(Some(0));
+    }
+    let mut state = super::AncestryResolutionState::new();
+    let mut active = HashSet::new();
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        index: &NavigationIndex,
+        current_uri: &Url,
+        current: &str,
+        ancestor_uri: &Url,
+        ancestor: &str,
+        depth: usize,
+        state: &mut super::AncestryResolutionState,
+        active: &mut HashSet<(Url, String)>,
+        cancel: &AtomicBool,
+        shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+    ) -> Result<Option<usize>, String> {
+        check_cancel(Some(cancel))?;
+        charge_shared_work(shared_work_budget, Some(cancel), 1)?;
+        if current_uri == ancestor_uri && current == ancestor {
+            return Ok(Some(depth));
+        }
+        let identity = (current_uri.clone(), current.to_owned());
+        if !active.insert(identity.clone()) {
+            return Err("override family ancestry is cyclic".to_string());
+        }
+        if !state.take_work() {
+            active.remove(&identity);
+            return Err("override family ancestry work limit reached".to_string());
+        }
+        let ancestry = index.resolve_type_ancestry(current_uri, current, state);
+        if ancestry.status != super::AncestryStatus::Complete {
+            active.remove(&identity);
+            return Err("override family ancestry is unknown".to_string());
+        }
+        let mut found = None;
+        for (parent_uri, parent_key) in ancestry.parents {
+            if let Some(distance) = visit(
+                index,
+                &parent_uri,
+                &parent_key,
+                ancestor_uri,
+                ancestor,
+                depth + 1,
+                state,
+                active,
+                cancel,
+                shared_work_budget,
+            )? {
+                if found.is_some() {
+                    active.remove(&identity);
+                    return Err("override family ancestry is ambiguous".to_string());
+                }
+                found = Some(distance);
+            }
+        }
+        active.remove(&identity);
+        Ok(found)
+    }
+
+    visit(
+        index,
+        descendant_uri,
+        descendant,
+        ancestor_uri,
+        ancestor,
+        0,
+        &mut state,
+        &mut active,
+        cancel,
+        shared_work_budget,
+    )
+}
+
+/// Return whether `descendant_uri::descendant` is a proven subclass of
+/// `ancestor_uri::ancestor`.  The resolver retains URI identity and rejects
+/// ambiguous/unknown ancestry, so same-name classes in separate units cannot
+/// accidentally form a family.
+fn proven_type_descendant(
+    index: &NavigationIndex,
+    descendant_uri: &Url,
+    descendant: &str,
+    ancestor_uri: &Url,
+    ancestor: &str,
+    cancel: &AtomicBool,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+) -> Result<bool, String> {
+    Ok(proven_type_distance(
+        index,
+        descendant_uri,
+        descendant,
+        ancestor_uri,
+        ancestor,
+        cancel,
+        shared_work_budget,
+    )?
+    .is_some())
+}
+
+/// Prove that every same-signature declaration between a descendant and an
+/// ancestor preserves the same virtual slot.  A virtual redeclaration or a
+/// `reintroduce` boundary starts a new slot; a transitive ancestry check alone
+/// must not connect the descendant back to the older root.
+#[allow(clippy::too_many_arguments)]
+fn proven_override_slot_path(
+    index: &NavigationIndex,
+    descendant_symbol: &Symbol,
+    descendant_uri: &Url,
+    descendant_owner: &str,
+    ancestor_uri: &Url,
+    ancestor_owner: &str,
+    cancel: &AtomicBool,
+    shared_work_budget: &mut Option<&mut super::AssistanceBudget>,
+) -> Result<bool, String> {
+    let mut current_uri = descendant_uri.clone();
+    let mut current_owner = descendant_owner.to_owned();
+    let mut state = super::AncestryResolutionState::new();
+    let mut active = HashSet::new();
+    loop {
+        check_cancel(Some(cancel))?;
+        charge_shared_work(shared_work_budget, Some(cancel), 1)?;
+        if current_uri == *ancestor_uri && current_owner == ancestor_owner {
+            return Ok(true);
+        }
+        let identity = (current_uri.clone(), current_owner.clone());
+        if !active.insert(identity.clone()) {
+            return Err("override family ancestry is cyclic".to_string());
+        }
+        if !state.take_work() {
+            return Err("override family ancestry work limit reached".to_string());
+        }
+        let ancestry = index.resolve_type_ancestry(&current_uri, &current_owner, &mut state);
+        if ancestry.status != super::AncestryStatus::Complete {
+            return Err("override family ancestry is unknown".to_string());
+        }
+        let Some((parent_uri, parent_owner)) = ancestry
+            .parents
+            .into_iter()
+            .find(|(_, key)| !key.is_empty())
+        else {
+            return Ok(false);
+        };
+        if parent_uri == *ancestor_uri && parent_owner == ancestor_owner {
+            return Ok(true);
+        }
+
+        let Some(parent_document) = index.documents.get(&parent_uri) else {
+            return Err("override family ancestor document disappeared".to_string());
+        };
+        let mut matching_parent = None;
+        let mut seen_parent_routines = HashSet::new();
+        for parent_candidate in parent_document.symbols.iter().filter(|symbol| {
+            symbol.kind == SymbolKind::Routine
+                && symbol.key == descendant_symbol.key
+                && symbol.owner_type.as_deref() == Some(parent_owner.as_str())
+                && !symbol.is_static
+                && symbol.routine_kind == descendant_symbol.routine_kind
+        }) {
+            let Some(routine_key) = parent_candidate.routine_key.as_deref() else {
+                return Err("override family ancestor has no stable routine identity".to_string());
+            };
+            if !seen_parent_routines.insert(routine_key.to_owned()) {
+                continue;
+            }
+            check_cancel(Some(cancel))?;
+            charge_shared_work(shared_work_budget, Some(cancel), 1)?;
+            match override_contract_match(
+                index,
+                descendant_symbol,
+                descendant_uri,
+                descendant_owner,
+                parent_candidate,
+                &parent_uri,
+                &parent_owner,
+                cancel,
+                shared_work_budget,
+            )? {
+                super::ContractMatch::Yes => {}
+                super::ContractMatch::No => continue,
+                super::ContractMatch::Unknown => {
+                    return Err("override family intermediate signature is unknown".to_string());
+                }
+            }
+            if matching_parent.is_some() {
+                return Err("override family ancestry has ambiguous slot declarations".to_string());
+            }
+            matching_parent = Some(parent_candidate);
+        }
+        if let Some(parent_symbol) = matching_parent {
+            if !parent_symbol.routine_directives.override_ {
+                return Ok(false);
+            }
+        }
+        active.remove(&identity);
+        current_uri = parent_uri;
+        current_owner = parent_owner;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

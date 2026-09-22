@@ -9,6 +9,26 @@ structural selection ranges, conservative symbol-aware rename, naming quick
 fixes, and reuses lint4d and fmt4d for diagnostics and formatting.
 It is not a replacement for Delphi's compiler or its complete type system.
 
+### References, highlights, and rename families
+
+Routine references and rename use the exact declaration/implementation pairing
+and overload signature already resolved by the source index. A `virtual` or
+`dynamic` class routine and source-backed descendants marked `override` form
+one coordinated slot family; class/static distinctions, routine kind, result,
+parameter modes/types, generic shape, and calling convention must match.
+Same-name overloads, hiding/reintroduced methods, helpers, unknown ancestry,
+ambiguous calls, compiler-only consumers, and conditional-unknown members are
+not guessed into the family. A name-free `inherited;` call is accounted for
+semantically but has no invented text edit.
+
+Workspace rename discovers authorized unopened sources and overlays before
+publishing one atomic edit. Missing providers, read-only or conflicting
+physical include ownership, stale source/configuration, incomplete ancestry,
+or any collision/rebind proof failure withhold the complete edit rather than
+returning a partial result. Generic owner substitutions and unsupported
+calling conventions remain conservative when the source snapshot cannot prove
+their identity.
+
 ### Source-semantic diagnostics
 
 In addition to lint4d rules, diagnostics report

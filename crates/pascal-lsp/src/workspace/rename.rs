@@ -18,8 +18,8 @@ use crate::include_expansion::{
     self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
     IncludeResolver, ResolvedInclude,
 };
-use crate::navigation::AssistanceBudget;
 use crate::navigation::ParsedDocument;
+use crate::navigation::{AssistanceBudget, BindingWorkBudget};
 use crate::text;
 use lsp_types::{
     DocumentChanges, DocumentHighlight, Location, OneOf, OptionalVersionedTextDocumentIdentifier,
@@ -3264,7 +3264,15 @@ pub(crate) fn rename_from_input(
     let raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel) {
         Ok(edits) => edits,
         Err(error) => {
-            if error == "no renameable identifier at position" {
+            let source_changed = source_for_input_with_cancel(&input, &uri, Some(cancel))
+                .is_ok_and(|(current, _)| current != planning_source);
+            let disk_changed = uri
+                .to_file_path()
+                .ok()
+                .map(absolute_path)
+                .and_then(|path| disk_stamp(&path))
+                != initial_disk_stamp;
+            if error == "no renameable identifier at position" || source_changed || disk_changed {
                 return Computed {
                     source_generation,
                     configuration_generation,
@@ -3325,6 +3333,32 @@ pub(crate) fn rename_from_input(
             };
         }
     }
+    if let Err(error) =
+        post_edit_rebind_proof(&snapshot, &raw_edits, new_name, &uri, position, cancel)
+    {
+        let disk_changed = uri
+            .to_file_path()
+            .ok()
+            .map(absolute_path)
+            .and_then(|path| disk_stamp(&path))
+            != initial_disk_stamp;
+        if disk_changed
+            || source_for_input_with_cancel(&input, &uri, Some(cancel))
+                .is_ok_and(|(current, _)| current != planning_source)
+        {
+            return failed(
+                source_generation,
+                configuration_generation,
+                format!("source changed while proving rename target {uri}"),
+            );
+        }
+        return Computed {
+            source_generation,
+            configuration_generation,
+            value: Err(error),
+            records: Vec::new(),
+        };
+    }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -3336,6 +3370,282 @@ pub(crate) fn rename_from_input(
         value,
         records,
     }
+}
+
+/// Apply the proposed source edits to immutable proof snapshots, reparse every
+/// changed document, and resolve the renamed binding again.  Static range and
+/// collision checks are necessary but not sufficient: a parser/rebinding
+/// change can make a formerly exact family split or capture an overload.  No
+/// workspace edit is admitted until the post-edit binding has exactly the
+/// same source-backed edit set.
+fn post_edit_rebind_proof(
+    snapshot: &RenameSnapshot,
+    raw_edits: &HashMap<Url, Vec<TextEdit>>,
+    _new_name: &str,
+    _requested_uri: &Url,
+    _requested_position: Position,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut budget = AssistanceBudget::new(
+        MAX_SNAPSHOT_MAPPING_WORK,
+        MAX_SNAPSHOT_SEMANTIC_BYTES,
+        "rename post-edit rebind proof",
+    );
+    let mut transformed = HashMap::<Url, String>::new();
+    let mut expected = HashSet::<(String, u32, u32, u32, u32)>::new();
+    let mut query_target = None;
+    let mut mapping_budget =
+        include_expansion::MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+    let mut ordered = raw_edits.keys().cloned().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    // Included physical sources are deliberately not standalone navigation
+    // documents. Rebind their owning expanded roots instead, otherwise a
+    // proof of a perfectly valid physical edit fails with "document is not
+    // indexed". Each physical edit must map to exactly one virtual owner;
+    // repeated or ambiguous include contexts remain fail-closed.
+    let mut expansion_edits = HashMap::<Url, Vec<TextEdit>>::new();
+    let mut direct_edits = Vec::<(Url, Vec<TextEdit>)>::new();
+    for edit_uri in ordered {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let edits = raw_edits
+            .get(&edit_uri)
+            .ok_or_else(|| "rename post-edit edits disappeared".to_string())?;
+        let source = snapshot
+            .sources
+            .get(&edit_uri)
+            .ok_or_else(|| format!("rename post-edit source was not retained: {edit_uri}"))?;
+        let mut owner = None;
+        let mut virtual_edits = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let start = text::position_to_offset(source, edit.range.start)
+                .ok_or_else(|| "rename post-edit start is not a UTF-16 boundary".to_string())?;
+            let end = text::position_to_offset(source, edit.range.end)
+                .ok_or_else(|| "rename post-edit end is not a UTF-16 boundary".to_string())?;
+            if start >= end || end > source.len() {
+                return Err("rename post-edit range is invalid".to_string());
+            }
+            let mut matches = Vec::new();
+            for (root_uri, expansion) in &snapshot.expansions {
+                if !expansion.source_texts.contains_key(&edit_uri) {
+                    continue;
+                }
+                let ranges = expansion.expanded.reverse_range_with_budget(
+                    &edit_uri,
+                    start..end,
+                    &mut mapping_budget,
+                )?;
+                if ranges.len() > 1 {
+                    return Err(
+                        "rename post-edit physical include range has repeated virtual owners"
+                            .to_string(),
+                    );
+                }
+                if let Some(range) = ranges.into_iter().next() {
+                    matches.push((root_uri.clone(), range));
+                }
+            }
+            if matches.len() > 1 {
+                return Err(
+                    "rename post-edit physical include range has ambiguous virtual owners"
+                        .to_string(),
+                );
+            }
+            let Some((root_uri, virtual_range)) = matches.into_iter().next() else {
+                if owner.is_some() {
+                    return Err("rename post-edit edits have mixed include ownership".to_string());
+                }
+                continue;
+            };
+            if owner.as_ref().is_some_and(|existing| existing != &root_uri) {
+                return Err("rename post-edit edits have mixed include ownership".to_string());
+            }
+            owner = Some(root_uri);
+            let expansion = snapshot
+                .expansions
+                .get(owner.as_ref().expect("include owner was set"))
+                .expect("include owner expansion was retained");
+            let virtual_source = expansion.expanded.text();
+            let virtual_start = text::offset_to_position(virtual_source, virtual_range.start)
+                .ok_or_else(|| "rename post-edit virtual start is invalid".to_string())?;
+            let virtual_end = text::offset_to_position(virtual_source, virtual_range.end)
+                .ok_or_else(|| "rename post-edit virtual end is invalid".to_string())?;
+            virtual_edits.push(TextEdit::new(
+                Range::new(virtual_start, virtual_end),
+                edit.new_text.clone(),
+            ));
+        }
+        if let Some(root_uri) = owner {
+            if virtual_edits.len() != edits.len() {
+                return Err("rename post-edit include mapping was incomplete".to_string());
+            }
+            expansion_edits
+                .entry(root_uri)
+                .or_default()
+                .extend(virtual_edits);
+        } else {
+            direct_edits.push((edit_uri, edits.clone()));
+        }
+    }
+
+    let mut expansion_uris = expansion_edits.keys().cloned().collect::<Vec<_>>();
+    expansion_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for root_uri in expansion_uris {
+        let expansion = snapshot
+            .expansions
+            .get(&root_uri)
+            .ok_or_else(|| format!("rename post-edit expansion was not retained: {root_uri}"))?;
+        let (replacement, mapped_ranges) = apply_text_edits_for_proof(
+            expansion.expanded.text(),
+            expansion_edits
+                .get(&root_uri)
+                .ok_or_else(|| "rename post-edit include edits disappeared".to_string())?,
+            cancel,
+            &mut budget,
+        )?;
+        budget.require_owned_bytes(replacement.len(), cancel)?;
+        for range in mapped_ranges {
+            if query_target.is_none() {
+                query_target = Some((root_uri.clone(), range.start));
+            }
+            expected.insert(location_key(&root_uri, range));
+        }
+        transformed.insert(root_uri, replacement);
+    }
+    for (edit_uri, edits) in direct_edits {
+        let source = snapshot
+            .sources
+            .get(&edit_uri)
+            .ok_or_else(|| format!("rename post-edit source was not retained: {edit_uri}"))?;
+        let (replacement, mapped_ranges) =
+            apply_text_edits_for_proof(source, &edits, cancel, &mut budget)?;
+        budget.require_owned_bytes(replacement.len(), cancel)?;
+        for range in mapped_ranges {
+            if query_target.is_none() {
+                query_target = Some((edit_uri.clone(), range.start));
+            }
+            expected.insert(location_key(&edit_uri, range));
+        }
+        transformed.insert(edit_uri, replacement);
+    }
+    if transformed.is_empty() {
+        return Err("rename produced no source-backed edits".to_string());
+    }
+
+    let mut rebound = None;
+    for (edit_uri, replacement) in &transformed {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let base = rebound.as_ref().unwrap_or(&snapshot.index);
+        rebound = Some(base.rebind_with_replaced_source_for_fix_all(
+            edit_uri,
+            replacement,
+            cancel,
+            &mut budget,
+        )?);
+    }
+    let rebound = rebound.ok_or_else(|| "rename produced no rebound index".to_string())?;
+
+    let (query_uri, query_position) =
+        query_target.ok_or_else(|| "rename post-edit target is not source-backed".to_string())?;
+    let mut binding_budget = BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
+    let locations = rebound.binding_locations_with_cancel_and_work_budget(
+        &query_uri,
+        query_position,
+        true,
+        cancel,
+        &mut binding_budget,
+        &mut budget,
+    )?;
+    let actual = locations
+        .into_iter()
+        .map(|location| {
+            (
+                location.uri.as_str().to_owned(),
+                location.range.start.line,
+                location.range.start.character,
+                location.range.end.line,
+                location.range.end.character,
+            )
+        })
+        .collect::<HashSet<_>>();
+    if actual != expected {
+        return Err(
+            "rename post-edit binding proof did not preserve the complete edit family".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn location_key(uri: &Url, range: Range) -> (String, u32, u32, u32, u32) {
+    (
+        uri.as_str().to_owned(),
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character,
+    )
+}
+
+fn apply_text_edits_for_proof(
+    source: &str,
+    edits: &[TextEdit],
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<(String, Vec<Range>), String> {
+    let mut replacements = Vec::<(usize, usize, String, Range)>::with_capacity(edits.len());
+    for edit in edits {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        let start = text::position_to_offset(source, edit.range.start)
+            .ok_or_else(|| "rename post-edit start is not a UTF-16 boundary".to_string())?;
+        let end = text::position_to_offset(source, edit.range.end)
+            .ok_or_else(|| "rename post-edit end is not a UTF-16 boundary".to_string())?;
+        if start >= end || end > source.len() {
+            return Err("rename post-edit range is invalid".to_string());
+        }
+        replacements.push((start, end, edit.new_text.clone(), edit.range));
+    }
+    replacements.sort_by_key(|(start, end, _, _)| (*start, *end));
+    for (index, pair) in replacements.windows(2).enumerate() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(index.saturating_add(1), cancel)?;
+        if pair[0].1 > pair[1].0 {
+            return Err("rename post-edit edits overlap".to_string());
+        }
+    }
+    let mut result = source.to_owned();
+    for (start, end, replacement, _) in replacements.iter().rev() {
+        budget.require_work(1, cancel)?;
+        result.replace_range(*start..*end, replacement);
+    }
+    let mut ranges = Vec::with_capacity(replacements.len());
+    let mut delta = 0isize;
+    for (start, end, replacement, _) in replacements {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        budget.require_work(1, cancel)?;
+        let original_start = start;
+        let original_end = end;
+        let mapped_start = start.saturating_add_signed(delta);
+        let mapped_end = mapped_start.saturating_add(replacement.len());
+        let start = text::offset_to_position(&result, mapped_start)
+            .ok_or_else(|| "rename post-edit mapped start is invalid".to_string())?;
+        let end = text::offset_to_position(&result, mapped_end)
+            .ok_or_else(|| "rename post-edit mapped end is invalid".to_string())?;
+        ranges.push(Range::new(start, end));
+        delta = delta
+            .saturating_add(replacement.len() as isize - (original_end - original_start) as isize);
+    }
+    Ok((result, ranges))
 }
 
 fn cancelled<T>(source_generation: u64, configuration_generation: u64) -> Computed<T> {

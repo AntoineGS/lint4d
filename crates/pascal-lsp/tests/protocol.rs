@@ -30602,14 +30602,17 @@ fn did_rename_round_trip_revalidates_a_reused_uri_pair_without_will_plan() {
     let path_a = root.join("A.pas");
     let path_b = root.join("B.pas");
     let consumer = root.join("Consumer.pas");
+    let old_consumer = root.join("OldConsumer.pas");
     let main = root.join("Main.pas");
     let source_a = "unit A;\ninterface\ntype TIdentity = class end;\nimplementation\nend.\n{one}\n";
     let source_b = source_a.replace("unit A;", "unit B;");
     let consumer_a =
         "unit Consumer;\ninterface\nuses A;\ntype TAlias = A.TIdentity;\nimplementation\nend.\n";
     let consumer_b = consumer_a.replace("A", "B");
+    let old_consumer_source = "unit OldConsumer;\ninterface\nuses A;\ntype TOldAlias = A.TIdentity;\nimplementation\nend.\n";
     write_file(&path_a, source_a);
     write_file(&consumer, consumer_a);
+    write_file(&old_consumer, old_consumer_source);
     write_file(
         &main,
         "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
@@ -30619,14 +30622,7 @@ fn did_rename_round_trip_revalidates_a_reused_uri_pair_without_will_plan() {
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
     );
     let mut server = TestServer::launch();
-    let initialize_id = RequestId::from("rename-round-trip-init".to_string());
-    server.send_request(
-        initialize_id.clone(),
-        "initialize",
-        json!({"processId":null,"rootUri":uri(&root),"capabilities":{}}),
-    );
-    assert!(server.response(&initialize_id).error.is_none());
-    server.send_notification("initialized", json!({}));
+    server.initialize_with_pull_diagnostics(&root);
     server.send_notification(
         "textDocument/didOpen",
         json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_a}}),
@@ -30693,6 +30689,16 @@ fn did_rename_round_trip_revalidates_a_reused_uri_pair_without_will_plan() {
         "final provider identity must refresh after A→B→A→B"
     );
     assert_eq!(locations[0]["uri"], uri(&path_b).to_string());
+    let old_definition_id = RequestId::from("rename-round-trip-negative-old-provider".to_string());
+    server.send_request(
+        old_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&old_consumer, old_consumer_source, "TIdentity", 0),
+    );
+    assert!(
+        result_locations(server.response(&old_definition_id)).is_empty(),
+        "an old A binding must not survive the physical round-trip when A.pas no longer exists"
+    );
     assert!(!path_a.exists());
     assert_eq!(
         fs::read_to_string(&path_b).expect("final provider file"),

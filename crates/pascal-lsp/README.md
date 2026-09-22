@@ -1203,19 +1203,30 @@ loaded-source observations, negative path observations, and affected
 diagnostics are invalidated/refreshed, including for unopened sources; events
 do not synthesize/delete imports or mutate physical files. File-operation
 notifications accept bounded batches of at most 64 unique file URIs and reject
-malformed batches before applying any entry. Repeated old/new rename pairs
+malformed batches before applying any entry; watched-file batches are likewise
+limited to 64 events. The cumulative UTF-8 length of canonical file URIs in a
+notification batch is limited to 32 KiB and the full batch is validated before
+any event mutates workspace state. Repeated old/new rename pairs
 conservatively invalidate and refresh again instead of being suppressed by URI
 pair alone; a later real reuse of those paths therefore cannot be mistaken for
 a stale duplicate. A pending, successful unit `willRenameFiles`
-plan can transfer an open provider overlay only when the current text exactly
-matches the planned edits, the source identity is unchanged, and the document
-version advanced beyond its planned version before `didRenameFiles`. Keep the
-provider open through the notification; a close-before-notification or a
-mismatched/out-of-order transition is invalidated and must be reopened rather
-than guessed. A delayed `didClose` for the old URI cannot close the transferred
-new-URI overlay. Unmatched late rename notifications invalidate old/new path
-state conservatively. Clients should continue to use watched-file
-notifications for changes not covered by these Pascal source filters.
+plan accepts an open overlay only when the exact planned text and version/identity
+transition can be proved. This supports a monotonic old-URI `didChange` followed
+by `didClose`, client move, and exact new-URI `didOpen` before the file-operation
+notification (even when the new URI starts a fresh version sequence), as well as
+the exact old-URI update before `didRenameFiles`. A new-URI overlay must match
+the planned text, and the old URI must have been closed after a verified planned
+update; a live old overlay plus a new target is rejected even if both contain
+identical text. A late old-URI `didChange` after close does not restore it.
+Unverified/mismatched transitions fail closed and require reopening. A delayed
+`didClose` for the old URI cannot close an accepted new-URI overlay. Unmatched
+late rename notifications invalidate old/new path state conservatively.
+Notification list length and URI bytes are bounded, but actual
+file-event discovery/invalidation and dependent-diagnostic fan-out still run
+synchronously on the protocol thread; a complete total-work bound and ordered
+off-thread state-processing design remain outstanding. Clients should continue
+to use watched-file notifications for changes not covered by these Pascal
+source filters.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial

@@ -1041,6 +1041,7 @@ struct PendingUnitFileRename {
     original_identity_generation: Option<u64>,
     original_version: Option<i32>,
     expected_text: Option<String>,
+    closed_verified_version: Option<i32>,
 }
 
 struct DiskSource {
@@ -2324,6 +2325,20 @@ impl Workspace {
     }
 
     pub fn close_document(&mut self, uri: &Url) -> bool {
+        if let (Some(pending), Some(document)) = (
+            self.pending_unit_file_renames.get_mut(uri),
+            self.open_documents.get(uri),
+        ) {
+            if pending.expected_text.as_deref().is_some_and(|expected| {
+                document.text.as_deref() == Some(expected) && document.rejection.is_none()
+            }) && pending.original_identity_generation == Some(document.identity_generation)
+                && pending
+                    .original_version
+                    .is_some_and(|version| document.version > version)
+            {
+                pending.closed_verified_version = Some(document.version);
+            }
+        }
         let retained_context = self.document_contexts.get(uri).cloned();
         let was_open = if let Some(document) = self.open_documents.remove(uri) {
             if let Some(text) = document.text {
@@ -2663,6 +2678,7 @@ impl Workspace {
                 original_identity_generation,
                 original_version,
                 expected_text,
+                closed_verified_version: None,
             },
         );
         Ok(())
@@ -2708,6 +2724,14 @@ impl Workspace {
                         "file rename transition did not match the planned provider overlay; close and reopen the document".to_string(),
                     );
                 }
+                if let Some(document) = self.open_documents.get(&new_uri) {
+                    let version = document.version;
+                    self.reject_open_document(
+                        new_uri.clone(),
+                        version,
+                        "new-URI overlay did not match the exact planned provider transition; close and reopen the document".to_string(),
+                    );
+                }
                 if let Some(removed) = self.pending_unit_file_renames.remove(&old_uri) {
                     self.pending_unit_file_rename_bytes = self
                         .pending_unit_file_rename_bytes
@@ -2736,8 +2760,23 @@ impl Workspace {
         let Some(expected_text) = pending.expected_text.as_deref() else {
             return false;
         };
-        if self.open_documents.contains_key(new_uri) {
-            return false;
+        if let Some(target_document) = self.open_documents.get(new_uri) {
+            // An already-open destination is only attributable to this
+            // transition after the exact planned old-URI edit was observed
+            // and that original document incarnation was closed. A live old
+            // URI alongside the target is a competing overlay, even if both
+            // currently contain identical text.
+            let old_uri_is_closed = !self.open_documents.contains_key(old_uri);
+            let closed_source_version_is_proven = pending
+                .closed_verified_version
+                .is_some_and(|version| version > pending.original_version.unwrap_or(i32::MAX));
+            let target_matches_plan = target_document.text.as_deref() == Some(expected_text)
+                && target_document.rejection.is_none();
+            if !old_uri_is_closed || !closed_source_version_is_proven || !target_matches_plan {
+                return false;
+            }
+            return self.open_document_contexts.contains_key(new_uri)
+                || self.document_contexts.contains_key(new_uri);
         }
         let Some(source_document) = self.open_documents.get(old_uri) else {
             return false;

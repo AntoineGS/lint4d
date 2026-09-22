@@ -76,6 +76,8 @@ const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
 const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
+const MAX_FILE_OPERATION_BATCH_ENTRIES: usize = 64;
+const MAX_FILE_OPERATION_BATCH_URI_BYTES: usize = 32 * 1024;
 // Keep one slot available for an authoritative state-changing notification
 // even when only retryable feature requests are arriving.
 const MAX_CONFIGURATION_DEFERRED_REQUESTS: usize =
@@ -9192,6 +9194,19 @@ fn handle_request(
     Ok(())
 }
 
+fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), String> {
+    let next = total
+        .checked_add(uri.as_str().len())
+        .ok_or_else(|| "file operation URI byte count overflow".to_string())?;
+    if next > MAX_FILE_OPERATION_BATCH_URI_BYTES {
+        return Err(format!(
+            "file operation URI bytes exceed the {MAX_FILE_OPERATION_BATCH_URI_BYTES}-byte batch limit"
+        ));
+    }
+    *total = next;
+    Ok(())
+}
+
 fn handle_notification(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
@@ -9319,8 +9334,20 @@ fn handle_notification(
         }
         "workspace/didChangeWatchedFiles" => {
             let params: DidChangeWatchedFilesParams = parse_notification(&notification)?;
-            let mut effect = DiagnosticNotificationEffect::default();
+            if params.changes.is_empty() || params.changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES
+            {
+                return Err(format!(
+                    "watched file batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
+                ));
+            }
+            let mut total_uri_bytes = 0usize;
+            let mut changes = Vec::with_capacity(params.changes.len());
             for change in params.changes {
+                let uri = canonical_file_uri(&change.uri);
+                if uri.to_file_path().is_err() {
+                    return Err("watched file batch contains a non-file URI".into());
+                }
+                add_file_operation_uri_bytes(&mut total_uri_bytes, &uri)?;
                 let kind = if change.typ == FileChangeType::CREATED {
                     FileChange::Created
                 } else if change.typ == FileChangeType::CHANGED {
@@ -9328,7 +9355,11 @@ fn handle_notification(
                 } else {
                     FileChange::Deleted
                 };
-                for uri in workspace.file_event(&change.uri, kind) {
+                changes.push((uri, kind));
+            }
+            let mut effect = DiagnosticNotificationEffect::default();
+            for (changed_uri, kind) in changes {
+                for uri in workspace.file_event(&changed_uri, kind) {
                     effect.refresh_uri(uri);
                 }
                 if !push_diagnostics_supported {
@@ -9337,9 +9368,9 @@ fn handle_notification(
                     // the legacy push publication map.  Push clients keep
                     // the historical affected-open/dependent set so a
                     // configuration file is not itself analyzed as Pascal.
-                    effect.refresh_uri(change.uri.clone());
+                    effect.refresh_uri(changed_uri.clone());
                 }
-                effect.refresh_dependents(workspace, &change.uri, true);
+                effect.refresh_dependents(workspace, &changed_uri, true);
             }
             Ok(effect)
         }
@@ -9348,11 +9379,14 @@ fn handle_notification(
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 return Err("file operation notification requires a files array".into());
             };
-            if files.is_empty() || files.len() > 64 {
-                return Err("file operation batch must contain between 1 and 64 entries".into());
+            if files.is_empty() || files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+                return Err(format!(
+                    "file operation batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
+                ));
             }
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
+            let mut total_uri_bytes = 0usize;
             for file in files {
                 let uri = file
                     .get("uri")
@@ -9363,6 +9397,7 @@ fn handle_notification(
                 if uri.to_file_path().is_err() || !unique.insert(uri.clone()) {
                     return Err("file operation batch contains a non-file or duplicate URI".into());
                 }
+                add_file_operation_uri_bytes(&mut total_uri_bytes, &uri)?;
                 uris.push(uri);
             }
             let mut effect = DiagnosticNotificationEffect::default();
@@ -9384,12 +9419,15 @@ fn handle_notification(
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 return Err("file operation notification requires a files array".into());
             };
-            if files.is_empty() || files.len() > 64 {
-                return Err("file rename batch must contain between 1 and 64 entries".into());
+            if files.is_empty() || files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+                return Err(format!(
+                    "file rename batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
+                ));
             }
             let mut renames = Vec::with_capacity(files.len());
             let mut old_uris = HashSet::with_capacity(files.len());
             let mut new_uris = HashSet::with_capacity(files.len());
+            let mut total_uri_bytes = 0usize;
             for file in files {
                 let old_uri = file
                     .get("oldUri")
@@ -9413,6 +9451,8 @@ fn handle_notification(
                         "file rename batch contains invalid, duplicate, or identical URIs".into(),
                     );
                 }
+                add_file_operation_uri_bytes(&mut total_uri_bytes, &old_uri)?;
+                add_file_operation_uri_bytes(&mut total_uri_bytes, &new_uri)?;
                 renames.push((old_uri, new_uri));
             }
             if old_uris.iter().any(|uri| new_uris.contains(uri)) {

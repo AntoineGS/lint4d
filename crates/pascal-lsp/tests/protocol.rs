@@ -30151,6 +30151,256 @@ fn did_rename_transfers_an_open_unit_overlay_only_after_will_rename_and_preserve
 }
 
 #[test]
+fn did_rename_rejects_competing_new_uri_overlay_opened_before_event() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let main = root.join("Main.pas");
+    let new_provider = root.join("Renamed.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    let init_id = RequestId::from("unverified-new-overlay-init".to_string());
+    server.send_request(
+        init_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}}}),
+    );
+    assert!(server.response(&init_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+    );
+
+    let will_id = RequestId::from("unverified-new-overlay-will".to_string());
+    server.send_request(
+        will_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    let will = server.response(&will_id);
+    assert!(will.error.is_none(), "willRename failed: {will:?}");
+    let edit = will.result.expect("file rename edit");
+    let provider_updated = apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+    let consumer_updated = apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    write_file(&consumer, &consumer_updated);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+    );
+    // Client moves the physical file and opens the new URI before reporting
+    // didRenameFiles, while the old URI remains open. This creates a competing
+    // overlay pair. The target text exactly matches the plan, but without
+    // the old incarnation's close this is still a competing overlay and
+    // must not be silently accepted as the planned transition.
+    fs::rename(&provider, &new_provider).expect("client-owned move");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&new_provider),"languageId":"pascal","version":6,"text":provider_updated}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":7},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+
+    let definition_id = RequestId::from("unverified-new-overlay-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert!(
+        locations.is_empty(),
+        "a target overlay competing with a still-open old incarnation must fail closed: {locations:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn did_rename_accepts_verified_close_and_new_open_before_event() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let main = root.join("Main.pas");
+    let new_provider = root.join("Renamed.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    let init_id = RequestId::from("verified-new-overlay-init".to_string());
+    server.send_request(
+        init_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}}}),
+    );
+    assert!(server.response(&init_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+    );
+
+    let will_id = RequestId::from("verified-new-overlay-will".to_string());
+    server.send_request(
+        will_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    let will = server.response(&will_id);
+    assert!(will.error.is_none(), "willRename failed: {will:?}");
+    let edit = will.result.expect("file rename edit");
+    let provider_updated = apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+    let consumer_updated = apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    fs::rename(&provider, &new_provider).expect("client-owned move");
+    // The new URI starts a fresh LSP document version; the exact old-URI
+    // changed text recorded before close provides the version/identity proof.
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&new_provider),"languageId":"pascal","version":1,"text":provider_updated}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":7},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    // The open new-URI overlay, rather than stale bytes moved on disk, must
+    // remain authoritative after the event and duplicate notification.
+    write_file(&new_provider, &provider_source.replace("TThing", "TStale"));
+
+    let definition_id = RequestId::from("verified-new-overlay-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&new_provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small_entries() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let main = root.path().join("Main.pas");
+    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+
+    let long_component = "a".repeat(120);
+    let oversized: Vec<_> = (0..64)
+        .map(|index| {
+            root.path()
+                .join(&long_component)
+                .join(&long_component)
+                .join(&long_component)
+                .join(&long_component)
+                .join(format!("File{index}.pas"))
+        })
+        .collect();
+    let total_uri_bytes: usize = oversized.iter().map(|path| uri(path).as_str().len()).sum();
+    assert!(total_uri_bytes > 32 * 1024);
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":oversized.iter().map(|path| json!({"uri":uri(path)})).collect::<Vec<_>>()}),
+    );
+    let probe_id = RequestId::from("file-operation-byte-budget-probe".to_string());
+    server.send_request(
+        probe_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    assert!(server.response(&probe_id).error.is_none());
+    server.assert_no_request("workspace/diagnostic/refresh");
+
+    let too_many: Vec<_> = (0..65)
+        .map(|index| root.path().join(format!("OverLimit{index}.pas")))
+        .collect();
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":too_many.iter().map(|path| json!({"uri":uri(path)})).collect::<Vec<_>>()}),
+    );
+    let count_probe_id = RequestId::from("file-operation-count-budget-probe".to_string());
+    server.send_request(
+        count_probe_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    assert!(server.response(&count_probe_id).error.is_none());
+    server.assert_no_request("workspace/diagnostic/refresh");
+
+    let small: Vec<_> = (0..64)
+        .map(|index| root.path().join(format!("Generated{index}.pas")))
+        .collect();
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":small.iter().map(|path| json!({"uri":uri(path)})).collect::<Vec<_>>()}),
+    );
+    let refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
 fn will_rename_unit_returns_versioned_atomic_edits_before_client_owned_move() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

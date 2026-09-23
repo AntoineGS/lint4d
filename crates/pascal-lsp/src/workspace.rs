@@ -23,7 +23,7 @@ use pascal_project::{
     discover_with_selections,
     discover_with_selections_and_observations_with_overrides_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
-    has_invalid_project_selection, project_candidate_membership_with_deleted_paths,
+    has_invalid_project_selection, project_candidate_membership_with_deleted_paths_and_budget,
     project_candidates_with_work_budget_and_deleted_paths,
     read_package_metadata_with_observations_and_work_budget, runtime_project_selection,
     selected_project_is_current_with_budget_and_deleted_paths,
@@ -2366,8 +2366,20 @@ impl Workspace {
         target: NavigationTarget,
         cancel: &AtomicBool,
     ) -> Result<Vec<Location>, String> {
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        self.navigate_with_cancel_and_budget(uri, position, target, cancel, Some(&budget))
+    }
+
+    fn navigate_with_cancel_and_budget(
+        &mut self,
+        uri: &Url,
+        position: Position,
+        target: NavigationTarget,
+        cancel: &AtomicBool,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Location>, String> {
         check_workspace_cancel(Some(cancel))?;
-        let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
+        let context_key = self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), budget)?;
         if self.context_has_invalid_project_selection(&context_key) {
             return Err(format!(
                 "project selection is invalid; navigation is unavailable for {uri}"
@@ -2388,7 +2400,7 @@ impl Workspace {
             .is_some_and(|path| extension_is(&path, "inc"))
         {
             if matches!(
-                self.discover_include_owners_with_cancel(uri, cancel)?,
+                self.discover_include_owners_with_cancel_and_budget(uri, cancel, budget)?,
                 IncludeOwnerDiscoveryOutcome::Incomplete
             ) {
                 return Err(format!(
@@ -2434,10 +2446,11 @@ impl Workspace {
         ))
     }
 
-    fn discover_include_owners_with_cancel(
+    fn discover_include_owners_with_cancel_and_budget(
         &mut self,
         include_uri: &Url,
         cancel: &AtomicBool,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<IncludeOwnerDiscoveryOutcome, String> {
         if self
             .include_parents
@@ -2451,19 +2464,22 @@ impl Workspace {
             .map(absolute_path)
             .map_err(|_| format!("include URI is not a file URI: {include_uri}"))?;
         let mut candidates = HashSet::new();
-        let mut open_documents = self
-            .open_documents
-            .iter()
-            .filter_map(|(uri, document)| {
-                (document.text.is_some()
-                    && uri != include_uri
-                    && uri
-                        .to_file_path()
-                        .ok()
-                        .is_some_and(|path| is_analyzable_source_path(&path)))
-                .then_some(canonical_file_uri(uri))
-            })
-            .collect::<Vec<_>>();
+        let mut open_documents = Vec::new();
+        for (uri, document) in &self.open_documents {
+            check_workspace_cancel(Some(cancel))?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if document.text.is_some()
+                && uri != include_uri
+                && uri
+                    .to_file_path()
+                    .ok()
+                    .is_some_and(|path| is_analyzable_source_path(&path))
+            {
+                open_documents.push(canonical_file_uri(uri));
+            }
+        }
         open_documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         for uri in open_documents {
             if candidates.insert(uri) && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY {
@@ -2478,19 +2494,29 @@ impl Workspace {
         root_paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
         for root_path in root_paths {
             check_workspace_cancel(Some(cancel))?;
-            let catalogue = self.filename_catalogue_with_cancel(&root_path, Some(cancel))?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            let catalogue =
+                self.filename_catalogue_with_cancel_and_budget(&root_path, Some(cancel), budget)?;
             if !catalogue.complete {
                 return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
             }
-            let mut paths = catalogue
-                .entries
-                .values()
-                .flatten()
-                .map(|path| absolute_path(path.clone()))
-                .collect::<Vec<_>>();
+            let mut paths = Vec::new();
+            for path in catalogue.entries.values().flatten() {
+                check_workspace_cancel(Some(cancel))?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                paths.push(absolute_path(path.clone()));
+            }
             paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
             paths.dedup_by(|left, right| paths_equal_ci(left, right));
             for path in paths {
+                check_workspace_cancel(Some(cancel))?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
                 if paths_equal_ci(&path, &include_path) {
                     continue;
                 }
@@ -2507,10 +2533,21 @@ impl Workspace {
         candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         for owner_uri in candidates {
             check_workspace_cancel(Some(cancel))?;
-            let owner_context = match self.context_for_uri_with_cancel(&owner_uri, Some(cancel)) {
-                Ok(context) => context,
-                Err(_) => return Ok(IncludeOwnerDiscoveryOutcome::Incomplete),
-            };
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            let owner_context =
+                match self.context_for_uri_with_cancel_and_budget(&owner_uri, Some(cancel), budget)
+                {
+                    Ok(context) => context,
+                    Err(error)
+                        if error == CANCELLATION_MESSAGE
+                            || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => return Ok(IncludeOwnerDiscoveryOutcome::Incomplete),
+                };
             if !self.ensure_supported_with_context(&owner_uri, &owner_context) {
                 return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
             }
@@ -5934,8 +5971,8 @@ impl Workspace {
         let mut rediscover_open_context = false;
         if let Some(existing) = self.open_document_contexts.get(uri).cloned() {
             if self.contexts.contains_key(&existing) {
-                self.extend_context_watch_paths(&existing, &path, cancel)?;
-                if self.context_is_fresh_with_cancel(&existing, cancel)?
+                self.extend_context_watch_paths(&existing, &path, cancel, budget)?;
+                if self.context_is_fresh_with_cancel(&existing, cancel, budget)?
                     && self
                         .context_matches_current_selection_with_cancel(&path, &existing, cancel)?
                 {
@@ -5950,8 +5987,8 @@ impl Workspace {
         if !rediscover_open_context {
             if let Some(existing) = self.document_contexts.get(uri).cloned() {
                 if self.contexts.contains_key(&existing) {
-                    self.extend_context_watch_paths(&existing, &path, cancel)?;
-                    if self.context_is_fresh_with_cancel(&existing, cancel)?
+                    self.extend_context_watch_paths(&existing, &path, cancel, budget)?;
+                    if self.context_is_fresh_with_cancel(&existing, cancel, budget)?
                         && self.context_matches_current_selection_with_cancel(
                             &path, &existing, cancel,
                         )?
@@ -6004,7 +6041,7 @@ impl Workspace {
             if owner.origin == OwnerOrigin::Automatic
                 && !rediscover_open_context
                 && self.context_has_open_legacy_overlay(&owner.state)
-                && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
+                && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
             {
                 // An automatic project owner remains authoritative while an
                 // explicitly opened legacy source has lost its backing file.
@@ -6066,6 +6103,7 @@ impl Workspace {
             candidate_memberships,
             &path,
             cancel,
+            budget,
         )?;
         self.select_document_context(uri, &key, self.owner_origin_for_context_key(&key));
         Ok(key)
@@ -6083,7 +6121,7 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
         if !owner.needs_revalidation
-            && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
+            && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
         {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
             self.select_document_context(uri, &owner.key, owner.origin);
@@ -6102,6 +6140,7 @@ impl Workspace {
             discovery.candidate_memberships,
             path,
             cancel,
+            budget,
         )?;
         self.select_document_context(uri, &key, owner.origin);
         Ok(key)
@@ -6279,7 +6318,7 @@ impl Workspace {
                 && self.known_owner_selection_is_current(path, owner)
             {
                 if !owner.needs_revalidation
-                    && self.context_state_is_fresh_with_open_documents(&owner.state, None)?
+                    && self.context_state_is_fresh_with_open_documents(&owner.state, None, None)?
                 {
                     return Ok((owner.key.clone(), owner.state.context.clone()));
                 }
@@ -6687,6 +6726,7 @@ impl Workspace {
             .map(|root| root.path.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install_context(
         &mut self,
         key: ContextKey,
@@ -6695,6 +6735,7 @@ impl Workspace {
         mut candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
         file: &Path,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
         let mut watched_paths = HashMap::new();
         let mut metadata = context.metadata_files.clone();
@@ -6709,14 +6750,17 @@ impl Workspace {
         for directory in self.discovery_directories(file) {
             let membership = take_candidate_membership(&mut candidate_memberships, &directory)
                 .unwrap_or_else(|| {
-                    project_candidate_membership_with_deleted_paths(
+                    project_candidate_membership_with_deleted_paths_and_budget(
                         &directory,
                         cancel,
                         &deleted_paths,
+                        budget.map(|budget| budget as &dyn ProjectWorkBudget),
                     )
                 });
             if let Err(error) = &membership {
-                if error == CANCELLATION_MESSAGE {
+                if error == CANCELLATION_MESSAGE
+                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
+                {
                     return Err(error.clone());
                 }
             }
@@ -6741,6 +6785,10 @@ impl Workspace {
         metadata.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
         metadata.dedup_by(|left, right| package_paths_equal(left, right));
         for path in metadata {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
             let stamp = self
                 .project_read_observation_for_path(&key, &path, &observations)
                 .map(|observation| Some(path_stamp_from_project_read(&observation.stamp)))
@@ -6793,24 +6841,50 @@ impl Workspace {
         key: &ContextKey,
         file: &Path,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
         let paths = self.discovery_directories(file);
         let deleted_paths = self.deleted_path_snapshot();
-        if let Some(state) = self.contexts.get_mut(key) {
-            for path in paths {
-                let Entry::Vacant(entry) = state.project_candidate_memberships.entry(path.clone())
-                else {
-                    continue;
-                };
-                let membership =
-                    project_candidate_membership_with_deleted_paths(&path, cancel, &deleted_paths);
-                if let Err(error) = &membership {
-                    if error == CANCELLATION_MESSAGE {
-                        return Err(error.clone());
-                    }
-                }
-                entry.insert(membership);
+        let Some(state) = self.contexts.get(key) else {
+            return Ok(());
+        };
+        let mut prepared = Vec::new();
+        for path in paths {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
             }
+            let mut known = false;
+            for existing in state.project_candidate_memberships.keys() {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if package_paths_equal(existing, &path) {
+                    known = true;
+                    break;
+                }
+            }
+            if known {
+                continue;
+            }
+            let membership = project_candidate_membership_with_deleted_paths_and_budget(
+                &path,
+                cancel,
+                &deleted_paths,
+                budget.map(|budget| budget as &dyn ProjectWorkBudget),
+            );
+            if let Err(error) = &membership {
+                if error == CANCELLATION_MESSAGE
+                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
+                {
+                    return Err(error.clone());
+                }
+            }
+            prepared.push((path, membership));
+        }
+        if let Some(state) = self.contexts.get_mut(key) {
+            state.project_candidate_memberships.extend(prepared);
         }
         Ok(())
     }
@@ -6844,9 +6918,10 @@ impl Workspace {
         &self,
         key: &ContextKey,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
         self.contexts.get(key).map_or(Ok(false), |state| {
-            self.context_state_is_fresh_with_open_documents(state, cancel)
+            self.context_state_is_fresh_with_open_documents(state, cancel, budget)
         })
     }
 
@@ -6854,29 +6929,41 @@ impl Workspace {
         &self,
         state: &ContextState,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
         let deleted_paths = self.deleted_path_snapshot();
-        let open_overlay_paths = self
-            .open_documents
-            .iter()
-            .filter_map(|(uri, document)| {
-                let path = document
-                    .text
-                    .as_ref()
-                    .and_then(|_| uri.to_file_path().ok())
-                    .map(absolute_path)?;
-                (!path.exists()
-                    && context_path_entry(&state.context, &path).is_some_and(|entry| {
-                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-                    }))
-                .then_some(path)
-            })
-            .collect::<Vec<_>>();
+        let mut open_overlay_paths = Vec::new();
+        for (uri, document) in &self.open_documents {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            let Some(path) = document
+                .text
+                .as_ref()
+                .and_then(|_| uri.to_file_path().ok())
+                .map(absolute_path)
+            else {
+                continue;
+            };
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !path.exists()
+                && context_path_entry(&state.context, &path).is_some_and(|entry| {
+                    matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                })
+            {
+                open_overlay_paths.push(path);
+            }
+        }
         context_state_is_fresh_with_cancel_ignoring_paths(
             state,
             cancel,
             &open_overlay_paths,
             &deleted_paths,
+            budget,
         )
     }
 
@@ -6948,11 +7035,18 @@ impl Workspace {
             if let Some(budget) = budget {
                 budget.charge_path_visits(1)?;
             }
-            if state
-                .watched_paths
-                .keys()
-                .any(|watched| paths_equal_ci(watched, &path))
-            {
+            let mut watches_changed_path = false;
+            for watched in state.watched_paths.keys() {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if paths_equal_ci(watched, &path) {
+                    watches_changed_path = true;
+                    break;
+                }
+            }
+            if watches_changed_path {
                 affected.push(key.clone());
             }
         }
@@ -7265,9 +7359,7 @@ impl Workspace {
         )?;
         self.retain_package_observations(context_key, package_lookup.observations.clone());
         self.merge_metadata_observations(context_key, &package_lookup.metadata_observations);
-        for path in &package_lookup.metadata_paths {
-            self.watch_package_path(context_key, path);
-        }
+        self.watch_package_paths(context_key, &package_lookup.metadata_paths, cancel, budget)?;
         if !package_lookup.complete {
             for warning in package_lookup.warnings {
                 self.warn(warning);
@@ -7756,22 +7848,58 @@ impl Workspace {
         }
     }
 
-    fn watch_package_path(&mut self, context_key: &ContextKey, path: &Path) {
-        if let Some(state) = self.contexts.get_mut(context_key) {
-            if (extension_is(path, "dpk") || extension_is(path, "dproj"))
-                && !state
-                    .context
-                    .metadata_files
-                    .iter()
-                    .any(|existing| paths_equal_ci(existing, path))
-            {
-                state.context.metadata_files.push(path.to_path_buf());
+    fn watch_package_paths(
+        &mut self,
+        context_key: &ContextKey,
+        paths: &[PathBuf],
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let Some(state) = self.contexts.get(context_key) else {
+            return Ok(());
+        };
+        // Prepare every comparison and stamp before mutating ContextState. If
+        // cancellation or the shared account stops this pass, no partial set
+        // of package bindings is made to look fully watched.
+        let mut prepared = Vec::with_capacity(paths.len());
+        for path in paths {
+            check_workspace_cancel(cancel)?;
+            let mut metadata_known = false;
+            for existing in &state.context.metadata_files {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if paths_equal_ci(existing, path) {
+                    metadata_known = true;
+                    break;
+                }
             }
-            state
-                .watched_paths
-                .entry(path.to_path_buf())
-                .or_insert_with(|| path_stamp(path));
+            let watched = state.watched_paths.contains_key(path);
+            let stamp = if watched {
+                None
+            } else {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                Some(path_stamp(path))
+            };
+            prepared.push((path.clone(), metadata_known, stamp));
         }
+        let state = self
+            .contexts
+            .get_mut(context_key)
+            .expect("context retained");
+        for (path, metadata_known, stamp) in prepared {
+            if !metadata_known && (extension_is(&path, "dpk") || extension_is(&path, "dproj")) {
+                state.context.metadata_files.push(path.clone());
+            }
+            if let Some(stamp) = stamp {
+                state.watched_paths.entry(path).or_insert(stamp);
+            }
+        }
+        Ok(())
     }
 
     fn retain_package_observations(
@@ -8361,18 +8489,32 @@ impl Workspace {
         root: &Path,
         cancel: Option<&AtomicBool>,
     ) -> Result<FilenameCatalogue, String> {
+        self.filename_catalogue_with_cancel_and_budget(root, cancel, None)
+    }
+
+    fn filename_catalogue_with_cancel_and_budget(
+        &mut self,
+        root: &Path,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<FilenameCatalogue, String> {
         check_workspace_cancel(cancel)?;
         let root = absolute_path(root.to_path_buf());
         let entry_limit = filename_catalogue_entry_limit();
-        let fresh = self
-            .filename_catalogues
-            .get(&root)
-            .is_some_and(|catalogue| {
-                catalogue
-                    .directories
-                    .iter()
-                    .all(|(path, stamp)| path_stamp(path) == *stamp)
-            });
+        let mut fresh = false;
+        if let Some(catalogue) = self.filename_catalogues.get(&root) {
+            fresh = true;
+            for (path, stamp) in &catalogue.directories {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if path_stamp(path) != *stamp {
+                    fresh = false;
+                    break;
+                }
+            }
+        }
         if fresh {
             self.use_clock = self.use_clock.saturating_add(1);
             if let Some(catalogue) = self.filename_catalogues.get_mut(&root) {
@@ -8381,6 +8523,10 @@ impl Workspace {
             }
         }
         let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         let mut directories = vec![(root.clone(), path_stamp(&root))];
         let mut visited = 0;
         let mut complete = true;
@@ -8389,17 +8535,28 @@ impl Workspace {
             .iter()
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
             .map(|workspace_root| workspace_root.excludes.clone());
-        for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+        let mut walk = WalkDir::new(&root).follow_links(false).into_iter();
+        loop {
             check_workspace_cancel(cancel)?;
             if visited >= entry_limit {
                 complete = false;
                 break;
             }
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            let Some(entry) = walk.next() else {
+                break;
+            };
             let Ok(entry) = entry else {
                 continue;
             };
             visited += 1;
             if entry.file_type().is_dir() && directories.len() < entry_limit {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
                 directories.push((entry.path().to_path_buf(), path_stamp(entry.path())));
             }
             if entry.file_type().is_symlink()
@@ -8486,7 +8643,7 @@ impl Workspace {
                 .cloned()
         });
         let effective_context_key = if let Some(owner) = &known_owner {
-            if self.context_state_is_fresh_with_open_documents(&owner.state, None)? {
+            if self.context_state_is_fresh_with_open_documents(&owner.state, None, None)? {
                 self.contexts
                     .entry(owner.key.clone())
                     .or_insert_with(|| owner.state.clone());
@@ -8518,6 +8675,7 @@ impl Workspace {
                     discovery.observations,
                     discovery.candidate_memberships,
                     &path,
+                    None,
                     None,
                 )?;
                 key
@@ -9912,8 +10070,9 @@ fn merge_candidate_memberships(
 fn context_state_is_fresh_with_cancel(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
-    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[])
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[], budget)
 }
 
 fn context_state_is_fresh_with_cancel_ignoring_paths(
@@ -9921,32 +10080,59 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     cancel: Option<&AtomicBool>,
     ignored_paths: &[PathBuf],
     deleted_paths: &[PathBuf],
+    budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
-    let watched_paths_are_fresh = state.watched_paths.iter().all(|(path, stamp)| {
-        if ignored_paths
-            .iter()
-            .any(|ignored| package_paths_equal(ignored, path))
-        {
-            true
-        } else if is_configuration_file(path) {
-            path_stamp_result(path)
-                .map(|actual| actual == *stamp)
-                .unwrap_or(false)
-        } else {
-            path_stamp(path) == *stamp
+    for (path, stamp) in &state.watched_paths {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
         }
-    });
-    if !watched_paths_are_fresh {
-        return Ok(false);
+        let mut ignored = false;
+        for ignored_path in ignored_paths {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if package_paths_equal(ignored_path, path) {
+                ignored = true;
+                break;
+            }
+        }
+        if ignored {
+            continue;
+        }
+        check_workspace_cancel(cancel)?;
+        let actual = if is_configuration_file(path) {
+            path_stamp_result(path).unwrap_or(None)
+        } else {
+            path_stamp(path)
+        };
+        if actual != *stamp {
+            return Ok(false);
+        }
     }
 
     for (directory, expected) in &state.project_candidate_memberships {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         match (
             expected,
-            project_candidate_membership_with_deleted_paths(directory, cancel, deleted_paths),
+            project_candidate_membership_with_deleted_paths_and_budget(
+                directory,
+                cancel,
+                deleted_paths,
+                budget.map(|budget| budget as &dyn ProjectWorkBudget),
+            ),
         ) {
             (Ok(expected), Ok(actual)) if actual == *expected => {}
-            (_, Err(error)) if error == CANCELLATION_MESSAGE => return Err(error),
+            (_, Err(error))
+                if error == CANCELLATION_MESSAGE
+                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED =>
+            {
+                return Err(error);
+            }
             _ => return Ok(false),
         }
     }
@@ -10890,6 +11076,175 @@ mod tests {
             budget.used.get().filesystem_path_visits >= 12,
             "directory open and each candidate's enumeration/inspection must be charged: {:?}",
             budget.used.get()
+        );
+    }
+
+    #[test]
+    fn include_filename_catalogue_charges_cached_stamps_and_walk_before_work() {
+        let temp = tempfile::tempdir().expect("include search root");
+        fs::write(temp.path().join("Owner.pas"), "unit Owner; end.\n").expect("owner source");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(cancellation);
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS - 1)
+            .expect("leave room for root stamp only");
+
+        let error = workspace
+            .filename_catalogue_with_cancel_and_budget(&root, None, Some(&budget))
+            .expect_err("walk entry must be charged before advancing");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS
+        );
+        assert!(
+            !workspace.filename_catalogues.contains_key(&root),
+            "a partial filename catalogue must not be cached as complete"
+        );
+    }
+
+    #[test]
+    fn package_watch_stamp_budget_refusal_does_not_install_partial_watches() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let first = root.join("First.dpk");
+        let second = root.join("Second.dpk");
+        fs::write(&first, "package First; end.").expect("first descriptor");
+        fs::write(&second, "package Second; end.").expect("second descriptor");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        workspace
+            .install_context(
+                key.clone(),
+                ProjectContext::default(),
+                Vec::new(),
+                HashMap::new(),
+                &first,
+                None,
+                None,
+            )
+            .expect("install baseline context");
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("exhaust remaining visits on next charge");
+
+        let error = workspace
+            .watch_package_paths(&key, &[first.clone(), second.clone()], None, Some(&budget))
+            .expect_err("must refuse before stamping paths");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        let state = workspace.contexts.get(&key).expect("context retained");
+        assert!(!state.watched_paths.contains_key(&first));
+        assert!(!state.watched_paths.contains_key(&second));
+        assert!(!state.context.metadata_files.contains(&first));
+        assert!(!state.context.metadata_files.contains(&second));
+    }
+
+    #[test]
+    fn include_catalogue_observes_cancellation_before_cached_path_stamp() {
+        let temp = tempfile::tempdir().expect("include root");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(cancellation.clone());
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("fill path account");
+        cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let error = workspace
+            .filename_catalogue_with_cancel_and_budget(&root, None, Some(&budget))
+            .expect_err("cancellation must be observed before the next filesystem operation");
+        assert_eq!(error, super::CANCELLATION_MESSAGE);
+        assert!(
+            !workspace.filename_catalogues.contains_key(&root),
+            "cancelled catalogue work must not publish a partial cache entry"
+        );
+    }
+
+    #[test]
+    fn cached_candidate_membership_budget_exhaustion_is_not_reported_as_freshness() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let state = super::ContextState {
+            context: ProjectContext::default(),
+            watched_paths: HashMap::new(),
+            project_candidate_memberships: HashMap::from([(
+                root.clone(),
+                Ok(super::ProjectCandidateMembership::default()),
+            )]),
+            project_read_observations: Vec::new(),
+        };
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("fill path budget");
+
+        let result = super::context_state_is_fresh_with_cancel(&state, None, Some(&budget));
+        assert_eq!(
+            result,
+            Err(super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned()),
+            "freshness must propagate budget exhaustion rather than treating it as a cache miss"
+        );
+    }
+
+    #[test]
+    fn watched_package_path_invalidation_charges_each_comparison() {
+        const WATCHED: usize = 4_096;
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let watched_paths = (0..WATCHED)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/tmp/watched-package-{index}.dpk")),
+                    None,
+                )
+            })
+            .collect();
+        workspace.contexts.insert(
+            key,
+            super::ContextState {
+                context: ProjectContext::default(),
+                watched_paths,
+                project_candidate_memberships: HashMap::new(),
+                project_read_observations: Vec::new(),
+            },
+        );
+        let changed =
+            Url::from_file_path(temp.path().join("unrelated.pas")).expect("changed file URI");
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+
+        workspace
+            .invalidate_metadata_for_uri(&changed, None, Some(&budget))
+            .expect("bounded full watched-path comparison");
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            WATCHED + 1,
+            "charge the context and each compared watched path"
         );
     }
 
@@ -13136,7 +13491,7 @@ mod tests {
         );
 
         assert!(
-            !context_state_is_fresh_with_cancel(&state, None).expect("freshness check"),
+            !context_state_is_fresh_with_cancel(&state, None, None).expect("freshness check"),
             "repeated candidate-enumeration errors must not prove freshness"
         );
     }
@@ -13419,6 +13774,7 @@ mod tests {
                 Vec::new(),
                 std::collections::HashMap::new(),
                 &source,
+                None,
                 None,
             )
             .expect("install context");

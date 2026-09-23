@@ -4956,8 +4956,12 @@ fn snapshot_context_for_uri(
 ) -> Result<ContextKey, String> {
     if let Some(owner) = loader.document_owners.get(uri).cloned() {
         if loader.context_has_open_legacy_overlay(&owner.state)
-            || (!super::context_state_is_fresh_with_cancel(&owner.state, Some(cancel))?
-                && loader.context_state_is_fresh_with_open_documents(&owner.state, Some(cancel))?)
+            || (!super::context_state_is_fresh_with_cancel(&owner.state, Some(cancel), None)?
+                && loader.context_state_is_fresh_with_open_documents(
+                    &owner.state,
+                    Some(cancel),
+                    None,
+                )?)
         {
             loader
                 .contexts
@@ -5114,6 +5118,7 @@ fn discover_project_metadata_contexts(
             HashMap::new(),
             &descriptor,
             Some(cancel),
+            None,
         )?;
         let Some(state) = loader.contexts.get(&key).cloned() else {
             return Err(format!(

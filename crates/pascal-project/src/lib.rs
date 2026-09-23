@@ -1701,7 +1701,21 @@ pub fn project_candidate_membership_with_deleted_paths(
     cancel: Option<&AtomicBool>,
     deleted_paths: &[PathBuf],
 ) -> Result<ProjectCandidateMembership, String> {
-    let entries = project_directory_entries(directory, cancel, None)?;
+    project_candidate_membership_with_deleted_paths_and_budget(
+        directory,
+        cancel,
+        deleted_paths,
+        None,
+    )
+}
+
+pub fn project_candidate_membership_with_deleted_paths_and_budget(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+    deleted_paths: &[PathBuf],
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<ProjectCandidateMembership, String> {
+    let entries = project_directory_entries(directory, cancel, work_budget)?;
     if entries.candidate_overflow {
         return Err(format!(
             "project candidate membership limit ({MAX_OWNERSHIP_CANDIDATES}) reached in {}",
@@ -1711,12 +1725,39 @@ pub fn project_candidate_membership_with_deleted_paths(
     let mut dproj = entries.dproj;
     let mut dpr_or_dpk = entries.dpr_or_dpk;
     dproj.append(&mut dpr_or_dpk);
-    dproj.retain(|path| !is_deleted_path(path, deleted_paths));
+    let mut retained = Vec::with_capacity(dproj.len());
+    for path in dproj {
+        check_project_scan_cancel(cancel)?;
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+        }
+        if !is_deleted_path_with_budget(&path, deleted_paths, work_budget)? {
+            retained.push(path);
+        }
+    }
+    let mut dproj = retained;
     dproj.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
     Ok(ProjectCandidateMembership {
         paths: dproj,
         readable: true,
     })
+}
+
+fn is_deleted_path_with_budget(
+    path: &Path,
+    deleted_paths: &[PathBuf],
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<bool, String> {
+    for deleted in deleted_paths {
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+            work_budget.charge_path_visits(1)?;
+        }
+        if project_paths_equal(path, deleted) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn project_path_starts_with(path: &Path, root: &Path) -> bool {

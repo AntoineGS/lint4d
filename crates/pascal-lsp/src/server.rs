@@ -27,11 +27,12 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentDiagnosticParams, DocumentFormattingParams, DocumentHighlightParams, FileChangeType,
     FileSystemWatcher, FoldingRangeParams, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, InitializeParams, Location, MarkupKind, OneOf, Position,
-    PrepareRenameResponse, ProgressToken, PublishDiagnosticsParams, ReferenceParams, Registration,
-    RegistrationParams, RelativePattern, SelectionRangeParams, ServerInfo, SignatureHelpParams,
-    SymbolInformation, TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams,
-    WorkspaceDiagnosticParams, WorkspaceEdit, WorkspaceFolder,
+    GotoDefinitionResponse, HoverParams, InitializeParams, Location, MarkupKind, MessageType,
+    OneOf, Position, PrepareRenameResponse, ProgressToken, PublishDiagnosticsParams,
+    ReferenceParams, Registration, RegistrationParams, RelativePattern, SelectionRangeParams,
+    ServerInfo, ShowMessageParams, SignatureHelpParams, SymbolInformation, TextDocumentIdentifier,
+    Url, WatchKind, WorkDoneProgressCancelParams, WorkspaceDiagnosticParams, WorkspaceEdit,
+    WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -7274,8 +7275,11 @@ fn deliver_analysis_result_with_store(
                         }),
                     )
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                for update in updates {
+                for update in updates.updates {
                     send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
+                }
+                if updates.incomplete {
+                    send_diagnostic_publication_incomplete(connection)?;
                 }
                 Ok(())
             }
@@ -10548,13 +10552,34 @@ fn send_diagnostic_publications(
     root_uri: &Url,
     publications: Vec<queries::DiagnosticPublication>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let updates = workspace
+    let replacement = workspace
         .replace_diagnostic_publications(root_uri, publications)
         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-    for update in updates {
+    for update in replacement.updates {
         send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
     }
+    if replacement.incomplete {
+        send_diagnostic_publication_incomplete(connection)?;
+    }
     Ok(())
+}
+
+fn send_diagnostic_publication_incomplete(
+    connection: &dyn ProtocolSender,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    connection
+        .send_control(diagnostic_publication_incomplete_message())
+        .map_err(Into::into)
+}
+
+fn diagnostic_publication_incomplete_message() -> Message {
+    Message::Notification(Notification::new(
+        "window/showMessage".to_string(),
+        ShowMessageParams {
+            typ: MessageType::WARNING,
+            message: "pascal-lsp: diagnostics are incomplete because the bounded publication limit was reached; no partial related-document report was accepted. This is an operational warning, not a Pascal semantic diagnostic. Retry after reducing workspace diagnostic fan-out.".to_string(),
+        },
+    ))
 }
 
 fn register_file_watcher(
@@ -11103,6 +11128,66 @@ mod tests {
         options: crate::workspace::WorkspaceOptions,
     ) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn publication_limit_notice_is_operational_not_a_semantic_diagnostic() {
+        let Message::Notification(notification) =
+            super::diagnostic_publication_incomplete_message()
+        else {
+            panic!("publication limit notice must be a notification");
+        };
+        assert_eq!(notification.method, "window/showMessage");
+        let params = notification.params;
+        assert_eq!(params["type"], 2);
+        let message = params["message"].as_str().expect("warning message");
+        assert!(message.contains("diagnostics are incomplete"));
+        assert!(message.contains("not a Pascal semantic diagnostic"));
+        assert!(!message.contains("publishDiagnostics"));
+    }
+
+    #[test]
+    fn push_publication_overflow_sends_only_a_client_visible_incomplete_notice() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        workspace.seed_diagnostic_publication_capacity_for_test();
+        let root = Url::from_file_path(temp.path().join("new-owner.pas")).expect("root URI");
+        let omitted =
+            Url::from_file_path(temp.path().join("nonempty-related.pas")).expect("related URI");
+        let (server, client) = Connection::memory();
+
+        super::send_diagnostic_publications(
+            &server,
+            &mut workspace,
+            &root,
+            vec![DiagnosticPublication {
+                uri: omitted.clone(),
+                version: None,
+                diagnostics: vec![lsp_types::Diagnostic::new_simple(
+                    lsp_types::Range::default(),
+                    "real semantic finding".to_string(),
+                )],
+            }],
+        )
+        .expect("over-cap report should be downgraded to an operational warning");
+
+        let Message::Notification(notification) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("client-visible incomplete notice")
+        else {
+            panic!("incomplete notice should be a notification");
+        };
+        assert_eq!(notification.method, "window/showMessage");
+        assert!(
+            notification.params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("diagnostics are incomplete"))
+        );
+        assert!(client.receiver.try_recv().is_err());
     }
 
     #[test]

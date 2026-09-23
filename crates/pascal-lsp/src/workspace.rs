@@ -1360,6 +1360,12 @@ pub(crate) enum DiagnosticPublicationCursorStep {
     Exhausted,
 }
 
+#[derive(Debug)]
+pub(crate) struct DiagnosticPublicationReplacement {
+    pub(crate) updates: Vec<queries::DiagnosticPublication>,
+    pub(crate) incomplete: bool,
+}
+
 impl DiagnosticPublicationUriCursor {
     fn new(
         publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
@@ -2599,6 +2605,27 @@ impl Workspace {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_diagnostic_publication_capacity_for_test(&mut self) {
+        self.diagnostic_publications.clear();
+        self.diagnostic_publication_target_count = 0;
+        self.diagnostic_publication_uri_bytes = 0;
+        for index in 0..MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS {
+            let owner = Url::parse(&format!("file:///virtual/owner-{}.pas", index % 128))
+                .expect("test owner URI");
+            let target = Url::parse(&format!("file:///virtual/target-{index:05}.pas"))
+                .expect("test target URI");
+            self.diagnostic_publication_uri_bytes = self
+                .diagnostic_publication_uri_bytes
+                .saturating_add(target.as_str().len());
+            self.diagnostic_publication_target_count += 1;
+            self.diagnostic_publications
+                .entry(owner)
+                .or_default()
+                .insert(target, Vec::new());
+        }
+    }
+
     pub fn change_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
         self.change_document_with_changes(
             uri,
@@ -3689,22 +3716,35 @@ impl Workspace {
         &mut self,
         root_uri: &Url,
         publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
-    ) -> Result<Vec<queries::DiagnosticPublication>, String> {
-        if !self.diagnostic_publications.contains_key(root_uri)
-            && self.diagnostic_publications.len() >= MAX_OPEN_DOCUMENTS
-        {
-            return Err("diagnostic publication root limit reached".to_string());
+    ) -> Result<DiagnosticPublicationReplacement, String> {
+        let mut proposed = BTreeMap::<Url, Vec<LspDiagnostic>>::new();
+        let mut proposed_uri_bytes = 0usize;
+        let mut incomplete = !self.diagnostic_publications.contains_key(root_uri)
+            && self.diagnostic_publications.len() >= MAX_OPEN_DOCUMENTS;
+        for publication in publications {
+            if incomplete {
+                break;
+            }
+            let uri = publication.uri;
+            let uri_bytes = uri.as_str().len();
+            let is_new_target = !proposed.contains_key(&uri);
+            if uri_bytes > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES
+                || (is_new_target
+                    && (proposed.len() >= MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS
+                        || proposed_uri_bytes.saturating_add(uri_bytes)
+                            > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES))
+            {
+                incomplete = true;
+                break;
+            }
+            if is_new_target {
+                proposed_uri_bytes = proposed_uri_bytes.saturating_add(uri_bytes);
+            }
+            proposed
+                .entry(uri)
+                .or_default()
+                .extend(publication.diagnostics);
         }
-        let proposed = publications.into_iter().fold(
-            BTreeMap::<Url, Vec<LspDiagnostic>>::new(),
-            |mut current, publication| {
-                current
-                    .entry(publication.uri)
-                    .or_default()
-                    .extend(publication.diagnostics);
-                current
-            },
-        );
         let previous = self.diagnostic_publications.get(root_uri);
         let previous_target_uris = previous
             .into_iter()
@@ -3722,35 +3762,52 @@ impl Workspace {
             .diagnostic_publication_uri_bytes
             .saturating_sub(previous_uri_bytes);
         let proposed_targets = proposed.keys().cloned().collect::<Vec<_>>();
-        let mut current = BTreeMap::new();
-        let mut current_uri_bytes = 0usize;
-        for (uri, diagnostics) in proposed {
-            let uri_bytes = uri.as_str().len();
-            if uri_bytes > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES
-                || retained_count.saturating_add(current.len())
-                    >= MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS
-                || retained_uri_bytes
-                    .saturating_add(current_uri_bytes)
-                    .saturating_add(uri_bytes)
-                    > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES
-            {
-                continue;
+        let mut affected = previous_target_uris
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut affected_uri_bytes = previous_uri_bytes;
+        for uri in &proposed_targets {
+            if affected.insert(uri.clone()) {
+                affected_uri_bytes = affected_uri_bytes.saturating_add(uri.as_str().len());
+                if affected.len() > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS
+                    || affected_uri_bytes > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES
+                {
+                    incomplete = true;
+                    break;
+                }
             }
-            current_uri_bytes = current_uri_bytes.saturating_add(uri_bytes);
-            current.insert(uri, diagnostics);
         }
-        let mut affected = previous_target_uris.into_iter().collect::<HashSet<_>>();
-        affected.extend(proposed_targets);
-        // Include rejected proposed targets in the aggregate pass so targets
-        // omitted by the global retention ceiling are explicitly cleared if
-        // no other retained root owns them.
-        // (They are intentionally not retained as publication authority.)
-        self.diagnostic_publication_target_count = retained_count.saturating_add(current.len());
+        let current_uri_bytes = proposed_uri_bytes;
+        if retained_count.saturating_add(proposed.len())
+            > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS
+            || retained_uri_bytes.saturating_add(current_uri_bytes)
+                > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES
+        {
+            incomplete = true;
+        }
+
+        if incomplete {
+            // Keep the prior complete root snapshot as the last known report.
+            // The caller emits an operational warning; no partial proposal or
+            // fabricated empty report is admitted, and the retained keys stay
+            // available to the existing later cleanup cursor.
+            return Ok(DiagnosticPublicationReplacement {
+                updates: Vec::new(),
+                incomplete: true,
+            });
+        }
+
+        let affected = affected.into_iter().collect();
+        self.diagnostic_publication_target_count = retained_count.saturating_add(proposed.len());
         self.diagnostic_publication_uri_bytes =
             retained_uri_bytes.saturating_add(current_uri_bytes);
         self.diagnostic_publications
-            .insert(root_uri.clone(), current);
-        Ok(self.aggregate_diagnostic_publications(affected))
+            .insert(root_uri.clone(), proposed);
+        Ok(DiagnosticPublicationReplacement {
+            updates: self.aggregate_diagnostic_publications(affected),
+            incomplete: false,
+        })
     }
 
     pub(crate) fn clear_diagnostic_publications(
@@ -10487,7 +10544,7 @@ mod tests {
         context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
-    use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
+    use lsp_types::{Diagnostic, Position, Range, TextDocumentContentChangeEvent, Url};
     use pascal_project::delphi_overrides::{
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
@@ -10550,6 +10607,172 @@ mod tests {
         assert_eq!(targets.len(), 513);
         assert!(targets.contains(&emitted));
         assert!(targets.contains(&later));
+    }
+
+    #[test]
+    fn retained_publication_cap_never_turns_omitted_diagnostics_into_empty_reports() {
+        const ROOTS: usize = 128;
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let mut total_uri_bytes = 0usize;
+        for root_index in 0..ROOTS {
+            let root = Url::from_file_path(temp.path().join(format!("owner-{root_index}.pas")))
+                .expect("owner URI");
+            let mut targets = BTreeMap::new();
+            for target_index in 0..(super::MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS / ROOTS) {
+                let target = Url::from_file_path(
+                    temp.path()
+                        .join(format!("owner-{root_index}-target-{target_index:04}.pas")),
+                )
+                .expect("retained target URI");
+                total_uri_bytes = total_uri_bytes.saturating_add(target.as_str().len());
+                targets.insert(target, Vec::new());
+            }
+            workspace.diagnostic_publications.insert(root, targets);
+        }
+        workspace.diagnostic_publication_target_count =
+            super::MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS;
+        workspace.diagnostic_publication_uri_bytes = total_uri_bytes;
+
+        let root = Url::from_file_path(temp.path().join("new-owner.pas")).expect("root URI");
+        let omitted = Url::from_file_path(temp.path().join("unretained-diagnostic.pas"))
+            .expect("new target URI");
+        let replacement = workspace
+            .replace_diagnostic_publications(
+                &root,
+                [super::queries::DiagnosticPublication {
+                    uri: omitted.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "real related diagnostic".to_string(),
+                    )],
+                }],
+            )
+            .expect("cap overflow is handled conservatively, not as a server error");
+
+        assert!(replacement.incomplete);
+        assert!(
+            replacement
+                .updates
+                .iter()
+                .all(|update| update.uri != omitted),
+            "an omitted nonempty target must never be published as an empty complete report"
+        );
+        assert!(!workspace.diagnostic_publications.contains_key(&root));
+        assert_eq!(
+            workspace.diagnostic_publication_target_count,
+            super::MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS
+        );
+
+        let existing_root =
+            Url::from_file_path(temp.path().join("owner-0.pas")).expect("existing root URI");
+        let previous = workspace
+            .diagnostic_publications
+            .get(&existing_root)
+            .expect("previous complete report")
+            .clone();
+        let oversized_replacement = (0..(previous.len() + 1))
+            .map(|index| super::queries::DiagnosticPublication {
+                uri: Url::from_file_path(temp.path().join(format!("replacement-{index:04}.pas")))
+                    .expect("replacement URI"),
+                version: None,
+                diagnostics: vec![Diagnostic::new_simple(
+                    Range::default(),
+                    "replacement diagnostic".to_string(),
+                )],
+            })
+            .collect::<Vec<_>>();
+        let existing_root_result = workspace
+            .replace_diagnostic_publications(&existing_root, oversized_replacement)
+            .expect("over-limit replacement remains an incomplete result");
+        assert!(existing_root_result.incomplete);
+        assert_eq!(
+            workspace.diagnostic_publications.get(&existing_root),
+            Some(&previous),
+            "atomic rejection preserves the previous complete root snapshot for later cleanup"
+        );
+    }
+
+    #[test]
+    fn related_publication_uri_boundary_is_atomic_at_sixteen_kib() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let root = Url::from_file_path(temp.path().join("root.pas")).expect("root URI");
+        let prefix = "file:///";
+        let accepted = Url::parse(&format!(
+            "{prefix}{}",
+            "a".repeat(super::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES - prefix.len())
+        ))
+        .expect("exact-limit URI");
+        assert_eq!(
+            accepted.as_str().len(),
+            super::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES
+        );
+        let accepted_result = workspace
+            .replace_diagnostic_publications(
+                &root,
+                [super::queries::DiagnosticPublication {
+                    uri: accepted.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "boundary diagnostic".to_string(),
+                    )],
+                }],
+            )
+            .expect("exact-limit target is admitted");
+        assert!(!accepted_result.incomplete);
+        assert!(
+            workspace
+                .diagnostic_publications
+                .get(&root)
+                .is_some_and(|targets| targets.contains_key(&accepted))
+        );
+
+        let rejected = Url::parse(&format!(
+            "{prefix}{}",
+            "b".repeat(super::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES + 1 - prefix.len())
+        ))
+        .expect("over-limit URI");
+        assert_eq!(
+            rejected.as_str().len(),
+            super::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES + 1
+        );
+        let rejected_result = workspace
+            .replace_diagnostic_publications(
+                &root,
+                [super::queries::DiagnosticPublication {
+                    uri: rejected.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "must not be hidden as empty".to_string(),
+                    )],
+                }],
+            )
+            .expect("over-limit report is rejected transactionally");
+        assert!(rejected_result.incomplete);
+        assert!(
+            rejected_result
+                .updates
+                .iter()
+                .all(|update| update.uri != rejected)
+        );
+        assert!(
+            workspace
+                .diagnostic_publications
+                .get(&root)
+                .is_some_and(|targets| targets.contains_key(&accepted))
+        );
+        assert!(
+            !workspace
+                .diagnostic_publications
+                .get(&root)
+                .is_some_and(|targets| targets.contains_key(&rejected))
+        );
     }
 
     #[test]

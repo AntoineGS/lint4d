@@ -1288,12 +1288,35 @@ capped at 20,000 entries and 16 MiB of URI bytes, in addition to the per-target
 16 KiB URI ceiling; the open-document URI snapshot is bounded by the open
 document limit. A URI over 16 KiB is not retained as a new push publication;
 an unrepresentable rejected URI that was never published is not sent as a
-clear. Backpressure leaves the current target in place for a later turn.
+clear. A push report that would exceed the root-table, retained-target,
+affected-target, or URI-byte ceiling is rejected atomically: the last complete
+retained root snapshot remains available for later cleanup, no subset of the
+new proposal is retained, and no empty publication is synthesized for an
+unseen proposed target. The client receives a `window/showMessage` warning that
+the report is incomplete; this operational warning is not a Pascal semantic
+diagnostic. Backpressure during the separate rejected-open cleanup cursor
+leaves its current target in place for a later turn.
 `didClose` defers synchronous push clears while the cleanup cursor is active,
 even if closing the rejected URI has already lifted the request fence. Fresh
 push-diagnostic scheduling waits until the cleanup cursor has drained, while
 ordinary protocol requests continue to be serviced. Pull diagnostics continue
-to use their existing refresh-request path.
+to use their separate transactional related-owner path; an over-limit pull
+request returns `RequestFailed` and commits neither a partial owner replacement
+nor a false empty report.
+
+Push publication replacement uses the same 20,000-target/16-MiB URI ceiling
+for the proposed and affected URI sets, with a 16-KiB per-target URI ceiling.
+These are state/cardinality ceilings, **not** an event-loop-turn work or
+serialized-payload ceiling for ordinary successful push publication. The
+existing synchronous aggregate/send path can still do high-fanout work. Push
+notifications use the general outbound control lane (8 MiB pending control
+bytes inside the 16 MiB pending-message byte limit); the separately bounded
+deferred control lane is also limited to 8 MiB. A saturated lane may still
+return backpressure instead of retaining a resumable diagnostic-publication
+cursor. No smaller per-publication serialized byte ceiling or per-turn output
+byte budget has been added here. Resumable push aggregation/output batching and
+its end-to-end stale-result handling remain open corrective work, so these
+guarantees do not close P2-4.
 
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,

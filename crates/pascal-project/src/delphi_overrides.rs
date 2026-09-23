@@ -252,6 +252,30 @@ impl OverrideSession {
         self.capture_path(&root.join(LOCAL_CONFIG_NAME))
     }
 
+    /// Replace one previously captured configuration with a bounded, cancellable
+    /// read. File notifications use this explicit refresh path so ordinary
+    /// `effective_for` calls retain their session-capture semantics.
+    pub fn refresh_path_with_budget(
+        &self,
+        path: &Path,
+        budget: &dyn crate::ProjectWorkBudget,
+    ) -> Result<(), String> {
+        let path = normalize_absolute_lexical(path)?;
+        let result = read_override_file_with_budget(&path, Some(budget));
+        let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
+        captured.insert(path, result.clone());
+        result.map(|_| ())
+    }
+
+    /// Remove a deleted configuration from the captured session without
+    /// consulting the filesystem (the old bytes may still exist until unlink).
+    pub fn remove_path(&self, path: &Path) -> Result<(), String> {
+        let path = normalize_absolute_lexical(path)?;
+        let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
+        captured.insert(path, Ok(None));
+        Ok(())
+    }
+
     pub fn effective_for(
         &self,
         workspace_root: Option<&Path>,
@@ -313,28 +337,71 @@ impl Default for OverrideSession {
 }
 
 fn read_override_file(path: &Path) -> CapturedLayer {
-    let Some(_) = inspect_candidate(path)? else {
+    read_override_file_with_budget(path, None)
+}
+
+fn read_override_file_with_budget(
+    path: &Path,
+    budget: Option<&dyn crate::ProjectWorkBudget>,
+) -> CapturedLayer {
+    if let Some(budget) = budget {
+        budget.check_cancelled()?;
+        budget.charge_path_visits(1)?;
+    }
+    let Some(metadata) = inspect_candidate(path, budget)? else {
         return Ok(None);
     };
+    if metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return Err(format!(
+            "{} exceeds {MAX_CONFIG_BYTES} bytes",
+            path.display()
+        ));
+    }
 
     #[cfg(all(test, target_os = "linux"))]
     maybe_substitute_candidate_after_inspection(path);
 
     let file = open_candidate(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    if let Some(budget) = budget {
+        budget.check_cancelled()?;
+        budget.charge_path_visits(1)?;
+    }
     let opened_metadata = file
         .metadata()
         .map_err(|error| format!("could not inspect opened {}: {error}", path.display()))?;
     validate_regular_file(path, &opened_metadata)?;
 
+    let read_limit = metadata.len().min(MAX_CONFIG_BYTES as u64);
+    if let Some(budget) = budget {
+        let reserve = usize::try_from(read_limit)
+            .map_err(|_| "configuration size does not fit the work budget".to_string())?
+            .saturating_add(1);
+        budget.ensure_file_read_fits(reserve)?;
+        budget.check_cancelled()?;
+    }
     let mut bytes = Vec::new();
-    file.take((MAX_CONFIG_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    if bytes.len() > MAX_CONFIG_BYTES {
+    let mut reader = file.take(read_limit.saturating_add(1));
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if let Some(budget) = budget {
+            budget.charge_file_bytes(read)?;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if bytes.len() as u64 > read_limit {
         return Err(format!(
-            "{} exceeds {MAX_CONFIG_BYTES} bytes",
-            path.display()
+            "{} grew beyond its {read_limit} byte read limit",
+            path.display(),
         ));
     }
     let text = std::str::from_utf8(&bytes)
@@ -342,13 +409,20 @@ fn read_override_file(path: &Path) -> CapturedLayer {
     OverrideLayer::parse(text, path).map(Some)
 }
 
-fn inspect_candidate(path: &Path) -> Result<Option<fs::Metadata>, String> {
+fn inspect_candidate(
+    path: &Path,
+    budget: Option<&dyn crate::ProjectWorkBudget>,
+) -> Result<Option<fs::Metadata>, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
     };
     let metadata = if metadata.file_type().is_symlink() {
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
         fs::metadata(path)
             .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
     } else {
@@ -680,6 +754,67 @@ fn is_valid_property_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{fs, read_override_file};
+    use std::cell::Cell;
+
+    struct RecordingBudget {
+        visits: Cell<usize>,
+        bytes: Cell<usize>,
+        reservation: Cell<usize>,
+    }
+
+    impl crate::ProjectWorkBudget for RecordingBudget {
+        fn check_cancelled(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+            self.visits.set(self.visits.get() + amount);
+            Ok(())
+        }
+
+        fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {
+            self.reservation.set(self.reservation.get() + max_bytes);
+            Ok(())
+        }
+
+        fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
+            self.bytes.set(self.bytes.get() + amount);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn explicit_budgeted_refresh_observes_same_stamp_override_changes() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let path = root.path().join(super::LOCAL_CONFIG_NAME);
+        let initial = "[properties]\nName = 'first'\n";
+        let replacement = "[properties]\nName = 'other'\n";
+        assert_eq!(initial.len(), replacement.len());
+        fs::write(&path, initial).expect("initial override");
+        let session = super::OverrideSession::new(None);
+        session.capture_workspace(root.path()).expect("capture");
+        fs::write(&path, replacement).expect("replace override");
+        let budget = RecordingBudget {
+            visits: Cell::new(0),
+            bytes: Cell::new(0),
+            reservation: Cell::new(0),
+        };
+
+        session
+            .refresh_path_with_budget(&path, &budget)
+            .expect("refresh changed override");
+        let effective = session
+            .effective_for(Some(root.path()), None)
+            .expect("effective override");
+
+        assert_eq!(
+            effective.properties.get("name").map(String::as_str),
+            Some("other")
+        );
+        assert!(budget.visits.get() > 0, "filesystem probes are charged");
+        assert_eq!(budget.bytes.get(), replacement.len());
+        assert!(budget.reservation.get() >= replacement.len());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

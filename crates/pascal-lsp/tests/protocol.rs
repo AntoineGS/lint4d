@@ -32488,6 +32488,124 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
 
 #[test]
 #[cfg(feature = "test-support")]
+fn watched_override_refresh_rebinds_same_stamp_provider_and_invalidates_pull_result() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let sdk = root.path().join("SDK");
+    let provider_a = sdk.join("A/Provider.pas");
+    let provider_b = sdk.join("B/Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let project = root.path().join("App.dproj");
+    let override_file = root.path().join(".delphi-tools.local.toml");
+    let source =
+        "unit Consumer; interface uses Provider; type TUse = TBefore; implementation end.\n";
+    let provider_source = "unit Provider; interface type TBefore = Integer; implementation end.\n";
+    write_file(&provider_a, provider_source);
+    write_file(&provider_b, provider_source);
+    write_file(&consumer, source);
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let config_for = |target: &Path| {
+        format!(
+            "[[path_mappings]]\nfrom = 'C:\\\\SDK'\nto = '{}'\n",
+            target.display()
+        )
+    };
+    let initial_config = config_for(&sdk.join("A"));
+    let replacement_config = config_for(&sdk.join("B"));
+    assert_eq!(initial_config.len(), replacement_config.len());
+    write_file(&override_file, &initial_config);
+    let original_stamp = fs::metadata(&override_file).expect("override stamp");
+
+    let metrics = root.path().join("reconciliation-work.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [(
+            "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+            metrics_value.as_str(),
+        )],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":source}}),
+    );
+    let initial_pull_id = RequestId::from("override-initial-pull".to_string());
+    server.send_request(
+        initial_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":null}),
+    );
+    let initial_pull = server.response(&initial_pull_id);
+    let previous_result_id = initial_pull.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("initial pull result ID")
+        .to_string();
+    let initial_definition_id = RequestId::from("override-initial-provider".to_string());
+    server.send_request(
+        initial_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, source, "TBefore", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&initial_definition_id))[0]["uri"],
+        uri(&provider_a).to_string()
+    );
+
+    write_file(&override_file, &replacement_config);
+    restore_mtime(&override_file, &original_stamp);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&override_file),"type":2}]}),
+    );
+    let fresh_definition_id = RequestId::from("override-fresh-provider".to_string());
+    server.send_request(
+        fresh_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, source, "TBefore", 0),
+    );
+    let fresh_definition = server.response(&fresh_definition_id);
+    assert_eq!(
+        result_locations(fresh_definition)[0]["uri"],
+        uri(&provider_b).to_string(),
+        "the watched override event must use the newly captured mapping"
+    );
+    let refreshed_pull_id = RequestId::from("override-refreshed-pull".to_string());
+    server.send_request(
+        refreshed_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":previous_result_id}),
+    );
+    let refreshed_pull = server.response(&refreshed_pull_id);
+    assert_ne!(
+        refreshed_pull.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "changed override configuration cannot retain the old pull result"
+    );
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "worker metrics are produced"
+    );
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(&metrics).expect("read metrics")).expect("parse metrics");
+    assert!(
+        metrics["file_bytes_read"].as_u64().unwrap_or_default() >= replacement_config.len() as u64,
+        "override bytes must be charged to the notification account: {metrics}"
+    );
+    assert!(
+        metrics["filesystem_path_visits"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 2,
+        "override candidate/open probes must be charged: {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

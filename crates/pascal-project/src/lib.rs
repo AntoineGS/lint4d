@@ -4111,15 +4111,14 @@ fn read_bounded_with_tracker(
     if let Some(budget) = tracker.work_budget {
         let estimate = usize::try_from(stamp.bytes)
             .map_err(|_| "metadata file size does not fit the work budget".to_string())?;
-        budget.ensure_file_read_fits(estimate)?;
+        budget.ensure_file_read_fits(estimate.saturating_add(1))?;
         budget.check_cancelled()?;
     }
     run_before_project_read(path);
-    let bytes = read_file_limited(path, stamp.bytes)?;
+    let bytes = read_file_limited(path, stamp.bytes, tracker.work_budget)?;
     run_after_project_read(path);
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
-        budget.charge_file_bytes(bytes.len())?;
     }
     let read = BoundedRead { stamp, bytes };
     let text =
@@ -4137,12 +4136,16 @@ fn read_bounded_bytes(path: &Path, limit: u64) -> Result<BoundedRead, String> {
             stamp.bytes, limit
         ));
     }
-    let bytes = read_file_limited(path, limit)?;
+    let bytes = read_file_limited(path, limit, None)?;
     run_after_project_read(path);
     Ok(BoundedRead { stamp, bytes })
 }
 
-fn read_file_limited(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+fn read_file_limited(
+    path: &Path,
+    limit: u64,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<Vec<u8>, String> {
     let file = fs::File::open(path).map_err(|error| format!("could not read file: {error}"))?;
     if !file
         .metadata()
@@ -4151,10 +4154,24 @@ fn read_file_limited(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     {
         return Err("opened metadata path is not a regular file".to_string());
     }
+    let mut reader = file.take(limit.saturating_add(1));
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read file: {error}"))?;
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+        }
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| format!("could not read file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if let Some(work_budget) = work_budget {
+            work_budget.charge_file_bytes(read)?;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
         return Err(format!(
             "metadata file grew beyond the {limit} byte read limit"
@@ -4187,13 +4204,31 @@ fn read_payload_with_tracker(
         budget.charge_path_visits(1)?;
     }
     let stamp = project_read_stamp(&entry.path)?;
+    let read_limit = stamp.bytes.min(limit);
     if let Some(budget) = tracker.work_budget {
-        let estimate = usize::try_from(stamp.bytes)
+        let estimate = usize::try_from(read_limit)
             .map_err(|_| "metadata file size does not fit the work budget".to_string())?;
-        budget.ensure_file_read_fits(estimate)?;
+        // The authorized stream uses `take(read_limit + 1)` to detect a
+        // same-path growth race. Reserve that probe byte before opening the
+        // stream so a concurrent replacement cannot exceed the shared ceiling.
+        budget.ensure_file_read_fits(estimate.saturating_add(1))?;
         budget.check_cancelled()?;
     }
-    let bytes = read_policy.read_payload_bytes(entry, stamp.bytes.min(limit))?;
+    let bytes = match read_policy.read_payload_bytes(entry, read_limit) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if let Some(budget) = tracker.work_budget {
+                // A failed over-limit stream may have consumed the full
+                // `limit + 1` probe. Debit the reserved maximum rather than
+                // losing those bytes from the cumulative account.
+                let reserved = usize::try_from(read_limit)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
+                budget.charge_file_bytes(reserved)?;
+            }
+            return Err(error);
+        }
+    };
     run_after_project_read(&entry.path);
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
@@ -6642,6 +6677,64 @@ mod tests {
         assert!(
             error.contains("exceed") || error.contains("limit"),
             "unexpected bounded-read error: {error}"
+        );
+    }
+
+    #[test]
+    fn project_metadata_read_reserves_the_growth_probe_byte_before_streaming() {
+        use std::cell::Cell;
+
+        struct RecordingBudget {
+            ensured: Cell<usize>,
+            charged: Cell<usize>,
+        }
+
+        impl crate::ProjectWorkBudget for RecordingBudget {
+            fn check_cancelled(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn charge_path_visits(&self, _amount: usize) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {
+                self.ensured.set(max_bytes);
+                Ok(())
+            }
+
+            fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
+                self.charged.set(amount);
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("App.dproj");
+        fs::write(&path, b"small").expect("descriptor");
+        let replacement = b"x".repeat(20);
+        let replacement_for_hook = replacement.clone();
+        let _hook = test_before_project_read_at(path.clone(), move |path| {
+            fs::write(path, replacement_for_hook).expect("grow descriptor after reservation");
+        });
+        let budget = RecordingBudget {
+            ensured: Cell::new(0),
+            charged: Cell::new(0),
+        };
+        let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+
+        let error = read_bounded_with_tracker(&path, 32, &mut tracker)
+            .expect_err("same-path growth must trip the bounded stream");
+        assert!(error.contains("grew beyond"), "unexpected error: {error}");
+        assert_eq!(
+            budget.ensured.get(),
+            6,
+            "reserve stat size plus the probe byte"
+        );
+        assert_eq!(
+            budget.charged.get(),
+            6,
+            "charge the consumed growth-probe byte"
         );
     }
 

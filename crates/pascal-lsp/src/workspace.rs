@@ -1554,6 +1554,13 @@ struct PackageLookup {
     complete: bool,
 }
 
+#[derive(Debug)]
+struct PreparedPackageWatch {
+    path: PathBuf,
+    metadata_known: bool,
+    stamp: Option<Option<PathStamp>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ContextKey {
     project_file: Option<PathBuf>,
@@ -6013,7 +6020,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
         };
-        let deleted_paths = self.deleted_path_snapshot();
+        let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
                 && !owner.follow_current_project_file
@@ -6156,7 +6163,7 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(ContextKey, ProjectDiscovery), String> {
         let mut options = project_options.clone();
-        let deleted_paths = self.deleted_path_snapshot();
+        let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         if let (Some(scope), Some(selected)) = (
             owner.key.selection_scope.as_deref(),
             owner.key.selection_project.as_deref(),
@@ -6737,18 +6744,60 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
-        let mut watched_paths = HashMap::new();
-        let mut metadata = context.metadata_files.clone();
+        let initial_metadata_count = context.metadata_files.len()
+            + usize::from(context.project_file.is_some())
+            + usize::from(context.main_source.is_some());
+        if let Some(budget) = budget {
+            budget.charge_path_visits(initial_metadata_count)?;
+        }
+        check_workspace_cancel(cancel)?;
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve(initial_metadata_count)
+            .map_err(|error| format!("could not reserve project metadata paths: {error}"))?;
+        for path in &context.metadata_files {
+            check_workspace_cancel(cancel)?;
+            metadata.push(path.clone());
+        }
         if let Some(project_file) = &context.project_file {
+            check_workspace_cancel(cancel)?;
             metadata.push(project_file.clone());
         }
         if let Some(main_source) = &context.main_source {
+            check_workspace_cancel(cancel)?;
             metadata.push(main_source.clone());
         }
+        let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
+        let directories = self.discovery_directories_with_control(file, cancel, budget)?;
+        let mut candidate_membership_index = HashMap::new();
+        if let Some(budget) = budget {
+            budget.charge_path_visits(candidate_memberships.len())?;
+        }
+        candidate_membership_index
+            .try_reserve(candidate_memberships.len())
+            .map_err(|error| format!("could not reserve candidate-membership index: {error}"))?;
+        for candidate in candidate_memberships.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_indexed_bytes(candidate.to_string_lossy().len())?;
+            }
+            candidate_membership_index
+                .entry(project_path_lookup_key(candidate))
+                .or_insert_with(|| candidate.clone());
+        }
         let mut project_candidate_memberships = HashMap::new();
-        let deleted_paths = self.deleted_path_snapshot();
-        for directory in self.discovery_directories(file) {
-            let membership = take_candidate_membership(&mut candidate_memberships, &directory)
+        project_candidate_memberships
+            .try_reserve(directories.len())
+            .map_err(|error| format!("could not reserve candidate memberships: {error}"))?;
+        for directory in directories {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+                budget.charge_indexed_bytes(directory.to_string_lossy().len())?;
+            }
+            let membership = candidate_membership_index
+                .remove(&project_path_lookup_key(&directory))
+                .and_then(|candidate| candidate_memberships.remove(&candidate))
                 .unwrap_or_else(|| {
                     project_candidate_membership_with_deleted_paths_and_budget(
                         &directory,
@@ -6771,69 +6820,125 @@ impl Workspace {
             .as_deref()
             .and_then(Path::parent)
             .or(key.project_scope.as_deref());
-        let roots = self
-            .roots
-            .iter()
-            .map(|root| root.path.clone())
-            .collect::<Vec<_>>();
+        if let Some(budget) = budget {
+            budget.charge_path_visits(self.roots.len())?;
+        }
+        let mut roots = Vec::new();
+        roots
+            .try_reserve(self.roots.len())
+            .map_err(|error| format!("could not reserve workspace roots: {error}"))?;
+        for root in &self.roots {
+            check_workspace_cancel(cancel)?;
+            roots.push(root.path.clone());
+        }
         if let Ok(directories) = config_directories(file, project_directory, &roots) {
             for directory in directories {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                metadata
+                    .try_reserve(2)
+                    .map_err(|error| format!("could not reserve config metadata paths: {error}"))?;
                 metadata.push(directory.join(".lint4d.toml"));
                 metadata.push(directory.join(".fmt4d.toml"));
             }
         }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(metadata.len()))?;
+        }
         metadata.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        metadata.dedup_by(|left, right| package_paths_equal(left, right));
+        let mut unique_metadata: Vec<PathBuf> = Vec::new();
+        unique_metadata
+            .try_reserve(metadata.len())
+            .map_err(|error| format!("could not reserve unique metadata paths: {error}"))?;
+        for path in metadata {
+            check_workspace_cancel(cancel)?;
+            if let Some(previous) = unique_metadata.last() {
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if package_paths_equal(previous, &path) {
+                    continue;
+                }
+            }
+            unique_metadata.push(path);
+        }
+        let metadata = unique_metadata;
+        let new_read_index = build_project_read_observation_index(&observations, cancel, budget)?;
+        let retained_observations = self
+            .contexts
+            .get(&key)
+            .map(|state| state.project_read_observations.as_slice())
+            .unwrap_or_default();
+        let retained_read_index =
+            build_project_read_observation_index(retained_observations, cancel, budget)?;
+        let mut staged_watched: HashMap<PathBuf, Option<PathStamp>> = HashMap::new();
+        staged_watched
+            .try_reserve(metadata.len())
+            .map_err(|error| format!("could not reserve watched metadata stamps: {error}"))?;
         for path in metadata {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
                 budget.charge_path_visits(1)?;
+                budget.charge_indexed_bytes(path.to_string_lossy().len())?;
             }
-            let stamp = self
-                .project_read_observation_for_path(&key, &path, &observations)
+            let path_key = project_path_lookup_key(&path);
+            let observation = new_read_index
+                .get(&path_key)
+                .or_else(|| retained_read_index.get(&path_key));
+            let stamp = observation
                 .map(|observation| Some(path_stamp_from_project_read(&observation.stamp)))
                 .unwrap_or_else(|| path_stamp(&path));
-            watched_paths.insert(path, stamp);
+            staged_watched.insert(path, stamp);
+        }
+        let (staged_observations, staged_memberships) = if let Some(state) = self.contexts.get(&key)
+        {
+            (
+                merge_project_read_observations_indexed(
+                    &state.project_read_observations,
+                    &observations,
+                    cancel,
+                    budget,
+                )?,
+                merge_candidate_memberships_indexed(
+                    &state.project_candidate_memberships,
+                    project_candidate_memberships,
+                    cancel,
+                    budget,
+                )?,
+            )
+        } else {
+            (observations, project_candidate_memberships)
+        };
+        if let Some(state) = self.contexts.get_mut(&key) {
+            state
+                .watched_paths
+                .try_reserve(staged_watched.len())
+                .map_err(|error| format!("could not reserve context watched paths: {error}"))?;
+        }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
         }
         if let Some(state) = self.contexts.get_mut(&key) {
             state.context = context;
-            merge_project_read_observations(&mut state.project_read_observations, observations);
-            state.watched_paths.extend(watched_paths);
-            merge_candidate_memberships(
-                &mut state.project_candidate_memberships,
-                project_candidate_memberships,
-            );
+            state.project_read_observations = staged_observations;
+            state.watched_paths.extend(staged_watched);
+            state.project_candidate_memberships = staged_memberships;
         } else {
             self.contexts.insert(
                 key,
                 ContextState {
                     context,
-                    watched_paths,
-                    project_candidate_memberships,
-                    project_read_observations: observations,
+                    watched_paths: staged_watched,
+                    project_candidate_memberships: staged_memberships,
+                    project_read_observations: staged_observations,
                 },
             );
         }
         Ok(())
-    }
-
-    fn project_read_observation_for_path<'a>(
-        &'a self,
-        key: &ContextKey,
-        path: &Path,
-        new_observations: &'a [ProjectReadObservation],
-    ) -> Option<&'a ProjectReadObservation> {
-        new_observations
-            .iter()
-            .find(|observation| package_paths_equal(&observation.path, path))
-            .or_else(|| {
-                self.contexts.get(key).and_then(|state| {
-                    state
-                        .project_read_observations
-                        .iter()
-                        .find(|observation| package_paths_equal(&observation.path, path))
-                })
-            })
     }
 
     fn extend_context_watch_paths(
@@ -6843,8 +6948,8 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
-        let paths = self.discovery_directories(file);
-        let deleted_paths = self.deleted_path_snapshot();
+        let paths = self.discovery_directories_with_control(file, cancel, budget)?;
+        let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         let Some(state) = self.contexts.get(key) else {
             return Ok(());
         };
@@ -6889,13 +6994,38 @@ impl Workspace {
         Ok(())
     }
 
-    fn discovery_directories(&self, file: &Path) -> Vec<PathBuf> {
+    fn discovery_directories_with_control(
+        &self,
+        file: &Path,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<PathBuf>, String> {
         let Some(mut directory) = file.parent().map(Path::to_path_buf) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let boundary = self.root_for_path(file);
+        let mut boundary = None;
+        for root in &self.roots {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if path_starts_with_ci(file, &root.path)
+                && boundary.as_ref().is_none_or(|current: &PathBuf| {
+                    root.path.components().count() > current.components().count()
+                })
+            {
+                boundary = Some(root.path.clone());
+            }
+        }
         let mut result = Vec::new();
         loop {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            result
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve discovery directories: {error}"))?;
             result.push(directory.clone());
             if boundary
                 .as_ref()
@@ -6911,7 +7041,7 @@ impl Workspace {
             }
             directory = parent.to_path_buf();
         }
-        result
+        Ok(result)
     }
 
     fn context_is_fresh_with_cancel(
@@ -6931,7 +7061,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
-        let deleted_paths = self.deleted_path_snapshot();
+        let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         let mut open_overlay_paths = Vec::new();
         for (uri, document) in &self.open_documents {
             check_workspace_cancel(cancel)?;
@@ -7357,9 +7487,7 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.retain_package_observations(context_key, package_lookup.observations.clone());
-        self.merge_metadata_observations(context_key, &package_lookup.metadata_observations);
-        self.watch_package_paths(context_key, &package_lookup.metadata_paths, cancel, budget)?;
+        self.apply_package_lookup(context_key, &package_lookup, cancel, budget)?;
         if !package_lookup.complete {
             for warning in package_lookup.warnings {
                 self.warn(warning);
@@ -7848,33 +7976,42 @@ impl Workspace {
         }
     }
 
-    fn watch_package_paths(
-        &mut self,
+    fn prepare_package_watches(
+        &self,
         context_key: &ContextKey,
         paths: &[PathBuf],
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<PreparedPackageWatch>, String> {
         let Some(state) = self.contexts.get(context_key) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
-        // Prepare every comparison and stamp before mutating ContextState. If
-        // cancellation or the shared account stops this pass, no partial set
-        // of package bindings is made to look fully watched.
-        let mut prepared = Vec::with_capacity(paths.len());
+        if let Some(budget) = budget {
+            budget.charge_path_visits(paths.len())?;
+        }
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve(paths.len())
+            .map_err(|error| format!("could not reserve package watch updates: {error}"))?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(state.context.metadata_files.len())?;
+            budget.charge_indexed_bytes(path_key_bytes(&state.context.metadata_files)?)?;
+            budget.charge_indexed_bytes(path_key_bytes(paths)?)?;
+        }
+        let mut metadata_index = HashSet::new();
+        metadata_index
+            .try_reserve(state.context.metadata_files.len())
+            .map_err(|error| format!("could not reserve package metadata index: {error}"))?;
+        for existing in &state.context.metadata_files {
+            check_workspace_cancel(cancel)?;
+            metadata_index.insert(path_ci_lookup_key(existing));
+        }
         for path in paths {
             check_workspace_cancel(cancel)?;
-            let mut metadata_known = false;
-            for existing in &state.context.metadata_files {
-                check_workspace_cancel(cancel)?;
-                if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
-                }
-                if paths_equal_ci(existing, path) {
-                    metadata_known = true;
-                    break;
-                }
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
             }
+            let metadata_known = metadata_index.contains(&path_ci_lookup_key(path));
             let watched = state.watched_paths.contains_key(path);
             let stamp = if watched {
                 None
@@ -7885,47 +8022,81 @@ impl Workspace {
                 }
                 Some(path_stamp(path))
             };
-            prepared.push((path.clone(), metadata_known, stamp));
+            prepared.push(PreparedPackageWatch {
+                path: path.clone(),
+                metadata_known,
+                stamp,
+            });
         }
+        Ok(prepared)
+    }
+
+    fn apply_package_lookup(
+        &mut self,
+        context_key: &ContextKey,
+        lookup: &PackageLookup,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let Some(state) = self.contexts.get(context_key) else {
+            return Ok(());
+        };
+        let staged_reads = merge_project_read_observations_indexed(
+            &state.project_read_observations,
+            &lookup.observations,
+            cancel,
+            budget,
+        )?;
+        let staged_metadata = merge_metadata_observations_indexed(
+            &state.context.metadata_observations,
+            &lookup.metadata_observations,
+            cancel,
+            budget,
+        )?;
+        let prepared_watches =
+            self.prepare_package_watches(context_key, &lookup.metadata_paths, cancel, budget)?;
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        {
+            let state = self
+                .contexts
+                .get_mut(context_key)
+                .expect("context retained during package lookup");
+            state
+                .context
+                .metadata_files
+                .try_reserve(prepared_watches.len())
+                .map_err(|error| format!("could not reserve package metadata files: {error}"))?;
+            state
+                .watched_paths
+                .try_reserve(prepared_watches.len())
+                .map_err(|error| format!("could not reserve package watched paths: {error}"))?;
+        }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        // All fallible budget, cancellation, merge, and reservation work has
+        // completed. Publish the staged observation and watch set together.
         let state = self
             .contexts
             .get_mut(context_key)
-            .expect("context retained");
-        for (path, metadata_known, stamp) in prepared {
-            if !metadata_known && (extension_is(&path, "dpk") || extension_is(&path, "dproj")) {
-                state.context.metadata_files.push(path.clone());
+            .expect("context retained during package lookup");
+        state.project_read_observations = staged_reads;
+        state.context.metadata_observations = staged_metadata;
+        for watch in prepared_watches {
+            if !watch.metadata_known
+                && (extension_is(&watch.path, "dpk") || extension_is(&watch.path, "dproj"))
+            {
+                state.context.metadata_files.push(watch.path.clone());
             }
-            if let Some(stamp) = stamp {
-                state.watched_paths.entry(path).or_insert(stamp);
+            if let Some(stamp) = watch.stamp {
+                state.watched_paths.entry(watch.path).or_insert(stamp);
             }
         }
         Ok(())
-    }
-
-    fn retain_package_observations(
-        &mut self,
-        context_key: &ContextKey,
-        observations: Vec<ProjectReadObservation>,
-    ) {
-        if let Some(state) = self.contexts.get_mut(context_key) {
-            merge_project_read_observations(&mut state.project_read_observations, observations);
-        }
-    }
-
-    fn merge_metadata_observations(
-        &mut self,
-        context_key: &ContextKey,
-        observations: &[MetadataObservation],
-    ) {
-        let Some(state) = self.contexts.get_mut(context_key) else {
-            return;
-        };
-        for observation in observations {
-            pascal_project::add_metadata_observation(
-                &mut state.context.metadata_observations,
-                observation.clone(),
-            );
-        }
     }
 
     fn package_catalogue(
@@ -8756,15 +8927,50 @@ impl Workspace {
     }
 
     fn deleted_path_snapshot(&self) -> Vec<PathBuf> {
-        let mut paths = self
-            .deleted_overrides
-            .keys()
-            .filter_map(|uri| uri.to_file_path().ok())
-            .map(absolute_path)
-            .collect::<Vec<_>>();
-        paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-        paths.dedup_by(|left, right| paths_equal_ci(left, right));
+        self.deleted_path_snapshot_with_control(None, None)
+            .unwrap_or_default()
+    }
+
+    fn deleted_path_snapshot_with_control(
+        &self,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<PathBuf>, String> {
+        if let Some(budget) = budget {
+            budget.charge_path_visits(self.deleted_overrides.len())?;
+        }
+        let mut paths = Vec::new();
         paths
+            .try_reserve(self.deleted_overrides.len())
+            .map_err(|error| format!("could not reserve deleted-path snapshot: {error}"))?;
+        for uri in self.deleted_overrides.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Ok(path) = uri.to_file_path() {
+                paths.push(absolute_path(path));
+            }
+        }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(paths.len()))?;
+        }
+        paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        let mut unique: Vec<PathBuf> = Vec::new();
+        unique
+            .try_reserve(paths.len())
+            .map_err(|error| format!("could not reserve deduplicated deleted paths: {error}"))?;
+        for path in paths {
+            check_workspace_cancel(cancel)?;
+            if let Some(previous) = unique.last() {
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if paths_equal_ci(previous, &path) {
+                    continue;
+                }
+            }
+            unique.push(path);
+        }
+        Ok(unique)
     }
 
     fn deletion_blocks_load(&mut self, uri: &Url, path: &Path) -> bool {
@@ -10026,17 +10232,6 @@ fn path_stamp_from_project_read(stamp: &ProjectReadStamp) -> PathStamp {
     }
 }
 
-fn take_candidate_membership(
-    memberships: &mut HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
-    directory: &Path,
-) -> Option<Result<ProjectCandidateMembership, String>> {
-    let key = memberships
-        .keys()
-        .find(|candidate| package_paths_equal(candidate, directory))
-        .cloned()?;
-    memberships.remove(&key)
-}
-
 fn merge_project_read_observations(
     target: &mut Vec<ProjectReadObservation>,
     observations: Vec<ProjectReadObservation>,
@@ -10052,19 +10247,187 @@ fn merge_project_read_observations(
     }
 }
 
-fn merge_candidate_memberships(
-    target: &mut HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
-    memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
-) {
-    for (path, membership) in memberships {
-        if target
-            .keys()
-            .any(|existing| package_paths_equal(existing, &path))
-        {
-            continue;
-        }
-        target.insert(path, membership);
+#[cfg(windows)]
+type ProjectPathLookupKey = String;
+#[cfg(not(windows))]
+type ProjectPathLookupKey = PathBuf;
+
+fn project_path_lookup_key(path: &Path) -> ProjectPathLookupKey {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().to_ascii_lowercase()
     }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+fn path_ci_lookup_key(path: &Path) -> String {
+    path.to_string_lossy().to_ascii_lowercase()
+}
+
+fn path_key_bytes(paths: &[PathBuf]) -> Result<usize, String> {
+    paths.iter().try_fold(0usize, |total, path| {
+        total
+            .checked_add(path.to_string_lossy().len())
+            .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())
+    })
+}
+
+fn observation_path_key_bytes(observations: &[ProjectReadObservation]) -> Result<usize, String> {
+    observations.iter().try_fold(0usize, |total, observation| {
+        total
+            .checked_add(observation.path.to_string_lossy().len())
+            .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())
+    })
+}
+
+fn sort_work_estimate(len: usize) -> usize {
+    if len < 2 {
+        return len;
+    }
+    let levels = usize::BITS as usize - len.leading_zeros() as usize;
+    len.saturating_mul(levels)
+}
+
+fn build_project_read_observation_index<'a>(
+    observations: &'a [ProjectReadObservation],
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<HashMap<ProjectPathLookupKey, &'a ProjectReadObservation>, String> {
+    if let Some(budget) = budget {
+        budget.charge_path_visits(observations.len())?;
+        budget.charge_indexed_bytes(observation_path_key_bytes(observations)?)?;
+    }
+    let mut index = HashMap::new();
+    index
+        .try_reserve(observations.len())
+        .map_err(|error| format!("could not reserve project read observation index: {error}"))?;
+    for observation in observations {
+        check_workspace_cancel(cancel)?;
+        index
+            .entry(project_path_lookup_key(&observation.path))
+            .or_insert(observation);
+    }
+    Ok(index)
+}
+
+fn merge_project_read_observations_indexed(
+    existing: &[ProjectReadObservation],
+    incoming: &[ProjectReadObservation],
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<Vec<ProjectReadObservation>, String> {
+    let capacity = existing
+        .len()
+        .checked_add(incoming.len())
+        .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())?;
+    if let Some(budget) = budget {
+        budget.charge_path_visits(capacity)?;
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve(capacity)
+        .map_err(|error| format!("could not reserve merged project observations: {error}"))?;
+    let mut seen = HashSet::new();
+    seen.try_reserve(capacity)
+        .map_err(|error| format!("could not reserve project observation keys: {error}"))?;
+    for observation in existing {
+        check_workspace_cancel(cancel)?;
+        let key = project_path_lookup_key(&observation.path);
+        if seen.insert(key) {
+            result.push((*observation).clone());
+        }
+    }
+    for observation in incoming {
+        check_workspace_cancel(cancel)?;
+        if seen.insert(project_path_lookup_key(&observation.path)) {
+            result.push(observation.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn merge_metadata_observations_indexed(
+    existing: &[MetadataObservation],
+    incoming: &[MetadataObservation],
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<Vec<MetadataObservation>, String> {
+    let capacity = existing
+        .len()
+        .checked_add(incoming.len())
+        .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())?;
+    if let Some(budget) = budget {
+        budget.charge_path_visits(capacity)?;
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve(capacity)
+        .map_err(|error| format!("could not reserve metadata observations: {error}"))?;
+    let mut positions = HashMap::new();
+    positions
+        .try_reserve(capacity)
+        .map_err(|error| format!("could not reserve metadata observation index: {error}"))?;
+    for observation in existing {
+        check_workspace_cancel(cancel)?;
+        let index = result.len();
+        positions
+            .entry(project_path_lookup_key(observation.path()))
+            .or_insert(index);
+        result.push(observation.clone());
+    }
+    for observation in incoming {
+        check_workspace_cancel(cancel)?;
+        let key = project_path_lookup_key(observation.path());
+        if let Some(index) = positions.get(&key).copied() {
+            if matches!(result[index], MetadataObservation::Stat { .. })
+                && matches!(observation, MetadataObservation::Payload { .. })
+            {
+                result[index] = observation.clone();
+            }
+        } else {
+            positions.insert(key, result.len());
+            result.push(observation.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn merge_candidate_memberships_indexed(
+    existing: &HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    incoming: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<HashMap<PathBuf, Result<ProjectCandidateMembership, String>>, String> {
+    let capacity = existing
+        .len()
+        .checked_add(incoming.len())
+        .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())?;
+    if let Some(budget) = budget {
+        budget.charge_path_visits(capacity)?;
+    }
+    let mut result = HashMap::new();
+    result
+        .try_reserve(capacity)
+        .map_err(|error| format!("could not reserve merged candidate memberships: {error}"))?;
+    let mut keys = HashSet::new();
+    keys.try_reserve(capacity)
+        .map_err(|error| format!("could not reserve candidate membership index: {error}"))?;
+    for (path, membership) in existing {
+        check_workspace_cancel(cancel)?;
+        let key = project_path_lookup_key(path);
+        keys.insert(key);
+        result.insert(path.clone(), membership.clone());
+    }
+    for (path, membership) in incoming {
+        check_workspace_cancel(cancel)?;
+        if keys.insert(project_path_lookup_key(&path)) {
+            result.insert(path, membership);
+        }
+    }
+    Ok(result)
 }
 
 fn context_state_is_fresh_with_cancel(
@@ -11018,8 +11381,8 @@ mod tests {
         ContextKey, ContextState, DiagnosticLineIndex, DiagnosticPublicationCursorStep,
         DiagnosticPublicationUriCursor, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
         MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_URIS, MAX_SOURCE_CHANGE_OBSERVATIONS,
-        OpenDocument, ReconciliationBudget, ResourceLimits, RuntimeOptionsOverride, Workspace,
-        WorkspaceOptions, context_state_is_fresh_with_cancel, normalize_line_endings,
+        OpenDocument, PackageLookup, ReconciliationBudget, ResourceLimits, RuntimeOptionsOverride,
+        Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel, normalize_line_endings,
         scan_external_units,
     };
     use crate::NavigationTarget;
@@ -11028,8 +11391,9 @@ mod tests {
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
     };
     use pascal_project::{
-        CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, ProjectContext,
-        ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
+        CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
+        ProjectContext, ProjectPathEntry, ProjectPathProvenance, ProjectReadObservation,
+        ProjectReadStamp, ReadPolicy,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -11142,7 +11506,7 @@ mod tests {
             .expect("exhaust remaining visits on next charge");
 
         let error = workspace
-            .watch_package_paths(&key, &[first.clone(), second.clone()], None, Some(&budget))
+            .prepare_package_watches(&key, &[first.clone(), second.clone()], None, Some(&budget))
             .expect_err("must refuse before stamping paths");
         assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
         let state = workspace.contexts.get(&key).expect("context retained");
@@ -11245,6 +11609,192 @@ mod tests {
             budget.used.get().filesystem_path_visits,
             WATCHED + 1,
             "charge the context and each compared watched path"
+        );
+    }
+
+    #[test]
+    fn context_install_indexes_large_observation_sets_with_linear_budget_charges() {
+        const METADATA: usize = 1_200;
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let source = root.join("Source.pas");
+        let paths = (0..METADATA)
+            .map(|index| root.join(format!("metadata-{index:04}.dproj")))
+            .collect::<Vec<_>>();
+        let observations = paths
+            .iter()
+            .map(|path| ProjectReadObservation {
+                path: path.clone(),
+                stamp: ProjectReadStamp {
+                    bytes: 12,
+                    modified: None,
+                    is_dir: false,
+                    is_symlink: false,
+                },
+                content_hash: 0,
+                content_bytes: None,
+            })
+            .collect::<Vec<_>>();
+        let context = ProjectContext {
+            metadata_files: paths,
+            ..ProjectContext::default()
+        };
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+
+        workspace
+            .install_context(
+                key.clone(),
+                context,
+                observations,
+                HashMap::new(),
+                &source,
+                None,
+                Some(&budget),
+            )
+            .expect("metadata watch preparation remains within linear path budget");
+
+        assert!(
+            budget.used.get().filesystem_path_visits >= METADATA * 2,
+            "observation indexing must be charged in addition to metadata path stamps; used={}",
+            budget.used.get().filesystem_path_visits
+        );
+        let installed = workspace.contexts.get(&key).expect("context installed");
+        assert!(installed.watched_paths.len() >= METADATA);
+        assert_eq!(
+            installed
+                .watched_paths
+                .values()
+                .filter(|stamp| stamp.as_ref().is_some_and(|stamp| stamp.bytes == 12))
+                .count(),
+            METADATA
+        );
+    }
+
+    #[test]
+    fn package_lookup_budget_refusal_keeps_observations_and_watches_unchanged() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let package_path = root.join("Shared.dpk");
+        fs::write(&package_path, "package Shared; end.").expect("package descriptor");
+        let source = root.join("Main.pas");
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        workspace
+            .install_context(
+                key.clone(),
+                ProjectContext::default(),
+                Vec::new(),
+                HashMap::new(),
+                &source,
+                None,
+                None,
+            )
+            .expect("install starting context");
+        let read_observation = ProjectReadObservation {
+            path: package_path.clone(),
+            stamp: ProjectReadStamp {
+                bytes: 20,
+                modified: None,
+                is_dir: false,
+                is_symlink: false,
+            },
+            content_hash: 1,
+            content_bytes: None,
+        };
+        let lookup = PackageLookup {
+            metadata_paths: vec![package_path.clone()],
+            observations: vec![read_observation],
+            metadata_observations: vec![MetadataObservation::Stat {
+                path: package_path.clone(),
+            }],
+            complete: true,
+            ..PackageLookup::default()
+        };
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS - 3)
+            .expect("leave only the bounded observation/watch preparation allowance");
+
+        let error = workspace
+            .apply_package_lookup(&key, &lookup, None, Some(&budget))
+            .expect_err("the package stamp should be refused after staged observation work");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        let state = workspace.contexts.get(&key).expect("context remains");
+        assert!(state.project_read_observations.is_empty());
+        assert!(state.context.metadata_observations.is_empty());
+        assert!(!state.watched_paths.contains_key(&package_path));
+        assert!(!state.context.metadata_files.contains(&package_path));
+    }
+
+    #[test]
+    fn package_watch_membership_work_scales_linearly_with_existing_paths() {
+        const EXISTING: usize = 1_200;
+        let root = PathBuf::from("/tmp/package-watch-index");
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let metadata_files = (0..EXISTING)
+            .map(|index| root.join(format!("metadata-{index}.dproj")))
+            .collect::<Vec<_>>();
+        let watched_paths = metadata_files
+            .iter()
+            .map(|path| (path.clone(), None))
+            .collect();
+        let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            super::ContextState {
+                context: ProjectContext {
+                    metadata_files,
+                    ..ProjectContext::default()
+                },
+                watched_paths,
+                project_candidate_memberships: HashMap::new(),
+                project_read_observations: Vec::new(),
+            },
+        );
+        let incoming = (0..EXISTING)
+            .map(|index| PathBuf::from(format!("/tmp/package-watch-new-{index}.dpk")))
+            .collect::<Vec<_>>();
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+
+        workspace
+            .prepare_package_watches(&key, &incoming, None, Some(&budget))
+            .expect("metadata/watch membership should use indexed linear work");
+        assert!(
+            budget.used.get().filesystem_path_visits <= EXISTING * 4,
+            "watch membership exceeded the linear visit allowance: {}",
+            budget.used.get().filesystem_path_visits
         );
     }
 

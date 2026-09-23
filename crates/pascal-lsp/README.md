@@ -1251,11 +1251,19 @@ cannot be interrupted. The stdio reader also has a bounded priority lane for
 ordinary rendezvous is backpressured. Deterministic tests fill the 64-message
 workspace FIFO and its one overflow slot, then send shutdown or exit without
 releasing a cooperative discovery barrier; both controls reach worker
-cancellation/join. Ordinary messages remain retained and FIFO ordered on normal
-completion, as covered by the saturation replay test. This is not a deadline
-or a guarantee against an OS call that does not return, a full priority lane, or
-an ordinary frame already blocking the reader before a later control frame can
-be parsed.
+cancellation/join. A separate 30-second workspace-notification deadline also
+cancels the worker independently of input when a reader is already blocked
+sending an ordinary message; after the worker cooperatively returns, the partial
+workspace is globally invalidated before deferred messages replay. The
+test-support-only `PASCAL_LSP_TEST_WORKSPACE_NOTIFICATION_DEADLINE_MS` setting
+shortens this deadline for deterministic protocol tests. A 66th ordinary frame
+followed by shutdown, exit, or cancellation is covered, including a queued query
+that sees fresh disk state and a final delete tombstone from an event entry not
+reached before cancellation. The deadline is cooperative: it cannot interrupt
+an OS filesystem call that does not return, and fallback invalidation/output
+work is not yet bounded by the reconciliation account. Ordinary messages remain
+retained and FIFO ordered on normal completion, as covered by the saturation
+replay test.
 
 High-fan-out delete/tombstone fallback remains covered. A dedicated saturation
 regression now also transfers a staged A-to-B open overlay in the first pair of
@@ -1265,7 +1273,6 @@ does not resolve through it, and a cached pull result ID is invalidated. This
 does not prove every rename/tombstone interleaving, duplicate/late event, or
 uncharged path. This stage remains partial and does not close P2-4.
 
-While it reconciles a preceding event, workspace-dependent requests and
 While it reconciles a preceding event, workspace-dependent requests and
 state-changing notifications wait in a FIFO (up to 64 messages and 1 MiB);
 `$/cancelRequest` remains serviceable and can cancel a queued request. When

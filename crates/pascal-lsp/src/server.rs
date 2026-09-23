@@ -72,6 +72,10 @@ const MAX_DIAGNOSTIC_BURST: usize = 2;
 const ANALYSIS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ANALYSIS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// Bounds how long the protocol loop waits for cooperative workspace
+// reconciliation before switching to conservative invalidation. This does
+// not interrupt a synchronous filesystem call already in progress.
+const WORKSPACE_NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
@@ -7929,8 +7933,14 @@ fn is_workspace_file_event_notification(method: &str) -> bool {
 }
 
 struct WorkspaceFileNotificationWorker {
-    receiver: Receiver<(Workspace, Result<DiagnosticNotificationEffect, String>)>,
+    receiver: Receiver<(
+        Workspace,
+        Result<DiagnosticNotificationEffect, String>,
+        ReconciliationBudget,
+    )>,
     cancellation: Arc<AtomicBool>,
+    deadline_expired: Arc<AtomicBool>,
+    deadline: Instant,
     join: Option<JoinHandle<()>>,
 }
 
@@ -7998,6 +8008,8 @@ fn spawn_workspace_file_notification(
     let (sender, receiver) = bounded(1);
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = Arc::clone(&cancellation);
+    let deadline_expired = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + workspace_notification_deadline();
     let owned_workspace = std::mem::take(workspace);
     let join = thread::Builder::new()
         .name("PascalLspWorkspaceMutation".to_string())
@@ -8027,11 +8039,6 @@ fn spawn_workspace_file_notification(
             if std::env::var_os("PASCAL_LSP_TEST_PANIC_FILE_WORKER").is_some() {
                 panic!("injected file-notification worker panic");
             }
-            let _ = sender.send((workspace, result));
-            #[cfg(feature = "test-support")]
-            if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_FILE_WORKER_COMPLETED") {
-                let _ = std::fs::write(path, b"completed");
-            }
             #[cfg(feature = "test-support")]
             if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT") {
                 let _ = std::fs::write(
@@ -8039,13 +8046,31 @@ fn spawn_workspace_file_notification(
                     serde_json::to_vec(&budget.metrics(budget.is_exhausted())).unwrap_or_default(),
                 );
             }
+            let _ = sender.send((workspace, result, budget));
+            #[cfg(feature = "test-support")]
+            if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_FILE_WORKER_COMPLETED") {
+                let _ = std::fs::write(path, b"completed");
+            }
         })
         .expect("failed to start serialized workspace mutation worker");
     WorkspaceFileNotificationWorker {
         receiver,
         cancellation,
+        deadline_expired,
+        deadline,
         join: Some(join),
     }
+}
+
+fn workspace_notification_deadline() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(milliseconds) = std::env::var("PASCAL_LSP_TEST_WORKSPACE_NOTIFICATION_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds.clamp(1, 30_000));
+    }
+    WORKSPACE_NOTIFICATION_DEADLINE
 }
 
 fn queue_workspace_message(
@@ -8097,7 +8122,8 @@ fn event_loop(
         connection.flush()?;
         if let Some(worker) = file_notification_worker.as_ref() {
             match worker.receiver.try_recv() {
-                Ok((completed_workspace, result)) => {
+                Ok((mut completed_workspace, mut result, budget)) => {
+                    let deadline_expired = worker.deadline_expired.load(Ordering::Acquire);
                     let mut worker = file_notification_worker
                         .take()
                         .expect("completed workspace file worker");
@@ -8123,6 +8149,24 @@ fn event_loop(
                         }
                         jobs.shutdown_with_connection(connection)?;
                         return Ok(true);
+                    }
+                    if deadline_expired {
+                        // Cancellation may have landed after one or more
+                        // entries mutated the owned workspace. Discard its
+                        // partial effect and use the same tombstone/rename-
+                        // aware invalidation path as work-budget exhaustion.
+                        eprintln!(
+                            "pascal-lsp: workspace notification reconciliation exceeded its deadline; invalidating partial state"
+                        );
+                        let open_uris =
+                            completed_workspace.invalidate_for_reconciliation_budget(&budget);
+                        let mut effect = DiagnosticNotificationEffect::default();
+                        effect.request_refresh();
+                        for uri in open_uris {
+                            effect.cancel_uri(uri.clone());
+                            effect.refresh_uri(uri);
+                        }
+                        result = Ok(effect);
                     }
                     *workspace = completed_workspace;
                     match result {
@@ -8181,7 +8225,16 @@ fn event_loop(
                     jobs.shutdown_with_connection(connection)?;
                     return Ok(true);
                 }
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => {
+                    if Instant::now() >= worker.deadline
+                        && !worker.deadline_expired.swap(true, Ordering::AcqRel)
+                    {
+                        eprintln!(
+                            "pascal-lsp: workspace notification reconciliation deadline elapsed; requesting cooperative cancellation"
+                        );
+                        worker.cancellation.store(true, Ordering::Release);
+                    }
+                }
             }
         }
         let workspace_busy = file_notification_worker.is_some();

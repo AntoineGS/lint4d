@@ -31401,13 +31401,23 @@ fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
 }
 
 #[cfg(feature = "test-support")]
-fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
+fn assert_saturated_control_bypasses_workspace_fifo(
+    send_exit: bool,
+    extra_ordinary_frames: usize,
+    send_cancel: bool,
+    deadline_ms: Option<u64>,
+    verify_recovery_query: bool,
+    final_delete_after_barrier: bool,
+) {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
-    write_file(
-        &provider,
-        "unit Provider;\ninterface\ntype TItem = record end;\nimplementation\nend.\n",
-    );
+    let consumer = root.path().join("Consumer.pas");
+    let old_provider = "unit Provider;\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n";
+    let new_provider = "unit Provider;\ninterface\ntype TAfter = Integer;\nimplementation\nend.\n";
+    write_file(&provider, old_provider);
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider;\ntype TUse = TAfter;\nimplementation\nend.\n";
+    write_file(&consumer, consumer_source);
     let barrier_dir = root.path().join("saturated-shutdown-barrier");
     fs::create_dir_all(&barrier_dir).expect("barrier directory");
     let barrier = TestBarrier {
@@ -31421,6 +31431,7 @@ fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
         barrier.release.display()
     );
     let completed_value = completed.display().to_string();
+    let deadline_value = deadline_ms.map_or_else(String::new, |deadline| deadline.to_string());
     let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         root.path(),
         [
@@ -31432,6 +31443,10 @@ fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
                 "PASCAL_LSP_TEST_FILE_WORKER_COMPLETED",
                 completed_value.as_str(),
             ),
+            (
+                "PASCAL_LSP_TEST_WORKSPACE_NOTIFICATION_DEADLINE_MS",
+                deadline_value.as_str(),
+            ),
         ],
     );
     server.initialize_with_pull_diagnostics(root.path());
@@ -31442,10 +31457,18 @@ fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
         json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
     );
     assert!(server.response(&initial_id).error.is_none());
-    server.send_notification(
-        "workspace/didChangeWatchedFiles",
-        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
-    );
+    if deadline_ms.is_some() {
+        write_file(&provider, new_provider);
+    }
+    let changes = if final_delete_after_barrier {
+        json!({"changes":[
+            {"uri":uri(&provider),"type":2},
+            {"uri":uri(&provider),"type":3}
+        ]})
+    } else {
+        json!({"changes":[{"uri":uri(&provider),"type":2}]})
+    };
+    server.send_notification("workspace/didChangeWatchedFiles", changes);
     barrier.wait_until_entered();
 
     // Fill the 64-message FIFO and its retained overflow slot while the worker
@@ -31457,6 +31480,50 @@ fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
             json!({"textDocument":{"uri":uri(&overlay),"languageId":"pascal","version":1,"text":format!("unit Queued{index:02}; interface implementation end.")}}),
         );
     }
+    if extra_ordinary_frames > 0 {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+        );
+    }
+    if deadline_ms.is_some() && verify_recovery_query {
+        let query_id = RequestId::from("saturated-timeout-fresh-provider".to_string());
+        server.send_request(
+            query_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TAfter", 0),
+        );
+        let response = server.response_with_timeout(&query_id, Duration::from_secs(3));
+        if response.is_none() {
+            let _ = server.child.kill();
+            let _ = server.child.wait();
+            panic!("deferred query was not replayed after the notification deadline");
+        }
+        let locations = result_locations(response.expect("query response was checked"));
+        let expected_provider_uri = uri(&provider).to_string();
+        let location_uri = locations
+            .first()
+            .and_then(|location| location["uri"].as_str());
+        if final_delete_after_barrier {
+            assert!(
+                locations.is_empty(),
+                "timeout fallback must restore a final delete tombstone even when that entry was not reached"
+            );
+        } else {
+            assert_eq!(
+                location_uri,
+                Some(expected_provider_uri.as_str()),
+                "deferred query must run after conservative timeout fallback and see current disk identity"
+            );
+        }
+        let refresh = server
+            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(3))
+            .expect("timeout fallback must request a pull-diagnostic refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    }
+    if send_cancel {
+        server.send_notification("$/cancelRequest", json!({"id":"cancel-saturated-worker"}));
+    }
     let shutdown = if send_exit {
         server.send_notification("exit", Value::Null);
         server.stdin.take();
@@ -31466,7 +31533,12 @@ fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
         server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
         server.response_with_timeout(&shutdown_id, Duration::from_millis(750))
     };
-    let completed_without_release = wait_for_file(&completed, Duration::from_millis(100));
+    let completion_timeout = if deadline_ms.is_some() {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_millis(100)
+    };
+    let completed_without_release = wait_for_file(&completed, completion_timeout);
     if (!send_exit && shutdown.is_none()) || !completed_without_release {
         let _ = server.child.kill();
         let _ = server.child.wait();
@@ -31503,18 +31575,41 @@ fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
 #[test]
 #[cfg(feature = "test-support")]
 fn shutdown_bypasses_full_workspace_fifo_and_overflow_without_releasing_worker_barrier() {
-    assert_saturated_control_bypasses_workspace_fifo(false);
+    assert_saturated_control_bypasses_workspace_fifo(false, 0, false, None, false, false);
 }
 
 #[test]
 #[cfg(feature = "test-support")]
 fn exit_bypasses_full_workspace_fifo_and_overflow_without_releasing_worker_barrier() {
-    assert_saturated_control_bypasses_workspace_fifo(true);
+    assert_saturated_control_bypasses_workspace_fifo(true, 0, false, None, false, false);
 }
 
 #[test]
 #[cfg(feature = "test-support")]
-fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_result() {
+fn shutdown_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline() {
+    assert_saturated_control_bypasses_workspace_fifo(false, 1, false, Some(150), false, false);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn exit_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline() {
+    assert_saturated_control_bypasses_workspace_fifo(true, 1, false, Some(150), false, false);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn cancel_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline() {
+    assert_saturated_control_bypasses_workspace_fifo(false, 1, true, Some(150), false, false);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn worker_deadline_fallback_restores_unprocessed_delete_tombstone() {
+    assert_saturated_control_bypasses_workspace_fifo(false, 1, false, Some(150), true, true);
+}
+
+#[cfg(feature = "test-support")]
+fn assert_rename_overlay_is_invalidated_on_reconciliation_fallback(deadline_ms: Option<u64>) {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let provider_source =
@@ -31546,6 +31641,7 @@ fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_resul
     );
     let metrics = barrier_dir.join("rename-budget.json");
     let metrics_value = metrics.display().to_string();
+    let deadline_value = deadline_ms.map_or_else(String::new, |deadline| deadline.to_string());
     let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         root.path(),
         [
@@ -31556,6 +31652,10 @@ fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_resul
             (
                 "PASCAL_LSP_TEST_DIAGNOSTIC_WORK_BARRIER",
                 barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_WORKSPACE_NOTIFICATION_DEADLINE_MS",
+                deadline_value.as_str(),
             ),
         ],
     );
@@ -31695,31 +31795,36 @@ fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_resul
             .is_none(),
         "requests must remain behind the held multi-pair rename reconciliation"
     );
-    barrier.release();
+    if deadline_ms.is_none() {
+        barrier.release();
+    }
     assert!(
         wait_for_file(&metrics, IO_TIMEOUT),
         "rename worker must report reconciliation accounting"
     );
     let metrics: Value = serde_json::from_slice(&fs::read(&metrics).expect("read budget metrics"))
         .expect("parse budget metrics");
-    assert!(
+    assert_eq!(
         metrics["budget_exceeded"].as_bool().unwrap_or(false),
-        "later rename pairs must exhaust diagnostic work after the first overlay transfer: {metrics}"
+        deadline_ms.is_none(),
+        "fallback must use the work-budget or deadline cause as configured: {metrics}"
     );
-    let rename_path_visits = metrics["filesystem_path_visits"]
-        .as_u64()
-        .unwrap_or_default();
-    assert!(
-        (2..=82).contains(&rename_path_visits) && rename_path_visits % 2 == 0,
-        "processed rename pairs must charge their old/new file-event visits, without charging unattempted pairs: {metrics}"
-    );
-    assert!(
-        metrics["diagnostic_record_checks"]
+    if deadline_ms.is_none() {
+        let rename_path_visits = metrics["filesystem_path_visits"]
             .as_u64()
-            .unwrap_or_default()
-            >= 2_048,
-        "diagnostic comparison counter must establish the actual overrun: {metrics}"
-    );
+            .unwrap_or_default();
+        assert!(
+            (2..=82).contains(&rename_path_visits) && rename_path_visits % 2 == 0,
+            "processed rename pairs must charge their old/new file-event visits, without charging unattempted pairs: {metrics}"
+        );
+        assert!(
+            metrics["diagnostic_record_checks"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 2_048,
+            "diagnostic comparison counter must establish the actual overrun: {metrics}"
+        );
+    }
     let definition = result_locations(server.response(&definition_id));
     assert!(
         definition.is_empty(),
@@ -31740,6 +31845,18 @@ fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_resul
         "old pull result ID must be invalidated: {result}"
     );
     server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_result() {
+    assert_rename_overlay_is_invalidated_on_reconciliation_fallback(None);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn deadline_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_result() {
+    assert_rename_overlay_is_invalidated_on_reconciliation_fallback(Some(150));
 }
 
 #[cfg(feature = "test-support")]

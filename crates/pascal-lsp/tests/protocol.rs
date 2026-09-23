@@ -30476,6 +30476,72 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
     server.shutdown();
 }
 
+#[test]
+#[cfg(feature = "test-support")]
+#[ignore = "P2-4 acceptance regression: enable after ordered notification worker is implemented"]
+fn blocked_file_discovery_does_not_block_cancel_or_unrelated_protocol_messages() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("file-discovery-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variable(
+        root.path(),
+        Some("PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER"),
+        Some(&barrier_value),
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+
+    let initial_id = RequestId::from("file-discovery-initial-load".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    assert!(server.response(&initial_id).error.is_none());
+
+    let files: Vec<_> = (0..64)
+        .map(|index| {
+            let path = if index == 0 {
+                provider.clone()
+            } else {
+                root.path().join(format!("Dependent{index}.pas"))
+            };
+            json!({
+                "uri": uri(&path),
+                "type": 2
+            })
+        })
+        .collect();
+    server.send_notification("workspace/didChangeWatchedFiles", json!({"changes":files}));
+    barrier.wait_until_entered();
+
+    let cancelled_id = RequestId::from("request-behind-file-discovery".to_string());
+    server.send_request(
+        cancelled_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    server.send_notification("$/cancelRequest", json!({"id":cancelled_id}));
+    let responsive = server.response_with_timeout(&cancelled_id, Duration::from_millis(250));
+    barrier.release();
+    let response = responsive.expect("cancellation must be processed while discovery is blocked");
+    assert_eq!(response.error.expect("request is cancelled").code, -32800);
+    server.shutdown();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state() {

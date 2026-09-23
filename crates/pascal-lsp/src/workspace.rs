@@ -3388,6 +3388,8 @@ impl Workspace {
     }
 
     fn refresh_loaded_disk(&mut self, uri: &Url) {
+        #[cfg(feature = "test-support")]
+        wait_at_file_discovery_test_barrier();
         let Some(context_key) = self.document_contexts.get(uri).cloned() else {
             self.remove_indexed(uri);
             return;
@@ -8378,6 +8380,30 @@ impl Workspace {
             self.store_expansion(&root_uri, &context_key, source, expansion);
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn wait_at_file_discovery_test_barrier() {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER") else {
+        return;
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return;
+    };
+    let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+    else {
+        return;
+    };
+    let _ = marker.write_all(b"x");
+    drop(marker);
+    while !std::path::Path::new(release).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

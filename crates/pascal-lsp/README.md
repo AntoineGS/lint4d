@@ -1234,6 +1234,12 @@ off-thread state-processing design remain outstanding. Clients should continue
 to use watched-file notifications for changes not covered by these Pascal
 source filters.
 
+The test-support build exposes a deterministic file-discovery barrier at the
+loaded-source disk refresh boundary. Its 64-event protocol regression currently
+reproduces the protocol-loop stall (the regression is intentionally ignored in
+the normal suite until the ordered notification worker lands); it is not
+evidence of responsiveness or freshness correctness.
+
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial
 location list. Unsupported or ambiguous bindings are rejected rather than

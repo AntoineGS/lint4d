@@ -9207,6 +9207,16 @@ fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), Stri
     Ok(())
 }
 
+fn invalidate_for_watched_file_overflow(workspace: &mut Workspace) -> DiagnosticNotificationEffect {
+    let mut effect = DiagnosticNotificationEffect::default();
+    effect.request_refresh();
+    for uri in workspace.invalidate_all_for_watched_file_overflow() {
+        effect.cancel_uri(uri.clone());
+        effect.refresh_uri(uri);
+    }
+    effect
+}
+
 fn handle_notification(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
@@ -9334,11 +9344,14 @@ fn handle_notification(
         }
         "workspace/didChangeWatchedFiles" => {
             let params: DidChangeWatchedFilesParams = parse_notification(&notification)?;
-            if params.changes.is_empty() || params.changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES
-            {
-                return Err(format!(
-                    "watched file batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
-                ));
+            if params.changes.is_empty() {
+                return Ok(DiagnosticNotificationEffect::default());
+            }
+            if params.changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+                eprintln!(
+                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; invalidating workspace file state"
+                );
+                return Ok(invalidate_for_watched_file_overflow(workspace));
             }
             let mut total_uri_bytes = 0usize;
             let mut changes = Vec::with_capacity(params.changes.len());
@@ -9347,7 +9360,14 @@ fn handle_notification(
                 if uri.to_file_path().is_err() {
                     return Err("watched file batch contains a non-file URI".into());
                 }
-                add_file_operation_uri_bytes(&mut total_uri_bytes, &uri)?;
+                let next_uri_bytes = total_uri_bytes.saturating_add(uri.as_str().len());
+                if next_uri_bytes > MAX_FILE_OPERATION_BATCH_URI_BYTES {
+                    eprintln!(
+                        "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
+                    );
+                    return Ok(invalidate_for_watched_file_overflow(workspace));
+                }
+                total_uri_bytes = next_uri_bytes;
                 let kind = if change.typ == FileChangeType::CREATED {
                     FileChange::Created
                 } else if change.typ == FileChangeType::CHANGED {

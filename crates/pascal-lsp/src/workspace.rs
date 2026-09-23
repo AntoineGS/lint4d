@@ -2553,6 +2553,56 @@ impl Workspace {
         diagnostic_uris
     }
 
+    pub(crate) fn invalidate_all_for_watched_file_overflow(&mut self) -> Vec<Url> {
+        // The notification has no response channel, so rejecting it would
+        // silently lose the only invalidation signal for arbitrary paths.
+        // Drop bounded derived state and force subsequent requests to reread
+        // disk rather than trying to process an unbounded event list here.
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_global_change();
+        self.pending_unit_file_renames.clear();
+        self.pending_unit_file_rename_bytes = 0;
+        self.contexts.clear();
+        self.document_contexts.clear();
+        self.open_document_contexts.clear();
+        for owner in self.document_owners.values_mut() {
+            owner.needs_revalidation = true;
+            owner.legacy_route = None;
+        }
+        self.cached_documents.clear();
+        self.directory_catalogues.clear();
+        self.filename_catalogues.clear();
+        self.package_catalogues.clear();
+        self.package_metadata_cache.clear();
+        self.source_change_generations.clear();
+        self.source_change_observations.clear();
+        self.configuration_change_generations.clear();
+        self.expansions.clear();
+        self.include_parents.clear();
+        self.diagnostic_dependencies.clear();
+        self.deleted_overrides.clear();
+        self.pending_diagnostics.clear();
+
+        self.index = NavigationIndex::new();
+        self.indexed_files.clear();
+        self.indexed_sizes.clear();
+        self.indexed_bytes = 0;
+        self.disk_stamps.clear();
+        self.last_used.clear();
+        self.file_cap_warning_sent = false;
+        self.total_cap_warning_sent = false;
+        if let Some(records) = self.analysis_records.as_mut() {
+            records.clear();
+        }
+
+        let open_uris = self.open_documents.keys().cloned().collect::<Vec<_>>();
+        for uri in &open_uris {
+            self.schedule_diagnostics(uri.clone());
+        }
+        open_uris
+    }
+
     pub(crate) fn unit_rename_position(
         &self,
         old_uri: &Url,

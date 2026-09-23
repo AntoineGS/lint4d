@@ -30388,6 +30388,53 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
     assert!(server.response(&count_probe_id).error.is_none());
     server.assert_no_request("workspace/diagnostic/refresh");
 
+    server.send_notification(
+        "workspace/didDeleteFiles",
+        json!({"files":too_many.iter().map(|path| json!({"uri":uri(path)})).collect::<Vec<_>>()}),
+    );
+    let delete_probe_id = RequestId::from("file-delete-count-budget-probe".to_string());
+    server.send_request(
+        delete_probe_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    assert!(server.response(&delete_probe_id).error.is_none());
+    server.assert_no_request("workspace/diagnostic/refresh");
+
+    let mut oversized_renames = Vec::new();
+    let long_component = "r".repeat(178);
+    for index in 0..5 {
+        let mut old_path = root.path().join(format!("old{index}"));
+        let mut new_path = root.path().join(format!("new{index}"));
+        for _ in 0..20 {
+            old_path.push(&long_component);
+            new_path.push(&long_component);
+        }
+        old_path.push("From.pas");
+        new_path.push("To.pas");
+        oversized_renames.push(json!({"oldUri":uri(&old_path),"newUri":uri(&new_path)}));
+    }
+    let rename_uri_bytes: usize = oversized_renames
+        .iter()
+        .map(|rename| {
+            rename["oldUri"].as_str().expect("old URI").len()
+                + rename["newUri"].as_str().expect("new URI").len()
+        })
+        .sum();
+    assert!(rename_uri_bytes > 32 * 1024);
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":oversized_renames}),
+    );
+    let rename_probe_id = RequestId::from("file-rename-byte-budget-probe".to_string());
+    server.send_request(
+        rename_probe_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    assert!(server.response(&rename_probe_id).error.is_none());
+    server.assert_no_request("workspace/diagnostic/refresh");
+
     let small: Vec<_> = (0..64)
         .map(|index| root.path().join(format!("Generated{index}.pas")))
         .collect();
@@ -30397,6 +30444,219 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
     );
     let refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let provider_alias = root.join("ProviderAlias.pas");
+    let old_consumer = root.join("OldConsumer.pas");
+    let new_consumer = root.join("NewConsumer.pas");
+    let main = root.join("Main.pas");
+    let initial_provider = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let updated_provider = initial_provider
+        .replace("badConst", "GOODNAME")
+        .replace("TOldThing", "TNewThing");
+    assert_eq!(initial_provider.len(), updated_provider.len());
+    let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\nimplementation\nend.\n";
+    let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    let main_source =
+        "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n";
+    write_file(&provider, initial_provider);
+    write_file(&old_consumer, old_consumer_source);
+    write_file(&new_consumer, new_consumer_source);
+    write_file(&main, main_source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    symlink(&provider, &provider_alias).expect("provider path alias");
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+
+    let old_definition_id = RequestId::from("oversized-watch-old-definition-initial".to_string());
+    server.send_request(
+        old_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+    );
+    let old_locations = result_locations(server.response(&old_definition_id));
+    assert_eq!(old_locations.len(), 1, "initial provider binding");
+    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
+
+    let initial_diagnostic_id = RequestId::from("oversized-watch-diagnostic-initial".to_string());
+    server.send_request(
+        initial_diagnostic_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let initial_diagnostic = server.response(&initial_diagnostic_id);
+    assert!(
+        initial_diagnostic.error.is_none(),
+        "initial diagnostic: {initial_diagnostic:?}"
+    );
+    let initial_diagnostic = initial_diagnostic
+        .result
+        .expect("initial diagnostic result");
+    assert!(
+        initial_diagnostic["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
+    );
+    let initial_result_id = initial_diagnostic["resultId"]
+        .as_str()
+        .expect("initial diagnostic result ID")
+        .to_string();
+
+    let original_metadata = fs::metadata(&provider).expect("provider metadata before rewrite");
+    write_file(&provider, &updated_provider);
+    restore_mtime(&provider, &original_metadata);
+    let rewritten_metadata = fs::metadata(&provider).expect("provider metadata after rewrite");
+    assert_eq!(rewritten_metadata.len(), original_metadata.len());
+    assert_eq!(rewritten_metadata.mtime(), original_metadata.mtime());
+    assert_eq!(
+        rewritten_metadata.mtime_nsec(),
+        original_metadata.mtime_nsec()
+    );
+    let mut count_overflow_changes: Vec<_> = (0..62)
+        .map(|index| json!({"uri":uri(&root.join(format!("Unrelated{index}.pas"))),"type":2}))
+        .collect();
+    count_overflow_changes.push(json!({"uri":uri(&provider),"type":2}));
+    count_overflow_changes.push(json!({"uri":uri(&provider_alias),"type":2}));
+    count_overflow_changes.push(json!({"uri":uri(&provider),"type":2}));
+    assert_eq!(count_overflow_changes.len(), 65);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":count_overflow_changes}),
+    );
+
+    let old_after_count_id =
+        RequestId::from("oversized-watch-old-definition-after-count".to_string());
+    server.send_request(
+        old_after_count_id.clone(),
+        "textDocument/definition",
+        navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+    );
+    assert!(
+        result_locations(server.response(&old_after_count_id)).is_empty(),
+        "the old declaration must disappear after an oversized watcher batch"
+    );
+    let new_after_count_id =
+        RequestId::from("oversized-watch-new-definition-after-count".to_string());
+    server.send_request(
+        new_after_count_id.clone(),
+        "textDocument/definition",
+        navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
+    );
+    let new_locations = result_locations(server.response(&new_after_count_id));
+    assert_eq!(
+        new_locations.len(),
+        1,
+        "new provider declaration after count overflow"
+    );
+    assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
+
+    let diagnostic_after_count_id =
+        RequestId::from("oversized-watch-diagnostic-after-count".to_string());
+    server.send_request(
+        diagnostic_after_count_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":initial_result_id}),
+    );
+    let diagnostic_after_count = server.response(&diagnostic_after_count_id);
+    assert!(diagnostic_after_count.error.is_none());
+    let diagnostic_after_count = diagnostic_after_count.result.expect("updated diagnostic");
+    assert_eq!(diagnostic_after_count["kind"], "full");
+    assert!(
+        diagnostic_after_count["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().all(|item| item["code"] != "constant-naming") })
+    );
+    let count_refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("oversized watcher batch must request a pull-diagnostic refresh");
+    server.send(Message::Response(Response::new_ok(
+        count_refresh.id,
+        Value::Null,
+    )));
+
+    let before_byte_overflow = fs::metadata(&provider).expect("provider metadata before reversal");
+    write_file(&provider, initial_provider);
+    restore_mtime(&provider, &before_byte_overflow);
+    let mut byte_overflow_changes = Vec::new();
+    let long_component = "x".repeat(178);
+    for index in 0..20 {
+        let mut long_path = root.join(format!("long{index}"));
+        for _ in 0..20 {
+            long_path.push(&long_component);
+        }
+        byte_overflow_changes.push(json!({"uri":uri(&long_path.join("Ignored.pas")),"type":2}));
+    }
+    byte_overflow_changes.push(json!({"uri":uri(&provider),"type":2}));
+    let total_uri_bytes: usize = byte_overflow_changes
+        .iter()
+        .map(|change| change["uri"].as_str().expect("URI string").len())
+        .sum();
+    assert!(total_uri_bytes > 32 * 1024);
+    assert!(byte_overflow_changes.len() < 64);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":byte_overflow_changes}),
+    );
+
+    let new_after_bytes_id =
+        RequestId::from("oversized-watch-new-definition-after-bytes".to_string());
+    server.send_request(
+        new_after_bytes_id.clone(),
+        "textDocument/definition",
+        navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
+    );
+    assert!(
+        result_locations(server.response(&new_after_bytes_id)).is_empty(),
+        "the new declaration must disappear after a URI-byte-overflow watcher batch"
+    );
+    let old_after_bytes_id =
+        RequestId::from("oversized-watch-old-definition-after-bytes".to_string());
+    server.send_request(
+        old_after_bytes_id.clone(),
+        "textDocument/definition",
+        navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+    );
+    let old_locations = result_locations(server.response(&old_after_bytes_id));
+    assert_eq!(
+        old_locations.len(),
+        1,
+        "old provider declaration after byte overflow"
+    );
+    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
+
+    let diagnostic_after_bytes_id =
+        RequestId::from("oversized-watch-diagnostic-after-bytes".to_string());
+    server.send_request(
+        diagnostic_after_bytes_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":diagnostic_after_count["resultId"]}),
+    );
+    let diagnostic_after_bytes = server.response(&diagnostic_after_bytes_id);
+    assert!(diagnostic_after_bytes.error.is_none());
+    let diagnostic_after_bytes = diagnostic_after_bytes.result.expect("restored diagnostic");
+    assert!(
+        diagnostic_after_bytes["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
+    );
+    let bytes_refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("URI-byte overflow must request a pull-diagnostic refresh");
+    server.send(Message::Response(Response::new_ok(
+        bytes_refresh.id,
+        Value::Null,
+    )));
     server.shutdown();
 }
 

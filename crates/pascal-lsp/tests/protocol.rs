@@ -34342,6 +34342,11 @@ fn symbol_rename_rejects_unit_alias_and_unresolved_provider_controls() {
             "MissingProvider",
         ),
         (
+            "traversing-explicit-path",
+            "unit Consumer;\ninterface\nuses Provider in '../Provider.pas';\nimplementation\nend.\n",
+            "Provider in",
+        ),
+        (
             "conditional-use",
             "unit Consumer;\ninterface\n{$IFDEF MAYBE}\nuses Provider;\n{$ENDIF}\nimplementation\nend.\n",
             "Provider;",
@@ -34431,10 +34436,11 @@ fn symbol_rename_rejects_namespaced_and_include_owned_unit_controls_atomically()
         } else {
             "unit Consumer;\ninterface\nuses\n{$I Uses.inc}\n;\nimplementation\nend.\n"
         };
+        let include_source = "Provider in 'Provider.pas'\n";
         write_file(&provider, provider_source);
         write_file(&consumer, consumer_source);
         if case == "include" {
-            write_file(&include, "Provider\n");
+            write_file(&include, include_source);
         }
         write_file(
             &root.join("Main.pas"),
@@ -34463,7 +34469,7 @@ fn symbol_rename_rejects_namespaced_and_include_owned_unit_controls_atomically()
             &consumer
         };
         let query_source = if case == "include" {
-            "Provider\n"
+            include_source
         } else {
             consumer_source
         };
@@ -34497,7 +34503,10 @@ fn symbol_rename_rejects_namespaced_and_include_owned_unit_controls_atomically()
             consumer_source.as_bytes()
         );
         if case == "include" {
-            assert_eq!(fs::read(&include).expect("include bytes"), b"Provider\n");
+            assert_eq!(
+                fs::read(&include).expect("include bytes"),
+                include_source.as_bytes()
+            );
         }
         server.shutdown();
     }
@@ -34520,8 +34529,8 @@ fn unit_rename_updates_only_selected_relative_uses_in_paths() {
         let source_b =
             "unit Provider;\ninterface\ntype TFromB = class end;\nimplementation\nend.\n";
         let helper_source = "unit Helper;\ninterface\nimplementation\nend.\n";
-        let one_source = "\u{feff}unit ConsumerOne;\r\ninterface\r\nuses Provider in 'lib/Provider.pas', Helper in 'lib/Helper.pas';\r\ntype TAlias = Provider.TA;\r\nconst Note = 'lib/Provider.pas'; // Provider in 'fake/Provider.pas'\r\nimplementation\r\nend.\r\n";
-        let two_source = "unit ConsumerTwo;\ninterface\nimplementation\nuses Provider in 'lib/Provider.pas';\nprocedure Run;\nvar Value: Provider.TB;\nbegin end;\nend.\n";
+        let one_source = "\u{feff}unit ConsumerOne;\r\ninterface\r\nuses Provider { 😀 comment between identifier and in }\r\n in (* comment between in and path *) 'lib/Provider.pas' { comment before separator }\r\n, { comment after separator } Helper in 'lib/Helper.pas';\r\ntype TAlias = Provider.TA;\r\nconst Note = 'lib/Provider.pas'; // Provider in 'fake/Provider.pas'\r\nimplementation\r\nend.\r\n";
+        let two_source = "unit ConsumerTwo;\ninterface\nimplementation\nuses Provider (* inline *) in\r\n { multiline path comment\r\n   retained exactly } 'lib/Provider.pas';\nprocedure Run;\nvar Value: Provider.TB;\nbegin end;\nend.\n";
         let b_source = "unit ConsumerB;\ninterface\nuses Provider in 'lib/Provider.pas';\ntype TAlias = Provider.TFromB;\nimplementation\nend.\n";
         write_file(&provider_a, source_a);
         write_file(&provider_b, source_b);
@@ -34654,10 +34663,12 @@ fn unit_rename_updates_only_selected_relative_uses_in_paths() {
         let b_provider_after = apply_workspace_edit_to_source(source_b, &edit, &uri(&provider_b));
         let b_consumer_after = apply_workspace_edit_to_source(b_source, &edit, &uri(&consumer_b));
         assert!(provider_updated.contains("unit Renamed;"));
-        assert!(
-            one_updated.contains("uses Renamed in 'lib/Renamed.pas', Helper in 'lib/Helper.pas';")
-        );
-        assert!(two_updated.contains("uses Renamed in 'lib/Renamed.pas';"));
+        assert!(one_updated.contains(
+            "uses Renamed { 😀 comment between identifier and in }\r\n in (* comment between in and path *) 'lib/Renamed.pas' { comment before separator }\r\n, { comment after separator } Helper in 'lib/Helper.pas';"
+        ));
+        assert!(two_updated.contains(
+            "uses Renamed (* inline *) in\r\n { multiline path comment\r\n   retained exactly } 'lib/Renamed.pas';"
+        ));
         assert!(
             one_updated
                 .contains("const Note = 'lib/Provider.pas'; // Provider in 'fake/Provider.pas'")
@@ -34759,7 +34770,10 @@ fn will_rename_unit_requires_negotiation_and_rejects_existing_target() {
     let root = temp.path().join("fixture");
     let provider = root.join("Provider.pas");
     let collision = root.join("Renamed.pas");
+    let consumer = root.join("Consumer.pas");
     let main = root.join("Main.pas");
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider in 'Provider.pas';\nimplementation\nend.\n";
     write_file(
         &provider,
         "unit Provider;\ninterface\nimplementation\nend.\n",
@@ -34768,7 +34782,11 @@ fn will_rename_unit_requires_negotiation_and_rejects_existing_target() {
         &collision,
         "unit Renamed;\ninterface\nimplementation\nend.\n",
     );
-    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    write_file(&consumer, consumer_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+    );
     write_file(
         &root.join("App.dproj"),
         "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
@@ -34810,6 +34828,11 @@ fn will_rename_unit_requires_negotiation_and_rejects_existing_target() {
     assert!(
         response.result.is_none(),
         "collision must not return partial text edits"
+    );
+    assert_eq!(
+        fs::read(&consumer).expect("collision consumer bytes"),
+        consumer_source.as_bytes(),
+        "a destination collision must not leave or apply a partial in-path edit"
     );
     server.shutdown();
 }
@@ -42839,8 +42862,10 @@ fn rename_revalidates_every_scanned_source_before_returning_edits() {
     let consumer = root.join("Consumer.pas");
     let provider_source =
         "unit Provider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
-    let original_consumer_source = "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Use;\nbegin\n  Log(0);\nend;\nend.\n";
-    let changed_consumer_source = original_consumer_source.replace("Log(0)", "Log(badConst)");
+    let original_consumer_source = "unit Consumer;\ninterface\nuses Provider in 'Provider.pas';\nimplementation\nprocedure Use;\nbegin\n  Log(0);\nend;\nend.\n";
+    let changed_consumer_source = original_consumer_source
+        .replace("'Provider.pas'", "'Decoy.pas'")
+        .replace("Log(0)", "Log(badConst)");
     write_file(&provider, provider_source);
     write_file(&consumer, original_consumer_source);
     for index in 0..400 {

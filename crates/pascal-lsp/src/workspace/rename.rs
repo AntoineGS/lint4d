@@ -3740,61 +3740,6 @@ fn rename_from_input_impl(
             records: Vec::new(),
         };
     }
-    for edited_uri in raw_edits.keys() {
-        if !snapshot.editable.contains(edited_uri) {
-            return Computed {
-                source_generation,
-                configuration_generation,
-                value: Err(format!(
-                    "rename would modify source outside configured workspace roots: {edited_uri}"
-                )),
-                records: Vec::new(),
-            };
-        }
-        if !snapshot.records.contains_key(edited_uri) {
-            return Computed {
-                source_generation,
-                configuration_generation,
-                value: Err(format!(
-                    "rename source was not retained in the complete workspace snapshot: {edited_uri}"
-                )),
-                records: Vec::new(),
-            };
-        }
-    }
-    if let Err(error) = post_edit_rebind_proof(
-        &snapshot,
-        &raw_edits,
-        &candidate_names,
-        new_name,
-        &uri,
-        position,
-        cancel,
-        if allow_unit { new_uri } else { None },
-    ) {
-        let disk_changed = uri
-            .to_file_path()
-            .ok()
-            .map(absolute_path)
-            .and_then(|path| disk_stamp(&path))
-            != initial_disk_stamp;
-        if disk_changed
-            || source_for_input_with_cancel(&input, &uri, Some(cancel))
-                .is_ok_and(|(current, _)| current != planning_source)
-        {
-            return failed(
-                source_generation,
-                configuration_generation,
-                format!("source changed while proving rename target {uri}"),
-            );
-        }
-        return Computed {
-            source_generation,
-            configuration_generation,
-            value: Err(error),
-            records: Vec::new(),
-        };
-    }
     if allow_unit {
         let Some(new_uri) = new_uri.map(canonical_file_uri) else {
             return failed(
@@ -3943,6 +3888,61 @@ fn rename_from_input_impl(
             raw_edits.entry(edit_uri).or_default().push(edit);
         }
     }
+    for edited_uri in raw_edits.keys() {
+        if !snapshot.editable.contains(edited_uri) {
+            return Computed {
+                source_generation,
+                configuration_generation,
+                value: Err(format!(
+                    "rename would modify source outside configured workspace roots: {edited_uri}"
+                )),
+                records: Vec::new(),
+            };
+        }
+        if !snapshot.records.contains_key(edited_uri) {
+            return Computed {
+                source_generation,
+                configuration_generation,
+                value: Err(format!(
+                    "rename source was not retained in the complete workspace snapshot: {edited_uri}"
+                )),
+                records: Vec::new(),
+            };
+        }
+    }
+    if let Err(error) = post_edit_rebind_proof(
+        &snapshot,
+        &raw_edits,
+        &candidate_names,
+        new_name,
+        &uri,
+        position,
+        cancel,
+        if allow_unit { new_uri } else { None },
+    ) {
+        let disk_changed = uri
+            .to_file_path()
+            .ok()
+            .map(absolute_path)
+            .and_then(|path| disk_stamp(&path))
+            != initial_disk_stamp;
+        if disk_changed
+            || source_for_input_with_cancel(&input, &uri, Some(cancel))
+                .is_ok_and(|(current, _)| current != planning_source)
+        {
+            return failed(
+                source_generation,
+                configuration_generation,
+                format!("source changed while proving rename target {uri}"),
+            );
+        }
+        return Computed {
+            source_generation,
+            configuration_generation,
+            value: Err(error),
+            records: Vec::new(),
+        };
+    }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -3992,15 +3992,85 @@ struct ExplicitUsesPathLiteral {
     basename_range: std::ops::Range<usize>,
 }
 
+fn skip_pascal_trivia(source: &str, cursor: &mut usize, cancel: &AtomicBool) -> Result<(), String> {
+    let bytes = source.as_bytes();
+    loop {
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            *cursor += 1;
+        }
+        if bytes.get(*cursor..*cursor + 2) == Some(b"//") {
+            *cursor += 2;
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
+            {
+                if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                *cursor += 1;
+            }
+            continue;
+        }
+        if bytes.get(*cursor) == Some(&b'{') {
+            let start = *cursor;
+            *cursor += 1;
+            while bytes.get(*cursor).is_some_and(|byte| *byte != b'}') {
+                if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                *cursor += 1;
+            }
+            if bytes.get(*cursor) != Some(&b'}') {
+                return Err("unterminated brace comment in explicit unit uses entry".to_string());
+            }
+            *cursor += 1;
+            if *cursor == start {
+                unreachable!("comment scanner advanced");
+            }
+            continue;
+        }
+        if bytes.get(*cursor..*cursor + 2) == Some(b"(*") {
+            *cursor += 2;
+            let mut depth = 1usize;
+            while depth > 0 {
+                if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                match bytes.get(*cursor..*cursor + 2) {
+                    Some(b"(*") => {
+                        depth += 1;
+                        *cursor += 2;
+                    }
+                    Some(b"*)") => {
+                        depth -= 1;
+                        *cursor += 2;
+                    }
+                    Some(_) => *cursor += 1,
+                    None => {
+                        return Err(
+                            "unterminated parenthesized comment in explicit unit uses entry"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        return Ok(());
+    }
+}
+
 fn explicit_uses_path_after(
     source: &str,
     import_end: usize,
+    cancel: &AtomicBool,
 ) -> Result<Option<ExplicitUsesPathLiteral>, String> {
     let bytes = source.as_bytes();
     let mut cursor = import_end;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
+    skip_pascal_trivia(source, &mut cursor, cancel)?;
     if bytes
         .get(cursor..cursor.saturating_add(2))
         .is_none_or(|word| !word.eq_ignore_ascii_case(b"in"))
@@ -4012,9 +4082,7 @@ fn explicit_uses_path_after(
         return Ok(None);
     }
     cursor += 2;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
+    skip_pascal_trivia(source, &mut cursor, cancel)?;
     if bytes.get(cursor) != Some(&b'\'') {
         return Err("explicit unit in-path has no single-quoted literal".to_string());
     }
@@ -4023,6 +4091,9 @@ fn explicit_uses_path_after(
     let mut decoded_path = String::new();
     let mut raw_starts = Vec::new();
     loop {
+        if cursor % 1024 == 0 && is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
         let Some(character) = source.get(cursor..).and_then(|tail| tail.chars().next()) else {
             return Err("explicit unit in-path literal is unterminated".to_string());
         };
@@ -4065,6 +4136,35 @@ fn explicit_uses_path_after(
 }
 
 fn resolve_safe_relative_uses_path(importer: &Path, relative: &str) -> Result<PathBuf, String> {
+    let resolved = resolve_relative_uses_path_lexically(importer, relative)?;
+    let parent = importer
+        .parent()
+        .ok_or_else(|| "explicit unit in-path importer has no parent directory".to_string())?;
+    let components = relative.split(['/', '\\']).collect::<Vec<_>>();
+    let mut current = absolute_path(parent.to_path_buf());
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| format!("cannot verify explicit unit in-path target: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("explicit unit in-path traverses a symlink".to_string());
+        }
+        if index + 1 != components.len() && !metadata.is_dir() {
+            return Err("explicit unit in-path has a non-directory parent component".to_string());
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&resolved)
+        .map_err(|error| format!("cannot verify explicit unit in-path target: {error}"))?;
+    if !metadata.is_file() {
+        return Err("explicit unit in-path target is not a regular file".to_string());
+    }
+    Ok(resolved)
+}
+
+fn resolve_relative_uses_path_lexically(
+    importer: &Path,
+    relative: &str,
+) -> Result<PathBuf, String> {
     if relative.starts_with('/')
         || relative.starts_with('\\')
         || relative.contains(':')
@@ -4086,16 +4186,6 @@ fn resolve_safe_relative_uses_path(importer: &Path, relative: &str) -> Result<Pa
     }
     for component in components {
         resolved.push(component);
-        let metadata = std::fs::symlink_metadata(&resolved)
-            .map_err(|error| format!("cannot verify explicit unit in-path target: {error}"))?;
-        if metadata.file_type().is_symlink() {
-            return Err("explicit unit in-path traverses a symlink".to_string());
-        }
-    }
-    let metadata = std::fs::symlink_metadata(&resolved)
-        .map_err(|error| format!("cannot verify explicit unit in-path target: {error}"))?;
-    if !metadata.is_file() {
-        return Err("explicit unit in-path target is not a regular file".to_string());
     }
     Ok(absolute_path(resolved))
 }
@@ -4130,7 +4220,8 @@ fn selected_explicit_uses_path_edits(
             );
         };
         for import in snapshot.index.imports(source_uri) {
-            let Some(path_literal) = explicit_uses_path_after(source, import.span.end)? else {
+            let Some(path_literal) = explicit_uses_path_after(source, import.span.end, cancel)?
+            else {
                 continue;
             };
             if !source_uri
@@ -4345,6 +4436,30 @@ fn post_edit_rebind_proof(
     let mut virtual_indices = HashMap::<Url, PositionIndex>::new();
     let mut transformed = HashMap::<Url, String>::new();
     let mut expected = HashSet::<(String, u32, u32, u32, u32)>::new();
+    let mut explicit_path_edit_ranges = HashSet::new();
+    for edit_uri in &ordered {
+        let Some(source) = snapshot.sources.get(edit_uri) else {
+            continue;
+        };
+        for import in snapshot.index.imports(edit_uri) {
+            budget.require_work(1, cancel)?;
+            let Some(path_literal) = explicit_uses_path_after(source, import.span.end, cancel)?
+            else {
+                continue;
+            };
+            let start = text::offset_to_position(source, path_literal.basename_range.start)
+                .ok_or_else(|| "cannot map explicit uses path edit start".to_string())?;
+            let end = text::offset_to_position(source, path_literal.basename_range.end)
+                .ok_or_else(|| "cannot map explicit uses path edit end".to_string())?;
+            explicit_path_edit_ranges.insert((
+                edit_uri.clone(),
+                start.line,
+                start.character,
+                end.line,
+                end.character,
+            ));
+        }
+    }
     let mut query_target = None;
     for edit_uri in ordered {
         if is_cancelled(cancel) {
@@ -4503,7 +4618,25 @@ fn post_edit_rebind_proof(
         let (replacement, mapped_ranges) =
             apply_text_edits_for_proof(source, &edits, cancel, &mut budget)?;
         budget.require_owned_bytes(replacement.len(), cancel)?;
-        for range in mapped_ranges {
+        let mut edits_by_position = edits.iter().collect::<Vec<_>>();
+        edits_by_position.sort_by_key(|edit| {
+            (
+                edit.range.start.line,
+                edit.range.start.character,
+                edit.range.end.line,
+                edit.range.end.character,
+            )
+        });
+        for (edit, range) in edits_by_position.into_iter().zip(mapped_ranges) {
+            if explicit_path_edit_ranges.contains(&(
+                edit_uri.clone(),
+                edit.range.start.line,
+                edit.range.start.character,
+                edit.range.end.line,
+                edit.range.end.character,
+            )) {
+                continue;
+            }
             if query_target.is_none() {
                 query_target = Some((
                     moved_file
@@ -4555,6 +4688,17 @@ fn post_edit_rebind_proof(
     }
     let rebound = rebound.ok_or_else(|| "rename produced no rebound index".to_string())?;
 
+    if let Some(moved_file) = moved_file {
+        verify_post_edit_explicit_uses_paths(
+            &rebound,
+            &transformed,
+            snapshot,
+            requested_uri,
+            moved_file,
+            cancel,
+        )?;
+    }
+
     let (query_uri, query_position) =
         query_target.ok_or_else(|| "rename post-edit target is not source-backed".to_string())?;
     let mut binding_budget = BindingWorkBudget::new(MAX_SNAPSHOT_MAPPING_WORK);
@@ -4593,6 +4737,67 @@ fn post_edit_rebind_proof(
         return Err(
             "rename post-edit binding proof did not preserve the complete edit family".to_string(),
         );
+    }
+    Ok(())
+}
+
+fn verify_post_edit_explicit_uses_paths(
+    rebound: &NavigationIndex,
+    transformed: &HashMap<Url, String>,
+    snapshot: &RenameSnapshot,
+    requested_uri: &Url,
+    moved_file: &Url,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    for (importer_uri, source) in transformed {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let importer_path = if importer_uri == requested_uri {
+            moved_file
+                .to_file_path()
+                .map_err(|_| "post-rename importer URI is not a file URI".to_string())?
+        } else {
+            snapshot
+                .records
+                .get(importer_uri)
+                .and_then(|record| record.path.clone())
+                .or_else(|| importer_uri.to_file_path().ok())
+                .ok_or_else(|| "post-rename uses importer has no physical path".to_string())?
+        };
+        for import in rebound.imports(importer_uri) {
+            let Some(path_literal) = explicit_uses_path_after(source, import.span.end, cancel)?
+            else {
+                continue;
+            };
+            let position = text::offset_to_position(source, import.span.start)
+                .ok_or_else(|| "cannot map post-rename explicit import position".to_string())?;
+            let binding = rebound
+                .rename_binding_info_with_cancel(importer_uri, position, cancel)
+                .map_err(|error| format!("cannot rebind post-rename explicit import: {error}"))?;
+            if !binding.unit {
+                return Err("post-rename explicit import is not a unit binding".to_string());
+            }
+            let selected_uri = binding
+                .unit_provider_uri
+                .ok_or_else(|| "post-rename explicit import has no unique provider".to_string())?;
+            let selected_uri =
+                if canonical_file_uri(&selected_uri) == canonical_file_uri(requested_uri) {
+                    moved_file.clone()
+                } else {
+                    selected_uri
+                };
+            let mapped_path =
+                resolve_relative_uses_path_lexically(&importer_path, &path_literal.decoded_path)?;
+            let mapped_uri = Url::from_file_path(mapped_path).map_err(|_| {
+                "post-rename explicit path cannot be represented as a file URI".to_string()
+            })?;
+            if canonical_file_uri(&mapped_uri) != canonical_file_uri(&selected_uri) {
+                return Err(format!(
+                    "post-rename explicit uses path does not resolve to its rebound provider: {importer_uri}"
+                ));
+            }
+        }
     }
     Ok(())
 }

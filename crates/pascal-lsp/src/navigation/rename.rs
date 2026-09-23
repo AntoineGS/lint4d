@@ -263,12 +263,59 @@ pub(crate) struct RenameBindingInfo {
 }
 
 fn is_explicit_uses_path_keyword(identifier: Node<'_>, document: &Document, span: Span) -> bool {
-    node_text(identifier, &document.source).eq_ignore_ascii_case("in")
-        && has_ancestor_kind(identifier, "declUses")
-        && document
-            .source
-            .get(span.end..)
-            .is_some_and(|tail| tail.trim_start().starts_with('\''))
+    if !node_text(identifier, &document.source).eq_ignore_ascii_case("in")
+        || !has_ancestor_kind(identifier, "declUses")
+    {
+        return false;
+    }
+    let source = document.source.as_bytes();
+    let mut cursor = span.end;
+    loop {
+        while source.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if source.get(cursor..cursor.saturating_add(2)) == Some(b"//") {
+            cursor += 2;
+            while source
+                .get(cursor)
+                .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
+            {
+                cursor += 1;
+            }
+            continue;
+        }
+        if source.get(cursor) == Some(&b'{') {
+            cursor += 1;
+            while source.get(cursor).is_some_and(|byte| *byte != b'}') {
+                cursor += 1;
+            }
+            if source.get(cursor) != Some(&b'}') {
+                return false;
+            }
+            cursor += 1;
+            continue;
+        }
+        if source.get(cursor..cursor.saturating_add(2)) == Some(b"(*") {
+            cursor += 2;
+            let mut depth = 1usize;
+            while depth > 0 {
+                match source.get(cursor..cursor.saturating_add(2)) {
+                    Some(b"(*") => {
+                        depth += 1;
+                        cursor += 2;
+                    }
+                    Some(b"*)") => {
+                        depth -= 1;
+                        cursor += 2;
+                    }
+                    Some(_) => cursor += 1,
+                    None => return false,
+                }
+            }
+            continue;
+        }
+        return source.get(cursor) == Some(&b'\'');
+    }
 }
 
 #[derive(Debug, Clone)]

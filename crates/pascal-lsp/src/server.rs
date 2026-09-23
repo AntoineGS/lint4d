@@ -114,6 +114,10 @@ const MAX_DIAGNOSTIC_REPORT_ITEMS: usize = 10_000;
 const MAX_DIAGNOSTIC_REPORT_BYTES: usize = 7 * 1024 * 1024;
 const MAX_DIAGNOSTIC_REPORT_ITEM_BYTES: usize = 64 * 1024;
 const MAX_DIAGNOSTIC_DISPATCHES_PER_TURN: usize = 64;
+const MAX_PUSH_DIAGNOSTIC_NOTIFICATIONS_PER_TURN: usize = 64;
+const MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN: usize = 1024 * 1024;
+const MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES: usize = 64 * 1024;
+const LSP_FRAME_HEADER_RESERVE_BYTES: usize = 64;
 // Rejected-open cleanup is bounded independently from outbound buffering.
 // The workspace admits at most 10,000 open documents and each push report is
 // already capped at 10,000 items; this allowance covers their deduplicated
@@ -240,6 +244,57 @@ struct OutboundQueue {
 }
 
 impl OutboundQueue {
+    fn discard_diagnostic_publications(&mut self, uris: &std::collections::BTreeSet<Url>) {
+        let is_superseded_diagnostic = |pending: &PendingOutboundMessage| {
+            matches!(
+                &pending.message,
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification.params.get("uri").and_then(Value::as_str)
+                            .and_then(|uri| Url::parse(uri).ok())
+                            .is_some_and(|uri| uris.contains(&uri))
+            )
+        };
+        self.pending
+            .retain(|pending| !is_superseded_diagnostic(pending));
+        self.deferred
+            .retain(|pending| !is_superseded_diagnostic(pending));
+
+        self.pending_bytes = 0;
+        self.pending_data_messages = 0;
+        self.pending_control_messages = 0;
+        self.pending_control_bytes = 0;
+        for pending in &self.pending {
+            self.pending_bytes = self.pending_bytes.saturating_add(pending.bytes);
+            match pending.class {
+                OutboundClass::Data => self.pending_data_messages += 1,
+                OutboundClass::Control | OutboundClass::Result => {
+                    self.pending_control_messages += 1;
+                    self.pending_control_bytes =
+                        self.pending_control_bytes.saturating_add(pending.bytes);
+                }
+            }
+        }
+
+        self.deferred_bytes = 0;
+        self.deferred_control_messages = 0;
+        self.deferred_result_messages = 0;
+        self.deferred_control_bytes = 0;
+        self.deferred_result_bytes = 0;
+        for pending in &self.deferred {
+            self.deferred_bytes = self.deferred_bytes.saturating_add(pending.bytes);
+            if pending.class.is_result() {
+                self.deferred_result_messages += 1;
+                self.deferred_result_bytes =
+                    self.deferred_result_bytes.saturating_add(pending.bytes);
+            } else {
+                self.deferred_control_messages += 1;
+                self.deferred_control_bytes =
+                    self.deferred_control_bytes.saturating_add(pending.bytes);
+            }
+        }
+    }
+
     fn control_message_limit(&self, pending: &PendingOutboundMessage) -> usize {
         #[cfg(not(feature = "test-support"))]
         let _ = pending;
@@ -434,6 +489,7 @@ trait ProtocolSender {
     fn send_control(&self, message: Message) -> Result<(), OutputError>;
     fn send_result(&self, message: Message) -> Result<(), OutputError>;
     fn send_data(&self, message: Message) -> Result<bool, OutputError>;
+    fn discard_diagnostic_publications(&self, _uris: &std::collections::BTreeSet<Url>) {}
 }
 
 impl ProtocolSender for Connection {
@@ -564,6 +620,12 @@ impl ProtocolSender for ProtocolConnection {
         self.outbound
             .borrow_mut()
             .enqueue(&self.connection.sender, message, OutboundClass::Data)
+    }
+
+    fn discard_diagnostic_publications(&self, uris: &std::collections::BTreeSet<Url>) {
+        self.outbound
+            .borrow_mut()
+            .discard_diagnostic_publications(uris);
     }
 }
 
@@ -2006,6 +2068,13 @@ struct DiagnosticPullStore {
     order: VecDeque<String>,
     retained_bytes: usize,
     next_id: u64,
+}
+
+#[derive(Default)]
+struct DiagnosticPublicationTurnBudget {
+    notification_count: usize,
+    processed_targets: usize,
+    serialized_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -6738,10 +6807,21 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    #[cfg(test)]
     fn poll(
         &mut self,
         connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut diagnostic_budget = DiagnosticPublicationTurnBudget::default();
+        self.poll_with_diagnostic_budget(connection, workspace, &mut diagnostic_budget)
+    }
+
+    fn poll_with_diagnostic_budget(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &mut Workspace,
+        diagnostic_budget: &mut DiagnosticPublicationTurnBudget,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.reap_retired_partial_validations();
         if workspace.analysis_admission_fenced() {
@@ -6792,6 +6872,11 @@ impl AnalysisJobs {
                             &mut self.diagnostic_results,
                             result,
                             None,
+                        )?;
+                        pump_pending_diagnostic_publications_with_budget(
+                            connection,
+                            workspace,
+                            diagnostic_budget,
                         )?;
                         self.progress
                             .finish_job(Some(connection), AnalysisJobId::Diagnostic(id), None)
@@ -7263,7 +7348,7 @@ fn deliver_analysis_result_with_store(
                 let uri = diagnostics.uri;
                 let version = diagnostics.version;
                 let updates = workspace
-                    .replace_diagnostic_publications(
+                    .stage_diagnostic_publications(
                         &uri,
                         std::iter::once(queries::DiagnosticPublication {
                             uri: uri.clone(),
@@ -7275,11 +7360,8 @@ fn deliver_analysis_result_with_store(
                         }),
                     )
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                for update in updates.updates {
-                    send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
-                }
                 if updates.incomplete {
-                    send_diagnostic_publication_incomplete(connection)?;
+                    workspace.mark_pending_diagnostic_publication_incomplete();
                 }
                 Ok(())
             }
@@ -8365,8 +8447,10 @@ fn event_loop(
     let mut pending_diagnostic_clears = PendingDiagnosticClears::default();
     loop {
         connection.flush()?;
+        let diagnostic_clears_were_pending = !pending_diagnostic_clears.is_empty();
+        let mut diagnostic_publication_budget = DiagnosticPublicationTurnBudget::default();
         if !pull_diagnostics_supported
-            && !pending_diagnostic_clears.is_empty()
+            && diagnostic_clears_were_pending
             && !connection.has_pending_output()
         {
             pending_diagnostic_clears.pump(connection, MAX_DIAGNOSTIC_DISPATCHES_PER_TURN)?;
@@ -8422,6 +8506,12 @@ fn event_loop(
                                     pending_diagnostic_clears
                                         .enqueue_cursor(cursor, effect.cleanup_rejected_uri);
                                 }
+                                mark_refreshed_publication_roots_stale(
+                                    connection,
+                                    workspace,
+                                    &effect.refresh,
+                                    effect.refresh_all_diagnostics,
+                                );
                             }
                             if pull_diagnostics_supported
                                 && (effect.refresh_requested || !effect.refresh.is_empty())
@@ -8508,6 +8598,12 @@ fn event_loop(
                     diagnostic_refresh.request(connection)?;
                 }
                 if !pull_diagnostics_supported {
+                    mark_refreshed_publication_roots_stale(
+                        connection,
+                        workspace,
+                        &effect.refresh,
+                        false,
+                    );
                     jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     jobs.refresh_diagnostics_with_connection(
@@ -8527,7 +8623,21 @@ fn event_loop(
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
         if !workspace_busy {
-            jobs.poll(connection, workspace)?;
+            jobs.poll_with_diagnostic_budget(
+                connection,
+                workspace,
+                &mut diagnostic_publication_budget,
+            )?;
+        }
+        if !pull_diagnostics_supported
+            && !diagnostic_clears_were_pending
+            && pending_diagnostic_clears.is_empty()
+        {
+            pump_pending_diagnostic_publications_with_budget(
+                connection,
+                workspace,
+                &mut diagnostic_publication_budget,
+            )?;
         }
         let output_pending = connection.has_pending_output();
         // Pull-owned diagnostics must not inherit the debounced push queue.
@@ -8763,6 +8873,12 @@ fn event_loop(
                             diagnostic_refresh.request(connection)?;
                         }
                         if !pull_diagnostics_supported {
+                            mark_refreshed_publication_roots_stale(
+                                connection,
+                                workspace,
+                                &open_documents,
+                                false,
+                            );
                             jobs.refresh_diagnostics_with_connection(
                                 connection,
                                 workspace,
@@ -8959,6 +9075,12 @@ fn event_loop(
                             diagnostic_refresh.request(connection)?;
                         }
                         if !pull_diagnostics_supported {
+                            mark_refreshed_publication_roots_stale(
+                                connection,
+                                workspace,
+                                &effect.refresh,
+                                effect.refresh_all_diagnostics,
+                            );
                             jobs.cancel_diagnostics_for_with_connection(
                                 Some(connection),
                                 &effect.cancel,
@@ -9003,6 +9125,12 @@ fn event_loop(
                         diagnostic_refresh.request(connection)?;
                     }
                     if !pull_diagnostics_supported {
+                        mark_refreshed_publication_roots_stale(
+                            connection,
+                            workspace,
+                            &effect.refresh,
+                            effect.refresh_all_diagnostics,
+                        );
                         jobs.cancel_diagnostics_for_with_connection(
                             Some(connection),
                             &effect.cancel,
@@ -10043,6 +10171,32 @@ fn invalidate_for_file_notification_overflow(
     effect
 }
 
+fn mark_publication_root_stale(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    root_uri: &Url,
+) {
+    let affected = workspace.mark_diagnostic_publication_root_stale(root_uri);
+    connection.discard_diagnostic_publications(&affected);
+}
+
+fn mark_refreshed_publication_roots_stale(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    refresh: &[Url],
+    refresh_all: bool,
+) {
+    if refresh_all {
+        for uri in workspace.open_document_uris() {
+            mark_publication_root_stale(connection, workspace, &uri);
+        }
+    } else {
+        for uri in refresh {
+            mark_publication_root_stale(connection, workspace, uri);
+        }
+    }
+}
+
 fn handle_notification_with_cancel(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
@@ -10119,6 +10273,7 @@ fn handle_notification_with_control(
             // that have already published a context-sensitive semantic claim;
             // ordinary lint-only roots retain their normal publication order.
             for open_uri in workspace.open_diagnostic_roots_with_semantic_claims() {
+                mark_publication_root_stale(connection, workspace, &open_uri);
                 effect.refresh_uri(open_uri);
             }
             Ok(effect)
@@ -10133,6 +10288,7 @@ fn handle_notification_with_control(
                             version,
                             format!("{error}; a full-document replacement is required"),
                         ) {
+                            mark_publication_root_stale(connection, workspace, &uri);
                             let mut effect = DiagnosticNotificationEffect::default();
                             effect.cancel_uri_with_budget(uri.clone(), budget)?;
                             effect.refresh_uri_with_budget(uri.clone(), budget)?;
@@ -10156,10 +10312,12 @@ fn handle_notification_with_control(
                     eprintln!("pascal-lsp: didChange ignored: {error}");
                     error
                 })?;
+            mark_publication_root_stale(connection, workspace, &uri);
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri_with_budget(uri.clone(), budget)?;
             effect.refresh_dependents_with_control(workspace, &uri, false, cancel, budget)?;
             for open_uri in workspace.open_document_uris() {
+                mark_publication_root_stale(connection, workspace, &open_uri);
                 effect.refresh_uri_with_budget(open_uri, budget)?;
             }
             Ok(effect)
@@ -10173,10 +10331,12 @@ fn handle_notification_with_control(
                     eprintln!("pascal-lsp: didSave ignored: {error}");
                     error
                 })?;
+            mark_publication_root_stale(connection, workspace, &uri);
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri_with_budget(uri.clone(), budget)?;
             effect.refresh_dependents_with_control(workspace, &uri, true, cancel, budget)?;
             for open_uri in workspace.open_document_uris() {
+                mark_publication_root_stale(connection, workspace, &open_uri);
                 effect.refresh_uri_with_budget(open_uri, budget)?;
             }
             Ok(effect)
@@ -10186,33 +10346,21 @@ fn handle_notification_with_control(
             let uri = params.text_document.uri;
             let closed = workspace.close_document(&uri);
             if closed {
-                let replacement = workspace.clear_diagnostic_publications(&uri);
+                mark_publication_root_stale(connection, workspace, &uri);
+                let replacement = if push_diagnostics_supported && !defer_push_clears {
+                    workspace.stage_clear_diagnostic_publications(&uri)
+                } else {
+                    workspace.clear_diagnostic_publications(&uri)
+                };
                 // A rejected-open cleanup cursor already owns the complete
                 // retained publication union. Do not bypass its bounded,
                 // resumable admission path with synchronous close clears.
                 if push_diagnostics_supported
                     && !defer_push_clears
                     && !workspace.analysis_admission_fenced()
+                    && replacement.incomplete
                 {
-                    let mut root_was_updated = false;
-                    for update in replacement.updates {
-                        root_was_updated |= update.uri == uri;
-                        send_diagnostics(
-                            connection,
-                            &update.uri,
-                            update.version,
-                            update.diagnostics,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    }
-                    if !root_was_updated {
-                        send_diagnostics(connection, &uri, None, Vec::new())
-                            .map_err(|error| error.to_string())?;
-                    }
-                    if replacement.incomplete {
-                        send_diagnostic_publication_incomplete(connection)
-                            .map_err(|error| error.to_string())?;
-                    }
+                    workspace.mark_pending_diagnostic_publication_incomplete();
                 }
             }
             let mut effect = DiagnosticNotificationEffect::default();
@@ -10221,6 +10369,7 @@ fn handle_notification_with_control(
                 effect.request_refresh();
                 effect.refresh_dependents_with_control(workspace, &uri, true, cancel, budget)?;
                 for open_uri in workspace.open_document_uris() {
+                    mark_publication_root_stale(connection, workspace, &open_uri);
                     effect.refresh_uri_with_budget(open_uri, budget)?;
                 }
             }
@@ -10276,6 +10425,7 @@ fn handle_notification_with_control(
                     return Err(rename::CANCELLATION_MESSAGE.to_string());
                 }
                 for uri in workspace.file_event_with_control(&changed_uri, kind, cancel, budget)? {
+                    mark_publication_root_stale(connection, workspace, &uri);
                     effect.refresh_uri_with_budget(uri, budget)?;
                 }
                 if !push_diagnostics_supported {
@@ -10473,6 +10623,7 @@ fn handle_notification_with_control(
             let mut effect = DiagnosticNotificationEffect::default();
             effect.request_refresh();
             for uri in workspace.open_document_uris() {
+                mark_publication_root_stale(connection, workspace, &uri);
                 effect.refresh_uri(uri);
             }
             Ok(effect)
@@ -10556,24 +10707,107 @@ fn send_diagnostic_publications(
     root_uri: &Url,
     publications: Vec<queries::DiagnosticPublication>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    mark_publication_root_stale(connection, workspace, root_uri);
     let replacement = workspace
-        .replace_diagnostic_publications(root_uri, publications)
+        .stage_diagnostic_publications(root_uri, publications)
         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-    for update in replacement.updates {
-        send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
-    }
     if replacement.incomplete {
-        send_diagnostic_publication_incomplete(connection)?;
+        workspace.mark_pending_diagnostic_publication_incomplete();
     }
     Ok(())
 }
 
-fn send_diagnostic_publication_incomplete(
+#[cfg(test)]
+fn pump_pending_diagnostic_publications(
     connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection
-        .send_control(diagnostic_publication_incomplete_message())
-        .map_err(Into::into)
+    pump_pending_diagnostic_publications_with_budget(
+        connection,
+        workspace,
+        &mut DiagnosticPublicationTurnBudget::default(),
+    )
+}
+
+fn pump_pending_diagnostic_publications_with_budget(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    budget: &mut DiagnosticPublicationTurnBudget,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    while budget.processed_targets < MAX_PUSH_DIAGNOSTIC_NOTIFICATIONS_PER_TURN
+        && budget.notification_count < MAX_PUSH_DIAGNOSTIC_NOTIFICATIONS_PER_TURN
+        && budget.serialized_bytes < MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN
+    {
+        let Some((uri, publication, incomplete)) = workspace.peek_pending_diagnostic_publication()
+        else {
+            break;
+        };
+        budget.processed_targets += 1;
+        if incomplete {
+            workspace.mark_pending_diagnostic_publication_incomplete();
+        }
+        let Some(publication) = publication else {
+            workspace.complete_pending_diagnostic_publication(&uri);
+            continue;
+        };
+        let message = diagnostics_notification(
+            &publication.uri,
+            publication.version,
+            publication.diagnostics,
+        );
+        let bytes = serde_json::to_vec(&message)?
+            .len()
+            .saturating_add(LSP_FRAME_HEADER_RESERVE_BYTES);
+        if bytes > MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES {
+            // Omit the complete report rather than publishing a truncated or
+            // false-empty notification. The operational warning is retained
+            // and retried by a later pump if output is temporarily full.
+            workspace.complete_pending_diagnostic_publication(&uri);
+            workspace.mark_pending_diagnostic_publication_incomplete();
+            continue;
+        }
+        if budget.serialized_bytes.saturating_add(bytes) > MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN {
+            break;
+        }
+        match connection.send_control(message) {
+            Ok(()) => {
+                workspace.complete_pending_diagnostic_publication(&uri);
+                budget.notification_count += 1;
+                budget.serialized_bytes = budget.serialized_bytes.saturating_add(bytes);
+            }
+            Err(OutputError::Backpressure) => break,
+            Err(OutputError::MessageTooLarge) => {
+                workspace.complete_pending_diagnostic_publication(&uri);
+                workspace.mark_pending_diagnostic_publication_incomplete();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if budget.notification_count < MAX_PUSH_DIAGNOSTIC_NOTIFICATIONS_PER_TURN
+        && workspace.take_pending_diagnostic_publication_incomplete()
+    {
+        let warning = diagnostic_publication_incomplete_message();
+        let bytes = serde_json::to_vec(&warning)?
+            .len()
+            .saturating_add(LSP_FRAME_HEADER_RESERVE_BYTES);
+        if bytes <= MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES
+            && budget.serialized_bytes.saturating_add(bytes) <= MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN
+        {
+            match connection.send_control(warning) {
+                Ok(()) => {
+                    budget.notification_count += 1;
+                    budget.serialized_bytes = budget.serialized_bytes.saturating_add(bytes);
+                }
+                Err(OutputError::Backpressure) => {
+                    workspace.mark_pending_diagnostic_publication_incomplete();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            workspace.mark_pending_diagnostic_publication_incomplete();
+        }
+    }
+    Ok(())
 }
 
 fn diagnostic_publication_incomplete_message() -> Message {
@@ -11095,21 +11329,23 @@ mod tests {
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisProgressTokens, AnalysisRequest,
         AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
-        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult, DiagnosticPullStore,
-        DocumentationFormat, FileWatcherRegistration, MAX_ANALYSIS_QUEUE,
-        MAX_CLIENT_ANALYSIS_RECIPIENTS, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
-        MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
-        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES,
-        MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
-        MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass,
-        OutboundQueue, PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation,
-        PartialResultPayload, PendingAnalysis, PriorityQueue, TestBarrierConfig,
-        deliver_analysis_result, event_loop_receive_timeout, invalidate_analysis_result,
-        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
+        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult,
+        ConfigurationCoordinator, DiagnosticPullStore, DocumentationFormat,
+        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
+        MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
+        MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
+        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, OutputError,
+        PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload,
+        PendingAnalysis, PriorityQueue, ProtocolSender, TestBarrierConfig, deliver_analysis_result,
+        event_loop_receive_timeout, invalidate_analysis_result,
+        pump_pending_diagnostic_publications, supports_diagnostic_refresh,
+        supports_workspace_diagnostic_reports,
     };
-    use crate::workspace::Workspace;
     use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
+    use crate::workspace::{Workspace, WorkspaceOptions};
     use crossbeam_channel::{RecvTimeoutError, bounded};
     use lsp_server::{Connection, Message, Notification, RequestId, Response};
     use lsp_types::{
@@ -11122,10 +11358,37 @@ mod tests {
     use std::io::{Cursor, ErrorKind};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    struct BackpressureOnceSender {
+        should_block: AtomicBool,
+        accepted: Mutex<Vec<Message>>,
+    }
+
+    impl ProtocolSender for BackpressureOnceSender {
+        fn send_control(&self, message: Message) -> Result<(), OutputError> {
+            if self
+                .should_block
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(OutputError::Backpressure);
+            }
+            self.accepted.lock().expect("sender lock").push(message);
+            Ok(())
+        }
+
+        fn send_result(&self, message: Message) -> Result<(), OutputError> {
+            self.send_control(message)
+        }
+
+        fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+            self.send_control(message).map(|()| true)
+        }
+    }
 
     fn test_workspace(
         roots: Vec<PathBuf>,
@@ -11177,6 +11440,8 @@ mod tests {
             }],
         )
         .expect("over-cap report should be downgraded to an operational warning");
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("deliver incomplete notice");
 
         let Message::Notification(notification) = client
             .receiver
@@ -11220,6 +11485,8 @@ mod tests {
             }],
         )
         .expect("initial A publication");
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("deliver initial A publication");
         let Message::Notification(initial) = client
             .receiver
             .recv_timeout(Duration::from_secs(1))
@@ -11249,6 +11516,8 @@ mod tests {
             }],
         )
         .expect("overflow should be reported without partial publications");
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("deliver overflow warning");
         let Message::Notification(overflow_notice) = client
             .receiver
             .recv_timeout(Duration::from_secs(1))
@@ -11272,6 +11541,8 @@ mod tests {
             }],
         )
         .expect("B publication must omit A's stale contribution");
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("deliver B's current report and incomplete warning");
         let Message::Notification(update) = client
             .receiver
             .recv_timeout(Duration::from_secs(1))
@@ -11301,6 +11572,560 @@ mod tests {
             panic!("incomplete aggregate should be a warning notification");
         };
         assert_eq!(incomplete_notice.method, "window/showMessage");
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn staged_publications_are_bounded_ordered_and_revalidated_after_supersession() {
+        const TARGETS: usize = 70;
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let base = temp.path().to_path_buf();
+        let publications = |message: &'static str| {
+            (0..TARGETS)
+                .map(|index| DiagnosticPublication {
+                    uri: Url::from_file_path(base.join(format!("Related{index:02}.inc")))
+                        .expect("related URI"),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(Range::default(), message.into())],
+                })
+                .collect::<Vec<_>>()
+        };
+        let (server, client) = Connection::memory();
+        super::send_diagnostic_publications(&server, &mut workspace, &root, publications("old"))
+            .expect("stage first generation");
+        super::send_diagnostic_publications(
+            &server,
+            &mut workspace,
+            &root,
+            publications("current"),
+        )
+        .expect("supersede before output admission");
+
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("emit first bounded batch");
+        let first_batch = (0..64)
+            .map(|_| {
+                client
+                    .receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("first turn notification")
+            })
+            .collect::<Vec<_>>();
+        assert!(first_batch.iter().all(|message| {
+            matches!(message, Message::Notification(notification)
+                if notification.params["diagnostics"][0]["message"] == "current")
+        }));
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 6);
+        assert!(client.receiver.try_recv().is_err());
+
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("resume remaining targets");
+        let last_batch = (0..6)
+            .map(|_| {
+                client
+                    .receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("resumed turn notification")
+            })
+            .collect::<Vec<_>>();
+        assert!(last_batch.iter().all(|message| {
+            matches!(message, Message::Notification(notification)
+                if notification.params["diagnostics"][0]["message"] == "current")
+        }));
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 0);
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn source_version_supersession_marks_queued_owner_stale_before_aggregate() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root_a = Url::from_file_path(temp.path().join("A.pas")).expect("root A URI");
+        let root_b = Url::from_file_path(temp.path().join("B.pas")).expect("root B URI");
+        let target = Url::from_file_path(temp.path().join("Shared.inc")).expect("target URI");
+        let (server, client) = Connection::memory();
+        for (root, message) in [(&root_a, "A old version"), (&root_b, "B current")] {
+            super::send_diagnostic_publications(
+                &server,
+                &mut workspace,
+                root,
+                vec![DiagnosticPublication {
+                    uri: target.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(Range::default(), message.into())],
+                }],
+            )
+            .expect("stage owner snapshot");
+        }
+        workspace.mark_diagnostic_publication_root_stale(&root_a);
+
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("queued URI must be revalidated against current owners");
+        let Message::Notification(update) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("current aggregate")
+        else {
+            panic!("expected current aggregate notification");
+        };
+        assert_eq!(update.method, "textDocument/publishDiagnostics");
+        assert_eq!(update.params["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(update.params["diagnostics"][0]["message"], "B current");
+        let Message::Notification(warning) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale-owner incomplete notice")
+        else {
+            panic!("expected stale-owner warning notification");
+        };
+        assert_eq!(warning.method, "window/showMessage");
+    }
+
+    #[test]
+    fn rapid_refresh_discards_writer_queued_old_version_before_resuming() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let target = Url::from_file_path(temp.path().join("Shared.inc")).expect("target URI");
+        let (outbound_sender, outbound_receiver) = crossbeam_channel::bounded(1);
+        outbound_sender
+            .send(Message::Notification(Notification::new(
+                "$/writerPaused".into(),
+                serde_json::Value::Null,
+            )))
+            .expect("pause transport writer");
+        let (_inbound_sender, inbound_receiver) = crossbeam_channel::unbounded();
+        let protocol = super::ProtocolConnection::new(
+            Connection {
+                sender: outbound_sender,
+                receiver: inbound_receiver,
+            },
+            crossbeam_channel::unbounded().1,
+            &TestBarrierConfig::disabled(),
+        );
+        let publication = |message: &str| DiagnosticPublication {
+            uri: target.clone(),
+            version: None,
+            diagnostics: vec![Diagnostic::new_simple(Range::default(), message.into())],
+        };
+        workspace
+            .stage_diagnostic_publications(&root, [publication("version one")])
+            .expect("stage version one");
+        pump_pending_diagnostic_publications(&protocol, &mut workspace)
+            .expect("writer queue accepts bounded old output");
+        assert!(protocol.has_pending_output());
+
+        super::mark_publication_root_stale(&protocol, &mut workspace, &root);
+        workspace
+            .stage_diagnostic_publications(&root, [publication("version two")])
+            .expect("stage newer generation");
+        pump_pending_diagnostic_publications(&protocol, &mut workspace)
+            .expect("new report remains resumable while writer is paused");
+
+        assert!(matches!(
+            outbound_receiver.try_recv(),
+            Ok(Message::Notification(notification)) if notification.method == "$/writerPaused"
+        ));
+        protocol.flush().expect("resume transport writer");
+        let Message::Notification(update) = outbound_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resumed latest report")
+        else {
+            panic!("expected latest diagnostics notification");
+        };
+        assert_eq!(update.method, "textDocument/publishDiagnostics");
+        assert_eq!(update.params["diagnostics"][0]["message"], "version two");
+        assert!(
+            outbound_receiver.try_recv().is_err(),
+            "old version was discarded"
+        );
+    }
+
+    #[test]
+    fn paused_writer_resumes_normal_push_without_losing_or_reordering_targets() {
+        const TARGETS: usize = 70;
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let expected = (0..TARGETS)
+            .map(|index| {
+                Url::from_file_path(temp.path().join(format!("Related{index:02}.inc")))
+                    .expect("related URI")
+            })
+            .collect::<std::collections::HashSet<_>>();
+        workspace
+            .stage_diagnostic_publications(
+                &root,
+                expected.iter().cloned().map(|uri| DiagnosticPublication {
+                    uri,
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "paused-writer finding".into(),
+                    )],
+                }),
+            )
+            .expect("stage fanout");
+
+        let (outbound_sender, outbound_receiver) = crossbeam_channel::bounded(1);
+        let (_inbound_sender, inbound_receiver) = crossbeam_channel::unbounded();
+        let connection = Connection {
+            sender: outbound_sender,
+            receiver: inbound_receiver,
+        };
+        let (_priority_sender, priority_receiver) = crossbeam_channel::unbounded();
+        let protocol = super::ProtocolConnection::new(
+            connection,
+            priority_receiver,
+            &TestBarrierConfig::disabled(),
+        );
+
+        let mut received = std::collections::HashSet::new();
+        while workspace.pending_diagnostic_publication_count() > 0 || protocol.has_pending_output()
+        {
+            if workspace.pending_diagnostic_publication_count() > 0 {
+                pump_pending_diagnostic_publications(&protocol, &mut workspace)
+                    .expect("paused writer pressure remains resumable");
+            }
+            protocol.flush().expect("flush admitted output");
+            while let Ok(message) = outbound_receiver.try_recv() {
+                let Message::Notification(notification) = message else {
+                    panic!("expected publication notification");
+                };
+                let uri = Url::parse(notification.params["uri"].as_str().unwrap())
+                    .expect("publication URI");
+                assert!(expected.contains(&uri));
+                assert!(received.insert(uri), "duplicate publication after resume");
+                protocol.flush().expect("resume queued writer output");
+            }
+        }
+        assert_eq!(received, expected);
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 0);
+    }
+
+    #[test]
+    fn event_loop_services_a_request_between_normal_push_batches() {
+        const TARGETS: usize = 70;
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let publications = (0..TARGETS)
+            .map(|index| DiagnosticPublication {
+                uri: Url::from_file_path(temp.path().join(format!("Related{index:02}.inc")))
+                    .expect("related URI"),
+                version: None,
+                diagnostics: vec![Diagnostic::new_simple(
+                    Range::default(),
+                    format!("finding {index}"),
+                )],
+            })
+            .collect::<Vec<_>>();
+        workspace
+            .stage_diagnostic_publications(&root, publications)
+            .expect("stage normal push fanout");
+
+        let (server, client) = Connection::memory();
+        let (priority_sender, priority_receiver) = crossbeam_channel::unbounded();
+        drop(priority_sender);
+        let protocol = super::ProtocolConnection::new(
+            server,
+            priority_receiver,
+            &TestBarrierConfig::disabled(),
+        );
+        let request_id = RequestId::from("responsive-request".to_string());
+        client
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                request_id.clone(),
+                "pascal/unknownProbe".to_string(),
+                serde_json::json!({}),
+            )))
+            .expect("send request");
+        client
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                RequestId::from("shutdown".to_string()),
+                "shutdown".to_string(),
+                serde_json::json!(null),
+            )))
+            .expect("send shutdown");
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "exit".to_string(),
+                serde_json::json!(null),
+            )))
+            .expect("send exit");
+
+        let mut configuration =
+            ConfigurationCoordinator::new(None, WorkspaceOptions::default(), false, false);
+        let result = super::event_loop(
+            &protocol,
+            &mut workspace,
+            false,
+            symbol_client_features(),
+            false,
+            false,
+            false,
+            &mut configuration,
+            None,
+            AnalysisJobs::new(),
+        )
+        .expect("event loop completes");
+        assert!(result);
+
+        let mut before_response = 0usize;
+        let mut response_seen = false;
+        let mut total_publications = 0usize;
+        while let Ok(message) = client.receiver.try_recv() {
+            match message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics" =>
+                {
+                    total_publications += 1;
+                    if !response_seen {
+                        before_response += 1;
+                    }
+                }
+                Message::Response(response) if response.id == request_id => {
+                    assert!(
+                        response.error.is_some(),
+                        "unknown request should be answered"
+                    );
+                    response_seen = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(response_seen);
+        assert_eq!(total_publications, TARGETS);
+        assert!(
+            before_response <= 64,
+            "request must interleave before second batch"
+        );
+    }
+
+    #[test]
+    fn staged_publication_retains_front_target_after_backpressure() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let target = Url::from_file_path(temp.path().join("Related.inc")).expect("target URI");
+        let sender = BackpressureOnceSender {
+            should_block: AtomicBool::new(true),
+            accepted: Mutex::new(Vec::new()),
+        };
+        let (connection, _client) = Connection::memory();
+        super::send_diagnostic_publications(
+            &connection,
+            &mut workspace,
+            &root,
+            vec![DiagnosticPublication {
+                uri: target.clone(),
+                version: None,
+                diagnostics: vec![Diagnostic::new_simple(
+                    Range::default(),
+                    "must be delivered".into(),
+                )],
+            }],
+        )
+        .expect("stage publication");
+
+        pump_pending_diagnostic_publications(&sender, &mut workspace)
+            .expect("temporary backpressure is retryable");
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 1);
+        assert!(sender.accepted.lock().expect("sender lock").is_empty());
+
+        pump_pending_diagnostic_publications(&sender, &mut workspace)
+            .expect("resume the same target");
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 0);
+        let accepted = sender.accepted.lock().expect("sender lock");
+        assert_eq!(accepted.len(), 1);
+        let Message::Notification(notification) = &accepted[0] else {
+            panic!("expected publishDiagnostics");
+        };
+        assert_eq!(notification.params["uri"], target.as_str());
+        assert_eq!(
+            notification.params["diagnostics"][0]["message"],
+            "must be delivered"
+        );
+    }
+
+    #[test]
+    fn closing_owner_cancels_queued_finding_and_stages_an_empty_clear() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let target = Url::from_file_path(temp.path().join("Related.inc")).expect("target URI");
+        let (server, client) = Connection::memory();
+        super::send_diagnostic_publications(
+            &server,
+            &mut workspace,
+            &root,
+            vec![DiagnosticPublication {
+                uri: target.clone(),
+                version: None,
+                diagnostics: vec![Diagnostic::new_simple(
+                    Range::default(),
+                    "queued but superseded by close".into(),
+                )],
+            }],
+        )
+        .expect("stage owner report");
+        workspace.stage_clear_diagnostic_publications(&root);
+
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("publish close cleanup");
+        let mut cleared = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let Message::Notification(notification) = client
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("close cleanup notification")
+            else {
+                panic!("expected a cleanup notification");
+            };
+            assert_eq!(notification.method, "textDocument/publishDiagnostics");
+            assert_eq!(notification.params["diagnostics"], serde_json::json!([]));
+            cleared.insert(notification.params["uri"].as_str().unwrap().to_owned());
+        }
+        assert!(cleared.contains(root.as_str()));
+        assert!(cleared.contains(target.as_str()));
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 0);
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn oversized_aggregate_is_omitted_with_operational_warning_not_empty_report() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let target = Url::from_file_path(temp.path().join("Shared.inc")).expect("target URI");
+        let (server, client) = Connection::memory();
+        for owner_index in 0..2 {
+            let root = Url::from_file_path(temp.path().join(format!("Owner{owner_index}.pas")))
+                .expect("root URI");
+            super::send_diagnostic_publications(
+                &server,
+                &mut workspace,
+                &root,
+                vec![DiagnosticPublication {
+                    uri: target.clone(),
+                    version: None,
+                    diagnostics: (0..24)
+                        .map(|index| {
+                            Diagnostic::new_simple(
+                                Range::default(),
+                                format!("{}-{owner_index}-{index}", "x".repeat(1_500)),
+                            )
+                        })
+                        .collect(),
+                }],
+            )
+            .expect("stage current owner contribution");
+        }
+
+        pump_pending_diagnostic_publications(&server, &mut workspace)
+            .expect("oversized report is skipped, not sent partially");
+        let Message::Notification(warning) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("incomplete warning")
+        else {
+            panic!("expected operational warning");
+        };
+        assert_eq!(warning.method, "window/showMessage");
+        assert!(
+            warning.params["message"]
+                .as_str()
+                .unwrap()
+                .contains("incomplete")
+        );
+        assert!(client.receiver.try_recv().is_err());
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 0);
+    }
+
+    #[test]
+    fn staged_publication_turns_respect_count_and_serialized_byte_budgets() {
+        const TARGETS: usize = 80;
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let expected = (0..TARGETS)
+            .map(|index| {
+                Url::from_file_path(temp.path().join(format!("Related{index:02}.inc")))
+                    .expect("related URI")
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let long_message = "x".repeat(20 * 1024);
+        let publications = expected
+            .iter()
+            .cloned()
+            .map(|uri| DiagnosticPublication {
+                uri,
+                version: None,
+                diagnostics: vec![Diagnostic::new_simple(
+                    Range::default(),
+                    long_message.clone(),
+                )],
+            })
+            .collect::<Vec<_>>();
+        let (server, client) = Connection::memory();
+        super::send_diagnostic_publications(&server, &mut workspace, &root, publications)
+            .expect("stage high-fanout report");
+
+        let mut received = std::collections::HashSet::new();
+        while workspace.pending_diagnostic_publication_count() > 0 {
+            pump_pending_diagnostic_publications(&server, &mut workspace)
+                .expect("pump bounded notification turn");
+            let mut turn_count = 0usize;
+            let mut turn_bytes = 0usize;
+            while let Ok(message) = client.receiver.try_recv() {
+                let encoded = serde_json::to_vec(&message).expect("serialize test output");
+                let wire_bytes = encoded.len() + super::LSP_FRAME_HEADER_RESERVE_BYTES;
+                assert!(wire_bytes <= super::MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES);
+                turn_bytes += wire_bytes;
+                turn_count += 1;
+                let Message::Notification(notification) = message else {
+                    panic!("expected publishDiagnostics notification");
+                };
+                let uri = Url::parse(notification.params["uri"].as_str().unwrap())
+                    .expect("published URI");
+                assert!(received.insert(uri), "target emitted twice");
+            }
+            assert!(turn_count <= 64);
+            assert!(turn_bytes <= super::MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN);
+            assert!(turn_count > 0, "bounded byte budget must make progress");
+        }
+        assert_eq!(received, expected);
         assert!(client.receiver.try_recv().is_err());
     }
 
@@ -12351,6 +13176,52 @@ mod tests {
         );
         assert_eq!(queue.pending_control_messages, 1);
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn supersession_discards_queued_diagnostic_messages_and_recounts_limits() {
+        let (sender, _receiver) = bounded(1);
+        sender
+            .send(Message::Notification(Notification::new(
+                "$/occupied".to_string(),
+                serde_json::Value::Null,
+            )))
+            .expect("occupy writer channel");
+        let target = Url::parse("file:///tmp/queued.inc").expect("target URI");
+        let unrelated = Url::parse("file:///tmp/other.inc").expect("unrelated URI");
+        let publication = |uri: &Url, message: &str| {
+            Message::Notification(Notification::new(
+                "textDocument/publishDiagnostics".to_string(),
+                serde_json::json!({"uri": uri, "diagnostics": [{"message": message}]}),
+            ))
+        };
+        let mut queue = OutboundQueue::default();
+        queue
+            .enqueue(
+                &sender,
+                publication(&target, "stale"),
+                OutboundClass::Control,
+            )
+            .expect("queue stale report");
+        queue
+            .enqueue(
+                &sender,
+                publication(&unrelated, "still current"),
+                OutboundClass::Control,
+            )
+            .expect("queue unrelated report");
+        assert_eq!(queue.pending_control_messages, 2);
+        let superseded = std::collections::BTreeSet::from([target]);
+
+        queue.discard_diagnostic_publications(&superseded);
+
+        assert_eq!(queue.pending_control_messages, 1);
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.deferred_control_messages, 0);
+        let Message::Notification(notification) = &queue.pending[0].message else {
+            panic!("expected remaining diagnostics notification");
+        };
+        assert_eq!(notification.params["uri"], unrelated.as_str());
     }
 
     #[test]

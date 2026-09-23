@@ -1312,19 +1312,30 @@ to use their separate transactional related-owner path; an over-limit pull
 request returns `RequestFailed` and commits neither a partial owner replacement
 nor a false empty report.
 
-Push publication replacement uses the same 20,000-target/16-MiB URI ceiling
-for the proposed and affected URI sets, with a 16-KiB per-target URI ceiling.
-These are state/cardinality ceilings, **not** an event-loop-turn work or
-serialized-payload ceiling for ordinary successful push publication. The
-existing synchronous aggregate/send path can still do high-fanout work. Push
-notifications use the general outbound control lane (8 MiB pending control
-bytes inside the 16 MiB pending-message byte limit); the separately bounded
-deferred control lane is also limited to 8 MiB. A saturated lane may still
-return backpressure instead of retaining a resumable diagnostic-publication
-cursor. No smaller per-publication serialized byte ceiling or per-turn output
-byte budget has been added here. Resumable push aggregation/output batching and
-its end-to-end stale-result handling remain open corrective work, so these
-guarantees do not close P2-4.
+Normal successful push replacement commits each root snapshot, then queues a
+sorted, coalescing set of affected URI keys rather than materializing aggregate
+reports. The transient normal queue is capped at 40,000 targets/32 MiB of URI
+bytes; a simultaneous root close can add at most the 20,000 retained-target /
+16-MiB retained-key ceiling, so its combined bound is 60,000 targets/48 MiB.
+Each event-loop pump visits at most 64 target keys, admits at most 64
+notifications and at most 1 MiB of framed serialized output. A single
+`publishDiagnostics` notification is limited to 64 KiB. Aggregate work is
+bounded to 20,000 diagnostic visits per target and aggregate reports to 64 KiB
+of diagnostic JSON; a target that exceeds those limits is omitted as a whole
+and generates the same client-visible nonsemantic incomplete warning, never a
+truncated or fabricated empty report. Current owner state is looked up when a
+queued URI is pumped, so pending targets coalesce across replacement versions,
+recovery, and close. Temporary outbound backpressure retains the unaccepted
+front target for a later pump; shutdown/drop cancels the remaining in-memory
+cursor. Supersession removes matching diagnostics still retained in the
+protocol pending/deferred queues and requeues affected targets for current
+owner aggregation. A message already handed to the transport channel cannot
+be recalled; transport disconnect also cannot guarantee client receipt.
+
+Push notifications continue through the bounded general/deferred outbound
+control lanes. Pull diagnostics continue to use their separate transactional
+related-owner path; the staged push publication state does not alter pull
+replacement commits.
 
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,

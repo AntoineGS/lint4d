@@ -60,6 +60,11 @@ const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES: usize = 16 * 1024;
 const MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS: usize = 20_000;
 const MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PENDING_DIAGNOSTIC_PUBLICATION_TARGETS: usize =
+    MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS * 2;
+pub(crate) const MAX_PENDING_DIAGNOSTIC_PUBLICATION_URI_BYTES: usize =
+    MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES * 2;
+const MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS: usize = 20_000;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
@@ -1362,6 +1367,7 @@ pub(crate) enum DiagnosticPublicationCursorStep {
 
 #[derive(Debug)]
 pub(crate) struct DiagnosticPublicationReplacement {
+    #[allow(dead_code)]
     pub(crate) updates: Vec<queries::DiagnosticPublication>,
     pub(crate) incomplete: bool,
 }
@@ -1891,9 +1897,13 @@ pub struct Workspace {
     open_text_bytes: usize,
     pending_diagnostics: HashMap<Url, Instant>,
     diagnostic_publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
+    diagnostic_publication_root_order: BTreeSet<Url>,
     incomplete_diagnostic_publication_roots: HashSet<Url>,
     diagnostic_publication_target_count: usize,
     diagnostic_publication_uri_bytes: usize,
+    pending_diagnostic_publication_targets: BTreeSet<Url>,
+    pending_diagnostic_publication_uri_bytes: usize,
+    pending_diagnostic_publication_incomplete: bool,
     // Bounded event overrides are needed because some clients report a
     // deletion before the filesystem has caught up. They are cleared by a
     // create/change event or as soon as the observed stamp changes.
@@ -3714,10 +3724,28 @@ impl Workspace {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_diagnostic_publications(
         &mut self,
         root_uri: &Url,
         publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
+    ) -> Result<DiagnosticPublicationReplacement, String> {
+        self.replace_diagnostic_publications_inner(root_uri, publications, false)
+    }
+
+    pub(crate) fn stage_diagnostic_publications(
+        &mut self,
+        root_uri: &Url,
+        publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
+    ) -> Result<DiagnosticPublicationReplacement, String> {
+        self.replace_diagnostic_publications_inner(root_uri, publications, true)
+    }
+
+    fn replace_diagnostic_publications_inner(
+        &mut self,
+        root_uri: &Url,
+        publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
+        staged: bool,
     ) -> Result<DiagnosticPublicationReplacement, String> {
         let mut proposed = BTreeMap::<Url, Vec<LspDiagnostic>>::new();
         let mut proposed_uri_bytes = 0usize;
@@ -3788,6 +3816,28 @@ impl Workspace {
         {
             incomplete = true;
         }
+        if staged {
+            let pending_new_targets = affected
+                .iter()
+                .filter(|uri| !self.pending_diagnostic_publication_targets.contains(*uri))
+                .collect::<Vec<_>>();
+            let pending_new_bytes = pending_new_targets
+                .iter()
+                .map(|uri| uri.as_str().len())
+                .sum::<usize>();
+            if self
+                .pending_diagnostic_publication_targets
+                .len()
+                .saturating_add(pending_new_targets.len())
+                > MAX_PENDING_DIAGNOSTIC_PUBLICATION_TARGETS
+                || self
+                    .pending_diagnostic_publication_uri_bytes
+                    .saturating_add(pending_new_bytes)
+                    > MAX_PENDING_DIAGNOSTIC_PUBLICATION_URI_BYTES
+            {
+                incomplete = true;
+            }
+        }
 
         if incomplete {
             // Keep the prior complete root snapshot as the last known report.
@@ -3809,9 +3859,19 @@ impl Workspace {
             retained_uri_bytes.saturating_add(current_uri_bytes);
         self.incomplete_diagnostic_publication_roots
             .remove(root_uri);
+        self.diagnostic_publication_root_order
+            .insert(root_uri.clone());
         self.diagnostic_publications
             .insert(root_uri.clone(), proposed);
-        Ok(self.aggregate_diagnostic_publications(affected))
+        if staged {
+            self.enqueue_diagnostic_publication_targets(affected);
+            Ok(DiagnosticPublicationReplacement {
+                updates: Vec::new(),
+                incomplete: false,
+            })
+        } else {
+            Ok(self.aggregate_diagnostic_publications(affected.into_iter().collect()))
+        }
     }
 
     pub(crate) fn clear_diagnostic_publications(
@@ -3822,6 +3882,7 @@ impl Workspace {
             .diagnostic_publications
             .remove(root_uri)
             .unwrap_or_default();
+        self.diagnostic_publication_root_order.remove(root_uri);
         self.incomplete_diagnostic_publication_roots
             .remove(root_uri);
         self.diagnostic_publication_target_count = self
@@ -3833,12 +3894,99 @@ impl Workspace {
         self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
     }
 
+    pub(crate) fn stage_clear_diagnostic_publications(
+        &mut self,
+        root_uri: &Url,
+    ) -> DiagnosticPublicationReplacement {
+        let previous = self
+            .diagnostic_publications
+            .remove(root_uri)
+            .unwrap_or_default();
+        self.diagnostic_publication_root_order.remove(root_uri);
+        self.incomplete_diagnostic_publication_roots
+            .remove(root_uri);
+        self.diagnostic_publication_target_count = self
+            .diagnostic_publication_target_count
+            .saturating_sub(previous.len());
+        self.diagnostic_publication_uri_bytes = self
+            .diagnostic_publication_uri_bytes
+            .saturating_sub(previous.keys().map(|uri| uri.as_str().len()).sum::<usize>());
+        let mut affected = previous.into_keys().collect::<BTreeSet<_>>();
+        affected.insert(root_uri.clone());
+        self.enqueue_diagnostic_publication_targets(affected);
+        DiagnosticPublicationReplacement {
+            updates: Vec::new(),
+            incomplete: false,
+        }
+    }
+
+    fn enqueue_diagnostic_publication_targets(&mut self, targets: BTreeSet<Url>) {
+        for uri in targets {
+            if self
+                .pending_diagnostic_publication_targets
+                .insert(uri.clone())
+            {
+                self.pending_diagnostic_publication_uri_bytes = self
+                    .pending_diagnostic_publication_uri_bytes
+                    .saturating_add(uri.as_str().len());
+            }
+        }
+    }
+
+    pub(crate) fn peek_pending_diagnostic_publication(
+        &self,
+    ) -> Option<(Url, Option<queries::DiagnosticPublication>, bool)> {
+        let uri = self.pending_diagnostic_publication_targets.first()?.clone();
+        let (publication, incomplete) = self.aggregate_diagnostic_publication(&uri);
+        Some((uri, publication, incomplete))
+    }
+
+    pub(crate) fn complete_pending_diagnostic_publication(&mut self, uri: &Url) {
+        if self.pending_diagnostic_publication_targets.remove(uri) {
+            self.pending_diagnostic_publication_uri_bytes = self
+                .pending_diagnostic_publication_uri_bytes
+                .saturating_sub(uri.as_str().len());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_diagnostic_publication_count(&self) -> usize {
+        self.pending_diagnostic_publication_targets.len()
+    }
+
+    pub(crate) fn mark_pending_diagnostic_publication_incomplete(&mut self) {
+        self.pending_diagnostic_publication_incomplete = true;
+    }
+
+    pub(crate) fn mark_diagnostic_publication_root_stale(
+        &mut self,
+        root_uri: &Url,
+    ) -> BTreeSet<Url> {
+        if let Some(publications) = self.diagnostic_publications.get(root_uri) {
+            self.incomplete_diagnostic_publication_roots
+                .insert(root_uri.clone());
+            let targets = publications.keys().cloned().collect::<BTreeSet<_>>();
+            self.enqueue_diagnostic_publication_targets(targets.clone());
+            targets
+        } else {
+            BTreeSet::new()
+        }
+    }
+
+    pub(crate) fn take_pending_diagnostic_publication_incomplete(&mut self) -> bool {
+        std::mem::take(&mut self.pending_diagnostic_publication_incomplete)
+    }
+
     pub(crate) fn take_all_diagnostic_publication_uris(
         &mut self,
         extra: Option<Url>,
     ) -> DiagnosticPublicationUriCursor {
         self.diagnostic_publication_target_count = 0;
         self.diagnostic_publication_uri_bytes = 0;
+        self.pending_diagnostic_publication_targets.clear();
+        self.pending_diagnostic_publication_uri_bytes = 0;
+        self.pending_diagnostic_publication_incomplete = false;
+        self.diagnostic_publication_root_order.clear();
         self.incomplete_diagnostic_publication_roots.clear();
         let publications = std::mem::take(&mut self.diagnostic_publications);
         let open_documents = self.open_documents.keys().cloned().collect();
@@ -3854,46 +4002,69 @@ impl Workspace {
         let mut updates = Vec::with_capacity(affected.len());
         let mut incomplete = false;
         for uri in affected {
-            let mut roots = self.diagnostic_publications.keys().collect::<Vec<_>>();
-            roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-            let mut has_current_owner = false;
-            let mut has_incomplete_owner = false;
-            let mut diagnostics = Vec::new();
-            for root in roots {
-                let Some(contribution) = self
-                    .diagnostic_publications
-                    .get(root)
-                    .and_then(|publications| publications.get(&uri))
-                else {
-                    continue;
-                };
-                if self.incomplete_diagnostic_publication_roots.contains(root) {
-                    has_incomplete_owner = true;
-                    continue;
-                }
-                has_current_owner = true;
-                for diagnostic in contribution {
-                    if !diagnostics.contains(diagnostic) {
-                        diagnostics.push(diagnostic.clone());
-                    }
-                }
+            let (publication, target_incomplete) = self.aggregate_diagnostic_publication(&uri);
+            incomplete |= target_incomplete;
+            if let Some(publication) = publication {
+                updates.push(publication);
             }
-            if !has_current_owner && has_incomplete_owner {
-                // The only retained owners are stale snapshots. Do not turn
-                // their old key into a fabricated authoritative empty report.
-                continue;
-            }
-            incomplete |= has_incomplete_owner;
-            updates.push(queries::DiagnosticPublication {
-                version: self.document_version(&uri),
-                uri,
-                diagnostics,
-            });
         }
         DiagnosticPublicationReplacement {
             updates,
             incomplete,
         }
+    }
+
+    fn aggregate_diagnostic_publication(
+        &self,
+        uri: &Url,
+    ) -> (Option<queries::DiagnosticPublication>, bool) {
+        let mut has_current_owner = false;
+        let mut has_incomplete_owner = false;
+        let mut diagnostics = Vec::new();
+        let mut seen_diagnostics = HashSet::new();
+        let mut diagnostics_bytes = 0usize;
+        let mut visits = 0usize;
+        for root in &self.diagnostic_publication_root_order {
+            let Some(contribution) = self
+                .diagnostic_publications
+                .get(root)
+                .and_then(|publications| publications.get(uri))
+            else {
+                continue;
+            };
+            if self.incomplete_diagnostic_publication_roots.contains(root) {
+                has_incomplete_owner = true;
+                continue;
+            }
+            has_current_owner = true;
+            for diagnostic in contribution {
+                visits = visits.saturating_add(1);
+                if visits > MAX_DIAGNOSTIC_PUBLICATION_AGGREGATE_VISITS {
+                    return (None, true);
+                }
+                let Ok(encoded) = serde_json::to_vec(diagnostic) else {
+                    return (None, true);
+                };
+                if seen_diagnostics.insert(encoded.clone()) {
+                    diagnostics_bytes = diagnostics_bytes.saturating_add(encoded.len());
+                    if diagnostics.len() >= 10_000 || diagnostics_bytes > 64 * 1024 {
+                        return (None, true);
+                    }
+                    diagnostics.push(diagnostic.clone());
+                }
+            }
+        }
+        if !has_current_owner && has_incomplete_owner {
+            return (None, true);
+        }
+        (
+            Some(queries::DiagnosticPublication {
+                version: self.document_version(uri),
+                uri: uri.clone(),
+                diagnostics,
+            }),
+            has_incomplete_owner,
+        )
     }
 
     pub fn take_due_diagnostics(&mut self) -> Vec<(Url, Option<i32>, Vec<LspDiagnostic>)> {
@@ -10899,6 +11070,30 @@ mod tests {
             .find(|update| update.uri == target)
             .expect("closing the last owner must clear its previously published target");
         assert!(cleanup.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn successful_push_replacement_stages_fanout_without_materializing_reports() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let root = Url::from_file_path(temp.path().join("Main.pas")).expect("root URI");
+        let publications = (0..70).map(|index| super::queries::DiagnosticPublication {
+            uri: Url::from_file_path(temp.path().join(format!("Related{index:02}.inc")))
+                .expect("related URI"),
+            version: None,
+            diagnostics: vec![Diagnostic::new_simple(
+                Range::default(),
+                format!("finding {index}"),
+            )],
+        });
+
+        let replacement = workspace
+            .stage_diagnostic_publications(&root, publications)
+            .expect("bounded fanout should be admitted");
+
+        assert!(replacement.updates.is_empty());
+        assert_eq!(workspace.pending_diagnostic_publication_count(), 70);
     }
 
     #[test]

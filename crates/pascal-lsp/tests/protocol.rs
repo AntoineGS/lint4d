@@ -31232,6 +31232,86 @@ fn high_fanout_file_batch_reports_shared_actual_work_and_replays_fresh_requests(
 
 #[test]
 #[cfg(feature = "test-support")]
+fn watched_refresh_charges_nested_include_reads_to_notification_budget() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let outer = root.path().join("Outer.inc");
+    let inner = root.path().join("Inner.inc");
+    let provider_source = "unit Provider;\ninterface\n{$I Outer.inc}\nimplementation\nend.\n";
+    let outer_source = "{$I Inner.inc}\n";
+    let inner_source = "type TProvided = Integer;\n";
+    write_file(&provider, provider_source);
+    write_file(&outer, outer_source);
+    write_file(&inner, inner_source);
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider;\ntype TUse = TProvided;\nimplementation\nend.\n";
+    write_file(&consumer, consumer_source);
+
+    let barrier_dir = root.path().join("include-budget-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let metrics = barrier_dir.join("work.json");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+                metrics_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_watched_registration(root.path(), Value::Null, false);
+
+    let definition_id = RequestId::from("nested-include-initial-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TProvided", 0),
+    );
+    let initial_locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        initial_locations.len(),
+        1,
+        "provider must load through includes"
+    );
+    assert_eq!(initial_locations[0]["uri"], uri(&inner).to_string());
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+    barrier.release();
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "worker metrics must be written"
+    );
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(&metrics).expect("read metrics")).expect("parse metrics");
+    let expected_read_bytes = provider_source.len() + outer_source.len() + inner_source.len();
+    assert!(
+        metrics["file_bytes_read"].as_u64().unwrap_or_default() as usize >= expected_read_bytes,
+        "notification read accounting must include the root, outer include, and nested include bytes ({expected_read_bytes}): {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
@@ -31625,6 +31705,13 @@ fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_resul
     assert!(
         metrics["budget_exceeded"].as_bool().unwrap_or(false),
         "later rename pairs must exhaust diagnostic work after the first overlay transfer: {metrics}"
+    );
+    let rename_path_visits = metrics["filesystem_path_visits"]
+        .as_u64()
+        .unwrap_or_default();
+    assert!(
+        (2..=82).contains(&rename_path_visits) && rename_path_visits % 2 == 0,
+        "processed rename pairs must charge their old/new file-event visits, without charging unattempted pairs: {metrics}"
     );
     assert!(
         metrics["diagnostic_record_checks"]

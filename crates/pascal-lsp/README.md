@@ -1231,8 +1231,8 @@ whose transition can no longer be proved is rejected until reopened. Ordinary
 file-event discovery and dependent-diagnostic fan-out run on a serialized
 workspace-mutation worker that temporarily owns the live workspace. Each
 notification currently shares local ceilings for 65,536 charged file-event/read
-path visits, 16 MiB of directly refreshed file bytes read, 16 MiB of bytes
-indexed through that refresh path, 65,536 inspected dependency records, 2,048
+path visits, 16 MiB of directly refreshed and nested include bytes read, 16 MiB
+of bytes indexed through that refresh path, 65,536 inspected dependency records, 2,048
 diagnostic-record comparisons, 4,096 diagnostic targets, and 256 KiB of target
 URI bytes. Exceeding a charged ceiling abandons partial derived state, performs
 the conservative global invalidation, preserves the final delete tombstones
@@ -1240,9 +1240,11 @@ from the notification, and schedules diagnostics for open documents. Test
 support exposes the charged counters independently.
 
 These ceilings are not yet a global actual-work bound: project/context and
-package discovery, nested source/include reads and indexing, rename-specific
-reconciliation, some filesystem metadata work, and invalidation/refresh output
-loops are not all charged to the shared account. Cancellation is checked at
+package discovery, include candidate-search observations, rename transition
+validation, some filesystem metadata work, and invalidation/refresh output loops
+are not all charged to the shared account. Resolved nested include file reads
+are charged, but that does not bound the directory/candidate search performed
+to find them. Cancellation is checked at
 existing cooperative checkpoints, but synchronous filesystem calls themselves
 cannot be interrupted. The stdio reader also has a bounded priority lane for
 `shutdown`, `exit`, and `$/cancelRequest` when a control frame is read while the

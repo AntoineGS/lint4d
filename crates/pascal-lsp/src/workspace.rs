@@ -3031,6 +3031,16 @@ impl Workspace {
         new_uri: &Url,
         cancel: Option<&AtomicBool>,
     ) -> Result<Vec<Url>, String> {
+        self.did_rename_file_with_control(old_uri, new_uri, cancel, None)
+    }
+
+    pub(crate) fn did_rename_file_with_control(
+        &mut self,
+        old_uri: &Url,
+        new_uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
         let old_uri = canonical_file_uri(old_uri);
         let new_uri = canonical_file_uri(new_uri);
@@ -3077,8 +3087,14 @@ impl Workspace {
                 "unmatched workspace file rename invalidated this open document; close and reopen it".to_string(),
             );
         }
-        let mut affected = self.file_event_with_cancel(&old_uri, FileChange::Deleted, cancel)?;
-        affected.extend(self.file_event_with_cancel(&new_uri, FileChange::Created, cancel)?);
+        let mut affected =
+            self.file_event_with_control(&old_uri, FileChange::Deleted, cancel, budget)?;
+        affected.extend(self.file_event_with_control(
+            &new_uri,
+            FileChange::Created,
+            cancel,
+            budget,
+        )?);
         Ok(affected)
     }
 
@@ -4351,7 +4367,7 @@ impl Workspace {
             .unwrap_or_default();
         let expansion = if rename::may_contain_include_directive(source.as_bytes()) {
             let mut expansion =
-                self.expand_source_with_cancel(uri, &source, context_key, cancel)?;
+                self.expand_source_with_control(uri, &source, context_key, cancel, budget)?;
             let fallback_cancel = AtomicBool::new(false);
             let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
                 expansion.expanded.text(),
@@ -4468,6 +4484,17 @@ impl Workspace {
         context_key: &ContextKey,
         cancel: Option<&AtomicBool>,
     ) -> Result<crate::include_expansion::ExpansionResult, String> {
+        self.expand_source_with_control(uri, source, context_key, cancel, None)
+    }
+
+    fn expand_source_with_control(
+        &self,
+        uri: &Url,
+        source: &str,
+        context_key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<crate::include_expansion::ExpansionResult, String> {
         let fallback = AtomicBool::new(false);
         let cancel = cancel.unwrap_or(&fallback);
         rename::expand_source_with_workspace(
@@ -4477,6 +4504,7 @@ impl Workspace {
             context_key,
             self.include_expansion_limits(),
             cancel,
+            budget,
         )
     }
 

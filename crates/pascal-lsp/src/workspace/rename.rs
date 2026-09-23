@@ -8442,6 +8442,7 @@ pub(super) fn expand_source_with_workspace(
     context_key: &ContextKey,
     limits: ExpansionLimits,
     cancel: &AtomicBool,
+    budget: Option<&super::ReconciliationBudget>,
 ) -> Result<ExpansionResult, String> {
     let context = workspace
         .contexts
@@ -8454,6 +8455,7 @@ pub(super) fn expand_source_with_workspace(
         context_key,
         max_file_bytes: workspace.options.limits.max_file_bytes,
         max_total_bytes: workspace.options.limits.max_total_bytes,
+        budget,
         legacy_authorizations: HashMap::new(),
     };
     let conditional_context = context.effective_conditional_context();
@@ -8473,6 +8475,7 @@ struct WorkspaceIncludeResolver<'a> {
     context_key: &'a ContextKey,
     max_file_bytes: usize,
     max_total_bytes: usize,
+    budget: Option<&'a super::ReconciliationBudget>,
     legacy_authorizations: HashMap<Url, bool>,
 }
 
@@ -8517,6 +8520,9 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
             .as_ref()
             .cloned()
             .ok_or_else(|| "include path is unresolved".to_string())?;
+        if let Some(budget) = self.budget {
+            budget.charge_path_visits(1)?;
+        }
         let route = lookup.selected_route.clone();
         let relative = include_name(&directive).is_some_and(|raw| Path::new(&raw).is_relative());
         let legacy_authorized = if !matches!(&route, IncludeRoute::Legacy) {
@@ -8590,6 +8596,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                 self.max_file_bytes,
                 self.max_total_bytes,
                 cancel,
+                self.budget,
             )?,
             IncludeRoute::Legacy => read_include(
                 &path,
@@ -8598,6 +8605,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                 self.max_file_bytes,
                 Some(self.max_total_bytes),
                 Some(cancel),
+                self.budget,
             )?,
         };
         if let Some(observation) = observations
@@ -8706,6 +8714,7 @@ fn read_include(
     max_file_bytes: usize,
     max_total_bytes: Option<usize>,
     cancel: Option<&AtomicBool>,
+    budget: Option<&super::ReconciliationBudget>,
 ) -> Result<IncludeSource, String> {
     if cancel.is_some_and(is_cancelled) {
         return Err(CANCELLATION_MESSAGE.to_string());
@@ -8719,6 +8728,10 @@ fn read_include(
         return Err("payload path is not authorized".to_string());
     }
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if let Some(budget) = budget {
+        budget.charge_path_visits(1)?;
+        budget.ensure_file_read_fits(metadata.len().min(usize::MAX as u64) as usize)?;
+    }
     if !metadata.is_file() {
         return Err("path is not a regular file".to_string());
     }
@@ -8741,6 +8754,9 @@ fn read_include(
     }
     .map_err(|error| error.to_string())?;
     let byte_count = bytes.len();
+    if let Some(budget) = budget {
+        budget.charge_file_bytes(byte_count)?;
+    }
     if cancel.is_some_and(is_cancelled) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
@@ -8760,12 +8776,21 @@ fn read_mapped_include(
     max_file_bytes: usize,
     max_total_bytes: usize,
     cancel: &AtomicBool,
+    budget: Option<&super::ReconciliationBudget>,
 ) -> Result<IncludeSource, String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     let limit = max_file_bytes.min(max_total_bytes);
+    if let Some(budget) = budget {
+        budget.charge_path_visits(1)?;
+        let metadata = fs::metadata(&path_entry.path).map_err(|error| error.to_string())?;
+        budget.ensure_file_read_fits(metadata.len().min(usize::MAX as u64) as usize)?;
+    }
     let bytes = read_policy.read_payload_bytes(path_entry, limit as u64)?;
+    if let Some(budget) = budget {
+        budget.charge_file_bytes(bytes.len())?;
+    }
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }

@@ -10086,7 +10086,9 @@ fn handle_notification_with_control(
                 if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
                     return Err(rename::CANCELLATION_MESSAGE.to_string());
                 }
-                for affected in workspace.did_rename_file_with_cancel(&old_uri, &new_uri, cancel)? {
+                for affected in
+                    workspace.did_rename_file_with_control(&old_uri, &new_uri, cancel, budget)?
+                {
                     effect.refresh_uri_with_budget(affected, budget)?;
                 }
                 effect.refresh_uri_with_budget(old_uri.clone(), budget)?;

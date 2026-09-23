@@ -23,6 +23,7 @@ use pascal_project::{
     discover_with_selections,
     discover_with_selections_and_observations_with_overrides_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
+    discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths,
     has_invalid_project_selection, project_candidate_membership_with_deleted_paths_and_budget,
     project_candidates_with_work_budget_and_deleted_paths,
     read_package_metadata_with_observations_and_work_budget, runtime_project_selection,
@@ -2259,6 +2260,25 @@ impl Workspace {
 
     fn workspace_root_paths(&self) -> Vec<PathBuf> {
         self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    fn workspace_root_paths_with_control(
+        &self,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<PathBuf>, String> {
+        if let Some(budget) = budget {
+            budget.charge_path_visits(self.roots.len())?;
+        }
+        let mut roots = Vec::new();
+        roots
+            .try_reserve(self.roots.len())
+            .map_err(|error| format!("could not reserve workspace root paths: {error}"))?;
+        for root in &self.roots {
+            check_workspace_cancel(cancel)?;
+            roots.push(root.path.clone());
+        }
+        Ok(roots)
     }
 
     pub(crate) fn configuration_scope_uri(&self) -> Option<Url> {
@@ -5980,8 +6000,9 @@ impl Workspace {
             if self.contexts.contains_key(&existing) {
                 self.extend_context_watch_paths(&existing, &path, cancel, budget)?;
                 if self.context_is_fresh_with_cancel(&existing, cancel, budget)?
-                    && self
-                        .context_matches_current_selection_with_cancel(&path, &existing, cancel)?
+                    && self.context_matches_current_selection_with_cancel_and_budget(
+                        &path, &existing, cancel, budget,
+                    )?
                 {
                     self.remember_document_owner(uri, &existing);
                     return Ok(existing);
@@ -5996,8 +6017,8 @@ impl Workspace {
                 if self.contexts.contains_key(&existing) {
                     self.extend_context_watch_paths(&existing, &path, cancel, budget)?;
                     if self.context_is_fresh_with_cancel(&existing, cancel, budget)?
-                        && self.context_matches_current_selection_with_cancel(
-                            &path, &existing, cancel,
+                        && self.context_matches_current_selection_with_cancel_and_budget(
+                            &path, &existing, cancel, budget,
                         )?
                     {
                         self.remember_document_owner(uri, &existing);
@@ -6025,7 +6046,9 @@ impl Workspace {
             if owner.origin != OwnerOrigin::Automatic
                 && !owner.follow_current_project_file
                 && (rediscover_open_context
-                    || self.known_owner_selection_is_current_with_cancel(&path, &owner, cancel)?)
+                    || self.known_owner_selection_is_current_with_cancel_and_budget(
+                        &path, &owner, cancel, budget,
+                    )?)
             {
                 return self
                     .restore_known_owner(
@@ -6059,30 +6082,18 @@ impl Workspace {
                 return Ok(owner.key);
             }
         }
-        let discovered = match cancel {
-            Some(cancel) => {
-                discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
-                    &path,
-                    &roots,
-                    &project_options,
-                    &self.project_selections,
-                    &self.overrides,
-                    &self.options.exclude,
-                    cancel,
-                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
-                    &deleted_paths,
-                )
-            }
-            None => discover_with_selections_and_observations_with_overrides_and_deleted_paths(
+        let discovered =
+            discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths(
                 &path,
                 &roots,
                 &project_options,
                 &self.project_selections,
                 &self.overrides,
                 &self.options.exclude,
+                cancel,
+                budget.map(|budget| budget as &dyn ProjectWorkBudget),
                 &deleted_paths,
-            ),
-        };
+            );
         let discovery = match discovered {
             Ok(discovery) => discovery,
             Err(error) => {
@@ -6357,6 +6368,16 @@ impl Workspace {
         owner: &KnownDocumentOwner,
         cancel: Option<&AtomicBool>,
     ) -> Result<bool, String> {
+        self.known_owner_selection_is_current_with_cancel_and_budget(path, owner, cancel, None)
+    }
+
+    fn known_owner_selection_is_current_with_cancel_and_budget(
+        &self,
+        path: &Path,
+        owner: &KnownDocumentOwner,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
         if owner.origin == OwnerOrigin::Automatic {
             // Automatic discovery must be rerun after invalidation. Retaining
             // its old project here would turn a discovered owner into an
@@ -6378,7 +6399,12 @@ impl Workspace {
             // follow the same precedence: retain their project identity only
             // when no runtime selection applies to the document.
             return Ok(self
-                .runtime_selection_for_path_with_cancel(path, &self.workspace_root_paths(), cancel)?
+                .runtime_selection_for_path_with_cancel_and_budget(
+                    path,
+                    &self.workspace_root_paths_with_control(cancel, budget)?,
+                    cancel,
+                    budget,
+                )?
                 .is_none());
         };
         let Some(selected) = owner.key.selection_project.as_deref() else {
@@ -6388,8 +6414,12 @@ impl Workspace {
         // A selection only applies within its nearest candidate directory.
         // A newly-created nearer project scope therefore invalidates the old
         // retained selection even while the session mapping still exists.
-        let candidates =
-            self.project_candidates_with_deleted_paths(path, &self.workspace_root_paths(), cancel)?;
+        let candidates = self.project_candidates_with_deleted_paths_and_budget(
+            path,
+            &self.workspace_root_paths_with_control(cancel, budget)?,
+            cancel,
+            budget,
+        )?;
         if candidates
             .directory
             .as_deref()
@@ -6404,16 +6434,18 @@ impl Workspace {
             .is_some_and(|current| paths_equal_ci(current, selected)))
     }
 
-    fn context_matches_current_selection_with_cancel(
+    fn context_matches_current_selection_with_cancel_and_budget(
         &self,
         path: &Path,
         key: &ContextKey,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
-        let Some((scope, selected)) = self.runtime_selection_for_path_with_cancel(
+        let Some((scope, selected)) = self.runtime_selection_for_path_with_cancel_and_budget(
             path,
-            &self.workspace_root_paths(),
+            &self.workspace_root_paths_with_control(cancel, budget)?,
             cancel,
+            budget,
         )?
         else {
             let Some(scope) = key.selection_scope.as_deref() else {
@@ -6647,12 +6679,22 @@ impl Workspace {
         roots: &[PathBuf],
         cancel: Option<&AtomicBool>,
     ) -> Result<ProjectCandidates, String> {
-        let deleted_paths = self.deleted_path_snapshot();
+        self.project_candidates_with_deleted_paths_and_budget(path, roots, cancel, None)
+    }
+
+    fn project_candidates_with_deleted_paths_and_budget(
+        &self,
+        path: &Path,
+        roots: &[PathBuf],
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<ProjectCandidates, String> {
+        let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         project_candidates_with_work_budget_and_deleted_paths(
             path,
             roots,
             cancel,
-            None,
+            budget.map(|budget| budget as &dyn ProjectWorkBudget),
             &deleted_paths,
         )
     }
@@ -6663,7 +6705,18 @@ impl Workspace {
         roots: &[PathBuf],
         cancel: Option<&AtomicBool>,
     ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-        let candidates = self.project_candidates_with_deleted_paths(path, roots, cancel)?;
+        self.runtime_selection_for_path_with_cancel_and_budget(path, roots, cancel, None)
+    }
+
+    fn runtime_selection_for_path_with_cancel_and_budget(
+        &self,
+        path: &Path,
+        roots: &[PathBuf],
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        let candidates =
+            self.project_candidates_with_deleted_paths_and_budget(path, roots, cancel, budget)?;
         Ok(runtime_project_selection(
             path,
             &candidates,
@@ -7995,9 +8048,9 @@ impl Workspace {
             .map_err(|error| format!("could not reserve package watch updates: {error}"))?;
         if let Some(budget) = budget {
             budget.charge_path_visits(state.context.metadata_files.len())?;
-            budget.charge_indexed_bytes(path_key_bytes(&state.context.metadata_files)?)?;
-            budget.charge_indexed_bytes(path_key_bytes(paths)?)?;
         }
+        charge_path_key_bytes(&state.context.metadata_files, cancel, budget)?;
+        charge_path_key_bytes(paths, cancel, budget)?;
         let mut metadata_index = HashSet::new();
         metadata_index
             .try_reserve(state.context.metadata_files.len())
@@ -8924,11 +8977,6 @@ impl Workspace {
             .map(|path| disk_stamp(&absolute_path(path)))
             .unwrap_or(None);
         self.deleted_overrides.insert(uri.clone(), stamp);
-    }
-
-    fn deleted_path_snapshot(&self) -> Vec<PathBuf> {
-        self.deleted_path_snapshot_with_control(None, None)
-            .unwrap_or_default()
     }
 
     fn deleted_path_snapshot_with_control(
@@ -10267,20 +10315,18 @@ fn path_ci_lookup_key(path: &Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
-fn path_key_bytes(paths: &[PathBuf]) -> Result<usize, String> {
-    paths.iter().try_fold(0usize, |total, path| {
-        total
-            .checked_add(path.to_string_lossy().len())
-            .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())
-    })
-}
-
-fn observation_path_key_bytes(observations: &[ProjectReadObservation]) -> Result<usize, String> {
-    observations.iter().try_fold(0usize, |total, observation| {
-        total
-            .checked_add(observation.path.to_string_lossy().len())
-            .ok_or_else(|| NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_owned())
-    })
+fn charge_path_key_bytes(
+    paths: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<(), String> {
+    for path in paths {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_indexed_bytes(path.to_string_lossy().len())?;
+        }
+    }
+    Ok(())
 }
 
 fn sort_work_estimate(len: usize) -> usize {
@@ -10298,7 +10344,12 @@ fn build_project_read_observation_index<'a>(
 ) -> Result<HashMap<ProjectPathLookupKey, &'a ProjectReadObservation>, String> {
     if let Some(budget) = budget {
         budget.charge_path_visits(observations.len())?;
-        budget.charge_indexed_bytes(observation_path_key_bytes(observations)?)?;
+    }
+    for observation in observations {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_indexed_bytes(observation.path.to_string_lossy().len())?;
+        }
     }
     let mut index = HashMap::new();
     index
@@ -11379,11 +11430,11 @@ fn is_immutable_override_file(path: &Path) -> bool {
 mod tests {
     use super::{
         ContextKey, ContextState, DiagnosticLineIndex, DiagnosticPublicationCursorStep,
-        DiagnosticPublicationUriCursor, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
-        MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_URIS, MAX_SOURCE_CHANGE_OBSERVATIONS,
-        OpenDocument, PackageLookup, ReconciliationBudget, ResourceLimits, RuntimeOptionsOverride,
-        Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel, normalize_line_endings,
-        scan_external_units,
+        DiagnosticPublicationUriCursor, FileChange, KnownDocumentOwner,
+        MAX_OPEN_DOCUMENT_URI_BYTES, MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_URIS,
+        MAX_SOURCE_CHANGE_OBSERVATIONS, OpenDocument, OwnerOrigin, PackageLookup,
+        ReconciliationBudget, ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
+        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
     use lsp_types::{Diagnostic, Position, Range, TextDocumentContentChangeEvent, Url};
@@ -11795,6 +11846,113 @@ mod tests {
             budget.used.get().filesystem_path_visits <= EXISTING * 4,
             "watch membership exceeded the linear visit allowance: {}",
             budget.used.get().filesystem_path_visits
+        );
+    }
+
+    #[test]
+    fn cached_context_selection_check_propagates_shared_budget_exhaustion() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let source = root.join("Consumer.pas");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source, "unit Consumer; interface implementation end.\n")
+            .expect("consumer source");
+        for index in 0..512 {
+            fs::write(
+                root.join(format!("Candidate{index:03}.dproj")),
+                "<Project/>",
+            )
+            .expect("project candidate");
+        }
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("fill shared account exactly");
+
+        let error = workspace
+            .context_matches_current_selection_with_cancel_and_budget(
+                &source,
+                &key,
+                None,
+                Some(&budget),
+            )
+            .expect_err("cached binding must not survive an exhausted selection scan");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS
+        );
+    }
+
+    #[test]
+    fn known_owner_selection_check_propagates_shared_budget_exhaustion() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let source = root.join("Consumer.pas");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source, "unit Consumer; interface implementation end.\n")
+            .expect("consumer source");
+        for index in 0..512 {
+            fs::write(
+                root.join(format!("Candidate{index:03}.dproj")),
+                "<Project/>",
+            )
+            .expect("project candidate");
+        }
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: Default::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let owner = KnownDocumentOwner {
+            key,
+            state: ContextState {
+                context: ProjectContext::default(),
+                watched_paths: HashMap::new(),
+                project_candidate_memberships: HashMap::new(),
+                project_read_observations: Vec::new(),
+            },
+            origin: OwnerOrigin::Explicit,
+            needs_revalidation: false,
+            follow_current_project_file: false,
+            legacy_route: None,
+        };
+        let workspace = test_workspace(vec![root], WorkspaceOptions::default());
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("fill shared account exactly");
+
+        let error = workspace
+            .known_owner_selection_is_current_with_cancel_and_budget(
+                &source,
+                &owner,
+                None,
+                Some(&budget),
+            )
+            .expect_err("known owner must not be retained after an exhausted selection scan");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS
         );
     }
 

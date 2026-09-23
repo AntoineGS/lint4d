@@ -1253,6 +1253,32 @@ pub fn discover_with_selections_and_observations_with_work_budget_and_deleted_pa
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    exclusions: &[String],
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
+) -> Result<ProjectDiscovery, String> {
+    discover_context_with_selections(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        overrides,
+        Vec::new(),
+        exclusions,
+        cancel,
+        work_budget,
+        deleted_paths,
+    )
+}
+
 #[allow(dead_code)]
 fn discover_context(
     file: &Path,

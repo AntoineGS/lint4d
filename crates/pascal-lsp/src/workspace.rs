@@ -54,7 +54,7 @@ const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_FILES: usize = 10_000;
 const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
 const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
-const MAX_REJECTED_OPEN_FENCE_PATHS: usize = 64;
+const MAX_REJECTED_OPEN_FENCE_URIS: usize = 64;
 const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
@@ -1760,7 +1760,7 @@ pub struct Workspace {
     index: NavigationIndex,
     cached_documents: HashMap<Url, rename::CachedDocument>,
     open_documents: HashMap<Url, OpenDocument>,
-    rejected_open_fence_paths: HashSet<PathBuf>,
+    rejected_open_fence_uris: HashSet<Url>,
     rejected_open_fence_permanent: bool,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
     pending_unit_file_rename_bytes: usize,
@@ -1833,20 +1833,16 @@ struct SharedLintResult {
 }
 
 impl Workspace {
-    fn rejected_open_fence_path(uri: &Url) -> Option<PathBuf> {
-        if uri.as_str().len() > MAX_REJECTED_OPEN_FENCE_URI_BYTES {
-            return None;
-        }
-        let path = uri.to_file_path().ok()?;
-        (path.to_string_lossy().len() <= MAX_OPEN_DOCUMENT_URI_BYTES).then(|| absolute_path(path))
+    fn bounded_rejected_open_uri(uri: &Url) -> Option<Url> {
+        (uri.as_str().len() <= MAX_REJECTED_OPEN_FENCE_URI_BYTES).then(|| uri.clone())
     }
 
     fn fence_rejected_open_document(&mut self, uri: &Url) {
-        if let Some(path) = Self::rejected_open_fence_path(uri) {
-            if self.rejected_open_fence_paths.contains(&path)
-                || self.rejected_open_fence_paths.len() < MAX_REJECTED_OPEN_FENCE_PATHS
+        if let Some(uri) = Self::bounded_rejected_open_uri(uri) {
+            if self.rejected_open_fence_uris.contains(&uri)
+                || self.rejected_open_fence_uris.len() < MAX_REJECTED_OPEN_FENCE_URIS
             {
-                self.rejected_open_fence_paths.insert(path);
+                self.rejected_open_fence_uris.insert(uri);
             } else {
                 // Do not grow memory in response to an unbounded stream of
                 // distinct rejected opens. This conservative latch is cleared
@@ -1854,21 +1850,20 @@ impl Workspace {
                 self.rejected_open_fence_permanent = true;
             }
         } else {
-            // An unrepresentable/non-file or overlong native path cannot be
-            // matched safely on didClose without retaining attacker-sized URI
-            // state. Refuse queries for this workspace until restart.
+            // An overlong URI cannot be retained safely for exact didClose
+            // matching. Refuse queries for this workspace until restart.
             self.rejected_open_fence_permanent = true;
         }
         self.bump_source_generation();
     }
 
     fn clear_rejected_open_fence(&mut self, uri: &Url) -> bool {
-        Self::rejected_open_fence_path(uri)
-            .is_some_and(|path| self.rejected_open_fence_paths.remove(&path))
+        Self::bounded_rejected_open_uri(uri)
+            .is_some_and(|uri| self.rejected_open_fence_uris.remove(&uri))
     }
 
     pub(crate) fn analysis_admission_fenced(&self) -> bool {
-        self.rejected_open_fence_permanent || !self.rejected_open_fence_paths.is_empty()
+        self.rejected_open_fence_permanent || !self.rejected_open_fence_uris.is_empty()
     }
 
     pub fn new(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Self {
@@ -10292,7 +10287,7 @@ fn is_immutable_override_file(path: &Path) -> bool {
 mod tests {
     use super::{
         ContextState, DiagnosticLineIndex, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
-        MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_PATHS, MAX_SOURCE_CHANGE_OBSERVATIONS,
+        MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_URIS, MAX_SOURCE_CHANGE_OBSERVATIONS,
         OpenDocument, ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
         context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
@@ -10432,18 +10427,38 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
-        for index in 0..=MAX_REJECTED_OPEN_FENCE_PATHS {
+        for index in 0..=MAX_REJECTED_OPEN_FENCE_URIS {
             let uri = Url::from_file_path(temp.path().join(format!("Rejected{index}.pas")))
                 .expect("rejected URI");
             workspace.fence_rejected_open_document(&uri);
         }
 
         assert_eq!(
-            workspace.rejected_open_fence_paths.len(),
-            MAX_REJECTED_OPEN_FENCE_PATHS
+            workspace.rejected_open_fence_uris.len(),
+            MAX_REJECTED_OPEN_FENCE_URIS
         );
         assert!(workspace.rejected_open_fence_permanent);
         assert!(workspace.analysis_input().admission_fence_active);
+    }
+
+    #[test]
+    fn closing_one_uri_alias_does_not_clear_another_rejected_open_fence() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let first = Url::from_file_path(temp.path().join("Shared.pas")).expect("first URI");
+        let mut second = first.clone();
+        second.set_fragment(Some("another-uri-identity"));
+        assert_ne!(first, second);
+
+        workspace.fence_rejected_open_document(&first);
+        workspace.fence_rejected_open_document(&second);
+        assert!(workspace.close_document(&first));
+
+        assert!(
+            workspace.analysis_input().admission_fence_active,
+            "one close must not release another rejected URI identity"
+        );
     }
 
     #[test]

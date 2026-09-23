@@ -1343,7 +1343,7 @@ impl Workspace {
             rejected_documents,
             rejection_reasons,
             admission_fence_active: self.rejected_open_fence_permanent
-                || !self.rejected_open_fence_paths.is_empty(),
+                || !self.rejected_open_fence_uris.is_empty(),
             document_versions,
             deleted_overrides: self.deleted_overrides.clone(),
             source_generation: self.source_generation,

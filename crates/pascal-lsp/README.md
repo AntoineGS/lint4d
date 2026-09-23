@@ -1262,12 +1262,12 @@ conservative admission fence. Analysis requests (including navigation, pull
 diagnostics, and rename) fail closed rather than treating the rejected editor
 buffer as absent and using stale disk/index contents. `didClose` for a fenced,
 representable file path releases that fence; after freeing an open-document
-slot, the client can retry `didOpen`. The fence ledger is separately capped at
-64 paths, each at most 4 KiB; fence path decoding is attempted only for URIs up
-to 16 KiB. If the ledger itself fills or the URI cannot be represented by a
-bounded file path, the workspace remains fenced until restart rather than
-allocate unbounded rejection state. The recovery URI reserve above does not
-include this small fence ledger.
+slot, the client can retry `didOpen`. The fence ledger retains exact URI
+identities and is separately capped at 64 entries of at most 16 KiB each, so
+closing one URI spelling cannot release a second rejected alias. If the ledger
+itself fills or a URI exceeds 16 KiB, the workspace remains fenced until
+restart rather than allocate unbounded rejection state. The recovery URI
+reserve above does not include this small fence ledger.
 
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,

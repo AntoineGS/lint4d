@@ -1275,6 +1275,16 @@ a URI exceeds 16 KiB, the workspace remains fenced until restart rather than
 allocate unbounded rejection state. The recovery URI reserve above does not
 include this small fence ledger.
 
+For push clients, rejected-open cleanup is kept in an event-loop-owned,
+URI-deduplicated cursor instead of synchronously sending the complete fan-out.
+It retains at most 20,001 targets and 64 MiB of retained URI-string bytes
+(counting both the ordered target and deduplication key), with a 16 KiB limit
+per URI. The loop admits at most 64 clears per turn and advances the cursor
+only after outbound admission; backpressure leaves the current target in place
+for a later turn. Fresh push-diagnostic scheduling waits until the cleanup
+cursor has drained, while ordinary protocol requests continue to be serviced.
+Pull diagnostics continue to use their existing refresh-request path.
+
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,
 rename transition validation, and some project metadata work are not all

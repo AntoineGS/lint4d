@@ -3593,16 +3593,16 @@ impl Workspace {
         self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
     }
 
-    pub(crate) fn clear_all_diagnostic_publications(
-        &mut self,
-    ) -> Vec<queries::DiagnosticPublication> {
-        let affected = self
+    pub(crate) fn clear_all_diagnostic_publications(&mut self) -> Vec<Url> {
+        let mut affected = self
             .diagnostic_publications
             .values()
             .flat_map(|publications| publications.keys().cloned())
             .collect::<HashSet<_>>();
         self.diagnostic_publications.clear();
-        self.aggregate_diagnostic_publications(affected)
+        let mut affected = affected.drain().collect::<Vec<_>>();
+        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected
     }
 
     fn aggregate_diagnostic_publications(

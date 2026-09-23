@@ -112,6 +112,13 @@ const MAX_DIAGNOSTIC_REPORT_ITEMS: usize = 10_000;
 const MAX_DIAGNOSTIC_REPORT_BYTES: usize = 7 * 1024 * 1024;
 const MAX_DIAGNOSTIC_REPORT_ITEM_BYTES: usize = 64 * 1024;
 const MAX_DIAGNOSTIC_DISPATCHES_PER_TURN: usize = 64;
+// Rejected-open cleanup is bounded independently from outbound buffering.
+// The workspace admits at most 10,000 open documents and each push report is
+// already capped at 10,000 items; this allowance covers their deduplicated
+// union plus the rejected URI.
+const MAX_DIAGNOSTIC_CLEANUP_TARGETS: usize = 20_001;
+const MAX_DIAGNOSTIC_CLEANUP_URI_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET: usize = 16 * 1024;
 /// Progress is deliberately smaller than the analysis recipient bound.  A
 /// client can attach many request recipients to one computation, but progress
 /// state must not become an alternate unbounded queue.
@@ -228,9 +235,29 @@ struct OutboundQueue {
     deferred_result_messages: usize,
     deferred_control_bytes: usize,
     deferred_result_bytes: usize,
+    #[cfg(feature = "test-support")]
+    test_control_message_limit: Option<usize>,
 }
 
 impl OutboundQueue {
+    fn control_message_limit(&self, pending: &PendingOutboundMessage) -> usize {
+        #[cfg(not(feature = "test-support"))]
+        let _ = pending;
+        #[cfg(feature = "test-support")]
+        if matches!(pending.class, OutboundClass::Control)
+            && matches!(
+                &pending.message,
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+            )
+        {
+            if let Some(limit) = self.test_control_message_limit {
+                return limit;
+            }
+        }
+        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+    }
+
     fn has_pending(&self) -> bool {
         !self.pending.is_empty() || !self.deferred.is_empty()
     }
@@ -263,7 +290,7 @@ impl OutboundQueue {
             let Some(deferred) = self.deferred.front() else {
                 return Ok(());
             };
-            if !self.can_fit_pending(deferred.bytes, deferred.class) {
+            if !self.can_fit_pending(deferred) {
                 return Ok(());
             }
             let deferred = self.deferred.pop_front().expect("deferred message exists");
@@ -281,7 +308,9 @@ impl OutboundQueue {
         }
     }
 
-    fn can_fit_pending(&self, bytes: usize, class: OutboundClass) -> bool {
+    fn can_fit_pending(&self, pending: &PendingOutboundMessage) -> bool {
+        let bytes = pending.bytes;
+        let class = pending.class;
         let total_messages = self
             .pending_data_messages
             .saturating_add(self.pending_control_messages);
@@ -293,7 +322,7 @@ impl OutboundQueue {
         match class {
             OutboundClass::Data => self.pending_data_messages < MAX_PENDING_OUTBOUND_DATA_MESSAGES,
             OutboundClass::Control | OutboundClass::Result => {
-                self.pending_control_messages < MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
+                self.pending_control_messages < self.control_message_limit(pending)
                     && self.pending_control_bytes.saturating_add(bytes)
                         <= MAX_PENDING_OUTBOUND_CONTROL_BYTES
             }
@@ -319,6 +348,7 @@ impl OutboundQueue {
         // request/result state without retrying or duplicating it.  Results
         // and lifecycle controls have separate count/byte budgets so a
         // result burst cannot consume all control capacity.
+        let control_limit = self.control_message_limit(&pending);
         let (deferred_messages, max_deferred_messages, deferred_bytes, max_deferred_bytes) =
             if pending.class.is_result() {
                 (
@@ -330,7 +360,7 @@ impl OutboundQueue {
             } else {
                 (
                     &mut self.deferred_control_messages,
-                    MAX_DEFERRED_OUTBOUND_CONTROL_MESSAGES,
+                    control_limit,
                     &mut self.deferred_control_bytes,
                     MAX_DEFERRED_OUTBOUND_CONTROL_BYTES,
                 )
@@ -379,7 +409,7 @@ impl OutboundQueue {
                 OutboundClass::Control | OutboundClass::Result => self.defer(pending),
             };
         }
-        if !self.can_fit_pending(bytes, class) {
+        if !self.can_fit_pending(&pending) {
             return match class {
                 OutboundClass::Data => Ok(false),
                 OutboundClass::Control | OutboundClass::Result => self.defer(pending),
@@ -435,10 +465,23 @@ struct ProtocolConnection {
 }
 
 impl ProtocolConnection {
-    fn new(connection: Connection, priority_receiver: Receiver<Message>) -> Self {
+    fn new(
+        connection: Connection,
+        priority_receiver: Receiver<Message>,
+        test_barriers: &TestBarrierConfig,
+    ) -> Self {
+        let outbound = OutboundQueue::default();
+        #[cfg(feature = "test-support")]
+        let outbound = {
+            let mut outbound = outbound;
+            outbound.test_control_message_limit = test_barriers.outbound_control_limit;
+            outbound
+        };
+        #[cfg(not(feature = "test-support"))]
+        let _ = test_barriers;
         Self {
             connection,
-            outbound: RefCell::new(OutboundQueue::default()),
+            outbound: RefCell::new(outbound),
             priority_receiver: Some(priority_receiver),
         }
     }
@@ -724,12 +767,22 @@ pub struct TestBarrierConfig {
     workspace_symbols: Option<TestBarrierPaths>,
     references: Option<TestBarrierPaths>,
     partial_validation: Option<TestBarrierPaths>,
+    outbound_writer: Option<OutboundWriterBarrierPaths>,
+    outbound_control_limit: Option<usize>,
     dispatch: Option<PathBuf>,
 }
 
 #[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 struct TestBarrierPaths {
+    entered: PathBuf,
+    release: PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+struct OutboundWriterBarrierPaths {
+    armed: PathBuf,
     entered: PathBuf,
     release: PathBuf,
 }
@@ -751,8 +804,25 @@ impl TestBarrierConfig {
             workspace_symbols: None,
             references: None,
             partial_validation: None,
+            outbound_writer: None,
+            outbound_control_limit: None,
             dispatch: None,
         }
+    }
+
+    pub fn with_outbound_writer(
+        mut self,
+        outbound_writer: Option<(PathBuf, PathBuf, PathBuf, usize)>,
+    ) -> Self {
+        self.outbound_writer = outbound_writer.map(|(armed, entered, release, control_limit)| {
+            self.outbound_control_limit = Some(control_limit);
+            OutboundWriterBarrierPaths {
+                armed,
+                entered,
+                release,
+            }
+        });
+        self
     }
 
     pub fn with_selection(mut self, selection: Option<(PathBuf, PathBuf)>) -> Self {
@@ -2411,11 +2481,81 @@ impl DiagnosticPullStore {
 struct DiagnosticNotificationEffect {
     refresh: Vec<Url>,
     cancel: Vec<Url>,
-    clear_publications: Vec<queries::DiagnosticPublication>,
+    clear_publications: Vec<DiagnosticClearTarget>,
     refresh_membership: HashSet<Url>,
     cancel_membership: HashSet<Url>,
     refresh_requested: bool,
     refresh_all_diagnostics: bool,
+}
+
+#[derive(Debug)]
+struct DiagnosticClearTarget {
+    uri: Url,
+    version: Option<i32>,
+}
+
+#[derive(Debug, Default)]
+struct PendingDiagnosticClears {
+    targets: VecDeque<DiagnosticClearTarget>,
+    membership: HashSet<Url>,
+    uri_bytes: usize,
+}
+
+impl PendingDiagnosticClears {
+    fn enqueue(
+        &mut self,
+        targets: impl IntoIterator<Item = DiagnosticClearTarget>,
+    ) -> Result<(), String> {
+        for target in targets {
+            let uri_bytes = target.uri.as_str().len();
+            if uri_bytes > MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET {
+                return Err(format!(
+                    "diagnostic cleanup URI exceeds the {}-byte retention limit",
+                    MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET
+                ));
+            }
+            if self.membership.contains(&target.uri) {
+                continue;
+            }
+            // The queue target and the deduplication set each retain a URL;
+            // account for both owned URI strings against the byte budget.
+            let retained_uri_bytes = uri_bytes.saturating_mul(2);
+            if self.membership.len() >= MAX_DIAGNOSTIC_CLEANUP_TARGETS
+                || self.uri_bytes.saturating_add(retained_uri_bytes)
+                    > MAX_DIAGNOSTIC_CLEANUP_URI_BYTES
+            {
+                return Err("diagnostic cleanup cursor capacity is full".to_string());
+            }
+            self.uri_bytes = self.uri_bytes.saturating_add(retained_uri_bytes);
+            self.membership.insert(target.uri.clone());
+            self.targets.push_back(target);
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    fn pump(&mut self, connection: &dyn ProtocolSender, limit: usize) -> Result<(), OutputError> {
+        for _ in 0..limit {
+            let Some(target) = self.targets.front() else {
+                break;
+            };
+            match send_diagnostic_clear(connection, &target.uri, target.version) {
+                Ok(()) => {
+                    self.targets.pop_front().expect("front cleanup target");
+                }
+                Err(OutputError::Backpressure) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        if self.targets.is_empty() {
+            self.membership.clear();
+            self.uri_bytes = 0;
+        }
+        Ok(())
+    }
 }
 
 impl DiagnosticNotificationEffect {
@@ -7632,8 +7772,8 @@ pub fn run_stdio_with_test_barriers(
 fn run_stdio_with_config(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let (connection, priority_receiver, io_threads) = bounded_stdio();
-    let connection = ProtocolConnection::new(connection, priority_receiver);
+    let (connection, priority_receiver, io_threads) = bounded_stdio(test_barriers.clone());
+    let connection = ProtocolConnection::new(connection, priority_receiver, &test_barriers);
     let outcome = run_connection(&connection, test_barriers);
     let shutdown_deadline = Instant::now() + OUTPUT_SHUTDOWN_TIMEOUT;
     let drain_result = connection.drain_until(shutdown_deadline);
@@ -7699,14 +7839,37 @@ impl StdioThreads {
     }
 }
 
-fn bounded_stdio() -> (Connection, Receiver<Message>, StdioThreads) {
+fn bounded_stdio(
+    test_barriers: TestBarrierConfig,
+) -> (Connection, Receiver<Message>, StdioThreads) {
     let (writer_sender, writer_receiver) = bounded::<Message>(MAX_OUTBOUND_MESSAGES);
     let writer = thread::Builder::new()
         .name("PascalLspWriter".to_string())
         .spawn(move || {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
+            #[cfg(feature = "test-support")]
+            let outbound_writer_barrier = test_barriers.outbound_writer;
+            #[cfg(feature = "test-support")]
+            let mut outbound_writer_barrier_used = false;
+            #[cfg(not(feature = "test-support"))]
+            let _ = test_barriers;
             for message in writer_receiver {
+                #[cfg(feature = "test-support")]
+                if !outbound_writer_barrier_used
+                    && outbound_writer_barrier
+                        .as_ref()
+                        .is_some_and(|barrier| barrier.armed.exists())
+                {
+                    let barrier = outbound_writer_barrier
+                        .as_ref()
+                        .expect("armed outbound writer barrier exists");
+                    std::fs::write(&barrier.entered, b"entered")?;
+                    while !barrier.release.exists() {
+                        thread::sleep(ANALYSIS_POLL_INTERVAL);
+                    }
+                    outbound_writer_barrier_used = true;
+                }
                 message.write(&mut stdout)?;
             }
             Ok(())
@@ -8183,8 +8346,15 @@ fn event_loop(
     let mut deferred_workspace_overflow: Option<Message> = None;
     let mut file_notification_worker: Option<WorkspaceFileNotificationWorker> = None;
     let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
+    let mut pending_diagnostic_clears = PendingDiagnosticClears::default();
     loop {
         connection.flush()?;
+        if !pull_diagnostics_supported
+            && !pending_diagnostic_clears.is_empty()
+            && !connection.has_pending_output()
+        {
+            pending_diagnostic_clears.pump(connection, MAX_DIAGNOSTIC_DISPATCHES_PER_TURN)?;
+        }
         if let Some(worker) = file_notification_worker.as_ref() {
             match worker.receiver.try_recv() {
                 Ok((mut completed_workspace, mut result, budget)) => {
@@ -8231,15 +8401,13 @@ fn event_loop(
                     *workspace = completed_workspace;
                     match result {
                         Ok(effect) => {
-                            if !pull_diagnostics_supported {
-                                for publication in &effect.clear_publications {
-                                    send_diagnostics(
-                                        connection,
-                                        &publication.uri,
-                                        publication.version,
-                                        publication.diagnostics.clone(),
-                                    )?;
-                                }
+                            if !pull_diagnostics_supported && !effect.clear_publications.is_empty()
+                            {
+                                pending_diagnostic_clears
+                                    .enqueue(effect.clear_publications)
+                                    .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                        error.into()
+                                    })?;
                             }
                             if pull_diagnostics_supported
                                 && (effect.refresh_requested || !effect.refresh.is_empty())
@@ -8337,7 +8505,11 @@ fn event_loop(
                 }
             }
         }
-        if !workspace_busy && !shutdown_received && !pull_diagnostics_supported {
+        if !workspace_busy
+            && !shutdown_received
+            && !pull_diagnostics_supported
+            && pending_diagnostic_clears.is_empty()
+        {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
         if !workspace_busy {
@@ -8395,7 +8567,11 @@ fn event_loop(
                 None => match connection.receiver().recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
-                        if !workspace_busy && !shutdown_received && !pull_diagnostics_supported {
+                        if !workspace_busy
+                            && !shutdown_received
+                            && !pull_diagnostics_supported
+                            && pending_diagnostic_clears.is_empty()
+                        {
                             publish_due_diagnostics(connection, workspace, &mut jobs)?;
                         }
                         if !workspace_busy {
@@ -8417,7 +8593,11 @@ fn event_loop(
             match connection.receiver().recv_timeout(timeout) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
-                    if !workspace_busy && !shutdown_received && !pull_diagnostics_supported {
+                    if !workspace_busy
+                        && !shutdown_received
+                        && !pull_diagnostics_supported
+                        && pending_diagnostic_clears.is_empty()
+                    {
                         publish_due_diagnostics(connection, workspace, &mut jobs)?;
                     }
                     if !workspace_busy {
@@ -8748,15 +8928,12 @@ fn event_loop(
                 };
                 match result {
                     Ok(effect) => {
-                        if !pull_diagnostics_supported {
-                            for publication in &effect.clear_publications {
-                                send_diagnostics(
-                                    connection,
-                                    &publication.uri,
-                                    publication.version,
-                                    publication.diagnostics.clone(),
-                                )?;
-                            }
+                        if !pull_diagnostics_supported && !effect.clear_publications.is_empty() {
+                            pending_diagnostic_clears
+                                .enqueue(effect.clear_publications)
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
                         }
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
@@ -9910,23 +10087,18 @@ fn handle_notification_with_control(
                 if workspace.analysis_admission_fenced() {
                     let mut effect = DiagnosticNotificationEffect::default();
                     effect.request_refresh();
-                    effect.clear_publications = workspace.clear_all_diagnostic_publications();
-                    let mut cleared = effect
-                        .clear_publications
-                        .iter()
-                        .map(|publication| publication.uri.clone())
-                        .collect::<HashSet<_>>();
-                    for open_uri in workspace.open_document_uris().into_iter().chain([uri]) {
-                        if cleared.insert(open_uri.clone()) {
-                            effect
-                                .clear_publications
-                                .push(queries::DiagnosticPublication {
-                                    version: workspace.document_version(&open_uri),
-                                    uri: open_uri,
-                                    diagnostics: Vec::new(),
-                                });
-                        }
-                    }
+                    let mut clear_uris = workspace.clear_all_diagnostic_publications();
+                    clear_uris.extend(workspace.open_document_uris());
+                    clear_uris.push(uri);
+                    clear_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                    clear_uris.dedup();
+                    effect.clear_publications = clear_uris
+                        .into_iter()
+                        .map(|uri| DiagnosticClearTarget {
+                            version: workspace.document_version(&uri),
+                            uri,
+                        })
+                        .collect();
                     return Ok(effect);
                 }
                 return Err(error);
@@ -10333,15 +10505,31 @@ fn send_diagnostics(
     version: Option<i32>,
     diagnostics: Vec<lsp_types::Diagnostic>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    connection.send_control(Message::Notification(Notification::new(
+    connection.send_control(diagnostics_notification(uri, version, diagnostics))?;
+    Ok(())
+}
+
+fn send_diagnostic_clear(
+    connection: &dyn ProtocolSender,
+    uri: &Url,
+    version: Option<i32>,
+) -> Result<(), OutputError> {
+    connection.send_control(diagnostics_notification(uri, version, Vec::new()))
+}
+
+fn diagnostics_notification(
+    uri: &Url,
+    version: Option<i32>,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+) -> Message {
+    Message::Notification(Notification::new(
         "textDocument/publishDiagnostics".to_string(),
         PublishDiagnosticsParams {
             uri: uri.clone(),
             diagnostics,
             version,
         },
-    )))?;
-    Ok(())
+    ))
 }
 
 fn send_diagnostic_publications(

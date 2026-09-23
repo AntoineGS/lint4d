@@ -176,6 +176,14 @@ struct TestBarrier {
 }
 
 #[cfg(feature = "test-support")]
+struct OutboundWriterBarrier {
+    armed: PathBuf,
+    entered: PathBuf,
+    release: PathBuf,
+    control_limit: usize,
+}
+
+#[cfg(feature = "test-support")]
 struct TestDispatchLog {
     path: PathBuf,
 }
@@ -198,6 +206,32 @@ impl TestServer {
     #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier(environment: TempDir) -> (Self, TestBarrier) {
         Self::launch_with_barrier(environment, "PASCAL_LSP_TEST_NAVIGATION_BARRIER")
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_outbound_writer_barrier(environment: TempDir) -> (Self, OutboundWriterBarrier) {
+        let directory = environment.path().join("outbound-writer-barrier");
+        fs::create_dir_all(&directory).expect("outbound writer barrier directory");
+        let barrier = OutboundWriterBarrier {
+            armed: directory.join("armed"),
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+            control_limit: 8,
+        };
+        let value = format!(
+            "{}|{}|{}|{}",
+            barrier.armed.display(),
+            barrier.entered.display(),
+            barrier.release.display(),
+            barrier.control_limit
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
     }
 
     #[cfg(feature = "test-support")]
@@ -1511,6 +1545,24 @@ impl TestBarrier {
 
     fn release(&self) {
         fs::write(&self.release, b"release").expect("release analysis barrier");
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl OutboundWriterBarrier {
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.entered.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("outbound writer did not enter the test barrier");
+    }
+
+    fn release(&self) {
+        fs::write(&self.release, b"release").expect("release outbound writer barrier");
     }
 }
 
@@ -7074,6 +7126,198 @@ fn rejected_open_fence_clears_push_diagnostics_for_open_roots() {
         );
     }
     barrier.release();
+    server.assert_no_notification("textDocument/publishDiagnostics");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_push_cleanup_resumes_after_outbound_backpressure() {
+    const ROOTS: usize = 64;
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let component = "é".repeat(100);
+    let mut root = temp.path().join("fixture");
+    while uri(&root).as_str().len() < 900 {
+        root = root.join(&component);
+    }
+    fs::create_dir_all(&root).expect("workspace directory");
+    let mut expected_uris = HashSet::new();
+    for index in 0..ROOTS {
+        let source = root.join(format!("Root{index}.pas"));
+        write_file(
+            &source,
+            &format!(
+                "unit Root{index};\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n"
+            ),
+        );
+        let source_uri = uri(&source);
+        expected_uris.insert(source_uri.clone());
+    }
+
+    let mut long_dir = root.join("deep");
+    fs::create_dir_all(&long_dir).expect("deep directory");
+    while long_dir
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        long_dir = long_dir.join(&component);
+        fs::create_dir_all(&long_dir).expect("deep directory component");
+    }
+    let rejected_uri = uri(&long_dir.join("Rejected.pas"));
+    assert!(rejected_uri.as_str().len() > 4_096);
+
+    let (mut server, writer_barrier) = TestServer::launch_with_outbound_writer_barrier(temp);
+    server.initialize(&root, Value::Null);
+    for index in 0..ROOTS {
+        let source = root.join(format!("Root{index}.pas"));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri(&source),
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": format!(
+                        "unit Root{index};\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n"
+                    )
+                }
+            }),
+        );
+    }
+
+    let mut initial_publications = HashSet::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while initial_publications.len() < ROOTS {
+        assert!(
+            Instant::now() < deadline,
+            "only received {} initial root publications",
+            initial_publications.len()
+        );
+        let message = match server.pending.pop_front() {
+            Some(message) => message,
+            None => server
+                .messages
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "timed out waiting for initial publications: got {} of {ROOTS}: {error}",
+                        initial_publications.len()
+                    )
+                })
+                .expect("read LSP message")
+                .expect("LSP server closed during initial publications"),
+        };
+        match message {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                let published_uri = Url::parse(
+                    notification.params["uri"]
+                        .as_str()
+                        .expect("published diagnostic URI"),
+                )
+                .expect("valid published URI");
+                if expected_uris.contains(&published_uri) {
+                    assert!(
+                        initial_publications.insert(published_uri.clone()),
+                        "duplicate initial publication for {published_uri}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(initial_publications, expected_uris);
+
+    fs::write(&writer_barrier.armed, b"pause").expect("arm outbound writer barrier");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rejected_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorRejected;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let request_id = RequestId::from("request-during-resumable-push-cleanup".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&root.join("Root0.pas"))}}),
+    );
+    writer_barrier.wait_until_entered();
+    thread::sleep(Duration::from_millis(500));
+    let process_status = server.child.try_wait().expect("inspect LSP process");
+    writer_barrier.release();
+    assert!(
+        process_status.is_none(),
+        "server exited instead of retaining cleanup after outbound backpressure: {process_status:?}"
+    );
+
+    let mut clear_counts = HashMap::<Url, usize>::new();
+    let mut request_response = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut expected_clears = expected_uris.clone();
+    expected_clears.insert(rejected_uri.clone());
+    while clear_counts.len() < expected_clears.len() || request_response.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "cleanup/request did not drain: cleared={}, response={:?}",
+            clear_counts.len(),
+            request_response
+        );
+        let message = server
+            .pending
+            .pop_front()
+            .unwrap_or_else(|| server.receive_until(deadline));
+        match message {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                let publication_uri = Url::parse(
+                    notification.params["uri"]
+                        .as_str()
+                        .expect("publication URI"),
+                )
+                .expect("valid publication URI");
+                if expected_clears.contains(&publication_uri) {
+                    assert!(
+                        notification.params["diagnostics"]
+                            .as_array()
+                            .is_some_and(Vec::is_empty),
+                        "stale diagnostics were republished for {publication_uri}"
+                    );
+                    *clear_counts.entry(publication_uri.clone()).or_default() += 1;
+                }
+            }
+            Message::Response(response) if response.id == request_id => {
+                request_response = Some(response);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        clear_counts.len(),
+        expected_clears.len(),
+        "every previously published or rejected URI must be cleared"
+    );
+    assert!(
+        clear_counts.values().all(|count| *count == 1),
+        "every old root must receive exactly one cleanup publication"
+    );
+    let request_error = request_response
+        .expect("request response")
+        .error
+        .expect("fenced analysis request must fail closed");
+    assert_eq!(
+        request_error.code, -32803,
+        "server must service the request and return RequestFailed while fenced"
+    );
     server.assert_no_notification("textDocument/publishDiagnostics");
     server.shutdown();
 }

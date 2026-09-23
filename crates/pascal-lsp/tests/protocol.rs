@@ -25241,6 +25241,152 @@ fn type_definition_requests_follow_the_selected_project_unit_binding() {
 }
 
 #[test]
+fn deleted_project_tombstone_blocks_disk_rediscovery_until_changed_event() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let root = temp.path().join("workspace");
+    let main = root.join("src/Main.pas");
+    let project = root.join("App.dproj");
+    let provider_a = temp.path().join("providers/a/Shared.pas");
+    let provider_b = temp.path().join("providers/b/Shared.pas");
+    let main_source = "unit Main;\ninterface\nuses Shared;\nimplementation\nprocedure Run;\nvar Item: TShared;\nbegin\n  Item := nil;\nend;\nend.\n";
+    let provider_source =
+        "unit Shared;\ninterface\ntype TShared = class end;\nimplementation\nend.\n";
+    let descriptor = |provider: &str| {
+        format!(
+            "<Project><PropertyGroup><MainSource>src/Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"../providers/{provider}/Shared.pas\" /></ItemGroup></Project>"
+        )
+    };
+    fs::create_dir_all(main.parent().expect("main directory")).expect("workspace source directory");
+    write_file(&main, main_source);
+    write_file(&provider_a, provider_source);
+    write_file(&provider_b, provider_source);
+    write_file(&project, &descriptor("a"));
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&main),"languageId":"pascal","version":1,"text":main_source}}),
+    );
+
+    let definition = |server: &mut TestServer, id: &str| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, main_source, "TShared", 0),
+        );
+        result_locations(server.response(&request_id))
+    };
+    let pull = |server: &mut TestServer, id: &str, previous: Option<String>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({"textDocument":{"uri":uri(&main)},"previousResultId":previous}),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "project metadata pull failed: {response:?}"
+        );
+        response.result.expect("project metadata pull result")
+    };
+
+    let selected = definition(&mut server, "delete-project-selected-provider");
+    assert_eq!(
+        selected.len(),
+        1,
+        "initial project selection should resolve one provider"
+    );
+    assert_eq!(selected[0]["uri"], uri(&provider_a).to_string());
+    let initial_pull = pull(&mut server, "delete-project-initial-pull", None);
+    let initial_result_id = initial_pull["resultId"]
+        .as_str()
+        .expect("initial pull result ID")
+        .to_string();
+
+    let deletion_stamp = fs::metadata(&project).expect("descriptor exists before delete");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&project),"type":3}]}),
+    );
+    assert!(
+        project.exists(),
+        "fixture must exercise delete-before-unlink"
+    );
+    let after_delete = definition(&mut server, "delete-project-must-not-rediscover");
+    assert!(
+        after_delete
+            .iter()
+            .all(|location| location["uri"] != uri(&provider_a).to_string()),
+        "a deleted project descriptor still present on disk must not select its provider: {after_delete:?}"
+    );
+    let deleted_request_id =
+        RequestId::from("delete-project-pull-invalidates-previous-id".to_string());
+    server.send_request(
+        deleted_request_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument":{"uri":uri(&main)},
+            "previousResultId":initial_result_id
+        }),
+    );
+    let deleted_response = server.response(&deleted_request_id);
+    let deleted_pull = match deleted_response.result {
+        Some(result) => result,
+        None => {
+            let error = deleted_response
+                .error
+                .expect("failed stale-result request includes error");
+            assert!(
+                error
+                    .message
+                    .contains("project candidate membership changed"),
+                "unexpected diagnostic failure: {error:?}"
+            );
+            json!({"kind":"error","message":error.message})
+        }
+    };
+    assert_ne!(
+        deleted_pull["kind"], "unchanged",
+        "a previous pull result must be reconciled against the tombstoned project context"
+    );
+    if let Some(related) = deleted_pull["relatedDocuments"].as_object() {
+        assert!(
+            !related.contains_key(uri(&provider_a).as_str()),
+            "related diagnostics must not retain the provider from the tombstoned project: {deleted_pull}"
+        );
+    }
+
+    let replacement = descriptor("b");
+    assert_eq!(
+        replacement.len(),
+        fs::read(&project).expect("read old descriptor").len()
+    );
+    write_file(&project, &replacement);
+    restore_mtime(&project, &deletion_stamp);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&project),"type":2}]}),
+    );
+    let restored = definition(&mut server, "changed-project-selects-new-provider");
+    assert_eq!(
+        restored.len(),
+        1,
+        "a verified changed event restores project selection"
+    );
+    assert_eq!(restored[0]["uri"], uri(&provider_b).to_string());
+    let after_change_pull = pull(
+        &mut server,
+        "changed-project-pull-refreshes",
+        deleted_pull["resultId"].as_str().map(str::to_owned),
+    );
+    assert_ne!(after_change_pull["kind"], "unchanged");
+    server.shutdown();
+}
+
+#[test]
 fn naming_code_actions_use_the_selected_project_configuration() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

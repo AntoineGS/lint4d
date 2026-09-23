@@ -148,6 +148,7 @@ pub(crate) struct WorkspaceInput {
 pub(crate) struct RevalidationInput {
     pub(crate) options: WorkspaceOptions,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
+    pub(crate) deleted_paths: Vec<PathBuf>,
 }
 
 impl RevalidationInput {
@@ -1278,6 +1279,7 @@ impl Workspace {
         RevalidationInput {
             options: self.options.clone(),
             overlays,
+            deleted_paths: deleted_override_paths(&self.deleted_overrides),
         }
     }
 
@@ -1389,6 +1391,7 @@ impl Workspace {
 
     pub(crate) fn revalidate_records(&self, records: &[SourceRecord]) -> Result<(), String> {
         let cancel = AtomicBool::new(false);
+        let deleted_paths = deleted_override_paths(&self.deleted_overrides);
         for record in records {
             if let Some(path) = &record.path {
                 if record.missing_provider_candidate {
@@ -1412,7 +1415,7 @@ impl Workspace {
                         ));
                     }
                 }
-                revalidate_path_record(path, record, &cancel, true)?;
+                revalidate_path_record(path, record, &cancel, true, &deleted_paths)?;
                 continue;
             }
             if record.open {
@@ -1498,7 +1501,14 @@ pub(crate) fn revalidate_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    revalidate_records(&input.options, &input.overlays, records, cancel, true)
+    revalidate_records(
+        &input.options,
+        &input.overlays,
+        &deleted_override_paths(&input.deleted_overrides),
+        records,
+        cancel,
+        true,
+    )
 }
 
 /// Revalidate the effective source/context identity of retained diagnostics.
@@ -1514,7 +1524,14 @@ pub(crate) fn revalidate_effective_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    revalidate_records(&input.options, &input.overlays, records, cancel, false)
+    revalidate_records(
+        &input.options,
+        &input.overlays,
+        &deleted_override_paths(&input.deleted_overrides),
+        records,
+        cancel,
+        false,
+    )
 }
 
 pub(crate) fn revalidate_revalidation_input(
@@ -1522,12 +1539,31 @@ pub(crate) fn revalidate_revalidation_input(
     records: &[SourceRecord],
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    revalidate_records(&input.options, &input.overlays, records, cancel, true)
+    revalidate_records(
+        &input.options,
+        &input.overlays,
+        &input.deleted_paths,
+        records,
+        cancel,
+        true,
+    )
+}
+
+fn deleted_override_paths(overrides: &HashMap<Url, Option<DiskStamp>>) -> Vec<PathBuf> {
+    let mut paths = overrides
+        .keys()
+        .filter_map(|uri| uri.to_file_path().ok())
+        .map(absolute_path)
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    paths.dedup();
+    paths
 }
 
 fn revalidate_records(
     options: &WorkspaceOptions,
     overlays: &HashMap<Url, OverlayInput>,
+    deleted_paths: &[PathBuf],
     records: &[SourceRecord],
     cancel: &AtomicBool,
     validate_transport_observations: bool,
@@ -1537,7 +1573,13 @@ fn revalidate_records(
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         if let Some(path) = &record.path {
-            revalidate_path_record(path, record, cancel, validate_transport_observations)?;
+            revalidate_path_record(
+                path,
+                record,
+                cancel,
+                validate_transport_observations,
+                deleted_paths,
+            )?;
             // A retained path-backed record can become superseded by a newly
             // admitted overlay.  Effective owner validation must compare the
             // overlay's text, while ordinary worker validation must continue
@@ -1638,6 +1680,7 @@ fn revalidate_path_record(
     record: &SourceRecord,
     cancel: &AtomicBool,
     validate_transport_observations: bool,
+    deleted_paths: &[PathBuf],
 ) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
@@ -1650,17 +1693,21 @@ fn revalidate_path_record(
         return Ok(());
     }
     if let Some(expected) = &record.candidate_membership {
-        let actual =
-            pascal_project::project_candidate_membership(path, Some(cancel)).map_err(|error| {
-                if error == CANCELLATION_MESSAGE {
-                    error
-                } else {
-                    format!(
-                        "project candidate membership could not be revalidated for {}: {error}",
-                        path.display()
-                    )
-                }
-            })?;
+        let actual = pascal_project::project_candidate_membership_with_deleted_paths(
+            path,
+            Some(cancel),
+            deleted_paths,
+        )
+        .map_err(|error| {
+            if error == CANCELLATION_MESSAGE {
+                error
+            } else {
+                format!(
+                    "project candidate membership could not be revalidated for {}: {error}",
+                    path.display()
+                )
+            }
+        })?;
         if actual != *expected {
             return Err(format!(
                 "project candidate membership changed while resolving {}; retry the request",
@@ -9452,7 +9499,7 @@ mod tests {
         assert!(record.read_policy.is_some());
         assert!(record.path_entry.is_some());
         let cancel = AtomicBool::new(false);
-        super::revalidate_path_record(&candidate, &record, &cancel, true)
+        super::revalidate_path_record(&candidate, &record, &cancel, true, &[])
             .expect("unchanged discarded candidate must revalidate");
 
         let original_mtime = fs::metadata(&candidate)
@@ -9467,7 +9514,7 @@ mod tests {
             .set_times(FileTimes::new().set_modified(original_mtime))
             .expect("restore candidate mtime");
 
-        let error = super::revalidate_path_record(&candidate, &record, &cancel, true)
+        let error = super::revalidate_path_record(&candidate, &record, &cancel, true, &[])
             .expect_err("same-stamp discarded candidate mutation must stale");
         assert!(
             error.contains("changed") || error.contains("metadata"),

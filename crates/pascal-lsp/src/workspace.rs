@@ -20,11 +20,13 @@ use pascal_project::{
     PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
     ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
     ProjectReadObservation, ProjectReadStamp, ProjectSelections, ProjectWorkBudget, ReadPolicy,
-    discover_with_selections, discover_with_selections_and_observations_with_overrides,
-    discover_with_selections_and_observations_with_work_budget, has_invalid_project_selection,
-    project_candidate_membership, project_candidates, project_candidates_with_cancel,
+    discover_with_selections,
+    discover_with_selections_and_observations_with_overrides_and_deleted_paths,
+    discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
+    has_invalid_project_selection, project_candidate_membership_with_deleted_paths,
+    project_candidates_with_work_budget_and_deleted_paths,
     read_package_metadata_with_observations_and_work_budget, runtime_project_selection,
-    selected_project_is_current, selected_project_is_current_with_work_budget,
+    selected_project_is_current_with_budget_and_deleted_paths,
 };
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
@@ -2769,14 +2771,18 @@ impl Workspace {
             self.bump_configuration_generation();
             self.mark_configuration_change(uri, true);
         }
-        let metadata_owners = self.invalidate_metadata_for_uri(uri, cancel, budget)?;
-        self.invalidate_directory_for_uri(uri);
+        // Record the ordered filesystem transition before invalidating or
+        // rediscovering metadata owners. A Deleted notification is a logical
+        // tombstone even while the old bytes remain on disk; only a later
+        // Created/Changed event makes that path eligible again.
         match change {
             FileChange::Deleted => self.remember_deleted(uri),
             FileChange::Created | FileChange::Changed => {
                 self.deleted_overrides.remove(uri);
             }
         }
+        let metadata_owners = self.invalidate_metadata_for_uri(uri, cancel, budget)?;
+        self.invalidate_directory_for_uri(uri);
         if self.open_documents.contains_key(uri) {
             // The editor buffer remains authoritative until didClose.
             self.schedule_diagnostics(uri.clone());
@@ -3557,7 +3563,7 @@ impl Workspace {
             return Err(self.file_too_large_message(uri, source.len()));
         }
         ensure_safe_tree_depth(&path, source.as_bytes())?;
-        let candidates = project_candidates(&path, &roots)?;
+        let candidates = self.project_candidates_with_deleted_paths(&path, &roots, None)?;
         let project_directory =
             self.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
         let directories = config_directories(&path, project_directory.as_deref(), &roots)?;
@@ -3694,7 +3700,7 @@ impl Workspace {
         ensure_safe_tree_depth(&path, source.as_bytes())?;
         check_workspace_cancel(Some(cancel))?;
         let roots = self.workspace_root_paths();
-        let candidates = project_candidates_with_cancel(&path, &roots, Some(cancel))?;
+        let candidates = self.project_candidates_with_deleted_paths(&path, &roots, Some(cancel))?;
         let project_directory =
             self.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
         let directories = config_directories(&path, project_directory.as_deref(), &roots)?;
@@ -5358,6 +5364,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
         };
+        let deleted_paths = self.deleted_path_snapshot();
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
                 && !owner.follow_current_project_file
@@ -5397,23 +5404,27 @@ impl Workspace {
             }
         }
         let discovered = match cancel {
-            Some(cancel) => discover_with_selections_and_observations_with_work_budget(
+            Some(cancel) => {
+                discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+                    &path,
+                    &roots,
+                    &project_options,
+                    &self.project_selections,
+                    &self.overrides,
+                    &self.options.exclude,
+                    cancel,
+                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                    &deleted_paths,
+                )
+            }
+            None => discover_with_selections_and_observations_with_overrides_and_deleted_paths(
                 &path,
                 &roots,
                 &project_options,
                 &self.project_selections,
                 &self.overrides,
                 &self.options.exclude,
-                cancel,
-                budget.map(|budget| budget as &dyn ProjectWorkBudget),
-            ),
-            None => discover_with_selections_and_observations_with_overrides(
-                &path,
-                &roots,
-                &project_options,
-                &self.project_selections,
-                &self.overrides,
-                &self.options.exclude,
+                &deleted_paths,
             ),
         };
         let discovery = match discovered {
@@ -5494,19 +5505,18 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(ContextKey, ProjectDiscovery), String> {
         let mut options = project_options.clone();
+        let deleted_paths = self.deleted_path_snapshot();
         if let (Some(scope), Some(selected)) = (
             owner.key.selection_scope.as_deref(),
             owner.key.selection_project.as_deref(),
         ) {
-            let candidate_status = match cancel {
-                Some(cancel) => selected_project_is_current_with_work_budget(
-                    scope,
-                    selected,
-                    Some(cancel),
-                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
-                ),
-                None => selected_project_is_current(scope, selected),
-            };
+            let candidate_status = selected_project_is_current_with_budget_and_deleted_paths(
+                scope,
+                selected,
+                cancel,
+                budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                &deleted_paths,
+            );
             if let Err(error) = &candidate_status {
                 if error == CANCELLATION_MESSAGE {
                     return Err(error.clone());
@@ -5539,23 +5549,27 @@ impl Workspace {
             }
             options.project_file = Some(selected.to_path_buf());
             let context = match cancel {
-                Some(cancel) => discover_with_selections_and_observations_with_work_budget(
+                Some(cancel) => {
+                    discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+                        path,
+                        roots,
+                        &options,
+                        &ProjectSelections::new(),
+                        &self.overrides,
+                        &self.options.exclude,
+                        cancel,
+                        budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                        &deleted_paths,
+                    )?
+                }
+                None => discover_with_selections_and_observations_with_overrides_and_deleted_paths(
                     path,
                     roots,
                     &options,
                     &ProjectSelections::new(),
                     &self.overrides,
                     &self.options.exclude,
-                    cancel,
-                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
-                )?,
-                None => discover_with_selections_and_observations_with_overrides(
-                    path,
-                    roots,
-                    &options,
-                    &ProjectSelections::new(),
-                    &self.overrides,
-                    &self.options.exclude,
+                    &deleted_paths,
                 )?,
             };
             return Ok((
@@ -5567,23 +5581,27 @@ impl Workspace {
         if let Some(project_file) = &owner.key.project_file {
             options.project_file = Some(project_file.clone());
             let context = match cancel {
-                Some(cancel) => discover_with_selections_and_observations_with_work_budget(
+                Some(cancel) => {
+                    discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+                        path,
+                        roots,
+                        &options,
+                        &ProjectSelections::new(),
+                        &self.overrides,
+                        &self.options.exclude,
+                        cancel,
+                        budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                        &deleted_paths,
+                    )?
+                }
+                None => discover_with_selections_and_observations_with_overrides_and_deleted_paths(
                     path,
                     roots,
                     &options,
                     &ProjectSelections::new(),
                     &self.overrides,
                     &self.options.exclude,
-                    cancel,
-                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
-                )?,
-                None => discover_with_selections_and_observations_with_overrides(
-                    path,
-                    roots,
-                    &options,
-                    &ProjectSelections::new(),
-                    &self.overrides,
-                    &self.options.exclude,
+                    &deleted_paths,
                 )?,
             };
             return Ok((
@@ -5593,23 +5611,27 @@ impl Workspace {
         }
 
         let context = match cancel {
-            Some(cancel) => discover_with_selections_and_observations_with_work_budget(
+            Some(cancel) => {
+                discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+                    path,
+                    roots,
+                    &options,
+                    &self.project_selections,
+                    &self.overrides,
+                    &self.options.exclude,
+                    cancel,
+                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                    &deleted_paths,
+                )?
+            }
+            None => discover_with_selections_and_observations_with_overrides_and_deleted_paths(
                 path,
                 roots,
                 &options,
                 &self.project_selections,
                 &self.overrides,
                 &self.options.exclude,
-                cancel,
-                budget.map(|budget| budget as &dyn ProjectWorkBudget),
-            )?,
-            None => discover_with_selections_and_observations_with_overrides(
-                path,
-                roots,
-                &options,
-                &self.project_selections,
-                &self.overrides,
-                &self.options.exclude,
+                &deleted_paths,
             )?,
         };
         Ok((
@@ -5709,7 +5731,7 @@ impl Workspace {
         // A newly-created nearer project scope therefore invalidates the old
         // retained selection even while the session mapping still exists.
         let candidates =
-            project_candidates_with_cancel(path, &self.workspace_root_paths(), cancel)?;
+            self.project_candidates_with_deleted_paths(path, &self.workspace_root_paths(), cancel)?;
         if candidates
             .directory
             .as_deref()
@@ -5955,8 +5977,26 @@ impl Workspace {
         path: &Path,
         roots: &[PathBuf],
     ) -> Option<(PathBuf, PathBuf)> {
-        let candidates = project_candidates(path, roots).ok()?;
+        let candidates = self
+            .project_candidates_with_deleted_paths(path, roots, None)
+            .ok()?;
         runtime_project_selection(path, &candidates, &self.project_selections)
+    }
+
+    fn project_candidates_with_deleted_paths(
+        &self,
+        path: &Path,
+        roots: &[PathBuf],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ProjectCandidates, String> {
+        let deleted_paths = self.deleted_path_snapshot();
+        project_candidates_with_work_budget_and_deleted_paths(
+            path,
+            roots,
+            cancel,
+            None,
+            &deleted_paths,
+        )
     }
 
     fn runtime_selection_for_path_with_cancel(
@@ -5965,7 +6005,7 @@ impl Workspace {
         roots: &[PathBuf],
         cancel: Option<&AtomicBool>,
     ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-        let candidates = project_candidates_with_cancel(path, roots, cancel)?;
+        let candidates = self.project_candidates_with_deleted_paths(path, roots, cancel)?;
         Ok(runtime_project_selection(
             path,
             &candidates,
@@ -5998,7 +6038,9 @@ impl Workspace {
             .iter()
             .map(|root| root.path.clone())
             .collect::<Vec<_>>();
-        let candidates = project_candidates(path, &roots).ok()?;
+        let candidates = self
+            .project_candidates_with_deleted_paths(path, &roots, None)
+            .ok()?;
         runtime_project_selection(path, &candidates, &self.project_selections)
             .map(|(scope, _)| scope)
             .or(candidates.directory)
@@ -6017,7 +6059,7 @@ impl Workspace {
             return Ok(Some(scope.to_path_buf()));
         }
         let roots = self.workspace_root_paths();
-        let candidates = project_candidates_with_cancel(path, &roots, cancel)?;
+        let candidates = self.project_candidates_with_deleted_paths(path, &roots, cancel)?;
         Ok(
             runtime_project_selection(path, &candidates, &self.project_selections)
                 .map(|(scope, _)| scope)
@@ -6051,9 +6093,16 @@ impl Workspace {
             metadata.push(main_source.clone());
         }
         let mut project_candidate_memberships = HashMap::new();
+        let deleted_paths = self.deleted_path_snapshot();
         for directory in self.discovery_directories(file) {
             let membership = take_candidate_membership(&mut candidate_memberships, &directory)
-                .unwrap_or_else(|| project_candidate_membership(&directory, cancel));
+                .unwrap_or_else(|| {
+                    project_candidate_membership_with_deleted_paths(
+                        &directory,
+                        cancel,
+                        &deleted_paths,
+                    )
+                });
             if let Err(error) = &membership {
                 if error == CANCELLATION_MESSAGE {
                     return Err(error.clone());
@@ -6134,13 +6183,15 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
     ) -> Result<(), String> {
         let paths = self.discovery_directories(file);
+        let deleted_paths = self.deleted_path_snapshot();
         if let Some(state) = self.contexts.get_mut(key) {
             for path in paths {
                 let Entry::Vacant(entry) = state.project_candidate_memberships.entry(path.clone())
                 else {
                     continue;
                 };
-                let membership = project_candidate_membership(&path, cancel);
+                let membership =
+                    project_candidate_membership_with_deleted_paths(&path, cancel, &deleted_paths);
                 if let Err(error) = &membership {
                     if error == CANCELLATION_MESSAGE {
                         return Err(error.clone());
@@ -6192,6 +6243,7 @@ impl Workspace {
         state: &ContextState,
         cancel: Option<&AtomicBool>,
     ) -> Result<bool, String> {
+        let deleted_paths = self.deleted_path_snapshot();
         let open_overlay_paths = self
             .open_documents
             .iter()
@@ -6208,7 +6260,12 @@ impl Workspace {
                 .then_some(path)
             })
             .collect::<Vec<_>>();
-        context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &open_overlay_paths)
+        context_state_is_fresh_with_cancel_ignoring_paths(
+            state,
+            cancel,
+            &open_overlay_paths,
+            &deleted_paths,
+        )
     }
 
     fn context_has_open_legacy_overlay(&self, state: &ContextState) -> bool {
@@ -7857,6 +7914,18 @@ impl Workspace {
         self.deleted_overrides.insert(uri.clone(), stamp);
     }
 
+    fn deleted_path_snapshot(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .deleted_overrides
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok())
+            .map(absolute_path)
+            .collect::<Vec<_>>();
+        paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        paths.dedup_by(|left, right| paths_equal_ci(left, right));
+        paths
+    }
+
     fn deletion_blocks_load(&mut self, uri: &Url, path: &Path) -> bool {
         let Some(deleted_stamp) = self.deleted_overrides.get(uri).cloned() else {
             return false;
@@ -8382,7 +8451,7 @@ impl Workspace {
         }
         check_workspace_cancel(Some(cancel))?;
         let roots = self.workspace_root_paths();
-        let candidates = project_candidates_with_cancel(&path, &roots, Some(cancel))?;
+        let candidates = self.project_candidates_with_deleted_paths(&path, &roots, Some(cancel))?;
         let project_directory =
             self.configuration_project_directory(&path, &context, Some(&context_key), &candidates);
         check_workspace_cancel(Some(cancel))?;
@@ -9161,13 +9230,14 @@ fn context_state_is_fresh_with_cancel(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
 ) -> Result<bool, String> {
-    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[])
+    context_state_is_fresh_with_cancel_ignoring_paths(state, cancel, &[], &[])
 }
 
 fn context_state_is_fresh_with_cancel_ignoring_paths(
     state: &ContextState,
     cancel: Option<&AtomicBool>,
     ignored_paths: &[PathBuf],
+    deleted_paths: &[PathBuf],
 ) -> Result<bool, String> {
     let watched_paths_are_fresh = state.watched_paths.iter().all(|(path, stamp)| {
         if ignored_paths
@@ -9188,7 +9258,10 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
     }
 
     for (directory, expected) in &state.project_candidate_memberships {
-        match (expected, project_candidate_membership(directory, cancel)) {
+        match (
+            expected,
+            project_candidate_membership_with_deleted_paths(directory, cancel, deleted_paths),
+        ) {
             (Ok(expected), Ok(actual)) if actual == *expected => {}
             (_, Err(error)) if error == CANCELLATION_MESSAGE => return Err(error),
             _ => return Ok(false),

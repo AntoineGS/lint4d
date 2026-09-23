@@ -761,12 +761,17 @@ struct ProjectReadTracker<'a> {
     observations: Vec<ProjectReadObservation>,
     candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     work_budget: Option<&'a dyn ProjectWorkBudget>,
+    deleted_paths: &'a [PathBuf],
 }
 
 impl<'a> ProjectReadTracker<'a> {
-    fn with_budget(work_budget: Option<&'a dyn ProjectWorkBudget>) -> Self {
+    fn with_budget(
+        work_budget: Option<&'a dyn ProjectWorkBudget>,
+        deleted_paths: &'a [PathBuf],
+    ) -> Self {
         Self {
             work_budget,
+            deleted_paths,
             ..Self::default()
         }
     }
@@ -959,6 +964,7 @@ impl ProjectContext {
             &[],
             None,
             None,
+            &[],
         )
         .map(|discovery| discovery.context)
     }
@@ -981,6 +987,7 @@ impl ProjectContext {
             &[],
             None,
             None,
+            &[],
         )
         .map(|discovery| discovery.context)
     }
@@ -1025,6 +1032,22 @@ pub fn project_candidates_with_work_budget(
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
 ) -> Result<ProjectCandidates, String> {
+    project_candidates_with_work_budget_and_deleted_paths(
+        file,
+        workspace_roots,
+        cancel,
+        work_budget,
+        &[],
+    )
+}
+
+pub fn project_candidates_with_work_budget_and_deleted_paths(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
+) -> Result<ProjectCandidates, String> {
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -1034,7 +1057,13 @@ pub fn project_candidates_with_work_budget(
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
-    find_project_candidates(&file_path, relevant_root.as_deref(), cancel, work_budget)
+    find_project_candidates(
+        &file_path,
+        relevant_root.as_deref(),
+        cancel,
+        work_budget,
+        deleted_paths,
+    )
 }
 
 pub fn discover_with_selections(
@@ -1055,6 +1084,7 @@ pub fn discover_with_selections(
         exclusions,
         None,
         None,
+        &[],
     )
     .map(|discovery| discovery.context)
 }
@@ -1077,6 +1107,7 @@ pub(crate) fn discover_with_selections_and_observations(
         &[],
         None,
         None,
+        &[],
     )
 }
 
@@ -1099,6 +1130,7 @@ pub(crate) fn discover_with_selections_and_observations_with_cancel(
         &[],
         Some(cancel),
         None,
+        &[],
     )
 }
 
@@ -1110,6 +1142,26 @@ pub fn discover_with_selections_and_observations_with_overrides(
     overrides: &OverrideSession,
     exclusions: &[String],
 ) -> Result<ProjectDiscovery, String> {
+    discover_with_selections_and_observations_with_overrides_and_deleted_paths(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        overrides,
+        exclusions,
+        &[],
+    )
+}
+
+pub fn discover_with_selections_and_observations_with_overrides_and_deleted_paths(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    exclusions: &[String],
+    deleted_paths: &[PathBuf],
+) -> Result<ProjectDiscovery, String> {
     discover_context_with_selections(
         file,
         workspace_roots,
@@ -1120,6 +1172,7 @@ pub fn discover_with_selections_and_observations_with_overrides(
         exclusions,
         None,
         None,
+        deleted_paths,
     )
 }
 
@@ -1155,6 +1208,31 @@ pub fn discover_with_selections_and_observations_with_work_budget(
     cancel: &AtomicBool,
     work_budget: Option<&dyn ProjectWorkBudget>,
 ) -> Result<ProjectDiscovery, String> {
+    discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+        file,
+        workspace_roots,
+        options,
+        selections,
+        overrides,
+        exclusions,
+        cancel,
+        work_budget,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    overrides: &OverrideSession,
+    exclusions: &[String],
+    cancel: &AtomicBool,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
+) -> Result<ProjectDiscovery, String> {
     discover_context_with_selections(
         file,
         workspace_roots,
@@ -1165,6 +1243,7 @@ pub fn discover_with_selections_and_observations_with_work_budget(
         exclusions,
         Some(cancel),
         work_budget,
+        deleted_paths,
     )
 }
 
@@ -1185,6 +1264,7 @@ fn discover_context(
         &[],
         None,
         None,
+        &[],
     )
     .map(|discovery| discovery.context)
 }
@@ -1202,12 +1282,13 @@ fn discover_context_with_selections(
     exclusions: &[String],
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
 ) -> Result<ProjectDiscovery, String> {
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
     }
-    let mut read_tracker = ProjectReadTracker::with_budget(work_budget);
+    let mut read_tracker = ProjectReadTracker::with_budget(work_budget, deleted_paths);
     let absolute_file = absolute_lexical(file)?;
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
@@ -1217,6 +1298,7 @@ fn discover_context_with_selections(
         relevant_root.as_deref(),
         &mut read_tracker,
         cancel,
+        deleted_paths,
     )?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -1230,6 +1312,7 @@ fn discover_context_with_selections(
             relevant_root.as_deref(),
             cancel,
             work_budget,
+            deleted_paths,
         ) {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -1264,51 +1347,65 @@ fn discover_context_with_selections(
         })
     };
 
-    let selected_project = if let Some((scope, requested, selected, candidates)) = runtime_selection
-    {
-        let Some(project_file) = selected else {
-            warnings.push(format!(
-                "selected project {} is not a current candidate in {}",
-                requested.display(),
-                scope.display()
-            ));
-            let context = build_standalone_context_with_overrides(
+    let mut selected_project =
+        if let Some((scope, requested, selected, candidates)) = runtime_selection {
+            let Some(project_file) = selected else {
+                warnings.push(format!(
+                    "selected project {} is not a current candidate in {}",
+                    requested.display(),
+                    scope.display()
+                ));
+                let context = build_standalone_context_with_overrides(
+                    &file_path,
+                    &roots,
+                    options,
+                    warnings,
+                    false,
+                    candidates,
+                    Vec::new(),
+                    overrides,
+                    exclusions,
+                )?;
+                if let Some(work_budget) = work_budget {
+                    work_budget.check_cancelled()?;
+                }
+                return Ok(read_tracker.into_discovery(context));
+            };
+            ProjectSelection::Selected {
+                path: project_file,
+                explicit: true,
+                metadata_files: candidates,
+                metadata_observations: Vec::new(),
+            }
+        } else if let Some(project_file) = &options.project_file {
+            explicit_project_file(project_file, &roots, &file_path, &mut warnings)
+        } else {
+            discover_project_file(
                 &file_path,
+                relevant_root.as_deref(),
                 &roots,
                 options,
-                warnings,
-                false,
-                candidates,
-                Vec::new(),
                 overrides,
+                &mut warnings,
+                &mut read_tracker,
+                cancel,
                 exclusions,
-            )?;
-            if let Some(work_budget) = work_budget {
-                work_budget.check_cancelled()?;
-            }
-            return Ok(read_tracker.into_discovery(context));
+                deleted_paths,
+            )
         };
-        ProjectSelection::Selected {
-            path: project_file,
-            explicit: true,
-            metadata_files: candidates,
-            metadata_observations: Vec::new(),
+    if let ProjectSelection::Selected { path, .. } = &selected_project {
+        if is_deleted_path(path, deleted_paths) {
+            warnings.push(format!(
+                "selected project {} is tombstoned by a delete notification",
+                path.display()
+            ));
+            selected_project = ProjectSelection::Incomplete {
+                metadata_files: vec![path.clone()],
+                metadata_observations: Vec::new(),
+                override_error: None,
+            };
         }
-    } else if let Some(project_file) = &options.project_file {
-        explicit_project_file(project_file, &roots, &file_path, &mut warnings)
-    } else {
-        discover_project_file(
-            &file_path,
-            relevant_root.as_deref(),
-            &roots,
-            options,
-            overrides,
-            &mut warnings,
-            &mut read_tracker,
-            cancel,
-            exclusions,
-        )
-    };
+    }
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -1486,11 +1583,26 @@ pub fn selected_project_is_current_with_work_budget(
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
 ) -> Result<bool, String> {
+    selected_project_is_current_with_budget_and_deleted_paths(
+        scope,
+        selected,
+        cancel,
+        work_budget,
+        &[],
+    )
+}
+
+pub fn selected_project_is_current_with_budget_and_deleted_paths(
+    scope: &Path,
+    selected: &Path,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
+) -> Result<bool, String> {
     let entries = project_directory_entries(scope, cancel, work_budget)?;
-    Ok(entries
-        .dproj
-        .iter()
-        .any(|candidate| project_paths_equal(candidate, selected)))
+    Ok(entries.dproj.iter().any(|candidate| {
+        !is_deleted_path(candidate, deleted_paths) && project_paths_equal(candidate, selected)
+    }))
 }
 
 fn find_project_candidates(
@@ -1498,13 +1610,16 @@ fn find_project_candidates(
     workspace_root: Option<&Path>,
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
 ) -> Result<ProjectCandidates, String> {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     loop {
         check_project_scan_cancel(cancel)?;
         let entries = project_directory_entries(&directory, cancel, work_budget)?;
-        if !entries.dproj.is_empty() {
-            let mut files = entries.dproj;
+        let mut project_files = entries.dproj;
+        project_files.retain(|path| !is_deleted_path(path, deleted_paths));
+        if !project_files.is_empty() {
+            let mut files = project_files;
             files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
             return Ok(ProjectCandidates {
                 directory: Some(directory),
@@ -1530,6 +1645,7 @@ fn record_candidate_memberships(
     boundary: Option<&Path>,
     tracker: &mut ProjectReadTracker<'_>,
     cancel: Option<&AtomicBool>,
+    deleted_paths: &[PathBuf],
 ) -> Result<(), String> {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     loop {
@@ -1544,6 +1660,7 @@ fn record_candidate_memberships(
                 } else {
                     let mut paths = entries.dproj;
                     paths.extend(entries.dpr_or_dpk);
+                    paths.retain(|path| !is_deleted_path(path, deleted_paths));
                     paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
                     Ok(ProjectCandidateMembership { paths, readable: true })
                 }
@@ -1570,6 +1687,14 @@ pub fn project_candidate_membership(
     directory: &Path,
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectCandidateMembership, String> {
+    project_candidate_membership_with_deleted_paths(directory, cancel, &[])
+}
+
+pub fn project_candidate_membership_with_deleted_paths(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+    deleted_paths: &[PathBuf],
+) -> Result<ProjectCandidateMembership, String> {
     let entries = project_directory_entries(directory, cancel, None)?;
     if entries.candidate_overflow {
         return Err(format!(
@@ -1580,6 +1705,7 @@ pub fn project_candidate_membership(
     let mut dproj = entries.dproj;
     let mut dpr_or_dpk = entries.dpr_or_dpk;
     dproj.append(&mut dpr_or_dpk);
+    dproj.retain(|path| !is_deleted_path(path, deleted_paths));
     dproj.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
     Ok(ProjectCandidateMembership {
         paths: dproj,
@@ -1605,6 +1731,12 @@ fn project_paths_equal(left: &Path, right: &Path) -> bool {
             .iter()
             .zip(right_components.iter())
             .all(|(left, right)| project_components_equal(*left, *right))
+}
+
+fn is_deleted_path(path: &Path, deleted_paths: &[PathBuf]) -> bool {
+    deleted_paths
+        .iter()
+        .any(|deleted| project_paths_equal(path, deleted))
 }
 
 fn project_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
@@ -1904,6 +2036,7 @@ fn discover_project_file(
     tracker: &mut ProjectReadTracker<'_>,
     cancel: Option<&AtomicBool>,
     exclusions: &[String],
+    deleted_paths: &[PathBuf],
 ) -> ProjectSelection {
     let mut directory = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
     let mut fallback_dpr = None;
@@ -1929,8 +2062,10 @@ fn discover_project_file(
                 };
             }
         };
-        let dproj = entries.dproj;
-        let dpr_or_dpk = entries.dpr_or_dpk;
+        let mut dproj = entries.dproj;
+        dproj.retain(|path| !is_deleted_path(path, deleted_paths));
+        let mut dpr_or_dpk = entries.dpr_or_dpk;
+        dpr_or_dpk.retain(|path| !is_deleted_path(path, deleted_paths));
 
         if !dproj.is_empty() {
             return choose_project_candidate(
@@ -2673,6 +2808,7 @@ fn fallback_main_source(
     warnings: &mut Vec<String>,
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
 ) -> Result<Option<PathBuf>, String> {
     let (Some(stem), Some(directory)) = (project_file.file_stem(), project_file.parent()) else {
         return Ok(None);
@@ -2703,11 +2839,12 @@ fn fallback_main_source(
         .dpr_or_dpk
         .into_iter()
         .filter(|path| {
-            path.file_stem().is_some_and(|candidate| {
-                candidate
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&stem.to_string_lossy())
-            })
+            !is_deleted_path(path, deleted_paths)
+                && path.file_stem().is_some_and(|candidate| {
+                    candidate
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&stem.to_string_lossy())
+                })
         })
         .collect::<Vec<_>>();
     match candidates.len() {
@@ -2787,6 +2924,7 @@ fn build_project_context(
                 &mut builder.warnings,
                 cancel,
                 tracker.work_budget,
+                tracker.deleted_paths,
             )?
             .map(ProjectPathEntry::legacy),
         }
@@ -3914,6 +4052,12 @@ fn read_bounded_with_tracker(
     limit: u64,
     tracker: &mut ProjectReadTracker<'_>,
 ) -> Result<String, String> {
+    if is_deleted_path(path, tracker.deleted_paths) {
+        return Err(format!(
+            "metadata path is tombstoned by a delete notification: {}",
+            path.display()
+        ));
+    }
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
         budget.charge_path_visits(1)?;
@@ -3964,6 +4108,12 @@ fn read_payload_with_tracker(
     limit: u64,
     tracker: &mut ProjectReadTracker<'_>,
 ) -> Result<(String, MetadataObservation), String> {
+    if is_deleted_path(&entry.path, tracker.deleted_paths) {
+        return Err(format!(
+            "metadata path is tombstoned by a delete notification: {}",
+            entry.path.display()
+        ));
+    }
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
         budget.charge_path_visits(1)?;
@@ -4114,7 +4264,7 @@ pub fn read_package_metadata_with_observations_and_work_budget(
             path.display()
         ));
     }
-    let mut tracker = ProjectReadTracker::with_budget(work_budget);
+    let mut tracker = ProjectReadTracker::with_budget(work_budget, &[]);
     let (contents, descriptor_observation) =
         read_payload_with_tracker(read_policy, entry, MAX_PACKAGE_METADATA_BYTES, &mut tracker)
             .map_err(|error| {

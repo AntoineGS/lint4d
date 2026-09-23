@@ -30,8 +30,9 @@ use pascal_project::{
 };
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -56,6 +57,7 @@ const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
 const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
 const MAX_REJECTED_OPEN_FENCE_URIS: usize = 64;
 const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
@@ -1329,6 +1331,110 @@ struct OpenDocument {
     identity_generation: u64,
 }
 
+type DiagnosticPublicationUriStream =
+    std::collections::btree_map::IntoKeys<Url, Vec<LspDiagnostic>>;
+
+/// A sorted, deduplicating stream over the URI keys of retained push
+/// publications. The publication maps are moved into this cursor, not cloned
+/// into a workspace-sized URI vector.
+#[derive(Debug)]
+pub(crate) struct DiagnosticPublicationUriCursor {
+    streams: Vec<DiagnosticPublicationUriStream>,
+    frontier: BinaryHeap<Reverse<(Url, usize)>>,
+    previous: Option<Url>,
+    late_targets: HashSet<Url>,
+}
+
+impl DiagnosticPublicationUriCursor {
+    fn new(
+        publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
+        open_documents: BTreeMap<Url, Vec<LspDiagnostic>>,
+        extra: Option<Url>,
+    ) -> Self {
+        let mut late_targets = HashSet::new();
+        if let Some(uri) = extra.as_ref() {
+            late_targets.insert(uri.clone());
+        }
+        let mut streams = Vec::with_capacity(
+            publications.len()
+                + usize::from(!open_documents.is_empty())
+                + usize::from(extra.is_some()),
+        );
+        let mut frontier = BinaryHeap::with_capacity(streams.capacity());
+        for publications in publications.into_values() {
+            let mut stream = publications.into_keys();
+            let index = streams.len();
+            if let Some(uri) = stream.next() {
+                frontier.push(Reverse((uri, index)));
+            }
+            streams.push(stream);
+        }
+        if !open_documents.is_empty() {
+            let mut stream = open_documents.into_keys();
+            let index = streams.len();
+            if let Some(uri) = stream.next() {
+                frontier.push(Reverse((uri, index)));
+            }
+            streams.push(stream);
+        }
+        if let Some(extra) = extra {
+            let stream = [(extra, Vec::new())]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let mut stream = stream.into_keys();
+            let index = streams.len();
+            if let Some(uri) = stream.next() {
+                frontier.push(Reverse((uri, index)));
+            }
+            streams.push(stream);
+        }
+        Self {
+            streams,
+            frontier,
+            previous: None,
+            late_targets,
+        }
+    }
+
+    pub(crate) fn add_late_target(&mut self, uri: Url) {
+        if uri.as_str().len() > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES
+            || self.late_targets.contains(&uri)
+            || self.late_targets.len() >= MAX_REJECTED_OPEN_FENCE_URIS
+        {
+            return;
+        }
+        self.late_targets.insert(uri.clone());
+        if self.previous.as_ref() == Some(&uri) {
+            return;
+        }
+        let stream = [(uri, Vec::new())].into_iter().collect::<BTreeMap<_, _>>();
+        let mut stream = stream.into_keys();
+        let index = self.streams.len();
+        if let Some(uri) = stream.next() {
+            self.frontier.push(Reverse((uri, index)));
+        }
+        self.streams.push(stream);
+    }
+
+    pub(crate) fn next_uri(&mut self) -> Option<Url> {
+        loop {
+            let Reverse((uri, index)) = self.frontier.pop()?;
+            if let Some(next) = self.streams[index].next() {
+                self.frontier.push(Reverse((next, index)));
+            }
+            if self.previous.as_ref() == Some(&uri) {
+                continue;
+            }
+            self.previous = Some(uri.clone());
+            return Some(uri);
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.frontier.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingUnitFileRename {
     new_uri: Url,
@@ -1772,7 +1878,7 @@ pub struct Workspace {
     use_clock: u64,
     open_text_bytes: usize,
     pending_diagnostics: HashMap<Url, Instant>,
-    diagnostic_publications: HashMap<Url, HashMap<Url, Vec<LspDiagnostic>>>,
+    diagnostic_publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
     // Bounded event overrides are needed because some clients report a
     // deletion before the filesystem has caught up. They are cleared by a
     // create/change event or as soon as the observed stamp changes.
@@ -3562,10 +3668,18 @@ impl Workspace {
         &mut self,
         root_uri: &Url,
         publications: impl IntoIterator<Item = queries::DiagnosticPublication>,
-    ) -> Vec<queries::DiagnosticPublication> {
+    ) -> Result<Vec<queries::DiagnosticPublication>, String> {
+        if !self.diagnostic_publications.contains_key(root_uri)
+            && self.diagnostic_publications.len() >= MAX_OPEN_DOCUMENTS
+        {
+            return Err("diagnostic publication root limit reached".to_string());
+        }
         let current = publications.into_iter().fold(
-            HashMap::<Url, Vec<LspDiagnostic>>::new(),
+            BTreeMap::<Url, Vec<LspDiagnostic>>::new(),
             |mut current, publication| {
+                if publication.uri.as_str().len() > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES {
+                    return current;
+                }
                 current
                     .entry(publication.uri)
                     .or_default()
@@ -3579,7 +3693,7 @@ impl Workspace {
             .unwrap_or_default();
         let mut affected = previous.keys().cloned().collect::<HashSet<_>>();
         affected.extend(current.keys().cloned());
-        self.aggregate_diagnostic_publications(affected)
+        Ok(self.aggregate_diagnostic_publications(affected))
     }
 
     pub(crate) fn clear_diagnostic_publications(
@@ -3593,16 +3707,18 @@ impl Workspace {
         self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
     }
 
-    pub(crate) fn clear_all_diagnostic_publications(&mut self) -> Vec<Url> {
-        let mut affected = self
-            .diagnostic_publications
-            .values()
-            .flat_map(|publications| publications.keys().cloned())
-            .collect::<HashSet<_>>();
-        self.diagnostic_publications.clear();
-        let mut affected = affected.drain().collect::<Vec<_>>();
-        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        affected
+    pub(crate) fn take_all_diagnostic_publication_uris(
+        &mut self,
+        extra: Option<Url>,
+    ) -> DiagnosticPublicationUriCursor {
+        let publications = std::mem::take(&mut self.diagnostic_publications);
+        let open_documents = self
+            .open_documents
+            .keys()
+            .cloned()
+            .map(|uri| (uri, Vec::new()))
+            .collect();
+        DiagnosticPublicationUriCursor::new(publications, open_documents, extra)
     }
 
     fn aggregate_diagnostic_publications(

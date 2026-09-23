@@ -10,9 +10,9 @@ use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
-    FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, PreparedWorkspaceOptions,
-    ReconciliationBudget, RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace,
-    WorkspaceOptions, canonical_file_uri, parse_runtime_options,
+    DiagnosticPublicationUriCursor, FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState,
+    PreparedWorkspaceOptions, ReconciliationBudget, RuntimeOptionsOverride, RuntimeOptionsUpdate,
+    Workspace, WorkspaceOptions, canonical_file_uri, parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{
@@ -116,8 +116,6 @@ const MAX_DIAGNOSTIC_DISPATCHES_PER_TURN: usize = 64;
 // The workspace admits at most 10,000 open documents and each push report is
 // already capped at 10,000 items; this allowance covers their deduplicated
 // union plus the rejected URI.
-const MAX_DIAGNOSTIC_CLEANUP_TARGETS: usize = 20_001;
-const MAX_DIAGNOSTIC_CLEANUP_URI_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET: usize = 16 * 1024;
 /// Progress is deliberately smaller than the analysis recipient bound.  A
 /// client can attach many request recipients to one computation, but progress
@@ -2481,11 +2479,18 @@ impl DiagnosticPullStore {
 struct DiagnosticNotificationEffect {
     refresh: Vec<Url>,
     cancel: Vec<Url>,
-    clear_publications: Vec<DiagnosticClearTarget>,
+    clear_publication_cursor: Option<DiagnosticPublicationUriCursor>,
+    cleanup_rejected_uri: Option<Url>,
     refresh_membership: HashSet<Url>,
     cancel_membership: HashSet<Url>,
     refresh_requested: bool,
     refresh_all_diagnostics: bool,
+}
+
+#[derive(Debug, Default)]
+struct PendingDiagnosticClears {
+    targets: VecDeque<DiagnosticClearTarget>,
+    cursor: Option<DiagnosticPublicationUriCursor>,
 }
 
 #[derive(Debug)]
@@ -2494,51 +2499,50 @@ struct DiagnosticClearTarget {
     version: Option<i32>,
 }
 
-#[derive(Debug, Default)]
-struct PendingDiagnosticClears {
-    targets: VecDeque<DiagnosticClearTarget>,
-    membership: HashSet<Url>,
-    uri_bytes: usize,
-}
-
 impl PendingDiagnosticClears {
-    fn enqueue(
+    fn enqueue_cursor(
         &mut self,
-        targets: impl IntoIterator<Item = DiagnosticClearTarget>,
-    ) -> Result<(), String> {
-        for target in targets {
-            let uri_bytes = target.uri.as_str().len();
-            if uri_bytes > MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET {
-                return Err(format!(
-                    "diagnostic cleanup URI exceeds the {}-byte retention limit",
-                    MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET
-                ));
+        cursor: DiagnosticPublicationUriCursor,
+        rejected_uri: Option<Url>,
+    ) {
+        if let Some(pending) = self.cursor.as_mut() {
+            if let Some(uri) = rejected_uri {
+                pending.add_late_target(uri);
             }
-            if self.membership.contains(&target.uri) {
-                continue;
-            }
-            // The queue target and the deduplication set each retain a URL;
-            // account for both owned URI strings against the byte budget.
-            let retained_uri_bytes = uri_bytes.saturating_mul(2);
-            if self.membership.len() >= MAX_DIAGNOSTIC_CLEANUP_TARGETS
-                || self.uri_bytes.saturating_add(retained_uri_bytes)
-                    > MAX_DIAGNOSTIC_CLEANUP_URI_BYTES
-            {
-                return Err("diagnostic cleanup cursor capacity is full".to_string());
-            }
-            self.uri_bytes = self.uri_bytes.saturating_add(retained_uri_bytes);
-            self.membership.insert(target.uri.clone());
-            self.targets.push_back(target);
+        } else {
+            self.cursor = Some(cursor);
         }
-        Ok(())
     }
 
     fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+        self.targets.is_empty() && self.cursor.as_ref().is_none_or(|cursor| cursor.is_empty())
     }
 
     fn pump(&mut self, connection: &dyn ProtocolSender, limit: usize) -> Result<(), OutputError> {
         for _ in 0..limit {
+            if self.targets.is_empty() {
+                let Some(cursor) = self.cursor.as_mut() else {
+                    break;
+                };
+                while self.targets.len() < limit {
+                    let Some(uri) = cursor.next_uri() else {
+                        self.cursor = None;
+                        break;
+                    };
+                    let uri_bytes = uri.as_str().len();
+                    if uri_bytes > MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET {
+                        // This target could not have been retained as a push
+                        // publication. Preserve the admission fence but skip
+                        // an unrepresentable, never-published clear.
+                        continue;
+                    }
+                    self.targets
+                        .push_back(DiagnosticClearTarget { uri, version: None });
+                }
+                if self.targets.is_empty() {
+                    continue;
+                }
+            }
             let Some(target) = self.targets.front() else {
                 break;
             };
@@ -2550,9 +2554,8 @@ impl PendingDiagnosticClears {
                 Err(error) => return Err(error),
             }
         }
-        if self.targets.is_empty() {
-            self.membership.clear();
-            self.uri_bytes = 0;
+        if self.is_empty() {
+            self.cursor = None;
         }
         Ok(())
     }
@@ -7254,17 +7257,19 @@ fn deliver_analysis_result_with_store(
             Err(error) => {
                 let uri = diagnostics.uri;
                 let version = diagnostics.version;
-                let updates = workspace.replace_diagnostic_publications(
-                    &uri,
-                    std::iter::once(queries::DiagnosticPublication {
-                        uri: uri.clone(),
-                        version,
-                        diagnostics: vec![crate::workspace::server_diagnostic(
-                            &error,
-                            lsp_types::DiagnosticSeverity::ERROR,
-                        )],
-                    }),
-                );
+                let updates = workspace
+                    .replace_diagnostic_publications(
+                        &uri,
+                        std::iter::once(queries::DiagnosticPublication {
+                            uri: uri.clone(),
+                            version,
+                            diagnostics: vec![crate::workspace::server_diagnostic(
+                                &error,
+                                lsp_types::DiagnosticSeverity::ERROR,
+                            )],
+                        }),
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 for update in updates {
                     send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
                 }
@@ -8401,13 +8406,11 @@ fn event_loop(
                     *workspace = completed_workspace;
                     match result {
                         Ok(effect) => {
-                            if !pull_diagnostics_supported && !effect.clear_publications.is_empty()
-                            {
-                                pending_diagnostic_clears
-                                    .enqueue(effect.clear_publications)
-                                    .map_err(|error| -> Box<dyn Error + Send + Sync> {
-                                        error.into()
-                                    })?;
+                            if !pull_diagnostics_supported {
+                                if let Some(cursor) = effect.clear_publication_cursor {
+                                    pending_diagnostic_clears
+                                        .enqueue_cursor(cursor, effect.cleanup_rejected_uri);
+                                }
                             }
                             if pull_diagnostics_supported
                                 && (effect.refresh_requested || !effect.refresh.is_empty())
@@ -8928,12 +8931,11 @@ fn event_loop(
                 };
                 match result {
                     Ok(effect) => {
-                        if !pull_diagnostics_supported && !effect.clear_publications.is_empty() {
-                            pending_diagnostic_clears
-                                .enqueue(effect.clear_publications)
-                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
-                                    error.into()
-                                })?;
+                        if !pull_diagnostics_supported {
+                            if let Some(cursor) = effect.clear_publication_cursor {
+                                pending_diagnostic_clears
+                                    .enqueue_cursor(cursor, effect.cleanup_rejected_uri);
+                            }
                         }
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
@@ -10087,18 +10089,14 @@ fn handle_notification_with_control(
                 if workspace.analysis_admission_fenced() {
                     let mut effect = DiagnosticNotificationEffect::default();
                     effect.request_refresh();
-                    let mut clear_uris = workspace.clear_all_diagnostic_publications();
-                    clear_uris.extend(workspace.open_document_uris());
-                    clear_uris.push(uri);
-                    clear_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-                    clear_uris.dedup();
-                    effect.clear_publications = clear_uris
-                        .into_iter()
-                        .map(|uri| DiagnosticClearTarget {
-                            version: workspace.document_version(&uri),
-                            uri,
-                        })
-                        .collect();
+                    if push_diagnostics_supported {
+                        let extra = (uri.as_str().len()
+                            <= MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET)
+                            .then(|| uri.clone());
+                        effect.cleanup_rejected_uri = extra.clone();
+                        effect.clear_publication_cursor =
+                            Some(workspace.take_all_diagnostic_publication_uris(extra));
+                    }
                     return Ok(effect);
                 }
                 return Err(error);
@@ -10179,7 +10177,10 @@ fn handle_notification_with_control(
             let closed = workspace.close_document(&uri);
             if closed {
                 let updates = workspace.clear_diagnostic_publications(&uri);
-                if push_diagnostics_supported {
+                // A rejected-open cleanup cursor already owns the complete
+                // retained publication union. Do not bypass its bounded,
+                // resumable admission path with synchronous close clears.
+                if push_diagnostics_supported && !workspace.analysis_admission_fenced() {
                     let mut root_was_updated = false;
                     for update in updates {
                         root_was_updated |= update.uri == uri;
@@ -10538,7 +10539,9 @@ fn send_diagnostic_publications(
     root_uri: &Url,
     publications: Vec<queries::DiagnosticPublication>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let updates = workspace.replace_diagnostic_publications(root_uri, publications);
+    let updates = workspace
+        .replace_diagnostic_publications(root_uri, publications)
+        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
     for update in updates {
         send_diagnostics(connection, &update.uri, update.version, update.diagnostics)?;
     }

@@ -7244,6 +7244,35 @@ fn rejected_open_push_cleanup_resumes_after_outbound_backpressure() {
             }
         }),
     );
+    let overlapping_rejected_uri = uri(&long_dir.join("RejectedAgain.pas"));
+    assert!(overlapping_rejected_uri.as_str().len() > 4_096);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": overlapping_rejected_uri,
+                "languageId": "pascal",
+                "version": 2,
+                "text": "unit EditorRejectedAgain;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let root_zero_uri = uri(&root.join("Root0.pas"));
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": root_zero_uri}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": root_zero_uri,
+                "languageId": "pascal",
+                "version": 2,
+                "text": "unit Root0;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n"
+            }
+        }),
+    );
     let request_id = RequestId::from("request-during-resumable-push-cleanup".to_string());
     server.send_request(
         request_id.clone(),
@@ -7264,6 +7293,7 @@ fn rejected_open_push_cleanup_resumes_after_outbound_backpressure() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut expected_clears = expected_uris.clone();
     expected_clears.insert(rejected_uri.clone());
+    expected_clears.insert(overlapping_rejected_uri.clone());
     while clear_counts.len() < expected_clears.len() || request_response.is_none() {
         assert!(
             Instant::now() < deadline,
@@ -7318,8 +7348,96 @@ fn rejected_open_push_cleanup_resumes_after_outbound_backpressure() {
         request_error.code, -32803,
         "server must service the request and return RequestFailed while fenced"
     );
+    assert!(
+        server
+            .child
+            .try_wait()
+            .expect("inspect server status")
+            .is_none()
+    );
     server.assert_no_notification("textDocument/publishDiagnostics");
     server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_cleanup_caps_do_not_exit_for_large_uri_targets() {
+    for uri_length in [16_384_usize, 16_385, 17_016] {
+        let root = tempfile::tempdir().expect("workspace");
+        let source = root.path().join("Main.pas");
+        let text = "unit Main;\ninterface\nconst badConst = 1;\nimplementation\nend.\n";
+        write_file(&source, text);
+        let root_uri = uri(&source);
+        let mut server = TestServer::launch();
+        server.initialize(root.path(), Value::Null);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": root_uri,
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+        let initial = server
+            .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+            .expect("initial push publication for open root");
+        assert!(
+            initial["diagnostics"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+
+        let prefix = "file:///";
+        let oversized_uri = Url::parse(&format!(
+            "{prefix}{}",
+            "u".repeat(uri_length.saturating_sub(prefix.len()))
+        ))
+        .expect("syntactically valid large file URI");
+        assert_eq!(oversized_uri.as_str().len(), uri_length);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": oversized_uri,
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": "unit Rejected;\ninterface\nimplementation\nend.\n"
+                }
+            }),
+        );
+
+        let request_id = RequestId::from(format!("request-after-cleanup-uri-{uri_length}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": uri(&source)}}),
+        );
+        let response = server.response(&request_id);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(-32803),
+            "analysis must fail closed for rejected URI length {uri_length}: {response:?}"
+        );
+        assert!(
+            server
+                .child
+                .try_wait()
+                .expect("inspect server status")
+                .is_none(),
+            "push server exited for rejected URI length {uri_length}"
+        );
+        let clear = server
+            .diagnostic_with_timeout(&uri(&source), IO_TIMEOUT)
+            .expect("previously published root must be cleared");
+        assert!(
+            clear["diagnostics"].as_array().is_some_and(Vec::is_empty),
+            "previous diagnostics must be cleared for rejected URI length {uri_length}"
+        );
+        server.shutdown();
+    }
 }
 
 #[cfg(feature = "test-support")]

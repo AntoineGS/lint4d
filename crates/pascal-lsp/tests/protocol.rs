@@ -32606,6 +32606,182 @@ fn watched_override_refresh_rebinds_same_stamp_provider_and_invalidates_pull_res
 
 #[test]
 #[cfg(feature = "test-support")]
+fn late_override_budget_refusal_retries_after_sixty_four_event_fallback() {
+    const PROJECT_COUNT: usize = 7;
+    const DESCRIPTOR_BYTES: usize = 2 * 1024 * 1024;
+    const BATCH_ENTRIES: usize = 64;
+    const CONFIG_BYTES: usize = 4 * 1024 * 1024;
+
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let sdk = root.path().join("SDK");
+    let provider_a = sdk.join("A/Provider.pas");
+    let provider_b = sdk.join("B/Provider.pas");
+    write_file(
+        &provider_a,
+        "unit Provider; interface type TSelected = Integer; implementation end.\n",
+    );
+    write_file(
+        &provider_b,
+        "unit Provider; interface type TSelected = string; implementation end.\n",
+    );
+
+    let override_file = root.path().join(".delphi-tools.local.toml");
+    let config_for = |target: &Path| {
+        let prefix = format!(
+            "[[path_mappings]]\nfrom = 'C:\\\\SDK'\nto = '{}'\n#",
+            target.display()
+        );
+        assert!(prefix.len() < CONFIG_BYTES);
+        format!("{prefix}{}", "x".repeat(CONFIG_BYTES - prefix.len()))
+    };
+    let initial_config = config_for(&sdk.join("A"));
+    let replacement_config = config_for(&sdk.join("B"));
+    assert_eq!(initial_config.len(), CONFIG_BYTES);
+    assert_eq!(replacement_config.len(), CONFIG_BYTES);
+    assert_eq!(initial_config.len(), replacement_config.len());
+    write_file(&override_file, &initial_config);
+
+    let mut project_files = Vec::with_capacity(PROJECT_COUNT);
+    let mut consumers = Vec::with_capacity(PROJECT_COUNT);
+    let mut sources = Vec::with_capacity(PROJECT_COUNT);
+    for index in 0..PROJECT_COUNT {
+        let project_root = root.path().join(format!("Project{index:02}"));
+        let project = project_root.join("App.dproj");
+        let consumer = project_root.join(format!("Consumer{index:02}.pas"));
+        let source = format!(
+            "unit Consumer{index:02};\ninterface\nuses Provider;\ntype TUse{index:02} = TSelected;\nimplementation\nend.\n"
+        );
+        let descriptor_prefix = format!(
+            "<Project><PropertyGroup><MainSource>Consumer{index:02}.pas</MainSource><DCC_UnitSearchPath>C:\\\\SDK</DCC_UnitSearchPath></PropertyGroup><!--"
+        );
+        let descriptor_suffix = "--></Project>";
+        let descriptor = format!(
+            "{descriptor_prefix}{}{descriptor_suffix}",
+            "x".repeat(
+                DESCRIPTOR_BYTES.saturating_sub(descriptor_prefix.len() + descriptor_suffix.len())
+            )
+        );
+        write_file(&project, &descriptor);
+        write_file(&consumer, &source);
+        project_files.push(project);
+        consumers.push(consumer);
+        sources.push(source);
+    }
+
+    let metrics = root.path().join("reconciliation-work.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [(
+            "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+            metrics_value.as_str(),
+        )],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    for index in 0..PROJECT_COUNT {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumers[index]),"languageId":"pascal","version":1,"text":sources[index]}}),
+        );
+        let definition_id = RequestId::from(format!("late-override-initial-{index}"));
+        server.send_request(
+            definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumers[index], &sources[index], "TSelected", 0),
+        );
+        assert_eq!(
+            result_locations(server.response(&definition_id))[0]["uri"],
+            uri(&provider_a).to_string(),
+            "each initial context must select provider A"
+        );
+    }
+    let pull_id = RequestId::from("late-override-initial-pull".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":null}),
+    );
+    let initial_pull = server.response(&pull_id);
+    let previous_result_id = initial_pull.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("initial result ID")
+        .to_owned();
+
+    for project in &project_files {
+        let stamp = fs::metadata(project).expect("project descriptor stamp");
+        let original = fs::read(project).expect("project descriptor bytes");
+        write_file(
+            project,
+            std::str::from_utf8(&original).expect("UTF-8 descriptor"),
+        );
+        restore_mtime(project, &stamp);
+    }
+    let override_stamp = fs::metadata(&override_file).expect("override stamp before edit");
+    write_file(&override_file, &replacement_config);
+    restore_mtime(&override_file, &override_stamp);
+
+    let mut changes = project_files
+        .iter()
+        .map(|project| json!({"uri":uri(project),"type":2}))
+        .collect::<Vec<_>>();
+    while changes.len() < BATCH_ENTRIES - 1 {
+        let path = root
+            .path()
+            .join(format!("ignored-event-{}.pas", changes.len()));
+        changes.push(json!({"uri":uri(&path),"type":2}));
+    }
+    changes.push(json!({"uri":uri(&override_file),"type":2}));
+    assert_eq!(changes.len(), BATCH_ENTRIES);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    let fresh_definition_id = RequestId::from("late-override-fresh-provider".to_string());
+    server.send_request(
+        fresh_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &sources[0], "TSelected", 0),
+    );
+    let fresh_locations = result_locations(server.response(&fresh_definition_id));
+    assert_eq!(
+        fresh_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&provider_b).as_str()),
+        "after budget fallback the dirty override must be retried, not leave provider A captured"
+    );
+    let refreshed_pull_id = RequestId::from("late-override-refreshed-pull".to_string());
+    server.send_request(
+        refreshed_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":previous_result_id}),
+    );
+    let refreshed_pull = server.response(&refreshed_pull_id);
+    assert!(
+        refreshed_pull.error.is_none(),
+        "pull retry: {refreshed_pull:?}"
+    );
+    assert_ne!(
+        refreshed_pull.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "fallback must not preserve the pre-event pull result ID"
+    );
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "worker metrics are produced"
+    );
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(&metrics).expect("read metrics")).expect("parse metrics");
+    assert!(
+        metrics["budget_exceeded"].as_bool().unwrap_or(false),
+        "late config read should exceed the shared budget and trigger fallback: {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

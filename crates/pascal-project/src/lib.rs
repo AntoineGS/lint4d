@@ -754,6 +754,12 @@ pub trait ProjectWorkBudget {
     fn charge_path_visits(&self, amount: usize) -> Result<(), String>;
     fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String>;
     fn charge_file_bytes(&self, amount: usize) -> Result<(), String>;
+
+    /// Whether an error means a read was interrupted by caller-owned transient
+    /// work limits rather than a stable filesystem/configuration result.
+    fn is_transient_error(&self, _error: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]

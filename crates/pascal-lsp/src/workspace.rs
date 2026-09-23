@@ -1232,6 +1232,10 @@ impl ProjectWorkBudget for ReconciliationBudget {
     fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
         ReconciliationBudget::charge_file_bytes(self, amount)
     }
+
+    fn is_transient_error(&self, error: &str) -> bool {
+        error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED || error == CANCELLATION_MESSAGE
+    }
 }
 
 fn expected_renamed_document_text(
@@ -3081,7 +3085,7 @@ impl Workspace {
             diagnostic_uris.extend(self.mark_source_change(uri, true));
         }
         let configuration_changed = is_configuration_path(uri);
-        if configuration_changed && !override_changed {
+        if configuration_changed || (override_changed && budget.is_some()) {
             self.bump_configuration_generation();
             self.mark_configuration_change(uri, true);
         }

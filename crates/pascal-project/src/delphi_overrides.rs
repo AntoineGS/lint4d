@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -41,6 +41,7 @@ type CapturedLayer = Result<Option<OverrideLayer>, String>;
 pub struct OverrideSession {
     user_config_file: Option<PathBuf>,
     captured: Arc<Mutex<BTreeMap<PathBuf, CapturedLayer>>>,
+    dirty: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -240,6 +241,7 @@ impl OverrideSession {
         let session = Self {
             user_config_file,
             captured: Arc::new(Mutex::new(BTreeMap::new())),
+            dirty: Arc::new(Mutex::new(HashSet::new())),
         };
         if let Some(user_config_file) = session.user_config_file.as_ref() {
             let _ = session.capture_path(user_config_file);
@@ -263,8 +265,34 @@ impl OverrideSession {
         let path = normalize_absolute_lexical(path)?;
         let result = read_override_file_with_budget(&path, Some(budget));
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
-        captured.insert(path, result.clone());
-        result.map(|_| ())
+        match result {
+            Ok(layer) => {
+                captured.insert(path.clone(), Ok(layer));
+                self.dirty
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .remove(&path);
+                Ok(())
+            }
+            Err(error) if budget.is_transient_error(&error) => {
+                // Keep the last proven value but force the next effective
+                // lookup to retry instead of treating this interrupted read
+                // as a stable configuration error or current capture.
+                self.dirty
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .insert(path);
+                Err(error)
+            }
+            Err(error) => {
+                captured.insert(path.clone(), Err(error.clone()));
+                self.dirty
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .remove(&path);
+                Err(error)
+            }
+        }
     }
 
     /// Remove a deleted configuration from the captured session without
@@ -272,7 +300,11 @@ impl OverrideSession {
     pub fn remove_path(&self, path: &Path) -> Result<(), String> {
         let path = normalize_absolute_lexical(path)?;
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
-        captured.insert(path, Ok(None));
+        captured.insert(path.clone(), Ok(None));
+        self.dirty
+            .lock()
+            .map_err(|_| capture_store_poisoned())?
+            .remove(&path);
         Ok(())
     }
 
@@ -309,15 +341,26 @@ impl OverrideSession {
     fn capture_path(&self, path: &Path) -> Result<(), String> {
         let path = normalize_absolute_lexical(path)?;
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
-        if let Some(result) = captured.get(&path) {
-            return match result {
-                Ok(_) => Ok(()),
-                Err(error) => Err(error.clone()),
-            };
+        let dirty = self
+            .dirty
+            .lock()
+            .map_err(|_| capture_store_poisoned())?
+            .contains(&path);
+        if !dirty {
+            if let Some(result) = captured.get(&path) {
+                return match result {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error.clone()),
+                };
+            }
         }
 
         let result = read_override_file(&path);
-        captured.insert(path, result.clone());
+        captured.insert(path.clone(), result.clone());
+        self.dirty
+            .lock()
+            .map_err(|_| capture_store_poisoned())?
+            .remove(&path);
         result.map(|_| ())
     }
 
@@ -814,6 +857,107 @@ mod tests {
         assert!(budget.visits.get() > 0, "filesystem probes are charged");
         assert_eq!(budget.bytes.get(), replacement.len());
         assert!(budget.reservation.get() >= replacement.len());
+    }
+
+    #[test]
+    fn transient_budget_refusal_does_not_poison_the_captured_override() {
+        struct RefusingBudget;
+
+        impl crate::ProjectWorkBudget for RefusingBudget {
+            fn check_cancelled(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn charge_path_visits(&self, _amount: usize) -> Result<(), String> {
+                Err("workspace notification reconciliation work budget exceeded".to_owned())
+            }
+
+            fn ensure_file_read_fits(&self, _max_bytes: usize) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn charge_file_bytes(&self, _amount: usize) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn is_transient_error(&self, error: &str) -> bool {
+                error == "workspace notification reconciliation work budget exceeded"
+            }
+        }
+
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let path = root.path().join(super::LOCAL_CONFIG_NAME);
+        fs::write(&path, "[properties]\nName = 'first'\n").expect("initial override");
+        let session = super::OverrideSession::new(None);
+        session
+            .capture_workspace(root.path())
+            .expect("capture initial layer");
+        fs::write(&path, "[properties]\nName = 'fresh'\n").expect("updated override");
+
+        let error = session
+            .refresh_path_with_budget(&path, &RefusingBudget)
+            .expect_err("the event budget must stop this refresh");
+        assert_eq!(
+            error,
+            "workspace notification reconciliation work budget exceeded"
+        );
+
+        let effective = session
+            .effective_for(Some(root.path()), None)
+            .expect("a later bounded capture retries the valid override");
+        assert_eq!(
+            effective.properties.get("name").map(String::as_str),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn cancelled_override_refresh_propagates_cancellation_and_retries_later() {
+        struct CancelledBudget;
+
+        impl crate::ProjectWorkBudget for CancelledBudget {
+            fn check_cancelled(&self) -> Result<(), String> {
+                Err("request cancelled".to_owned())
+            }
+
+            fn charge_path_visits(&self, _amount: usize) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn ensure_file_read_fits(&self, _max_bytes: usize) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn charge_file_bytes(&self, _amount: usize) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn is_transient_error(&self, error: &str) -> bool {
+                error == "request cancelled"
+            }
+        }
+
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let path = root.path().join(super::LOCAL_CONFIG_NAME);
+        fs::write(&path, "[properties]\nName = 'first'\n").expect("initial override");
+        let session = super::OverrideSession::new(None);
+        session
+            .capture_workspace(root.path())
+            .expect("capture initial layer");
+        fs::write(&path, "[properties]\nName = 'fresh'\n").expect("updated override");
+
+        assert_eq!(
+            session.refresh_path_with_budget(&path, &CancelledBudget),
+            Err("request cancelled".to_owned()),
+            "refresh must propagate rather than swallow cancellation"
+        );
+        let effective = session
+            .effective_for(Some(root.path()), None)
+            .expect("later request retries the cancelled refresh");
+        assert_eq!(
+            effective.properties.get("name").map(String::as_str),
+            Some("fresh")
+        );
     }
 
     #[cfg(target_os = "linux")]

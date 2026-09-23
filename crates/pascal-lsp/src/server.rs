@@ -2612,17 +2612,38 @@ impl PendingDiagnosticClears {
         }
     }
 
-    fn pump(&mut self, connection: &dyn ProtocolSender, limit: usize) -> Result<(), OutputError> {
+    fn pump(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        budget: &mut DiagnosticPublicationTurnBudget,
+    ) -> Result<(), OutputError> {
+        let remaining = MAX_DIAGNOSTIC_DISPATCHES_PER_TURN
+            .saturating_sub(budget.processed_targets)
+            .min(MAX_DIAGNOSTIC_DISPATCHES_PER_TURN.saturating_sub(budget.notification_count));
         if self.targets.is_empty() {
-            self.fill_batch(limit);
+            self.fill_batch(remaining);
         }
-        for _ in 0..limit {
+        for _ in 0..remaining {
             let Some(target) = self.targets.front() else {
                 break;
             };
+            let message = diagnostics_notification(&target.uri, target.version, Vec::new());
+            let bytes = serde_json::to_vec(&message)
+                .map_err(|error| OutputError::Encoding(error.to_string()))?
+                .len()
+                .saturating_add(LSP_FRAME_HEADER_RESERVE_BYTES);
+            if bytes > MAX_PUSH_DIAGNOSTIC_NOTIFICATION_BYTES {
+                return Err(OutputError::MessageTooLarge);
+            }
+            if budget.serialized_bytes.saturating_add(bytes) > MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN {
+                break;
+            }
             match send_diagnostic_clear(connection, &target.uri, target.version) {
                 Ok(()) => {
                     self.targets.pop_front().expect("front cleanup target");
+                    budget.notification_count += 1;
+                    budget.processed_targets += 1;
+                    budget.serialized_bytes = budget.serialized_bytes.saturating_add(bytes);
                 }
                 Err(OutputError::Backpressure) => return Ok(()),
                 Err(error) => return Err(error),
@@ -6814,7 +6835,7 @@ impl AnalysisJobs {
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut diagnostic_budget = DiagnosticPublicationTurnBudget::default();
-        self.poll_with_diagnostic_budget(connection, workspace, &mut diagnostic_budget)
+        self.poll_with_diagnostic_budget(connection, workspace, &mut diagnostic_budget, true)
     }
 
     fn poll_with_diagnostic_budget(
@@ -6822,6 +6843,7 @@ impl AnalysisJobs {
         connection: &dyn ProtocolSender,
         workspace: &mut Workspace,
         diagnostic_budget: &mut DiagnosticPublicationTurnBudget,
+        allow_normal_publication: bool,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.reap_retired_partial_validations();
         if workspace.analysis_admission_fenced() {
@@ -6873,11 +6895,13 @@ impl AnalysisJobs {
                             result,
                             None,
                         )?;
-                        pump_pending_diagnostic_publications_with_budget(
-                            connection,
-                            workspace,
-                            diagnostic_budget,
-                        )?;
+                        if allow_normal_publication {
+                            pump_pending_diagnostic_publications_with_budget(
+                                connection,
+                                workspace,
+                                diagnostic_budget,
+                            )?;
+                        }
                         self.progress
                             .finish_job(Some(connection), AnalysisJobId::Diagnostic(id), None)
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
@@ -8453,7 +8477,7 @@ fn event_loop(
             && diagnostic_clears_were_pending
             && !connection.has_pending_output()
         {
-            pending_diagnostic_clears.pump(connection, MAX_DIAGNOSTIC_DISPATCHES_PER_TURN)?;
+            pending_diagnostic_clears.pump(connection, &mut diagnostic_publication_budget)?;
         }
         if let Some(worker) = file_notification_worker.as_ref() {
             match worker.receiver.try_recv() {
@@ -8627,6 +8651,7 @@ fn event_loop(
                 connection,
                 workspace,
                 &mut diagnostic_publication_budget,
+                pending_diagnostic_clears.is_empty(),
             )?;
         }
         if !pull_diagnostics_supported
@@ -11968,6 +11993,277 @@ mod tests {
         assert_eq!(
             notification.params["diagnostics"][0]["message"],
             "must be delivered"
+        );
+    }
+
+    #[test]
+    fn completed_diagnostic_job_cannot_publish_ahead_of_pending_cleanup() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        workspace
+            .open_document(
+                root.clone(),
+                "unit A;\ninterface\nimplementation\nend.\n".to_string(),
+                1,
+            )
+            .expect("open owner document");
+        let target = Url::from_file_path(temp.path().join("Z-target.inc")).expect("target URI");
+        let publication = |message: &str| DiagnosticPublication {
+            uri: target.clone(),
+            version: None,
+            diagnostics: vec![Diagnostic::new_simple(Range::default(), message.into())],
+        };
+        let sender = BackpressureOnceSender {
+            should_block: AtomicBool::new(false),
+            accepted: Mutex::new(Vec::new()),
+        };
+
+        super::send_diagnostic_publications(
+            &sender,
+            &mut workspace,
+            &root,
+            vec![publication("old diagnostic")],
+        )
+        .expect("stage old report");
+        pump_pending_diagnostic_publications(&sender, &mut workspace)
+            .expect("deliver old report before rejected-open cleanup");
+        sender.accepted.lock().expect("sender lock").clear();
+
+        let rejected_uri = Url::parse("file:///tmp/rejected-open.pas").expect("rejected URI");
+        let cursor = workspace.take_all_diagnostic_publication_uris(Some(rejected_uri));
+        let mut cleanup = super::PendingDiagnosticClears::default();
+        cleanup.enqueue_cursor(cursor, None);
+        let mut diagnostic_budget = super::DiagnosticPublicationTurnBudget::default();
+        sender
+            .should_block
+            .store(true, std::sync::atomic::Ordering::Release);
+        cleanup
+            .pump(&sender, &mut diagnostic_budget)
+            .expect("paused writer retains cleanup front");
+        assert!(!cleanup.is_empty(), "cleanup cursor must remain active");
+
+        let mut jobs = AnalysisJobs::new();
+        let canceled_job_id = AnalysisComputationId(9000);
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let handle = thread::spawn(|| {});
+        jobs.diagnostics.insert(
+            canceled_job_id,
+            super::PendingDiagnostic {
+                uri: root.clone(),
+                analysis: PendingAnalysis {
+                    cancellation,
+                    handle,
+                    recipients: Vec::new(),
+                    key: None,
+                },
+            },
+        );
+        jobs.diagnostic_jobs.insert(root.clone(), canceled_job_id);
+        jobs.sender
+            .send(AnalysisResult {
+                id: AnalysisJobId::Diagnostic(canceled_job_id),
+                source_generation: workspace.source_generation(),
+                configuration_generation: workspace.configuration_generation(),
+                records: Vec::new(),
+                value: AnalysisResultValue::Diagnostics(super::DiagnosticsAnalysis {
+                    uri: root.clone(),
+                    version: Some(1),
+                    value: Ok(vec![publication("cancelled diagnostic")]),
+                    discard: false,
+                }),
+            })
+            .expect("queue cancelled diagnostic result");
+        jobs.poll_with_diagnostic_budget(
+            &sender,
+            &mut workspace,
+            &mut super::DiagnosticPublicationTurnBudget::default(),
+            true,
+        )
+        .expect("poll cancelled diagnostic job");
+        assert!(
+            sender.accepted.lock().expect("sender lock").is_empty(),
+            "cancelled job must not publish while cleanup is pending"
+        );
+
+        // Model a diagnostic worker that completed successfully after a close
+        // released the rejected-open fence, while the old URI cursor is still
+        // waiting for writer capacity.
+        let job_id = AnalysisComputationId(9001);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let handle = thread::spawn(|| {});
+        jobs.diagnostics.insert(
+            job_id,
+            super::PendingDiagnostic {
+                uri: root.clone(),
+                analysis: PendingAnalysis {
+                    cancellation,
+                    handle,
+                    recipients: Vec::new(),
+                    key: None,
+                },
+            },
+        );
+        jobs.diagnostic_jobs.insert(root.clone(), job_id);
+        jobs.sender
+            .send(AnalysisResult {
+                id: AnalysisJobId::Diagnostic(job_id),
+                source_generation: workspace.source_generation(),
+                configuration_generation: workspace.configuration_generation(),
+                records: Vec::new(),
+                value: AnalysisResultValue::Diagnostics(super::DiagnosticsAnalysis {
+                    uri: root,
+                    version: Some(1),
+                    value: Ok(vec![publication("fresh diagnostic")]),
+                    discard: false,
+                }),
+            })
+            .expect("queue completed diagnostic result");
+        jobs.poll_with_diagnostic_budget(&sender, &mut workspace, &mut diagnostic_budget, false)
+            .expect("poll completed job under cleanup precedence");
+
+        let early_messages = sender.accepted.lock().expect("sender lock").clone();
+        assert!(
+            early_messages.is_empty(),
+            "normal diagnostic output must wait until cleanup drains: {early_messages:?}"
+        );
+
+        while !cleanup.is_empty() {
+            let mut drain_budget = super::DiagnosticPublicationTurnBudget::default();
+            cleanup
+                .pump(&sender, &mut drain_budget)
+                .expect("drain pending cleanup");
+            if cleanup.is_empty() {
+                super::pump_pending_diagnostic_publications_with_budget(
+                    &sender,
+                    &mut workspace,
+                    &mut drain_budget,
+                )
+                .expect("reaggregate current owners after cleanup");
+            }
+        }
+        let accepted = sender.accepted.lock().expect("sender lock");
+        let target_publications = accepted
+            .iter()
+            .filter_map(|message| match message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification.params["uri"] == target.as_str() =>
+                {
+                    Some(notification.params.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(target_publications.len(), 2);
+        assert!(
+            target_publications[0]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            target_publications[1]["diagnostics"][0]["message"],
+            "fresh diagnostic"
+        );
+    }
+
+    #[test]
+    fn cleanup_and_normal_push_share_one_notification_and_byte_budget() {
+        const TARGETS: usize = 72;
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root = Url::from_file_path(temp.path().join("A.pas")).expect("root URI");
+        let targets = (0..TARGETS)
+            .map(|index| {
+                Url::parse(&format!("file:///tmp/push-budget-{index:03}.inc")).expect("target URI")
+            })
+            .collect::<Vec<_>>();
+        let publication_set = |message: &str| {
+            targets
+                .iter()
+                .map(|uri| DiagnosticPublication {
+                    uri: uri.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(
+                        Range::default(),
+                        message.to_string(),
+                    )],
+                })
+                .collect::<Vec<_>>()
+        };
+        let sender = BackpressureOnceSender {
+            should_block: AtomicBool::new(false),
+            accepted: Mutex::new(Vec::new()),
+        };
+        super::send_diagnostic_publications(
+            &sender,
+            &mut workspace,
+            &root,
+            publication_set(&"x".repeat(18_500)),
+        )
+        .expect("stage retained root reports");
+        while workspace.pending_diagnostic_publication_count() != 0 {
+            pump_pending_diagnostic_publications(&sender, &mut workspace)
+                .expect("drain initial root reports");
+        }
+        sender.accepted.lock().expect("sender lock").clear();
+
+        let cursor = workspace.take_all_diagnostic_publication_uris(None);
+        let mut cleanup = super::PendingDiagnosticClears::default();
+        cleanup.enqueue_cursor(cursor, None);
+        super::send_diagnostic_publications(
+            &sender,
+            &mut workspace,
+            &root,
+            publication_set(&"y".repeat(18_500)),
+        )
+        .expect("stage newer owner results while clear cursor is active");
+
+        let mut budget = super::DiagnosticPublicationTurnBudget::default();
+        cleanup
+            .pump(&sender, &mut budget)
+            .expect("pump cleanup batch");
+        super::pump_pending_diagnostic_publications_with_budget(
+            &sender,
+            &mut workspace,
+            &mut budget,
+        )
+        .expect("pump normal-publication batch under shared budget");
+
+        let accepted = sender.accepted.lock().expect("sender lock");
+        let notifications = accepted
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::Notification(notification)
+                        if notification.method == "textDocument/publishDiagnostics"
+                )
+            })
+            .count();
+        let bytes = accepted
+            .iter()
+            .map(|message| {
+                serde_json::to_vec(message)
+                    .expect("serialize admitted notification")
+                    .len()
+                    .saturating_add(super::LSP_FRAME_HEADER_RESERVE_BYTES)
+            })
+            .sum::<usize>();
+        assert!(
+            notifications <= super::MAX_PUSH_DIAGNOSTIC_NOTIFICATIONS_PER_TURN,
+            "cleanup and normal push emitted {notifications} notifications in one turn"
+        );
+        assert!(
+            bytes <= super::MAX_PUSH_DIAGNOSTIC_BYTES_PER_TURN,
+            "cleanup and normal push emitted {bytes} framed bytes in one turn"
         );
     }
 

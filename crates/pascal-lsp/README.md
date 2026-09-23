@@ -1327,7 +1327,12 @@ truncated or fabricated empty report. Current owner state is looked up when a
 queued URI is pumped, so pending targets coalesce across replacement versions,
 recovery, and close. Temporary outbound backpressure retains the unaccepted
 front target for a later pump; shutdown/drop cancels the remaining in-memory
-cursor. Supersession removes matching diagnostics still retained in the
+cursor. Rejected-open cleanup clears take precedence while their cursor owns
+targets; successful diagnostic jobs may stage newer replacements during that
+interval, but normal push delivery resumes only after cleanup drains and then
+re-aggregates current owners. Cleanup and normal push notifications consume the
+same per-turn target, notification, and serialized-byte budget. Supersession
+removes matching diagnostics still retained in the
 protocol pending/deferred queues and requeues affected targets for current
 owner aggregation. A message already handed to the transport channel cannot
 be recalled; transport disconnect also cannot guarantee client receipt.

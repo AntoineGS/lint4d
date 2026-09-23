@@ -31319,6 +31319,159 @@ fn watched_refresh_charges_nested_include_reads_to_notification_budget() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_pull_results() {
+    const PROJECTS: usize = 64;
+    const PADDING_BYTES: usize = 2 * 1024 * 1024;
+
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let mut project_files = Vec::with_capacity(PROJECTS);
+    let mut providers = Vec::with_capacity(PROJECTS);
+    let mut consumers = Vec::with_capacity(PROJECTS);
+    let mut consumer_sources = Vec::with_capacity(PROJECTS);
+    for index in 0..PROJECTS {
+        let project_root = root.path().join(format!("Project{index:02}"));
+        fs::create_dir_all(&project_root).expect("project root");
+        let project = project_root.join("App.dproj");
+        let provider = project_root.join(format!("Provider{index:02}.pas"));
+        let consumer = project_root.join(format!("Consumer{index:02}.pas"));
+        let source = format!(
+            "unit Consumer{index:02};\ninterface\nuses Provider{index:02};\ntype TUse{index:02} = TBefore;\nimplementation\nend.\n"
+        );
+        let descriptor_prefix = format!(
+            "<Project><PropertyGroup><MainSource>Consumer{index:02}.pas</MainSource></PropertyGroup><!--"
+        );
+        let descriptor_suffix = "--></Project>";
+        let padding = "x".repeat(
+            PADDING_BYTES.saturating_sub(descriptor_prefix.len() + descriptor_suffix.len()),
+        );
+        write_file(
+            &project,
+            &format!("{descriptor_prefix}{padding}{descriptor_suffix}"),
+        );
+        write_file(
+            &provider,
+            &format!(
+                "unit Provider{index:02};\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n"
+            ),
+        );
+        write_file(&consumer, &source);
+        project_files.push(project);
+        providers.push(provider);
+        consumers.push(consumer);
+        consumer_sources.push(source);
+    }
+
+    let metrics = root.path().join("reconciliation-work.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [(
+            "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+            metrics_value.as_str(),
+        )],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    for index in 0..PROJECTS {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumers[index]),"languageId":"pascal","version":1,"text":consumer_sources[index]}}),
+        );
+    }
+
+    let initial_id = RequestId::from("metadata-budget-initial-pull".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":null}),
+    );
+    let initial = server.response(&initial_id);
+    assert!(initial.error.is_none(), "initial pull: {initial:?}");
+    let previous_result_id = initial.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("initial result ID")
+        .to_string();
+
+    let provider_before = fs::metadata(&providers[0]).expect("provider metadata before edit");
+    let provider_text = fs::read_to_string(&providers[0]).expect("read provider");
+    let provider_after = provider_text.replace("TBefore", "TAfter ");
+    assert_eq!(provider_text.len(), provider_after.len());
+    write_file(&providers[0], &provider_after);
+    restore_mtime(&providers[0], &provider_before);
+
+    let changes = project_files
+        .iter()
+        .map(|project| json!({"uri":uri(project),"type":2}))
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 64);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    let fresh_definition_id = RequestId::from("metadata-budget-fresh-provider".to_string());
+    let updated_consumer_source = consumer_sources[0].replace("TBefore", "TAfter ");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumers[0]),"version":2},"contentChanges":[{"text":updated_consumer_source}]}),
+    );
+    server.send_request(
+        fresh_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &updated_consumer_source, "TAfter", 0),
+    );
+    let fresh_definition = server.response(&fresh_definition_id);
+    let fresh_locations = result_locations(fresh_definition);
+    assert_eq!(
+        fresh_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&providers[0]).as_str()),
+        "same-size/restored-mtime provider edits must not preserve stale selected-provider state"
+    );
+
+    let refreshed_id = RequestId::from("metadata-budget-refreshed-pull".to_string());
+    server.send_request(
+        refreshed_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":previous_result_id}),
+    );
+    let refreshed = server.response(&refreshed_id);
+    assert!(refreshed.error.is_none(), "refreshed pull: {refreshed:?}");
+    assert_ne!(
+        refreshed.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "metadata reconciliation must not reuse the pre-event pull result ID"
+    );
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "worker metrics must be written"
+    );
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(&metrics).expect("read metrics")).expect("parse metrics");
+    assert!(
+        metrics["budget_exceeded"].as_bool().unwrap_or(false),
+        "64 large project metadata rediscoveries must consume one shared notification byte budget: {metrics}"
+    );
+    assert!(
+        metrics["file_bytes_read"].as_u64().unwrap_or_default() >= 12 * 1024 * 1024,
+        "project descriptor payload reads must be part of the shared worker accounting: {metrics}"
+    );
+    assert!(
+        metrics["file_bytes_read"].as_u64().unwrap_or_default() <= 16 * 1024 * 1024,
+        "metadata reads must stop at the shared notification byte ceiling: {metrics}"
+    );
+    assert!(
+        metrics["diagnostic_record_checks"]
+            .as_u64()
+            .unwrap_or_default()
+            < 2_048,
+        "this case must exhaust the metadata byte budget before the separate diagnostic-work ceiling: {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

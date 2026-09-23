@@ -6182,6 +6182,7 @@ fn retain_resolvable_auto_import_providers(
             context_key,
             pinned,
             Some(cancel),
+            None,
         )?;
         if resolved.as_ref() != Some(&expected) {
             providers.remove(&name);

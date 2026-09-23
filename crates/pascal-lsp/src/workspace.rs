@@ -19,12 +19,12 @@ use pascal_project::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
     PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
     ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ProjectSelections, ReadPolicy,
-    discover_with_selections, discover_with_selections_and_observations_with_cancel_and_overrides,
-    discover_with_selections_and_observations_with_overrides, has_invalid_project_selection,
+    ProjectReadObservation, ProjectReadStamp, ProjectSelections, ProjectWorkBudget, ReadPolicy,
+    discover_with_selections, discover_with_selections_and_observations_with_overrides,
+    discover_with_selections_and_observations_with_work_budget, has_invalid_project_selection,
     project_candidate_membership, project_candidates, project_candidates_with_cancel,
-    read_package_metadata_with_observations, runtime_project_selection,
-    selected_project_is_current, selected_project_is_current_with_cancel,
+    read_package_metadata_with_observations_and_work_budget, runtime_project_selection,
+    selected_project_is_current, selected_project_is_current_with_work_budget,
 };
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
@@ -1172,6 +1172,30 @@ impl ReconciliationBudget {
             "diagnostic_uri_bytes": used.diagnostic_uri_bytes,
             "budget_exceeded": budget_exceeded,
         })
+    }
+}
+
+impl ProjectWorkBudget for ReconciliationBudget {
+    fn check_cancelled(&self) -> Result<(), String> {
+        if self.cancellation.load(Ordering::Relaxed) {
+            Err(CANCELLATION_MESSAGE.to_string())
+        } else if self.exhausted.get() {
+            Err(NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+        ReconciliationBudget::charge_path_visits(self, amount)
+    }
+
+    fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {
+        ReconciliationBudget::ensure_file_read_fits(self, max_bytes)
+    }
+
+    fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
+        ReconciliationBudget::charge_file_bytes(self, amount)
     }
 }
 
@@ -2518,7 +2542,7 @@ impl Workspace {
         } else {
             // A save notification without an open overlay must never make the
             // optional text payload authoritative over the disk file.
-            self.invalidate_metadata_for_uri(uri);
+            self.invalidate_metadata_for_uri(uri, None, None)?;
             self.refresh_loaded_disk(uri);
         }
         Ok(())
@@ -2745,7 +2769,7 @@ impl Workspace {
             self.bump_configuration_generation();
             self.mark_configuration_change(uri, true);
         }
-        self.invalidate_metadata_for_uri(uri);
+        let metadata_owners = self.invalidate_metadata_for_uri(uri, cancel, budget)?;
         self.invalidate_directory_for_uri(uri);
         match change {
             FileChange::Deleted => self.remember_deleted(uri),
@@ -2758,6 +2782,28 @@ impl Workspace {
             self.schedule_diagnostics(uri.clone());
             diagnostic_uris.push(uri.clone());
             return Ok(diagnostic_uris);
+        }
+        for owner_uri in metadata_owners {
+            check_workspace_cancel(cancel)?;
+            let owner_context =
+                self.context_for_uri_with_cancel_and_budget(&owner_uri, cancel, budget)?;
+            let is_retained = self.index.contains(&owner_uri)
+                || self
+                    .open_documents
+                    .get(&owner_uri)
+                    .is_some_and(|document| document.text.is_some());
+            if is_retained {
+                self.load_source_with_reconciliation_budget(
+                    &owner_uri,
+                    &owner_context,
+                    &HashSet::new(),
+                    cancel,
+                    budget,
+                )?;
+                if !diagnostic_uris.contains(&owner_uri) {
+                    diagnostic_uris.push(owner_uri);
+                }
+            }
         }
         if configuration_changed {
             let open_documents = self
@@ -5247,6 +5293,15 @@ impl Workspace {
         uri: &Url,
         cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
+        self.context_for_uri_with_cancel_and_budget(uri, cancel, None)
+    }
+
+    fn context_for_uri_with_cancel_and_budget(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<ContextKey, String> {
         let path = uri
             .to_file_path()
             .map(absolute_path)
@@ -5260,19 +5315,7 @@ impl Workspace {
 
         let mut rediscover_open_context = false;
         if let Some(existing) = self.open_document_contexts.get(uri).cloned() {
-            self.extend_context_watch_paths(&existing, &path, cancel)?;
-            if self.context_is_fresh_with_cancel(&existing, cancel)?
-                && self.context_matches_current_selection_with_cancel(&path, &existing, cancel)?
-            {
-                self.remember_document_owner(uri, &existing);
-                return Ok(existing);
-            }
-            self.invalidate_context(&existing);
-            rediscover_open_context = true;
-        }
-
-        if !rediscover_open_context {
-            if let Some(existing) = self.document_contexts.get(uri).cloned() {
+            if self.contexts.contains_key(&existing) {
                 self.extend_context_watch_paths(&existing, &path, cancel)?;
                 if self.context_is_fresh_with_cancel(&existing, cancel)?
                     && self
@@ -5282,6 +5325,24 @@ impl Workspace {
                     return Ok(existing);
                 }
                 self.invalidate_context(&existing);
+            }
+            rediscover_open_context = true;
+        }
+
+        if !rediscover_open_context {
+            if let Some(existing) = self.document_contexts.get(uri).cloned() {
+                if self.contexts.contains_key(&existing) {
+                    self.extend_context_watch_paths(&existing, &path, cancel)?;
+                    if self.context_is_fresh_with_cancel(&existing, cancel)?
+                        && self.context_matches_current_selection_with_cancel(
+                            &path, &existing, cancel,
+                        )?
+                    {
+                        self.remember_document_owner(uri, &existing);
+                        return Ok(existing);
+                    }
+                    self.invalidate_context(&existing);
+                }
             }
         }
 
@@ -5300,10 +5361,19 @@ impl Workspace {
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
                 && !owner.follow_current_project_file
-                && self.known_owner_selection_is_current_with_cancel(&path, &owner, cancel)?
+                && (rediscover_open_context
+                    || self.known_owner_selection_is_current_with_cancel(&path, &owner, cancel)?)
             {
                 return self
-                    .restore_known_owner(uri, &path, &owner, &roots, &project_options, cancel)
+                    .restore_known_owner(
+                        uri,
+                        &path,
+                        &owner,
+                        &roots,
+                        &project_options,
+                        cancel,
+                        budget,
+                    )
                     .map_err(|error| {
                         if error == CANCELLATION_MESSAGE {
                             error
@@ -5313,6 +5383,7 @@ impl Workspace {
                     });
             }
             if owner.origin == OwnerOrigin::Automatic
+                && !rediscover_open_context
                 && self.context_has_open_legacy_overlay(&owner.state)
                 && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
             {
@@ -5326,7 +5397,7 @@ impl Workspace {
             }
         }
         let discovered = match cancel {
-            Some(cancel) => discover_with_selections_and_observations_with_cancel_and_overrides(
+            Some(cancel) => discover_with_selections_and_observations_with_work_budget(
                 &path,
                 &roots,
                 &project_options,
@@ -5334,6 +5405,7 @@ impl Workspace {
                 &self.overrides,
                 &self.options.exclude,
                 cancel,
+                budget.map(|budget| budget as &dyn ProjectWorkBudget),
             ),
             None => discover_with_selections_and_observations_with_overrides(
                 &path,
@@ -5376,6 +5448,7 @@ impl Workspace {
         Ok(key)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn restore_known_owner(
         &mut self,
         uri: &Url,
@@ -5384,6 +5457,7 @@ impl Workspace {
         roots: &[PathBuf],
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
         if !owner.needs_revalidation
             && self.context_state_is_fresh_with_open_documents(&owner.state, cancel)?
@@ -5397,7 +5471,7 @@ impl Workspace {
             current_owner.legacy_route = None;
         }
         let (key, discovery) =
-            self.rediscover_known_owner(path, owner, roots, project_options, cancel)?;
+            self.rediscover_known_owner(path, owner, roots, project_options, cancel, budget)?;
         self.install_context(
             key.clone(),
             discovery.context,
@@ -5417,6 +5491,7 @@ impl Workspace {
         roots: &[PathBuf],
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<(ContextKey, ProjectDiscovery), String> {
         let mut options = project_options.clone();
         if let (Some(scope), Some(selected)) = (
@@ -5424,9 +5499,12 @@ impl Workspace {
             owner.key.selection_project.as_deref(),
         ) {
             let candidate_status = match cancel {
-                Some(cancel) => {
-                    selected_project_is_current_with_cancel(scope, selected, Some(cancel))
-                }
+                Some(cancel) => selected_project_is_current_with_work_budget(
+                    scope,
+                    selected,
+                    Some(cancel),
+                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                ),
                 None => selected_project_is_current(scope, selected),
             };
             if let Err(error) = &candidate_status {
@@ -5461,17 +5539,16 @@ impl Workspace {
             }
             options.project_file = Some(selected.to_path_buf());
             let context = match cancel {
-                Some(cancel) => {
-                    discover_with_selections_and_observations_with_cancel_and_overrides(
-                        path,
-                        roots,
-                        &options,
-                        &ProjectSelections::new(),
-                        &self.overrides,
-                        &self.options.exclude,
-                        cancel,
-                    )?
-                }
+                Some(cancel) => discover_with_selections_and_observations_with_work_budget(
+                    path,
+                    roots,
+                    &options,
+                    &ProjectSelections::new(),
+                    &self.overrides,
+                    &self.options.exclude,
+                    cancel,
+                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                )?,
                 None => discover_with_selections_and_observations_with_overrides(
                     path,
                     roots,
@@ -5490,17 +5567,16 @@ impl Workspace {
         if let Some(project_file) = &owner.key.project_file {
             options.project_file = Some(project_file.clone());
             let context = match cancel {
-                Some(cancel) => {
-                    discover_with_selections_and_observations_with_cancel_and_overrides(
-                        path,
-                        roots,
-                        &options,
-                        &ProjectSelections::new(),
-                        &self.overrides,
-                        &self.options.exclude,
-                        cancel,
-                    )?
-                }
+                Some(cancel) => discover_with_selections_and_observations_with_work_budget(
+                    path,
+                    roots,
+                    &options,
+                    &ProjectSelections::new(),
+                    &self.overrides,
+                    &self.options.exclude,
+                    cancel,
+                    budget.map(|budget| budget as &dyn ProjectWorkBudget),
+                )?,
                 None => discover_with_selections_and_observations_with_overrides(
                     path,
                     roots,
@@ -5517,7 +5593,7 @@ impl Workspace {
         }
 
         let context = match cancel {
-            Some(cancel) => discover_with_selections_and_observations_with_cancel_and_overrides(
+            Some(cancel) => discover_with_selections_and_observations_with_work_budget(
                 path,
                 roots,
                 &options,
@@ -5525,6 +5601,7 @@ impl Workspace {
                 &self.overrides,
                 &self.options.exclude,
                 cancel,
+                budget.map(|budget| budget as &dyn ProjectWorkBudget),
             )?,
             None => discover_with_selections_and_observations_with_overrides(
                 path,
@@ -5573,7 +5650,7 @@ impl Workspace {
                     return Ok((owner.key.clone(), owner.state.context.clone()));
                 }
                 let discovery =
-                    self.rediscover_known_owner(path, owner, roots, project_options, None)?;
+                    self.rediscover_known_owner(path, owner, roots, project_options, None, None)?;
                 return Ok((discovery.0, discovery.1.context));
             }
         }
@@ -6164,6 +6241,7 @@ impl Workspace {
         for owner in self.document_owners.values_mut() {
             if owner.key == *key {
                 owner.legacy_route = None;
+                owner.needs_revalidation = true;
             }
         }
         let mut affected: HashSet<Url> = self
@@ -6185,25 +6263,70 @@ impl Workspace {
         }
     }
 
-    fn invalidate_metadata_for_uri(&mut self, uri: &Url) {
+    fn invalidate_metadata_for_uri(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Url>, String> {
         let Ok(path) = uri.to_file_path() else {
-            return;
+            return Ok(Vec::new());
         };
         let path = absolute_path(path);
-        let affected: Vec<ContextKey> = self
-            .contexts
-            .iter()
-            .filter_map(|(key, state)| {
-                state
-                    .watched_paths
-                    .keys()
-                    .any(|watched| paths_equal_ci(watched, &path))
-                    .then_some(key.clone())
-            })
-            .collect();
+        let mut affected = Vec::new();
+        for (key, state) in &self.contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if state
+                .watched_paths
+                .keys()
+                .any(|watched| paths_equal_ci(watched, &path))
+            {
+                affected.push(key.clone());
+            }
+        }
+        if affected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let affected_set: HashSet<_> = affected.iter().cloned().collect();
+        let mut owners = HashSet::new();
+        for (owner_uri, context_key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if affected_set.contains(context_key)
+                && (self.index.contains(owner_uri)
+                    || self
+                        .open_documents
+                        .get(owner_uri)
+                        .is_some_and(|document| document.text.is_some()))
+            {
+                owners.insert(owner_uri.clone());
+            }
+        }
+        for (owner_uri, context_key) in &self.open_document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if affected_set.contains(context_key)
+                && self
+                    .open_documents
+                    .get(owner_uri)
+                    .is_some_and(|document| document.text.is_some())
+            {
+                owners.insert(owner_uri.clone());
+            }
+        }
         for key in affected {
             self.invalidate_context(&key);
         }
+        let mut owners = owners.into_iter().collect::<Vec<_>>();
+        owners.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(owners)
     }
 
     fn invalidate_directory_for_uri(&mut self, _uri: &Url) {}
@@ -6333,6 +6456,7 @@ impl Workspace {
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<Option<Url>, String> {
         check_workspace_cancel(cancel)?;
         let mut groups: Vec<(Vec<PathBuf>, bool)> = Vec::new();
@@ -6468,6 +6592,7 @@ impl Workspace {
             context,
             context_key,
             cancel,
+            budget,
         )?;
         self.retain_package_observations(context_key, package_lookup.observations.clone());
         self.merge_metadata_observations(context_key, &package_lookup.metadata_observations);
@@ -6571,6 +6696,7 @@ impl Workspace {
         context: &ProjectContext,
         context_key: &ContextKey,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<PackageLookup, String> {
         check_workspace_cancel(cancel)?;
         let mut lookup = PackageLookup {
@@ -6626,7 +6752,7 @@ impl Workspace {
 
             let descriptor = &descriptors[0];
             let (metadata, observations) =
-                match self.cached_package_metadata(descriptor, context, cancel) {
+                match self.cached_package_metadata(descriptor, context, cancel, budget) {
                     Ok(metadata) => metadata,
                     Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
                     Err(error) => {
@@ -6801,8 +6927,12 @@ impl Workspace {
         path: &Path,
         context: &ProjectContext,
         cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<(PackageMetadata, Vec<ProjectReadObservation>), String> {
         check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         let key = PackageMetadataKey {
             descriptor: path.to_path_buf(),
             overrides: context.overrides.clone(),
@@ -6813,11 +6943,17 @@ impl Workspace {
         };
         let stamp = path_stamp(path);
         if let Some(cached) = self.package_metadata_cache.get(&key) {
-            if cached
-                .metadata_stamps
-                .iter()
-                .all(|(metadata_path, metadata_stamp)| path_stamp(metadata_path) == *metadata_stamp)
-            {
+            let mut metadata_is_current = true;
+            for (metadata_path, metadata_stamp) in &cached.metadata_stamps {
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if path_stamp(metadata_path) != *metadata_stamp {
+                    metadata_is_current = false;
+                    break;
+                }
+            }
+            if metadata_is_current {
                 let result = cached.result.clone();
                 let observations = cached.observations.clone();
                 self.use_clock = self.use_clock.saturating_add(1);
@@ -6854,12 +6990,13 @@ impl Workspace {
                 ));
             }
         };
-        let package_read = read_package_metadata_with_observations(
+        let package_read = read_package_metadata_with_observations_and_work_budget(
             path,
             &options,
             &key.overrides,
             &key.read_policy,
             &entry,
+            budget.map(|budget| budget as &dyn ProjectWorkBudget),
         );
         let (result, observations) = match package_read {
             Ok(read) => (Ok(read.metadata), read.observations),
@@ -6873,6 +7010,9 @@ impl Workspace {
         let metadata_stamps = metadata_paths
             .into_iter()
             .map(|metadata_path| {
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
                 let metadata_stamp = if package_paths_equal(&metadata_path, path) {
                     stamp.clone()
                 } else if let Some(observation) = observations
@@ -6883,9 +7023,9 @@ impl Workspace {
                 } else {
                     path_stamp(&metadata_path)
                 };
-                (metadata_path, metadata_stamp)
+                Ok((metadata_path, metadata_stamp))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         self.use_clock = self.use_clock.saturating_add(1);
         self.package_metadata_cache.insert(
             key,
@@ -7621,7 +7761,14 @@ impl Workspace {
                 );
                 let roots = self.workspace_root_paths();
                 let (key, discovery) = self
-                    .rediscover_known_owner(&path, owner, &roots, &self.project_options(), None)
+                    .rediscover_known_owner(
+                        &path,
+                        owner,
+                        &roots,
+                        &self.project_options(),
+                        None,
+                        None,
+                    )
                     .map_err(|error| {
                         format!("could not rediscover known project owner for {uri}: {error}")
                     })?;

@@ -10,9 +10,10 @@ use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
-    DiagnosticPublicationUriCursor, FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState,
-    PreparedWorkspaceOptions, ReconciliationBudget, RuntimeOptionsOverride, RuntimeOptionsUpdate,
-    Workspace, WorkspaceOptions, canonical_file_uri, parse_runtime_options,
+    DiagnosticPublicationCursorStep, DiagnosticPublicationUriCursor, FileChange,
+    MAX_CONFIGURATION_WATCH_PATHS, NavigationState, PreparedWorkspaceOptions, ReconciliationBudget,
+    RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri,
+    parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{
@@ -2515,34 +2516,37 @@ impl PendingDiagnosticClears {
     }
 
     fn is_empty(&self) -> bool {
-        self.targets.is_empty() && self.cursor.as_ref().is_none_or(|cursor| cursor.is_empty())
+        self.targets.is_empty() && self.cursor.is_none()
+    }
+
+    fn fill_batch(&mut self, step_limit: usize) {
+        let mut cursor_steps = 0usize;
+        while cursor_steps < step_limit {
+            let Some(cursor) = self.cursor.as_mut() else {
+                break;
+            };
+            cursor_steps += 1;
+            match cursor.next_step() {
+                DiagnosticPublicationCursorStep::Target(uri) => {
+                    if uri.as_str().len() <= MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET {
+                        self.targets
+                            .push_back(DiagnosticClearTarget { uri, version: None });
+                    }
+                }
+                DiagnosticPublicationCursorStep::Skipped => {}
+                DiagnosticPublicationCursorStep::Exhausted => {
+                    self.cursor = None;
+                    break;
+                }
+            }
+        }
     }
 
     fn pump(&mut self, connection: &dyn ProtocolSender, limit: usize) -> Result<(), OutputError> {
+        if self.targets.is_empty() {
+            self.fill_batch(limit);
+        }
         for _ in 0..limit {
-            if self.targets.is_empty() {
-                let Some(cursor) = self.cursor.as_mut() else {
-                    break;
-                };
-                while self.targets.len() < limit {
-                    let Some(uri) = cursor.next_uri() else {
-                        self.cursor = None;
-                        break;
-                    };
-                    let uri_bytes = uri.as_str().len();
-                    if uri_bytes > MAX_DIAGNOSTIC_CLEANUP_URI_BYTES_PER_TARGET {
-                        // This target could not have been retained as a push
-                        // publication. Preserve the admission fence but skip
-                        // an unrepresentable, never-published clear.
-                        continue;
-                    }
-                    self.targets
-                        .push_back(DiagnosticClearTarget { uri, version: None });
-                }
-                if self.targets.is_empty() {
-                    continue;
-                }
-            }
             let Some(target) = self.targets.front() else {
                 break;
             };
@@ -8259,8 +8263,11 @@ fn spawn_workspace_file_notification(
                 notification,
                 workspace_folders_supported,
                 push_diagnostics_supported,
-                Some(&worker_cancellation),
-                Some(&budget),
+                NotificationWorkControl {
+                    cancel: Some(&worker_cancellation),
+                    budget: Some(&budget),
+                    defer_push_clears: false,
+                },
             );
             if budget.is_exhausted() && !budget.is_cancelled() {
                 workspace.invalidate_for_reconciliation_budget(&budget);
@@ -8912,12 +8919,14 @@ fn event_loop(
                     }
                     let refresh_configuration =
                         notification_method == "workspace/didChangeWorkspaceFolders";
-                    let result = handle_notification(
+                    let result = handle_notification_with_cancel(
                         connection,
                         workspace,
                         notification,
                         workspace_folders_supported,
                         !pull_diagnostics_supported,
+                        None,
+                        !pending_diagnostic_clears.is_empty(),
                     );
                     if refresh_configuration && result.is_ok() {
                         configuration
@@ -10030,23 +10039,6 @@ fn invalidate_for_file_notification_overflow(
     effect
 }
 
-fn handle_notification(
-    connection: &dyn ProtocolSender,
-    workspace: &mut Workspace,
-    notification: Notification,
-    workspace_folders_supported: bool,
-    push_diagnostics_supported: bool,
-) -> Result<DiagnosticNotificationEffect, String> {
-    handle_notification_with_cancel(
-        connection,
-        workspace,
-        notification,
-        workspace_folders_supported,
-        push_diagnostics_supported,
-        None,
-    )
-}
-
 fn handle_notification_with_cancel(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
@@ -10054,6 +10046,7 @@ fn handle_notification_with_cancel(
     workspace_folders_supported: bool,
     push_diagnostics_supported: bool,
     cancel: Option<&AtomicBool>,
+    defer_push_clears: bool,
 ) -> Result<DiagnosticNotificationEffect, String> {
     handle_notification_with_control(
         connection,
@@ -10061,9 +10054,18 @@ fn handle_notification_with_cancel(
         notification,
         workspace_folders_supported,
         push_diagnostics_supported,
-        cancel,
-        None,
+        NotificationWorkControl {
+            cancel,
+            budget: None,
+            defer_push_clears,
+        },
     )
+}
+
+struct NotificationWorkControl<'a> {
+    cancel: Option<&'a AtomicBool>,
+    budget: Option<&'a ReconciliationBudget>,
+    defer_push_clears: bool,
 }
 
 fn handle_notification_with_control(
@@ -10072,9 +10074,13 @@ fn handle_notification_with_control(
     notification: Notification,
     workspace_folders_supported: bool,
     push_diagnostics_supported: bool,
-    cancel: Option<&AtomicBool>,
-    budget: Option<&ReconciliationBudget>,
+    control: NotificationWorkControl<'_>,
 ) -> Result<DiagnosticNotificationEffect, String> {
+    let NotificationWorkControl {
+        cancel,
+        budget,
+        defer_push_clears,
+    } = control;
     match notification.method.as_str() {
         "initialized" => Ok(DiagnosticNotificationEffect::default()),
         "textDocument/didOpen" => {
@@ -10180,7 +10186,10 @@ fn handle_notification_with_control(
                 // A rejected-open cleanup cursor already owns the complete
                 // retained publication union. Do not bypass its bounded,
                 // resumable admission path with synchronous close clears.
-                if push_diagnostics_supported && !workspace.analysis_admission_fenced() {
+                if push_diagnostics_supported
+                    && !defer_push_clears
+                    && !workspace.analysis_admission_fenced()
+                {
                     let mut root_was_updated = false;
                     for update in updates {
                         root_was_updated |= update.uri == uri;

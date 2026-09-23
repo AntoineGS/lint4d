@@ -7244,13 +7244,15 @@ fn rejected_open_push_cleanup_resumes_after_outbound_backpressure() {
             }
         }),
     );
-    let overlapping_rejected_uri = uri(&long_dir.join("RejectedAgain.pas"));
-    assert!(overlapping_rejected_uri.as_str().len() > 4_096);
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": rejected_uri}}),
+    );
     server.send_notification(
         "textDocument/didOpen",
         json!({
             "textDocument": {
-                "uri": overlapping_rejected_uri,
+                "uri": rejected_uri,
                 "languageId": "pascal",
                 "version": 2,
                 "text": "unit EditorRejectedAgain;\ninterface\nimplementation\nend.\n"
@@ -7293,7 +7295,6 @@ fn rejected_open_push_cleanup_resumes_after_outbound_backpressure() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut expected_clears = expected_uris.clone();
     expected_clears.insert(rejected_uri.clone());
-    expected_clears.insert(overlapping_rejected_uri.clone());
     while clear_counts.len() < expected_clears.len() || request_response.is_none() {
         assert!(
             Instant::now() < deadline,

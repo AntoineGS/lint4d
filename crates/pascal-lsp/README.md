@@ -1279,14 +1279,21 @@ For push clients, rejected-open cleanup is kept in an event-loop-owned,
 URI-deduplicating merge cursor instead of materializing the complete union of
 published and open-document URIs. It streams sorted publication-key maps and a
 bounded open-document URI set, retaining only a frontier entry per publication
-root and a 64-clear outbound batch. A URI over 16 KiB is not retained as a new
-push publication; an unrepresentable rejected URI that was never published is
-not sent as a clear. The loop admits at most 64 clears per turn and advances
-the outbound batch only after admission; backpressure leaves the current
-target in place for a later turn. Fresh push-diagnostic scheduling waits until
-the cleanup cursor has drained, while ordinary protocol requests continue to
-be serviced. Pull diagnostics continue to use their existing refresh-request
-path.
+root and a 64-clear outbound batch. Cursor initialization and heap advancement
+are also incremental: no event-loop turn consumes more than 64 cursor steps or
+admits more than 64 clear notifications. Its emitted-URI history is retained
+through the complete drain so overlapping publication streams and late rejected
+targets cannot requeue a clear. Retained publication entries are globally
+capped at 20,000 entries and 16 MiB of URI bytes, in addition to the per-target
+16 KiB URI ceiling; the open-document URI snapshot is bounded by the open
+document limit. A URI over 16 KiB is not retained as a new push publication;
+an unrepresentable rejected URI that was never published is not sent as a
+clear. Backpressure leaves the current target in place for a later turn.
+`didClose` defers synchronous push clears while the cleanup cursor is active,
+even if closing the rejected URI has already lifted the request fence. Fresh
+push-diagnostic scheduling waits until the cleanup cursor has drained, while
+ordinary protocol requests continue to be serviced. Pull diagnostics continue
+to use their existing refresh-request path.
 
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,

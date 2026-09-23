@@ -32,7 +32,7 @@ use serde::Deserialize;
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -58,6 +58,8 @@ const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
 const MAX_REJECTED_OPEN_FENCE_URIS: usize = 64;
 const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES: usize = 16 * 1024;
+const MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS: usize = 20_000;
+const MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
@@ -1331,6 +1333,8 @@ struct OpenDocument {
     identity_generation: u64,
 }
 
+type DiagnosticPublicationRootStream =
+    std::collections::hash_map::IntoValues<Url, BTreeMap<Url, Vec<LspDiagnostic>>>;
 type DiagnosticPublicationUriStream =
     std::collections::btree_map::IntoKeys<Url, Vec<LspDiagnostic>>;
 
@@ -1339,99 +1343,101 @@ type DiagnosticPublicationUriStream =
 /// into a workspace-sized URI vector.
 #[derive(Debug)]
 pub(crate) struct DiagnosticPublicationUriCursor {
+    publication_roots: DiagnosticPublicationRootStream,
     streams: Vec<DiagnosticPublicationUriStream>,
     frontier: BinaryHeap<Reverse<(Url, usize)>>,
-    previous: Option<Url>,
-    late_targets: HashSet<Url>,
+    open_documents: Option<std::collections::btree_set::IntoIter<Url>>,
+    open_stream_added: bool,
+    late_targets: VecDeque<Url>,
+    late_membership: HashSet<Url>,
+    emitted_targets: HashSet<Url>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DiagnosticPublicationCursorStep {
+    Target(Url),
+    Skipped,
+    Exhausted,
 }
 
 impl DiagnosticPublicationUriCursor {
     fn new(
         publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
-        open_documents: BTreeMap<Url, Vec<LspDiagnostic>>,
+        open_documents: BTreeSet<Url>,
         extra: Option<Url>,
     ) -> Self {
-        let mut late_targets = HashSet::new();
+        let mut late_targets = VecDeque::new();
+        let mut late_membership = HashSet::new();
         if let Some(uri) = extra.as_ref() {
-            late_targets.insert(uri.clone());
-        }
-        let mut streams = Vec::with_capacity(
-            publications.len()
-                + usize::from(!open_documents.is_empty())
-                + usize::from(extra.is_some()),
-        );
-        let mut frontier = BinaryHeap::with_capacity(streams.capacity());
-        for publications in publications.into_values() {
-            let mut stream = publications.into_keys();
-            let index = streams.len();
-            if let Some(uri) = stream.next() {
-                frontier.push(Reverse((uri, index)));
-            }
-            streams.push(stream);
-        }
-        if !open_documents.is_empty() {
-            let mut stream = open_documents.into_keys();
-            let index = streams.len();
-            if let Some(uri) = stream.next() {
-                frontier.push(Reverse((uri, index)));
-            }
-            streams.push(stream);
-        }
-        if let Some(extra) = extra {
-            let stream = [(extra, Vec::new())]
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            let mut stream = stream.into_keys();
-            let index = streams.len();
-            if let Some(uri) = stream.next() {
-                frontier.push(Reverse((uri, index)));
-            }
-            streams.push(stream);
+            late_membership.insert(uri.clone());
+            late_targets.push_back(uri.clone());
         }
         Self {
-            streams,
-            frontier,
-            previous: None,
+            publication_roots: publications.into_values(),
+            streams: Vec::new(),
+            frontier: BinaryHeap::new(),
+            open_documents: Some(open_documents.into_iter()),
+            open_stream_added: false,
             late_targets,
+            late_membership,
+            emitted_targets: HashSet::new(),
         }
     }
 
     pub(crate) fn add_late_target(&mut self, uri: Url) {
         if uri.as_str().len() > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES
-            || self.late_targets.contains(&uri)
-            || self.late_targets.len() >= MAX_REJECTED_OPEN_FENCE_URIS
+            || self.emitted_targets.contains(&uri)
+            || self.late_membership.contains(&uri)
+            || self.late_membership.len() >= MAX_REJECTED_OPEN_FENCE_URIS
         {
             return;
         }
-        self.late_targets.insert(uri.clone());
-        if self.previous.as_ref() == Some(&uri) {
-            return;
-        }
-        let stream = [(uri, Vec::new())].into_iter().collect::<BTreeMap<_, _>>();
-        let mut stream = stream.into_keys();
-        let index = self.streams.len();
-        if let Some(uri) = stream.next() {
-            self.frontier.push(Reverse((uri, index)));
-        }
-        self.streams.push(stream);
+        self.late_membership.insert(uri.clone());
+        self.late_targets.push_back(uri);
     }
 
-    pub(crate) fn next_uri(&mut self) -> Option<Url> {
-        loop {
-            let Reverse((uri, index)) = self.frontier.pop()?;
-            if let Some(next) = self.streams[index].next() {
+    pub(crate) fn next_step(&mut self) -> DiagnosticPublicationCursorStep {
+        if let Some(publications) = self.publication_roots.next() {
+            let mut stream = publications.into_keys();
+            let index = self.streams.len();
+            if let Some(uri) = stream.next() {
+                self.frontier.push(Reverse((uri, index)));
+            }
+            self.streams.push(stream);
+            return DiagnosticPublicationCursorStep::Skipped;
+        }
+        if !self.open_stream_added {
+            self.open_stream_added = true;
+            if let Some(stream) = self.open_documents.as_mut() {
+                if let Some(uri) = stream.next() {
+                    self.frontier.push(Reverse((uri, usize::MAX)));
+                }
+            }
+            return DiagnosticPublicationCursorStep::Skipped;
+        }
+        if let Some(Reverse((uri, index))) = self.frontier.pop() {
+            let next = if index == usize::MAX {
+                self.open_documents.as_mut().and_then(Iterator::next)
+            } else {
+                self.streams[index].next()
+            };
+            if let Some(next) = next {
                 self.frontier.push(Reverse((next, index)));
             }
-            if self.previous.as_ref() == Some(&uri) {
-                continue;
-            }
-            self.previous = Some(uri.clone());
-            return Some(uri);
+            return if self.emitted_targets.insert(uri.clone()) {
+                DiagnosticPublicationCursorStep::Target(uri)
+            } else {
+                DiagnosticPublicationCursorStep::Skipped
+            };
         }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.frontier.is_empty()
+        if let Some(uri) = self.late_targets.pop_front() {
+            return if self.emitted_targets.insert(uri.clone()) {
+                DiagnosticPublicationCursorStep::Target(uri)
+            } else {
+                DiagnosticPublicationCursorStep::Skipped
+            };
+        }
+        DiagnosticPublicationCursorStep::Exhausted
     }
 }
 
@@ -1879,6 +1885,8 @@ pub struct Workspace {
     open_text_bytes: usize,
     pending_diagnostics: HashMap<Url, Instant>,
     diagnostic_publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
+    diagnostic_publication_target_count: usize,
+    diagnostic_publication_uri_bytes: usize,
     // Bounded event overrides are needed because some clients report a
     // deletion before the filesystem has caught up. They are cleared by a
     // create/change event or as soon as the observed stamp changes.
@@ -3674,12 +3682,9 @@ impl Workspace {
         {
             return Err("diagnostic publication root limit reached".to_string());
         }
-        let current = publications.into_iter().fold(
+        let proposed = publications.into_iter().fold(
             BTreeMap::<Url, Vec<LspDiagnostic>>::new(),
             |mut current, publication| {
-                if publication.uri.as_str().len() > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES {
-                    return current;
-                }
                 current
                     .entry(publication.uri)
                     .or_default()
@@ -3687,12 +3692,51 @@ impl Workspace {
                 current
             },
         );
-        let previous = self
-            .diagnostic_publications
-            .insert(root_uri.clone(), current.clone())
-            .unwrap_or_default();
-        let mut affected = previous.keys().cloned().collect::<HashSet<_>>();
-        affected.extend(current.keys().cloned());
+        let previous = self.diagnostic_publications.get(root_uri);
+        let previous_target_uris = previous
+            .into_iter()
+            .flat_map(|map| map.keys().cloned())
+            .collect::<Vec<_>>();
+        let previous_count = previous_target_uris.len();
+        let previous_uri_bytes = previous_target_uris
+            .iter()
+            .map(|uri| uri.as_str().len())
+            .sum::<usize>();
+        let retained_count = self
+            .diagnostic_publication_target_count
+            .saturating_sub(previous_count);
+        let retained_uri_bytes = self
+            .diagnostic_publication_uri_bytes
+            .saturating_sub(previous_uri_bytes);
+        let proposed_targets = proposed.keys().cloned().collect::<Vec<_>>();
+        let mut current = BTreeMap::new();
+        let mut current_uri_bytes = 0usize;
+        for (uri, diagnostics) in proposed {
+            let uri_bytes = uri.as_str().len();
+            if uri_bytes > MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES
+                || retained_count.saturating_add(current.len())
+                    >= MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS
+                || retained_uri_bytes
+                    .saturating_add(current_uri_bytes)
+                    .saturating_add(uri_bytes)
+                    > MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES
+            {
+                continue;
+            }
+            current_uri_bytes = current_uri_bytes.saturating_add(uri_bytes);
+            current.insert(uri, diagnostics);
+        }
+        let mut affected = previous_target_uris.into_iter().collect::<HashSet<_>>();
+        affected.extend(proposed_targets);
+        // Include rejected proposed targets in the aggregate pass so targets
+        // omitted by the global retention ceiling are explicitly cleared if
+        // no other retained root owns them.
+        // (They are intentionally not retained as publication authority.)
+        self.diagnostic_publication_target_count = retained_count.saturating_add(current.len());
+        self.diagnostic_publication_uri_bytes =
+            retained_uri_bytes.saturating_add(current_uri_bytes);
+        self.diagnostic_publications
+            .insert(root_uri.clone(), current);
         Ok(self.aggregate_diagnostic_publications(affected))
     }
 
@@ -3704,6 +3748,12 @@ impl Workspace {
             .diagnostic_publications
             .remove(root_uri)
             .unwrap_or_default();
+        self.diagnostic_publication_target_count = self
+            .diagnostic_publication_target_count
+            .saturating_sub(previous.len());
+        self.diagnostic_publication_uri_bytes = self
+            .diagnostic_publication_uri_bytes
+            .saturating_sub(previous.keys().map(|uri| uri.as_str().len()).sum::<usize>());
         self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
     }
 
@@ -3711,13 +3761,10 @@ impl Workspace {
         &mut self,
         extra: Option<Url>,
     ) -> DiagnosticPublicationUriCursor {
+        self.diagnostic_publication_target_count = 0;
+        self.diagnostic_publication_uri_bytes = 0;
         let publications = std::mem::take(&mut self.diagnostic_publications);
-        let open_documents = self
-            .open_documents
-            .keys()
-            .cloned()
-            .map(|uri| (uri, Vec::new()))
-            .collect();
+        let open_documents = self.open_documents.keys().cloned().collect();
         DiagnosticPublicationUriCursor::new(publications, open_documents, extra)
     }
 
@@ -10420,7 +10467,8 @@ fn is_immutable_override_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextState, DiagnosticLineIndex, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
+        ContextState, DiagnosticLineIndex, DiagnosticPublicationCursorStep,
+        DiagnosticPublicationUriCursor, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
         MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_URIS, MAX_SOURCE_CHANGE_OBSERVATIONS,
         OpenDocument, ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
         context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
@@ -10435,7 +10483,7 @@ mod tests {
         ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
     };
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fs;
     #[cfg(unix)]
     use std::path::Path;
@@ -10444,6 +10492,51 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn diagnostic_uri_cursor_bounds_each_step_and_deduplicates_late_targets() {
+        let root = Url::parse("file:///cursor-root.pas").expect("root URI");
+        let emitted = Url::parse("file:///related/00000.pas").expect("related URI");
+        let later = Url::parse("file:///late-rejected.pas").expect("late URI");
+        let publications = (0..512)
+            .map(|index| {
+                (
+                    Url::parse(&format!("file:///related/{index:05}.pas")).expect("target URI"),
+                    Vec::new(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut cursor = DiagnosticPublicationUriCursor::new(
+            HashMap::from([(root, publications)]),
+            BTreeSet::new(),
+            None,
+        );
+
+        let mut targets = HashSet::new();
+        let mut steps = 0usize;
+        loop {
+            // The cursor exposes at most one root initialization, heap pop,
+            // duplicate skip, or late-target admission per call.
+            steps += 1;
+            match cursor.next_step() {
+                DiagnosticPublicationCursorStep::Target(uri) => {
+                    assert!(targets.insert(uri.clone()), "duplicate cursor target {uri}");
+                    if uri == emitted {
+                        // A later rejection may name a URI already emitted by
+                        // the publication union. Durable history must suppress it.
+                        cursor.add_late_target(uri);
+                        cursor.add_late_target(later.clone());
+                    }
+                }
+                DiagnosticPublicationCursorStep::Skipped => {}
+                DiagnosticPublicationCursorStep::Exhausted => break,
+            }
+            assert!(steps <= 2_000, "cursor did not make bounded progress");
+        }
+        assert_eq!(targets.len(), 513);
+        assert!(targets.contains(&emitted));
+        assert!(targets.contains(&later));
     }
 
     #[test]

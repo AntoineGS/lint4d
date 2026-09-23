@@ -3332,8 +3332,13 @@ pub(crate) fn symbol_rename_from_input(
     rename_file: bool,
     cancel: &AtomicBool,
 ) -> (Computed<WorkspaceEdit>, Option<(Url, Url)>) {
-    let source_overlay = input.overlays.get(uri).map(|overlay| overlay.text.as_str());
-    if !source_overlay.is_some_and(|source| unit_rename_syntax_candidate(source, position)) {
+    // Admission is performed on the analysis worker, not the protocol thread.
+    // Use the same bounded, owner-aware source loader as semantic planning so
+    // closed documents are considered without bypassing read policy or
+    // cancellation. This heuristic only chooses the unit-rename path; the
+    // selected binding/snapshot remains the authorization proof.
+    let source = source_for_input_with_cancel(&input, uri, Some(cancel));
+    if !source.is_ok_and(|(source, _)| unit_rename_syntax_candidate(&source, position)) {
         return (
             rename_from_input(input, uri, position, new_name, document_changes, cancel),
             None,

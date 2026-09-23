@@ -33130,6 +33130,149 @@ fn symbol_rename_of_unit_from_uses_and_qualified_prefix_uses_selected_provider()
 }
 
 #[test]
+fn symbol_rename_supports_closed_provider_and_consumer_sources() {
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    let implementation_uses = "unit Consumer;\ninterface\nimplementation\nuses Provider;\nprocedure Run;\nbegin\nend;\nend.\n";
+    for (case, query_provider, query_source, needle) in [
+        ("closed-declaration", true, provider_source, "Provider"),
+        ("closed-uses", false, consumer_source, "Provider;"),
+        ("closed-prefix", false, consumer_source, "Provider.TThing"),
+        (
+            "closed-implementation-uses",
+            false,
+            implementation_uses,
+            "Provider;",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let consumer = root.join("Consumer.pas");
+        let main = root.join("Main.pas");
+        let consumer_original = if case == "closed-implementation-uses" {
+            implementation_uses
+        } else {
+            consumer_source
+        };
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_original);
+        write_file(
+            &main,
+            "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        let init = RequestId::from(format!("{case}-init"));
+        server.send_request(
+            init.clone(),
+            "initialize",
+            json!({
+                "processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{
+                    "documentChanges":true,"resourceOperations":["rename"]
+                }}}
+            }),
+        );
+        assert!(server.response(&init).error.is_none());
+        server.send_notification("initialized", json!({}));
+        let request_path = if query_provider { &provider } else { &consumer };
+        let request_source = query_source;
+        let rename = RequestId::from(format!("{case}-rename"));
+        server.send_request(
+            rename.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument":{"uri":uri(request_path)},
+                "position":position_of(request_source, needle, 0),
+                "newName":"Renamed"
+            }),
+        );
+        let response = server.response(&rename);
+        assert!(
+            response.error.is_none(),
+            "closed {case} rename failed: {response:?}"
+        );
+        let edit = response.result.expect("workspace edit");
+        let changes = edit["documentChanges"].as_array().expect("documentChanges");
+        let text_documents = changes
+            .iter()
+            .filter(|change| change.get("textDocument").is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            !text_documents.is_empty(),
+            "closed {case} returned no text edits"
+        );
+        assert!(
+            text_documents
+                .iter()
+                .all(|change| change["textDocument"]["version"].is_null()),
+            "closed sources must carry null versions: {changes:?}"
+        );
+        let moves = changes
+            .iter()
+            .filter(|change| change["kind"] == "rename")
+            .collect::<Vec<_>>();
+        assert_eq!(moves.len(), 1, "{case}: {changes:?}");
+        assert_eq!(moves[0]["oldUri"], uri(&provider).to_string());
+        assert_eq!(moves[0], changes.last().expect("last change"));
+
+        let provider_updated =
+            apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+        let consumer_updated =
+            apply_workspace_edit_to_source(consumer_original, &edit, &uri(&consumer));
+        assert!(provider_updated.contains("unit Renamed;"));
+        if case == "closed-implementation-uses" {
+            assert!(consumer_updated.contains("uses Renamed;"));
+        } else {
+            assert!(consumer_updated.contains("uses Renamed;"));
+            assert!(consumer_updated.contains("Renamed.TThing"));
+        }
+        write_file(&provider, &provider_updated);
+        write_file(&consumer, &consumer_updated);
+        let renamed_provider = root.join("Renamed.pas");
+        assert_eq!(moves[0]["newUri"], uri(&renamed_provider).to_string());
+        fs::rename(&provider, &renamed_provider).expect("client applies RenameFile");
+        server.shutdown();
+
+        let mut fresh = TestServer::launch();
+        let fresh_init = RequestId::from(format!("{case}-fresh-init"));
+        fresh.send_request(
+            fresh_init.clone(),
+            "initialize",
+            json!({
+                "processId":null,"rootUri":uri(&root),"capabilities":{}
+            }),
+        );
+        assert!(fresh.response(&fresh_init).error.is_none());
+        fresh.send_notification("initialized", json!({}));
+        let definition = RequestId::from(format!("{case}-fresh-definition"));
+        fresh.send_request(
+            definition.clone(),
+            "textDocument/definition",
+            navigation_params(
+                &consumer,
+                &consumer_updated,
+                if case == "closed-implementation-uses" {
+                    "Renamed"
+                } else {
+                    "TThing"
+                },
+                0,
+            ),
+        );
+        let locations = result_locations(fresh.response(&definition));
+        assert_eq!(locations.len(), 1, "{case}: {locations:?}");
+        assert_eq!(locations[0]["uri"], uri(&renamed_provider).to_string());
+        fresh.shutdown();
+    }
+}
+
+#[test]
 fn symbol_rename_uses_same_provider_as_navigation_across_project_collision() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace");
@@ -33138,12 +33281,15 @@ fn symbol_rename_uses_same_provider_as_navigation_across_project_collision() {
     let provider_a = project_a.join("lib/Provider.pas");
     let provider_b = project_b.join("lib/Provider.pas");
     let consumer = project_a.join("Consumer.pas");
+    let consumer_b = project_b.join("ConsumerB.pas");
     let source_a = "unit Provider;\ninterface\ntype TFromA = class end;\nimplementation\nend.\n";
     let source_b = "unit Provider;\ninterface\ntype TFromB = class end;\nimplementation\nend.\n";
     let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TFromA;\nimplementation\nend.\n";
+    let consumer_b_source = "unit ConsumerB;\ninterface\nuses Provider;\ntype TAlias = Provider.TFromB;\nimplementation\nend.\n";
     write_file(&provider_a, source_a);
     write_file(&provider_b, source_b);
     write_file(&consumer, consumer_source);
+    write_file(&consumer_b, consumer_b_source);
     write_file(
         &project_a.join("Main.pas"),
         "unit MainA;\ninterface\nuses Consumer;\nimplementation\nend.\n",
@@ -33227,7 +33373,89 @@ fn symbol_rename_uses_same_provider_as_navigation_across_project_collision() {
             .count(),
         1
     );
+    let text_edit_uris = operations
+        .iter()
+        .filter_map(|operation| operation["textDocument"]["uri"].as_str())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(text_edit_uris.contains(&uri(&provider_a).to_string()));
+    assert!(text_edit_uris.contains(&uri(&consumer).to_string()));
+    assert!(
+        !text_edit_uris.contains(&uri(&provider_b).to_string()),
+        "B provider edited: {operations:?}"
+    );
+    assert!(
+        !text_edit_uris.contains(&uri(&consumer_b).to_string()),
+        "B consumer edited: {operations:?}"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| operation["kind"] == "rename")
+            .count(),
+        1
+    );
+
+    let provider_a_updated = apply_workspace_edit_to_source(source_a, &edit, &uri(&provider_a));
+    let consumer_a_updated =
+        apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    let provider_b_after = apply_workspace_edit_to_source(source_b, &edit, &uri(&provider_b));
+    let consumer_b_after =
+        apply_workspace_edit_to_source(consumer_b_source, &edit, &uri(&consumer_b));
+    assert_eq!(provider_b_after.as_bytes(), source_b.as_bytes());
+    assert_eq!(consumer_b_after.as_bytes(), consumer_b_source.as_bytes());
+    write_file(&provider_a, &provider_a_updated);
+    write_file(&consumer, &consumer_a_updated);
+    let moved_provider_a = project_a.join("lib/Renamed.pas");
+    fs::rename(&provider_a, &moved_provider_a).expect("client applies A move");
     server.shutdown();
+
+    let mut fresh_a = TestServer::launch();
+    let fresh_a_init = RequestId::from("unit-collision-fresh-a-init".to_string());
+    fresh_a.send_request(
+        fresh_a_init.clone(),
+        "initialize",
+        json!({
+            "processId":null,"rootUri":uri(&project_a),"capabilities":{}
+        }),
+    );
+    assert!(fresh_a.response(&fresh_a_init).error.is_none());
+    fresh_a.send_notification("initialized", json!({}));
+    let fresh_a_definition = RequestId::from("unit-collision-fresh-a-definition".to_string());
+    fresh_a.send_request(
+        fresh_a_definition.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_a_updated, "TFromA", 0),
+    );
+    let fresh_a_locations = result_locations(fresh_a.response(&fresh_a_definition));
+    assert_eq!(fresh_a_locations.len(), 1, "A: {fresh_a_locations:?}");
+    assert_eq!(
+        fresh_a_locations[0]["uri"],
+        uri(&moved_provider_a).to_string()
+    );
+    fresh_a.shutdown();
+
+    let mut fresh_b = TestServer::launch();
+    let fresh_b_init = RequestId::from("unit-collision-fresh-b-init".to_string());
+    fresh_b.send_request(
+        fresh_b_init.clone(),
+        "initialize",
+        json!({
+            "processId":null,"rootUri":uri(&project_b),"capabilities":{}
+        }),
+    );
+    assert!(fresh_b.response(&fresh_b_init).error.is_none());
+    fresh_b.send_notification("initialized", json!({}));
+    let fresh_b_definition = RequestId::from("unit-collision-fresh-b-definition".to_string());
+    fresh_b.send_request(
+        fresh_b_definition.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer_b, consumer_b_source, "TFromB", 0),
+    );
+    let fresh_b_locations = result_locations(fresh_b.response(&fresh_b_definition));
+    assert_eq!(fresh_b_locations.len(), 1, "B: {fresh_b_locations:?}");
+    assert_eq!(fresh_b_locations[0]["uri"], uri(&provider_b).to_string());
+    fresh_b.shutdown();
 }
 
 #[test]
@@ -33242,6 +33470,16 @@ fn symbol_rename_rejects_unit_alias_and_unresolved_provider_controls() {
             "unknown",
             "unit Consumer;\ninterface\nuses MissingProvider;\nimplementation\nend.\n",
             "MissingProvider",
+        ),
+        (
+            "explicit-in-path",
+            "unit Consumer;\ninterface\nuses Provider in 'Provider.pas';\nimplementation\nend.\n",
+            "Provider",
+        ),
+        (
+            "conditional-use",
+            "unit Consumer;\ninterface\n{$IFDEF MAYBE}\nuses Provider;\n{$ENDIF}\nimplementation\nend.\n",
+            "Provider;",
         ),
     ];
     for (case, consumer_source, needle) in controls {
@@ -33290,10 +33528,112 @@ fn symbol_rename_rejects_unit_alias_and_unresolved_provider_controls() {
             "{case} control must reject atomically: {response:?}"
         );
         assert!(response.result.is_none());
+        assert_eq!(
+            fs::read(&provider).expect("provider bytes"),
+            provider_source.as_bytes()
+        );
+        assert_eq!(
+            fs::read(&consumer).expect("consumer bytes"),
+            consumer_source.as_bytes()
+        );
         assert!(
             provider.exists(),
             "the server must not move a file for a notification/request plan"
         );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn symbol_rename_rejects_namespaced_and_include_owned_unit_controls_atomically() {
+    for case in ["namespace", "include"] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = if case == "namespace" {
+            root.join("Ns.Provider.pas")
+        } else {
+            root.join("Provider.pas")
+        };
+        let consumer = root.join("Consumer.pas");
+        let include = root.join("Uses.inc");
+        let provider_source = if case == "namespace" {
+            "unit Ns.Provider;\ninterface\nimplementation\nend.\n"
+        } else {
+            "unit Provider;\ninterface\nimplementation\nend.\n"
+        };
+        let consumer_source = if case == "namespace" {
+            "unit Consumer;\ninterface\nuses Ns.Provider;\nimplementation\nend.\n"
+        } else {
+            "unit Consumer;\ninterface\nuses\n{$I Uses.inc}\n;\nimplementation\nend.\n"
+        };
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        if case == "include" {
+            write_file(&include, "Provider\n");
+        }
+        write_file(
+            &root.join("Main.pas"),
+            "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+        let mut server = TestServer::launch();
+        let init = RequestId::from(format!("unit-boundary-{case}-init"));
+        server.send_request(
+            init.clone(),
+            "initialize",
+            json!({
+                "processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{
+                    "documentChanges":true,"resourceOperations":["rename"]
+                }}}
+            }),
+        );
+        assert!(server.response(&init).error.is_none());
+        server.send_notification("initialized", json!({}));
+        let query_uri = if case == "include" {
+            &include
+        } else {
+            &consumer
+        };
+        let query_source = if case == "include" {
+            "Provider\n"
+        } else {
+            consumer_source
+        };
+        let needle = if case == "namespace" {
+            "Ns.Provider"
+        } else {
+            "Provider"
+        };
+        let rename = RequestId::from(format!("unit-boundary-{case}"));
+        server.send_request(
+            rename.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument":{"uri":uri(query_uri)},
+                "position":position_of(query_source, needle, 0),
+                "newName":"Renamed"
+            }),
+        );
+        let response = server.response(&rename);
+        assert!(response.error.is_some(), "{case} must reject: {response:?}");
+        assert!(
+            response.result.is_none(),
+            "{case} must not return a partial WorkspaceEdit"
+        );
+        assert_eq!(
+            fs::read(&provider).expect("provider bytes"),
+            provider_source.as_bytes()
+        );
+        assert_eq!(
+            fs::read(&consumer).expect("consumer bytes"),
+            consumer_source.as_bytes()
+        );
+        if case == "include" {
+            assert_eq!(fs::read(&include).expect("include bytes"), b"Provider\n");
+        }
         server.shutdown();
     }
 }

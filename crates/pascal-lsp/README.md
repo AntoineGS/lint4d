@@ -1228,8 +1228,28 @@ and reschedule open-document diagnostics, and request a pull-diagnostic refresh.
 The oversized entry list is not traversed or applied entry-by-entry. Pending
 unit-rename transitions are invalidated, and any open old/new endpoint overlay
 whose transition can no longer be proved is rejected until reopened. Ordinary
-In-range file-event discovery and dependent-diagnostic fan-out now run on a
-serialized workspace-mutation worker that temporarily owns the live workspace.
+file-event discovery and dependent-diagnostic fan-out run on a serialized
+workspace-mutation worker that temporarily owns the live workspace. Each
+notification currently shares local ceilings for 65,536 charged file-event/read
+path visits, 16 MiB of directly refreshed file bytes read, 16 MiB of bytes
+indexed through that refresh path, 65,536 inspected dependency records, 2,048
+diagnostic-record comparisons, 4,096 diagnostic targets, and 256 KiB of target
+URI bytes. Exceeding a charged ceiling abandons partial derived state, performs
+the conservative global invalidation, preserves the final delete tombstones
+from the notification, and schedules diagnostics for open documents. Test
+support exposes the charged counters independently.
+
+These ceilings are not yet a global actual-work bound: project/context and
+package discovery, nested source/include reads and indexing, rename-specific
+reconciliation, some filesystem metadata work, and invalidation/refresh output
+loops are not all charged to the shared account. Cancellation is checked at
+existing cooperative checkpoints, but synchronous filesystem calls themselves
+cannot be interrupted. High-fan-out delete/tombstone fallback and blocked-worker
+cancellation have deterministic protocol coverage; rename-overlay lifecycle
+under budget saturation and all uncharged paths remain open. This stage is
+partial and does not close P2-4.
+
+While it reconciles a preceding event, workspace-dependent requests and
 While it reconciles a preceding event, workspace-dependent requests and
 state-changing notifications wait in a FIFO (up to 64 messages and 1 MiB);
 `$/cancelRequest` remains serviceable and can cancel a queued request. When
@@ -1239,9 +1259,9 @@ replay in causal order. A single message larger than the byte budget can use
 that slot, but a second cannot be consumed before the slot is replayed. Shutdown,
 exit, and input disconnect request cooperative worker cancellation and join the
 worker before the session releases its only workspace owner; worker panic fails
-queued requests and closes the session. This stage does not yet impose a total
-actual-work budget across filesystem/project/index/dependent reconciliation or
-diagnostic fan-out, and therefore does not close P2-4. Clients should continue
+queued requests and closes the session. The current charged work ceilings do
+not bound all filesystem/project/index/dependent reconciliation or diagnostic
+fan-out, and therefore do not close P2-4. Clients should continue
 to use watched-file notifications for changes not covered by these Pascal
 source filters.
 

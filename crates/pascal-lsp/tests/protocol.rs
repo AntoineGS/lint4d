@@ -31071,6 +31071,255 @@ fn one_oversized_deferred_notification_does_not_abort_workspace_reconciliation()
     server.shutdown();
 }
 
+#[test]
+#[cfg(feature = "test-support")]
+fn high_fanout_file_batch_reports_shared_actual_work_and_replays_fresh_requests() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let shared_include = root.path().join("Shared.inc");
+    let old_provider = "unit Provider;\ninterface\ntype TOld = record end;\nimplementation\nend.\n";
+    write_file(&provider, old_provider);
+    write_file(&shared_include, "const SharedValue = 1;\n");
+
+    let barrier_dir = root.path().join("reconciliation-work-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let metrics = barrier_dir.join("work.json");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+                metrics_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_watched_registration(root.path(), Value::Null, false);
+
+    let mut consumers = Vec::new();
+    for index in 0..32 {
+        let consumer = root.path().join(format!("Consumer{index:02}.pas"));
+        let source = format!(
+            "unit Consumer{index:02};\ninterface\nuses Provider;\ntype TUse{index:02} = TOld;\nimplementation\n{{$I Shared.inc}}\nend.\n"
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":source}}),
+        );
+        let _initial_diagnostics = diagnostics_for_uri(&mut server, &uri(&consumer));
+        consumers.push(consumer);
+    }
+
+    let original_consumer = "unit Consumer00;\ninterface\nuses Provider;\ntype TUse00 = TOld;\nimplementation\n{$I Shared.inc}\nend.\n";
+    let initial_definition_id = RequestId::from("high-fanout-initial-definition".to_string());
+    server.send_request(
+        initial_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], original_consumer, "TOld", 0),
+    );
+    let initial_definition = server.response(&initial_definition_id);
+    let initial_locations = result_locations(initial_definition);
+    assert_eq!(
+        initial_locations.len(),
+        1,
+        "fixture must begin with a real indexed provider: {initial_locations:?}"
+    );
+    assert_eq!(initial_locations[0]["uri"], uri(&provider).to_string());
+
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype TNew = record end;\nimplementation\nend.\n",
+    );
+    write_file(&shared_include, "const SharedValue = 2;\n");
+    let mut changes = (0..31)
+        .flat_map(|_| {
+            [
+                json!({"uri":uri(&provider),"type":2}),
+                json!({"uri":uri(&shared_include),"type":2}),
+            ]
+        })
+        .collect::<Vec<_>>();
+    changes.push(json!({"uri":uri(&shared_include),"type":2}));
+    // The physical provider still exists, but this final delete is the
+    // causally latest event. Budget fallback must retain its tombstone.
+    changes.push(json!({"uri":uri(&provider),"type":3}));
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+    barrier.wait_until_entered();
+
+    let updated_consumer = consumers[0].clone();
+    let updated_source = "unit Consumer00;\ninterface\nuses Provider;\ntype TUse00 = TNew;\nimplementation\n{$I Shared.inc}\nend.\n";
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&updated_consumer),"version":2},"contentChanges":[{"text":updated_source}]}),
+    );
+    let definition_id = RequestId::from("high-fanout-fresh-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&updated_consumer, updated_source, "TNew", 0),
+    );
+    assert!(
+        server
+            .response_with_timeout(&definition_id, Duration::from_millis(150))
+            .is_none(),
+        "workspace request must remain behind the blocked file batch"
+    );
+
+    barrier.release();
+    let definition = server.response_with_timeout(&definition_id, IO_TIMEOUT);
+    let refreshed_diagnostics = diagnostics_for_uri(&mut server, &uri(&updated_consumer));
+    let metrics_written = wait_for_file(&metrics, IO_TIMEOUT);
+    if definition.is_none() || !metrics_written {
+        let _ = server.child.kill();
+    }
+    let definition = definition.expect("queued definition must complete after reconciliation");
+    let locations = result_locations(definition);
+    assert!(
+        locations.is_empty(),
+        "fresh query must respect the final delete tombstone rather than stale provider contents: {locations:?}"
+    );
+    assert_eq!(
+        refreshed_diagnostics["uri"],
+        uri(&updated_consumer).to_string()
+    );
+    assert_eq!(refreshed_diagnostics["version"], 2);
+    assert!(
+        metrics_written,
+        "worker must publish independent work counters"
+    );
+    let counters: Value = serde_json::from_slice(&fs::read(metrics).expect("read work counters"))
+        .expect("parse work counters");
+    assert!(
+        counters["filesystem_path_visits"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "processed event entries must charge path visits: {counters}"
+    );
+    assert!(
+        counters["diagnostic_record_checks"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 2_048,
+        "64 duplicate provider/include events must charge dependent-record checks: {counters}"
+    );
+    assert!(
+        counters["budget_exceeded"].as_bool().unwrap_or(false),
+        "high-fan-out batch must take the conservative work-budget fallback: {counters}"
+    );
+    assert!(
+        counters["unique_targets"].as_u64().unwrap_or(u64::MAX) <= 33,
+        "duplicate-heavy work must not duplicate output targets: {counters}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype TItem = record end;\nimplementation\nend.\n",
+    );
+    let consumer = root.path().join("Consumer.pas");
+    write_file(
+        &consumer,
+        "unit Consumer;\ninterface\nuses Provider;\ntype TUse = TItem;\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("diagnostic-work-cancel-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let completed = barrier_dir.join("completed");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let completed_value = completed.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_DIAGNOSTIC_WORK_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_FILE_WORKER_COMPLETED",
+                completed_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":"unit Consumer;\ninterface\nuses Provider;\ntype TUse = TItem;\nimplementation\nend.\n"}}),
+    );
+    let diagnostics_id = RequestId::from("diagnostic-work-cancel-load".to_string());
+    server.send_request(
+        diagnostics_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":null}),
+    );
+    assert!(server.response(&diagnostics_id).error.is_none());
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+
+    let entered = wait_for_file(&barrier.entered, Duration::from_millis(250));
+    let shutdown_response = if entered {
+        let shutdown_id = RequestId::from("shutdown-diagnostic-work-held".to_string());
+        server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+        let response = server.response_with_timeout(&shutdown_id, Duration::from_millis(500));
+        let completed_before_response = wait_for_file(&completed, Duration::from_millis(50));
+        barrier.release();
+        assert!(
+            completed_before_response,
+            "shutdown must join worker before responding"
+        );
+        response
+    } else {
+        barrier.release();
+        None
+    };
+    if shutdown_response.is_some() {
+        server.send_notification("exit", Value::Null);
+        server.stdin.take();
+        let _ = server.child.wait().expect("wait for shutdown child");
+    } else {
+        server.shutdown();
+    }
+    assert!(
+        entered,
+        "diagnostic dependent enumeration must expose a deterministic work barrier"
+    );
+    assert!(
+        shutdown_response.is_some_and(|response| response.error.is_none()),
+        "shutdown must remain responsive while diagnostic work is held"
+    );
+}
+
 #[cfg(feature = "test-support")]
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;

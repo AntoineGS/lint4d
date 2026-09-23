@@ -11,8 +11,8 @@ use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
     FileChange, MAX_CONFIGURATION_WATCH_PATHS, NavigationState, PreparedWorkspaceOptions,
-    RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri,
-    parse_runtime_options,
+    ReconciliationBudget, RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace,
+    WorkspaceOptions, canonical_file_uri, parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{
@@ -2396,6 +2396,8 @@ impl DiagnosticPullStore {
 struct DiagnosticNotificationEffect {
     refresh: Vec<Url>,
     cancel: Vec<Url>,
+    refresh_membership: HashSet<Url>,
+    cancel_membership: HashSet<Url>,
     refresh_requested: bool,
 }
 
@@ -2405,15 +2407,45 @@ impl DiagnosticNotificationEffect {
     }
 
     fn refresh_uri(&mut self, uri: Url) {
-        if !self.refresh.contains(&uri) {
+        if self.refresh_membership.insert(uri.clone()) {
             self.refresh.push(uri);
         }
     }
 
     fn cancel_uri(&mut self, uri: Url) {
-        if !self.cancel.contains(&uri) {
+        if self.cancel_membership.insert(uri.clone()) {
             self.cancel.push(uri);
         }
+    }
+
+    fn refresh_uri_with_budget(
+        &mut self,
+        uri: Url,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        if !self.refresh_membership.contains(&uri) {
+            if let Some(budget) = budget {
+                budget.charge_diagnostic_target(&uri)?;
+            }
+            self.refresh_membership.insert(uri.clone());
+            self.refresh.push(uri);
+        }
+        Ok(())
+    }
+
+    fn cancel_uri_with_budget(
+        &mut self,
+        uri: Url,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        if !self.cancel_membership.contains(&uri) {
+            if let Some(budget) = budget {
+                budget.charge_diagnostic_target(&uri)?;
+            }
+            self.cancel_membership.insert(uri.clone());
+            self.cancel.push(uri);
+        }
+        Ok(())
     }
 
     fn refresh_dependents(
@@ -2425,6 +2457,29 @@ impl DiagnosticNotificationEffect {
         for uri in workspace.diagnostic_dependents_for_change(changed_uri, include_parent) {
             self.refresh_uri(uri);
         }
+    }
+
+    fn refresh_dependents_with_control(
+        &mut self,
+        workspace: &Workspace,
+        changed_uri: &Url,
+        include_parent: bool,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let Some(budget) = budget else {
+            self.refresh_dependents(workspace, changed_uri, include_parent);
+            return Ok(());
+        };
+        #[cfg(feature = "test-support")]
+        wait_at_diagnostic_work_test_barrier(budget)?;
+        workspace.visit_diagnostic_dependents_for_change(
+            changed_uri,
+            include_parent,
+            cancel,
+            budget,
+            |uri| self.refresh_uri_with_budget(uri.clone(), Some(budget)),
+        )
     }
 }
 
@@ -7860,6 +7915,34 @@ impl Drop for WorkspaceFileNotificationWorker {
     }
 }
 
+#[cfg(feature = "test-support")]
+fn wait_at_diagnostic_work_test_barrier(budget: &ReconciliationBudget) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_DIAGNOSTIC_WORK_BARRIER") else {
+        return Ok(());
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return Ok(());
+    };
+    let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+    else {
+        return Ok(());
+    };
+    let _ = marker.write_all(b"x");
+    drop(marker);
+    while !std::path::Path::new(release).exists() {
+        if budget.is_cancelled() {
+            return Err(rename::CANCELLATION_MESSAGE.to_string());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn cancel_and_join_workspace_file_worker(
     worker: &mut Option<WorkspaceFileNotificationWorker>,
 ) -> thread::Result<()> {
@@ -7882,14 +7965,26 @@ fn spawn_workspace_file_notification(
         .name("PascalLspWorkspaceMutation".to_string())
         .spawn(move || {
             let mut workspace = owned_workspace;
-            let result = handle_notification_with_cancel(
+            let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
+            let mut result = handle_notification_with_control(
                 &UnusedProtocolSender,
                 &mut workspace,
                 notification,
                 workspace_folders_supported,
                 push_diagnostics_supported,
                 Some(&worker_cancellation),
+                Some(&budget),
             );
+            if budget.is_exhausted() && !budget.is_cancelled() {
+                let open_uris = workspace.invalidate_for_reconciliation_budget(&budget);
+                let mut effect = DiagnosticNotificationEffect::default();
+                effect.request_refresh();
+                for uri in open_uris {
+                    effect.cancel_uri(uri.clone());
+                    effect.refresh_uri(uri);
+                }
+                result = Ok(effect);
+            }
             #[cfg(feature = "test-support")]
             if std::env::var_os("PASCAL_LSP_TEST_PANIC_FILE_WORKER").is_some() {
                 panic!("injected file-notification worker panic");
@@ -7898,6 +7993,13 @@ fn spawn_workspace_file_notification(
             #[cfg(feature = "test-support")]
             if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_FILE_WORKER_COMPLETED") {
                 let _ = std::fs::write(path, b"completed");
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT") {
+                let _ = std::fs::write(
+                    path,
+                    serde_json::to_vec(&budget.metrics(budget.is_exhausted())).unwrap_or_default(),
+                );
             }
         })
         .expect("failed to start serialized workspace mutation worker");
@@ -9587,6 +9689,26 @@ fn handle_notification_with_cancel(
     push_diagnostics_supported: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<DiagnosticNotificationEffect, String> {
+    handle_notification_with_control(
+        connection,
+        workspace,
+        notification,
+        workspace_folders_supported,
+        push_diagnostics_supported,
+        cancel,
+        None,
+    )
+}
+
+fn handle_notification_with_control(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    notification: Notification,
+    workspace_folders_supported: bool,
+    push_diagnostics_supported: bool,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<DiagnosticNotificationEffect, String> {
     match notification.method.as_str() {
         "initialized" => Ok(DiagnosticNotificationEffect::default()),
         "textDocument/didOpen" => {
@@ -9603,8 +9725,8 @@ fn handle_notification_with_cancel(
                     error
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.refresh_uri(uri.clone());
-            effect.refresh_dependents(workspace, &uri, false);
+            effect.refresh_uri_with_budget(uri.clone(), budget)?;
+            effect.refresh_dependents_with_control(workspace, &uri, false, cancel, budget)?;
             // Opening another root can change the ownership set for a shared
             // include even when no source dependency changed.  Recompute roots
             // that have already published a context-sensitive semantic claim;
@@ -9625,9 +9747,11 @@ fn handle_notification_with_cancel(
                             format!("{error}; a full-document replacement is required"),
                         ) {
                             let mut effect = DiagnosticNotificationEffect::default();
-                            effect.cancel_uri(uri.clone());
-                            effect.refresh_uri(uri.clone());
-                            effect.refresh_dependents(workspace, &uri, false);
+                            effect.cancel_uri_with_budget(uri.clone(), budget)?;
+                            effect.refresh_uri_with_budget(uri.clone(), budget)?;
+                            effect.refresh_dependents_with_control(
+                                workspace, &uri, false, cancel, budget,
+                            )?;
                             return Ok(effect);
                         }
                     }
@@ -9646,10 +9770,10 @@ fn handle_notification_with_cancel(
                     error
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.refresh_uri(uri.clone());
-            effect.refresh_dependents(workspace, &uri, false);
+            effect.refresh_uri_with_budget(uri.clone(), budget)?;
+            effect.refresh_dependents_with_control(workspace, &uri, false, cancel, budget)?;
             for open_uri in workspace.open_document_uris() {
-                effect.refresh_uri(open_uri);
+                effect.refresh_uri_with_budget(open_uri, budget)?;
             }
             Ok(effect)
         }
@@ -9663,10 +9787,10 @@ fn handle_notification_with_cancel(
                     error
                 })?;
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.refresh_uri(uri.clone());
-            effect.refresh_dependents(workspace, &uri, true);
+            effect.refresh_uri_with_budget(uri.clone(), budget)?;
+            effect.refresh_dependents_with_control(workspace, &uri, true, cancel, budget)?;
             for open_uri in workspace.open_document_uris() {
-                effect.refresh_uri(open_uri);
+                effect.refresh_uri_with_budget(open_uri, budget)?;
             }
             Ok(effect)
         }
@@ -9695,12 +9819,12 @@ fn handle_notification_with_cancel(
                 }
             }
             let mut effect = DiagnosticNotificationEffect::default();
-            effect.cancel_uri(uri.clone());
+            effect.cancel_uri_with_budget(uri.clone(), budget)?;
             if closed {
                 effect.request_refresh();
-                effect.refresh_dependents(workspace, &uri, true);
+                effect.refresh_dependents_with_control(workspace, &uri, true, cancel, budget)?;
                 for open_uri in workspace.open_document_uris() {
-                    effect.refresh_uri(open_uri);
+                    effect.refresh_uri_with_budget(open_uri, budget)?;
                 }
             }
             Ok(effect)
@@ -9744,13 +9868,18 @@ fn handle_notification_with_cancel(
                 );
                 return Ok(invalidate_for_file_notification_overflow(workspace));
             }
+            if let Some(budget) = budget {
+                for (uri, kind) in &changes {
+                    budget.record_file_event(uri.clone(), *kind);
+                }
+            }
             let mut effect = DiagnosticNotificationEffect::default();
             for (changed_uri, kind) in changes {
                 if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
                     return Err(rename::CANCELLATION_MESSAGE.to_string());
                 }
-                for uri in workspace.file_event_with_cancel(&changed_uri, kind, cancel)? {
-                    effect.refresh_uri(uri);
+                for uri in workspace.file_event_with_control(&changed_uri, kind, cancel, budget)? {
+                    effect.refresh_uri_with_budget(uri, budget)?;
                 }
                 if !push_diagnostics_supported {
                     // Pull clients must be told about watched changes even
@@ -9758,9 +9887,15 @@ fn handle_notification_with_cancel(
                     // the legacy push publication map.  Push clients keep
                     // the historical affected-open/dependent set so a
                     // configuration file is not itself analyzed as Pascal.
-                    effect.refresh_uri(changed_uri.clone());
+                    effect.refresh_uri_with_budget(changed_uri.clone(), budget)?;
                 }
-                effect.refresh_dependents(workspace, &changed_uri, true);
+                effect.refresh_dependents_with_control(
+                    workspace,
+                    &changed_uri,
+                    true,
+                    cancel,
+                    budget,
+                )?;
             }
             Ok(effect)
         }
@@ -9807,6 +9942,18 @@ fn handle_notification_with_cancel(
                 );
                 return Ok(invalidate_for_file_notification_overflow(workspace));
             }
+            if let Some(budget) = budget {
+                for uri in &uris {
+                    budget.record_file_event(
+                        uri.clone(),
+                        if created {
+                            FileChange::Created
+                        } else {
+                            FileChange::Deleted
+                        },
+                    );
+                }
+            }
             let mut effect = DiagnosticNotificationEffect::default();
             for uri in uris {
                 if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
@@ -9817,11 +9964,11 @@ fn handle_notification_with_cancel(
                 } else {
                     FileChange::Deleted
                 };
-                for affected in workspace.file_event_with_cancel(&uri, change, cancel)? {
-                    effect.refresh_uri(affected);
+                for affected in workspace.file_event_with_control(&uri, change, cancel, budget)? {
+                    effect.refresh_uri_with_budget(affected, budget)?;
                 }
-                effect.refresh_uri(uri.clone());
-                effect.refresh_dependents(workspace, &uri, true);
+                effect.refresh_uri_with_budget(uri.clone(), budget)?;
+                effect.refresh_dependents_with_control(workspace, &uri, true, cancel, budget)?;
             }
             Ok(effect)
         }
@@ -9885,18 +10032,26 @@ fn handle_notification_with_cancel(
                 );
                 return Ok(invalidate_for_file_notification_overflow(workspace));
             }
+            if let Some(budget) = budget {
+                for (old_uri, new_uri) in &renames {
+                    budget.record_file_event(old_uri.clone(), FileChange::Deleted);
+                    budget.record_file_event(new_uri.clone(), FileChange::Created);
+                }
+            }
             let mut effect = DiagnosticNotificationEffect::default();
             for (old_uri, new_uri) in renames {
                 if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
                     return Err(rename::CANCELLATION_MESSAGE.to_string());
                 }
                 for affected in workspace.did_rename_file_with_cancel(&old_uri, &new_uri, cancel)? {
-                    effect.refresh_uri(affected);
+                    effect.refresh_uri_with_budget(affected, budget)?;
                 }
-                effect.refresh_uri(old_uri.clone());
-                effect.refresh_uri(new_uri.clone());
-                effect.refresh_dependents(workspace, &old_uri, true);
-                effect.refresh_dependents(workspace, &new_uri, true);
+                effect.refresh_uri_with_budget(old_uri.clone(), budget)?;
+                effect.refresh_uri_with_budget(new_uri.clone(), budget)?;
+                effect
+                    .refresh_dependents_with_control(workspace, &old_uri, true, cancel, budget)?;
+                effect
+                    .refresh_dependents_with_control(workspace, &new_uri, true, cancel, budget)?;
             }
             Ok(effect)
         }

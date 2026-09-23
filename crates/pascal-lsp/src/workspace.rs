@@ -27,6 +27,7 @@ use pascal_project::{
     selected_project_is_current, selected_project_is_current_with_cancel,
 };
 use serde::Deserialize;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -973,6 +974,195 @@ pub enum FileChange {
     Created,
     Changed,
     Deleted,
+}
+
+const MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS: usize = 65_536;
+const MAX_NOTIFICATION_RECONCILIATION_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NOTIFICATION_RECONCILIATION_INDEX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NOTIFICATION_RECONCILIATION_DEPENDENCY_EDGES: usize = 65_536;
+const MAX_NOTIFICATION_DIAGNOSTIC_RECORD_CHECKS: usize = 2_048;
+const MAX_NOTIFICATION_DIAGNOSTIC_TARGETS: usize = 4_096;
+const MAX_NOTIFICATION_DIAGNOSTIC_URI_BYTES: usize = 256 * 1024;
+const NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED: &str =
+    "workspace notification reconciliation work budget exceeded";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReconciliationWorkUsed {
+    filesystem_path_visits: usize,
+    file_bytes_read: usize,
+    indexed_source_bytes: usize,
+    dependency_edges: usize,
+    diagnostic_record_checks: usize,
+    unique_diagnostic_targets: usize,
+    diagnostic_uri_bytes: usize,
+}
+
+/// One shared work/cancellation account for a single file-notification batch.
+/// The notification worker is the only writer; `Cell` keeps accounting local
+/// without adding synchronization to each inner-loop charge.
+pub(crate) struct ReconciliationBudget {
+    cancellation: std::sync::Arc<AtomicBool>,
+    used: Cell<ReconciliationWorkUsed>,
+    exhausted: Cell<bool>,
+    deleted_uris: RefCell<HashSet<Url>>,
+}
+
+impl ReconciliationBudget {
+    pub(crate) fn new(cancellation: std::sync::Arc<AtomicBool>) -> Self {
+        Self {
+            cancellation,
+            used: Cell::new(ReconciliationWorkUsed::default()),
+            exhausted: Cell::new(false),
+            deleted_uris: RefCell::new(HashSet::new()),
+        }
+    }
+
+    fn charge(
+        &self,
+        current: usize,
+        amount: usize,
+        limit: usize,
+        update: impl FnOnce(&mut ReconciliationWorkUsed, usize),
+    ) -> Result<(), String> {
+        if self.cancellation.load(Ordering::Relaxed) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if self.exhausted.get() {
+            return Err(NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_string());
+        }
+        let Some(next) = current.checked_add(amount).filter(|next| *next <= limit) else {
+            self.exhausted.set(true);
+            return Err(NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_string());
+        };
+        let mut used = self.used.get();
+        update(&mut used, next);
+        self.used.set(used);
+        Ok(())
+    }
+
+    pub(crate) fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+        self.charge(
+            self.used.get().filesystem_path_visits,
+            amount,
+            MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
+            |used, next| used.filesystem_path_visits = next,
+        )
+    }
+
+    pub(crate) fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
+        self.charge(
+            self.used.get().file_bytes_read,
+            amount,
+            MAX_NOTIFICATION_RECONCILIATION_FILE_BYTES,
+            |used, next| used.file_bytes_read = next,
+        )
+    }
+
+    fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {
+        if self.cancellation.load(Ordering::Relaxed) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if self.exhausted.get() {
+            return Err(NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_string());
+        }
+        if self
+            .used
+            .get()
+            .file_bytes_read
+            .checked_add(max_bytes)
+            .is_none_or(|total| total > MAX_NOTIFICATION_RECONCILIATION_FILE_BYTES)
+        {
+            self.exhausted.set(true);
+            return Err(NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn charge_indexed_bytes(&self, amount: usize) -> Result<(), String> {
+        self.charge(
+            self.used.get().indexed_source_bytes,
+            amount,
+            MAX_NOTIFICATION_RECONCILIATION_INDEX_BYTES,
+            |used, next| used.indexed_source_bytes = next,
+        )
+    }
+
+    pub(crate) fn charge_dependency_edges(&self, amount: usize) -> Result<(), String> {
+        self.charge(
+            self.used.get().dependency_edges,
+            amount,
+            MAX_NOTIFICATION_RECONCILIATION_DEPENDENCY_EDGES,
+            |used, next| used.dependency_edges = next,
+        )
+    }
+
+    pub(crate) fn charge_diagnostic_check(&self) -> Result<(), String> {
+        self.charge(
+            self.used.get().diagnostic_record_checks,
+            1,
+            MAX_NOTIFICATION_DIAGNOSTIC_RECORD_CHECKS,
+            |used, next| used.diagnostic_record_checks = next,
+        )
+    }
+
+    pub(crate) fn charge_diagnostic_target(&self, uri: &Url) -> Result<(), String> {
+        let next_bytes = self
+            .used
+            .get()
+            .diagnostic_uri_bytes
+            .checked_add(uri.as_str().len())
+            .filter(|next| *next <= MAX_NOTIFICATION_DIAGNOSTIC_URI_BYTES);
+        let Some(next_bytes) = next_bytes else {
+            self.exhausted.set(true);
+            return Err(NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED.to_string());
+        };
+        let used = self.used.get();
+        self.charge(
+            used.unique_diagnostic_targets,
+            1,
+            MAX_NOTIFICATION_DIAGNOSTIC_TARGETS,
+            |used, next| {
+                used.unique_diagnostic_targets = next;
+                used.diagnostic_uri_bytes = next_bytes;
+            },
+        )
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_file_event(&self, uri: Url, change: FileChange) {
+        let mut deleted = self.deleted_uris.borrow_mut();
+        if matches!(change, FileChange::Deleted) {
+            deleted.insert(uri);
+        } else {
+            deleted.remove(&uri);
+        }
+    }
+
+    pub(crate) fn deleted_uris(&self) -> HashSet<Url> {
+        self.deleted_uris.borrow().clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn metrics(&self, budget_exceeded: bool) -> serde_json::Value {
+        let used = self.used.get();
+        serde_json::json!({
+            "filesystem_path_visits": used.filesystem_path_visits,
+            "file_bytes_read": used.file_bytes_read,
+            "indexed_source_bytes": used.indexed_source_bytes,
+            "dependency_edges": used.dependency_edges,
+            "diagnostic_record_checks": used.diagnostic_record_checks,
+            "unique_targets": used.unique_diagnostic_targets,
+            "diagnostic_uri_bytes": used.diagnostic_uri_bytes,
+            "budget_exceeded": budget_exceeded,
+        })
+    }
 }
 
 fn expected_renamed_document_text(
@@ -2518,7 +2708,20 @@ impl Workspace {
         change: FileChange,
         cancel: Option<&AtomicBool>,
     ) -> Result<Vec<Url>, String> {
+        self.file_event_with_control(uri, change, cancel, None)
+    }
+
+    pub(crate) fn file_event_with_control(
+        &mut self,
+        uri: &Url,
+        change: FileChange,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         let mut diagnostic_uris = Vec::new();
         let override_changed = uri
             .to_file_path()
@@ -2560,7 +2763,7 @@ impl Workspace {
         match change {
             FileChange::Deleted => self.remove_indexed(uri),
             FileChange::Created | FileChange::Changed => {
-                self.refresh_loaded_disk_with_cancel(uri, cancel)?
+                self.refresh_loaded_disk_with_control(uri, cancel, budget)?
             }
         }
         Ok(diagnostic_uris)
@@ -2631,6 +2834,18 @@ impl Workspace {
         let open_uris = self.open_documents.keys().cloned().collect::<Vec<_>>();
         for uri in &open_uris {
             self.schedule_diagnostics(uri.clone());
+        }
+        open_uris
+    }
+
+    pub(crate) fn invalidate_for_reconciliation_budget(
+        &mut self,
+        budget: &ReconciliationBudget,
+    ) -> Vec<Url> {
+        let deleted_uris = budget.deleted_uris();
+        let open_uris = self.invalidate_all_for_file_notification_overflow();
+        for uri in deleted_uris {
+            self.remember_deleted(&uri);
         }
         open_uris
     }
@@ -3043,6 +3258,35 @@ impl Workspace {
             .collect::<Vec<_>>()
     }
 
+    pub(crate) fn visit_diagnostic_dependents_for_change(
+        &self,
+        changed_uri: &Url,
+        include_parent: bool,
+        cancel: Option<&AtomicBool>,
+        budget: &ReconciliationBudget,
+        mut visit: impl FnMut(&Url) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for (consumer, records) in &self.diagnostic_dependencies {
+            check_workspace_cancel(cancel)?;
+            if !self.open_documents.contains_key(consumer) {
+                continue;
+            }
+            let mut matches = false;
+            for record in records {
+                budget.charge_dependency_edges(1)?;
+                budget.charge_diagnostic_check()?;
+                if source_record_matches_change(record, changed_uri, include_parent) {
+                    matches = true;
+                    break;
+                }
+            }
+            if matches {
+                visit(consumer)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_document_uris(&self) -> Vec<Url> {
         self.open_documents.keys().cloned().collect()
     }
@@ -3423,6 +3667,15 @@ impl Workspace {
         uri: &Url,
         cancel: Option<&AtomicBool>,
     ) -> Result<(), String> {
+        self.refresh_loaded_disk_with_control(uri, cancel, None)
+    }
+
+    fn refresh_loaded_disk_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
         #[cfg(feature = "test-support")]
         wait_at_file_discovery_test_barrier(cancel)?;
         check_workspace_cancel(cancel)?;
@@ -3431,7 +3684,9 @@ impl Workspace {
             return Ok(());
         };
         let pins = HashSet::new();
-        if let Err(error) = self.load_source_with_cancel(uri, &context_key, &pins, cancel) {
+        if let Err(error) =
+            self.load_source_with_reconciliation_budget(uri, &context_key, &pins, cancel, budget)
+        {
             if error == "request cancelled" {
                 return Err(error);
             }
@@ -3765,13 +4020,25 @@ impl Workspace {
         pinned: &HashSet<Url>,
         cancel: Option<&AtomicBool>,
     ) -> Result<bool, String> {
-        self.load_source_with_legacy_sibling_with_cancel(
+        self.load_source_with_reconciliation_budget(uri, context_key, pinned, cancel, None)
+    }
+
+    fn load_source_with_reconciliation_budget(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
+        self.load_source_with_legacy_sibling_with_budget(
             uri,
             context_key,
             pinned,
             None,
             false,
             cancel,
+            budget,
         )
     }
 
@@ -3801,6 +4068,30 @@ impl Workspace {
         legacy_sibling_directory: Option<&Path>,
         legacy_search_path_route: bool,
         cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        self.load_source_with_legacy_sibling_with_budget(
+            uri,
+            context_key,
+            pinned,
+            legacy_sibling_directory,
+            legacy_search_path_route,
+            cancel,
+            None,
+        )
+    }
+
+    // Keep the existing load context explicit; batch control is intentionally
+    // optional so non-notification callers retain their current behavior.
+    #[allow(clippy::too_many_arguments)]
+    fn load_source_with_legacy_sibling_with_budget(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        legacy_sibling_directory: Option<&Path>,
+        legacy_search_path_route: bool,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
         check_workspace_cancel(cancel)?;
         let path = match uri.to_file_path() {
@@ -3936,13 +4227,14 @@ impl Workspace {
             }
             return Ok(true);
         }
-        let source = match read_disk_source_with_cancel(
+        let source = match read_disk_source_with_budget(
             &path,
             self.options.limits.max_file_bytes,
             &context.read_policy,
             &entry,
             verified_legacy_payload,
             cancel,
+            budget,
         ) {
             Ok(source) => source,
             Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
@@ -3958,13 +4250,14 @@ impl Workspace {
             stamp,
             content_hash,
         } = source;
-        let indexed = self.index_source_with_cancel(
+        let indexed = self.index_source_with_budget(
             uri,
             text.clone(),
             Some(bytes),
             context_key,
             pinned,
             cancel,
+            budget,
         )?;
         if indexed {
             self.disk_stamps.insert(uri.clone(), stamp.clone());
@@ -4003,6 +4296,20 @@ impl Workspace {
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
         cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        self.index_source_with_budget(uri, source, disk_size, context_key, pinned, cancel, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn index_source_with_budget(
+        &mut self,
+        uri: &Url,
+        source: String,
+        disk_size: Option<usize>,
+        context_key: &ContextKey,
+        pinned: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<bool, String> {
         check_workspace_cancel(cancel)?;
         let size = disk_size.unwrap_or(source.len());
@@ -4050,6 +4357,9 @@ impl Workspace {
             || source.clone(),
             |expansion| expansion.expanded.text().to_owned(),
         );
+        if let Some(budget) = budget {
+            budget.charge_indexed_bytes(indexed_source.len())?;
+        }
         let cached = self
             .cached_documents
             .get(uri)
@@ -8898,7 +9208,31 @@ fn read_disk_source_with_cancel(
     allow_legacy_payload: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<DiskSource, String> {
+    read_disk_source_with_budget(
+        path,
+        max_bytes,
+        read_policy,
+        entry,
+        allow_legacy_payload,
+        cancel,
+        None,
+    )
+}
+
+fn read_disk_source_with_budget(
+    path: &Path,
+    max_bytes: usize,
+    read_policy: &pascal_project::ReadPolicy,
+    entry: &ProjectPathEntry,
+    allow_legacy_payload: bool,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<DiskSource, String> {
     check_workspace_cancel(cancel)?;
+    if let Some(budget) = budget {
+        budget.ensure_file_read_fits(max_bytes)?;
+        budget.charge_path_visits(1)?;
+    }
     let link_metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     let is_symlink = link_metadata.file_type().is_symlink();
@@ -8909,6 +9243,9 @@ fn read_disk_source_with_cancel(
         ));
     }
     let metadata = if is_symlink {
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         fs::metadata(path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
     } else {
         link_metadata
@@ -8931,6 +9268,9 @@ fn read_disk_source_with_cancel(
     }
     .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     check_workspace_cancel(cancel)?;
+    if let Some(budget) = budget {
+        budget.charge_file_bytes(bytes.len())?;
+    }
     let text = resolver::decode_source_bytes(&bytes);
     if text.len() > max_bytes {
         return Err(format!(

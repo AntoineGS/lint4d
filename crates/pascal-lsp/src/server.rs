@@ -110,6 +110,7 @@ const MAX_DIAGNOSTIC_RELATED_CONTRIBUTIONS: usize = MAX_DIAGNOSTIC_RESULT_ENTRIE
 const MAX_DIAGNOSTIC_REPORT_ITEMS: usize = 10_000;
 const MAX_DIAGNOSTIC_REPORT_BYTES: usize = 7 * 1024 * 1024;
 const MAX_DIAGNOSTIC_REPORT_ITEM_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_DISPATCHES_PER_TURN: usize = 64;
 /// Progress is deliberately smaller than the analysis recipient bound.  A
 /// client can attach many request recipients to one computation, but progress
 /// state must not become an alternate unbounded queue.
@@ -2412,6 +2413,7 @@ struct DiagnosticNotificationEffect {
     refresh_membership: HashSet<Url>,
     cancel_membership: HashSet<Url>,
     refresh_requested: bool,
+    refresh_all_diagnostics: bool,
 }
 
 impl DiagnosticNotificationEffect {
@@ -2423,6 +2425,11 @@ impl DiagnosticNotificationEffect {
         if self.refresh_membership.insert(uri.clone()) {
             self.refresh.push(uri);
         }
+    }
+
+    fn refresh_all_diagnostics(&mut self) {
+        self.refresh_all_diagnostics = true;
+        self.refresh_requested = true;
     }
 
     fn cancel_uri(&mut self, uri: Url) {
@@ -5885,6 +5892,17 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    fn cancel_all_diagnostics_with_connection(
+        &mut self,
+        connection: Option<&dyn ProtocolSender>,
+    ) -> Result<(), String> {
+        // Active/queued analysis is already capped by MAX_ANALYSIS_JOBS; this
+        // vector is bounded by that admission ceiling, unlike the workspace's
+        // open-document set.
+        let uris = self.diagnostic_jobs.keys().cloned().collect::<Vec<_>>();
+        self.cancel_diagnostics_for_with_connection(connection, &uris)
+    }
+
     fn refresh_diagnostics_with_connection(
         &mut self,
         connection: &dyn ProtocolSender,
@@ -8030,13 +8048,9 @@ fn spawn_workspace_file_notification(
                 Some(&budget),
             );
             if budget.is_exhausted() && !budget.is_cancelled() {
-                let open_uris = workspace.invalidate_for_reconciliation_budget(&budget);
+                workspace.invalidate_for_reconciliation_budget(&budget);
                 let mut effect = DiagnosticNotificationEffect::default();
-                effect.request_refresh();
-                for uri in open_uris {
-                    effect.cancel_uri(uri.clone());
-                    effect.refresh_uri(uri);
-                }
+                effect.refresh_all_diagnostics();
                 result = Ok(effect);
             }
             #[cfg(feature = "test-support")]
@@ -8162,14 +8176,9 @@ fn event_loop(
                         eprintln!(
                             "pascal-lsp: workspace notification reconciliation exceeded its deadline; invalidating partial state"
                         );
-                        let open_uris =
-                            completed_workspace.invalidate_for_reconciliation_budget(&budget);
+                        completed_workspace.invalidate_for_reconciliation_budget(&budget);
                         let mut effect = DiagnosticNotificationEffect::default();
-                        effect.request_refresh();
-                        for uri in open_uris {
-                            effect.cancel_uri(uri.clone());
-                            effect.refresh_uri(uri);
-                        }
+                        effect.refresh_all_diagnostics();
                         result = Ok(effect);
                     }
                     *workspace = completed_workspace;
@@ -8181,21 +8190,28 @@ fn event_loop(
                                 diagnostic_refresh.request(connection)?;
                             }
                             if !pull_diagnostics_supported {
-                                jobs.cancel_diagnostics_for_with_connection(
-                                    Some(connection),
-                                    &effect.cancel,
-                                )
-                                .map_err(
-                                    |error| -> Box<dyn Error + Send + Sync> { error.into() },
-                                )?;
-                                jobs.refresh_diagnostics_with_connection(
-                                    connection,
-                                    workspace,
-                                    &effect.refresh,
-                                )
-                                .map_err(
-                                    |error| -> Box<dyn Error + Send + Sync> { error.into() },
-                                )?;
+                                if effect.refresh_all_diagnostics {
+                                    jobs.cancel_all_diagnostics_with_connection(Some(connection))
+                                        .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                            error.into()
+                                        })?;
+                                } else {
+                                    jobs.cancel_diagnostics_for_with_connection(
+                                        Some(connection),
+                                        &effect.cancel,
+                                    )
+                                    .map_err(
+                                        |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                                    )?;
+                                    jobs.refresh_diagnostics_with_connection(
+                                        connection,
+                                        workspace,
+                                        &effect.refresh,
+                                    )
+                                    .map_err(
+                                        |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                                    )?;
+                                }
                             }
                         }
                         Err(error) => {
@@ -9753,12 +9769,9 @@ fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), Stri
 fn invalidate_for_file_notification_overflow(
     workspace: &mut Workspace,
 ) -> DiagnosticNotificationEffect {
+    workspace.invalidate_all_for_file_notification_overflow_bounded();
     let mut effect = DiagnosticNotificationEffect::default();
-    effect.request_refresh();
-    for uri in workspace.invalidate_all_for_file_notification_overflow() {
-        effect.cancel_uri(uri.clone());
-        effect.refresh_uri(uri);
-    }
+    effect.refresh_all_diagnostics();
     effect
 }
 
@@ -10193,7 +10206,9 @@ fn publish_due_diagnostics(
     workspace: &mut Workspace,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    for (uri, version) in workspace.take_due_diagnostic_requests() {
+    for (uri, version) in
+        workspace.take_due_diagnostic_requests_limited(MAX_DIAGNOSTIC_DISPATCHES_PER_TURN)
+    {
         if let Err(error) = jobs.start_diagnostics(uri.clone(), workspace) {
             if error == ANALYSIS_QUEUE_FULL_MESSAGE {
                 workspace.retry_diagnostics(uri);

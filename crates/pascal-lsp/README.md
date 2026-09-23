@@ -1248,15 +1248,22 @@ of bytes indexed through that refresh path, 65,536 inspected dependency records,
 diagnostic-record comparisons, 4,096 diagnostic targets, and 256 KiB of target
 URI bytes. Exceeding a charged ceiling abandons partial derived state, performs
 the conservative global invalidation, preserves the final delete tombstones
-from the notification, and schedules diagnostics for open documents. Test
-support exposes the charged counters independently.
+from the notification, and schedules diagnostics for open documents. Recovery
+reserves capacity for at most 10,000 tracked open-document URIs, with each URI
+limited to 4 KiB. Budget/deadline fallback does not materialize that full URI
+set in the worker effect; push-mode diagnostic work is dispatched at most 64
+documents per protocol turn, while the existing per-report and outbound writer
+queues retain their byte/message caps. Test support exposes normal-work and
+recovery-reserve counters independently.
 
-These ceilings are not yet a global actual-work bound: project/context and
-package discovery, include candidate-search observations, rename transition
-validation, some filesystem metadata work, and invalidation/refresh output loops
-are not all charged to the shared account. Resolved nested include file reads
-are charged, but that does not bound the directory/candidate search performed
-to find them. Cancellation is checked at
+These ceilings are not yet a global actual-work bound: override configuration
+reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,
+rename transition validation, and some project metadata work are not all
+charged to the shared account. Project metadata reads use a streaming per-file
+limit to reject growth after a pre-read stamp, but this does not make every
+metadata/candidate path part of the common work account. Resolved nested include
+file reads are charged, but that does not bound the directory/candidate search
+performed to find them. Cancellation is checked at
 existing cooperative checkpoints, but synchronous filesystem calls themselves
 cannot be interrupted. The stdio reader also has a bounded priority lane for
 `shutdown`, `exit`, and `$/cancelRequest` when a control frame is read while the

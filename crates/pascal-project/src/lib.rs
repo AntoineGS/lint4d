@@ -1851,6 +1851,8 @@ thread_local! {
         std::cell::RefCell<Option<ProjectReadHook>> = std::cell::RefCell::new(None);
     static TEST_AFTER_PROJECT_READ_AT:
         std::cell::RefCell<Option<(PathBuf, ProjectReadHook)>> = std::cell::RefCell::new(None);
+    static TEST_BEFORE_PROJECT_READ_AT:
+        std::cell::RefCell<Option<(PathBuf, ProjectReadHook)>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1893,6 +1895,26 @@ impl Drop for TestAfterProjectReadGuard {
 pub struct TestAfterProjectReadAtGuard(Option<(PathBuf, ProjectReadHook)>);
 
 #[cfg(any(test, feature = "test-support"))]
+pub struct TestBeforeProjectReadAtGuard(Option<(PathBuf, ProjectReadHook)>);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_before_project_read_at(
+    path: PathBuf,
+    hook: impl FnOnce(&Path) + 'static,
+) -> TestBeforeProjectReadAtGuard {
+    let previous =
+        TEST_BEFORE_PROJECT_READ_AT.with(|slot| slot.borrow_mut().replace((path, Box::new(hook))));
+    TestBeforeProjectReadAtGuard(previous)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestBeforeProjectReadAtGuard {
+    fn drop(&mut self) {
+        TEST_BEFORE_PROJECT_READ_AT.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_after_project_read_at(
     path: PathBuf,
     hook: impl FnOnce(&Path) + 'static,
@@ -1927,8 +1949,25 @@ fn run_after_project_read(path: &Path) {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn run_before_project_read(path: &Path) {
+    let targeted_hook = TEST_BEFORE_PROJECT_READ_AT.with(|slot| {
+        let matches = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| target == path);
+        matches.then(|| slot.borrow_mut().take()).flatten()
+    });
+    if let Some((_, hook)) = targeted_hook {
+        hook(path);
+    }
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_after_project_read(_path: &Path) {}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_before_project_read(_path: &Path) {}
 
 fn normalize_workspace_roots(
     roots: &[PathBuf],
@@ -4075,7 +4114,8 @@ fn read_bounded_with_tracker(
         budget.ensure_file_read_fits(estimate)?;
         budget.check_cancelled()?;
     }
-    let bytes = fs::read(path).map_err(|error| format!("could not read file: {error}"))?;
+    run_before_project_read(path);
+    let bytes = read_file_limited(path, stamp.bytes)?;
     run_after_project_read(path);
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
@@ -4097,9 +4137,30 @@ fn read_bounded_bytes(path: &Path, limit: u64) -> Result<BoundedRead, String> {
             stamp.bytes, limit
         ));
     }
-    let bytes = fs::read(path).map_err(|error| format!("could not read file: {error}"))?;
+    let bytes = read_file_limited(path, limit)?;
     run_after_project_read(path);
     Ok(BoundedRead { stamp, bytes })
+}
+
+fn read_file_limited(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|error| format!("could not read file: {error}"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("could not inspect opened file: {error}"))?
+        .is_file()
+    {
+        return Err("opened metadata path is not a regular file".to_string());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read file: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(format!(
+            "metadata file grew beyond the {limit} byte read limit"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn read_payload_with_tracker(
@@ -4132,7 +4193,7 @@ fn read_payload_with_tracker(
         budget.ensure_file_read_fits(estimate)?;
         budget.check_cancelled()?;
     }
-    let bytes = read_policy.read_payload_bytes(entry, limit)?;
+    let bytes = read_policy.read_payload_bytes(entry, stamp.bytes.min(limit))?;
     run_after_project_read(&entry.path);
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;
@@ -6462,7 +6523,8 @@ mod tests {
         MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES, MetadataObservation,
         ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectReadStamp,
         ProjectReadTracker, ReadPolicy, content_hash_bytes, path_stamp_result,
-        project_candidate_membership, read_package_metadata, test_cancel_project_scan_after_checks,
+        project_candidate_membership, read_bounded_with_tracker, read_package_metadata,
+        test_before_project_read_at, test_cancel_project_scan_after_checks,
     };
     use crate::delphi_overrides::OverrideSession;
     use std::fs;
@@ -6556,6 +6618,30 @@ mod tests {
         assert_eq!(
             discovery.observations[0].content_bytes,
             Some(b"first".to_vec())
+        );
+    }
+
+    #[test]
+    fn project_metadata_reader_rejects_growth_after_pre_read_stamp() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("App.dproj");
+        fs::write(&path, b"small").expect("initial descriptor");
+        // Stay below the per-file limit so this specifically proves that the
+        // pre-read budget estimate, rather than only the coarse file ceiling,
+        // bounds bytes consumed after a same-path growth race.
+        let replacement = b"x".repeat(20);
+        let replacement_for_hook = replacement.clone();
+        let _hook = test_before_project_read_at(path.clone(), move |path| {
+            fs::write(path, replacement_for_hook).expect("grow descriptor after stamp");
+        });
+        let mut tracker = ProjectReadTracker::default();
+
+        let error = read_bounded_with_tracker(&path, 32, &mut tracker)
+            .expect_err("metadata growth between stamp and read must not bypass the byte cap");
+
+        assert!(
+            error.contains("exceed") || error.contains("limit"),
+            "unexpected bounded-read error: {error}"
         );
     }
 

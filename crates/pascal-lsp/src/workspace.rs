@@ -52,6 +52,8 @@ pub(crate) mod resolver;
 pub const MAX_TREE_DEPTH: usize = 256;
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_FILES: usize = 10_000;
+const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
+const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
@@ -985,6 +987,9 @@ const MAX_NOTIFICATION_RECONCILIATION_DEPENDENCY_EDGES: usize = 65_536;
 const MAX_NOTIFICATION_DIAGNOSTIC_RECORD_CHECKS: usize = 2_048;
 const MAX_NOTIFICATION_DIAGNOSTIC_TARGETS: usize = 4_096;
 const MAX_NOTIFICATION_DIAGNOSTIC_URI_BYTES: usize = 256 * 1024;
+const MAX_NOTIFICATION_RECOVERY_TARGETS: usize = DEFAULT_MAX_FILES;
+const MAX_NOTIFICATION_RECOVERY_URI_BYTES: usize =
+    MAX_NOTIFICATION_RECOVERY_TARGETS * MAX_OPEN_DOCUMENT_URI_BYTES;
 const NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED: &str =
     "workspace notification reconciliation work budget exceeded";
 
@@ -1008,6 +1013,8 @@ pub(crate) struct ReconciliationBudget {
     exhausted: Cell<bool>,
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
+    recovery_target_reserve: Cell<usize>,
+    recovery_uri_byte_reserve: Cell<usize>,
 }
 
 impl ReconciliationBudget {
@@ -1018,6 +1025,8 @@ impl ReconciliationBudget {
             exhausted: Cell::new(false),
             deleted_uris: RefCell::new(HashSet::new()),
             rename_endpoints: RefCell::new(HashSet::new()),
+            recovery_target_reserve: Cell::new(0),
+            recovery_uri_byte_reserve: Cell::new(0),
         }
     }
 
@@ -1161,6 +1170,17 @@ impl ReconciliationBudget {
         self.rename_endpoints.borrow().clone()
     }
 
+    pub(crate) fn reserve_recovery_envelope(&self) {
+        // Recovery remains available after normal-work exhaustion or
+        // cancellation. Its maximum is derived from Workspace's admitted
+        // open-document count and URI length limits, and is recorded before
+        // the invalidation path traverses those documents.
+        self.recovery_target_reserve
+            .set(MAX_NOTIFICATION_RECOVERY_TARGETS);
+        self.recovery_uri_byte_reserve
+            .set(MAX_NOTIFICATION_RECOVERY_URI_BYTES);
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn metrics(&self, budget_exceeded: bool) -> serde_json::Value {
         let used = self.used.get();
@@ -1172,6 +1192,8 @@ impl ReconciliationBudget {
             "diagnostic_record_checks": used.diagnostic_record_checks,
             "unique_targets": used.unique_diagnostic_targets,
             "diagnostic_uri_bytes": used.diagnostic_uri_bytes,
+            "recovery_target_reserve": self.recovery_target_reserve.get(),
+            "recovery_uri_byte_reserve": self.recovery_uri_byte_reserve.get(),
             "budget_exceeded": budget_exceeded,
         })
     }
@@ -2329,6 +2351,19 @@ impl Workspace {
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
+        if !self.open_documents.contains_key(&uri)
+            && self.open_documents.len() >= MAX_OPEN_DOCUMENTS
+        {
+            return Err(format!(
+                "open document tracking limit ({MAX_OPEN_DOCUMENTS}) reached"
+            ));
+        }
+        if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+            return Err(format!(
+                "document URI is {} bytes; the notification recovery limit is {MAX_OPEN_DOCUMENT_URI_BYTES} bytes",
+                uri.as_str().len()
+            ));
+        }
         if !self.open_documents.contains_key(&uri) {
             let preserve_mapped_owner =
                 uri.to_file_path()
@@ -2644,6 +2679,18 @@ impl Workspace {
         context_key: ContextKey,
         preserve_identity: bool,
     ) -> Result<(), String> {
+        if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+            return Err(format!(
+                "document URI exceeds notification recovery limit ({MAX_OPEN_DOCUMENT_URI_BYTES} bytes)"
+            ));
+        }
+        if !self.open_documents.contains_key(&uri)
+            && self.open_documents.len() >= MAX_OPEN_DOCUMENTS
+        {
+            return Err(format!(
+                "open document tracking limit ({MAX_OPEN_DOCUMENTS}) reached"
+            ));
+        }
         self.bump_source_generation();
         self.mark_source_change(&uri, false);
         let text_len = text.len();
@@ -2682,6 +2729,15 @@ impl Workspace {
     }
 
     fn reject_open_document(&mut self, uri: Url, version: i32, reason: String) {
+        if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES
+            || (!self.open_documents.contains_key(&uri)
+                && self.open_documents.len() >= MAX_OPEN_DOCUMENTS)
+        {
+            eprintln!(
+                "pascal-lsp: rejected document state was not retained because the bounded recovery index is full: {uri}"
+            );
+            return;
+        }
         self.bump_source_generation();
         self.mark_source_change(&uri, false);
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -2875,7 +2931,11 @@ impl Workspace {
         Ok(diagnostic_uris)
     }
 
-    pub(crate) fn invalidate_all_for_file_notification_overflow(&mut self) -> Vec<Url> {
+    pub(crate) fn invalidate_all_for_file_notification_overflow_bounded(&mut self) {
+        self.invalidate_all_for_file_notification_overflow_inner();
+    }
+
+    fn invalidate_all_for_file_notification_overflow_inner(&mut self) {
         // The notification has no response channel, so rejecting it would
         // silently lose the only invalidation signal for arbitrary paths.
         // Drop bounded derived state and force subsequent requests to reread
@@ -2937,20 +2997,18 @@ impl Workspace {
             }
         }
 
-        let open_uris = self.open_documents.keys().cloned().collect::<Vec<_>>();
-        for uri in &open_uris {
-            self.schedule_diagnostics(uri.clone());
+        let deadline = Instant::now() + DIAGNOSTIC_DEBOUNCE;
+        let pending_diagnostics = &mut self.pending_diagnostics;
+        for uri in self.open_documents.keys() {
+            pending_diagnostics.insert(uri.clone(), deadline);
         }
-        open_uris
     }
 
-    pub(crate) fn invalidate_for_reconciliation_budget(
-        &mut self,
-        budget: &ReconciliationBudget,
-    ) -> Vec<Url> {
+    pub(crate) fn invalidate_for_reconciliation_budget(&mut self, budget: &ReconciliationBudget) {
+        budget.reserve_recovery_envelope();
         let deleted_uris = budget.deleted_uris();
         let rename_endpoints = budget.rename_endpoints();
-        let open_uris = self.invalidate_all_for_file_notification_overflow();
+        self.invalidate_all_for_file_notification_overflow_inner();
         for uri in deleted_uris {
             self.remember_deleted(&uri);
         }
@@ -2965,7 +3023,6 @@ impl Workspace {
                 }
             }
         }
-        open_uris
     }
 
     pub(crate) fn unit_rename_position(
@@ -3329,11 +3386,19 @@ impl Workspace {
     }
 
     pub(crate) fn take_due_diagnostic_requests(&mut self) -> Vec<(Url, Option<i32>)> {
+        self.take_due_diagnostic_requests_limited(usize::MAX)
+    }
+
+    pub(crate) fn take_due_diagnostic_requests_limited(
+        &mut self,
+        maximum: usize,
+    ) -> Vec<(Url, Option<i32>)> {
         let now = Instant::now();
         let due: Vec<Url> = self
             .pending_diagnostics
             .iter()
             .filter_map(|(uri, deadline)| (*deadline <= now).then_some(uri.clone()))
+            .take(maximum)
             .collect();
         let mut result = Vec::with_capacity(due.len());
         for uri in due {
@@ -10179,9 +10244,10 @@ fn is_immutable_override_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextState, DiagnosticLineIndex, FileChange, MAX_SOURCE_CHANGE_OBSERVATIONS,
-        ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
-        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
+        ContextState, DiagnosticLineIndex, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
+        MAX_OPEN_DOCUMENTS, MAX_SOURCE_CHANGE_OBSERVATIONS, OpenDocument, ResourceLimits,
+        RuntimeOptionsOverride, Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel,
+        normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
@@ -10202,6 +10268,79 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn due_diagnostic_dispatch_is_bounded_to_one_protocol_turn() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let now = std::time::Instant::now();
+        for index in 0..65 {
+            let path = temp.path().join(format!("Open{index:02}.pas"));
+            let uri = Url::from_file_path(path).expect("open document URI");
+            workspace
+                .open_document(
+                    uri.clone(),
+                    "unit Open; interface implementation end.".into(),
+                    1,
+                )
+                .expect("open document");
+            workspace.pending_diagnostics.insert(uri, now);
+        }
+
+        let first = workspace.take_due_diagnostic_requests_limited(16);
+        let second = workspace.take_due_diagnostic_requests_limited(16);
+
+        assert_eq!(first.len(), 16);
+        assert_eq!(second.len(), 16);
+        assert_eq!(workspace.pending_diagnostics.len(), 33);
+    }
+
+    #[test]
+    fn tracked_open_document_count_has_a_hard_recovery_ceiling() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        for index in 0..MAX_OPEN_DOCUMENTS {
+            let uri = Url::from_file_path(temp.path().join(format!("Retained{index}.pas")))
+                .expect("tracked URI");
+            workspace.open_documents.insert(
+                uri,
+                OpenDocument {
+                    text: None,
+                    version: 1,
+                    rejection: Some("test rejection".into()),
+                    identity_generation: 0,
+                },
+            );
+        }
+        let next = Url::from_file_path(temp.path().join("Overflow.pas")).expect("overflow URI");
+
+        let error = workspace
+            .open_document(next, "unit Overflow; implementation end.".into(), 1)
+            .expect_err(
+                "a rejected open must not let tracked document count exceed recovery reserve",
+            );
+
+        assert!(error.contains("open document tracking limit"), "{error}");
+        assert_eq!(workspace.open_documents.len(), MAX_OPEN_DOCUMENTS);
+    }
+
+    #[test]
+    fn open_document_uri_bytes_have_a_hard_recovery_ceiling() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let path = temp.path().join("x".repeat(MAX_OPEN_DOCUMENT_URI_BYTES));
+        let uri = Url::from_file_path(path).expect("long file URI");
+
+        let error = workspace
+            .open_document(uri, "unit LongUri; implementation end.".into(), 1)
+            .expect_err("a long URI must not exceed the notification recovery byte envelope");
+
+        assert!(error.contains("notification recovery limit"), "{error}");
+        assert!(workspace.open_documents.is_empty());
     }
 
     #[test]

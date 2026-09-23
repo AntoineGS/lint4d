@@ -31471,40 +31471,49 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
 
     let root = tempfile::tempdir().expect("temporary workspace");
     let mut project_files = Vec::with_capacity(PROJECTS);
-    let mut providers = Vec::with_capacity(PROJECTS);
+    let mut selected_providers = Vec::with_capacity(PROJECTS);
+    let mut replacement_providers = Vec::with_capacity(PROJECTS);
     let mut consumers = Vec::with_capacity(PROJECTS);
     let mut consumer_sources = Vec::with_capacity(PROJECTS);
+    let mut project_descriptors = Vec::with_capacity(PROJECTS);
     for index in 0..PROJECTS {
         let project_root = root.path().join(format!("Project{index:02}"));
         fs::create_dir_all(&project_root).expect("project root");
         let project = project_root.join("App.dproj");
-        let provider = project_root.join(format!("Provider{index:02}.pas"));
+        let selected_provider = project_root.join(format!("A/Provider{index:02}.pas"));
+        let replacement_provider = project_root.join(format!("B/Provider{index:02}.pas"));
         let consumer = project_root.join(format!("Consumer{index:02}.pas"));
         let source = format!(
             "unit Consumer{index:02};\ninterface\nuses Provider{index:02};\ntype TUse{index:02} = TBefore;\nimplementation\nend.\n"
         );
         let descriptor_prefix = format!(
-            "<Project><PropertyGroup><MainSource>Consumer{index:02}.pas</MainSource></PropertyGroup><!--"
+            "<Project><PropertyGroup><MainSource>Consumer{index:02}.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"A/Provider{index:02}.pas\" /></ItemGroup><!--"
         );
         let descriptor_suffix = "--></Project>";
         let padding = "x".repeat(
             PADDING_BYTES.saturating_sub(descriptor_prefix.len() + descriptor_suffix.len()),
         );
+        let descriptor = format!("{descriptor_prefix}{padding}{descriptor_suffix}");
+        write_file(&project, &descriptor);
         write_file(
-            &project,
-            &format!("{descriptor_prefix}{padding}{descriptor_suffix}"),
-        );
-        write_file(
-            &provider,
+            &selected_provider,
             &format!(
                 "unit Provider{index:02};\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n"
             ),
         );
+        write_file(
+            &replacement_provider,
+            &format!(
+                "unit Provider{index:02};\ninterface\ntype TBefore = string;\nimplementation\nend.\n"
+            ),
+        );
         write_file(&consumer, &source);
         project_files.push(project);
-        providers.push(provider);
+        selected_providers.push(selected_provider);
+        replacement_providers.push(replacement_provider);
         consumers.push(consumer);
         consumer_sources.push(source);
+        project_descriptors.push(descriptor);
     }
 
     let metrics = root.path().join("reconciliation-work.json");
@@ -31537,12 +31546,28 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         .expect("initial result ID")
         .to_string();
 
-    let provider_before = fs::metadata(&providers[0]).expect("provider metadata before edit");
-    let provider_text = fs::read_to_string(&providers[0]).expect("read provider");
-    let provider_after = provider_text.replace("TBefore", "TAfter ");
-    assert_eq!(provider_text.len(), provider_after.len());
-    write_file(&providers[0], &provider_after);
-    restore_mtime(&providers[0], &provider_before);
+    let initial_definition_id = RequestId::from("metadata-budget-initial-provider".to_string());
+    server.send_request(
+        initial_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &consumer_sources[0], "TBefore", 0),
+    );
+    let initial_locations = result_locations(server.response(&initial_definition_id));
+    assert_eq!(
+        initial_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&selected_providers[0]).as_str()),
+        "initial descriptor must select provider A"
+    );
+
+    for index in 0..PROJECTS {
+        let stamp = fs::metadata(&project_files[index]).expect("descriptor stamp before edit");
+        let replacement = project_descriptors[index].replace("A/Provider", "B/Provider");
+        assert_eq!(replacement.len(), project_descriptors[index].len());
+        write_file(&project_files[index], &replacement);
+        restore_mtime(&project_files[index], &stamp);
+    }
 
     let changes = project_files
         .iter()
@@ -31555,15 +31580,10 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
     );
 
     let fresh_definition_id = RequestId::from("metadata-budget-fresh-provider".to_string());
-    let updated_consumer_source = consumer_sources[0].replace("TBefore", "TAfter ");
-    server.send_notification(
-        "textDocument/didChange",
-        json!({"textDocument":{"uri":uri(&consumers[0]),"version":2},"contentChanges":[{"text":updated_consumer_source}]}),
-    );
     server.send_request(
         fresh_definition_id.clone(),
         "textDocument/definition",
-        navigation_params(&consumers[0], &updated_consumer_source, "TAfter", 0),
+        navigation_params(&consumers[0], &consumer_sources[0], "TBefore", 0),
     );
     let fresh_definition = server.response(&fresh_definition_id);
     let fresh_locations = result_locations(fresh_definition);
@@ -31571,8 +31591,8 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         fresh_locations
             .first()
             .and_then(|location| location["uri"].as_str()),
-        Some(uri(&providers[0]).as_str()),
-        "same-size/restored-mtime provider edits must not preserve stale selected-provider state"
+        Some(uri(&replacement_providers[0]).as_str()),
+        "same-size/restored-mtime project descriptor edits must select provider B after budget fallback"
     );
 
     let refreshed_id = RequestId::from("metadata-budget-refreshed-pull".to_string());
@@ -31612,6 +31632,16 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
             .unwrap_or_default()
             < 2_048,
         "this case must exhaust the metadata byte budget before the separate diagnostic-work ceiling: {metrics}"
+    );
+    assert_eq!(
+        metrics["recovery_target_reserve"].as_u64(),
+        Some(10_000),
+        "fallback must reserve bounded recovery for the maximum admitted open-document count: {metrics}"
+    );
+    assert_eq!(
+        metrics["recovery_uri_byte_reserve"].as_u64(),
+        Some(10_000 * 4_096),
+        "fallback URI staging must have an explicit pre-reserved byte ceiling: {metrics}"
     );
     server.shutdown();
 }

@@ -30478,39 +30478,62 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
 
 #[test]
 #[cfg(feature = "test-support")]
-#[ignore = "P2-4 acceptance regression: enable after ordered notification worker is implemented"]
 fn blocked_file_discovery_does_not_block_cancel_or_unrelated_protocol_messages() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
-    write_file(
-        &provider,
-        "unit Provider;\ninterface\nimplementation\nend.\n",
-    );
+    let provider_source =
+        "unit Provider;\ninterface\ntype TOld = record end;\nimplementation\nend.\n";
+    let consumer = root.path().join("Consumer.pas");
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider;\ntype TConsumer = TOld;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
     let barrier_dir = root.path().join("file-discovery-barrier");
     fs::create_dir_all(&barrier_dir).expect("barrier directory");
     let barrier = TestBarrier {
         entered: barrier_dir.join("entered"),
         release: barrier_dir.join("release"),
     };
+    let analysis_barrier_dir = root.path().join("workspace-symbols-barrier");
+    fs::create_dir_all(&analysis_barrier_dir).expect("workspace symbols barrier directory");
+    let analysis_barrier = TestBarrier {
+        entered: analysis_barrier_dir.join("entered"),
+        release: analysis_barrier_dir.join("release"),
+    };
     let barrier_value = format!(
         "{}|{}",
         barrier.entered.display(),
         barrier.release.display()
     );
-    let mut server = TestServer::launch_test_server_with_environment_path_and_variable(
+    let analysis_barrier_value = format!(
+        "{}|{}",
+        analysis_barrier.entered.display(),
+        analysis_barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         root.path(),
-        Some("PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER"),
-        Some(&barrier_value),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_WORKSPACE_SYMBOLS_BARRIER",
+                analysis_barrier_value.as_str(),
+            ),
+        ],
     );
     server.initialize_with_pull_diagnostics(root.path());
 
     let initial_id = RequestId::from("file-discovery-initial-load".to_string());
     server.send_request(
         initial_id.clone(),
-        "textDocument/diagnostic",
-        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOld", 0),
     );
-    assert!(server.response(&initial_id).error.is_none());
+    let initial_locations = result_locations(server.response(&initial_id));
+    assert_eq!(initial_locations.len(), 1, "initial provider must resolve");
+    write_file(&provider, &provider_source.replace("TOld", "TNew"));
 
     let files: Vec<_> = (0..64)
         .map(|index| {
@@ -30525,20 +30548,74 @@ fn blocked_file_discovery_does_not_block_cancel_or_unrelated_protocol_messages()
             })
         })
         .collect();
+    let symbols_id = RequestId::from("cancel-symbol-query-during-file-discovery".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "workspace/symbol",
+        json!({"query":"TOld"}),
+    );
+    analysis_barrier.wait_until_entered();
     server.send_notification("workspace/didChangeWatchedFiles", json!({"changes":files}));
     barrier.wait_until_entered();
 
-    let cancelled_id = RequestId::from("request-behind-file-discovery".to_string());
-    server.send_request(
-        cancelled_id.clone(),
-        "textDocument/diagnostic",
-        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
-    );
-    server.send_notification("$/cancelRequest", json!({"id":cancelled_id}));
-    let responsive = server.response_with_timeout(&cancelled_id, Duration::from_millis(250));
-    barrier.release();
+    server.send_notification("$/cancelRequest", json!({"id":symbols_id}));
+    let responsive = server.response_with_timeout(&symbols_id, Duration::from_millis(250));
     let response = responsive.expect("cancellation must be processed while discovery is blocked");
     assert_eq!(response.error.expect("request is cancelled").code, -32800);
+
+    let while_busy_id = RequestId::from("query-during-file-reconciliation".to_string());
+    server.send_request(
+        while_busy_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOld", 0),
+    );
+    assert!(
+        server
+            .response_with_timeout(&while_busy_id, Duration::from_millis(250))
+            .is_none(),
+        "query must wait behind the workspace mutation rather than use stale state"
+    );
+
+    barrier.release();
+    analysis_barrier.release();
+
+    let after_release = server.response(&while_busy_id);
+    assert!(
+        after_release.error.is_none(),
+        "deferred query failed: {after_release:?}"
+    );
+    assert!(
+        result_locations(after_release).is_empty(),
+        "deferred query must observe the provider after reconciliation"
+    );
+
+    let fresh_deadline = Instant::now() + IO_TIMEOUT;
+    loop {
+        let fresh_id = RequestId::from("post-file-reconciliation-definition".to_string());
+        server.send_request(
+            fresh_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOld", 0),
+        );
+        let fresh = server.response(&fresh_id);
+        if fresh
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == -32802)
+        {
+            assert!(
+                Instant::now() < fresh_deadline,
+                "workspace never became queryable"
+            );
+            continue;
+        }
+        assert!(fresh.error.is_none(), "fresh query failed: {fresh:?}");
+        assert!(
+            result_locations(fresh).is_empty(),
+            "pre-event provider identity must not survive reconciliation"
+        );
+        break;
+    }
     server.shutdown();
 }
 

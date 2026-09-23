@@ -76,6 +76,7 @@ const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
 const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
+const MAX_WORKSPACE_MUTATION_DEFERRED_BYTES: usize = 1024 * 1024;
 const MAX_FILE_OPERATION_BATCH_ENTRIES: usize = 64;
 const MAX_FILE_OPERATION_BATCH_URI_BYTES: usize = 32 * 1024;
 // Keep one slot available for an authoritative state-changing notification
@@ -506,6 +507,22 @@ impl ProtocolSender for ProtocolConnection {
         self.outbound
             .borrow_mut()
             .enqueue(&self.connection.sender, message, OutboundClass::Data)
+    }
+}
+
+struct UnusedProtocolSender;
+
+impl ProtocolSender for UnusedProtocolSender {
+    fn send_control(&self, _message: Message) -> Result<(), OutputError> {
+        Err(OutputError::Disconnected)
+    }
+
+    fn send_result(&self, _message: Message) -> Result<(), OutputError> {
+        Err(OutputError::Disconnected)
+    }
+
+    fn send_data(&self, _message: Message) -> Result<bool, OutputError> {
+        Err(OutputError::Disconnected)
     }
 }
 
@@ -7808,6 +7825,61 @@ fn run_connection(
     )
 }
 
+fn is_workspace_file_event_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace/didChangeWatchedFiles"
+            | "workspace/didCreateFiles"
+            | "workspace/didDeleteFiles"
+            | "workspace/didRenameFiles"
+    )
+}
+
+fn spawn_workspace_file_notification(
+    workspace: &mut Workspace,
+    notification: Notification,
+    workspace_folders_supported: bool,
+    push_diagnostics_supported: bool,
+) -> Receiver<(Workspace, Result<DiagnosticNotificationEffect, String>)> {
+    let (sender, receiver) = bounded(1);
+    let owned_workspace = std::mem::take(workspace);
+    thread::Builder::new()
+        .name("PascalLspWorkspaceMutation".to_string())
+        .spawn(move || {
+            let mut workspace = owned_workspace;
+            let result = handle_notification(
+                &UnusedProtocolSender,
+                &mut workspace,
+                notification,
+                workspace_folders_supported,
+                push_diagnostics_supported,
+            );
+            let _ = sender.send((workspace, result));
+        })
+        .expect("failed to start serialized workspace mutation worker");
+    receiver
+}
+
+fn queue_workspace_message(
+    queue: &mut VecDeque<(Message, usize)>,
+    queued_bytes: &mut usize,
+    message: Message,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec(&message)
+        .map(|encoded| encoded.len())
+        .unwrap_or(MAX_WORKSPACE_MUTATION_DEFERRED_BYTES + 1);
+    if queue.len() >= MAX_CONFIGURATION_DEFERRED_MESSAGES
+        || queued_bytes.saturating_add(bytes) > MAX_WORKSPACE_MUTATION_DEFERRED_BYTES
+    {
+        return Err(io::Error::other(
+            "workspace mutation queue saturated; reconnect and retry notifications",
+        ));
+    }
+    *queued_bytes = queued_bytes.saturating_add(bytes);
+    queue.push_back((message, bytes));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn event_loop(
     connection: &ProtocolConnection,
@@ -7823,29 +7895,84 @@ fn event_loop(
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
     let mut deferred_configuration_messages = VecDeque::new();
+    let mut deferred_workspace_messages = VecDeque::new();
+    let mut deferred_workspace_message_bytes = 0usize;
+    let mut file_notification_worker: Option<
+        Receiver<(Workspace, Result<DiagnosticNotificationEffect, String>)>,
+    > = None;
     let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
     loop {
         connection.flush()?;
-        if let Some(effect) = configuration.poll(workspace)? {
-            if let Some(registration) = watcher_registration.as_mut() {
-                sync_file_watcher(connection, workspace, registration)?;
-            }
-            if pull_diagnostics_supported
-                && (effect.refresh_requested || !effect.refresh.is_empty())
-            {
-                diagnostic_refresh.request(connection)?;
-            }
-            if !pull_diagnostics_supported {
-                jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
-                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                jobs.refresh_diagnostics_with_connection(connection, workspace, &effect.refresh)
-                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+        if let Some(receiver) = file_notification_worker.as_ref() {
+            match receiver.try_recv() {
+                Ok((completed_workspace, result)) => {
+                    *workspace = completed_workspace;
+                    file_notification_worker = None;
+                    match result {
+                        Ok(effect) => {
+                            if pull_diagnostics_supported
+                                && (effect.refresh_requested || !effect.refresh.is_empty())
+                            {
+                                diagnostic_refresh.request(connection)?;
+                            }
+                            if !pull_diagnostics_supported {
+                                jobs.cancel_diagnostics_for_with_connection(
+                                    Some(connection),
+                                    &effect.cancel,
+                                )
+                                .map_err(
+                                    |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                                )?;
+                                jobs.refresh_diagnostics_with_connection(
+                                    connection,
+                                    workspace,
+                                    &effect.refresh,
+                                )
+                                .map_err(
+                                    |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                                )?;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("pascal-lsp: notification handling failed: {error}")
+                        }
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return Err("workspace file-notification worker disconnected".into());
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
-        if !shutdown_received && !pull_diagnostics_supported {
+        let workspace_busy = file_notification_worker.is_some();
+        if !workspace_busy {
+            if let Some(effect) = configuration.poll(workspace)? {
+                if let Some(registration) = watcher_registration.as_mut() {
+                    sync_file_watcher(connection, workspace, registration)?;
+                }
+                if pull_diagnostics_supported
+                    && (effect.refresh_requested || !effect.refresh.is_empty())
+                {
+                    diagnostic_refresh.request(connection)?;
+                }
+                if !pull_diagnostics_supported {
+                    jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                    jobs.refresh_diagnostics_with_connection(
+                        connection,
+                        workspace,
+                        &effect.refresh,
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                }
+            }
+        }
+        if !workspace_busy && !shutdown_received && !pull_diagnostics_supported {
             publish_due_diagnostics(connection, workspace, &mut jobs)?;
         }
-        jobs.poll(connection, workspace)?;
+        if !workspace_busy {
+            jobs.poll(connection, workspace)?;
+        }
         let output_pending = connection.has_pending_output();
         // Pull-owned diagnostics must not inherit the debounced push queue.
         // Those deadlines have no consumer in pull mode and would otherwise
@@ -7855,9 +7982,22 @@ fn event_loop(
             workspace.next_diagnostic_timeout(),
             jobs.is_empty(),
             output_pending,
-            configuration.is_preparing(),
+            configuration.is_preparing() || workspace_busy,
         );
-        let message = if !configuration.is_preparing() {
+        let deferred_workspace_message = if workspace_busy {
+            None
+        } else {
+            deferred_workspace_messages
+                .pop_front()
+                .map(|(message, bytes)| {
+                    deferred_workspace_message_bytes =
+                        deferred_workspace_message_bytes.saturating_sub(bytes);
+                    message
+                })
+        };
+        let message = if let Some(message) = deferred_workspace_message {
+            message
+        } else if !workspace_busy && !configuration.is_preparing() {
             match deferred_configuration_messages.pop_front() {
                 Some(DeferredConfigurationMessage::Request(deferred)) => {
                     if !deferred_request_is_current(workspace, configuration, &deferred) {
@@ -7878,10 +8018,12 @@ fn event_loop(
                 None => match connection.receiver().recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
-                        if !shutdown_received && !pull_diagnostics_supported {
+                        if !workspace_busy && !shutdown_received && !pull_diagnostics_supported {
                             publish_due_diagnostics(connection, workspace, &mut jobs)?;
                         }
-                        jobs.pump_partial_deliveries(connection, workspace)?;
+                        if !workspace_busy {
+                            jobs.pump_partial_deliveries(connection, workspace)?;
+                        }
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
@@ -7896,10 +8038,12 @@ fn event_loop(
             match connection.receiver().recv_timeout(timeout) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
-                    if !shutdown_received && !pull_diagnostics_supported {
+                    if !workspace_busy && !shutdown_received && !pull_diagnostics_supported {
                         publish_due_diagnostics(connection, workspace, &mut jobs)?;
                     }
-                    jobs.pump_partial_deliveries(connection, workspace)?;
+                    if !workspace_busy {
+                        jobs.pump_partial_deliveries(connection, workspace)?;
+                    }
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -7926,8 +8070,26 @@ fn event_loop(
                         )?;
                     }
                 }
+                for (deferred, _) in deferred_workspace_messages.drain(..) {
+                    if let Message::Request(deferred) = deferred {
+                        send_error(
+                            connection,
+                            deferred.id,
+                            ErrorCode::RequestCanceled,
+                            rename::CANCELLATION_MESSAGE,
+                        )?;
+                    }
+                }
+                deferred_workspace_message_bytes = 0;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
+            }
+            Message::Request(request) if file_notification_worker.is_some() => {
+                queue_workspace_message(
+                    &mut deferred_workspace_messages,
+                    &mut deferred_workspace_message_bytes,
+                    Message::Request(request),
+                )?;
             }
             Message::Request(request) => {
                 if shutdown_received {
@@ -8072,7 +8234,9 @@ fn event_loop(
                         jobs.cancel_progress(connection, &params.token)
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     }
-                    jobs.pump_partial_deliveries(connection, workspace)?;
+                    if file_notification_worker.is_none() {
+                        jobs.pump_partial_deliveries(connection, workspace)?;
+                    }
                     continue;
                 }
                 if notification.method == "$/cancelRequest" {
@@ -8104,13 +8268,42 @@ fn event_loop(
                                 ErrorCode::RequestCanceled,
                                 rename::CANCELLATION_MESSAGE,
                             )?;
+                        } else if let Some(index) = deferred_workspace_messages.iter().position(
+                            |(message, _)| {
+                                matches!(message, Message::Request(request) if request.id == id)
+                            },
+                        ) {
+                            let (message, bytes) = deferred_workspace_messages
+                                .remove(index)
+                                .expect("deferred workspace request index");
+                            deferred_workspace_message_bytes =
+                                deferred_workspace_message_bytes.saturating_sub(bytes);
+                            let Message::Request(request) = message else {
+                                unreachable!("deferred workspace request predicate");
+                            };
+                            send_error(
+                                connection,
+                                request.id,
+                                ErrorCode::RequestCanceled,
+                                rename::CANCELLATION_MESSAGE,
+                            )?;
                         } else {
                             jobs.cancel(connection, &id).map_err(
                                 |error| -> Box<dyn Error + Send + Sync> { error.into() },
                             )?;
                         }
                     }
-                    jobs.pump_partial_deliveries(connection, workspace)?;
+                    if file_notification_worker.is_none() {
+                        jobs.pump_partial_deliveries(connection, workspace)?;
+                    }
+                    continue;
+                }
+                if file_notification_worker.is_some() {
+                    queue_workspace_message(
+                        &mut deferred_workspace_messages,
+                        &mut deferred_workspace_message_bytes,
+                        Message::Notification(notification),
+                    )?;
                     continue;
                 }
                 let notification_method = notification.method.clone();
@@ -8122,6 +8315,15 @@ fn event_loop(
                         .handle_notification(connection, workspace, &notification)
                         .map_err(|error| error.to_string())
                 } else {
+                    if is_workspace_file_event_notification(&notification_method) {
+                        file_notification_worker = Some(spawn_workspace_file_notification(
+                            workspace,
+                            notification,
+                            workspace_folders_supported,
+                            !pull_diagnostics_supported,
+                        ));
+                        continue;
+                    }
                     let refresh_configuration =
                         notification_method == "workspace/didChangeWorkspaceFolders";
                     let result = handle_notification(
@@ -8171,6 +8373,14 @@ fn event_loop(
                 }
             }
             Message::Response(response) => {
+                if file_notification_worker.is_some() {
+                    queue_workspace_message(
+                        &mut deferred_workspace_messages,
+                        &mut deferred_workspace_message_bytes,
+                        Message::Response(response),
+                    )?;
+                    continue;
+                }
                 if diagnostic_refresh.handle_response(connection, &response)? {
                     // Refresh responses are deliberately non-blocking. A
                     // pending coalesced refresh, if any, was sent by the
@@ -8231,7 +8441,9 @@ fn event_loop(
                 }
             }
         }
-        jobs.pump_partial_deliveries(connection, workspace)?;
+        if file_notification_worker.is_none() {
+            jobs.pump_partial_deliveries(connection, workspace)?;
+        }
     }
 }
 

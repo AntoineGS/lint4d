@@ -1228,17 +1228,22 @@ and reschedule open-document diagnostics, and request a pull-diagnostic refresh.
 The oversized entry list is not traversed or applied entry-by-entry. Pending
 unit-rename transitions are invalidated, and any open old/new endpoint overlay
 whose transition can no longer be proved is rejected until reopened. Ordinary
-in-range file-event discovery and dependent-diagnostic fan-out still run
-synchronously on the protocol thread; a complete total-work bound and ordered
-off-thread state-processing design remain outstanding. Clients should continue
-to use watched-file notifications for changes not covered by these Pascal
-source filters.
+In-range file-event discovery and dependent-diagnostic fan-out now run on a
+serialized workspace-mutation worker that temporarily owns the live workspace.
+While it reconciles a preceding event, workspace-dependent requests and
+state-changing notifications wait in a FIFO (up to 64 messages and 1 MiB);
+`$/cancelRequest` remains serviceable and can cancel a queued request. Queue
+saturation terminates the session rather than using stale state. This first
+stage makes the protocol loop responsive but does not yet bound actual
+filesystem/project/index/dependent work, cancel reconciliation work, or provide
+a safe tombstone-aware saturation fallback. Do not interpret it as closing
+P2-4. Clients should continue to use watched-file notifications for changes
+not covered by these Pascal source filters.
 
 The test-support build exposes a deterministic file-discovery barrier at the
-loaded-source disk refresh boundary. Its 64-event protocol regression currently
-reproduces the protocol-loop stall (the regression is intentionally ignored in
-the normal suite until the ordered notification worker lands); it is not
-evidence of responsiveness or freshness correctness.
+loaded-source disk refresh boundary. Its 64-event protocol regression holds
+that worker while checking cancellation responsiveness, request deferral rather
+than stale answers, and post-release provider freshness.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial

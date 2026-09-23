@@ -134,6 +134,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) rejection_reasons: HashMap<Url, String>,
+    pub(crate) admission_fence_active: bool,
     pub(crate) document_versions: HashMap<Url, i32>,
     pub(crate) deleted_overrides: HashMap<Url, Option<DiskStamp>>,
     pub(crate) source_generation: u64,
@@ -1341,6 +1342,8 @@ impl Workspace {
             cached_documents,
             rejected_documents,
             rejection_reasons,
+            admission_fence_active: self.rejected_open_fence_permanent
+                || !self.rejected_open_fence_paths.is_empty(),
             document_versions,
             deleted_overrides: self.deleted_overrides.clone(),
             source_generation: self.source_generation,

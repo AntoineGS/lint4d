@@ -1256,6 +1256,19 @@ documents per protocol turn, while the existing per-report and outbound writer
 queues retain their byte/message caps. Test support exposes normal-work and
 recovery-reserve counters independently.
 
+If a `didOpen` cannot be admitted because the open-document count or URI-byte
+limit is reached, the workspace advances its source generation and enters a
+conservative admission fence. Analysis requests (including navigation, pull
+diagnostics, and rename) fail closed rather than treating the rejected editor
+buffer as absent and using stale disk/index contents. `didClose` for a fenced,
+representable file path releases that fence; after freeing an open-document
+slot, the client can retry `didOpen`. The fence ledger is separately capped at
+64 paths, each at most 4 KiB; fence path decoding is attempted only for URIs up
+to 16 KiB. If the ledger itself fills or the URI cannot be represented by a
+bounded file path, the workspace remains fenced until restart rather than
+allocate unbounded rejection state. The recovery URI reserve above does not
+include this small fence ledger.
+
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,
 rename transition validation, and some project metadata work are not all

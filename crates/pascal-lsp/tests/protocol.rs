@@ -43093,6 +43093,126 @@ fn rename_does_not_fall_back_to_disk_for_a_rejected_open_document() {
 }
 
 #[test]
+fn oversized_uri_open_fails_closed_for_existing_disk_navigation() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let nested = root.join("deep");
+    fs::create_dir_all(&nested).expect("create workspace root");
+    let mut provider_dir = nested;
+    let component = "é".repeat(100);
+    loop {
+        let next = provider_dir.join(&component);
+        if next.as_os_str().to_string_lossy().len() > 3_500 {
+            break;
+        }
+        fs::create_dir_all(&next).expect("create deep path");
+        provider_dir = next;
+    }
+    let provider = provider_dir.join("DiskProvider.pas");
+    let provider_source =
+        "unit DiskProvider;\ninterface\nconst\n  diskOnly = 1;\nimplementation\nend.\n";
+    let consumer = root.join("Consumer.pas");
+    let consumer_source = "unit Consumer;\ninterface\nuses DiskProvider;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    let provider_uri = uri(&provider);
+    assert!(
+        provider_uri.as_str().len() > 4_096,
+        "fixture URI must exceed admission cap"
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    let before_id = RequestId::from("oversized-uri-diagnostic-before".to_string());
+    server.send_request(
+        before_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": provider_uri}, "previousResultId": null}),
+    );
+    let before = server.response(&before_id);
+    let previous_result_id = before.result.expect("initial diagnostic result")["resultId"]
+        .as_str()
+        .expect("initial diagnostic result ID")
+        .to_string();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": provider_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorProvider;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+
+    let request_id = RequestId::from("oversized-uri-stale-definition".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&consumer)},
+            "position": position_of(consumer_source, "DiskProvider", 0)
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.result.as_ref().is_some_and(Value::is_null) || response.error.is_some(),
+        "an over-cap didOpen must not allow stale disk navigation: {response:?}"
+    );
+
+    let diagnostic_id = RequestId::from("oversized-uri-diagnostic-after".to_string());
+    server.send_request(
+        diagnostic_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": provider_uri},
+            "previousResultId": previous_result_id
+        }),
+    );
+    let diagnostic = server.response(&diagnostic_id);
+    assert!(
+        diagnostic.error.is_some(),
+        "fenced pull diagnostics must fail closed: {diagnostic:?}"
+    );
+
+    let rename_id = RequestId::from("oversized-uri-rename".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": provider_uri},
+            "position": position_of(provider_source, "diskOnly", 0),
+            "newName": "renamedDiskOnly"
+        }),
+    );
+    let rename = server.response(&rename_id);
+    assert!(
+        rename.error.is_some(),
+        "fenced rename must produce no workspace edit: {rename:?}"
+    );
+
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": provider_uri}}),
+    );
+    let retry_id = RequestId::from("oversized-uri-after-close".to_string());
+    server.send_request(
+        retry_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&consumer)},
+            "position": position_of(consumer_source, "DiskProvider", 0)
+        }),
+    );
+    assert!(
+        server.response(&retry_id).result.is_some(),
+        "didClose of the rejected URI should restore queries once disk is authoritative"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn rename_rejects_a_target_in_an_external_source_path() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

@@ -54,6 +54,8 @@ const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_FILES: usize = 10_000;
 const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
 const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
+const MAX_REJECTED_OPEN_FENCE_PATHS: usize = 64;
+const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPENDENCY_WORK: usize = 256;
@@ -1758,6 +1760,8 @@ pub struct Workspace {
     index: NavigationIndex,
     cached_documents: HashMap<Url, rename::CachedDocument>,
     open_documents: HashMap<Url, OpenDocument>,
+    rejected_open_fence_paths: HashSet<PathBuf>,
+    rejected_open_fence_permanent: bool,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
     pending_unit_file_rename_bytes: usize,
     indexed_files: HashSet<Url>,
@@ -1829,6 +1833,44 @@ struct SharedLintResult {
 }
 
 impl Workspace {
+    fn rejected_open_fence_path(uri: &Url) -> Option<PathBuf> {
+        if uri.as_str().len() > MAX_REJECTED_OPEN_FENCE_URI_BYTES {
+            return None;
+        }
+        let path = uri.to_file_path().ok()?;
+        (path.to_string_lossy().len() <= MAX_OPEN_DOCUMENT_URI_BYTES).then(|| absolute_path(path))
+    }
+
+    fn fence_rejected_open_document(&mut self, uri: &Url) {
+        if let Some(path) = Self::rejected_open_fence_path(uri) {
+            if self.rejected_open_fence_paths.contains(&path)
+                || self.rejected_open_fence_paths.len() < MAX_REJECTED_OPEN_FENCE_PATHS
+            {
+                self.rejected_open_fence_paths.insert(path);
+            } else {
+                // Do not grow memory in response to an unbounded stream of
+                // distinct rejected opens. This conservative latch is cleared
+                // only by restarting the workspace.
+                self.rejected_open_fence_permanent = true;
+            }
+        } else {
+            // An unrepresentable/non-file or overlong native path cannot be
+            // matched safely on didClose without retaining attacker-sized URI
+            // state. Refuse queries for this workspace until restart.
+            self.rejected_open_fence_permanent = true;
+        }
+        self.bump_source_generation();
+    }
+
+    fn clear_rejected_open_fence(&mut self, uri: &Url) -> bool {
+        Self::rejected_open_fence_path(uri)
+            .is_some_and(|path| self.rejected_open_fence_paths.remove(&path))
+    }
+
+    pub(crate) fn analysis_admission_fenced(&self) -> bool {
+        self.rejected_open_fence_permanent || !self.rejected_open_fence_paths.is_empty()
+    }
+
     pub fn new(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Self {
         let (overrides, warnings) = production_override_session();
         let mut workspace = Self::with_override_session(roots, options, overrides);
@@ -2354,16 +2396,19 @@ impl Workspace {
         if !self.open_documents.contains_key(&uri)
             && self.open_documents.len() >= MAX_OPEN_DOCUMENTS
         {
+            self.fence_rejected_open_document(&uri);
             return Err(format!(
                 "open document tracking limit ({MAX_OPEN_DOCUMENTS}) reached"
             ));
         }
         if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+            self.fence_rejected_open_document(&uri);
             return Err(format!(
                 "document URI is {} bytes; the notification recovery limit is {MAX_OPEN_DOCUMENT_URI_BYTES} bytes",
                 uri.as_str().len()
             ));
         }
+        self.clear_rejected_open_fence(&uri);
         if !self.open_documents.contains_key(&uri) {
             let preserve_mapped_owner =
                 uri.to_file_path()
@@ -2630,6 +2675,7 @@ impl Workspace {
     }
 
     pub fn close_document(&mut self, uri: &Url) -> bool {
+        let cleared_rejected_fence = self.clear_rejected_open_fence(uri);
         if let (Some(pending), Some(document)) = (
             self.pending_unit_file_renames.get_mut(uri),
             self.open_documents.get(uri),
@@ -2655,7 +2701,7 @@ impl Workspace {
         };
         self.pending_diagnostics.remove(uri);
         self.forget_diagnostic_dependencies(uri);
-        if was_open {
+        if was_open || cleared_rejected_fence {
             self.bump_source_generation();
             self.mark_source_change(uri, true);
             self.open_document_contexts.remove(uri);
@@ -2668,7 +2714,7 @@ impl Workspace {
             self.disk_stamps.remove(uri);
             self.refresh_loaded_disk(uri);
         }
-        was_open
+        was_open || cleared_rejected_fence
     }
 
     fn accept_open_document(
@@ -2733,6 +2779,7 @@ impl Workspace {
             || (!self.open_documents.contains_key(&uri)
                 && self.open_documents.len() >= MAX_OPEN_DOCUMENTS)
         {
+            self.fence_rejected_open_document(&uri);
             eprintln!(
                 "pascal-lsp: rejected document state was not retained because the bounded recovery index is full: {uri}"
             );
@@ -10245,9 +10292,9 @@ fn is_immutable_override_file(path: &Path) -> bool {
 mod tests {
     use super::{
         ContextState, DiagnosticLineIndex, FileChange, MAX_OPEN_DOCUMENT_URI_BYTES,
-        MAX_OPEN_DOCUMENTS, MAX_SOURCE_CHANGE_OBSERVATIONS, OpenDocument, ResourceLimits,
-        RuntimeOptionsOverride, Workspace, WorkspaceOptions, context_state_is_fresh_with_cancel,
-        normalize_line_endings, scan_external_units,
+        MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_PATHS, MAX_SOURCE_CHANGE_OBSERVATIONS,
+        OpenDocument, ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
+        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Url};
@@ -10306,7 +10353,7 @@ mod tests {
             let uri = Url::from_file_path(temp.path().join(format!("Retained{index}.pas")))
                 .expect("tracked URI");
             workspace.open_documents.insert(
-                uri,
+                uri.clone(),
                 OpenDocument {
                     text: None,
                     version: 1,
@@ -10318,13 +10365,28 @@ mod tests {
         let next = Url::from_file_path(temp.path().join("Overflow.pas")).expect("overflow URI");
 
         let error = workspace
-            .open_document(next, "unit Overflow; implementation end.".into(), 1)
+            .open_document(next.clone(), "unit Overflow; implementation end.".into(), 1)
             .expect_err(
                 "a rejected open must not let tracked document count exceed recovery reserve",
             );
 
         assert!(error.contains("open document tracking limit"), "{error}");
         assert_eq!(workspace.open_documents.len(), MAX_OPEN_DOCUMENTS);
+        assert!(workspace.analysis_input().admission_fence_active);
+
+        assert!(
+            workspace.close_document(&next),
+            "close clears rejected-open fence"
+        );
+        let first = Url::from_file_path(temp.path().join("Retained0.pas")).expect("first URI");
+        assert!(
+            workspace.close_document(&first),
+            "closing a tracked document frees a slot"
+        );
+        workspace
+            .open_document(next, "unit Overflow; implementation end.".into(), 2)
+            .expect("retry succeeds after a slot is freed");
+        assert!(!workspace.analysis_input().admission_fence_active);
     }
 
     #[test]
@@ -10332,15 +10394,56 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
-        let path = temp.path().join("x".repeat(MAX_OPEN_DOCUMENT_URI_BYTES));
-        let uri = Url::from_file_path(path).expect("long file URI");
+        let mut accepted =
+            Url::from_file_path(temp.path().join("Accepted.pas")).expect("accepted file URI");
+        let padding = MAX_OPEN_DOCUMENT_URI_BYTES - accepted.as_str().len() - 1;
+        accepted.set_fragment(Some(&"a".repeat(padding)));
+        assert_eq!(accepted.as_str().len(), MAX_OPEN_DOCUMENT_URI_BYTES);
+        workspace
+            .open_document(
+                accepted.clone(),
+                "unit Accepted; implementation end.".into(),
+                1,
+            )
+            .expect("URI at the exact bound remains admissible");
+        assert!(!workspace.analysis_input().admission_fence_active);
 
+        let mut rejected =
+            Url::from_file_path(temp.path().join("Rejected.pas")).expect("rejected file URI");
+        let padding = MAX_OPEN_DOCUMENT_URI_BYTES - rejected.as_str().len();
+        rejected.set_fragment(Some(&"b".repeat(padding)));
+        assert_eq!(rejected.as_str().len(), MAX_OPEN_DOCUMENT_URI_BYTES + 1);
         let error = workspace
-            .open_document(uri, "unit LongUri; implementation end.".into(), 1)
-            .expect_err("a long URI must not exceed the notification recovery byte envelope");
-
+            .open_document(
+                rejected.clone(),
+                "unit Rejected; implementation end.".into(),
+                1,
+            )
+            .expect_err("one byte over the URI limit must be rejected");
         assert!(error.contains("notification recovery limit"), "{error}");
-        assert!(workspace.open_documents.is_empty());
+        assert!(workspace.analysis_input().admission_fence_active);
+        assert!(workspace.close_document(&rejected));
+        assert!(!workspace.analysis_input().admission_fence_active);
+        assert!(workspace.close_document(&accepted));
+    }
+
+    #[test]
+    fn rejected_open_fence_ledger_has_a_fixed_capacity() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        for index in 0..=MAX_REJECTED_OPEN_FENCE_PATHS {
+            let uri = Url::from_file_path(temp.path().join(format!("Rejected{index}.pas")))
+                .expect("rejected URI");
+            workspace.fence_rejected_open_document(&uri);
+        }
+
+        assert_eq!(
+            workspace.rejected_open_fence_paths.len(),
+            MAX_REJECTED_OPEN_FENCE_PATHS
+        );
+        assert!(workspace.rejected_open_fence_permanent);
+        assert!(workspace.analysis_input().admission_fence_active);
     }
 
     #[test]
@@ -10607,6 +10710,7 @@ mod tests {
             cached_documents: HashMap::new(),
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),
+            admission_fence_active: false,
             document_versions: HashMap::new(),
             deleted_overrides: HashMap::new(),
             source_generation: 0,

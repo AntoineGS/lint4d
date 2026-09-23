@@ -79,6 +79,7 @@ const WORKSPACE_NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+const OPEN_ADMISSION_FENCE_MESSAGE: &str = "analysis is disabled because an editor document could not be tracked; close the rejected document or restart the workspace";
 const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
 const MAX_WORKSPACE_MUTATION_DEFERRED_BYTES: usize = 1024 * 1024;
 const MAX_FILE_OPERATION_BATCH_ENTRIES: usize = 64;
@@ -4359,6 +4360,9 @@ impl AnalysisJobs {
         features: ClientFeatures,
     ) -> Result<PendingAnalysis, String> {
         let input = workspace.analysis_input();
+        if input.admission_fence_active {
+            return Err(OPEN_ADMISSION_FENCE_MESSAGE.to_string());
+        }
         let cancellation = Arc::new(AtomicBool::new(false));
         let source_generation = input.source_generation;
         let configuration_generation = input.configuration_generation;
@@ -5370,6 +5374,9 @@ impl AnalysisJobs {
         self.reap_retired_partial_validations();
         if self.shutting_down {
             return Err("analysis server is shutting down".to_string());
+        }
+        if workspace.analysis_admission_fenced() {
+            return Err(OPEN_ADMISSION_FENCE_MESSAGE.to_string());
         }
         if self.request_to_job.contains_key(&id) {
             return Err("analysis request ID is already in use".to_string());
@@ -9045,6 +9052,15 @@ fn handle_request(
     ) {
         // These operations have no safe pre-operation source edits to offer.
         connection.send_result(Message::Response(Response::new_ok(request.id, Value::Null)))?;
+        return Ok(());
+    }
+    if workspace.analysis_admission_fenced() {
+        send_error(
+            connection,
+            request.id,
+            ErrorCode::RequestFailed,
+            OPEN_ADMISSION_FENCE_MESSAGE,
+        )?;
         return Ok(());
     }
     let work_done_token = match request_work_done_token(&request) {

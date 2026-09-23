@@ -2508,6 +2508,17 @@ impl Workspace {
     }
 
     pub fn file_event(&mut self, uri: &Url, change: FileChange) -> Vec<Url> {
+        self.file_event_with_cancel(uri, change, None)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn file_event_with_cancel(
+        &mut self,
+        uri: &Url,
+        change: FileChange,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Url>, String> {
+        check_workspace_cancel(cancel)?;
         let mut diagnostic_uris = Vec::new();
         let override_changed = uri
             .to_file_path()
@@ -2533,7 +2544,7 @@ impl Workspace {
             // The editor buffer remains authoritative until didClose.
             self.schedule_diagnostics(uri.clone());
             diagnostic_uris.push(uri.clone());
-            return diagnostic_uris;
+            return Ok(diagnostic_uris);
         }
         if configuration_changed {
             let open_documents = self
@@ -2548,9 +2559,11 @@ impl Workspace {
         }
         match change {
             FileChange::Deleted => self.remove_indexed(uri),
-            FileChange::Created | FileChange::Changed => self.refresh_loaded_disk(uri),
+            FileChange::Created | FileChange::Changed => {
+                self.refresh_loaded_disk_with_cancel(uri, cancel)?
+            }
         }
-        diagnostic_uris
+        Ok(diagnostic_uris)
     }
 
     pub(crate) fn invalidate_all_for_file_notification_overflow(&mut self) -> Vec<Url> {
@@ -2769,7 +2782,19 @@ impl Workspace {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn did_rename_file(&mut self, old_uri: &Url, new_uri: &Url) -> Vec<Url> {
+        self.did_rename_file_with_cancel(old_uri, new_uri, None)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn did_rename_file_with_cancel(
+        &mut self,
+        old_uri: &Url,
+        new_uri: &Url,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Url>, String> {
+        check_workspace_cancel(cancel)?;
         let old_uri = canonical_file_uri(old_uri);
         let new_uri = canonical_file_uri(new_uri);
         let pending = self
@@ -2815,9 +2840,9 @@ impl Workspace {
                 "unmatched workspace file rename invalidated this open document; close and reopen it".to_string(),
             );
         }
-        let mut affected = self.file_event(&old_uri, FileChange::Deleted);
-        affected.extend(self.file_event(&new_uri, FileChange::Created));
-        affected
+        let mut affected = self.file_event_with_cancel(&old_uri, FileChange::Deleted, cancel)?;
+        affected.extend(self.file_event_with_cancel(&new_uri, FileChange::Created, cancel)?);
+        Ok(affected)
     }
 
     fn try_transfer_renamed_overlay(
@@ -3388,16 +3413,31 @@ impl Workspace {
     }
 
     fn refresh_loaded_disk(&mut self, uri: &Url) {
-        #[cfg(feature = "test-support")]
-        wait_at_file_discovery_test_barrier();
-        let Some(context_key) = self.document_contexts.get(uri).cloned() else {
-            self.remove_indexed(uri);
-            return;
-        };
-        let pins = HashSet::new();
-        if let Err(error) = self.load_source(uri, &context_key, &pins) {
+        if let Err(error) = self.refresh_loaded_disk_with_cancel(uri, None) {
             self.warn(error);
         }
+    }
+
+    fn refresh_loaded_disk_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        #[cfg(feature = "test-support")]
+        wait_at_file_discovery_test_barrier(cancel)?;
+        check_workspace_cancel(cancel)?;
+        let Some(context_key) = self.document_contexts.get(uri).cloned() else {
+            self.remove_indexed(uri);
+            return Ok(());
+        };
+        let pins = HashSet::new();
+        if let Err(error) = self.load_source_with_cancel(uri, &context_key, &pins, cancel) {
+            if error == "request cancelled" {
+                return Err(error);
+            }
+            self.warn(error);
+        }
+        Ok(())
     }
 
     fn resolve_navigation_once_with_cancel(
@@ -3708,6 +3748,7 @@ impl Workspace {
         Ok(dependencies)
     }
 
+    #[allow(dead_code)]
     fn load_source(
         &mut self,
         uri: &Url,
@@ -8384,27 +8425,29 @@ impl Workspace {
 }
 
 #[cfg(feature = "test-support")]
-fn wait_at_file_discovery_test_barrier() {
+fn wait_at_file_discovery_test_barrier(cancel: Option<&AtomicBool>) -> Result<(), String> {
     use std::io::Write as _;
 
     let Ok(spec) = std::env::var("PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER") else {
-        return;
+        return Ok(());
     };
     let Some((entered, release)) = spec.split_once('|') else {
-        return;
+        return Ok(());
     };
     let Ok(mut marker) = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(entered)
     else {
-        return;
+        return Ok(());
     };
     let _ = marker.write_all(b"x");
     drop(marker);
     while !std::path::Path::new(release).exists() {
+        check_workspace_cancel(cancel)?;
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    Ok(())
 }
 
 fn scan_external_units(

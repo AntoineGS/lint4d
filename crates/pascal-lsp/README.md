@@ -1232,18 +1232,25 @@ In-range file-event discovery and dependent-diagnostic fan-out now run on a
 serialized workspace-mutation worker that temporarily owns the live workspace.
 While it reconciles a preceding event, workspace-dependent requests and
 state-changing notifications wait in a FIFO (up to 64 messages and 1 MiB);
-`$/cancelRequest` remains serviceable and can cancel a queued request. Queue
-saturation terminates the session rather than using stale state. This first
-stage makes the protocol loop responsive but does not yet bound actual
-filesystem/project/index/dependent work, cancel reconciliation work, or provide
-a safe tombstone-aware saturation fallback. Do not interpret it as closing
-P2-4. Clients should continue to use watched-file notifications for changes
-not covered by these Pascal source filters.
+`$/cancelRequest` remains serviceable and can cancel a queued request. When
+that FIFO fills, one additional message is retained in a bounded overflow slot;
+the stdio reader is then backpressured until the worker finishes and messages
+replay in causal order. A single message larger than the byte budget can use
+that slot, but a second cannot be consumed before the slot is replayed. Shutdown,
+exit, and input disconnect request cooperative worker cancellation and join the
+worker before the session releases its only workspace owner; worker panic fails
+queued requests and closes the session. This stage does not yet impose a total
+actual-work budget across filesystem/project/index/dependent reconciliation or
+diagnostic fan-out, and therefore does not close P2-4. Clients should continue
+to use watched-file notifications for changes not covered by these Pascal
+source filters.
 
 The test-support build exposes a deterministic file-discovery barrier at the
-loaded-source disk refresh boundary. Its 64-event protocol regression holds
-that worker while checking cancellation responsiveness, request deferral rather
-than stale answers, and post-release provider freshness.
+loaded-source disk refresh boundary. Protocol regressions hold that worker
+while checking cancellation responsiveness, shutdown/exit/disconnect cleanup,
+worker-panic request failure, FIFO replay across more than 64 messages including
+overlay changes and a client response, single-oversize-message replay, and
+post-release freshness rather than stale answers.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial

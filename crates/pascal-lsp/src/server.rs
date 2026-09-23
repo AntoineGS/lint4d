@@ -46,7 +46,7 @@ use std::io::{self, BufRead, Read};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -7835,34 +7835,83 @@ fn is_workspace_file_event_notification(method: &str) -> bool {
     )
 }
 
+struct WorkspaceFileNotificationWorker {
+    receiver: Receiver<(Workspace, Result<DiagnosticNotificationEffect, String>)>,
+    cancellation: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WorkspaceFileNotificationWorker {
+    fn cancel_and_join(&mut self) -> thread::Result<()> {
+        self.cancellation.store(true, Ordering::Release);
+        self.join.take().map_or(Ok(()), JoinHandle::join)
+    }
+}
+
+impl Drop for WorkspaceFileNotificationWorker {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            // Preserve the only owned Workspace until worker teardown is complete.
+            // This deliberately joins on exceptional exits rather than detaching
+            // a state owner with no session/recovery path.
+            let _ = join.join();
+        }
+    }
+}
+
+fn cancel_and_join_workspace_file_worker(
+    worker: &mut Option<WorkspaceFileNotificationWorker>,
+) -> thread::Result<()> {
+    worker
+        .take()
+        .map_or(Ok(()), |mut worker| worker.cancel_and_join())
+}
+
 fn spawn_workspace_file_notification(
     workspace: &mut Workspace,
     notification: Notification,
     workspace_folders_supported: bool,
     push_diagnostics_supported: bool,
-) -> Receiver<(Workspace, Result<DiagnosticNotificationEffect, String>)> {
+) -> WorkspaceFileNotificationWorker {
     let (sender, receiver) = bounded(1);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
     let owned_workspace = std::mem::take(workspace);
-    thread::Builder::new()
+    let join = thread::Builder::new()
         .name("PascalLspWorkspaceMutation".to_string())
         .spawn(move || {
             let mut workspace = owned_workspace;
-            let result = handle_notification(
+            let result = handle_notification_with_cancel(
                 &UnusedProtocolSender,
                 &mut workspace,
                 notification,
                 workspace_folders_supported,
                 push_diagnostics_supported,
+                Some(&worker_cancellation),
             );
+            #[cfg(feature = "test-support")]
+            if std::env::var_os("PASCAL_LSP_TEST_PANIC_FILE_WORKER").is_some() {
+                panic!("injected file-notification worker panic");
+            }
             let _ = sender.send((workspace, result));
+            #[cfg(feature = "test-support")]
+            if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_FILE_WORKER_COMPLETED") {
+                let _ = std::fs::write(path, b"completed");
+            }
         })
         .expect("failed to start serialized workspace mutation worker");
-    receiver
+    WorkspaceFileNotificationWorker {
+        receiver,
+        cancellation,
+        join: Some(join),
+    }
 }
 
 fn queue_workspace_message(
     queue: &mut VecDeque<(Message, usize)>,
     queued_bytes: &mut usize,
+    overflow: &mut Option<Message>,
     message: Message,
 ) -> io::Result<()> {
     let bytes = serde_json::to_vec(&message)
@@ -7871,9 +7920,13 @@ fn queue_workspace_message(
     if queue.len() >= MAX_CONFIGURATION_DEFERRED_MESSAGES
         || queued_bytes.saturating_add(bytes) > MAX_WORKSPACE_MUTATION_DEFERRED_BYTES
     {
-        return Err(io::Error::other(
-            "workspace mutation queue saturated; reconnect and retry notifications",
-        ));
+        if overflow.is_some() {
+            return Err(io::Error::other(
+                "workspace mutation overflow slot occupied while reading continued",
+            ));
+        }
+        *overflow = Some(message);
+        return Ok(());
     }
     *queued_bytes = queued_bytes.saturating_add(bytes);
     queue.push_back((message, bytes));
@@ -7897,17 +7950,41 @@ fn event_loop(
     let mut deferred_configuration_messages = VecDeque::new();
     let mut deferred_workspace_messages = VecDeque::new();
     let mut deferred_workspace_message_bytes = 0usize;
-    let mut file_notification_worker: Option<
-        Receiver<(Workspace, Result<DiagnosticNotificationEffect, String>)>,
-    > = None;
+    let mut deferred_workspace_overflow: Option<Message> = None;
+    let mut file_notification_worker: Option<WorkspaceFileNotificationWorker> = None;
     let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
     loop {
         connection.flush()?;
-        if let Some(receiver) = file_notification_worker.as_ref() {
-            match receiver.try_recv() {
+        if let Some(worker) = file_notification_worker.as_ref() {
+            match worker.receiver.try_recv() {
                 Ok((completed_workspace, result)) => {
+                    let mut worker = file_notification_worker
+                        .take()
+                        .expect("completed workspace file worker");
+                    if worker.cancel_and_join().is_err() {
+                        for (message, _) in deferred_workspace_messages.drain(..) {
+                            if let Message::Request(request) = message {
+                                send_error(
+                                    connection,
+                                    request.id,
+                                    ErrorCode::RequestFailed,
+                                    "workspace reconciliation worker panicked; retry after reconnect",
+                                )?;
+                            }
+                        }
+                        if let Some(Message::Request(request)) = deferred_workspace_overflow.take()
+                        {
+                            send_error(
+                                connection,
+                                request.id,
+                                ErrorCode::RequestFailed,
+                                "workspace reconciliation worker panicked; retry after reconnect",
+                            )?;
+                        }
+                        jobs.shutdown_with_connection(connection)?;
+                        return Ok(true);
+                    }
                     *workspace = completed_workspace;
-                    file_notification_worker = None;
                     match result {
                         Ok(effect) => {
                             if pull_diagnostics_supported
@@ -7939,7 +8016,30 @@ fn event_loop(
                     }
                 }
                 Err(TryRecvError::Disconnected) => {
-                    return Err("workspace file-notification worker disconnected".into());
+                    let mut worker = file_notification_worker
+                        .take()
+                        .expect("disconnected workspace file worker");
+                    let _ = worker.cancel_and_join();
+                    for (message, _) in deferred_workspace_messages.drain(..) {
+                        if let Message::Request(request) = message {
+                            send_error(
+                                connection,
+                                request.id,
+                                ErrorCode::RequestFailed,
+                                "workspace reconciliation worker failed; retry after reconnect",
+                            )?;
+                        }
+                    }
+                    if let Some(Message::Request(request)) = deferred_workspace_overflow.take() {
+                        send_error(
+                            connection,
+                            request.id,
+                            ErrorCode::RequestFailed,
+                            "workspace reconciliation worker failed; retry after reconnect",
+                        )?;
+                    }
+                    jobs.shutdown_with_connection(connection)?;
+                    return Ok(true);
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -7994,9 +8094,13 @@ fn event_loop(
                         deferred_workspace_message_bytes.saturating_sub(bytes);
                     message
                 })
+                .or_else(|| deferred_workspace_overflow.take())
         };
         let message = if let Some(message) = deferred_workspace_message {
             message
+        } else if workspace_busy && deferred_workspace_overflow.is_some() {
+            thread::sleep(timeout);
+            continue;
         } else if !workspace_busy && !configuration.is_preparing() {
             match deferred_configuration_messages.pop_front() {
                 Some(DeferredConfigurationMessage::Request(deferred)) => {
@@ -8027,6 +8131,8 @@ fn event_loop(
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => {
+                        let _ =
+                            cancel_and_join_workspace_file_worker(&mut file_notification_worker);
                         jobs.shutdown();
                         configuration.shutdown();
                         diagnostic_refresh.shutdown();
@@ -8047,6 +8153,7 @@ fn event_loop(
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
                     jobs.shutdown();
                     configuration.shutdown();
                     diagnostic_refresh.shutdown();
@@ -8057,6 +8164,7 @@ fn event_loop(
 
         match message {
             Message::Request(request) if request.method == "shutdown" => {
+                let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
@@ -8080,6 +8188,14 @@ fn event_loop(
                         )?;
                     }
                 }
+                if let Some(Message::Request(deferred)) = deferred_workspace_overflow.take() {
+                    send_error(
+                        connection,
+                        deferred.id,
+                        ErrorCode::RequestCanceled,
+                        rename::CANCELLATION_MESSAGE,
+                    )?;
+                }
                 deferred_workspace_message_bytes = 0;
                 send_ok(connection, request.id, ())?;
                 shutdown_received = true;
@@ -8088,6 +8204,7 @@ fn event_loop(
                 queue_workspace_message(
                     &mut deferred_workspace_messages,
                     &mut deferred_workspace_message_bytes,
+                    &mut deferred_workspace_overflow,
                     Message::Request(request),
                 )?;
             }
@@ -8193,6 +8310,7 @@ fn event_loop(
                 }
             }
             Message::Notification(notification) if notification.method == "exit" => {
+                let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
@@ -8287,6 +8405,17 @@ fn event_loop(
                                 ErrorCode::RequestCanceled,
                                 rename::CANCELLATION_MESSAGE,
                             )?;
+                        } else if matches!(
+                            deferred_workspace_overflow.as_ref(),
+                            Some(Message::Request(request)) if request.id == id
+                        ) {
+                            deferred_workspace_overflow = None;
+                            send_error(
+                                connection,
+                                id,
+                                ErrorCode::RequestCanceled,
+                                rename::CANCELLATION_MESSAGE,
+                            )?;
                         } else {
                             jobs.cancel(connection, &id).map_err(
                                 |error| -> Box<dyn Error + Send + Sync> { error.into() },
@@ -8302,6 +8431,7 @@ fn event_loop(
                     queue_workspace_message(
                         &mut deferred_workspace_messages,
                         &mut deferred_workspace_message_bytes,
+                        &mut deferred_workspace_overflow,
                         Message::Notification(notification),
                     )?;
                     continue;
@@ -8377,6 +8507,7 @@ fn event_loop(
                     queue_workspace_message(
                         &mut deferred_workspace_messages,
                         &mut deferred_workspace_message_bytes,
+                        &mut deferred_workspace_overflow,
                         Message::Response(response),
                     )?;
                     continue;
@@ -9438,6 +9569,24 @@ fn handle_notification(
     workspace_folders_supported: bool,
     push_diagnostics_supported: bool,
 ) -> Result<DiagnosticNotificationEffect, String> {
+    handle_notification_with_cancel(
+        connection,
+        workspace,
+        notification,
+        workspace_folders_supported,
+        push_diagnostics_supported,
+        None,
+    )
+}
+
+fn handle_notification_with_cancel(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    notification: Notification,
+    workspace_folders_supported: bool,
+    push_diagnostics_supported: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<DiagnosticNotificationEffect, String> {
     match notification.method.as_str() {
         "initialized" => Ok(DiagnosticNotificationEffect::default()),
         "textDocument/didOpen" => {
@@ -9597,7 +9746,10 @@ fn handle_notification(
             }
             let mut effect = DiagnosticNotificationEffect::default();
             for (changed_uri, kind) in changes {
-                for uri in workspace.file_event(&changed_uri, kind) {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                    return Err(rename::CANCELLATION_MESSAGE.to_string());
+                }
+                for uri in workspace.file_event_with_cancel(&changed_uri, kind, cancel)? {
                     effect.refresh_uri(uri);
                 }
                 if !push_diagnostics_supported {
@@ -9657,12 +9809,15 @@ fn handle_notification(
             }
             let mut effect = DiagnosticNotificationEffect::default();
             for uri in uris {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                    return Err(rename::CANCELLATION_MESSAGE.to_string());
+                }
                 let change = if created {
                     FileChange::Created
                 } else {
                     FileChange::Deleted
                 };
-                for affected in workspace.file_event(&uri, change) {
+                for affected in workspace.file_event_with_cancel(&uri, change, cancel)? {
                     effect.refresh_uri(affected);
                 }
                 effect.refresh_uri(uri.clone());
@@ -9732,7 +9887,10 @@ fn handle_notification(
             }
             let mut effect = DiagnosticNotificationEffect::default();
             for (old_uri, new_uri) in renames {
-                for affected in workspace.did_rename_file(&old_uri, &new_uri) {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                    return Err(rename::CANCELLATION_MESSAGE.to_string());
+                }
+                for affected in workspace.did_rename_file_with_cancel(&old_uri, &new_uri, cancel)? {
                     effect.refresh_uri(affected);
                 }
                 effect.refresh_uri(old_uri.clone());

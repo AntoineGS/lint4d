@@ -6,6 +6,8 @@ use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::fmt::Write as _;
 use std::fs;
+#[cfg(feature = "test-support")]
+use std::io::Write as _;
 use std::io::{self, BufReader};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
@@ -30617,6 +30619,468 @@ fn blocked_file_discovery_does_not_block_cancel_or_unrelated_protocol_messages()
         break;
     }
     server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn shutdown_cancels_and_reaps_a_held_workspace_file_worker() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let source = "unit Provider;\ninterface\nimplementation\nend.\n";
+    write_file(&provider, source);
+    let barrier_dir = root.path().join("shutdown-file-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let completed = barrier_dir.join("completed");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let completed_value = completed.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_FILE_WORKER_COMPLETED",
+                completed_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial = RequestId::from("shutdown-file-worker-load".to_string());
+    server.send_request(
+        initial.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let _ = server.response(&initial);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+
+    let shutdown_id = RequestId::from("shutdown-held-file-worker".to_string());
+    server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+    let shutdown_response = server.response_with_timeout(&shutdown_id, Duration::from_millis(250));
+    let completed_before_release = wait_for_file(&completed, Duration::from_millis(250));
+
+    // Always release and reap the child even in the expected RED run.
+    barrier.release();
+    if !completed_before_release {
+        assert!(
+            wait_for_file(&completed, IO_TIMEOUT),
+            "worker did not exit after release"
+        );
+    }
+    server.send_notification("exit", Value::Null);
+    server.stdin.take();
+    let status = server.child.wait().expect("wait for LSP server");
+    assert!(status.success(), "server exited unsuccessfully: {status}");
+    assert!(
+        shutdown_response.is_some_and(|response| response.error.is_none()),
+        "shutdown should respond while the worker is held"
+    );
+    assert!(
+        completed_before_release,
+        "shutdown returned while the detached worker still owned the workspace"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn exit_cancels_and_reaps_a_held_workspace_file_worker() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("exit-file-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let completed = barrier_dir.join("completed");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let completed_value = completed.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_FILE_WORKER_COMPLETED",
+                completed_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial = RequestId::from("exit-file-worker-load".to_string());
+    server.send_request(
+        initial.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let _ = server.response(&initial);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("exit", Value::Null);
+    let reaped_before_release = wait_for_file(&completed, Duration::from_millis(250));
+    if !reaped_before_release {
+        barrier.release();
+    }
+    let _status = server.child.wait().expect("wait after exit");
+    assert!(
+        reaped_before_release,
+        "exit returned while the detached worker still owned the workspace"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn input_disconnect_cancels_and_reaps_a_held_workspace_file_worker() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("disconnect-file-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let completed = barrier_dir.join("completed");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let completed_value = completed.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_FILE_WORKER_COMPLETED",
+                completed_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial = RequestId::from("disconnect-file-worker-load".to_string());
+    server.send_request(
+        initial.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let _ = server.response(&initial);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+    server.stdin.take();
+    let worker_reaped = wait_for_file(&completed, Duration::from_millis(250));
+    barrier.release();
+    let _ = server.child.wait().expect("wait after input disconnect");
+    assert!(
+        worker_reaped,
+        "disconnect left the workspace worker detached"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn panicked_workspace_worker_fails_queued_requests_before_closing() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("panic-file-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            ("PASCAL_LSP_TEST_PANIC_FILE_WORKER", "1"),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial = RequestId::from("panic-file-worker-load".to_string());
+    server.send_request(
+        initial.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let _ = server.response(&initial);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+    let pending = RequestId::from("request-after-panicked-file-worker".to_string());
+    server.send_request(
+        pending.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    barrier.release();
+    let response = server.response_with_timeout(&pending, IO_TIMEOUT);
+    let _ = server.child.wait().expect("wait after worker panic");
+    assert_eq!(
+        response.and_then(|response| response.error.map(|error| error.code)),
+        Some(-32803),
+        "queued request must fail explicitly when reconciliation panics"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn saturated_workspace_fifo_replays_overlay_changes_config_response_and_query() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype TStart = record end;\nimplementation\nend.\n",
+    );
+    let consumer = root.path().join("Consumer.pas");
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Overlay;\ntype TUse = TFinal;\nimplementation\nend.\n";
+    write_file(&consumer, consumer_source);
+    let barrier_dir = root.path().join("saturated-workspace-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variable(
+        root.path(),
+        Some("PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER"),
+        Some(&barrier_value),
+    );
+    let root_uri = uri(root.path());
+    let initialize_id = RequestId::from("saturated-fifo-initialize".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": root_uri,
+            "capabilities": {"workspace": {"configuration": true}}
+        }),
+    );
+    assert!(server.response(&initialize_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    let initial_configuration = server.request("workspace/configuration");
+    server.send(Message::Response(Response::new_ok(
+        initial_configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+    server.send_notification("workspace/didChangeConfiguration", json!({"settings":{}}));
+    let pending_configuration = server.request("workspace/configuration");
+
+    let initial_definition = RequestId::from("saturated-fifo-initial-definition".to_string());
+    server.send_request(
+        initial_definition.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let _ = server.response(&initial_definition);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+
+    let mut queued = Vec::new();
+    queued.push(Message::Response(Response::new_ok(
+        pending_configuration.id,
+        json!([{"projectFile": null}]),
+    )));
+    let overlay = root.path().join("Overlay.pas");
+    let overlay_source = |name: &str| {
+        format!("unit Overlay;\ninterface\ntype {name} = record end;\nimplementation\nend.\n")
+    };
+    let mut version = 1;
+    let mut latest_source = overlay_source("T00000");
+    queued.push(Message::Notification(Notification::new(
+        "textDocument/didOpen".to_string(),
+        json!({"textDocument":{"uri":uri(&overlay),"languageId":"pascal","version":version,"text":latest_source}}),
+    )));
+    for index in 0..63 {
+        version += 1;
+        let next_name = if index == 62 {
+            "TFinal".to_string()
+        } else {
+            format!("T{index:05}")
+        };
+        latest_source = overlay_source(&next_name);
+        queued.push(Message::Notification(Notification::new(
+            "textDocument/didChange".to_string(),
+            json!({"textDocument":{"uri":uri(&overlay),"version":version},"contentChanges":[{"text":latest_source}]}),
+        )));
+    }
+    assert!(queued.len() > 64);
+    let mut wire = Vec::new();
+    for message in &queued {
+        message.write(&mut wire).expect("encode queued message");
+    }
+    server
+        .stdin
+        .as_mut()
+        .expect("server stdin")
+        .write_all(&wire)
+        .expect("send saturated FIFO burst");
+    let pending_query = RequestId::from("saturated-fifo-final-definition".to_string());
+    server.send_request(
+        pending_query.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TFinal", 0),
+    );
+
+    barrier.release();
+    let query_response = server.response_with_timeout(&pending_query, IO_TIMEOUT);
+    if query_response.is_none() {
+        // Ensure a test failure cannot leave the child blocked or unreaped.
+        let _ = server.child.kill();
+    }
+    let query_response =
+        query_response.expect("saturated notifications must replay, not terminate the session");
+    let locations = result_locations(query_response);
+    assert_eq!(
+        locations.len(),
+        1,
+        "query must observe the final queued overlay"
+    );
+    assert_eq!(locations[0]["uri"], uri(&overlay).to_string());
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn one_oversized_deferred_notification_does_not_abort_workspace_reconciliation() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("oversized-deferred-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variable(
+        root.path(),
+        Some("PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER"),
+        Some(&barrier_value),
+    );
+    server.initialize(root.path(), Value::Null);
+    let initial = RequestId::from("oversized-deferred-load".to_string());
+    server.send_request(
+        initial.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let _ = server.response(&initial);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+
+    let oversized_notification = Message::Notification(Notification::new(
+        "workspace/didChangeConfiguration".to_string(),
+        json!({"settings":{"ignoredPadding":"x".repeat(1024 * 1024 + 1)}}),
+    ));
+    let query_id = RequestId::from("after-oversized-deferred-message".to_string());
+    let query = Message::Request(Request::new(
+        query_id.clone(),
+        "textDocument/documentSymbol".to_string(),
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    ));
+    let mut wire = Vec::new();
+    oversized_notification
+        .write(&mut wire)
+        .expect("encode oversized notification");
+    query.write(&mut wire).expect("encode query");
+    server
+        .stdin
+        .as_mut()
+        .expect("server stdin")
+        .write_all(&wire)
+        .expect("send oversized deferred message");
+    barrier.release();
+    let response = server.response_with_timeout(&query_id, IO_TIMEOUT);
+    if response.is_none() {
+        let _ = server.child.kill();
+    }
+    assert!(
+        response.is_some_and(|response| response.error.is_none()),
+        "a single oversized deferred message must replay without losing the session"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    path.exists()
 }
 
 #[cfg(target_os = "linux")]

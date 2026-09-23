@@ -8512,6 +8512,15 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                     .is_some_and(|document| document.text.is_some())
             },
         );
+        // Include resolution probes every directory and candidate before it
+        // knows which file wins. Account for the complete observation set,
+        // not just the selected payload read.
+        if let Some(budget) = self.budget {
+            budget.charge_path_visits(lookup.observations.len())?;
+        }
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
         if let Some(error) = lookup.error.as_ref() {
             return Err(error.clone());
         }
@@ -8520,9 +8529,6 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
             .as_ref()
             .cloned()
             .ok_or_else(|| "include path is unresolved".to_string())?;
-        if let Some(budget) = self.budget {
-            budget.charge_path_visits(1)?;
-        }
         let route = lookup.selected_route.clone();
         let relative = include_name(&directive).is_some_and(|raw| Path::new(&raw).is_relative());
         let legacy_authorized = if !matches!(&route, IncludeRoute::Legacy) {
@@ -8655,6 +8661,12 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                     .is_some_and(|document| document.text.is_some())
             },
         );
+        if let Some(budget) = self.budget {
+            budget.charge_path_visits(lookup.observations.len())?;
+        }
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
         if let Some(error) = lookup.error {
             return Err(error);
         }

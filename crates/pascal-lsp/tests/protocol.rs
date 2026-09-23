@@ -31307,6 +31307,13 @@ fn watched_refresh_charges_nested_include_reads_to_notification_budget() {
         metrics["file_bytes_read"].as_u64().unwrap_or_default() as usize >= expected_read_bytes,
         "notification read accounting must include the root, outer include, and nested include bytes ({expected_read_bytes}): {metrics}"
     );
+    assert!(
+        metrics["filesystem_path_visits"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 8,
+        "include resolution must charge both search-directory and candidate observations, not only selected reads: {metrics}"
+    );
     server.shutdown();
 }
 

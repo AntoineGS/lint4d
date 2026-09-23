@@ -40,7 +40,7 @@ pub(crate) struct WorkspaceDiagnosticsResult {
     pub(crate) publication_dependencies: HashMap<Url, Arc<Vec<SourceRecord>>>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct DiagnosticPublication {
     pub(crate) uri: Url,
     pub(crate) version: Option<i32>,

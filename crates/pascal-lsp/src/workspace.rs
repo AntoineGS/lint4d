@@ -1855,6 +1855,11 @@ impl Workspace {
             self.rejected_open_fence_permanent = true;
         }
         self.bump_source_generation();
+        // Dependency-scoped results intentionally ignore ordinary source
+        // generation changes, so rejected editor authority must also advance
+        // the global freshness watermark. This invalidates old read sets even
+        // after didClose releases the query fence.
+        self.mark_global_change();
     }
 
     fn clear_rejected_open_fence(&mut self, uri: &Url) -> bool {
@@ -2403,7 +2408,6 @@ impl Workspace {
                 uri.as_str().len()
             ));
         }
-        self.clear_rejected_open_fence(&uri);
         if !self.open_documents.contains_key(&uri) {
             let preserve_mapped_owner =
                 uri.to_file_path()
@@ -2463,7 +2467,9 @@ impl Workspace {
             self.reject_open_document(uri, version, reason);
             return Ok(());
         }
-        self.accept_open_document(uri, text, version, context_key, false)
+        self.accept_open_document(uri.clone(), text, version, context_key, false)?;
+        self.clear_rejected_open_fence(&uri);
+        Ok(())
     }
 
     pub fn change_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
@@ -3585,6 +3591,18 @@ impl Workspace {
             .remove(root_uri)
             .unwrap_or_default();
         self.aggregate_diagnostic_publications(previous.keys().cloned().collect())
+    }
+
+    pub(crate) fn clear_all_diagnostic_publications(
+        &mut self,
+    ) -> Vec<queries::DiagnosticPublication> {
+        let affected = self
+            .diagnostic_publications
+            .values()
+            .flat_map(|publications| publications.keys().cloned())
+            .collect::<HashSet<_>>();
+        self.diagnostic_publications.clear();
+        self.aggregate_diagnostic_publications(affected)
     }
 
     fn aggregate_diagnostic_publications(
@@ -10458,6 +10476,58 @@ mod tests {
         assert!(
             workspace.analysis_input().admission_fence_active,
             "one close must not release another rejected URI identity"
+        );
+    }
+
+    #[test]
+    fn failed_admitted_retry_keeps_rejected_open_fence() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let allowed_root = temp.path().join("allowed");
+        fs::create_dir_all(&allowed_root).expect("allowed root");
+        let mut workspace = test_workspace(
+            vec![allowed_root.clone()],
+            WorkspaceOptions {
+                source_paths: vec![allowed_root.to_string_lossy().into_owned()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        for index in 0..MAX_OPEN_DOCUMENTS {
+            let uri = Url::from_file_path(allowed_root.join(format!("Retained{index}.pas")))
+                .expect("tracked URI");
+            workspace.open_documents.insert(
+                uri,
+                OpenDocument {
+                    text: None,
+                    version: 1,
+                    rejection: Some("test rejection".into()),
+                    identity_generation: 0,
+                },
+            );
+        }
+        let outside = temp.path().join("outside.txt");
+        let outside_uri = Url::from_file_path(&outside).expect("outside URI");
+        assert!(
+            workspace
+                .open_document(outside_uri.clone(), "unit Outside; end.".into(), 1)
+                .expect_err("full tracker must reject first attempt")
+                .contains("tracking limit")
+        );
+
+        let retained =
+            Url::from_file_path(allowed_root.join("Retained0.pas")).expect("retained URI");
+        assert!(workspace.close_document(&retained));
+        let error = workspace
+            .open_document(outside_uri, "unit Outside; end.".into(), 2)
+            .expect_err("retry outside supported paths must fail");
+
+        assert!(
+            error.contains("unsupported Pascal document path")
+                || error.contains("outside configured source paths"),
+            "{error}"
+        );
+        assert!(
+            workspace.analysis_input().admission_fence_active,
+            "failed retry must not clear the rejected editor's fence"
         );
     }
 

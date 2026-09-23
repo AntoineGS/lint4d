@@ -1258,16 +1258,22 @@ recovery-reserve counters independently.
 
 If a `didOpen` cannot be admitted because the open-document count or URI-byte
 limit is reached, the workspace advances its source generation and enters a
-conservative admission fence. Analysis requests (including navigation, pull
-diagnostics, and rename) fail closed rather than treating the rejected editor
-buffer as absent and using stale disk/index contents. `didClose` for a fenced,
-representable file path releases that fence; after freeing an open-document
-slot, the client can retry `didOpen`. The fence ledger retains exact URI
-identities and is separately capped at 64 entries of at most 16 KiB each, so
-closing one URI spelling cannot release a second rejected alias. If the ledger
-itself fills or a URI exceeds 16 KiB, the workspace remains fenced until
-restart rather than allocate unbounded rejection state. The recovery URI
-reserve above does not include this small fence ledger.
+conservative admission fence and advances the global source-freshness
+watermark. Analysis requests (including navigation, pull diagnostics, and
+rename) fail closed rather than treating the rejected editor buffer as absent
+and using stale disk/index contents. In-flight and queued client work is
+cancelled or failed at delivery, partial results are stopped, stale push
+diagnostics are cleared, and pull clients receive a diagnostic refresh. The
+global watermark keeps pre-rejection read sets stale after `didClose`, so
+lifting the request fence cannot revive an older worker result. An exact
+`didClose` for a retained URI releases that fence; after freeing an
+open-document slot, a `didOpen` retry clears the fence only after the overlay
+has been accepted. The fence ledger retains exact URI identities and is
+separately capped at 64 entries of at most 16 KiB each, so closing one URI
+spelling cannot release a second rejected alias. If the ledger itself fills or
+a URI exceeds 16 KiB, the workspace remains fenced until restart rather than
+allocate unbounded rejection state. The recovery URI reserve above does not
+include this small fence ledger.
 
 These ceilings are not yet a global actual-work bound: override configuration
 reads/stamps, package lookup/cache/catalogue work, several path-stamp loops,

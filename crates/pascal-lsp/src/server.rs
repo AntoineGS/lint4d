@@ -2411,6 +2411,7 @@ impl DiagnosticPullStore {
 struct DiagnosticNotificationEffect {
     refresh: Vec<Url>,
     cancel: Vec<Url>,
+    clear_publications: Vec<queries::DiagnosticPublication>,
     refresh_membership: HashSet<Url>,
     cancel_membership: HashSet<Url>,
     refresh_requested: bool,
@@ -5932,6 +5933,28 @@ impl AnalysisJobs {
             return Vec::new();
         }
         let mut failures = Vec::new();
+        if workspace.analysis_admission_fenced() {
+            while let Some(queued) = self.queue.pop() {
+                match queued {
+                    QueuedAnalysis::Client(job) => {
+                        self.remove_observation(job.key.as_ref(), &job.id);
+                        for recipient in &job.recipients {
+                            self.remove_client_mapping(&recipient.id, &job.id);
+                        }
+                        failures.push(DispatchFailure {
+                            recipients: job.recipients,
+                            client_job: Some(job.id),
+                            diagnostic: None,
+                            message: OPEN_ADMISSION_FENCE_MESSAGE.to_string(),
+                        });
+                    }
+                    QueuedAnalysis::Diagnostic(job) => {
+                        self.diagnostic_jobs.remove(&job.uri);
+                    }
+                }
+            }
+            return failures;
+        }
         while self.pending.len().saturating_add(self.diagnostics.len()) < MAX_ANALYSIS_JOBS {
             let Some(queued) = self.queue.pop() else {
                 break;
@@ -6476,7 +6499,8 @@ impl AnalysisJobs {
             let Some(mut delivery) = self.partial_deliveries.pop_front() else {
                 return Ok(());
             };
-            if delivery.source_generation != workspace.source_generation()
+            if workspace.analysis_admission_fenced()
+                || delivery.source_generation != workspace.source_generation()
                 || delivery.configuration_generation != workspace.configuration_generation()
             {
                 if delivery.retrigger_on_stale {
@@ -6572,6 +6596,17 @@ impl AnalysisJobs {
         workspace: &mut Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.reap_retired_partial_validations();
+        if workspace.analysis_admission_fenced() {
+            // A rejected editor overlay invalidates authority workspace-wide.
+            // Stop active workers before inspecting their completions so even
+            // results that were already computed cannot be published.
+            for job in self.pending.values() {
+                job.cancellation.store(true, Ordering::Relaxed);
+            }
+            for job in self.diagnostics.values() {
+                job.analysis.cancellation.store(true, Ordering::Relaxed);
+            }
+        }
         while let Ok(result) = self.receiver.try_recv() {
             match result.id {
                 AnalysisJobId::Diagnostic(id) => {
@@ -6598,7 +6633,9 @@ impl AnalysisJobs {
                                 Some("Cancelled"),
                             )
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                        workspace.reschedule_diagnostics(job.uri);
+                        if !workspace.analysis_admission_fenced() {
+                            workspace.reschedule_diagnostics(job.uri);
+                        }
                     } else {
                         deliver_analysis_result_with_store(
                             connection,
@@ -6885,6 +6922,9 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
 }
 
 fn analysis_result_is_stale(workspace: &Workspace, result: &AnalysisResult) -> bool {
+    if workspace.analysis_admission_fenced() {
+        return true;
+    }
     if is_dependency_scoped_result(&result.value, &result.records) {
         workspace
             .dependency_scoped_result_is_fresh(
@@ -8191,6 +8231,16 @@ fn event_loop(
                     *workspace = completed_workspace;
                     match result {
                         Ok(effect) => {
+                            if !pull_diagnostics_supported {
+                                for publication in &effect.clear_publications {
+                                    send_diagnostics(
+                                        connection,
+                                        &publication.uri,
+                                        publication.version,
+                                        publication.diagnostics.clone(),
+                                    )?;
+                                }
+                            }
                             if pull_diagnostics_supported
                                 && (effect.refresh_requested || !effect.refresh.is_empty())
                             {
@@ -8698,6 +8748,16 @@ fn event_loop(
                 };
                 match result {
                     Ok(effect) => {
+                        if !pull_diagnostics_supported {
+                            for publication in &effect.clear_publications {
+                                send_diagnostics(
+                                    connection,
+                                    &publication.uri,
+                                    publication.version,
+                                    publication.diagnostics.clone(),
+                                )?;
+                            }
+                        }
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
                         }
@@ -9841,16 +9901,36 @@ fn handle_notification_with_control(
         "textDocument/didOpen" => {
             let params: DidOpenTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri.clone();
-            workspace
-                .open_document(
-                    params.text_document.uri,
-                    params.text_document.text,
-                    params.text_document.version,
-                )
-                .map_err(|error| {
-                    eprintln!("pascal-lsp: didOpen ignored: {error}");
-                    error
-                })?;
+            if let Err(error) = workspace.open_document(
+                params.text_document.uri,
+                params.text_document.text,
+                params.text_document.version,
+            ) {
+                eprintln!("pascal-lsp: didOpen ignored: {error}");
+                if workspace.analysis_admission_fenced() {
+                    let mut effect = DiagnosticNotificationEffect::default();
+                    effect.request_refresh();
+                    effect.clear_publications = workspace.clear_all_diagnostic_publications();
+                    let mut cleared = effect
+                        .clear_publications
+                        .iter()
+                        .map(|publication| publication.uri.clone())
+                        .collect::<HashSet<_>>();
+                    for open_uri in workspace.open_document_uris().into_iter().chain([uri]) {
+                        if cleared.insert(open_uri.clone()) {
+                            effect
+                                .clear_publications
+                                .push(queries::DiagnosticPublication {
+                                    version: workspace.document_version(&open_uri),
+                                    uri: open_uri,
+                                    diagnostics: Vec::new(),
+                                });
+                        }
+                    }
+                    return Ok(effect);
+                }
+                return Err(error);
+            }
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri_with_budget(uri.clone(), budget)?;
             effect.refresh_dependents_with_control(workspace, &uri, false, cancel, budget)?;
@@ -10222,6 +10302,9 @@ fn publish_due_diagnostics(
     workspace: &mut Workspace,
     jobs: &mut AnalysisJobs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if workspace.analysis_admission_fenced() {
+        return Ok(());
+    }
     for (uri, version) in
         workspace.take_due_diagnostic_requests_limited(MAX_DIAGNOSTIC_DISPATCHES_PER_TURN)
     {

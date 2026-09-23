@@ -6603,6 +6603,483 @@ fn pull_diagnostics_stale_worker_returns_server_cancelled_with_retrigger_data() 
 
 #[cfg(feature = "test-support")]
 #[test]
+fn rejected_open_fence_cancels_an_inflight_dependency_scoped_definition() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let mut directory = root.join("deep");
+    fs::create_dir_all(&directory).expect("workspace directory");
+    let component = "é".repeat(100);
+    while directory
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        directory = directory.join(&component);
+        fs::create_dir_all(&directory).expect("deep provider directory");
+    }
+    let provider = directory.join("DiskProvider.pas");
+    let provider_text =
+        "unit DiskProvider;\ninterface\nconst\n  diskOnly = 1;\nimplementation\nend.\n";
+    let consumer = root.join("Consumer.pas");
+    let consumer_text = "unit Consumer;\ninterface\nuses DiskProvider;\nimplementation\nend.\n";
+    write_file(&provider, provider_text);
+    write_file(&consumer, consumer_text);
+    let provider_uri = uri(&provider);
+    assert!(provider_uri.as_str().len() > 4_096);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(temp);
+    server.initialize(&root, Value::Null);
+    let definition_id = RequestId::from("inflight-definition-before-rejected-open".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&consumer)},
+            "position": position_of(consumer_text, "DiskProvider", 0)
+        }),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": provider_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorProvider;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let fenced_id = RequestId::from("request-observes-rejected-open-fence".to_string());
+    server.send_request(
+        fenced_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&consumer)},
+            "position": position_of(consumer_text, "DiskProvider", 0)
+        }),
+    );
+    assert!(
+        server.response(&fenced_id).error.is_some(),
+        "rejected open must install the fence"
+    );
+
+    // Lift the request fence before releasing the old worker. Its read set
+    // must stay stale rather than becoming authoritative again on didClose.
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": provider_uri}}),
+    );
+    barrier.release();
+    let response = server.response(&definition_id);
+    assert!(
+        response.error.is_some(),
+        "pre-fence dependency-scoped definition must not succeed: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_fence_prevents_an_inflight_rename_workspace_edit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("workspace directory");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&main, source);
+    let oversized = root.join("deep");
+    let mut directory = oversized;
+    fs::create_dir_all(&directory).expect("deep directory");
+    let component = "é".repeat(100);
+    while directory
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        directory = directory.join(&component);
+        fs::create_dir_all(&directory).expect("deep directory component");
+    }
+    let rejected_uri = uri(&directory.join("Rejected.pas"));
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(temp);
+    server.initialize(&root, Value::Null);
+    let rename_id = RequestId::from("inflight-rename-before-rejected-open".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0),
+            "newName": "GOOD_CONST"
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rejected_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorRejected;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let fenced_id = RequestId::from("rename-observes-rejected-open-fence".to_string());
+    server.send_request(
+        fenced_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "badConst", 0)
+        }),
+    );
+    assert!(server.response(&fenced_id).error.is_some());
+    barrier.release();
+    let response = server.response(&rename_id);
+    assert!(
+        response.error.is_some(),
+        "a pre-fence rename must not return a WorkspaceEdit: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_fence_stops_partial_result_delivery_before_first_chunk() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("workspace directory");
+    let main = root.join("Main.pas");
+    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    let mut directory = root.join("deep");
+    fs::create_dir_all(&directory).expect("deep directory");
+    let component = "é".repeat(100);
+    while directory
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        directory = directory.join(&component);
+        fs::create_dir_all(&directory).expect("deep directory component");
+    }
+    let rejected_uri = uri(&directory.join("Rejected.pas"));
+
+    let (mut server, barrier) = TestServer::launch_with_workspace_symbols_barrier(temp);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("inflight-partial-symbols-before-rejected-open".to_string());
+    server.send_request(
+        request_id.clone(),
+        "workspace/symbol",
+        json!({"query": "Main", "partialResultToken": "fenced-symbols"}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rejected_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorRejected;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let fenced_id = RequestId::from("partial-request-observes-rejected-open-fence".to_string());
+    server.send_request(
+        fenced_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 0, "character": 5}
+        }),
+    );
+    assert!(server.response(&fenced_id).error.is_some());
+    barrier.release();
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some(),
+        "partial request must fail rather than return a complete result: {response:?}"
+    );
+    server.assert_no_notification("$/progress");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_fence_fails_queued_client_jobs_without_dispatch() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("workspace directory");
+    let provider = root.join("DiskProvider.pas");
+    write_file(
+        &provider,
+        "unit DiskProvider;\ninterface\nconst\n  diskOnly = 1;\nimplementation\nend.\n",
+    );
+    let mut consumers = Vec::new();
+    for name in ["First", "Second", "Queued"] {
+        let path = root.join(format!("{name}.pas"));
+        let text = format!("unit {name};\ninterface\nuses DiskProvider;\nimplementation\nend.\n");
+        write_file(&path, &text);
+        consumers.push((path, text));
+    }
+    let mut directory = root.join("deep");
+    fs::create_dir_all(&directory).expect("deep directory");
+    let component = "é".repeat(100);
+    while directory
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        directory = directory.join(&component);
+        fs::create_dir_all(&directory).expect("deep directory component");
+    }
+    let rejected_uri = uri(&directory.join("Rejected.pas"));
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(temp);
+    server.initialize(&root, Value::Null);
+    let mut running_ids = Vec::new();
+    for (index, (path, text)) in consumers.iter().take(2).enumerate() {
+        let id = RequestId::from(format!("running-definition-{index}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": uri(path)},
+                "position": position_of(text, "DiskProvider", 0)
+            }),
+        );
+        running_ids.push(id);
+    }
+    barrier.wait_for_entries(2);
+    let queued_id = RequestId::from("queued-definition-before-rejected-open".to_string());
+    let (queued_path, queued_text) = &consumers[2];
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(queued_path)},
+            "position": position_of(queued_text, "DiskProvider", 0)
+        }),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rejected_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorRejected;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let fenced_id = RequestId::from("queued-fence-confirmation".to_string());
+    server.send_request(
+        fenced_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(queued_path)},
+            "position": position_of(queued_text, "DiskProvider", 0)
+        }),
+    );
+    assert!(server.response(&fenced_id).error.is_some());
+    barrier.release();
+    for id in running_ids.into_iter().chain([queued_id]) {
+        assert!(
+            server.response(&id).error.is_some(),
+            "pre-fence running/queued request {id:?} must fail"
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_fence_cancels_inflight_pull_diagnostics_and_requests_refresh() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let mut directory = root.join("deep");
+    fs::create_dir_all(&directory).expect("workspace directory");
+    let component = "é".repeat(100);
+    while directory
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        directory = directory.join(&component);
+        fs::create_dir_all(&directory).expect("deep provider directory");
+    }
+    let provider = directory.join("DiskProvider.pas");
+    write_file(
+        &provider,
+        "unit DiskProvider;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n",
+    );
+    let provider_uri = uri(&provider);
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(temp);
+    server.initialize_with_pull_diagnostics(&root);
+
+    // Prime a report ID, then re-arm the worker barrier. A stale response must
+    // not be allowed to claim this old report is still `unchanged`.
+    barrier.release();
+    let baseline_id = RequestId::from("pull-diagnostics-baseline-before-fence".to_string());
+    server.send_request(
+        baseline_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": provider_uri}, "previousResultId": null}),
+    );
+    let baseline = server.response(&baseline_id);
+    assert!(
+        baseline.error.is_none(),
+        "baseline pull failed: {baseline:?}"
+    );
+    let previous_result_id = baseline.result.expect("baseline diagnostic result")["resultId"]
+        .as_str()
+        .expect("baseline result ID")
+        .to_string();
+    fs::remove_file(&barrier.release).expect("re-arm diagnostics worker barrier");
+
+    let diagnostic_id =
+        RequestId::from("inflight-pull-diagnostics-before-rejected-open".to_string());
+    server.send_request(
+        diagnostic_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": provider_uri},
+            "previousResultId": previous_result_id
+        }),
+    );
+    barrier.wait_for_entries(2);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": provider_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorProvider;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let fenced_id = RequestId::from("pull-request-observes-rejected-open-fence".to_string());
+    server.send_request(
+        fenced_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": provider_uri}, "previousResultId": null}),
+    );
+    assert!(server.response(&fenced_id).error.is_some());
+
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("rejected didOpen must refresh pull diagnostics");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    barrier.release();
+    let response = server.response(&diagnostic_id);
+    assert!(
+        response.error.is_some(),
+        "pre-fence pull diagnostics must not return full/unchanged: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn rejected_open_fence_clears_push_diagnostics_for_open_roots() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("workspace directory");
+    let open_source = root.join("Open.pas");
+    let open_text = "unit Open;\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n";
+    write_file(&open_source, open_text);
+    let mut directory = root.join("deep");
+    fs::create_dir_all(&directory).expect("deep directory");
+    let component = "é".repeat(100);
+    while directory
+        .join(&component)
+        .as_os_str()
+        .to_string_lossy()
+        .len()
+        < 3_500
+    {
+        directory = directory.join(&component);
+        fs::create_dir_all(&directory).expect("deep provider directory");
+    }
+    let rejected = directory.join("Rejected.pas");
+    write_file(
+        &rejected,
+        "unit Rejected;\ninterface\nimplementation\nend.\n",
+    );
+    let rejected_uri = uri(&rejected);
+
+    let (mut server, barrier) = TestServer::launch_with_diagnostics_barrier(temp);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&open_source),
+                "languageId": "pascal",
+                "version": 1,
+                "text": open_text
+            }
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": rejected_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": "unit EditorRejected;\ninterface\nimplementation\nend.\n"
+            }
+        }),
+    );
+    let fenced_id = RequestId::from("push-request-observes-rejected-open-fence".to_string());
+    server.send_request(
+        fenced_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&open_source)},
+            "position": position_of(open_text, "badConst", 0)
+        }),
+    );
+    assert!(server.response(&fenced_id).error.is_some());
+
+    let cleared = [
+        server.notification("textDocument/publishDiagnostics"),
+        server.notification("textDocument/publishDiagnostics"),
+    ];
+    for expected_uri in [uri(&open_source), rejected_uri] {
+        assert!(
+            cleared.iter().any(|publication| {
+                publication["uri"] == expected_uri.as_str()
+                    && publication["diagnostics"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+            }),
+            "missing empty cleanup publication for {expected_uri}"
+        );
+    }
+    barrier.release();
+    server.assert_no_notification("textDocument/publishDiagnostics");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn stale_workspace_diagnostic_partial_delivery_requests_retrigger() {
     let root = tempfile::tempdir().expect("workspace");
     let first = root.path().join("Unit000.pas");

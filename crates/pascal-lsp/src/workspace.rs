@@ -2553,7 +2553,7 @@ impl Workspace {
         diagnostic_uris
     }
 
-    pub(crate) fn invalidate_all_for_watched_file_overflow(&mut self) -> Vec<Url> {
+    pub(crate) fn invalidate_all_for_file_notification_overflow(&mut self) -> Vec<Url> {
         // The notification has no response channel, so rejecting it would
         // silently lose the only invalidation signal for arbitrary paths.
         // Drop bounded derived state and force subsequent requests to reread
@@ -2561,6 +2561,11 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_global_change();
+        let ambiguous_rename_uris: HashSet<Url> = self
+            .pending_unit_file_renames
+            .iter()
+            .flat_map(|(old_uri, pending)| [old_uri.clone(), pending.new_uri.clone()])
+            .collect();
         self.pending_unit_file_renames.clear();
         self.pending_unit_file_rename_bytes = 0;
         self.contexts.clear();
@@ -2594,6 +2599,20 @@ impl Workspace {
         self.total_cap_warning_sent = false;
         if let Some(records) = self.analysis_records.as_mut() {
             records.clear();
+        }
+
+        // An oversized file-operation batch cannot prove which staged rename
+        // pair it contains. Keep neither endpoint's open incarnation as an
+        // authoritative source; clients must reopen these documents.
+        for uri in ambiguous_rename_uris {
+            if let Some(version) = self.open_documents.get(&uri).map(|doc| doc.version) {
+                self.reject_open_document(
+                    uri,
+                    version,
+                    "file-operation batch overflow invalidated a pending rename transition"
+                        .to_string(),
+                );
+            }
         }
 
         let open_uris = self.open_documents.keys().cloned().collect::<Vec<_>>();

@@ -1202,11 +1202,11 @@ After `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`, catalogues,
 loaded-source observations, negative path observations, and affected
 diagnostics are invalidated/refreshed, including for unopened sources; events
 do not synthesize/delete imports or mutate physical files. File-operation
-notifications accept bounded batches of at most 64 unique file URIs and reject
-malformed batches before applying any entry; watched-file batches are likewise
-limited to 64 events. The cumulative UTF-8 length of canonical file URIs in a
-notification batch is limited to 32 KiB; in-range batches are validated before
-per-entry mutations. Repeated old/new rename pairs
+notifications accept bounded batches of at most 64 entries and reject
+malformed in-range batches before applying any entry; watched-file batches are
+likewise limited to 64 events. The cumulative UTF-8 length of canonical file
+URIs in a notification batch is limited to 32 KiB; in-range batches are
+validated before per-entry mutations. Repeated old/new rename pairs
 conservatively invalidate and refresh again instead of being suppressed by URI
 pair alone; a later real reuse of those paths therefore cannot be mistaken for
 a stale duplicate. A pending, successful unit `willRenameFiles`
@@ -1221,16 +1221,18 @@ identical text. A late old-URI `didChange` after close does not restore it.
 Unverified/mismatched transitions fail closed and require reopening. A delayed
 `didClose` for the old URI cannot close an accepted new-URI overlay. Unmatched
 late rename notifications invalidate old/new path state conservatively.
-An oversized `didChangeWatchedFiles` notification is not discarded: it triggers
-a conservative workspace-wide source/configuration/catalogue invalidation,
-cancels and reschedules open-document diagnostics, and requests a pull-diagnostic
-refresh. The bounded input list is not traversed or applied entry-by-entry on
-that path. Oversized `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`
-batches remain rejected before mutation. Ordinary file-event discovery and
-dependent-diagnostic fan-out still run synchronously on the protocol thread; a
-complete total-work bound and ordered off-thread state-processing design remain
-outstanding. Clients should continue to use watched-file notifications for
-changes not covered by these Pascal source filters.
+Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
+`didRenameFiles` notifications are not silently discarded: they trigger a
+conservative workspace-wide source/configuration/catalogue invalidation, cancel
+and reschedule open-document diagnostics, and request a pull-diagnostic refresh.
+The oversized entry list is not traversed or applied entry-by-entry. Pending
+unit-rename transitions are invalidated, and any open old/new endpoint overlay
+whose transition can no longer be proved is rejected until reopened. Ordinary
+in-range file-event discovery and dependent-diagnostic fan-out still run
+synchronously on the protocol thread; a complete total-work bound and ordered
+off-thread state-processing design remain outstanding. Clients should continue
+to use watched-file notifications for changes not covered by these Pascal
+source filters.
 
 If workspace discovery, a required source/include read, or binding resolution
 is incomplete, the request returns an actionable error rather than a partial

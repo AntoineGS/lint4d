@@ -9207,10 +9207,12 @@ fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), Stri
     Ok(())
 }
 
-fn invalidate_for_watched_file_overflow(workspace: &mut Workspace) -> DiagnosticNotificationEffect {
+fn invalidate_for_file_notification_overflow(
+    workspace: &mut Workspace,
+) -> DiagnosticNotificationEffect {
     let mut effect = DiagnosticNotificationEffect::default();
     effect.request_refresh();
-    for uri in workspace.invalidate_all_for_watched_file_overflow() {
+    for uri in workspace.invalidate_all_for_file_notification_overflow() {
         effect.cancel_uri(uri.clone());
         effect.refresh_uri(uri);
     }
@@ -9351,23 +9353,21 @@ fn handle_notification(
                 eprintln!(
                     "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; invalidating workspace file state"
                 );
-                return Ok(invalidate_for_watched_file_overflow(workspace));
+                return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             let mut total_uri_bytes = 0usize;
             let mut changes = Vec::with_capacity(params.changes.len());
+            let mut oversized_uri_bytes = false;
             for change in params.changes {
                 let uri = canonical_file_uri(&change.uri);
                 if uri.to_file_path().is_err() {
                     return Err("watched file batch contains a non-file URI".into());
                 }
-                let next_uri_bytes = total_uri_bytes.saturating_add(uri.as_str().len());
-                if next_uri_bytes > MAX_FILE_OPERATION_BATCH_URI_BYTES {
-                    eprintln!(
-                        "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
-                    );
-                    return Ok(invalidate_for_watched_file_overflow(workspace));
+                if !oversized_uri_bytes
+                    && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
+                {
+                    oversized_uri_bytes = true;
                 }
-                total_uri_bytes = next_uri_bytes;
                 let kind = if change.typ == FileChangeType::CREATED {
                     FileChange::Created
                 } else if change.typ == FileChangeType::CHANGED {
@@ -9376,6 +9376,12 @@ fn handle_notification(
                     FileChange::Deleted
                 };
                 changes.push((uri, kind));
+            }
+            if oversized_uri_bytes {
+                eprintln!(
+                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
+                );
+                return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             let mut effect = DiagnosticNotificationEffect::default();
             for (changed_uri, kind) in changes {
@@ -9399,14 +9405,21 @@ fn handle_notification(
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 return Err("file operation notification requires a files array".into());
             };
-            if files.is_empty() || files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+            if files.is_empty() {
                 return Err(format!(
                     "file operation batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
                 ));
             }
+            if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+                eprintln!(
+                    "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; invalidating workspace file state"
+                );
+                return Ok(invalidate_for_file_notification_overflow(workspace));
+            }
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
+            let mut oversized_uri_bytes = false;
             for file in files {
                 let uri = file
                     .get("uri")
@@ -9417,8 +9430,18 @@ fn handle_notification(
                 if uri.to_file_path().is_err() || !unique.insert(uri.clone()) {
                     return Err("file operation batch contains a non-file or duplicate URI".into());
                 }
-                add_file_operation_uri_bytes(&mut total_uri_bytes, &uri)?;
+                if !oversized_uri_bytes
+                    && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
+                {
+                    oversized_uri_bytes = true;
+                }
                 uris.push(uri);
+            }
+            if oversized_uri_bytes {
+                eprintln!(
+                    "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
+                );
+                return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             let mut effect = DiagnosticNotificationEffect::default();
             for uri in uris {
@@ -9439,15 +9462,22 @@ fn handle_notification(
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 return Err("file operation notification requires a files array".into());
             };
-            if files.is_empty() || files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+            if files.is_empty() {
                 return Err(format!(
                     "file rename batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
                 ));
+            }
+            if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+                eprintln!(
+                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; invalidating workspace file state"
+                );
+                return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             let mut renames = Vec::with_capacity(files.len());
             let mut old_uris = HashSet::with_capacity(files.len());
             let mut new_uris = HashSet::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
+            let mut oversized_uri_bytes = false;
             for file in files {
                 let old_uri = file
                     .get("oldUri")
@@ -9471,12 +9501,22 @@ fn handle_notification(
                         "file rename batch contains invalid, duplicate, or identical URIs".into(),
                     );
                 }
-                add_file_operation_uri_bytes(&mut total_uri_bytes, &old_uri)?;
-                add_file_operation_uri_bytes(&mut total_uri_bytes, &new_uri)?;
+                if !oversized_uri_bytes
+                    && (add_file_operation_uri_bytes(&mut total_uri_bytes, &old_uri).is_err()
+                        || add_file_operation_uri_bytes(&mut total_uri_bytes, &new_uri).is_err())
+                {
+                    oversized_uri_bytes = true;
+                }
                 renames.push((old_uri, new_uri));
             }
             if old_uris.iter().any(|uri| new_uris.contains(uri)) {
                 return Err("file rename batch contains chained or cyclic URI transitions".into());
+            }
+            if oversized_uri_bytes {
+                eprintln!(
+                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
+                );
+                return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             let mut effect = DiagnosticNotificationEffect::default();
             for (old_uri, new_uri) in renames {

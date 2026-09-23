@@ -30370,7 +30370,11 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
     assert!(server.response(&probe_id).error.is_none());
-    server.assert_no_request("workspace/diagnostic/refresh");
+    let byte_refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(
+        byte_refresh.id,
+        Value::Null,
+    )));
 
     let too_many: Vec<_> = (0..65)
         .map(|index| root.path().join(format!("OverLimit{index}.pas")))
@@ -30386,7 +30390,11 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
     assert!(server.response(&count_probe_id).error.is_none());
-    server.assert_no_request("workspace/diagnostic/refresh");
+    let count_refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(
+        count_refresh.id,
+        Value::Null,
+    )));
 
     server.send_notification(
         "workspace/didDeleteFiles",
@@ -30399,7 +30407,11 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
     assert!(server.response(&delete_probe_id).error.is_none());
-    server.assert_no_request("workspace/diagnostic/refresh");
+    let delete_refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(
+        delete_refresh.id,
+        Value::Null,
+    )));
 
     let mut oversized_renames = Vec::new();
     let long_component = "r".repeat(178);
@@ -30433,6 +30445,23 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
     assert!(server.response(&rename_probe_id).error.is_none());
+    let rename_refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(
+        rename_refresh.id,
+        Value::Null,
+    )));
+
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&root.path().join("Duplicate.pas"))},{"uri":uri(&root.path().join("./Duplicate.pas"))}]}),
+    );
+    let malformed_probe_id = RequestId::from("file-operation-malformed-batch-probe".to_string());
+    server.send_request(
+        malformed_probe_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    assert!(server.response(&malformed_probe_id).error.is_none());
     server.assert_no_request("workspace/diagnostic/refresh");
 
     let small: Vec<_> = (0..64)
@@ -30657,6 +30686,321 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         bytes_refresh.id,
         Value::Null,
     )));
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_create_and_delete_file_notifications_refresh_same_size_provider_state() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let old_consumer = root.join("OldConsumer.pas");
+    let new_consumer = root.join("NewConsumer.pas");
+    let main = root.join("Main.pas");
+    let initial_provider = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let updated_provider = initial_provider
+        .replace("badConst", "GOODNAME")
+        .replace("TOldThing", "TNewThing");
+    assert_eq!(initial_provider.len(), updated_provider.len());
+    let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\nimplementation\nend.\n";
+    let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    write_file(&provider, initial_provider);
+    write_file(&old_consumer, old_consumer_source);
+    write_file(&new_consumer, new_consumer_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    let pull_definition =
+        |server: &mut TestServer, id: &str, file: &Path, source: &str, name: &str| {
+            let request_id = RequestId::from(id.to_string());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/definition",
+                navigation_params(file, source, name, 0),
+            );
+            result_locations(server.response(&request_id))
+        };
+    let pull_diagnostic = |server: &mut TestServer, id: &str, previous: Option<&str>| {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/diagnostic",
+            json!({"textDocument":{"uri":uri(&provider)},"previousResultId":previous}),
+        );
+        let response = server.response(&request_id);
+        assert!(response.error.is_none(), "diagnostic failed: {response:?}");
+        response.result.expect("diagnostic result")
+    };
+
+    let old_locations = pull_definition(
+        &mut server,
+        "oversized-create-delete-old-initial",
+        &old_consumer,
+        old_consumer_source,
+        "TOldThing",
+    );
+    assert_eq!(old_locations.len(), 1);
+    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
+    let initial_diagnostic =
+        pull_diagnostic(&mut server, "oversized-create-delete-diag-initial", None);
+    assert!(
+        initial_diagnostic["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
+    );
+    let initial_result_id = initial_diagnostic["resultId"]
+        .as_str()
+        .expect("initial result ID")
+        .to_string();
+
+    let original_metadata = fs::metadata(&provider).expect("initial provider metadata");
+    write_file(&provider, &updated_provider);
+    restore_mtime(&provider, &original_metadata);
+    let create_batch: Vec<_> = (0..64)
+        .map(|index| json!({"uri":uri(&root.join(format!("CreateNoise{index}.pas")))}))
+        .chain(std::iter::once(json!({"uri":uri(&provider)})))
+        .collect();
+    assert_eq!(create_batch.len(), 65);
+    server.send_notification("workspace/didCreateFiles", json!({"files":create_batch}));
+
+    let old_after_create = pull_definition(
+        &mut server,
+        "oversized-create-delete-old-after-create",
+        &old_consumer,
+        old_consumer_source,
+        "TOldThing",
+    );
+    assert!(
+        old_after_create.is_empty(),
+        "old identity after didCreate overflow"
+    );
+    let new_after_create = pull_definition(
+        &mut server,
+        "oversized-create-delete-new-after-create",
+        &new_consumer,
+        new_consumer_source,
+        "TNewThing",
+    );
+    assert_eq!(
+        new_after_create.len(),
+        1,
+        "new identity after didCreate overflow"
+    );
+    assert_eq!(new_after_create[0]["uri"], uri(&provider).to_string());
+    let diagnostic_after_create = pull_diagnostic(
+        &mut server,
+        "oversized-create-delete-diag-after-create",
+        Some(&initial_result_id),
+    );
+    assert_eq!(diagnostic_after_create["kind"], "full");
+    assert!(
+        diagnostic_after_create["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().all(|item| item["code"] != "constant-naming") })
+    );
+    let create_refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("oversized didCreate must request pull-diagnostic refresh");
+    server.send(Message::Response(Response::new_ok(
+        create_refresh.id,
+        Value::Null,
+    )));
+
+    let before_delete = fs::metadata(&provider).expect("provider metadata before reversal");
+    write_file(&provider, initial_provider);
+    restore_mtime(&provider, &before_delete);
+    let long_component = "d".repeat(178);
+    let mut delete_batch: Vec<_> = (0..20)
+        .map(|index| {
+            let mut path = root.join(format!("delete{index}"));
+            for _ in 0..20 {
+                path.push(&long_component);
+            }
+            json!({"uri":uri(&path.join("Ignored.pas"))})
+        })
+        .collect();
+    delete_batch.push(json!({"uri":uri(&provider)}));
+    let delete_uri_bytes: usize = delete_batch
+        .iter()
+        .map(|file| file["uri"].as_str().expect("URI").len())
+        .sum();
+    assert!(delete_uri_bytes > 32 * 1024);
+    assert!(delete_batch.len() < 64);
+    server.send_notification("workspace/didDeleteFiles", json!({"files":delete_batch}));
+
+    let new_after_delete = pull_definition(
+        &mut server,
+        "oversized-create-delete-new-after-delete",
+        &new_consumer,
+        new_consumer_source,
+        "TNewThing",
+    );
+    assert!(
+        new_after_delete.is_empty(),
+        "new identity after didDelete overflow"
+    );
+    let old_after_delete = pull_definition(
+        &mut server,
+        "oversized-create-delete-old-after-delete",
+        &old_consumer,
+        old_consumer_source,
+        "TOldThing",
+    );
+    assert_eq!(
+        old_after_delete.len(),
+        1,
+        "old identity after didDelete overflow"
+    );
+    assert_eq!(old_after_delete[0]["uri"], uri(&provider).to_string());
+    let diagnostic_after_delete = pull_diagnostic(
+        &mut server,
+        "oversized-create-delete-diag-after-delete",
+        Some(
+            diagnostic_after_create["resultId"]
+                .as_str()
+                .expect("updated result ID"),
+        ),
+    );
+    assert_eq!(diagnostic_after_delete["kind"], "full");
+    assert!(
+        diagnostic_after_delete["items"]
+            .as_array()
+            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
+    );
+    let delete_refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("oversized didDelete must request pull-diagnostic refresh");
+    server.send(Message::Response(Response::new_ok(
+        delete_refresh.id,
+        Value::Null,
+    )));
+    server.shutdown();
+}
+
+#[test]
+fn oversized_did_rename_invalidates_pending_open_overlay_without_transferring_it() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let renamed_provider = root.join("Renamed.pas");
+    let consumer = root.join("Consumer.pas");
+    let main = root.join("Main.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    let initialize_id = RequestId::from("oversized-did-rename-init".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId":null,
+            "rootUri":uri(&root),
+            "capabilities":{
+                "textDocument":{"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":true}},
+                "workspace":{
+                    "diagnostics":{"refreshSupport":true},
+                    "workspaceEdit":{"documentChanges":true},
+                    "fileOperations":{"willRename":true},
+                    "workspaceFolders":true
+                }
+            }
+        }),
+    );
+    assert!(server.response(&initialize_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+    );
+
+    let will_id = RequestId::from("oversized-did-rename-will".to_string());
+    server.send_request(
+        will_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&renamed_provider)}]}),
+    );
+    let will = server.response(&will_id);
+    assert!(will.error.is_none(), "willRename failed: {will:?}");
+    let edit = will.result.expect("planned unit rename edits");
+    let provider_updated = apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+    let consumer_updated = apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    write_file(&consumer, &consumer_updated);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    fs::rename(&provider, &renamed_provider).expect("client-owned physical move");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&renamed_provider),"languageId":"pascal","version":1,"text":provider_updated}}),
+    );
+
+    let mut oversized_renames =
+        vec![json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)})];
+    oversized_renames.extend((0..64).map(|index| {
+        json!({
+            "oldUri":uri(&root.join(format!("OldNoise{index}.pas"))),
+            "newUri":uri(&root.join(format!("NewNoise{index}.pas")))
+        })
+    }));
+    assert_eq!(oversized_renames.len(), 65);
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":oversized_renames}),
+    );
+
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("oversized didRename must request pull-diagnostic refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let definition_id = RequestId::from("oversized-did-rename-no-transfer-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let response = server.response(&definition_id);
+    assert!(
+        response.error.is_none(),
+        "definition query failed: {response:?}"
+    );
+    assert!(
+        result_locations(response).is_empty(),
+        "overflow cannot attribute a pending staged transition to this rename batch or retain its destination overlay"
+    );
     server.shutdown();
 }
 

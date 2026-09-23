@@ -425,13 +425,15 @@ impl ProtocolSender for Connection {
 struct ProtocolConnection {
     connection: Connection,
     outbound: RefCell<OutboundQueue>,
+    priority_receiver: Option<Receiver<Message>>,
 }
 
 impl ProtocolConnection {
-    fn new(connection: Connection) -> Self {
+    fn new(connection: Connection, priority_receiver: Receiver<Message>) -> Self {
         Self {
             connection,
             outbound: RefCell::new(OutboundQueue::default()),
+            priority_receiver: Some(priority_receiver),
         }
     }
 
@@ -462,6 +464,12 @@ impl ProtocolConnection {
 
     fn receiver(&self) -> &Receiver<Message> {
         &self.connection.receiver
+    }
+
+    fn try_recv_priority(&self) -> Option<Message> {
+        self.priority_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
     }
 
     fn flush(&self) -> Result<(), OutputError> {
@@ -6937,6 +6945,9 @@ fn deliver_analysis_result_with_store(
         }
         workspace.record_diagnostic_dependencies(diagnostics.uri.clone(), result.records.clone());
     }
+    if let AnalysisResultValue::DocumentDiagnostics(Ok(diagnostics)) = &result.value {
+        workspace.record_diagnostic_dependencies(diagnostics.uri.clone(), result.records.clone());
+    }
     if let AnalysisResultValue::Navigation(navigation) = &mut result.value {
         if let Some(state) = navigation.state.take() {
             workspace.apply_navigation_state(state);
@@ -7548,8 +7559,8 @@ pub fn run_stdio_with_test_barriers(
 fn run_stdio_with_config(
     test_barriers: TestBarrierConfig,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let (connection, io_threads) = bounded_stdio();
-    let connection = ProtocolConnection::new(connection);
+    let (connection, priority_receiver, io_threads) = bounded_stdio();
+    let connection = ProtocolConnection::new(connection, priority_receiver);
     let outcome = run_connection(&connection, test_barriers);
     let shutdown_deadline = Instant::now() + OUTPUT_SHUTDOWN_TIMEOUT;
     let drain_result = connection.drain_until(shutdown_deadline);
@@ -7615,7 +7626,7 @@ impl StdioThreads {
     }
 }
 
-fn bounded_stdio() -> (Connection, StdioThreads) {
+fn bounded_stdio() -> (Connection, Receiver<Message>, StdioThreads) {
     let (writer_sender, writer_receiver) = bounded::<Message>(MAX_OUTBOUND_MESSAGES);
     let writer = thread::Builder::new()
         .name("PascalLspWriter".to_string())
@@ -7630,18 +7641,31 @@ fn bounded_stdio() -> (Connection, StdioThreads) {
         .expect("spawn LSP writer");
 
     let (reader_sender, reader_receiver) = bounded::<Message>(0);
+    let (priority_sender, priority_receiver) = bounded::<Message>(8);
     let reader = thread::Builder::new()
         .name("PascalLspReader".to_string())
         .spawn(move || {
             let stdin = io::stdin();
             let mut stdin = BoundedReader::new(stdin.lock());
             while let Some(message) = Message::read(&mut stdin)? {
-                let is_exit = matches!(
-                    &message,
-                    Message::Notification(notification) if notification.method == "exit"
-                );
-                if reader_sender.send(message).is_err() {
-                    return Ok(());
+                let is_exit = is_exit_notification(&message);
+                let dispatch = reader_sender.try_send(message);
+                match dispatch {
+                    Ok(()) => {}
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
+                    Err(TrySendError::Full(message)) if is_priority_control_message(&message) => {
+                        if priority_sender.send(message).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(TrySendError::Full(message)) => {
+                        // Ordinary protocol traffic remains retained and
+                        // backpressures stdin; only control frames may bypass
+                        // this rendezvous through the separate bounded lane.
+                        if reader_sender.send(message).is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
                 if is_exit {
                     break;
@@ -7656,7 +7680,21 @@ fn bounded_stdio() -> (Connection, StdioThreads) {
             sender: writer_sender,
             receiver: reader_receiver,
         },
+        priority_receiver,
         StdioThreads { reader, writer },
+    )
+}
+
+fn is_exit_notification(message: &Message) -> bool {
+    matches!(message, Message::Notification(notification) if notification.method == "exit")
+}
+
+fn is_priority_control_message(message: &Message) -> bool {
+    matches!(message,
+        Message::Request(request) if request.method == "shutdown"
+    ) || matches!(message,
+        Message::Notification(notification)
+            if notification.method == "exit" || notification.method == "$/cancelRequest"
     )
 }
 
@@ -8186,6 +8224,7 @@ fn event_loop(
             output_pending,
             configuration.is_preparing() || workspace_busy,
         );
+        let priority_message = connection.try_recv_priority();
         let deferred_workspace_message = if workspace_busy {
             None
         } else {
@@ -8198,7 +8237,9 @@ fn event_loop(
                 })
                 .or_else(|| deferred_workspace_overflow.take())
         };
-        let message = if let Some(message) = deferred_workspace_message {
+        let message = if let Some(message) = priority_message {
+            message
+        } else if let Some(message) = deferred_workspace_message {
             message
         } else if workspace_busy && deferred_workspace_overflow.is_some() {
             thread::sleep(timeout);
@@ -10034,6 +10075,8 @@ fn handle_notification_with_control(
             }
             if let Some(budget) = budget {
                 for (old_uri, new_uri) in &renames {
+                    budget.record_rename_endpoint(old_uri.clone());
+                    budget.record_rename_endpoint(new_uri.clone());
                     budget.record_file_event(old_uri.clone(), FileChange::Deleted);
                     budget.record_file_event(new_uri.clone(), FileChange::Created);
                 }

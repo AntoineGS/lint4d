@@ -1005,6 +1005,7 @@ pub(crate) struct ReconciliationBudget {
     used: Cell<ReconciliationWorkUsed>,
     exhausted: Cell<bool>,
     deleted_uris: RefCell<HashSet<Url>>,
+    rename_endpoints: RefCell<HashSet<Url>>,
 }
 
 impl ReconciliationBudget {
@@ -1014,6 +1015,7 @@ impl ReconciliationBudget {
             used: Cell::new(ReconciliationWorkUsed::default()),
             exhausted: Cell::new(false),
             deleted_uris: RefCell::new(HashSet::new()),
+            rename_endpoints: RefCell::new(HashSet::new()),
         }
     }
 
@@ -1147,6 +1149,14 @@ impl ReconciliationBudget {
 
     pub(crate) fn deleted_uris(&self) -> HashSet<Url> {
         self.deleted_uris.borrow().clone()
+    }
+
+    pub(crate) fn record_rename_endpoint(&self, uri: Url) {
+        self.rename_endpoints.borrow_mut().insert(uri);
+    }
+
+    pub(crate) fn rename_endpoints(&self) -> HashSet<Url> {
+        self.rename_endpoints.borrow().clone()
     }
 
     #[cfg(feature = "test-support")]
@@ -2843,9 +2853,21 @@ impl Workspace {
         budget: &ReconciliationBudget,
     ) -> Vec<Url> {
         let deleted_uris = budget.deleted_uris();
+        let rename_endpoints = budget.rename_endpoints();
         let open_uris = self.invalidate_all_for_file_notification_overflow();
         for uri in deleted_uris {
             self.remember_deleted(&uri);
+        }
+        for uri in rename_endpoints {
+            if let Some(document) = self.open_documents.get(&uri) {
+                if document.text.is_some() {
+                    self.reject_open_document(
+                        uri.clone(),
+                        document.version,
+                        "reconciliation budget overflow abandoned a multi-file rename batch; close and reopen this document".to_string(),
+                    );
+                }
+            }
         }
         open_uris
     }

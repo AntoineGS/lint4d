@@ -1244,10 +1244,24 @@ package discovery, nested source/include reads and indexing, rename-specific
 reconciliation, some filesystem metadata work, and invalidation/refresh output
 loops are not all charged to the shared account. Cancellation is checked at
 existing cooperative checkpoints, but synchronous filesystem calls themselves
-cannot be interrupted. High-fan-out delete/tombstone fallback and blocked-worker
-cancellation have deterministic protocol coverage; rename-overlay lifecycle
-under budget saturation and all uncharged paths remain open. This stage is
-partial and does not close P2-4.
+cannot be interrupted. The stdio reader also has a bounded priority lane for
+`shutdown`, `exit`, and `$/cancelRequest` when a control frame is read while the
+ordinary rendezvous is backpressured. Deterministic tests fill the 64-message
+workspace FIFO and its one overflow slot, then send shutdown or exit without
+releasing a cooperative discovery barrier; both controls reach worker
+cancellation/join. Ordinary messages remain retained and FIFO ordered on normal
+completion, as covered by the saturation replay test. This is not a deadline
+or a guarantee against an OS call that does not return, a full priority lane, or
+an ordinary frame already blocking the reader before a later control frame can
+be parsed.
+
+High-fan-out delete/tombstone fallback remains covered. A dedicated saturation
+regression now also transfers a staged A-to-B open overlay in the first pair of
+a multi-pair rename batch, forces a later diagnostic-work overrun while
+destination disk content is stale, and verifies B is rejected, a definition
+does not resolve through it, and a cached pull result ID is invalidated. This
+does not prove every rename/tombstone interleaving, duplicate/late event, or
+uncharged path. This stage remains partial and does not close P2-4.
 
 While it reconciles a preceding event, workspace-dependent requests and
 While it reconciles a preceding event, workspace-dependent requests and

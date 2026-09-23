@@ -31321,6 +31321,341 @@ fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
 }
 
 #[cfg(feature = "test-support")]
+fn assert_saturated_control_bypasses_workspace_fifo(send_exit: bool) {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype TItem = record end;\nimplementation\nend.\n",
+    );
+    let barrier_dir = root.path().join("saturated-shutdown-barrier");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let completed = barrier_dir.join("completed");
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let completed_value = completed.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                barrier_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_FILE_WORKER_COMPLETED",
+                completed_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    let initial_id = RequestId::from("saturated-control-worker-load".to_string());
+    server.send_request(
+        initial_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    assert!(server.response(&initial_id).error.is_none());
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+    );
+    barrier.wait_until_entered();
+
+    // Fill the 64-message FIFO and its retained overflow slot while the worker
+    // is held. The next control frame must bypass that full deferred lane.
+    for index in 0..65 {
+        let overlay = root.path().join(format!("Queued{index:02}.pas"));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&overlay),"languageId":"pascal","version":1,"text":format!("unit Queued{index:02}; interface implementation end.")}}),
+        );
+    }
+    let shutdown = if send_exit {
+        server.send_notification("exit", Value::Null);
+        server.stdin.take();
+        None
+    } else {
+        let shutdown_id = RequestId::from("saturated-priority-shutdown".to_string());
+        server.send_request(shutdown_id.clone(), "shutdown", Value::Null);
+        server.response_with_timeout(&shutdown_id, Duration::from_millis(750))
+    };
+    let completed_without_release = wait_for_file(&completed, Duration::from_millis(100));
+    if (!send_exit && shutdown.is_none()) || !completed_without_release {
+        let _ = server.child.kill();
+        let _ = server.child.wait();
+    }
+    assert!(
+        completed_without_release,
+        "control message must signal cancellation and join the held worker without releasing the barrier"
+    );
+    assert!(
+        !barrier.release.exists(),
+        "test must not release the worker barrier to make shutdown succeed"
+    );
+    if !send_exit {
+        assert!(
+            shutdown.is_some_and(|response| response.error.is_none()),
+            "shutdown must bypass the saturated deferred FIFO and overflow slot"
+        );
+        server.send_notification("exit", Value::Null);
+        server.stdin.take();
+    }
+    let status = server
+        .child
+        .wait()
+        .expect("wait for priority control child");
+    if send_exit {
+        // LSP requires a nonzero exit when the client exits without first
+        // sending shutdown; the assertion is that exit was consumed promptly.
+        assert_eq!(status.code(), Some(1));
+    } else {
+        assert!(status.success(), "server exited unsuccessfully: {status}");
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn shutdown_bypasses_full_workspace_fifo_and_overflow_without_releasing_worker_barrier() {
+    assert_saturated_control_bypasses_workspace_fifo(false);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn exit_bypasses_full_workspace_fifo_and_overflow_without_releasing_worker_barrier() {
+    assert_saturated_control_bypasses_workspace_fifo(true);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn budget_fallback_rejects_transferred_rename_overlay_and_invalidates_pull_result() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+
+    let mut consumers = Vec::new();
+    let mut consumer_sources = Vec::new();
+    for index in 0..64 {
+        let consumer = root.path().join(format!("Consumer{index:02}.pas"));
+        let source = format!(
+            "unit Consumer{index:02};\ninterface\nuses Provider;\ntype TAlias{index:02} = Provider.TThing;\nimplementation\nend.\n"
+        );
+        write_file(&consumer, &source);
+        consumers.push(consumer);
+        consumer_sources.push(source);
+    }
+
+    let barrier_dir = root.path().join("rename-budget-barrier");
+    fs::create_dir_all(&barrier_dir).expect("rename budget barrier directory");
+    let barrier = TestBarrier {
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+    };
+    let barrier_value = format!(
+        "{}|{}",
+        barrier.entered.display(),
+        barrier.release.display()
+    );
+    let metrics = barrier_dir.join("rename-budget.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+                metrics_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_DIAGNOSTIC_WORK_BARRIER",
+                barrier_value.as_str(),
+            ),
+        ],
+    );
+    let initialize_id = RequestId::from("budget-rename-init".to_string());
+    server.send_request(
+        initialize_id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root.path()),
+            "capabilities": {
+                "textDocument": {
+                    "diagnostic": {
+                        "dynamicRegistration": false,
+                        "relatedDocumentSupport": true
+                    }
+                },
+                "workspace": {
+                    "diagnostics": {"refreshSupport": true},
+                    "workspaceEdit": {"documentChanges": true},
+                    "fileOperations": {"willRename": true}
+                }
+            }
+        }),
+    );
+    assert!(server.response(&initialize_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+    );
+
+    let mut previous_result_id = None;
+    for (index, (consumer, source)) in consumers.iter().zip(&consumer_sources).enumerate() {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(consumer),"languageId":"pascal","version":1,"text":source}}),
+        );
+        let pull_id = RequestId::from(format!("budget-rename-pull-before-{index}"));
+        server.send_request(
+            pull_id.clone(),
+            "textDocument/diagnostic",
+            json!({"textDocument":{"uri":uri(consumer)},"previousResultId":null}),
+        );
+        let pull = server.response(&pull_id);
+        assert!(pull.error.is_none(), "initial pull failed: {pull:?}");
+        let result = pull.result.expect("initial document diagnostics");
+        if index == 0 {
+            previous_result_id = result["resultId"].as_str().map(ToOwned::to_owned);
+            assert!(
+                previous_result_id.is_some(),
+                "initial pull result ID is required"
+            );
+        }
+    }
+
+    let renamed = root.path().join("Renamed.pas");
+    let will_id = RequestId::from("budget-rename-will".to_string());
+    server.send_request(
+        will_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&renamed)}]}),
+    );
+    let will = server.response(&will_id);
+    assert!(will.error.is_none(), "willRename failed: {will:?}");
+    let edit = will.result.expect("staged provider rename edit");
+    let provider_updated = apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+    let updated_consumers = consumers
+        .iter()
+        .zip(&consumer_sources)
+        .map(|(consumer, source)| apply_workspace_edit_to_source(source, &edit, &uri(consumer)))
+        .collect::<Vec<_>>();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+    );
+    for (consumer, source) in consumers.iter().zip(&updated_consumers) {
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(consumer),"version":2},"contentChanges":[{"text":source}]}),
+        );
+    }
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    fs::rename(&provider, &renamed).expect("client-owned first-pair move");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&renamed),"languageId":"pascal","version":1,"text":provider_updated}}),
+    );
+    // This is stale destination disk content. The exact opened overlay must
+    // initially win, but must not remain authoritative after batch fallback.
+    write_file(&renamed, &provider_source.replace("TThing", "TStale"));
+
+    let mut files = vec![json!({"oldUri":uri(&provider),"newUri":uri(&renamed)})];
+    for index in 0..40 {
+        files.push(json!({
+            "oldUri": uri(&root.path().join(format!("Unused{index:02}.pas"))),
+            "newUri": uri(&root.path().join(format!("Moved{index:02}.pas")))
+        }));
+    }
+    server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+    barrier.wait_until_entered();
+    let post_event_source = updated_consumers[0].replace(
+        "implementation",
+        "type TFifoMarker = Integer;\ntype TMarkerUse = TFifoMarker;\nimplementation",
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumers[0]),"version":3},"contentChanges":[{"text":post_event_source}]}),
+    );
+    let definition_id = RequestId::from("budget-rename-no-stale-destination".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &post_event_source, "TThing", 0),
+    );
+    let fifo_definition_id = RequestId::from("budget-rename-fifo-overlay-control".to_string());
+    server.send_request(
+        fifo_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &post_event_source, "TFifoMarker", 1),
+    );
+    let pull_id = RequestId::from("budget-rename-pull-after-fallback".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument":{"uri":uri(&consumers[0])},
+            "previousResultId":previous_result_id
+        }),
+    );
+    assert!(
+        server
+            .response_with_timeout(&definition_id, Duration::from_millis(100))
+            .is_none(),
+        "requests must remain behind the held multi-pair rename reconciliation"
+    );
+    barrier.release();
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "rename worker must report reconciliation accounting"
+    );
+    let metrics: Value = serde_json::from_slice(&fs::read(&metrics).expect("read budget metrics"))
+        .expect("parse budget metrics");
+    assert!(
+        metrics["budget_exceeded"].as_bool().unwrap_or(false),
+        "later rename pairs must exhaust diagnostic work after the first overlay transfer: {metrics}"
+    );
+    assert!(
+        metrics["diagnostic_record_checks"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 2_048,
+        "diagnostic comparison counter must establish the actual overrun: {metrics}"
+    );
+    let definition = result_locations(server.response(&definition_id));
+    assert!(
+        definition.is_empty(),
+        "fallback must reject the already-transferred B overlay rather than resolve stale B disk: {definition:?}"
+    );
+    let fifo_definition = result_locations(server.response(&fifo_definition_id));
+    assert_eq!(
+        fifo_definition.len(),
+        1,
+        "deferred didChange must replay before query"
+    );
+    assert_eq!(fifo_definition[0]["uri"], uri(&consumers[0]).to_string());
+    let pull = server.response(&pull_id);
+    assert!(pull.error.is_none(), "post-fallback pull failed: {pull:?}");
+    let result = pull.result.expect("fresh post-fallback pull result");
+    assert_eq!(
+        result["kind"], "full",
+        "old pull result ID must be invalidated: {result}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

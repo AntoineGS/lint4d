@@ -32782,6 +32782,246 @@ fn late_override_budget_refusal_retries_after_sixty_four_event_fallback() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn package_descriptor_batch_fallback_rebinds_provider_and_pull_result() {
+    const OWNER_COUNT: usize = 9;
+    const PACKAGE_BYTES: usize = 2 * 1024 * 1024;
+    const BATCH_ENTRIES: usize = 64;
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider_a = root.path().join("units/ProviderA.pas");
+    let provider_b = root.path().join("units/ProviderB.pas");
+    let provider_source = |value: &str| {
+        format!("unit Provider; interface type TSelected = {value}; implementation end.\n")
+    };
+    write_file(&provider_a, &provider_source("Integer"));
+    write_file(&provider_b, &provider_source("string "));
+    assert_eq!(
+        fs::metadata(&provider_a).unwrap().len(),
+        fs::metadata(&provider_b).unwrap().len()
+    );
+
+    let mut projects = Vec::new();
+    let mut packages = Vec::new();
+    let mut consumers = Vec::new();
+    let mut sources = Vec::new();
+    for index in 0..OWNER_COUNT {
+        let directory = root.path().join(format!("Project{index:02}"));
+        let project = directory.join("App.dproj");
+        let consumer = directory.join(format!("Consumer{index:02}.pas"));
+        let source = format!(
+            "unit Consumer{index:02};\ninterface\nuses Provider;\ntype TUse{index:02} = TSelected;\nimplementation\nend.\n"
+        );
+        for flavor in ["A", "B"] {
+            let package = root.path().join(format!("Package{flavor}{index:02}.dpk"));
+            let mapped_provider = if flavor == "A" {
+                "ProviderA"
+            } else {
+                "ProviderB"
+            };
+            let mut contents = format!(
+                "package Package{flavor}{index:02};\ncontains\n  Provider in 'units/{mapped_provider}.pas';\n"
+            );
+            for candidate in 0..256 {
+                contents.push_str(&format!(
+                    "  Catalog{candidate:03} in 'catalogue/Catalog{candidate:03}.pas';\n"
+                ));
+            }
+            contents.push_str("end.\n");
+            write_file(&package, &contents);
+            packages.push(package);
+        }
+        let selected_package = if index == 0 { "A" } else { "B" };
+        let prefix = format!(
+            "<Project><PropertyGroup><MainSource>Consumer{index:02}.pas</MainSource><DCC_UsePackage>Package{selected_package}{index:02}</DCC_UsePackage></PropertyGroup><!--"
+        );
+        let suffix = "--></Project>";
+        let descriptor = format!(
+            "{prefix}{}{suffix}",
+            "p".repeat(PACKAGE_BYTES - prefix.len() - suffix.len())
+        );
+        assert_eq!(descriptor.len(), PACKAGE_BYTES);
+        write_file(&project, &descriptor);
+        write_file(&consumer, &source);
+        projects.push(project);
+        consumers.push(consumer);
+        sources.push(source);
+    }
+    let metrics = root.path().join("package-work.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [(
+            "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+            metrics_value.as_str(),
+        )],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    for index in 0..OWNER_COUNT {
+        let id = RequestId::from(format!("pkg-start-{index}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumers[index], &sources[index], "TSelected", 0),
+        );
+        let expected = if index == 0 { &provider_a } else { &provider_b };
+        assert_eq!(
+            result_locations(server.response(&id))[0]["uri"],
+            uri(expected).to_string()
+        );
+    }
+    for index in 0..OWNER_COUNT {
+        server.send_notification("textDocument/didOpen", json!({"textDocument":{"uri":uri(&consumers[index]),"languageId":"pascal","version":1,"text":sources[index]}}));
+    }
+    let pull_id = RequestId::from("pkg-prior-pull".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":null}),
+    );
+    let prior = server.response(&pull_id).result.unwrap()["resultId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let stamp = fs::metadata(&packages[0]).expect("package stamp");
+    let old = fs::read_to_string(&packages[0]).expect("package bytes");
+    let changed = old.replace("ProviderA", "ProviderB");
+    assert_eq!(old.len(), changed.len());
+    write_file(&packages[0], &changed);
+    restore_mtime(&packages[0], &stamp);
+    let mut changes = packages
+        .iter()
+        .map(|path| json!({"uri":uri(path),"type":2}))
+        .chain(
+            projects
+                .iter()
+                .map(|path| json!({"uri":uri(path),"type":2})),
+        )
+        .collect::<Vec<_>>();
+    while changes.len() < BATCH_ENTRIES {
+        let path = root.path().join(format!("other-{}.pas", changes.len()));
+        changes.push(json!({"uri":uri(&path),"type":2}));
+    }
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    let fresh_id = RequestId::from("pkg-fresh-definition".to_string());
+    server.send_request(
+        fresh_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &sources[0], "TSelected", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&fresh_id))[0]["uri"],
+        uri(&provider_b).to_string(),
+        "no stale provider A binding may survive the batch"
+    );
+    let pull2 = RequestId::from("pkg-new-pull".to_string());
+    server.send_request(
+        pull2.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":prior}),
+    );
+    assert_ne!(server.response(&pull2).result.unwrap()["kind"], "unchanged");
+    assert!(wait_for_file(&metrics, IO_TIMEOUT));
+    let metrics: Value = serde_json::from_slice(&fs::read(&metrics).unwrap()).unwrap();
+    assert!(
+        metrics["budget_exceeded"].as_bool().unwrap_or(false),
+        "package batch must exercise fallback: {metrics}"
+    );
+    assert!(
+        metrics["package_path_visits"].as_u64().unwrap_or_default() > 0,
+        "notification shared account must meter package descriptor event paths: {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn include_owner_catalogue_protocol_reports_actual_candidate_work() {
+    const DECOYS: usize = 256;
+    const BATCH: usize = 64;
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Use.inc");
+    let main_source = "unit Main;\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let include_source = "Log(RootValue);\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    for index in 0..DECOYS {
+        write_file(
+            &root.path().join(format!("Decoy{index:03}.pas")),
+            &format!("unit Decoy{index:03}; interface implementation end.\n"),
+        );
+    }
+    let metrics = root.path().with_extension("include-query-work.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [(
+            "PASCAL_LSP_TEST_QUERY_RECONCILIATION_WORK_RESULT",
+            metrics_value.as_str(),
+        )],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    let events = (0..BATCH)
+        .map(|index| {
+            let path = root.path().join(format!("batch-{index:02}.pas"));
+            write_file(&path, "unit Batch; interface implementation end.\n");
+            json!({"uri":uri(&path),"type":1})
+        })
+        .collect::<Vec<_>>();
+    server.send_notification("workspace/didChangeWatchedFiles", json!({"changes":events}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&main),"languageId":"pascal","version":1,"text":main_source}}),
+    );
+    let references_id = RequestId::from("include-owner-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&include)},
+            "position": position_of(include_source, "RootValue", 0),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    let references = server.response(&references_id);
+    assert!(
+        references.error.is_none(),
+        "include references: {references:?}"
+    );
+    assert_eq!(
+        references.result.unwrap().as_array().unwrap().len(),
+        2,
+        "the include owner must recover both the include and root declaration"
+    );
+    let id = RequestId::from("include-owner-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&include, include_source, "RootValue", 0),
+    );
+    let _include_definition = result_locations(server.response(&id));
+    assert!(wait_for_file(&metrics, IO_TIMEOUT));
+    let metrics: Value = serde_json::from_slice(&fs::read(&metrics).unwrap()).unwrap();
+    assert!(
+        metrics["include_path_visits"].as_u64().unwrap_or_default() >= DECOYS as u64,
+        "include-owner scan counts actual candidates: {metrics}"
+    );
+    assert!(
+        metrics["filesystem_path_visits"]
+            .as_u64()
+            .unwrap_or_default()
+            >= metrics["include_path_visits"].as_u64().unwrap_or_default(),
+        "include candidate visits are included in the shared request-account total: {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

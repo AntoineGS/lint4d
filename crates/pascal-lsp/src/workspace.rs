@@ -1008,6 +1008,8 @@ const NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED: &str =
 #[derive(Clone, Copy, Debug, Default)]
 struct ReconciliationWorkUsed {
     filesystem_path_visits: usize,
+    package_path_visits: usize,
+    include_path_visits: usize,
     file_bytes_read: usize,
     indexed_source_bytes: usize,
     dependency_edges: usize,
@@ -1072,6 +1074,25 @@ impl ReconciliationBudget {
             MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
             |used, next| used.filesystem_path_visits = next,
         )
+    }
+
+    fn charge_package_path_visits(&self, amount: usize) -> Result<(), String> {
+        // Keep package descriptor/catalogue probes distinguishable in test
+        // metrics while charging the same filesystem-path visit ceiling.
+        self.charge_path_visits(amount)?;
+        let mut used = self.used.get();
+        used.package_path_visits = used.package_path_visits.saturating_add(amount);
+        self.used.set(used);
+        Ok(())
+    }
+
+    fn charge_include_path_visits(&self, amount: usize) -> Result<(), String> {
+        // Include-owner catalogue probes share the ordinary path-visit limit.
+        self.charge_path_visits(amount)?;
+        let mut used = self.used.get();
+        used.include_path_visits = used.include_path_visits.saturating_add(amount);
+        self.used.set(used);
+        Ok(())
     }
 
     pub(crate) fn charge_file_bytes(&self, amount: usize) -> Result<(), String> {
@@ -1198,6 +1219,8 @@ impl ReconciliationBudget {
         let used = self.used.get();
         serde_json::json!({
             "filesystem_path_visits": used.filesystem_path_visits,
+            "package_path_visits": used.package_path_visits,
+            "include_path_visits": used.include_path_visits,
             "file_bytes_read": used.file_bytes_read,
             "indexed_source_bytes": used.indexed_source_bytes,
             "dependency_edges": used.dependency_edges,
@@ -2394,7 +2417,16 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Result<Vec<Location>, String> {
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
-        self.navigate_with_cancel_and_budget(uri, position, target, cancel, Some(&budget))
+        let result =
+            self.navigate_with_cancel_and_budget(uri, position, target, cancel, Some(&budget));
+        #[cfg(feature = "test-support")]
+        if let Some(path) = std::env::var_os("PASCAL_LSP_TEST_QUERY_RECONCILIATION_WORK_RESULT") {
+            let _ = std::fs::write(
+                path,
+                serde_json::to_vec(&budget.metrics(budget.is_exhausted())).unwrap_or_default(),
+            );
+        }
+        result
     }
 
     fn navigate_with_cancel_and_budget(
@@ -2495,7 +2527,7 @@ impl Workspace {
         for (uri, document) in &self.open_documents {
             check_workspace_cancel(Some(cancel))?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_include_path_visits(1)?;
             }
             if document.text.is_some()
                 && uri != include_uri
@@ -2522,7 +2554,7 @@ impl Workspace {
         for root_path in root_paths {
             check_workspace_cancel(Some(cancel))?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_include_path_visits(1)?;
             }
             let catalogue =
                 self.filename_catalogue_with_cancel_and_budget(&root_path, Some(cancel), budget)?;
@@ -2533,7 +2565,7 @@ impl Workspace {
             for path in catalogue.entries.values().flatten() {
                 check_workspace_cancel(Some(cancel))?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_include_path_visits(1)?;
                 }
                 paths.push(absolute_path(path.clone()));
             }
@@ -2542,7 +2574,7 @@ impl Workspace {
             for path in paths {
                 check_workspace_cancel(Some(cancel))?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_include_path_visits(1)?;
                 }
                 if paths_equal_ci(&path, &include_path) {
                     continue;
@@ -2561,7 +2593,7 @@ impl Workspace {
         for owner_uri in candidates {
             check_workspace_cancel(Some(cancel))?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_include_path_visits(1)?;
             }
             let owner_context =
                 match self.context_for_uri_with_cancel_and_budget(&owner_uri, Some(cancel), budget)
@@ -3138,7 +3170,15 @@ impl Workspace {
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
-            budget.charge_path_visits(1)?;
+            let package_descriptor_event = uri
+                .to_file_path()
+                .ok()
+                .is_some_and(|path| extension_is(&path, "dpk"));
+            if package_descriptor_event {
+                budget.charge_package_path_visits(1)?;
+            } else {
+                budget.charge_path_visits(1)?;
+            }
         }
         let mut diagnostic_uris = Vec::new();
         let override_changed = uri
@@ -7660,7 +7700,7 @@ impl Workspace {
         for package_name in &package_names {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_package_path_visits(1)?;
             }
             let (descriptors, catalogue_complete) = self.package_descriptors(
                 &package_names,
@@ -7720,7 +7760,7 @@ impl Workspace {
             for (unit_name, entries) in &metadata.unit_entries {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_package_path_visits(1)?;
                 }
                 if !package_unit_name_matches(unit_name, requested_name, lookup_name, context) {
                     continue;
@@ -7729,7 +7769,7 @@ impl Workspace {
                 for entry in entries {
                     check_workspace_cancel(cancel)?;
                     if let Some(budget) = budget {
-                        budget.charge_path_visits(1)?;
+                        budget.charge_package_path_visits(1)?;
                     }
                     if !context.read_policy.allows_location(entry) {
                         lookup.warnings.push(format!(
@@ -7858,7 +7898,7 @@ impl Workspace {
             for root in &workspace_root.source_roots {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_package_path_visits(1)?;
                 }
                 if !roots.iter().any(|existing| existing == root) {
                     roots.push(root.clone());
@@ -7868,7 +7908,7 @@ impl Workspace {
         for configured_root in context_key.overrides.read_roots() {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_package_path_visits(1)?;
             }
             let configured_root = absolute_path(configured_root);
             let root = native_mapping_root(&configured_root);
@@ -7906,7 +7946,7 @@ impl Workspace {
     ) -> Result<(PackageMetadata, Vec<ProjectReadObservation>), String> {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
-            budget.charge_path_visits(1)?;
+            budget.charge_package_path_visits(1)?;
         }
         let key = PackageMetadataKey {
             descriptor: path.to_path_buf(),
@@ -8062,7 +8102,7 @@ impl Workspace {
         for path in paths {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_package_path_visits(1)?;
             }
             let metadata_known = metadata_index.contains(&path_ci_lookup_key(path));
             let watched = state.watched_paths.contains_key(path);
@@ -8071,7 +8111,7 @@ impl Workspace {
             } else {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_package_path_visits(1)?;
                 }
                 Some(path_stamp(path))
             };
@@ -8183,7 +8223,7 @@ impl Workspace {
                 for (path, stamp) in &catalogue.directories {
                     check_workspace_cancel(cancel)?;
                     if let Some(budget) = budget {
-                        budget.charge_path_visits(1)?;
+                        budget.charge_package_path_visits(1)?;
                     }
                     if path_stamp(path) != *stamp {
                         fresh = false;
@@ -8248,7 +8288,7 @@ impl Workspace {
         };
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
-            budget.charge_path_visits(1)?;
+            budget.charge_package_path_visits(1)?;
         }
         scan.directories.push((root.clone(), path_stamp(&root)));
         check_workspace_cancel(cancel)?;
@@ -8265,7 +8305,7 @@ impl Workspace {
         'directories: while let Some(directory) = pending.pop_front() {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_package_path_visits(1)?;
             }
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
@@ -8279,7 +8319,7 @@ impl Workspace {
             loop {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_package_path_visits(1)?;
                 }
                 let Some(result) = read_dir.next() else {
                     break;
@@ -8731,7 +8771,7 @@ impl Workspace {
             for (path, stamp) in &catalogue.directories {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_include_path_visits(1)?;
                 }
                 if path_stamp(path) != *stamp {
                     fresh = false;
@@ -8749,7 +8789,7 @@ impl Workspace {
         let mut entries: HashMap<String, Vec<PathBuf>> = HashMap::new();
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
-            budget.charge_path_visits(1)?;
+            budget.charge_include_path_visits(1)?;
         }
         let mut directories = vec![(root.clone(), path_stamp(&root))];
         let mut visited = 0;
@@ -8767,7 +8807,7 @@ impl Workspace {
                 break;
             }
             if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
+                budget.charge_include_path_visits(1)?;
             }
             let Some(entry) = walk.next() else {
                 break;
@@ -8779,7 +8819,7 @@ impl Workspace {
             if entry.file_type().is_dir() && directories.len() < entry_limit {
                 check_workspace_cancel(cancel)?;
                 if let Some(budget) = budget {
-                    budget.charge_path_visits(1)?;
+                    budget.charge_include_path_visits(1)?;
                 }
                 directories.push((entry.path().to_path_buf(), path_stamp(entry.path())));
             }

@@ -1294,8 +1294,16 @@ retained root snapshot remains available for later cleanup, no subset of the
 new proposal is retained, and no empty publication is synthesized for an
 unseen proposed target. The client receives a `window/showMessage` warning that
 the report is incomplete; this operational warning is not a Pascal semantic
-diagnostic. Backpressure during the separate rejected-open cleanup cursor
-leaves its current target in place for a later turn.
+diagnostic. The retained root is marked incomplete until a later complete
+replacement or close: its target keys remain available for cleanup, but its old
+diagnostics are excluded from subsequent aggregates. If a later owner updates a
+shared target while an incomplete owner still retains it, only complete-owner
+diagnostics are published and an incomplete-report warning accompanies that
+aggregate. If the target has only incomplete owners, no aggregate is emitted;
+closing the last such owner still emits the required empty cleanup, and a
+successful owner replacement restores its current contribution. Backpressure
+during the separate rejected-open cleanup cursor leaves its current target in
+place for a later turn.
 `didClose` defers synchronous push clears while the cleanup cursor is active,
 even if closing the rejected URI has already lifted the request fence. Fresh
 push-diagnostic scheduling waits until the cleanup cursor has drained, while

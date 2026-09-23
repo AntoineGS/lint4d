@@ -10186,7 +10186,7 @@ fn handle_notification_with_control(
             let uri = params.text_document.uri;
             let closed = workspace.close_document(&uri);
             if closed {
-                let updates = workspace.clear_diagnostic_publications(&uri);
+                let replacement = workspace.clear_diagnostic_publications(&uri);
                 // A rejected-open cleanup cursor already owns the complete
                 // retained publication union. Do not bypass its bounded,
                 // resumable admission path with synchronous close clears.
@@ -10195,7 +10195,7 @@ fn handle_notification_with_control(
                     && !workspace.analysis_admission_fenced()
                 {
                     let mut root_was_updated = false;
-                    for update in updates {
+                    for update in replacement.updates {
                         root_was_updated |= update.uri == uri;
                         send_diagnostics(
                             connection,
@@ -10207,6 +10207,10 @@ fn handle_notification_with_control(
                     }
                     if !root_was_updated {
                         send_diagnostics(connection, &uri, None, Vec::new())
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if replacement.incomplete {
+                        send_diagnostic_publication_incomplete(connection)
                             .map_err(|error| error.to_string())?;
                     }
                 }
@@ -11187,6 +11191,116 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("diagnostics are incomplete"))
         );
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn push_publication_after_another_root_overflows_excludes_stale_findings() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let root_a = Url::from_file_path(temp.path().join("A.pas")).expect("root A URI");
+        let root_b = Url::from_file_path(temp.path().join("B.pas")).expect("root B URI");
+        let target = Url::from_file_path(temp.path().join("Shared.inc")).expect("target URI");
+        let (server, client) = Connection::memory();
+
+        super::send_diagnostic_publications(
+            &server,
+            &mut workspace,
+            &root_a,
+            vec![DiagnosticPublication {
+                uri: target.clone(),
+                version: None,
+                diagnostics: vec![lsp_types::Diagnostic::new_simple(
+                    lsp_types::Range::default(),
+                    "A stale finding".into(),
+                )],
+            }],
+        )
+        .expect("initial A publication");
+        let Message::Notification(initial) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial publishDiagnostics")
+        else {
+            panic!("initial message should be a notification");
+        };
+        assert_eq!(initial.method, "textDocument/publishDiagnostics");
+        assert!(initial.params["diagnostics"][0]["message"] == "A stale finding");
+
+        let too_long = Url::parse(&format!(
+            "file:///{}",
+            "x".repeat(crate::workspace::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES)
+        ))
+        .expect("over-limit URI");
+        super::send_diagnostic_publications(
+            &server,
+            &mut workspace,
+            &root_a,
+            vec![DiagnosticPublication {
+                uri: too_long,
+                version: None,
+                diagnostics: vec![lsp_types::Diagnostic::new_simple(
+                    lsp_types::Range::default(),
+                    "A no longer has this finding".into(),
+                )],
+            }],
+        )
+        .expect("overflow should be reported without partial publications");
+        let Message::Notification(overflow_notice) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("overflow warning")
+        else {
+            panic!("overflow should send a warning notification");
+        };
+        assert_eq!(overflow_notice.method, "window/showMessage");
+
+        super::send_diagnostic_publications(
+            &server,
+            &mut workspace,
+            &root_b,
+            vec![DiagnosticPublication {
+                uri: target.clone(),
+                version: None,
+                diagnostics: vec![lsp_types::Diagnostic::new_simple(
+                    lsp_types::Range::default(),
+                    "B current finding".into(),
+                )],
+            }],
+        )
+        .expect("B publication must omit A's stale contribution");
+        let Message::Notification(update) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("B's current publishDiagnostics")
+        else {
+            panic!("B's report should be a notification");
+        };
+        assert_eq!(update.method, "textDocument/publishDiagnostics");
+        assert_eq!(update.params["uri"], target.as_str());
+        assert_eq!(update.params["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            update.params["diagnostics"][0]["message"],
+            "B current finding"
+        );
+        assert!(
+            update.params["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|diagnostic| diagnostic["message"] != "A stale finding")
+        );
+        let Message::Notification(incomplete_notice) = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("aggregate incompleteness warning")
+        else {
+            panic!("incomplete aggregate should be a warning notification");
+        };
+        assert_eq!(incomplete_notice.method, "window/showMessage");
         assert!(client.receiver.try_recv().is_err());
     }
 

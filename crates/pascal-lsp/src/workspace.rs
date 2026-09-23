@@ -1891,6 +1891,7 @@ pub struct Workspace {
     open_text_bytes: usize,
     pending_diagnostics: HashMap<Url, Instant>,
     diagnostic_publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
+    incomplete_diagnostic_publication_roots: HashSet<Url>,
     diagnostic_publication_target_count: usize,
     diagnostic_publication_uri_bytes: usize,
     // Bounded event overrides are needed because some clients report a
@@ -2608,6 +2609,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn seed_diagnostic_publication_capacity_for_test(&mut self) {
         self.diagnostic_publications.clear();
+        self.incomplete_diagnostic_publication_roots.clear();
         self.diagnostic_publication_target_count = 0;
         self.diagnostic_publication_uri_bytes = 0;
         for index in 0..MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS {
@@ -3789,9 +3791,12 @@ impl Workspace {
 
         if incomplete {
             // Keep the prior complete root snapshot as the last known report.
-            // The caller emits an operational warning; no partial proposal or
-            // fabricated empty report is admitted, and the retained keys stay
-            // available to the existing later cleanup cursor.
+            // Mark its contribution stale so later roots cannot aggregate it
+            // as current. Its retained keys remain available to cleanup.
+            if self.diagnostic_publications.contains_key(root_uri) {
+                self.incomplete_diagnostic_publication_roots
+                    .insert(root_uri.clone());
+            }
             return Ok(DiagnosticPublicationReplacement {
                 updates: Vec::new(),
                 incomplete: true,
@@ -3802,22 +3807,23 @@ impl Workspace {
         self.diagnostic_publication_target_count = retained_count.saturating_add(proposed.len());
         self.diagnostic_publication_uri_bytes =
             retained_uri_bytes.saturating_add(current_uri_bytes);
+        self.incomplete_diagnostic_publication_roots
+            .remove(root_uri);
         self.diagnostic_publications
             .insert(root_uri.clone(), proposed);
-        Ok(DiagnosticPublicationReplacement {
-            updates: self.aggregate_diagnostic_publications(affected),
-            incomplete: false,
-        })
+        Ok(self.aggregate_diagnostic_publications(affected))
     }
 
     pub(crate) fn clear_diagnostic_publications(
         &mut self,
         root_uri: &Url,
-    ) -> Vec<queries::DiagnosticPublication> {
+    ) -> DiagnosticPublicationReplacement {
         let previous = self
             .diagnostic_publications
             .remove(root_uri)
             .unwrap_or_default();
+        self.incomplete_diagnostic_publication_roots
+            .remove(root_uri);
         self.diagnostic_publication_target_count = self
             .diagnostic_publication_target_count
             .saturating_sub(previous.len());
@@ -3833,6 +3839,7 @@ impl Workspace {
     ) -> DiagnosticPublicationUriCursor {
         self.diagnostic_publication_target_count = 0;
         self.diagnostic_publication_uri_bytes = 0;
+        self.incomplete_diagnostic_publication_roots.clear();
         let publications = std::mem::take(&mut self.diagnostic_publications);
         let open_documents = self.open_documents.keys().cloned().collect();
         DiagnosticPublicationUriCursor::new(publications, open_documents, extra)
@@ -3841,36 +3848,52 @@ impl Workspace {
     fn aggregate_diagnostic_publications(
         &self,
         affected: HashSet<Url>,
-    ) -> Vec<queries::DiagnosticPublication> {
+    ) -> DiagnosticPublicationReplacement {
         let mut affected = affected.into_iter().collect::<Vec<_>>();
         affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        affected
-            .into_iter()
-            .map(|uri| {
-                let mut roots = self.diagnostic_publications.keys().collect::<Vec<_>>();
-                roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-                let mut diagnostics = Vec::new();
-                for root in roots {
-                    let Some(contribution) = self
-                        .diagnostic_publications
-                        .get(root)
-                        .and_then(|publications| publications.get(&uri))
-                    else {
-                        continue;
-                    };
-                    for diagnostic in contribution {
-                        if !diagnostics.contains(diagnostic) {
-                            diagnostics.push(diagnostic.clone());
-                        }
+        let mut updates = Vec::with_capacity(affected.len());
+        let mut incomplete = false;
+        for uri in affected {
+            let mut roots = self.diagnostic_publications.keys().collect::<Vec<_>>();
+            roots.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            let mut has_current_owner = false;
+            let mut has_incomplete_owner = false;
+            let mut diagnostics = Vec::new();
+            for root in roots {
+                let Some(contribution) = self
+                    .diagnostic_publications
+                    .get(root)
+                    .and_then(|publications| publications.get(&uri))
+                else {
+                    continue;
+                };
+                if self.incomplete_diagnostic_publication_roots.contains(root) {
+                    has_incomplete_owner = true;
+                    continue;
+                }
+                has_current_owner = true;
+                for diagnostic in contribution {
+                    if !diagnostics.contains(diagnostic) {
+                        diagnostics.push(diagnostic.clone());
                     }
                 }
-                queries::DiagnosticPublication {
-                    version: self.document_version(&uri),
-                    uri,
-                    diagnostics,
-                }
-            })
-            .collect()
+            }
+            if !has_current_owner && has_incomplete_owner {
+                // The only retained owners are stale snapshots. Do not turn
+                // their old key into a fabricated authoritative empty report.
+                continue;
+            }
+            incomplete |= has_incomplete_owner;
+            updates.push(queries::DiagnosticPublication {
+                version: self.document_version(&uri),
+                uri,
+                diagnostics,
+            });
+        }
+        DiagnosticPublicationReplacement {
+            updates,
+            incomplete,
+        }
     }
 
     pub fn take_due_diagnostics(&mut self) -> Vec<(Url, Option<i32>, Vec<LspDiagnostic>)> {
@@ -10693,6 +10716,189 @@ mod tests {
             Some(&previous),
             "atomic rejection preserves the previous complete root snapshot for later cleanup"
         );
+    }
+
+    #[test]
+    fn overflowed_root_is_not_republished_as_current_by_another_owner() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let root_a = Url::from_file_path(temp.path().join("A.pas")).expect("root A URI");
+        let root_b = Url::from_file_path(temp.path().join("B.pas")).expect("root B URI");
+        let target = Url::from_file_path(temp.path().join("Shared.inc")).expect("target URI");
+        let diagnostic_a = Diagnostic::new_simple(Range::default(), "A stale finding".into());
+
+        let initial = workspace
+            .replace_diagnostic_publications(
+                &root_a,
+                [super::queries::DiagnosticPublication {
+                    uri: target.clone(),
+                    version: None,
+                    diagnostics: vec![diagnostic_a.clone()],
+                }],
+            )
+            .expect("initial A report");
+        assert!(!initial.incomplete);
+
+        let oversized = Url::parse(&format!(
+            "file:///{}",
+            "x".repeat(super::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES)
+        ))
+        .expect("over-limit target URI");
+        let rejected = workspace
+            .replace_diagnostic_publications(
+                &root_a,
+                [
+                    super::queries::DiagnosticPublication {
+                        uri: target.clone(),
+                        version: None,
+                        diagnostics: Vec::new(),
+                    },
+                    super::queries::DiagnosticPublication {
+                        uri: oversized,
+                        version: None,
+                        diagnostics: vec![Diagnostic::new_simple(
+                            Range::default(),
+                            "proposal rejected".into(),
+                        )],
+                    },
+                ],
+            )
+            .expect("overflow is an incomplete publication, not a transport error");
+        assert!(rejected.incomplete);
+        assert!(rejected.updates.is_empty());
+        assert_eq!(
+            workspace
+                .diagnostic_publications
+                .get(&root_a)
+                .and_then(|targets| targets.get(&target)),
+            Some(&vec![diagnostic_a.clone()]),
+            "retain A's keys and last report for cleanup, but do not treat it as current"
+        );
+
+        assert!(
+            workspace
+                .aggregate_diagnostic_publications(HashSet::from([target.clone()]))
+                .updates
+                .is_empty(),
+            "a stale-only owner must not synthesize an empty or current report"
+        );
+
+        let diagnostic_b = Diagnostic::new_simple(Range::default(), "B current finding".into());
+        let refreshed_b = workspace
+            .replace_diagnostic_publications(
+                &root_b,
+                [super::queries::DiagnosticPublication {
+                    uri: target.clone(),
+                    version: None,
+                    diagnostics: vec![diagnostic_b.clone()],
+                }],
+            )
+            .expect("B's independent report fits the retained-map limits");
+        assert!(
+            refreshed_b.incomplete,
+            "an aggregate that excludes a stale owner must remain explicitly incomplete"
+        );
+        let update = refreshed_b
+            .updates
+            .iter()
+            .find(|update| update.uri == target)
+            .expect("B's current target report");
+        assert_eq!(update.diagnostics, vec![diagnostic_b.clone()]);
+        assert!(
+            !update.diagnostics.contains(&diagnostic_a),
+            "A's stale finding must not be presented as current"
+        );
+
+        let recovered_a = workspace
+            .replace_diagnostic_publications(
+                &root_a,
+                [super::queries::DiagnosticPublication {
+                    uri: target.clone(),
+                    version: None,
+                    diagnostics: Vec::new(),
+                }],
+            )
+            .expect("A's later complete replacement recovers its ownership");
+        assert!(!recovered_a.incomplete);
+        assert_eq!(
+            recovered_a
+                .updates
+                .iter()
+                .find(|update| update.uri == target)
+                .expect("recovered shared target")
+                .diagnostics,
+            vec![diagnostic_b.clone()],
+            "recovery removes A's stale finding without erasing B's current finding"
+        );
+
+        let closed_a = workspace.clear_diagnostic_publications(&root_a);
+        assert!(!closed_a.incomplete);
+        assert_eq!(
+            closed_a
+                .updates
+                .iter()
+                .find(|update| update.uri == target)
+                .expect("shared target after A closes")
+                .diagnostics,
+            vec![diagnostic_b],
+            "closing A preserves B's complete ownership"
+        );
+    }
+
+    #[test]
+    fn closing_the_only_incomplete_publication_owner_emits_its_cleanup() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let root = Url::from_file_path(temp.path().join("Owner.pas")).expect("root URI");
+        let target = Url::from_file_path(temp.path().join("Shared.inc")).expect("target URI");
+        workspace
+            .replace_diagnostic_publications(
+                &root,
+                [super::queries::DiagnosticPublication {
+                    uri: target.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "old finding".into(),
+                    )],
+                }],
+            )
+            .expect("initial owner report");
+
+        let oversized = Url::parse(&format!(
+            "file:///{}",
+            "x".repeat(super::MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES)
+        ))
+        .expect("over-limit URI");
+        let failed = workspace
+            .replace_diagnostic_publications(
+                &root,
+                [super::queries::DiagnosticPublication {
+                    uri: oversized,
+                    version: None,
+                    diagnostics: Vec::new(),
+                }],
+            )
+            .expect("over-limit replacement");
+        assert!(failed.incomplete);
+        assert!(
+            workspace
+                .aggregate_diagnostic_publications(HashSet::from([target.clone()]))
+                .updates
+                .is_empty(),
+            "the stale owner alone must not produce an empty report"
+        );
+
+        let closed = workspace.clear_diagnostic_publications(&root);
+        assert!(!closed.incomplete);
+        let cleanup = closed
+            .updates
+            .iter()
+            .find(|update| update.uri == target)
+            .expect("closing the last owner must clear its previously published target");
+        assert!(cleanup.diagnostics.is_empty());
     }
 
     #[test]

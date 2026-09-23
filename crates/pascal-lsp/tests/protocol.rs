@@ -34342,11 +34342,6 @@ fn symbol_rename_rejects_unit_alias_and_unresolved_provider_controls() {
             "MissingProvider",
         ),
         (
-            "explicit-in-path",
-            "unit Consumer;\ninterface\nuses Provider in 'Provider.pas';\nimplementation\nend.\n",
-            "Provider",
-        ),
-        (
             "conditional-use",
             "unit Consumer;\ninterface\n{$IFDEF MAYBE}\nuses Provider;\n{$ENDIF}\nimplementation\nend.\n",
             "Provider;",
@@ -34505,6 +34500,220 @@ fn symbol_rename_rejects_namespaced_and_include_owned_unit_controls_atomically()
             assert_eq!(fs::read(&include).expect("include bytes"), b"Provider\n");
         }
         server.shutdown();
+    }
+}
+
+#[test]
+fn unit_rename_updates_only_selected_relative_uses_in_paths() {
+    for operation in ["symbol", "will"] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let project_a = root.join("A");
+        let project_b = root.join("B");
+        let provider_a = project_a.join("lib/Provider.pas");
+        let provider_b = project_b.join("lib/Provider.pas");
+        let helper_a = project_a.join("lib/Helper.pas");
+        let consumer_one = project_a.join("ConsumerOne.pas");
+        let consumer_two = project_a.join("ConsumerTwo.pas");
+        let consumer_b = project_b.join("ConsumerB.pas");
+        let source_a = "unit Provider;\r\ninterface\r\ntype TA = class end; TB = class end;\r\nimplementation\r\nend.\r\n";
+        let source_b =
+            "unit Provider;\ninterface\ntype TFromB = class end;\nimplementation\nend.\n";
+        let helper_source = "unit Helper;\ninterface\nimplementation\nend.\n";
+        let one_source = "\u{feff}unit ConsumerOne;\r\ninterface\r\nuses Provider in 'lib/Provider.pas', Helper in 'lib/Helper.pas';\r\ntype TAlias = Provider.TA;\r\nconst Note = 'lib/Provider.pas'; // Provider in 'fake/Provider.pas'\r\nimplementation\r\nend.\r\n";
+        let two_source = "unit ConsumerTwo;\ninterface\nimplementation\nuses Provider in 'lib/Provider.pas';\nprocedure Run;\nvar Value: Provider.TB;\nbegin end;\nend.\n";
+        let b_source = "unit ConsumerB;\ninterface\nuses Provider in 'lib/Provider.pas';\ntype TAlias = Provider.TFromB;\nimplementation\nend.\n";
+        write_file(&provider_a, source_a);
+        write_file(&provider_b, source_b);
+        write_file(&helper_a, helper_source);
+        write_file(&consumer_one, one_source);
+        write_file(&consumer_two, two_source);
+        write_file(&consumer_b, b_source);
+        write_file(
+            &project_a.join("Main.pas"),
+            "unit MainA;\ninterface\nuses ConsumerOne, ConsumerTwo;\nimplementation\nend.\n",
+        );
+        write_file(
+            &project_b.join("Main.pas"),
+            "unit MainB;\ninterface\nuses ConsumerB;\nimplementation\nend.\n",
+        );
+        write_file(
+            &project_a.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+        );
+        write_file(
+            &project_b.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        let init = RequestId::from(format!("relative-in-path-{operation}-init"));
+        server.send_request(init.clone(), "initialize", json!({
+            "processId":null,"rootUri":uri(&root),"capabilities":{
+                "workspace":{"workspaceEdit":{"documentChanges":true,"resourceOperations":["rename"]},
+                    "fileOperations":{"willRename":true}}
+            }
+        }));
+        assert!(server.response(&init).error.is_none());
+        server.send_notification("initialized", json!({}));
+        let selected_provider = RequestId::from(format!("relative-in-path-{operation}-selected"));
+        server.send_request(
+            selected_provider.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer_one, one_source, "Provider.TA", 0),
+        );
+        let selected_locations = result_locations(server.response(&selected_provider));
+        assert_eq!(
+            selected_locations.len(),
+            1,
+            "selected provider for {operation}: {selected_locations:?}"
+        );
+        assert_eq!(selected_locations[0]["uri"], uri(&provider_a).to_string());
+        if operation == "will" {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&provider_a),"languageId":"pascal","version":1,"text":source_a}}),
+            );
+            server.send_notification(
+                "textDocument/didClose",
+                json!({"textDocument":{"uri":uri(&provider_a)}}),
+            );
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&consumer_one),"languageId":"pascal","version":1,"text":one_source}}),
+            );
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&consumer_two),"languageId":"pascal","version":1,"text":two_source}}),
+            );
+        }
+        let request = RequestId::from(format!("relative-in-path-{operation}"));
+        if operation == "symbol" {
+            server.send_request(
+                request.clone(),
+                "textDocument/rename",
+                json!({
+                    "textDocument":{"uri":uri(&consumer_one)},
+                    "position":position_of(one_source, "Provider.TA", 0),
+                    "newName":"Renamed"
+                }),
+            );
+        } else {
+            server.send_request(
+                request.clone(),
+                "workspace/willRenameFiles",
+                json!({"files":[{
+                    "oldUri":uri(&provider_a),"newUri":uri(&project_a.join("lib/Renamed.pas"))
+                }]}),
+            );
+        }
+        let response = server.response(&request);
+        assert!(
+            response.error.is_none(),
+            "{operation} explicit path rename failed: {response:?}"
+        );
+        let edit = response.result.expect("workspace edit");
+        let changes = edit["documentChanges"].as_array().expect("documentChanges");
+        let moves = changes
+            .iter()
+            .filter(|change| change["kind"] == "rename")
+            .collect::<Vec<_>>();
+        if operation == "symbol" {
+            assert_eq!(moves.len(), 1, "{changes:?}");
+            assert_eq!(moves[0]["oldUri"], uri(&provider_a).to_string());
+            assert_eq!(moves[0], changes.last().expect("last operation"));
+        } else {
+            assert!(
+                moves.is_empty(),
+                "willRenameFiles must not duplicate the client move: {changes:?}"
+            );
+        }
+        let text_uris = changes
+            .iter()
+            .filter_map(|change| change["textDocument"]["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert!(text_uris.contains(&uri(&provider_a).as_str()));
+        assert!(text_uris.contains(&uri(&consumer_one).as_str()));
+        assert!(text_uris.contains(&uri(&consumer_two).as_str()));
+        assert!(
+            !text_uris.contains(&uri(&provider_b).as_str()),
+            "edited project B provider: {changes:?}"
+        );
+        assert!(
+            !text_uris.contains(&uri(&consumer_b).as_str()),
+            "edited project B consumer: {changes:?}"
+        );
+        assert!(
+            !text_uris.contains(&uri(&helper_a).as_str()),
+            "edited unrelated helper: {changes:?}"
+        );
+
+        let provider_updated = apply_workspace_edit_to_source(source_a, &edit, &uri(&provider_a));
+        let one_updated = apply_workspace_edit_to_source(one_source, &edit, &uri(&consumer_one));
+        let two_updated = apply_workspace_edit_to_source(two_source, &edit, &uri(&consumer_two));
+        let b_provider_after = apply_workspace_edit_to_source(source_b, &edit, &uri(&provider_b));
+        let b_consumer_after = apply_workspace_edit_to_source(b_source, &edit, &uri(&consumer_b));
+        assert!(provider_updated.contains("unit Renamed;"));
+        assert!(
+            one_updated.contains("uses Renamed in 'lib/Renamed.pas', Helper in 'lib/Helper.pas';")
+        );
+        assert!(two_updated.contains("uses Renamed in 'lib/Renamed.pas';"));
+        assert!(
+            one_updated
+                .contains("const Note = 'lib/Provider.pas'; // Provider in 'fake/Provider.pas'")
+        );
+        assert_eq!(b_provider_after.as_bytes(), source_b.as_bytes());
+        assert_eq!(b_consumer_after.as_bytes(), b_source.as_bytes());
+        write_file(&provider_a, &provider_updated);
+        write_file(&consumer_one, &one_updated);
+        write_file(&consumer_two, &two_updated);
+        let moved_provider = project_a.join("lib/Renamed.pas");
+        fs::rename(&provider_a, &moved_provider).expect("client applies provider move");
+        server.shutdown();
+
+        let mut fresh_a = TestServer::launch();
+        let fresh_a_init = RequestId::from(format!("relative-in-path-{operation}-fresh-a"));
+        fresh_a.send_request(
+            fresh_a_init.clone(),
+            "initialize",
+            json!({
+                "processId":null,"rootUri":uri(&project_a),"capabilities":{}
+            }),
+        );
+        assert!(fresh_a.response(&fresh_a_init).error.is_none());
+        fresh_a.send_notification("initialized", json!({}));
+        let a_definition = RequestId::from(format!("relative-in-path-{operation}-a-definition"));
+        fresh_a.send_request(
+            a_definition.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer_one, &one_updated, "Renamed.TA", 0),
+        );
+        let a_locations = result_locations(fresh_a.response(&a_definition));
+        assert_eq!(a_locations.len(), 1, "A: {a_locations:?}");
+        assert_eq!(a_locations[0]["uri"], uri(&moved_provider).to_string());
+        fresh_a.shutdown();
+
+        let mut fresh_b = TestServer::launch();
+        let fresh_b_init = RequestId::from(format!("relative-in-path-{operation}-fresh-b"));
+        fresh_b.send_request(
+            fresh_b_init.clone(),
+            "initialize",
+            json!({
+                "processId":null,"rootUri":uri(&project_b),"capabilities":{}
+            }),
+        );
+        assert!(fresh_b.response(&fresh_b_init).error.is_none());
+        fresh_b.send_notification("initialized", json!({}));
+        let b_definition = RequestId::from(format!("relative-in-path-{operation}-b-definition"));
+        fresh_b.send_request(
+            b_definition.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer_b, b_source, "TFromB", 0),
+        );
+        let b_locations = result_locations(fresh_b.response(&b_definition));
+        assert_eq!(b_locations.len(), 1, "B: {b_locations:?}");
+        assert_eq!(b_locations[0]["uri"], uri(&provider_b).to_string());
+        fresh_b.shutdown();
     }
 }
 

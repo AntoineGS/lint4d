@@ -262,6 +262,15 @@ pub(crate) struct RenameBindingInfo {
     pub(crate) names: Vec<String>,
 }
 
+fn is_explicit_uses_path_keyword(identifier: Node<'_>, document: &Document, span: Span) -> bool {
+    node_text(identifier, &document.source).eq_ignore_ascii_case("in")
+        && has_ancestor_kind(identifier, "declUses")
+        && document
+            .source
+            .get(span.end..)
+            .is_some_and(|tail| tail.trim_start().starts_with('\''))
+}
+
 #[derive(Debug, Clone)]
 struct Occurrence {
     uri: Url,
@@ -1799,6 +1808,11 @@ impl NavigationIndex {
                 )?;
                 let span = Span::from_node(identifier);
                 let name = canonical_name(&node_text(identifier, &document.source));
+                if binding.kind == SymbolKind::Unit
+                    && is_explicit_uses_path_keyword(identifier, document, span)
+                {
+                    continue;
+                }
                 let is_binding_member = binding.contains_span(uri, span);
                 let unit_span = if binding.kind == SymbolKind::Unit {
                     if options.shared_work_budget.is_some() {

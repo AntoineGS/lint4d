@@ -3649,6 +3649,7 @@ fn rename_from_input_impl(
             records: Vec::new(),
         };
     }
+    let mut selected_provider_context = None;
     if allow_unit {
         let (context, project_records) =
             match project_context_and_metadata_for_input(&input, &uri, cancel) {
@@ -3682,13 +3683,14 @@ fn rename_from_input_impl(
                 "unit provider is named by project main/reference/package metadata; updating those path consumers is unsupported".to_string(),
             );
         }
+        selected_provider_context = Some(context);
         snapshot.baseline_records.extend(project_records);
     }
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
 
-    let raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel, allow_unit) {
+    let mut raw_edits = match snapshot.rename_edits(&uri, position, new_name, cancel, allow_unit) {
         Ok(edits) => edits,
         Err(error) => {
             let source_changed = source_for_input_with_cancel(&input, &uri, Some(cancel))
@@ -3919,19 +3921,26 @@ fn rename_from_input_impl(
                 "unit rename source has multiple hard links".to_string(),
             );
         }
-        let mut in_path_scan_work = 0usize;
-        for source in snapshot.sources.values() {
-            match source_has_in_path_literal(source, cancel, &mut in_path_scan_work) {
-                Ok(true) => {
-                    return failed(
-                        source_generation,
-                        configuration_generation,
-                        "unit rename with explicit uses in-paths is unsupported".to_string(),
-                    );
-                }
-                Ok(false) => {}
-                Err(error) => return failed(source_generation, configuration_generation, error),
-            }
+        let Some(provider_context) = selected_provider_context.as_ref() else {
+            return failed(
+                source_generation,
+                configuration_generation,
+                "unit rename provider context disappeared".to_string(),
+            );
+        };
+        let in_path_edits = match selected_explicit_uses_path_edits(
+            &input,
+            &snapshot,
+            &uri,
+            provider_context,
+            &new_uri,
+            cancel,
+        ) {
+            Ok(edits) => edits,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+        for (edit_uri, edit) in in_path_edits {
+            raw_edits.entry(edit_uri).or_default().push(edit);
         }
     }
     if is_cancelled(cancel) {
@@ -3978,40 +3987,228 @@ fn rename_from_input_impl(
     }
 }
 
-fn source_has_in_path_literal(
+struct ExplicitUsesPathLiteral {
+    decoded_path: String,
+    basename_range: std::ops::Range<usize>,
+}
+
+fn explicit_uses_path_after(
     source: &str,
-    cancel: &AtomicBool,
-    work: &mut usize,
-) -> Result<bool, String> {
-    *work = work
-        .checked_add(source.len())
-        .ok_or_else(|| "unit rename path scan work accounting overflowed".to_string())?;
-    if *work > MAX_SNAPSHOT_MAPPING_WORK {
-        return Err("unit rename path scan work limit reached".to_string());
-    }
+    import_end: usize,
+) -> Result<Option<ExplicitUsesPathLiteral>, String> {
     let bytes = source.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if index % 1024 == 0 && is_cancelled(cancel) {
+    let mut cursor = import_end;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes
+        .get(cursor..cursor.saturating_add(2))
+        .is_none_or(|word| !word.eq_ignore_ascii_case(b"in"))
+        || (cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_'))
+        || bytes
+            .get(cursor + 2)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Ok(None);
+    }
+    cursor += 2;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'\'') {
+        return Err("explicit unit in-path has no single-quoted literal".to_string());
+    }
+    let content_start = cursor + 1;
+    cursor = content_start;
+    let mut decoded_path = String::new();
+    let mut raw_starts = Vec::new();
+    loop {
+        let Some(character) = source.get(cursor..).and_then(|tail| tail.chars().next()) else {
+            return Err("explicit unit in-path literal is unterminated".to_string());
+        };
+        if character == '\'' {
+            if bytes.get(cursor + 1) == Some(&b'\'') {
+                decoded_path.push('\'');
+                raw_starts.push(cursor);
+                cursor += 2;
+                continue;
+            }
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\0' {
+            return Err("explicit unit in-path literal contains a line break or NUL".to_string());
+        }
+        decoded_path.push(character);
+        raw_starts.push(cursor);
+        cursor += character.len_utf8();
+    }
+    if decoded_path.is_empty() {
+        return Err("explicit unit in-path literal is empty".to_string());
+    }
+    let basename_index = decoded_path
+        .char_indices()
+        .filter_map(|(index, character)| matches!(character, '/' | '\\').then_some(index + 1))
+        .last()
+        .unwrap_or(0);
+    let basename_char_index = decoded_path[..basename_index].chars().count();
+    let total_chars = decoded_path.chars().count();
+    if basename_char_index >= total_chars {
+        return Err("explicit unit in-path has no filename component".to_string());
+    }
+    let raw_basename_start = *raw_starts
+        .get(basename_char_index)
+        .ok_or_else(|| "explicit unit in-path basename mapping is incomplete".to_string())?;
+    Ok(Some(ExplicitUsesPathLiteral {
+        decoded_path,
+        basename_range: raw_basename_start..cursor,
+    }))
+}
+
+fn resolve_safe_relative_uses_path(importer: &Path, relative: &str) -> Result<PathBuf, String> {
+    if relative.starts_with('/')
+        || relative.starts_with('\\')
+        || relative.contains(':')
+        || relative.contains('\0')
+    {
+        return Err("explicit unit in-path must be a relative path".to_string());
+    }
+    let parent = importer
+        .parent()
+        .ok_or_else(|| "explicit unit in-path importer has no parent directory".to_string())?;
+    let mut resolved = absolute_path(parent.to_path_buf());
+    let components = relative.split(['/', '\\']).collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return Err("explicit unit in-path contains an empty or traversing component".to_string());
+    }
+    for component in components {
+        resolved.push(component);
+        let metadata = std::fs::symlink_metadata(&resolved)
+            .map_err(|error| format!("cannot verify explicit unit in-path target: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("explicit unit in-path traverses a symlink".to_string());
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&resolved)
+        .map_err(|error| format!("cannot verify explicit unit in-path target: {error}"))?;
+    if !metadata.is_file() {
+        return Err("explicit unit in-path target is not a regular file".to_string());
+    }
+    Ok(absolute_path(resolved))
+}
+
+fn selected_explicit_uses_path_edits(
+    input: &WorkspaceInput,
+    snapshot: &RenameSnapshot,
+    provider_uri: &Url,
+    provider_context: &ProjectContext,
+    new_uri: &Url,
+    cancel: &AtomicBool,
+) -> Result<Vec<(Url, TextEdit)>, String> {
+    let new_basename = new_uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
+        .and_then(|name| name.into_string().ok())
+        .ok_or_else(|| "new unit filename is not valid UTF-8".to_string())?;
+    let mut result = Vec::new();
+    let mut scan_work = 0usize;
+    for (source_uri, source) in &snapshot.sources {
+        scan_work = scan_work.saturating_add(source.len());
+        if scan_work > MAX_SNAPSHOT_MAPPING_WORK {
+            return Err("explicit unit in-path scan work limit reached".to_string());
+        }
+        if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        if *byte != b'\'' {
-            continue;
-        }
-        let mut before = index;
-        while before > 0 && bytes[before - 1].is_ascii_whitespace() {
-            before -= 1;
-        }
-        if before < 2 || !bytes[before - 2..before].eq_ignore_ascii_case(b"in") {
-            continue;
-        }
-        let token_start = before - 2;
-        if token_start == 0
-            || !(bytes[token_start - 1].is_ascii_alphanumeric() || bytes[token_start - 1] == b'_')
-        {
-            return Ok(true);
+        let Some(record) = snapshot.records.get(source_uri) else {
+            return Err(
+                "explicit unit in-path source is missing from the retained snapshot".to_string(),
+            );
+        };
+        for import in snapshot.index.imports(source_uri) {
+            let Some(path_literal) = explicit_uses_path_after(source, import.span.end)? else {
+                continue;
+            };
+            if !source_uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| {
+                    path.extension()
+                        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+                })
+                .is_some_and(|extension| matches!(extension.as_str(), "pas" | "pp" | "pascal"))
+            {
+                return Err(
+                    "explicit unit in-path owned by a non-Pascal include/source is unsupported"
+                        .to_string(),
+                );
+            }
+            let position = text::offset_to_position(source, import.span.start)
+                .ok_or_else(|| "cannot map explicit unit import position".to_string())?;
+            let binding = snapshot
+                .index
+                .rename_binding_info_with_cancel(source_uri, position, cancel)
+                .map_err(|error| format!("cannot prove explicit unit in-path binding: {error}"))?;
+            if !binding.unit {
+                return Err("explicit unit in-path did not resolve as a unit binding".to_string());
+            }
+            let Some(selected_uri) = binding.unit_provider_uri else {
+                return Err("explicit unit in-path has no unique selected provider".to_string());
+            };
+            let importer = record
+                .path
+                .clone()
+                .or_else(|| source_uri.to_file_path().ok())
+                .ok_or_else(|| "explicit unit in-path importer has no physical path".to_string())?;
+            let resolved_path =
+                resolve_safe_relative_uses_path(&importer, &path_literal.decoded_path)?;
+            let resolved_uri = Url::from_file_path(&resolved_path).map_err(|_| {
+                "explicit unit in-path target cannot be represented as a file URI".to_string()
+            })?;
+            if canonical_file_uri(&resolved_uri) != canonical_file_uri(&selected_uri) {
+                return Err(
+                    "explicit unit in-path does not map to its selected provider identity"
+                        .to_string(),
+                );
+            }
+            let importer_owner = owner_for_input(input, source_uri, cancel)?;
+            if !input_source_is_readable_with_owner(input, &resolved_uri, &importer_owner) {
+                return Err(
+                    "explicit unit in-path target is outside its authorized project context"
+                        .to_string(),
+                );
+            }
+            if canonical_file_uri(&selected_uri) != canonical_file_uri(provider_uri) {
+                continue;
+            }
+            let (consumer_context, _) =
+                project_context_and_metadata_for_input(input, source_uri, cancel)?;
+            if !consumer_context.discovery_complete || &consumer_context != provider_context {
+                return Err(
+                    "explicit unit in-path consumer and provider contexts are incomplete or differ"
+                        .to_string(),
+                );
+            }
+            let basename_start = path_literal.basename_range.start;
+            let basename_end = path_literal.basename_range.end;
+            let start = text::offset_to_position(source, basename_start)
+                .ok_or_else(|| "cannot map explicit unit path basename start".to_string())?;
+            let end = text::offset_to_position(source, basename_end)
+                .ok_or_else(|| "cannot map explicit unit path basename end".to_string())?;
+            result.push((
+                source_uri.clone(),
+                TextEdit {
+                    range: Range { start, end },
+                    new_text: new_basename.clone(),
+                },
+            ));
         }
     }
-    Ok(false)
+    Ok(result)
 }
 
 /// Apply the proposed source edits to immutable proof snapshots, reparse every

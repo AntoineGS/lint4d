@@ -53,7 +53,7 @@ pub(crate) mod resolver;
 pub const MAX_TREE_DEPTH: usize = 256;
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_FILES: usize = 10_000;
-const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
+pub(crate) const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
 const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
 const MAX_REJECTED_OPEN_FENCE_URIS: usize = 64;
 const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
@@ -2584,6 +2584,19 @@ impl Workspace {
         self.accept_open_document(uri.clone(), text, version, context_key, false)?;
         self.clear_rejected_open_fence(&uri);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_open_document_for_test(&mut self, uri: Url) {
+        self.open_documents.insert(
+            uri,
+            OpenDocument {
+                text: None,
+                version: 1,
+                rejection: None,
+                identity_generation: 0,
+            },
+        );
     }
 
     pub fn change_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {

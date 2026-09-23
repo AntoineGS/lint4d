@@ -11079,6 +11079,7 @@ mod tests {
         supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
     };
     use crate::workspace::Workspace;
+    use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
     use crossbeam_channel::{RecvTimeoutError, bounded};
     use lsp_server::{Connection, Message, Notification, RequestId, Response};
@@ -11102,6 +11103,114 @@ mod tests {
         options: crate::workspace::WorkspaceOptions,
     ) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn open_document_count_rejection_cannot_requeue_an_emitted_cleanup_uri() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            crate::workspace::WorkspaceOptions::default(),
+        );
+        let related_uri =
+            Url::from_file_path(temp.path().join("aaa-related.pas")).expect("related URI");
+        let root_uri = Url::from_file_path(temp.path().join("open-00000.pas")).expect("root URI");
+        for index in 0..crate::workspace::MAX_OPEN_DOCUMENTS {
+            let uri = if index == 0 {
+                root_uri.clone()
+            } else {
+                Url::from_file_path(temp.path().join(format!("open-{index:05}.pas")))
+                    .expect("open URI")
+            };
+            workspace.seed_open_document_for_test(uri);
+        }
+        workspace
+            .replace_diagnostic_publications(
+                &root_uri,
+                [DiagnosticPublication {
+                    uri: related_uri.clone(),
+                    version: None,
+                    diagnostics: Vec::new(),
+                }],
+            )
+            .expect("retain an earlier publication");
+
+        let cursor = workspace.take_all_diagnostic_publication_uris(None);
+        let mut pending = super::PendingDiagnosticClears::default();
+        pending.enqueue_cursor(cursor, None);
+        let mut initial_count = 0;
+        loop {
+            let step = pending.cursor.as_mut().expect("cleanup cursor").next_step();
+            match step {
+                crate::workspace::DiagnosticPublicationCursorStep::Target(uri)
+                    if uri == related_uri =>
+                {
+                    initial_count += 1;
+                    break;
+                }
+                crate::workspace::DiagnosticPublicationCursorStep::Target(_)
+                | crate::workspace::DiagnosticPublicationCursorStep::Skipped => {}
+                crate::workspace::DiagnosticPublicationCursorStep::Exhausted => {
+                    panic!("related publication was not found in the cleanup cursor")
+                }
+            }
+        }
+        assert_eq!(initial_count, 1);
+
+        let effect = super::handle_notification_with_cancel(
+            &super::UnusedProtocolSender,
+            &mut workspace,
+            lsp_server::Notification::new(
+                "textDocument/didOpen".to_string(),
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": related_uri,
+                        "languageId": "pascal",
+                        "version": 2,
+                        "text": "unit Related; interface implementation end."
+                    }
+                }),
+            ),
+            false,
+            true,
+            None,
+            true,
+        )
+        .expect("count-cap rejection schedules cleanup rather than exiting");
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(effect.cleanup_rejected_uri, Some(related_uri.clone()));
+        pending.enqueue_cursor(
+            effect
+                .clear_publication_cursor
+                .expect("count rejection returns its cleanup cursor"),
+            effect.cleanup_rejected_uri,
+        );
+
+        let mut final_count = initial_count;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            assert!(steps < 25_000, "cleanup cursor did not drain bounded input");
+            match pending
+                .cursor
+                .as_mut()
+                .expect("active cleanup cursor")
+                .next_step()
+            {
+                crate::workspace::DiagnosticPublicationCursorStep::Target(uri)
+                    if uri == related_uri =>
+                {
+                    final_count += 1;
+                }
+                crate::workspace::DiagnosticPublicationCursorStep::Target(_)
+                | crate::workspace::DiagnosticPublicationCursorStep::Skipped => {}
+                crate::workspace::DiagnosticPublicationCursorStep::Exhausted => break,
+            }
+        }
+        assert_eq!(
+            final_count, 1,
+            "the count-cap late target must not duplicate an already-emitted URI"
+        );
     }
 
     fn symbol_client_features() -> ClientFeatures {

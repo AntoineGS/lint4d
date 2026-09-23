@@ -1169,7 +1169,18 @@ and module identifiers are supported when the resolver proves the selected
 unit identity, including explicit project aliases. Unit declarations, `uses`
 entries, and qualified references use the complete bound prefix (`Ns.Provider`
 or `Alias` in `Alias.TThing`) rather than an arbitrary component. Unit/module
-rename remains unsupported because it requires `RenameFile` support.
+symbol rename is supported only for a uniquely proven selected provider and
+when the client negotiates both `workspace.workspaceEdit.documentChanges` and
+`workspace.workspaceEdit.resourceOperations: ["rename"]`. It returns
+versioned text edits for the old URIs followed by exactly one `RenameFile`;
+the client owns the move. The provider must satisfy the same simple
+unnamespaced declaration/basename, same-directory, preserved-extension,
+collision, authorization, project-metadata, and complete-binding checks as
+`willRenameFiles`. Selecting the actual unit spelling in a declaration, `uses`
+entry, or qualified unit prefix is supported; alias spellings, namespaced
+declarations, `in 'path'` uses, ambiguous/unknown bindings, and cross-project
+context changes fail atomically. `willRenameFiles` remains text-edit-only and
+never returns a `RenameFile` because the client already owns that move.
 
 ### Workspace file operations
 
@@ -1193,10 +1204,11 @@ supported. Explicit `uses ... in 'path'` files, aliases, namespace
   moves, open/rejected destination overlays, and unresolved includes/conditional
 or ownership uncertainty fail as a whole. The returned `documentChanges` are
 versioned for open documents; closed documents carry the LSP null version.
-There is no `RenameFile` resource operation: in this file-operation handshake
-the client owns and performs the requested physical move after applying the
-returned source edits. The server never moves files itself. `textDocument/rename`
-for unit symbols remains unsupported.
+There is no `RenameFile` resource operation in this file-operation handshake:
+the client already owns and performs the requested physical move after applying
+the returned source edits. By contrast, negotiated unit-symbol
+`textDocument/rename` appends one `RenameFile` after its versioned text edits;
+the client owns that move too. The server never moves files itself.
 
 After `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`, catalogues,
 loaded-source observations, negative path observations, and affected
@@ -1479,7 +1491,8 @@ Implemented and covered by tests:
 - Cross-unit references restricted by `uses` visibility, including separate
   interface/implementation uses clauses; `uses` entries navigate to units.
 - Unit references and highlights preserve selected provider identity, explicit
-  project aliases, and complete bound prefixes; unit rename remains unsupported.
+  project aliases, and complete bound prefixes; unit symbol rename is available
+  only for the negotiated, uniquely selected provider subset described below.
 - Routine and class-method declaration/implementation pairing, including unique
   abbreviated implementation headers.
 - Qualified unit/type names, namespaced units, straightforward declared-type
@@ -1619,7 +1632,8 @@ unresolved includes are skipped; active or unknown unresolved includes still
 block. Pascal-dependent conditional expressions and incomplete include audits
 remain unsupported; missing or unreadable includes cannot be treated as
 evidence that no reference exists. Source conditional compilation is projected
-for analysis rather than textually expanded. Unit/module renames (which require
+for analysis rather than textually expanded. Unit/module renames outside the
+negotiated, uniquely selected same-context provider subset (which requires
 `RenameFile`), inherited or `with`-dependent lookup, relationships whose exact
 overload/override slot cannot be proven, compiled-only consumers, and other
 unsupported bindings are also rejected by the shared planner. Name collisions

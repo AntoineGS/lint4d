@@ -1204,11 +1204,55 @@ impl ProjectWorkBudget for ReconciliationBudget {
 fn expected_renamed_document_text(
     edit: &WorkspaceEdit,
     uri: &Url,
+    new_uri: &Url,
     source: &str,
     version: i32,
 ) -> Result<String, String> {
-    let Some(DocumentChanges::Edits(documents)) = edit.document_changes.as_ref() else {
-        return Err("unit rename transition requires text-only documentChanges".to_string());
+    let documents = match edit.document_changes.as_ref() {
+        Some(DocumentChanges::Edits(documents)) => documents.iter().collect::<Vec<_>>(),
+        Some(DocumentChanges::Operations(operations)) => {
+            let mut documents = Vec::new();
+            let mut rename_position = None;
+            for (index, operation) in operations.iter().enumerate() {
+                match operation {
+                    lsp_types::DocumentChangeOperation::Edit(document) => {
+                        if rename_position.is_some() {
+                            return Err(
+                                "text edits must precede the RenameFile operation".to_string()
+                            );
+                        }
+                        documents.push(document);
+                    }
+                    lsp_types::DocumentChangeOperation::Op(lsp_types::ResourceOp::Rename(
+                        rename,
+                    )) => {
+                        if rename_position.replace(index).is_some()
+                            || canonical_file_uri(&rename.old_uri) != *uri
+                            || canonical_file_uri(&rename.new_uri) != *new_uri
+                            || index + 1 != operations.len()
+                        {
+                            return Err(
+                                "unit rename transition has an unexpected RenameFile operation"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    lsp_types::DocumentChangeOperation::Op(_) => {
+                        return Err(
+                            "unit rename transition contains an unsupported resource operation"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if rename_position.is_none() {
+                return Err(
+                    "unit symbol rename omitted its negotiated RenameFile operation".to_string(),
+                );
+            }
+            documents
+        }
+        _ => return Err("unit rename transition requires versioned documentChanges".to_string()),
     };
     let document = documents
         .iter()
@@ -3016,32 +3060,32 @@ impl Workspace {
         if old_path.parent() != new_path.parent() {
             return Err("unit rename transition must remain in one directory".to_string());
         }
-        let (original_identity_generation, original_version, expected_text) = if let Some(open) =
-            self.open_documents.get(&old_uri)
-        {
-            let Some(source) = open.text.as_deref() else {
-                return Err(
-                    "rejected open provider cannot participate in a file rename".to_string()
-                );
+        let (original_identity_generation, original_version, expected_text) =
+            if let Some(open) = self.open_documents.get(&old_uri) {
+                let Some(source) = open.text.as_deref() else {
+                    return Err(
+                        "rejected open provider cannot participate in a file rename".to_string()
+                    );
+                };
+                let expected =
+                    expected_renamed_document_text(edit, &old_uri, &new_uri, source, open.version)?;
+                let added_bytes = expected.len();
+                let total_bytes = self
+                    .pending_unit_file_rename_bytes
+                    .checked_add(added_bytes)
+                    .ok_or_else(|| "pending unit rename bytes overflow".to_string())?;
+                if total_bytes > MAX_PENDING_FILE_RENAME_BYTES {
+                    return Err("pending unit file rename text limit reached".to_string());
+                }
+                self.pending_unit_file_rename_bytes = total_bytes;
+                (
+                    Some(open.identity_generation),
+                    Some(open.version),
+                    Some(expected),
+                )
+            } else {
+                (None, None, None)
             };
-            let expected = expected_renamed_document_text(edit, &old_uri, source, open.version)?;
-            let added_bytes = expected.len();
-            let total_bytes = self
-                .pending_unit_file_rename_bytes
-                .checked_add(added_bytes)
-                .ok_or_else(|| "pending unit rename bytes overflow".to_string())?;
-            if total_bytes > MAX_PENDING_FILE_RENAME_BYTES {
-                return Err("pending unit file rename text limit reached".to_string());
-            }
-            self.pending_unit_file_rename_bytes = total_bytes;
-            (
-                Some(open.identity_generation),
-                Some(open.version),
-                Some(expected),
-            )
-        } else {
-            (None, None, None)
-        };
         self.pending_unit_file_renames.insert(
             old_uri,
             PendingUnitFileRename {

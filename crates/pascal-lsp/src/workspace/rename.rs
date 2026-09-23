@@ -22,8 +22,9 @@ use crate::navigation::ParsedDocument;
 use crate::navigation::{AssistanceBudget, BindingWorkBudget};
 use crate::text::{self, PositionIndex};
 use lsp_types::{
-    DocumentChanges, DocumentHighlight, Location, OneOf, OptionalVersionedTextDocumentIdentifier,
-    Position, PrepareRenameResponse, Range, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    DocumentChangeOperation, DocumentChanges, DocumentHighlight, Location, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, PrepareRenameResponse, Range, RenameFile,
+    ResourceOp, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use pascal_core::conditional::{
     self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind,
@@ -2578,6 +2579,8 @@ fn expanded_binding_info_for_input(
         if selected.as_ref().is_some_and(|previous| {
             previous.1 != current.1
                 || previous.0.local != current.0.local
+                || previous.0.unit != current.0.unit
+                || previous.0.unit_provider_uri != current.0.unit_provider_uri
                 || previous.0.names.iter().collect::<HashSet<_>>()
                     != current.0.names.iter().collect::<HashSet<_>>()
         }) {
@@ -3237,6 +3240,271 @@ pub(crate) fn unit_rename_from_input(
         cancel,
         true,
         Some(new_uri),
+    )
+}
+
+/// Reclassify a reference with the complete bounded workspace snapshot when
+/// the initial loaded-document index cannot resolve its unit provider.
+fn complete_binding_info_for_input(
+    input: &WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    classification: &BindingClassification,
+    new_name: &str,
+    cancel: &AtomicBool,
+) -> Result<Option<crate::navigation::RenameBindingInfo>, String> {
+    let Some(original_name) = identifier_at_position(&classification.source, position) else {
+        return Ok(None);
+    };
+    let mut candidate_names = vec![original_name, new_name.to_owned()];
+    candidate_names.sort_by_key(|name| name.to_ascii_lowercase());
+    candidate_names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let uri = canonical_file_uri(uri);
+    let snapshot = build_snapshot(
+        input,
+        std::slice::from_ref(&uri),
+        &candidate_names,
+        SnapshotMode::Workspace,
+        Some(
+            SnapshotSeed::new(classification.record.clone())
+                .with_consumed_configuration(&classification.consumed_configuration),
+        ),
+        &[],
+        cancel,
+    )?;
+    ensure_ready(&snapshot, &uri)?;
+    snapshot
+        .index
+        .rename_binding_info_with_cancel(&uri, position, cancel)
+        .map(Some)
+}
+
+fn unit_rename_syntax_candidate(source: &str, position: Position) -> bool {
+    let Some(offset) = text::position_to_offset(source, position) else {
+        return false;
+    };
+    if identifier_at_position(source, position).is_none() {
+        return false;
+    }
+    let mut start = offset;
+    for (index, character) in source[..offset].char_indices().rev() {
+        if character.is_alphanumeric() || character == '_' {
+            start = index;
+        } else {
+            break;
+        }
+    }
+    let mut end = offset;
+    for character in source[offset..].chars() {
+        if character.is_alphanumeric() || character == '_' {
+            end = end.saturating_add(character.len_utf8());
+        } else {
+            break;
+        }
+    }
+    let previous = source[..start].trim_end();
+    let next = source[end..].trim_start();
+    if previous
+        .rsplit(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("unit"))
+        || next.starts_with('.')
+        || previous.ends_with('.')
+    {
+        return true;
+    }
+    let Some(uses_start) = source[..start].to_ascii_lowercase().rfind("uses") else {
+        return false;
+    };
+    let between = &source[uses_start + "uses".len()..start];
+    !between.contains(';') && !between.to_ascii_lowercase().contains("implementation")
+}
+
+/// Plan a symbol rename, promoting selected unit bindings to an atomic
+/// versioned-text-edits-plus-RenameFile operation only when the client
+/// negotiated both documentChanges and resourceOperations.rename.
+pub(crate) fn symbol_rename_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    new_name: &str,
+    document_changes: bool,
+    rename_file: bool,
+    cancel: &AtomicBool,
+) -> (Computed<WorkspaceEdit>, Option<(Url, Url)>) {
+    let source_overlay = input.overlays.get(uri).map(|overlay| overlay.text.as_str());
+    if !source_overlay.is_some_and(|source| unit_rename_syntax_candidate(source, position)) {
+        return (
+            rename_from_input(input, uri, position, new_name, document_changes, cancel),
+            None,
+        );
+    }
+    let binding_classification =
+        binding_info_for_input(&input, uri, position, &[new_name.to_owned()], cancel);
+    let mut selected_binding = binding_classification
+        .as_ref()
+        .ok()
+        .and_then(|classification| classification.info.as_ref())
+        .map(|(binding, _)| binding.clone());
+    if selected_binding
+        .as_ref()
+        .is_none_or(|binding| binding.unit && binding.unit_provider_uri.is_none())
+    {
+        if let Ok(classification) = binding_classification {
+            match complete_binding_info_for_input(
+                &input,
+                uri,
+                position,
+                &classification,
+                new_name,
+                cancel,
+            ) {
+                Ok(Some(binding)) => selected_binding = Some(binding),
+                Ok(None) => {}
+                Err(error) => {
+                    return (
+                        failed(
+                            input.source_generation,
+                            input.configuration_generation,
+                            error,
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+    if !selected_binding
+        .as_ref()
+        .is_some_and(|binding| binding.unit)
+        || !document_changes
+        || !rename_file
+    {
+        return (
+            rename_from_input(input, uri, position, new_name, document_changes, cancel),
+            None,
+        );
+    }
+
+    let binding = selected_binding.expect("unit binding checked above");
+    let Some(provider_uri) = binding.unit_provider_uri else {
+        return (
+            failed(
+                input.source_generation,
+                input.configuration_generation,
+                "unit rename requires one proven selected provider declaration".to_string(),
+            ),
+            None,
+        );
+    };
+    let Some(provider_position) = binding.unit_provider_position else {
+        return (
+            failed(
+                input.source_generation,
+                input.configuration_generation,
+                "selected unit provider declaration position is unavailable".to_string(),
+            ),
+            None,
+        );
+    };
+    let target_uri = (|| {
+        let path = provider_uri
+            .to_file_path()
+            .map_err(|_| "unit symbol rename requires a file URI".to_string())?;
+        let extension = path
+            .extension()
+            .ok_or_else(|| "unit symbol rename requires a Pascal source extension".to_string())?;
+        let target = path.with_file_name(format!("{new_name}.{}", extension.to_string_lossy()));
+        Url::from_file_path(target).map_err(|_| {
+            "unit symbol rename target cannot be represented as a file URI".to_string()
+        })
+    })();
+    let target_uri = match target_uri {
+        Ok(target_uri) => target_uri,
+        Err(error) => {
+            return (
+                Computed {
+                    source_generation: input.source_generation,
+                    configuration_generation: input.configuration_generation,
+                    value: Err(error),
+                    records: Vec::new(),
+                },
+                None,
+            );
+        }
+    };
+    let context_match = (|| {
+        let (query_context, _) = project_context_and_metadata_for_input(&input, uri, cancel)?;
+        let (provider_context, _) =
+            project_context_and_metadata_for_input(&input, &provider_uri, cancel)?;
+        Ok::<_, String>(
+            query_context.discovery_complete
+                && provider_context.discovery_complete
+                && query_context == provider_context,
+        )
+    })();
+    match context_match {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                failed(
+                    input.source_generation,
+                    input.configuration_generation,
+                    "unit rename query and selected provider do not share a complete project context".to_string(),
+                ),
+                None,
+            );
+        }
+        Err(error) => {
+            return (
+                failed(
+                    input.source_generation,
+                    input.configuration_generation,
+                    error,
+                ),
+                None,
+            );
+        }
+    }
+    let computed = unit_rename_from_input(
+        input,
+        &provider_uri,
+        &target_uri,
+        provider_position,
+        new_name,
+        cancel,
+    );
+    if computed.value.is_err() {
+        return (computed, None);
+    }
+    let mut computed = computed;
+    let Some(DocumentChanges::Edits(edits)) = computed
+        .value
+        .as_mut()
+        .ok()
+        .and_then(|edit| edit.document_changes.take())
+    else {
+        computed.value = Err("unit symbol rename did not produce versioned text edits".to_string());
+        return (computed, None);
+    };
+    let mut operations: Vec<DocumentChangeOperation> = edits
+        .into_iter()
+        .map(DocumentChangeOperation::Edit)
+        .collect();
+    operations.push(DocumentChangeOperation::Op(ResourceOp::Rename(
+        RenameFile {
+            old_uri: canonical_file_uri(&provider_uri),
+            new_uri: target_uri.clone(),
+            options: None,
+            annotation_id: None,
+        },
+    )));
+    if let Ok(edit) = computed.value.as_mut() {
+        edit.document_changes = Some(DocumentChanges::Operations(operations));
+    }
+    (
+        computed,
+        Some((canonical_file_uri(&provider_uri), target_uri)),
     )
 }
 

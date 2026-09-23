@@ -257,6 +257,8 @@ struct Binding {
 pub(crate) struct RenameBindingInfo {
     pub(crate) local: bool,
     pub(crate) unit: bool,
+    pub(crate) unit_provider_uri: Option<Url>,
+    pub(crate) unit_provider_position: Option<lsp_types::Position>,
     pub(crate) names: Vec<String>,
 }
 
@@ -769,10 +771,30 @@ impl NavigationIndex {
                             | SymbolKind::Label
                     )
             });
+        let unit_provider_uri = if binding.kind == SymbolKind::Unit {
+            let mut declarations = binding
+                .members
+                .iter()
+                .filter(|member| {
+                    member.kind == SymbolKind::Unit && member.origin == super::Origin::Declaration
+                })
+                .map(|member| member.uri.clone())
+                .collect::<Vec<_>>();
+            declarations.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            declarations.dedup();
+            (declarations.len() == 1).then(|| declarations.remove(0))
+        } else {
+            None
+        };
+        let unit_provider_position = unit_provider_uri
+            .as_ref()
+            .and_then(|provider| self.unit_declaration_position(provider));
         check_cancel(Some(cancel))?;
         Ok(RenameBindingInfo {
             local,
             unit: binding.kind == SymbolKind::Unit,
+            unit_provider_uri,
+            unit_provider_position,
             names,
         })
     }

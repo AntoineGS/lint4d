@@ -924,6 +924,7 @@ struct ClientFeatures {
     action_resolve: bool,
     action_disabled: bool,
     document_changes: bool,
+    rename_file: bool,
     will_rename_files: bool,
     hierarchical_document_symbols: bool,
     hover_format: DocumentationFormat,
@@ -4905,22 +4906,24 @@ impl AnalysisJobs {
                                     },
                                 }
                             } else {
-                                let computed = if let Some(new_uri) = new_uri {
-                                    rename::unit_rename_from_input(
+                                let (computed, unit_file_move) = if let Some(new_uri) = new_uri {
+                                    let computed = rename::unit_rename_from_input(
                                         input,
                                         &uri,
                                         &new_uri,
                                         position,
                                         &new_name,
                                         &worker_cancellation,
-                                    )
+                                    );
+                                    (computed, Some((uri.clone(), new_uri)))
                                 } else {
-                                    rename::rename_from_input(
+                                    rename::symbol_rename_from_input(
                                         input,
                                         &uri,
                                         position,
                                         &new_name,
                                         features.document_changes,
+                                        features.rename_file,
                                         &worker_cancellation,
                                     )
                                 };
@@ -6817,6 +6820,7 @@ fn diagnostic_features() -> ClientFeatures {
         action_resolve: false,
         action_disabled: false,
         document_changes: false,
+        rename_file: false,
         will_rename_files: false,
         hierarchical_document_symbols: false,
         hover_format: DocumentationFormat::PlainText,
@@ -10502,6 +10506,14 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
     let document_changes = value["workspace"]["workspaceEdit"]["documentChanges"]
         .as_bool()
         .unwrap_or(false);
+    let rename_file = document_changes
+        && value["workspace"]["workspaceEdit"]["resourceOperations"]
+            .as_array()
+            .is_some_and(|operations| {
+                operations
+                    .iter()
+                    .any(|operation| operation.as_str() == Some("rename"))
+            });
     let hierarchical_document_symbols =
         value["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"]
             .as_bool()
@@ -10570,6 +10582,7 @@ fn client_features(client: &ClientCapabilities) -> ClientFeatures {
         action_resolve,
         action_disabled,
         document_changes,
+        rename_file,
         will_rename_files,
         hierarchical_document_symbols,
         hover_format,
@@ -10782,6 +10795,7 @@ mod tests {
             action_resolve: false,
             action_disabled: false,
             document_changes: false,
+            rename_file: false,
             will_rename_files: false,
             hierarchical_document_symbols: false,
             hover_format: DocumentationFormat::PlainText,

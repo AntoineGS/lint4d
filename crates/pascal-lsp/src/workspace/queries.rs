@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 const MAX_DOCUMENT_LINK_DIRECTIVES: usize = 64;
+const MAX_DOCUMENT_LINK_FRESHNESS_RECORDS: usize = 4_096;
+const MAX_DOCUMENT_LINK_FRESHNESS_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) struct NavigationResult {
     pub(crate) locations: Vec<Location>,
@@ -1272,6 +1274,8 @@ pub(crate) fn document_links_from_input(
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     let mut links = Vec::new();
+    let mut freshness_records = 0usize;
+    let mut freshness_bytes = 0usize;
     for directive in conditionals.directives.iter().filter(|directive| {
         directive.kind == pascal_core::conditional::DirectiveKind::Include
             && directive.activity == pascal_core::conditional::Truth::True
@@ -1286,7 +1290,9 @@ pub(crate) fn document_links_from_input(
         else {
             continue;
         };
-        let body = directive.body.trim_start();
+        let raw_body = directive.body.as_str();
+        let leading_trivia = raw_body.len().saturating_sub(raw_body.trim_start().len());
+        let body = raw_body.trim_start();
         let Some((keyword, operand)) = body.split_once(char::is_whitespace) else {
             continue;
         };
@@ -1325,6 +1331,24 @@ pub(crate) fn document_links_from_input(
         if !expansion.complete {
             continue;
         }
+        let (record_count, observation_bytes) = match workspace
+            .record_document_link_expansion_sources(
+                &expansion,
+                &context,
+                cancel,
+                MAX_DOCUMENT_LINK_FRESHNESS_RECORDS.saturating_sub(freshness_records),
+                MAX_DOCUMENT_LINK_FRESHNESS_BYTES.saturating_sub(freshness_bytes),
+            ) {
+            Ok(counts) => counts,
+            Err(error) if error == CANCELLATION_MESSAGE => {
+                return cancelled(source_generation, configuration_generation);
+            }
+            Err(error) => {
+                return failed(source_generation, configuration_generation, error);
+            }
+        };
+        freshness_records = freshness_records.saturating_add(record_count);
+        freshness_bytes = freshness_bytes.saturating_add(observation_bytes);
         let Some(target) = expansion
             .dependencies
             .first()
@@ -1332,7 +1356,7 @@ pub(crate) fn document_links_from_input(
         else {
             continue;
         };
-        let start = body_start + lead + quote_prefix;
+        let start = body_start + leading_trivia + lead + quote_prefix;
         let end = start + path.len();
         let (Some(start), Some(end)) = (
             crate::text::offset_to_position(&source, start),

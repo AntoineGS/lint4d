@@ -6897,6 +6897,113 @@ impl Workspace {
         Ok(())
     }
 
+    pub(crate) fn record_document_link_expansion_sources(
+        &mut self,
+        expansion: &crate::include_expansion::ExpansionResult,
+        context: &pascal_project::ProjectContext,
+        cancel: &AtomicBool,
+        max_records: usize,
+        max_observation_bytes: usize,
+    ) -> Result<(usize, usize), String> {
+        let mut record_count = 0usize;
+        let mut observation_bytes = 0usize;
+        for dependency in &expansion.dependencies {
+            check_workspace_cancel(Some(cancel))?;
+            record_count = record_count
+                .checked_add(1)
+                .and_then(|count| count.checked_add(dependency.observations.len()))
+                .ok_or_else(|| "document-link freshness record count overflowed".to_string())?;
+            observation_bytes = observation_bytes
+                .checked_add(dependency.uri.as_str().len())
+                .and_then(|bytes| bytes.checked_add(dependency.text.len()))
+                .ok_or_else(|| "document-link freshness byte count overflowed".to_string())?;
+            for observation in &dependency.observations {
+                observation_bytes = observation_bytes
+                    .checked_add(observation.path.as_os_str().len())
+                    .ok_or_else(|| "document-link observation byte count overflowed".to_string())?;
+            }
+            if record_count > max_records || observation_bytes > max_observation_bytes {
+                return Err("document-link freshness evidence exceeds its work limit".to_string());
+            }
+            for observation in &dependency.observations {
+                check_workspace_cancel(Some(cancel))?;
+                self.record_include_analysis_observation(observation, context);
+            }
+        }
+
+        let mut dependencies = expansion.dependencies.iter().collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+        dependencies.dedup_by(|left, right| left.uri == right.uri);
+        for dependency in dependencies {
+            check_workspace_cancel(Some(cancel))?;
+            let uri = canonical_file_uri(&dependency.uri);
+            if let Some((source, version)) = self.open_documents.get(&uri).and_then(|document| {
+                document
+                    .text
+                    .as_ref()
+                    .map(|source| (source.clone(), document.version))
+            }) {
+                if source != dependency.text {
+                    return Err(format!(
+                        "include source {uri} changed during document-link resolution"
+                    ));
+                }
+                self.record_open_analysis_source(&uri, &source, version);
+                continue;
+            }
+            if self.open_documents.contains_key(&uri) {
+                return Err(format!(
+                    "include source {uri} was rejected during document-link resolution"
+                ));
+            }
+
+            let path = uri
+                .to_file_path()
+                .map(absolute_path)
+                .map_err(|_| format!("include source is not a file URI: {uri}"))?;
+            let path_entry = dependency
+                .path_entry
+                .as_ref()
+                .cloned()
+                .or_else(|| context_path_entry(context, &path))
+                .ok_or_else(|| {
+                    format!("include source {uri} has no requester-scoped authorization")
+                })?;
+            let allow_legacy_payload =
+                matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+            let disk = read_disk_source_with_cancel(
+                &path,
+                self.options.limits.max_file_bytes,
+                &context.read_policy,
+                &path_entry,
+                allow_legacy_payload,
+                Some(cancel),
+            )?;
+            if disk.text != dependency.text {
+                return Err(format!(
+                    "include source {uri} changed during document-link resolution"
+                ));
+            }
+            self.record_closed_analysis_source(
+                &uri,
+                &disk.text,
+                disk.stamp,
+                disk.content_hash,
+                &path,
+                &context.read_policy,
+                &path_entry,
+            );
+            if let Some(record) = self
+                .analysis_records
+                .as_mut()
+                .and_then(|records| records.get_mut(&uri))
+            {
+                record.include_payload = true;
+            }
+        }
+        Ok((record_count, observation_bytes))
+    }
+
     fn record_include_analysis_observation(
         &mut self,
         observation: &crate::include_expansion::IncludeObservation,

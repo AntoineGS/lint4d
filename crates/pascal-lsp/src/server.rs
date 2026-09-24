@@ -5855,6 +5855,16 @@ impl AnalysisJobs {
                     records: Vec::new(),
                     value: panic_value,
                 });
+                #[cfg(feature = "test-support")]
+                if matches!(result.value, AnalysisResultValue::DocumentLinks(_)) {
+                    if let Err(error) = wait_at_test_barrier(
+                        TestBarrier::PartialValidation,
+                        &test_barriers,
+                        &worker_cancellation,
+                    ) {
+                        invalidate_analysis_result(&mut result, error);
+                    }
+                }
                 if let Err(error) = rename::revalidate_input(
                     &validation_input,
                     &result.records,

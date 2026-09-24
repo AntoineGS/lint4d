@@ -19,7 +19,9 @@ are canonical file URIs. Source, project metadata, include observations, and
 overlay versions are revalidated before delivery. Inactive/unknown conditional
 branches, unresolved or ambiguous paths, wildcard/variable/escaped names,
 resource directives, more than 64 directives, and any incomplete or unauthorized
-target produce no link.
+target produce no link. Freshness evidence is bounded to 4,096 records and 32 MiB
+of observed path/source bytes per request; exceeding either limit withholds the
+link result.
 This is intentionally read-only; link resolution does not edit files.
 
 ### References, highlights, and rename families

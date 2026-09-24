@@ -2454,6 +2454,45 @@ fn document_links_target_only_active_proven_include_paths() {
 }
 
 #[test]
+fn document_link_path_ranges_include_leading_directive_trivia_in_utf16() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let active = temp.path().join("Active.inc");
+    let quoted = temp.path().join("Quoted.inc");
+    let source = "\u{feff}unit Main;\r\ninterface\r\nimplementation\r\n// 😀\r\n{$   I Active.inc}\r\n(*$  INCLUDE  \"Quoted.inc\"*)\r\nend.\r\n";
+    write_file(&main, source);
+    write_file(&active, "const Active = 1;\n");
+    write_file(&quoted, "const Quoted = 1;\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("document-links-leading-trivia".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    let links = response.result.expect("document links");
+    assert_eq!(links.as_array().expect("links").len(), 2);
+    assert_eq!(
+        links[0]["range"],
+        json!({"start": {"line": 4, "character": 7}, "end": {"line": 4, "character": 17}})
+    );
+    assert_eq!(links[0]["target"], uri(&active).as_str());
+    assert_eq!(
+        links[1]["range"],
+        json!({"start": {"line": 5, "character": 15}, "end": {"line": 5, "character": 25}})
+    );
+    assert_eq!(links[1]["target"], uri(&quoted).as_str());
+    server.shutdown();
+}
+
+#[test]
 fn document_links_refuse_unknown_conditional_include_paths() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");
@@ -2501,6 +2540,135 @@ fn document_links_omit_unresolved_includes_and_wildcard_resources() {
         "document links failed: {response:?}"
     );
     assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+#[test]
+fn document_links_stale_after_same_stamp_include_target_replacement() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let target = root.join("Selected.inc");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(&target, "const Selected = 1;\n");
+    let target_metadata = fs::metadata(&target).expect("target metadata");
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("document-links-same-stamp-target".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    write_file(&target, "const Selected = 2;\n");
+    restore_mtime(&target, &target_metadata);
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("same-size include target replacement must stale the link result");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("retry the request"),
+        "replacement should be rejected as stale: {}",
+        error.message
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn document_links_stale_after_selected_include_opens_as_overlay() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let target = root.join("Selected.inc");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(&target, "const Selected = 1;\n");
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("document-links-target-overlay".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&target), "languageId": "pascal", "version": 1,
+            "text": "const Selected = 2;\n"
+        }}),
+    );
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("new target overlay must stale the link result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn document_links_stale_after_selected_include_overlay_changes() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let target = root.join("Selected.inc");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    let original_target = "const Selected = 1;\n";
+    write_file(&target, original_target);
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&target), "languageId": "pascal", "version": 1,
+            "text": original_target
+        }}),
+    );
+    let request_id = RequestId::from("document-links-target-overlay-change".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&target), "version": 2},
+            "contentChanges": [{"text": "const Selected = 2;\n"}]}),
+    );
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("changed selected-target overlay must stale the link result");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
     server.shutdown();
 }
 

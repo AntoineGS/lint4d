@@ -34727,6 +34727,269 @@ fn package_descriptor_batch_fallback_rebinds_provider_and_pull_result() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn package_descriptor_batch_fallback_clears_then_pushes_fresh_provider_diagnostics() {
+    const OWNER_COUNT: usize = 4;
+    const PACKAGE_BYTES: usize = 2 * 1024 * 1024;
+    const BATCH_ENTRIES: usize = 64;
+    let environment = tempfile::tempdir().expect("temporary workspace");
+    let root = environment.path();
+    let provider_a = root.join("units/ProviderA.pas");
+    let provider_b = root.join("units/ProviderB.pas");
+    let provider_source = |member: &str| {
+        format!(
+            "unit Provider;\ninterface\ntype TSelected = record\n  {member}: Integer;\nend;\nimplementation\nend.\n"
+        )
+    };
+    write_file(&provider_a, &provider_source("Value "));
+    write_file(&provider_b, &provider_source("Other "));
+    assert_eq!(
+        fs::metadata(&provider_a).unwrap().len(),
+        fs::metadata(&provider_b).unwrap().len()
+    );
+
+    let mut projects = Vec::new();
+    let mut packages = Vec::new();
+    let mut consumers = Vec::new();
+    let mut sources = Vec::new();
+    for index in 0..OWNER_COUNT {
+        let directory = root.join(format!("Project{index:02}"));
+        let project = directory.join("App.dproj");
+        let consumer = directory.join(format!("Consumer{index:02}.pas"));
+        let source = format!(
+            "unit Consumer{index:02};\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Item: TSelected;\nbegin\n  Item.Value := 1;\nend;\nend.\n"
+        );
+        for flavor in ["A", "B"] {
+            let package = root.join(format!("Package{flavor}{index:02}.dpk"));
+            let mapped_provider = if flavor == "A" {
+                "ProviderA"
+            } else {
+                "ProviderB"
+            };
+            let mut contents = format!(
+                "package Package{flavor}{index:02};\ncontains\n  Provider in 'units/{mapped_provider}.pas';\n"
+            );
+            for candidate in 0..256 {
+                contents.push_str(&format!(
+                    "  Catalog{candidate:03} in 'catalogue/Catalog{candidate:03}.pas';\n"
+                ));
+            }
+            contents.push_str("end.\n");
+            write_file(&package, &contents);
+            packages.push(package);
+        }
+        let selected_package = if index == 0 { "A" } else { "B" };
+        let prefix = format!(
+            "<Project><PropertyGroup><MainSource>Consumer{index:02}.pas</MainSource><DCC_UsePackage>Package{selected_package}{index:02}</DCC_UsePackage></PropertyGroup><!--"
+        );
+        let suffix = "--></Project>";
+        let descriptor = format!(
+            "{prefix}{}{suffix}",
+            "p".repeat(PACKAGE_BYTES - prefix.len() - suffix.len())
+        );
+        assert_eq!(descriptor.len(), PACKAGE_BYTES);
+        write_file(&project, &descriptor);
+        write_file(&consumer, &source);
+        projects.push(project);
+        consumers.push(consumer);
+        sources.push(source);
+    }
+
+    let barrier_dir = root.join("package-push-writer-barrier");
+    fs::create_dir_all(&barrier_dir).expect("writer barrier directory");
+    let writer_barrier = OutboundWriterBarrier {
+        armed: barrier_dir.join("armed"),
+        entered: barrier_dir.join("entered"),
+        release: barrier_dir.join("release"),
+        control_limit: 8,
+    };
+    let barrier_spec = format!(
+        "{}|{}|{}|{}",
+        writer_barrier.armed.display(),
+        writer_barrier.entered.display(),
+        writer_barrier.release.display(),
+        writer_barrier.control_limit
+    );
+    let metrics = root.join("package-push-work.json");
+    let metrics_spec = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root,
+        [
+            (
+                "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER",
+                barrier_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+                metrics_spec.as_str(),
+            ),
+        ],
+    );
+    server.initialize(root, Value::Null);
+    for index in 0..OWNER_COUNT {
+        let id = RequestId::from(format!("pkg-push-old-definition-{index}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumers[index], &sources[index], "TSelected", 0),
+        );
+        let expected = if index == 0 { &provider_a } else { &provider_b };
+        assert_eq!(
+            result_locations(server.response(&id))[0]["uri"],
+            uri(expected).to_string()
+        );
+    }
+    for index in 0..OWNER_COUNT {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumers[index]),"languageId":"pascal","version":1,"text":sources[index]}}),
+        );
+    }
+    let mut old_publications = HashMap::new();
+    for consumer in &consumers {
+        let params = server
+            .diagnostic_with_timeout(&uri(consumer), IO_TIMEOUT)
+            .expect("old full push diagnostic");
+        assert!(params["diagnostics"].is_array());
+        old_publications.insert(uri(consumer).to_string(), params);
+    }
+    assert!(
+        old_publications[&uri(&consumers[0]).to_string()]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["message"] != "missing member 'Value'")
+    );
+
+    let stamp = fs::metadata(&packages[0]).expect("package stamp");
+    let old = fs::read_to_string(&packages[0]).expect("package bytes");
+    let changed = old.replace("ProviderA", "ProviderB");
+    assert_eq!(old.len(), changed.len());
+    write_file(&packages[0], &changed);
+    restore_mtime(&packages[0], &stamp);
+    let mut changes = packages
+        .iter()
+        .map(|path| json!({"uri":uri(path),"type":2}))
+        .chain(
+            projects
+                .iter()
+                .map(|path| json!({"uri":uri(path),"type":2})),
+        )
+        .collect::<Vec<_>>();
+    while changes.len() < BATCH_ENTRIES {
+        let path = root.join(format!("unrelated-{}.pas", changes.len()));
+        changes.push(json!({"uri":uri(&path),"type":2}));
+    }
+    assert_eq!(changes.len(), BATCH_ENTRIES);
+    fs::write(&writer_barrier.armed, b"pause").expect("arm writer barrier");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "notification worker must finish package fallback accounting"
+    );
+    let work: Value = serde_json::from_slice(&fs::read(&metrics).expect("read package metrics"))
+        .expect("parse package metrics");
+    assert!(
+        work["budget_exceeded"].as_bool().unwrap_or(false),
+        "package event must hit fallback: {work}"
+    );
+    assert!(
+        work["package_path_visits"].as_u64().unwrap_or_default() > 0,
+        "package descriptor work must be charged in this notification's shared account: {work}"
+    );
+    assert!(
+        work["filesystem_path_visits"].as_u64().unwrap_or_default()
+            >= work["package_path_visits"].as_u64().unwrap_or_default(),
+        "package path charges contribute to the same notification filesystem-path account: {work}"
+    );
+    let processed_event_paths = work["file_event_path_visits"].as_u64().unwrap_or_default();
+    assert!(
+        processed_event_paths > 0 && processed_event_paths <= BATCH_ENTRIES as u64,
+        "package and watched-file path work is charged within the 64-entry notification account before fallback: {work}"
+    );
+    writer_barrier.wait_until_entered();
+
+    let new_definition_id = RequestId::from("pkg-push-new-definition".to_string());
+    server.send_request(
+        new_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[0], &sources[0], "TSelected", 0),
+    );
+    thread::sleep(Duration::from_millis(100));
+    let process_status = server.child.try_wait().expect("inspect server");
+    assert!(
+        server
+            .response_with_timeout(&new_definition_id, Duration::from_millis(100))
+            .is_none(),
+        "new navigation response remains behind writer backpressure until release"
+    );
+    writer_barrier.release();
+    assert!(
+        process_status.is_none(),
+        "server stays alive under writer backpressure: {process_status:?}"
+    );
+
+    let mut clear_uris = HashSet::new();
+    let mut saw_new_full = false;
+    let mut new_definition_response = None;
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while !saw_new_full {
+        let message = server.receive_until(deadline);
+        match message {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                let uri_value = notification.params["uri"]
+                    .as_str()
+                    .expect("diagnostic URI")
+                    .to_string();
+                let diagnostics = notification.params["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics array");
+                if diagnostics.is_empty() {
+                    clear_uris.insert(uri_value);
+                } else if uri_value == uri(&consumers[0]).as_str() {
+                    assert!(
+                        diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic["message"] == "missing member 'Value'"),
+                        "new full diagnostic must reflect provider B, not stale provider A: {notification:?}"
+                    );
+                    saw_new_full = true;
+                }
+            }
+            Message::Response(response) if response.id == new_definition_id => {
+                new_definition_response = Some(response);
+            }
+            other => server.pending.push_back(other),
+        }
+    }
+    assert!(
+        clear_uris.contains(uri(&consumers[0]).as_str()),
+        "fallback must publish bounded empty clear for stale consumer diagnostics: {clear_uris:?}"
+    );
+    assert!(
+        !clear_uris.is_empty(),
+        "push fallback must emit an empty clear"
+    );
+    assert!(
+        clear_uris.len() <= OWNER_COUNT,
+        "clear stream stays within retained roots: {}",
+        clear_uris.len()
+    );
+    let new_definition =
+        new_definition_response.unwrap_or_else(|| server.response(&new_definition_id));
+    assert_eq!(
+        result_locations(new_definition)[0]["uri"],
+        uri(&provider_b).to_string()
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn include_owner_catalogue_protocol_reports_actual_candidate_work() {
     const DECOYS: usize = 256;
     const BATCH: usize = 64;

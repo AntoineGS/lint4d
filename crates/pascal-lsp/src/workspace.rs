@@ -1591,6 +1591,14 @@ pub(crate) struct DiagnosticPublicationReplacement {
     pub(crate) incomplete: bool,
 }
 
+pub(crate) struct StaleDiagnosticPublicationBatch {
+    pub(crate) targets: BTreeSet<Url>,
+    pub(crate) roots_visited: usize,
+    pub(crate) target_visits: usize,
+    pub(crate) root_uri_bytes: usize,
+    pub(crate) target_uri_bytes: usize,
+}
+
 impl DiagnosticPublicationUriCursor {
     fn new(
         publications: HashMap<Url, BTreeMap<Url, Vec<LspDiagnostic>>>,
@@ -4870,15 +4878,66 @@ impl Workspace {
         &mut self,
         root_uri: &Url,
     ) -> BTreeSet<Url> {
-        if let Some(publications) = self.diagnostic_publications.get(root_uri) {
-            self.incomplete_diagnostic_publication_roots
-                .insert(root_uri.clone());
-            let targets = publications.keys().cloned().collect::<BTreeSet<_>>();
-            self.enqueue_diagnostic_publication_targets(targets.clone());
-            targets
-        } else {
-            BTreeSet::new()
+        self.mark_diagnostic_publication_roots_stale(std::slice::from_ref(root_uri), None)
+            .expect("retained diagnostic publication state fits its admission bounds")
+            .targets
+    }
+
+    pub(crate) fn mark_diagnostic_publication_roots_stale(
+        &mut self,
+        root_uris: &[Url],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<StaleDiagnosticPublicationBatch, String> {
+        if root_uris.len() > MAX_OPEN_DOCUMENTS {
+            return Err("diagnostic stale-root batch exceeds the open-document limit".into());
         }
+        let mut roots_with_publications = Vec::new();
+        let mut targets = BTreeSet::new();
+        let mut target_visits = 0usize;
+        let mut target_uri_bytes = 0usize;
+        let mut root_uri_bytes = 0usize;
+        for root_uri in root_uris {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                return Err("request cancelled".into());
+            }
+            root_uri_bytes = root_uri_bytes
+                .checked_add(root_uri.as_str().len())
+                .filter(|bytes| *bytes <= MAX_OPEN_DOCUMENTS * MAX_OPEN_DOCUMENT_URI_BYTES)
+                .ok_or_else(|| "diagnostic stale-root URI byte budget exceeded".to_string())?;
+            let Some(publications) = self.diagnostic_publications.get(root_uri) else {
+                continue;
+            };
+            roots_with_publications.push(root_uri.clone());
+            for target in publications.keys() {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err("request cancelled".into());
+                }
+                target_visits = target_visits
+                    .checked_add(1)
+                    .filter(|visits| *visits <= MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS)
+                    .ok_or_else(|| "diagnostic stale-target visit budget exceeded".to_string())?;
+                target_uri_bytes = target_uri_bytes
+                    .checked_add(target.as_str().len())
+                    .filter(|bytes| *bytes <= MAX_RETAINED_DIAGNOSTIC_PUBLICATION_URI_BYTES)
+                    .ok_or_else(|| {
+                        "diagnostic stale-target URI byte budget exceeded".to_string()
+                    })?;
+                targets.insert(target.clone());
+            }
+        }
+
+        for root_uri in roots_with_publications {
+            self.incomplete_diagnostic_publication_roots
+                .insert(root_uri);
+        }
+        self.enqueue_diagnostic_publication_targets(targets.clone());
+        Ok(StaleDiagnosticPublicationBatch {
+            targets,
+            roots_visited: root_uris.len(),
+            target_visits,
+            root_uri_bytes,
+            target_uri_bytes,
+        })
     }
 
     pub(crate) fn take_pending_diagnostic_publication_incomplete(&mut self) -> bool {

@@ -32678,6 +32678,10 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
     let environment = tempfile::tempdir().expect("workspace and server environment");
     let root = environment.path().to_path_buf();
     let mut expected_uris = HashSet::new();
+    let shared_target = root.join("Shared.inc");
+    write_file(&shared_target, "{ shared test-only publication target }\n");
+    let shared_target_uri = uri(&shared_target);
+    expected_uris.insert(shared_target_uri.clone());
     let mut sources = Vec::with_capacity(ROOTS);
     let mut files = Vec::with_capacity(ROOTS);
     for index in 0..ROOTS {
@@ -32708,6 +32712,9 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
     );
     let metrics = root.join("recovery-work.json");
     let metrics_value = metrics.display().to_string();
+    let staling_metrics = root.join("publication-staling.json");
+    let staling_metrics_value = staling_metrics.display().to_string();
+    let shared_target_value = shared_target_uri.as_str().to_string();
     let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         &root,
         [
@@ -32720,6 +32727,15 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
                 "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
                 metrics_value.as_str(),
             ),
+            (
+                "PASCAL_LSP_TEST_PUBLICATION_STALING_RESULT",
+                staling_metrics_value.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_SHARED_PUBLICATION_TARGET_URI",
+                shared_target_value.as_str(),
+            ),
+            ("PASCAL_LSP_TEST_ALLOW_PULL_DIAGNOSTICS_REQUESTS", "1"),
         ],
     );
     server._environment = Some(environment);
@@ -32732,7 +32748,7 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
     }
     let mut initial_publications = HashSet::new();
     let initial_deadline = Instant::now() + Duration::from_secs(60);
-    while initial_publications.len() < ROOTS {
+    while initial_publications.len() < expected_uris.len() {
         assert!(
             Instant::now() < initial_deadline,
             "only got {} initial diagnostic publications of {ROOTS}",
@@ -32767,6 +32783,22 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
     }
     assert_eq!(initial_publications, expected_uris);
 
+    let initial_pull_id = RequestId::from("shared-target-pull-initial".to_string());
+    server.send_request(
+        initial_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&files[0])}}),
+    );
+    let initial_pull = server.response(&initial_pull_id);
+    assert!(
+        initial_pull.error.is_none(),
+        "initial pull failed: {initial_pull:?}"
+    );
+    let previous_result_id = initial_pull.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("initial diagnostic result ID")
+        .to_string();
+
     fs::write(&writer_barrier.armed, b"pause").expect("arm writer barrier");
     let changes = (0..64)
         .map(|index| {
@@ -32799,7 +32831,7 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
     let mut clear_counts = HashMap::<Url, usize>::new();
     let mut request_response = None;
     let deadline = Instant::now() + Duration::from_secs(60);
-    while clear_counts.len() < ROOTS || request_response.is_none() {
+    while clear_counts.len() < expected_uris.len() || request_response.is_none() {
         assert!(
             Instant::now() < deadline,
             "bounded recovery output did not drain: cleared={}, response={:?}",
@@ -32850,6 +32882,75 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
         response.error.is_none(),
         "an unrelated request must still be serviced after recovery: {response:?}"
     );
+
+    assert!(wait_for_file(&staling_metrics, IO_TIMEOUT));
+    let staling_metrics: Value = serde_json::from_slice(
+        &fs::read(&staling_metrics).expect("read publication staling metrics"),
+    )
+    .expect("parse publication staling metrics");
+    assert_eq!(staling_metrics["queue_scans"], 1);
+    assert!(
+        staling_metrics["queue_messages_scanned"]
+            .as_u64()
+            .unwrap_or_default()
+            <= 2 * 32_768,
+        "one stale completion must scan only the admitted pending/deferred queues: {staling_metrics}"
+    );
+    assert!(
+        staling_metrics["queue_bytes_scanned"]
+            .as_u64()
+            .unwrap_or_default()
+            <= 16 * 1024 * 1024 + 64 * 1024 * 1024 + 8 * 1024 * 1024,
+        "queue scan bytes must stay within pending plus deferred admission: {staling_metrics}"
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&files[0]),
+                "languageId": "pascal",
+                "version": 2,
+                "text": "unit Root00;\ninterface\nimplementation\nend.\n",
+            }
+        }),
+    );
+    loop {
+        match server.receive_until(Instant::now() + IO_TIMEOUT) {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics"
+                    && notification.params["uri"] == uri(&files[0]).as_str() =>
+            {
+                assert_eq!(clear_counts.len(), expected_uris.len());
+                assert!(
+                    notification.params["diagnostics"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let refreshed_pull_id = RequestId::from("shared-target-pull-refreshed".to_string());
+    server.send_request(
+        refreshed_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument":{"uri":uri(&files[0])},
+            "previousResultId":previous_result_id,
+        }),
+    );
+    let refreshed_pull = server.response(&refreshed_pull_id);
+    assert!(
+        refreshed_pull.error.is_none(),
+        "refreshed pull failed: {refreshed_pull:?}"
+    );
+    let refreshed_report = refreshed_pull.result.expect("refreshed pull result");
+    assert_eq!(refreshed_report["kind"], "full");
+    assert_ne!(refreshed_report["resultId"], previous_result_id);
     assert!(
         wait_for_file(&metrics, IO_TIMEOUT),
         "worker metrics must be written"
@@ -32870,6 +32971,7 @@ fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
         "recovery must stay within its preflight envelope: {metrics}"
     );
     assert_eq!(metrics["recovery_refused"], false);
+
     server.shutdown();
 }
 

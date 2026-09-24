@@ -224,6 +224,15 @@ struct PendingOutboundMessage {
     message: Message,
     bytes: usize,
     class: OutboundClass,
+    diagnostic_uri: Option<Url>,
+    diagnostic_generation: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DiagnosticPublicationDiscardScan {
+    scanned_messages: usize,
+    scanned_bytes: usize,
+    removed_messages: usize,
 }
 
 #[derive(Debug, Default)]
@@ -241,58 +250,101 @@ struct OutboundQueue {
     deferred_result_bytes: usize,
     #[cfg(feature = "test-support")]
     test_control_message_limit: Option<usize>,
+    next_diagnostic_publication_generation: u64,
 }
 
 impl OutboundQueue {
-    fn discard_diagnostic_publications(&mut self, uris: &std::collections::BTreeSet<Url>) {
-        let is_superseded_diagnostic = |pending: &PendingOutboundMessage| {
-            matches!(
-                &pending.message,
-                Message::Notification(notification)
-                    if notification.method == "textDocument/publishDiagnostics"
-                        && notification.params.get("uri").and_then(Value::as_str)
-                            .and_then(|uri| Url::parse(uri).ok())
-                            .is_some_and(|uri| uris.contains(&uri))
-            )
-        };
-        self.pending
-            .retain(|pending| !is_superseded_diagnostic(pending));
-        self.deferred
-            .retain(|pending| !is_superseded_diagnostic(pending));
+    fn discard_diagnostic_publications(
+        &mut self,
+        uris: &std::collections::BTreeSet<Url>,
+    ) -> DiagnosticPublicationDiscardScan {
+        self.discard_diagnostic_publications_matching(Some(uris))
+    }
 
-        self.pending_bytes = 0;
-        self.pending_data_messages = 0;
-        self.pending_control_messages = 0;
-        self.pending_control_bytes = 0;
-        for pending in &self.pending {
-            self.pending_bytes = self.pending_bytes.saturating_add(pending.bytes);
+    fn discard_all_diagnostic_publications(&mut self) -> DiagnosticPublicationDiscardScan {
+        self.discard_diagnostic_publications_matching(None)
+    }
+
+    fn discard_diagnostic_publications_matching(
+        &mut self,
+        uris: Option<&std::collections::BTreeSet<Url>>,
+    ) -> DiagnosticPublicationDiscardScan {
+        let stale_before = self.next_diagnostic_publication_generation;
+        self.next_diagnostic_publication_generation = self
+            .next_diagnostic_publication_generation
+            .saturating_add(1);
+        let mut scan = DiagnosticPublicationDiscardScan::default();
+
+        let mut pending_bytes = 0usize;
+        let mut pending_data_messages = 0usize;
+        let mut pending_control_messages = 0usize;
+        let mut pending_control_bytes = 0usize;
+        self.pending.retain(|pending| {
+            scan.scanned_messages = scan.scanned_messages.saturating_add(1);
+            scan.scanned_bytes = scan.scanned_bytes.saturating_add(pending.bytes);
+            let superseded = pending.diagnostic_uri.as_ref().is_some_and(|uri| {
+                (match uris {
+                    Some(uris) => uris.contains(uri),
+                    None => true,
+                }) && pending
+                    .diagnostic_generation
+                    .is_some_and(|generation| generation < stale_before)
+            });
+            if superseded {
+                scan.removed_messages = scan.removed_messages.saturating_add(1);
+                return false;
+            }
+            pending_bytes = pending_bytes.saturating_add(pending.bytes);
             match pending.class {
-                OutboundClass::Data => self.pending_data_messages += 1,
+                OutboundClass::Data => pending_data_messages += 1,
                 OutboundClass::Control | OutboundClass::Result => {
-                    self.pending_control_messages += 1;
-                    self.pending_control_bytes =
-                        self.pending_control_bytes.saturating_add(pending.bytes);
+                    pending_control_messages += 1;
+                    pending_control_bytes = pending_control_bytes.saturating_add(pending.bytes);
                 }
             }
-        }
+            true
+        });
+        self.pending_bytes = pending_bytes;
+        self.pending_data_messages = pending_data_messages;
+        self.pending_control_messages = pending_control_messages;
+        self.pending_control_bytes = pending_control_bytes;
 
-        self.deferred_bytes = 0;
-        self.deferred_control_messages = 0;
-        self.deferred_result_messages = 0;
-        self.deferred_control_bytes = 0;
-        self.deferred_result_bytes = 0;
-        for pending in &self.deferred {
-            self.deferred_bytes = self.deferred_bytes.saturating_add(pending.bytes);
-            if pending.class.is_result() {
-                self.deferred_result_messages += 1;
-                self.deferred_result_bytes =
-                    self.deferred_result_bytes.saturating_add(pending.bytes);
-            } else {
-                self.deferred_control_messages += 1;
-                self.deferred_control_bytes =
-                    self.deferred_control_bytes.saturating_add(pending.bytes);
+        let mut deferred_bytes = 0usize;
+        let mut deferred_control_messages = 0usize;
+        let mut deferred_result_messages = 0usize;
+        let mut deferred_control_bytes = 0usize;
+        let mut deferred_result_bytes = 0usize;
+        self.deferred.retain(|pending| {
+            scan.scanned_messages = scan.scanned_messages.saturating_add(1);
+            scan.scanned_bytes = scan.scanned_bytes.saturating_add(pending.bytes);
+            let superseded = pending.diagnostic_uri.as_ref().is_some_and(|uri| {
+                (match uris {
+                    Some(uris) => uris.contains(uri),
+                    None => true,
+                }) && pending
+                    .diagnostic_generation
+                    .is_some_and(|generation| generation < stale_before)
+            });
+            if superseded {
+                scan.removed_messages = scan.removed_messages.saturating_add(1);
+                return false;
             }
-        }
+            deferred_bytes = deferred_bytes.saturating_add(pending.bytes);
+            if pending.class.is_result() {
+                deferred_result_messages += 1;
+                deferred_result_bytes = deferred_result_bytes.saturating_add(pending.bytes);
+            } else {
+                deferred_control_messages += 1;
+                deferred_control_bytes = deferred_control_bytes.saturating_add(pending.bytes);
+            }
+            true
+        });
+        self.deferred_bytes = deferred_bytes;
+        self.deferred_control_messages = deferred_control_messages;
+        self.deferred_result_messages = deferred_result_messages;
+        self.deferred_control_bytes = deferred_control_bytes;
+        self.deferred_result_bytes = deferred_result_bytes;
+        scan
     }
 
     fn control_message_limit(&self, pending: &PendingOutboundMessage) -> usize {
@@ -454,10 +506,19 @@ impl OutboundQueue {
             return Err(OutputError::MessageTooLarge);
         }
         let pending = PendingOutboundMessage {
+            diagnostic_uri: diagnostic_publication_uri(&message),
+            diagnostic_generation: None,
             message,
             bytes,
             class,
         };
+        let mut pending = pending;
+        if pending.diagnostic_uri.is_some() {
+            pending.diagnostic_generation = Some(self.next_diagnostic_publication_generation);
+            self.next_diagnostic_publication_generation = self
+                .next_diagnostic_publication_generation
+                .saturating_add(1);
+        }
         if !self.deferred.is_empty() {
             return match class {
                 OutboundClass::Data => Ok(false),
@@ -489,7 +550,15 @@ trait ProtocolSender {
     fn send_control(&self, message: Message) -> Result<(), OutputError>;
     fn send_result(&self, message: Message) -> Result<(), OutputError>;
     fn send_data(&self, message: Message) -> Result<bool, OutputError>;
-    fn discard_diagnostic_publications(&self, _uris: &std::collections::BTreeSet<Url>) {}
+    fn discard_diagnostic_publications(
+        &self,
+        _uris: &std::collections::BTreeSet<Url>,
+    ) -> DiagnosticPublicationDiscardScan {
+        DiagnosticPublicationDiscardScan::default()
+    }
+    fn discard_all_diagnostic_publications(&self) -> DiagnosticPublicationDiscardScan {
+        DiagnosticPublicationDiscardScan::default()
+    }
 }
 
 impl ProtocolSender for Connection {
@@ -622,10 +691,19 @@ impl ProtocolSender for ProtocolConnection {
             .enqueue(&self.connection.sender, message, OutboundClass::Data)
     }
 
-    fn discard_diagnostic_publications(&self, uris: &std::collections::BTreeSet<Url>) {
+    fn discard_diagnostic_publications(
+        &self,
+        uris: &std::collections::BTreeSet<Url>,
+    ) -> DiagnosticPublicationDiscardScan {
         self.outbound
             .borrow_mut()
-            .discard_diagnostic_publications(uris);
+            .discard_diagnostic_publications(uris)
+    }
+
+    fn discard_all_diagnostic_publications(&self) -> DiagnosticPublicationDiscardScan {
+        self.outbound
+            .borrow_mut()
+            .discard_all_diagnostic_publications()
     }
 }
 
@@ -2075,6 +2153,13 @@ struct DiagnosticPublicationTurnBudget {
     notification_count: usize,
     processed_targets: usize,
     serialized_bytes: usize,
+    stale_root_visits: usize,
+    stale_target_visits: usize,
+    stale_root_uri_bytes: usize,
+    stale_target_uri_bytes: usize,
+    publication_queue_scans: usize,
+    publication_queue_messages_scanned: usize,
+    publication_queue_bytes_scanned: usize,
 }
 
 #[derive(Clone)]
@@ -2556,6 +2641,7 @@ struct DiagnosticNotificationEffect {
     cancel_membership: HashSet<Url>,
     refresh_requested: bool,
     refresh_all_diagnostics: bool,
+    discard_all_queued_diagnostics: bool,
 }
 
 #[derive(Debug, Default)]
@@ -8383,6 +8469,7 @@ fn spawn_workspace_file_notification(
                 workspace.invalidate_for_reconciliation_budget(&budget);
                 let mut effect = DiagnosticNotificationEffect::default();
                 effect.refresh_all_diagnostics();
+                effect.discard_all_queued_diagnostics = true;
                 if push_diagnostics_supported {
                     effect.clear_publication_cursor =
                         Some(workspace.take_all_diagnostic_publication_uris(None));
@@ -8524,6 +8611,7 @@ fn event_loop(
                         completed_workspace.invalidate_for_reconciliation_budget(&budget);
                         let mut effect = DiagnosticNotificationEffect::default();
                         effect.refresh_all_diagnostics();
+                        effect.discard_all_queued_diagnostics = true;
                         if !pull_diagnostics_supported {
                             effect.clear_publication_cursor = Some(
                                 completed_workspace.take_all_diagnostic_publication_uris(None),
@@ -8535,16 +8623,38 @@ fn event_loop(
                     match result {
                         Ok(effect) => {
                             if !pull_diagnostics_supported {
+                                if effect.discard_all_queued_diagnostics {
+                                    let scan = connection.discard_all_diagnostic_publications();
+                                    diagnostic_publication_budget.publication_queue_scans =
+                                        diagnostic_publication_budget
+                                            .publication_queue_scans
+                                            .saturating_add(1);
+                                    diagnostic_publication_budget
+                                        .publication_queue_messages_scanned =
+                                        diagnostic_publication_budget
+                                            .publication_queue_messages_scanned
+                                            .saturating_add(scan.scanned_messages);
+                                    diagnostic_publication_budget.publication_queue_bytes_scanned =
+                                        diagnostic_publication_budget
+                                            .publication_queue_bytes_scanned
+                                            .saturating_add(scan.scanned_bytes);
+                                    #[cfg(feature = "test-support")]
+                                    write_publication_staling_test_metrics(0, 0, 0, 0, 0, scan);
+                                }
                                 if let Some(cursor) = effect.clear_publication_cursor {
                                     pending_diagnostic_clears
                                         .enqueue_cursor(cursor, effect.cleanup_rejected_uri);
                                 }
-                                mark_refreshed_publication_roots_stale(
-                                    connection,
-                                    workspace,
-                                    &effect.refresh,
-                                    effect.refresh_all_diagnostics,
-                                );
+                                if !effect.discard_all_queued_diagnostics {
+                                    mark_refreshed_publication_roots_stale(
+                                        connection,
+                                        workspace,
+                                        &effect.refresh,
+                                        effect.refresh_all_diagnostics,
+                                        &mut diagnostic_publication_budget,
+                                        None,
+                                    )?;
+                                }
                             }
                             if pull_diagnostics_supported
                                 && (effect.refresh_requested || !effect.refresh.is_empty())
@@ -8636,7 +8746,9 @@ fn event_loop(
                         workspace,
                         &effect.refresh,
                         false,
-                    );
+                        &mut diagnostic_publication_budget,
+                        None,
+                    )?;
                     jobs.cancel_diagnostics_for_with_connection(Some(connection), &effect.cancel)
                         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     jobs.refresh_diagnostics_with_connection(
@@ -8912,7 +9024,9 @@ fn event_loop(
                                 workspace,
                                 &open_documents,
                                 false,
-                            );
+                                &mut diagnostic_publication_budget,
+                                None,
+                            )?;
                             jobs.refresh_diagnostics_with_connection(
                                 connection,
                                 workspace,
@@ -9114,7 +9228,9 @@ fn event_loop(
                                 workspace,
                                 &effect.refresh,
                                 effect.refresh_all_diagnostics,
-                            );
+                                &mut diagnostic_publication_budget,
+                                None,
+                            )?;
                             jobs.cancel_diagnostics_for_with_connection(
                                 Some(connection),
                                 &effect.cancel,
@@ -9164,7 +9280,9 @@ fn event_loop(
                             workspace,
                             &effect.refresh,
                             effect.refresh_all_diagnostics,
-                        );
+                            &mut diagnostic_publication_budget,
+                            None,
+                        )?;
                         jobs.cancel_diagnostics_for_with_connection(
                             Some(connection),
                             &effect.cancel,
@@ -9640,7 +9758,12 @@ fn handle_request(
             )?;
         }
         "textDocument/diagnostic" => {
-            if !pull_diagnostics_supported {
+            #[cfg(feature = "test-support")]
+            let test_request_override =
+                std::env::var_os("PASCAL_LSP_TEST_ALLOW_PULL_DIAGNOSTICS_REQUESTS").is_some();
+            #[cfg(not(feature = "test-support"))]
+            let test_request_override = false;
+            if !pull_diagnostics_supported && !test_request_override {
                 send_error(
                     connection,
                     request.id,
@@ -10219,16 +10342,71 @@ fn mark_refreshed_publication_roots_stale(
     workspace: &mut Workspace,
     refresh: &[Url],
     refresh_all: bool,
-) {
-    if refresh_all {
-        for uri in workspace.open_document_uris() {
-            mark_publication_root_stale(connection, workspace, &uri);
-        }
+    budget: &mut DiagnosticPublicationTurnBudget,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let roots = if refresh_all {
+        workspace.open_document_uris()
     } else {
-        for uri in refresh {
-            mark_publication_root_stale(connection, workspace, uri);
-        }
-    }
+        refresh.to_vec()
+    };
+    let affected = workspace.mark_diagnostic_publication_roots_stale(&roots, cancel)?;
+    budget.stale_root_visits = budget
+        .stale_root_visits
+        .saturating_add(affected.roots_visited);
+    budget.stale_target_visits = budget
+        .stale_target_visits
+        .saturating_add(affected.target_visits);
+    budget.stale_root_uri_bytes = budget
+        .stale_root_uri_bytes
+        .saturating_add(affected.root_uri_bytes);
+    budget.stale_target_uri_bytes = budget
+        .stale_target_uri_bytes
+        .saturating_add(affected.target_uri_bytes);
+    let scan = connection.discard_diagnostic_publications(&affected.targets);
+    budget.publication_queue_scans = budget.publication_queue_scans.saturating_add(1);
+    budget.publication_queue_messages_scanned = budget
+        .publication_queue_messages_scanned
+        .saturating_add(scan.scanned_messages);
+    budget.publication_queue_bytes_scanned = budget
+        .publication_queue_bytes_scanned
+        .saturating_add(scan.scanned_bytes);
+    #[cfg(feature = "test-support")]
+    write_publication_staling_test_metrics(
+        affected.roots_visited,
+        affected.target_visits,
+        affected.targets.len(),
+        affected.root_uri_bytes,
+        affected.target_uri_bytes,
+        scan,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn write_publication_staling_test_metrics(
+    roots_visited: usize,
+    target_visits: usize,
+    unique_targets: usize,
+    root_uri_bytes: usize,
+    target_uri_bytes: usize,
+    scan: DiagnosticPublicationDiscardScan,
+) {
+    let Some(path) = std::env::var_os("PASCAL_LSP_TEST_PUBLICATION_STALING_RESULT") else {
+        return;
+    };
+    let metrics = serde_json::json!({
+        "roots_visited": roots_visited,
+        "target_visits": target_visits,
+        "unique_targets": unique_targets,
+        "root_uri_bytes": root_uri_bytes,
+        "target_uri_bytes": target_uri_bytes,
+        "queue_scans": 1,
+        "queue_messages_scanned": scan.scanned_messages,
+        "queue_bytes_scanned": scan.scanned_bytes,
+        "queue_messages_removed": scan.removed_messages,
+    });
+    let _ = std::fs::write(path, serde_json::to_vec(&metrics).unwrap_or_default());
 }
 
 fn handle_notification_with_cancel(
@@ -10735,12 +10913,44 @@ fn diagnostics_notification(
     ))
 }
 
+fn diagnostic_publication_uri(message: &Message) -> Option<Url> {
+    let Message::Notification(notification) = message else {
+        return None;
+    };
+    if notification.method != "textDocument/publishDiagnostics" {
+        return None;
+    }
+    notification
+        .params
+        .get("uri")
+        .and_then(Value::as_str)
+        .and_then(|uri| Url::parse(uri).ok())
+}
+
 fn send_diagnostic_publications(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
     root_uri: &Url,
     publications: Vec<queries::DiagnosticPublication>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "test-support")]
+    let publications = {
+        let mut publications = publications;
+        if let Some(shared_uri) = std::env::var("PASCAL_LSP_TEST_SHARED_PUBLICATION_TARGET_URI")
+            .ok()
+            .and_then(|value| Url::parse(&value).ok())
+        {
+            publications.push(queries::DiagnosticPublication {
+                uri: shared_uri,
+                version: None,
+                diagnostics: vec![lsp_types::Diagnostic::new_simple(
+                    lsp_types::Range::default(),
+                    "test-only shared publication target".into(),
+                )],
+            });
+        }
+        publications
+    };
     mark_publication_root_stale(connection, workspace, root_uri);
     let replacement = workspace
         .stage_diagnostic_publications(root_uri, publications)
@@ -11364,7 +11574,8 @@ mod tests {
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisProgressTokens, AnalysisRequest,
         AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
         CompletionResolutionSeed, CompletionResolutionStore, CompletionResult,
-        ConfigurationCoordinator, DiagnosticPullStore, DocumentationFormat,
+        ConfigurationCoordinator, DiagnosticPublicationDiscardScan,
+        DiagnosticPublicationTurnBudget, DiagnosticPullStore, DocumentationFormat,
         FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
         MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
         MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
@@ -11403,6 +11614,36 @@ mod tests {
         accepted: Mutex<Vec<Message>>,
     }
 
+    #[derive(Default)]
+    struct RecordingDiscardSender {
+        discarded: Mutex<Vec<std::collections::BTreeSet<Url>>>,
+    }
+
+    impl ProtocolSender for RecordingDiscardSender {
+        fn send_control(&self, _message: Message) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn send_result(&self, _message: Message) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn send_data(&self, _message: Message) -> Result<bool, OutputError> {
+            Ok(true)
+        }
+
+        fn discard_diagnostic_publications(
+            &self,
+            uris: &std::collections::BTreeSet<Url>,
+        ) -> DiagnosticPublicationDiscardScan {
+            self.discarded
+                .lock()
+                .expect("discard calls")
+                .push(uris.clone());
+            DiagnosticPublicationDiscardScan::default()
+        }
+    }
+
     impl ProtocolSender for BackpressureOnceSender {
         fn send_control(&self, message: Message) -> Result<(), OutputError> {
             if self
@@ -11429,6 +11670,74 @@ mod tests {
         options: crate::workspace::WorkspaceOptions,
     ) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn refreshed_publication_roots_coalesce_shared_targets_before_discard() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let roots = (0..8)
+            .map(|index| {
+                let path = temp.path().join(format!("Root{index}.pas"));
+                fs::write(
+                    &path,
+                    format!("unit Root{index}; interface implementation end."),
+                )
+                .expect("root source");
+                Url::from_file_path(path).expect("root URI")
+            })
+            .collect::<Vec<_>>();
+        let shared_target =
+            Url::from_file_path(temp.path().join("Shared.inc")).expect("shared target");
+        let private_target =
+            Url::from_file_path(temp.path().join("Private.inc")).expect("private target");
+        for (index, root) in roots.iter().enumerate() {
+            workspace
+                .open_document(
+                    root.clone(),
+                    format!("unit Root{index}; interface implementation end."),
+                    1,
+                )
+                .expect("open diagnostic root");
+            let mut publications = vec![DiagnosticPublication {
+                uri: shared_target.clone(),
+                version: None,
+                diagnostics: vec![Diagnostic::new_simple(Range::default(), "shared".into())],
+            }];
+            if index == 0 {
+                publications.push(DiagnosticPublication {
+                    uri: private_target.clone(),
+                    version: None,
+                    diagnostics: vec![Diagnostic::new_simple(Range::default(), "private".into())],
+                });
+            }
+            workspace
+                .stage_diagnostic_publications(root, publications)
+                .expect("retain root publications");
+        }
+        let protocol = RecordingDiscardSender::default();
+
+        super::mark_refreshed_publication_roots_stale(
+            &protocol,
+            &mut workspace,
+            &roots,
+            false,
+            &mut DiagnosticPublicationTurnBudget::default(),
+            None,
+        )
+        .expect("coalesce refreshed roots");
+
+        let discarded = protocol.discarded.lock().expect("discard calls");
+        assert_eq!(
+            discarded.len(),
+            1,
+            "all refreshed roots must share one outbound queue scan"
+        );
+        assert_eq!(
+            discarded[0],
+            std::collections::BTreeSet::from([shared_target, private_target])
+        );
     }
 
     #[test]
@@ -13511,19 +13820,36 @@ mod tests {
         queue
             .enqueue(
                 &sender,
+                publication(&target, "new generation"),
+                OutboundClass::Control,
+            )
+            .expect("queue current-generation report");
+        queue
+            .enqueue(
+                &sender,
                 publication(&unrelated, "still current"),
                 OutboundClass::Control,
             )
             .expect("queue unrelated report");
-        assert_eq!(queue.pending_control_messages, 2);
+        assert_eq!(queue.pending_control_messages, 3);
+        queue.pending[1].diagnostic_generation = Some(u64::MAX);
         let superseded = std::collections::BTreeSet::from([target]);
 
-        queue.discard_diagnostic_publications(&superseded);
+        let scan = queue.discard_diagnostic_publications(&superseded);
 
-        assert_eq!(queue.pending_control_messages, 1);
-        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(scan.scanned_messages, 3);
+        assert_eq!(scan.removed_messages, 1);
+        assert_eq!(queue.pending_control_messages, 2);
+        assert_eq!(queue.pending.len(), 2);
         assert_eq!(queue.deferred_control_messages, 0);
         let Message::Notification(notification) = &queue.pending[0].message else {
+            panic!("expected remaining diagnostics notification");
+        };
+        assert_eq!(
+            notification.params["diagnostics"][0]["message"],
+            "new generation"
+        );
+        let Message::Notification(notification) = &queue.pending[1].message else {
             panic!("expected remaining diagnostics notification");
         };
         assert_eq!(notification.params["uri"], unrelated.as_str());

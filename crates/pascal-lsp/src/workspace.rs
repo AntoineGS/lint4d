@@ -6793,7 +6793,7 @@ impl Workspace {
         };
         for observation in &expansion.include_observations {
             check_workspace_cancel(Some(cancel))?;
-            self.record_include_analysis_observation(observation, context);
+            self.record_include_analysis_observation(observation, context, false);
         }
         if let Some((root_source, root_version)) =
             self.open_documents.get(root_uri).and_then(|document| {
@@ -6927,7 +6927,7 @@ impl Workspace {
             }
             for observation in &dependency.observations {
                 check_workspace_cancel(Some(cancel))?;
-                self.record_include_analysis_observation(observation, context);
+                self.record_include_analysis_observation(observation, context, true);
             }
         }
 
@@ -7008,6 +7008,7 @@ impl Workspace {
         &mut self,
         observation: &crate::include_expansion::IncludeObservation,
         context: &pascal_project::ProjectContext,
+        document_link_candidate: bool,
     ) {
         let path = absolute_path(observation.path.clone());
         let Some(uri) = Url::from_file_path(&path).ok() else {
@@ -7017,7 +7018,10 @@ impl Workspace {
         let Some(records) = self.analysis_records.as_mut() else {
             return;
         };
-        if records.contains_key(&uri) {
+        if let Some(record) = records.get_mut(&uri) {
+            if document_link_candidate && !observation.present && record.path_stamp.is_none() {
+                record.document_link_missing_candidate = true;
+            }
             return;
         }
         let path_entry = context_path_entry(context, &path).unwrap_or_else(|| ProjectPathEntry {
@@ -7043,6 +7047,7 @@ impl Workspace {
                 path_entry: Some(path_entry),
                 include_payload: false,
                 missing_provider_candidate: !observation.present,
+                document_link_missing_candidate: document_link_candidate && !observation.present,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -7452,6 +7457,7 @@ impl Workspace {
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -7493,6 +7499,7 @@ impl Workspace {
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -7677,6 +7684,7 @@ impl Workspace {
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
@@ -10247,6 +10255,7 @@ impl Workspace {
                         path_entry: None,
                         include_payload: false,
                         missing_provider_candidate: true,
+                        document_link_missing_candidate: false,
                         directory_observation: false,
                         missing_provider_scope: None,
                         auto_import_provider_observation: false,
@@ -10303,6 +10312,7 @@ impl Workspace {
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: Some(scope),
                     auto_import_provider_observation: false,
@@ -14467,6 +14477,7 @@ mod tests {
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
@@ -14554,6 +14565,7 @@ mod tests {
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -16065,6 +16077,7 @@ mod tests {
             path_entry: None,
             include_payload: false,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,

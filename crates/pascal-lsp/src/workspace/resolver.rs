@@ -444,6 +444,7 @@ pub(crate) fn source_record_for_loaded(
             path_entry: context.path_entry_for(&source.path),
             include_payload,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
@@ -474,6 +475,7 @@ pub(crate) fn source_record_for_loaded(
             path_entry: Some(path_entry.clone()),
             include_payload,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
@@ -514,6 +516,7 @@ fn payload_record(
             path_entry: Some(path_entry.clone()),
             include_payload: false,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
@@ -541,6 +544,7 @@ fn payload_record(
             path_entry: context.path_entry_for(path),
             include_payload: false,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
@@ -596,6 +600,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         path_entry: None,
         include_payload: false,
         missing_provider_candidate,
+        document_link_missing_candidate: false,
         directory_observation,
         missing_provider_scope: None,
         auto_import_provider_observation: false,
@@ -702,6 +707,7 @@ pub(crate) fn report_records(
             path_entry,
             include_payload: false,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
@@ -795,6 +801,7 @@ pub(crate) fn merge_source_record(
     existing.open |= incoming.open;
     existing.include_payload |= incoming.include_payload;
     existing.missing_provider_candidate |= incoming.missing_provider_candidate;
+    existing.document_link_missing_candidate |= incoming.document_link_missing_candidate;
     existing.directory_observation |= incoming.directory_observation;
 }
 

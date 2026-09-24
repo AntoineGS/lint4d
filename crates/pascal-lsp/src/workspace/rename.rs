@@ -214,6 +214,11 @@ pub(crate) struct SourceRecord {
     /// Unlike a positive source URI, this is invalidated by a matching source
     /// change even when the file was not part of the worker's read set.
     pub(crate) missing_provider_candidate: bool,
+    /// An absent include search candidate observed by document-link resolution.
+    /// Unlike broad provider negatives, this narrow witness must be checked
+    /// against the filesystem at delivery so a higher-priority include cannot
+    /// appear unnoticed when directory metadata is restored.
+    pub(crate) document_link_missing_candidate: bool,
     /// The resolver observed the directory contents while resolving a source.
     /// A child create/delete/rename invalidates this record, but unrelated
     /// source records remain exact-path dependencies.
@@ -1577,6 +1582,12 @@ fn revalidate_records(
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         if let Some(path) = &record.path {
+            if record.document_link_missing_candidate && overlays.contains_key(&record.uri) {
+                return Err(format!(
+                    "include candidate appeared as an overlay while resolving {}; retry the request",
+                    path.display()
+                ));
+            }
             revalidate_path_record(
                 path,
                 record,
@@ -1688,6 +1699,23 @@ fn revalidate_path_record(
 ) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
+    }
+    if record.document_link_missing_candidate {
+        let actual = path_stamp_result(path).map_err(|error| {
+            format!(
+                "document-link candidate could not be revalidated for {}: {error}",
+                path.display()
+            )
+        })?;
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if actual.is_some() {
+            return Err(format!(
+                "include candidate appeared while resolving {}; retry the request",
+                path.display()
+            ));
+        }
     }
     // A resolver candidate can be rejected for authorization even while the
     // filesystem path exists (for example, a configured symlink). Its
@@ -1975,6 +2003,7 @@ fn path_record_at(
         path_entry,
         include_payload,
         missing_provider_candidate: false,
+        document_link_missing_candidate: false,
         directory_observation: false,
         missing_provider_scope: None,
         auto_import_provider_observation: false,
@@ -2078,6 +2107,7 @@ pub(crate) fn source_for_input_with_cancel(
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -2124,6 +2154,7 @@ pub(crate) fn source_for_input_with_owner(
                 path_entry: None,
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -2184,6 +2215,7 @@ pub(crate) fn source_for_input_with_owner(
         path_entry: Some(entry),
         include_payload: false,
         missing_provider_candidate: false,
+        document_link_missing_candidate: false,
         directory_observation: false,
         missing_provider_scope: None,
         auto_import_provider_observation: false,
@@ -5797,6 +5829,7 @@ pub(crate) fn build_snapshot(
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
@@ -5886,6 +5919,7 @@ pub(crate) fn build_snapshot(
                     path_entry: Some(path_entry.clone()),
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
@@ -6368,6 +6402,7 @@ pub(crate) fn build_snapshot(
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
@@ -6405,6 +6440,7 @@ pub(crate) fn build_snapshot(
                     path_entry: None,
                     include_payload: false,
                     missing_provider_candidate: false,
+                    document_link_missing_candidate: false,
                     directory_observation: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
@@ -6667,6 +6703,7 @@ fn retain_expansion_dependencies(
                 path_entry: Some(path_entry.clone()),
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -6717,6 +6754,7 @@ fn retain_expansion_dependencies(
                 path_entry: Some(path_entry.clone()),
                 include_payload: true,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
@@ -12089,6 +12127,7 @@ mod tests {
             path_entry: None,
             include_payload: true,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,

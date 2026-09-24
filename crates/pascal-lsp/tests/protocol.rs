@@ -2672,6 +2672,129 @@ fn document_links_stale_after_selected_include_overlay_changes() {
     server.shutdown();
 }
 
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+#[test]
+fn document_links_reject_a_new_higher_priority_include_candidate() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let library = root.join("lib");
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let lower_priority_target = library.join("Selected.inc");
+    let stale_directory_entry = root.join("Shadowed.inc");
+    let higher_priority_target = root.join("Selected.inc");
+    fs::create_dir_all(&library).expect("include search directory");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>lib</DCC_IncludePath></PropertyGroup></Project>",
+    );
+    write_file(&lower_priority_target, "const Selected = 1;\n");
+    write_file(&stale_directory_entry, "const Shadowed = 1;\n");
+    let root_metadata = fs::metadata(&root).expect("workspace directory metadata");
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("document-links-new-priority-candidate".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    fs::rename(&stale_directory_entry, &higher_priority_target)
+        .expect("replace unrelated entry with higher-priority include candidate");
+    restore_mtime(&root, &root_metadata);
+    barrier.release();
+
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("new higher-priority candidate must stale the old link target");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("retry the request"),
+        "candidate appearance should invalidate the result: {}",
+        error.message
+    );
+
+    let retry_id = RequestId::from("document-links-new-priority-candidate-retry".to_string());
+    server.send_request(
+        retry_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let retry = server.response(&retry_id);
+    assert!(retry.error.is_none(), "fresh retry failed: {retry:?}");
+    let links = retry.result.expect("fresh document links");
+    assert_eq!(links.as_array().expect("links").len(), 1);
+    assert_eq!(links[0]["target"], uri(&higher_priority_target).as_str());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn document_links_reject_a_new_higher_priority_include_overlay() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let library = root.join("lib");
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let lower_priority_target = library.join("Selected.inc");
+    let higher_priority_target = root.join("Selected.inc");
+    fs::create_dir_all(&library).expect("include search directory");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>lib</DCC_IncludePath></PropertyGroup></Project>",
+    );
+    write_file(&lower_priority_target, "const Selected = 1;\n");
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("document-links-new-priority-overlay".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&higher_priority_target), "languageId": "pascal", "version": 1,
+            "text": "const Selected = 2;\n"
+        }}),
+    );
+    barrier.release();
+
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("new higher-priority overlay must stale the old link target");
+    assert_eq!(error.code, -32803);
+    assert!(error.message.contains("retry the request"));
+
+    let retry_id = RequestId::from("document-links-new-priority-overlay-retry".to_string());
+    server.send_request(
+        retry_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let retry = server.response(&retry_id);
+    assert!(retry.error.is_none(), "fresh retry failed: {retry:?}");
+    let links = retry.result.expect("fresh document links");
+    assert_eq!(links.as_array().expect("links").len(), 1);
+    assert_eq!(links[0]["target"], uri(&higher_priority_target).as_str());
+    server.shutdown();
+}
+
 #[test]
 fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
     let root = tempfile::tempdir().expect("workspace");

@@ -1790,6 +1790,7 @@ fn completion_observations_equal(
         && left.path_entry == right.path_entry
         && left.include_payload == right.include_payload
         && left.missing_provider_candidate == right.missing_provider_candidate
+        && left.document_link_missing_candidate == right.document_link_missing_candidate
         && left.missing_provider_scope == right.missing_provider_scope
         && left.auto_import_provider_observation == right.auto_import_provider_observation
         && left.auto_import_scopes == right.auto_import_scopes

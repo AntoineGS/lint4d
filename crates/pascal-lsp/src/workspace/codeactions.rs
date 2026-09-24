@@ -5866,6 +5866,7 @@ fn lint_configuration_for_input(
                 path_entry: super::context_path_entry(&context, path),
                 include_payload: false,
                 missing_provider_candidate: false,
+                document_link_missing_candidate: false,
                 directory_observation: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,

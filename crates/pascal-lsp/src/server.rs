@@ -1787,6 +1787,7 @@ fn compact_completion_records(
             path_entry: record.path_entry.clone(),
             include_payload: record.include_payload,
             missing_provider_candidate: record.missing_provider_candidate,
+            document_link_missing_candidate: record.document_link_missing_candidate,
             directory_observation: record.directory_observation,
             missing_provider_scope: record.missing_provider_scope.clone(),
             auto_import_provider_observation: record.auto_import_provider_observation,
@@ -2248,6 +2249,7 @@ fn compact_diagnostic_records(records: &[SourceRecord]) -> Result<Vec<SourceReco
             path_entry: record.path_entry.clone(),
             include_payload: record.include_payload,
             missing_provider_candidate: record.missing_provider_candidate,
+            document_link_missing_candidate: record.document_link_missing_candidate,
             directory_observation: record.directory_observation,
             missing_provider_scope: record.missing_provider_scope.clone(),
             auto_import_provider_observation: record.auto_import_provider_observation,
@@ -2273,6 +2275,7 @@ fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
     record.parsed_text_hash.hash(&mut hasher);
     record.include_payload.hash(&mut hasher);
     record.missing_provider_candidate.hash(&mut hasher);
+    record.document_link_missing_candidate.hash(&mut hasher);
     record.directory_observation.hash(&mut hasher);
     record.auto_import_provider_observation.hash(&mut hasher);
     hash_debug(&mut hasher, &record.candidate_membership);
@@ -14437,6 +14440,7 @@ mod tests {
             path_entry: None,
             include_payload: false,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
@@ -14639,6 +14643,7 @@ mod tests {
             path_entry: None,
             include_payload: false,
             missing_provider_candidate: false,
+            document_link_missing_candidate: false,
             directory_observation: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,

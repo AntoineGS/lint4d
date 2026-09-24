@@ -10,6 +10,7 @@ use lsp_types::{
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentChanges, Location, NumberOrString,
     Position, Range, TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
 };
+use pascal_core::node_kind as K;
 use pascal_core::{FileInfo, Severity, parser};
 pub(crate) use pascal_project::content_hash_bytes;
 use pascal_project::delphi_overrides::{
@@ -52,7 +53,149 @@ pub(crate) mod resolver;
 
 /// Maximum syntax-tree depth used before invoking the recursive lint/format pipelines.
 pub const MAX_TREE_DEPTH: usize = 256;
-type FormattingOutput = (String, String, fmt4d::config::FmtConfig, HashSet<String>);
+const MAX_RANGE_MAPPING_NODES: usize = 100_000;
+const MAX_RANGE_TOKEN_MAPPING_BYTES: usize = 8 * 1024 * 1024;
+
+struct FormattingTokenBudget {
+    nodes: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct FormattingStatement<'tree> {
+    node: tree_sitter::Node<'tree>,
+    kind: String,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn is_supported_range_statement(kind: &str) -> bool {
+    matches!(
+        kind,
+        K::ASSIGNMENT
+            | K::IF
+            | K::IF_ELSE
+            | K::CASE
+            | K::TRY
+            | K::REPEAT
+            | K::FOR
+            | K::FOREACH
+            | K::WHILE
+            | K::WITH
+            | K::RAISE
+            | K::INHERITED
+            | "procedureCall"
+            | "callStatement"
+    )
+}
+
+fn formatting_statement_tokens(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    cancel: &AtomicBool,
+    budget: &mut FormattingTokenBudget,
+) -> Result<Vec<(String, String)>, String> {
+    let mut tokens = Vec::new();
+    let mut stack = vec![node];
+    let mut visits = 0usize;
+    while let Some(current) = stack.pop() {
+        visits = visits.saturating_add(1);
+        if budget.nodes == 0 {
+            return Err("range formatting token mapping exceeds its work limit".to_string());
+        }
+        budget.nodes -= 1;
+        if visits % 256 == 0 {
+            check_workspace_cancel(Some(cancel))?;
+        }
+        if current.child_count() == 0 {
+            if current.is_missing() || current.kind() == K::COMMENT {
+                return Err(
+                    "range formatting refused a recovered or comment-bearing statement".to_string(),
+                );
+            }
+            let bytes = source
+                .get(current.byte_range())
+                .ok_or_else(|| "statement token lies outside its source snapshot".to_string())?;
+            if bytes.len() > budget.bytes {
+                return Err("range formatting token mapping exceeds its byte limit".to_string());
+            }
+            budget.bytes -= bytes.len();
+            if bytes.is_empty() {
+                continue;
+            }
+            let value = String::from_utf8_lossy(bytes).into_owned();
+            let kind = current.kind().to_string();
+            let value = if kind == K::IDENTIFIER || kind.starts_with('k') {
+                value.to_ascii_uppercase()
+            } else {
+                value
+            };
+            tokens.push((kind, value));
+        } else {
+            for index in (0..current.child_count()).rev() {
+                if let Some(child) = current.child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn collect_formatting_statements<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    cancel: &AtomicBool,
+) -> Result<Vec<FormattingStatement<'tree>>, String> {
+    let mut statements = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    let mut visits = 0usize;
+    while let Some(node) = stack.pop() {
+        visits = visits.saturating_add(1);
+        if visits > MAX_RANGE_MAPPING_NODES {
+            return Err("range formatting syntax mapping exceeds its work limit".to_string());
+        }
+        if visits % 256 == 0 {
+            check_workspace_cancel(Some(cancel))?;
+        }
+        if is_supported_range_statement(node.kind()) {
+            statements.push(FormattingStatement {
+                node,
+                kind: node.kind().to_string(),
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            });
+        }
+        for index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Ok(statements)
+}
+
+fn line_body(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .unwrap_or(line)
+        .strip_suffix('\r')
+        .unwrap_or(line.strip_suffix('\n').unwrap_or(line))
+}
+
+fn only_ascii_whitespace(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+fn complete_statement_line_suffix(bytes: &[u8]) -> Option<usize> {
+    if only_ascii_whitespace(bytes) {
+        return Some(0);
+    }
+    let suffix = bytes.strip_prefix(b";")?;
+    only_ascii_whitespace(suffix).then_some(1)
+}
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_FILES: usize = 10_000;
 pub(crate) const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
@@ -5201,8 +5344,7 @@ impl Workspace {
         uri: &Url,
         cancel: &AtomicBool,
     ) -> Result<Option<TextEdit>, String> {
-        let Some((source, formatted, _, _)) =
-            self.formatting_output_with_cancel(uri, cancel, None)?
+        let Some((source, formatted)) = self.formatting_output_with_cancel(uri, cancel, None)?
         else {
             return Ok(None);
         };
@@ -5226,11 +5368,10 @@ impl Workspace {
         cancel: &AtomicBool,
     ) -> Result<Vec<TextEdit>, String> {
         const MAX_RANGE_FORMATTING_LINES: usize = 256;
-        const MAX_RANGE_FORMATTING_EDITS: usize = 128;
         if range.start > range.end {
             return Err("range start must not be after range end".to_string());
         }
-        let Some((source, formatted, config, external_units)) =
+        let Some((source, formatted)) =
             self.formatting_output_with_cancel(uri, cancel, Some((tab_size, insert_spaces)))?
         else {
             return Ok(Vec::new());
@@ -5239,10 +5380,48 @@ impl Workspace {
         if formatted.len() > MAX_RANGE_FORMATTED_BYTES {
             return Err("range formatting output exceeds the bounded byte limit".to_string());
         }
+        let path = uri
+            .to_file_path()
+            .map(absolute_path)
+            .map_err(|_| format!("not a file URI: {uri}"))?;
+        let (source_tree, source_diagnostics) =
+            parser::parse_file(&FileInfo::new(path.clone()), source.as_bytes()).map_err(
+                |error| format!("range formatting could not parse the original snapshot: {error}"),
+            )?;
+        check_workspace_cancel(Some(cancel))?;
+        if !source_diagnostics.is_empty() || source_tree.root_node().has_error() {
+            return Err(
+                "range formatting refused because the original document has parser recovery"
+                    .to_string(),
+            );
+        }
+        let (formatted_tree, formatted_diagnostics) =
+            parser::parse_file(&FileInfo::new(path), formatted.as_bytes()).map_err(|error| {
+                format!("range formatting could not parse formatter output: {error}")
+            })?;
+        check_workspace_cancel(Some(cancel))?;
+        if !formatted_diagnostics.is_empty() || formatted_tree.root_node().has_error() {
+            return Err(
+                "range formatting refused because formatter output has parser recovery".to_string(),
+            );
+        }
         let original_lines = source
             .split_inclusive('\n')
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let formatted_lines = formatted
+            .split_inclusive('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut formatted_offsets = Vec::with_capacity(formatted_lines.len() + 1);
+        formatted_offsets.push(0usize);
+        for (line_number, line) in formatted_lines.iter().enumerate() {
+            if line_number % 64 == 0 {
+                check_workspace_cancel(Some(cancel))?;
+            }
+            formatted_offsets
+                .push(formatted_offsets.last().copied().unwrap_or_default() + line.len());
+        }
         let start = text::position_to_offset(&source, range.start).ok_or_else(|| {
             "range start is outside the document or splits a UTF-16 scalar".to_string()
         })?;
@@ -5257,7 +5436,10 @@ impl Workspace {
         }
         let mut offsets = Vec::with_capacity(original_lines.len() + 1);
         offsets.push(0usize);
-        for line in &original_lines {
+        for (line_number, line) in original_lines.iter().enumerate() {
+            if line_number % 64 == 0 {
+                check_workspace_cancel(Some(cancel))?;
+            }
             offsets.push(offsets.last().copied().unwrap_or_default() + line.len());
         }
         let first = offsets
@@ -5270,100 +5452,173 @@ impl Workspace {
         if last.saturating_sub(first) + 1 > MAX_RANGE_FORMATTING_LINES {
             return Err("range formatting exceeds the bounded line limit".to_string());
         }
-        for (index, line) in original_lines.iter().enumerate().take(last + 1).skip(first) {
-            if index % 64 == 0 {
-                check_workspace_cancel(Some(cancel))?;
+        if first != last {
+            return Err("range formatting currently requires a selection contained in one physical statement line".to_string());
+        }
+        let selected_line = first;
+        if pascal_core::directives::parse_format_regions(source.as_bytes())
+            .iter()
+            .any(|region| (region.start_line - 1..=region.end_line - 1).contains(&selected_line))
+        {
+            return Err(
+                "range formatting refused because the selected line is inside a FMT.OFF region"
+                    .to_string(),
+            );
+        }
+        let source_statements = collect_formatting_statements(&source_tree, cancel)?;
+        let line_statements = source_statements
+            .iter()
+            .filter(|statement| {
+                statement.start_line == selected_line && statement.end_line == selected_line
+            })
+            .collect::<Vec<_>>();
+        if line_statements.len() != 1 {
+            return Err("range formatting refused because the selected line does not have one unambiguous complete statement".to_string());
+        }
+        let statement = line_statements[0];
+        let mut ancestor = statement.node;
+        while let Some(parent) = ancestor.parent() {
+            if matches!(
+                parent.kind(),
+                K::PP_BLOCK | K::PP_IF | K::PP_ELSE | K::PP_DIRECTIVE | K::PP_FRAGMENT_STMT
+            ) {
+                return Err("range formatting refused because the selected statement is owned by a compiler directive".to_string());
             }
-            let trimmed = line.trim_start().to_ascii_lowercase();
-            if line.contains("//")
-                || line.contains("{$")
-                || line.contains("(*")
-                || line.contains("{")
-                || trimmed.starts_with("uses ")
-                || trimmed == "uses"
+            ancestor = parent;
+        }
+        let mut token_budget = FormattingTokenBudget {
+            nodes: MAX_RANGE_MAPPING_NODES,
+            bytes: MAX_RANGE_TOKEN_MAPPING_BYTES,
+        };
+        let statement_tokens = formatting_statement_tokens(
+            statement.node,
+            source.as_bytes(),
+            cancel,
+            &mut token_budget,
+        )?;
+        let source_line = original_lines
+            .get(selected_line)
+            .ok_or_else(|| "selected source line is outside the document".to_string())?;
+        let source_body = line_body(source_line);
+        let line_start_byte = offsets[selected_line];
+        let line_end_byte = line_start_byte + source_body.len();
+        let source_suffix = source
+            .as_bytes()
+            .get(statement.end_byte..line_end_byte)
+            .ok_or_else(|| "statement range lies outside the selected physical line".to_string())?;
+        let source_terminator = complete_statement_line_suffix(source_suffix).ok_or_else(|| {
+            "range formatting refused because the physical line contains non-statement syntax"
+                .to_string()
+        })?;
+        if start > statement.start_byte || end < statement.end_byte + source_terminator {
+            return Err("range formatting refused because the selection cuts through the statement or one of its tokens".to_string());
+        }
+        if statement.start_byte < line_start_byte
+            || statement.end_byte > line_end_byte
+            || !only_ascii_whitespace(&source.as_bytes()[line_start_byte..statement.start_byte])
+            || source_terminator > line_end_byte - statement.end_byte
+        {
+            return Err(
+                "range formatting refused because the physical line contains non-statement syntax"
+                    .to_string(),
+            );
+        }
+        let formatted_statements = collect_formatting_statements(&formatted_tree, cancel)?;
+        let source_line_count = original_lines.len();
+        let formatted_line_count = formatted_lines.len();
+        let mut matches = Vec::new();
+        for candidate in &formatted_statements {
+            if candidate.kind == statement.kind
+                && formatting_statement_tokens(
+                    candidate.node,
+                    formatted.as_bytes(),
+                    cancel,
+                    &mut token_budget,
+                )? == statement_tokens
             {
-                return Err("range formatting refused because comments, directives, or uses ownership are ambiguous".to_string());
+                matches.push(candidate);
             }
         }
-        let formatted_lines = if first == last {
-            let selected = original_lines[first].trim_end_matches(['\r', '\n']);
-            if selected.contains("{$")
-                || selected.trim().is_empty()
-                || selected.starts_with('\u{feff}')
-            {
-                return Err("range formatting refused because the selected line is not an isolated statement".to_string());
-            }
-            let wrapper = format!("program __Range;\nbegin\n{selected}\nend.\n");
-            let formatted = fmt4d::format_source(
-                wrapper.as_bytes(),
-                &FileInfo::new(PathBuf::from("__Range.pas")),
-                &config,
-                &external_units,
-            )
-            .map_err(|error| format!("range formatting refused: {error}"))?;
-            let wrapped_lines = formatted.split_inclusive('\n').collect::<Vec<_>>();
-            if wrapped_lines.len() < 4
-                || !wrapped_lines[0].trim_start().starts_with("program")
-                || !wrapped_lines[1].trim().eq_ignore_ascii_case("begin")
-                || !wrapped_lines
-                    .last()
-                    .is_some_and(|line| line.trim().eq_ignore_ascii_case("end."))
-            {
-                return Err("range formatting refused because the selected line is not a complete statement".to_string());
-            }
-            let mut adjusted = original_lines.clone();
-            let body = &wrapped_lines[2..wrapped_lines.len() - 1];
-            // The selected line is represented by exactly one complete statement in the wrapper.
-            if body.len() != 1 {
+        let mapped = if source_line_count == formatted_line_count {
+            let on_same_line = matches
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    candidate.start_line == selected_line && candidate.end_line == selected_line
+                })
+                .collect::<Vec<_>>();
+            if on_same_line.len() == 1 {
+                on_same_line[0]
+            } else {
                 return Err(
-                    "range formatting refused because the selected statement expands across lines"
+                    "range formatting refused because the full-document line mapping is ambiguous"
                         .to_string(),
                 );
             }
-            adjusted[first] = body[0].to_string();
-            adjusted
-        } else {
-            return Err("range formatting currently supports only one complete statement line; wider ranges are refused to avoid ambiguous edits".to_string());
-        };
-        let mut edits = Vec::new();
-        for line_index in first..=last {
-            check_workspace_cancel(Some(cancel))?;
-            let original_line = original_lines[line_index].as_str();
-            let formatted_line = formatted_lines[line_index].as_str();
-            if original_line == formatted_line {
-                continue;
+        } else if matches.len() == 1 {
+            let mut source_occurrences = 0usize;
+            for candidate in &source_statements {
+                if candidate.kind == statement.kind
+                    && formatting_statement_tokens(
+                        candidate.node,
+                        source.as_bytes(),
+                        cancel,
+                        &mut token_budget,
+                    )? == statement_tokens
+                {
+                    source_occurrences = source_occurrences.saturating_add(1);
+                }
             }
-            if line_index == 0 && original_line.starts_with('\u{feff}') {
+            if source_occurrences == 1 {
+                matches[0]
+            } else {
                 return Err(
-                    "range formatting refused because the selected line contains a BOM".to_string(),
+                    "range formatting refused because statement anchors are not unique".to_string(),
                 );
             }
-            let original_body = original_line
-                .strip_suffix('\n')
-                .unwrap_or(original_line)
-                .strip_suffix('\r')
-                .unwrap_or(original_line.strip_suffix('\n').unwrap_or(original_line));
-            let formatted_body = formatted_line
-                .strip_suffix('\n')
-                .unwrap_or(formatted_line)
-                .strip_suffix('\r')
-                .unwrap_or(formatted_line.strip_suffix('\n').unwrap_or(formatted_line));
-            let line_start = offsets[line_index];
-            let line_end = line_start + original_body.len();
-            let start_pos = text::offset_to_position(&source, line_start)
-                .ok_or_else(|| "could not map range formatting line start".to_string())?;
-            let end_pos = text::offset_to_position(&source, line_end)
-                .ok_or_else(|| "could not map range formatting line end".to_string())?;
-            let replacement = formatted_body;
-            edits.push(TextEdit::new(
-                Range::new(start_pos, end_pos),
-                replacement.to_string(),
-            ));
-            if edits.len() > MAX_RANGE_FORMATTING_EDITS {
-                return Err("range formatting exceeds the bounded edit limit".to_string());
-            }
+        } else {
+            return Err(
+                "range formatting refused because the full-document statement mapping is ambiguous"
+                    .to_string(),
+            );
+        };
+        if mapped.start_line != mapped.end_line {
+            return Err("range formatting refused because the full formatter expanded the statement across lines".to_string());
         }
-        Ok(edits)
+        let formatted_line = formatted_lines
+            .get(mapped.start_line)
+            .ok_or_else(|| "mapped formatter line is outside its output".to_string())?;
+        let formatted_body = line_body(formatted_line);
+        let formatted_line_start = *formatted_offsets
+            .get(mapped.start_line)
+            .ok_or_else(|| "mapped formatter line offset is unavailable".to_string())?;
+        let formatted_line_end = formatted_line_start + formatted_body.len();
+        if mapped.start_byte < formatted_line_start || mapped.end_byte > formatted_line_end {
+            return Err("range formatting refused because mapped formatter output crosses its physical line".to_string());
+        }
+        let formatted_terminator = complete_statement_line_suffix(
+            &formatted.as_bytes()[mapped.end_byte..formatted_line_end],
+        )
+        .ok_or_else(|| {
+            "range formatting refused because mapped formatter output contains neighboring syntax"
+                .to_string()
+        })?;
+        if !only_ascii_whitespace(&formatted.as_bytes()[formatted_line_start..mapped.start_byte])
+            || formatted_terminator > formatted_line_end - mapped.end_byte
+        {
+            return Err("range formatting refused because mapped formatter output contains neighboring syntax".to_string());
+        }
+        if source_body == formatted_body {
+            return Ok(Vec::new());
+        }
+        let start_pos = text::offset_to_position(&source, line_start_byte)
+            .ok_or_else(|| "could not map range formatting line start".to_string())?;
+        let end_pos = text::offset_to_position(&source, line_end_byte)
+            .ok_or_else(|| "could not map range formatting line end".to_string())?;
+        Ok(vec![TextEdit::new(
+            Range::new(start_pos, end_pos),
+            formatted_body.to_string(),
+        )])
     }
 
     fn formatting_output_with_cancel(
@@ -5371,7 +5626,7 @@ impl Workspace {
         uri: &Url,
         cancel: &AtomicBool,
         client_options: Option<(u32, bool)>,
-    ) -> Result<Option<FormattingOutput>, String> {
+    ) -> Result<Option<(String, String)>, String> {
         check_workspace_cancel(Some(cancel))?;
         let path = uri
             .to_file_path()
@@ -5513,7 +5768,7 @@ impl Workspace {
         )
         .map_err(|error| error.to_string())?;
         check_workspace_cancel(Some(cancel))?;
-        Ok(Some((source, formatted, config, external_units)))
+        Ok(Some((source, formatted)))
     }
 
     fn refresh_loaded_disk(&mut self, uri: &Url) {

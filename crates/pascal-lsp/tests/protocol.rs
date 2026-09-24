@@ -30076,7 +30076,7 @@ fn range_formatting_uses_open_overlay_instead_of_disk_contents() {
         "textDocument/rangeFormatting",
         json!({
             "textDocument": {"uri": uri(&main)},
-            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 11}},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 13}},
             "options": {"tabSize": 2, "insertSpaces": true}
         }),
     );
@@ -30088,6 +30088,197 @@ fn range_formatting_uses_open_overlay_instead_of_disk_contents() {
     let edit = &response.result.expect("range edits")[0];
     assert_eq!(edit["newText"], "  Overlay := 1 + 2;");
     assert_eq!(fs::read_to_string(&main).expect("read disk source"), disk);
+    server.shutdown();
+}
+
+#[test]
+fn range_formatting_refuses_ambiguous_ownership_and_preserves_formatter_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let comment = root.join("Comment.pas");
+    let brace_comment = root.join("BraceComment.pas");
+    let fmt_off = root.join("FmtOff.pas");
+    let nested_if = root.join("NestedIf.pas");
+    let nested_while = root.join("NestedWhile.pas");
+    let same_line = root.join("SameLine.pas");
+    let recovery = root.join("Recovery.pas");
+    let uses = root.join("Uses.pas");
+    for (path, source) in [
+        (
+            &comment,
+            "unit Comment;\ninterface\nimplementation\nprocedure Run;\nbegin\n(*\nX:=1;\n*)\nend;\nend.\n",
+        ),
+        (
+            &brace_comment,
+            "unit BraceComment;\ninterface\nimplementation\nprocedure Run;\nbegin\n{\nX:=1;\n}\nend;\nend.\n",
+        ),
+        (
+            &fmt_off,
+            "unit FmtOff;\ninterface\nimplementation\nprocedure Run;\nbegin\n{$FMT.OFF}\nX:=1;\n{$FMT.ON}\nend;\nend.\n",
+        ),
+        (
+            &nested_if,
+            "unit NestedIf;\ninterface\nimplementation\nprocedure Run;\nbegin\nif Flag then\nX:=1;\nend;\nend.\n",
+        ),
+        (
+            &nested_while,
+            "unit NestedWhile;\ninterface\nimplementation\nprocedure Run;\nbegin\nwhile Flag do\nX:=1;\nend;\nend.\n",
+        ),
+        (
+            &same_line,
+            "unit SameLine;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:=1; Y:=2;\nend;\nend.\n",
+        ),
+        (
+            &recovery,
+            "unit Recovery;\ninterface\nimplementation\nprocedure Run;\nbegin\nif then\nX:=1;\nend;\nend.\n",
+        ),
+        (
+            &uses,
+            "unit Uses;\ninterface\nuses Zulu, Alpha;\nimplementation\nprocedure Run;\nbegin\nX:=1;\nend;\nend.\n",
+        ),
+    ] {
+        write_file(path, source);
+    }
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    for (name, path, line, character_range) in [
+        ("multiline-paren-comment", &comment, 6, (0, 5)),
+        ("multiline-brace-comment", &brace_comment, 6, (0, 5)),
+        ("fmt-off", &fmt_off, 6, (0, 5)),
+        ("same-line-siblings", &same_line, 5, (0, 11)),
+        ("parser-recovery", &recovery, 6, (0, 5)),
+        ("partial-token", &nested_if, 6, (1, 4)),
+    ] {
+        let id = RequestId::from(format!("range-refuse-{name}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": {"uri": uri(path)},
+                "range": {"start": {"line": line, "character": character_range.0}, "end": {"line": line, "character": character_range.1}},
+                "options": {"tabSize": 2, "insertSpaces": true}
+            }),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_some() || response.result == Some(json!([])),
+            "unsafe range {name} must fail closed, got {response:?}"
+        );
+    }
+
+    for (name, path, line) in [
+        ("nested-if", &nested_if, 6),
+        ("nested-while", &nested_while, 6),
+    ] {
+        let full_id = RequestId::from(format!("range-full-{name}"));
+        server.send_request(
+            full_id.clone(),
+            "textDocument/formatting",
+            json!({"textDocument": {"uri": uri(path)}, "options": {"tabSize": 2, "insertSpaces": true}}),
+        );
+        let full = server.response(&full_id);
+        assert!(full.error.is_none(), "full formatting failed: {full:?}");
+        let full_text = full.result.expect("full edit array")[0]["newText"]
+            .as_str()
+            .expect("formatted document")
+            .to_string();
+        let expected_line = full_text
+            .lines()
+            .find(|line| line.trim() == "X := 1;")
+            .expect("selected formatted statement line");
+
+        let range_id = RequestId::from(format!("range-context-{name}"));
+        server.send_request(
+            range_id.clone(),
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": {"uri": uri(path)},
+                "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 5}},
+                "options": {"tabSize": 2, "insertSpaces": true}
+            }),
+        );
+        let range = server.response(&range_id);
+        if let Some(edits) = range.result {
+            let edits = edits.as_array().expect("range edit array");
+            if edits.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                edits[0]["newText"], expected_line,
+                "range indentation must match full formatter context for {name}"
+            );
+        } else {
+            let error = range
+                .error
+                .expect("nested range must either return edits or a fail-closed error");
+            assert_eq!(
+                error.code, -32803,
+                "unexpected refusal for {name}: {error:?}"
+            );
+        }
+    }
+
+    let uses_id = RequestId::from("range-uses-outside-selection".to_string());
+    server.send_request(
+        uses_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&uses)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let uses_response = server.response(&uses_id);
+    if let Some(edits) = uses_response.result {
+        let edits = edits.as_array().expect("range edits");
+        assert_eq!(edits.len(), 1, "the isolated statement should format once");
+        for edit in edits {
+            assert_eq!(edit["range"]["start"]["line"], 5);
+            assert_eq!(edit["range"]["end"]["line"], 5);
+            assert_eq!(edit["newText"], "  X := 1;");
+        }
+    } else {
+        let error = uses_response
+            .error
+            .expect("statement after a uses clause must edit locally or fail closed");
+        assert_eq!(error.code, -32803, "unexpected error: {error:?}");
+    }
+    server.shutdown();
+}
+
+#[test]
+fn range_formatting_fails_closed_when_syntax_mapping_work_is_exhausted() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let mut source =
+        String::from("unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:=1;\n");
+    for _ in 0..20_000 {
+        source.push_str("X:=1;\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&main, &source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("range-format-syntax-work-cap".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&id);
+    let error = response.error.expect("work limit must refuse the result");
+    assert!(
+        error
+            .message
+            .contains("syntax mapping exceeds its work limit"),
+        "unexpected refusal: {error:?}"
+    );
     server.shutdown();
 }
 
@@ -52407,6 +52598,144 @@ fn cancelling_blocked_formatting_returns_one_request_cancelled_response() {
     assert_eq!(error.code, -32800);
     assert_eq!(error.message, "request cancelled");
     server.assert_no_response(&request_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_blocked_range_formatting_returns_request_cancelled() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:=1;\nend;\nend.\n";
+    write_file(&main, source);
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("cancelled-blocked-range-formatting".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "$/cancelRequest",
+        json!({"id": "cancelled-blocked-range-formatting"}),
+    );
+
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("cancelled range formatting must return an error");
+    assert_eq!(error.code, -32800);
+    assert_eq!(error.message, "request cancelled");
+    server.assert_no_response(&request_id);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn changed_open_snapshot_discards_blocked_range_formatting_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let first_source =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:=1;\nend;\nend.\n";
+    let second_source = first_source.replace("X:=1;", "X:=2;");
+    write_file(&main, first_source);
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": first_source}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let request_id = RequestId::from("stale-blocked-range-formatting".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": second_source}]
+        }),
+    );
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .expect("newer overlay must stale range formatting");
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn changed_formatter_config_discards_blocked_range_formatting_result() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Main.pas");
+    let config = root.join(".fmt4d.toml");
+    let source =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:=1;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(&config, "[format]\nindent_size = 2\n");
+
+    let (mut server, barrier) = TestServer::launch_with_formatting_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let request_id = RequestId::from("stale-blocked-range-config".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 5}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    barrier.wait_until_entered();
+    write_file(&config, "[format]\nindent_size = 4\n");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+    let fence_id = RequestId::from("formatter-config-event-fence".to_string());
+    server.send_request(
+        fence_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    assert!(server.response(&fence_id).error.is_none());
+    barrier.release();
+    let response = server.response(&request_id);
+    let error = response
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("changed formatter config must stale result: {response:?}"));
+    assert_eq!(error.code, -32803);
+    assert_eq!(
+        error.message,
+        "analysis result became stale; retry the request"
+    );
     server.shutdown();
 }
 

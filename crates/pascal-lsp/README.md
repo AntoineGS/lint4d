@@ -916,9 +916,13 @@ returns an edit to the client and never writes files. Range formatting also
 honors the request's standard `tabSize` and `insertSpaces` options for that
 request, overriding only indentation in the project formatter configuration.
 Range formatting currently accepts a single complete statement line (expanded
-to that whole line) and emits edits only within it. Wider selections and ranges
-whose formatting cannot be mapped safely (including comments/directives or
-ambiguous `uses` ownership) are refused rather than replacing the full document.
+to that whole line) and emits edits only within it. It maps the statement using
+the original and full-document formatted syntax trees, so nested indentation
+comes from the real surrounding context; comments, compiler directives,
+`FMT.OFF` regions, parser recovery, neighboring same-line syntax, and ambiguous
+line/statement mappings fail closed. Wider selections and ranges whose formatting
+cannot be mapped safely (including ambiguous `uses` ownership) are refused
+rather than replacing the full document.
 Include files (`.inc`)
 participate in source analysis but are rejected as direct formatting targets;
 only `.pas`, `.dpr`, and `.dpk` buffers are formatted.

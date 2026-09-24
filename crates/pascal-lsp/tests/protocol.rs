@@ -153,7 +153,10 @@ fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
     assert_eq!(result, 0, "utimensat failed for {}", path.display());
 }
 
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+// The serial protocol suite starts many real server processes. Allow for
+// scheduler stalls on loaded hosts without weakening the short, explicit
+// negative-assertion timeouts used below.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
     Workspace::with_override_session(roots, options, OverrideSession::new(None))
@@ -2631,6 +2634,39 @@ fn document_link_path_ranges_include_leading_directive_trivia_in_utf16() {
 }
 
 #[test]
+fn document_links_cover_the_whole_unquoted_include_path_with_spaces() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Selected File.inc");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected File.inc}\nend.\n",
+    );
+    write_file(&include, "const Selected = 1;\n");
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("document-links-unquoted-space-range".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    let links = response.result.expect("document links");
+    assert_eq!(links.as_array().expect("links").len(), 1);
+    assert_eq!(links[0]["target"], uri(&include).as_str());
+    assert_eq!(
+        links[0]["range"],
+        json!({"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 21}})
+    );
+    server.shutdown();
+}
+
+#[test]
 fn document_links_refuse_unknown_conditional_include_paths() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");
@@ -2953,6 +2989,112 @@ fn document_links_omit_legacy_symlink_targets_outside_workspace() {
     let mut server = TestServer::launch();
     server.initialize(&root, Value::Null);
     let id = RequestId::from("document-links-symlink-escape".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn document_links_omit_parent_traversal_even_when_legacy_include_can_resolve_it() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let main = root.join("Main.pas");
+    let external = temp.path().join("Outside.inc");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I ../Outside.inc}\nend.\n",
+    );
+    write_file(&external, "const External = 1;\n");
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-parent-traversal".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
+#[cfg(all(feature = "test-support", unix))]
+#[test]
+fn document_links_reject_an_ancestor_symlink_inserted_while_delivery_waits() {
+    use std::os::unix::fs::symlink;
+
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let assets = root.join("assets");
+    fs::create_dir_all(&assets).expect("asset directory");
+    let main = root.join("Main.pas");
+    let old_target = assets.join("Selected.inc");
+    let external_dir = environment.path().join("external");
+    let external_target = external_dir.join("Selected.inc");
+    fs::create_dir_all(&external_dir).expect("external directory");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I assets/Selected.inc}\nend.\n",
+    );
+    write_file(&old_target, "const Selected = 1;\n");
+    write_file(&external_target, "const Selected = 1;\n");
+    let old_target_metadata = fs::metadata(&old_target).expect("old include metadata");
+    restore_mtime(&external_target, &old_target_metadata);
+    let root_metadata = fs::metadata(&root).expect("workspace metadata");
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-ancestor-symlink".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    fs::rename(&assets, external_dir.join("previous-assets")).expect("move previous assets away");
+    symlink(&external_dir, &assets).expect("external replacement directory");
+    restore_mtime(&root, &root_metadata);
+    barrier.release();
+    let response = server.response(&id);
+    assert_eq!(
+        response
+            .error
+            .expect("ancestor symlink must stale the link")
+            .code,
+        -32803
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_links_refuse_case_insensitive_lookup_over_directory_scan_limit() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(&temp.path().join("selected.inc"), "const Selected = 1;\n");
+    for index in 0..4_097 {
+        write_file(&temp.path().join(format!("Noise{index:04}.txt")), "x");
+    }
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("document-links-case-scan-limit".to_string());
     server.send_request(
         id.clone(),
         "textDocument/documentLink",
@@ -5612,7 +5754,7 @@ fn negotiated_pull_diagnostics_refreshes_authorized_unopened_changes() {
         json!({"changes": [{"uri": uri(&source), "type": 2}]}),
     );
     let refresh = server
-        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
         .expect("unopened source changes must request a pull refresh");
     server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
     server.shutdown();

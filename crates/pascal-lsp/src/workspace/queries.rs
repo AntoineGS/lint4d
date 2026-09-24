@@ -1318,13 +1318,15 @@ pub(crate) fn document_links_from_input(
             let Some(end) = rest.find('"') else { continue };
             (&rest[..end], 1)
         } else {
-            let end = operand.find(char::is_whitespace).unwrap_or(operand.len());
-            (&operand[..end], 0)
+            // Include resolution treats the whole unquoted remainder as the
+            // filename, including spaces. The link range must do the same.
+            (operand.trim_end(), 0)
         };
         if path.is_empty()
             || path.len() > 4096
             || path.contains(['*', '?', '$'])
             || path.contains('\\')
+            || path.contains(['\'', '"']) && quote_prefix == 0
         {
             continue;
         }
@@ -1402,6 +1404,11 @@ pub(crate) fn document_links_from_input(
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
             });
+            if let Err(error) =
+                record_document_link_ancestors(&target_path, &mut resource_records, cancel)
+            {
+                return failed(source_generation, configuration_generation, error);
+            }
             target
         } else {
             let target_source = format!("{{${}}}", directive.body);
@@ -1449,11 +1456,35 @@ pub(crate) fn document_links_from_input(
             let Ok(target_path) = target.to_file_path() else {
                 continue;
             };
-            if !context.read_policy.allows_location(&ProjectPathEntry {
-                path: target_path,
-                provenance: ProjectPathProvenance::LegacyNative,
-            }) {
+            let real_path = if let Ok(real_path) = target_path.canonicalize() {
+                real_path
+            } else if input.overlays.contains_key(&target) {
+                let Some((directory, name)) = target_path.parent().zip(target_path.file_name())
+                else {
+                    continue;
+                };
+                let Ok(directory) = directory.canonicalize() else {
+                    continue;
+                };
+                directory.join(name)
+            } else {
                 continue;
+            };
+            // The legacy include reader may admit `../` beside the owner.
+            // A document link needs a selected project/workspace read root,
+            // independent of that legacy navigation fallback.
+            if super::context_path_entry(&context, &real_path).is_none()
+                || !context.read_policy.allows_location(&ProjectPathEntry {
+                    path: target_path,
+                    provenance: ProjectPathProvenance::LegacyNative,
+                })
+            {
+                continue;
+            }
+            if let Err(error) =
+                record_document_link_ancestors(&real_path, &mut resource_records, cancel)
+            {
+                return failed(source_generation, configuration_generation, error);
             }
             target
         };
@@ -1493,6 +1524,62 @@ pub(crate) fn document_links_from_input(
         Ok(links),
         records,
     )
+}
+
+/// A leaf's stamp and bytes do not witness a change to one of its parent
+/// directories. Retain the whole ancestor chain so replacing a parent with a
+/// symlink is rejected at delivery even if the new leaf has identical bytes.
+fn record_document_link_ancestors(
+    target: &Path,
+    records: &mut Vec<SourceRecord>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut directory = target.parent();
+    let mut depth = 0usize;
+    while let Some(path) = directory {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        depth += 1;
+        if depth > 32 || records.len() >= MAX_DOCUMENT_LINK_FRESHNESS_RECORDS {
+            return Err("document-link ancestor observation limit exceeded".to_string());
+        }
+        let stamp = super::path_stamp_result(path)
+            .map_err(|error| {
+                format!(
+                    "cannot observe document-link ancestor {}: {error}",
+                    path.display()
+                )
+            })?
+            .ok_or_else(|| format!("document-link ancestor disappeared: {}", path.display()))?;
+        let uri = Url::from_file_path(path)
+            .map_err(|_| format!("invalid document-link ancestor: {}", path.display()))?;
+        records.push(SourceRecord {
+            uri,
+            text: String::new(),
+            version: None,
+            stamp: None,
+            open: false,
+            path: Some(path.to_path_buf()),
+            path_stamp: Some(stamp),
+            content_hash: None,
+            parsed_text_hash: None,
+            content_bytes: None,
+            candidate_membership: None,
+            candidate_observations: Vec::new(),
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            document_link_missing_candidate: false,
+            directory_observation: true,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
+        });
+        directory = path.parent();
+    }
+    Ok(())
 }
 
 pub(crate) fn range_formatting_from_input(

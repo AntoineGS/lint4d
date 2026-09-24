@@ -8981,7 +8981,13 @@ fn resolve_include_path_with_overrides(
     directories: &[PathBuf],
     overrides: &EffectiveOverrides,
 ) -> IncludeLookup {
-    resolve_include_path_with_overrides_and_overlay(directive, directories, overrides, |_| false)
+    resolve_include_path_with_overrides_and_overlay(
+        directive,
+        directories,
+        overrides,
+        |_| false,
+        None,
+    )
 }
 
 fn resolve_include_path_with_overrides_and_overlay(
@@ -8989,6 +8995,7 @@ fn resolve_include_path_with_overrides_and_overlay(
     directories: &[PathBuf],
     overrides: &EffectiveOverrides,
     has_overlay: impl Fn(&Path) -> bool,
+    cancel: Option<&AtomicBool>,
 ) -> IncludeLookup {
     let Some(raw) = include_name(directive) else {
         return IncludeLookup {
@@ -9052,7 +9059,7 @@ fn resolve_include_path_with_overrides_and_overlay(
             }
             Ok(_) => {}
             Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
-                let case_lookup = resolve_case_insensitive_include_path(&candidate);
+                let case_lookup = resolve_case_insensitive_include_path(&candidate, cancel);
                 observations.extend(case_lookup.observations);
                 if let Some(case_error) = case_lookup.error {
                     error = Some(case_error);
@@ -9102,7 +9109,10 @@ struct CaseInsensitiveIncludeLookup {
     error: Option<String>,
 }
 
-fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeLookup {
+fn resolve_case_insensitive_include_path(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> CaseInsensitiveIncludeLookup {
     let absolute = absolute_path(path.to_path_buf());
     let mut base = absolute.clone();
     while !base.exists() {
@@ -9120,6 +9130,8 @@ fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeL
         path: current.clone(),
         stamp: path_stamp(&current),
     });
+    let mut visited = 0usize;
+    let mut name_bytes = 0usize;
     for component in relative.components() {
         match component {
             Component::CurDir => {}
@@ -9143,16 +9155,48 @@ fn resolve_case_insensitive_include_path(path: &Path) -> CaseInsensitiveIncludeL
                         };
                     }
                 };
-                let mut matches = entries
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .eq_ignore_ascii_case(&wanted)
-                            .then_some(entry.path())
-                    })
-                    .collect::<Vec<_>>();
+                let mut matches = Vec::new();
+                for entry in entries {
+                    if cancel.is_some_and(is_cancelled) {
+                        return CaseInsensitiveIncludeLookup {
+                            observations,
+                            selected: None,
+                            error: Some(CANCELLATION_MESSAGE.to_string()),
+                        };
+                    }
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            return CaseInsensitiveIncludeLookup {
+                                observations,
+                                selected: None,
+                                error: Some(format!(
+                                    "cannot enumerate {}: {error}",
+                                    current.display()
+                                )),
+                            };
+                        }
+                    };
+                    let name = entry.file_name();
+                    visited = visited.saturating_add(1);
+                    name_bytes = name_bytes.saturating_add(name.len());
+                    if visited > 4_096 || name_bytes > 1_048_576 {
+                        return CaseInsensitiveIncludeLookup {
+                            observations,
+                            selected: None,
+                            error: Some(
+                                "case-insensitive include directory scan limit exceeded"
+                                    .to_string(),
+                            ),
+                        };
+                    }
+                    if name.to_string_lossy().eq_ignore_ascii_case(&wanted) {
+                        matches.push(entry.path());
+                        if matches.len() > 1 {
+                            break;
+                        }
+                    }
+                }
                 if matches.len() > 1 {
                     return CaseInsensitiveIncludeLookup {
                         observations,
@@ -9343,6 +9387,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                     .and_then(|uri| self.workspace.open_documents.get(&uri))
                     .is_some_and(|document| document.text.is_some())
             },
+            Some(cancel),
         );
         // Include resolution probes every directory and candidate before it
         // knows which file wins. Account for the complete observation set,
@@ -9492,6 +9537,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
                     .and_then(|uri| self.workspace.open_documents.get(&uri))
                     .is_some_and(|document| document.text.is_some())
             },
+            Some(cancel),
         );
         if let Some(budget) = self.budget {
             budget.charge_path_visits(lookup.observations.len())?;

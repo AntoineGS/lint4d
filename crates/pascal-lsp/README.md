@@ -19,7 +19,10 @@ eight ordinary relative path components (`/` separator); each is limited to
 256 KiB, with an 8 MiB cumulative read allowance. Ranges cover the path
 operand in UTF-16 coordinates; targets are file URIs. Source, project metadata,
 include search candidates (including case-insensitive matches), target contents,
-and overlay versions are revalidated before delivery. Inactive/unknown
+their parent directory components, and overlay versions are revalidated before
+delivery. Initial case-insensitive searches and their delivery checks each cap
+directory entry visits at 4,096 and name bytes at 1 MiB per candidate.
+Inactive/unknown
 conditional branches, unresolved or ambiguous paths, wildcard/variable names,
 backslash paths, traversal, symlinked targets, more than 64 directives, and
 incomplete or unauthorized targets produce no link. Include freshness evidence

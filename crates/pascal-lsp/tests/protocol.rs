@@ -34685,7 +34685,7 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state() {
+fn oversized_watched_file_notifications_permanently_fence_analysis() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
     let provider = root.join("Provider.pas");
@@ -34779,8 +34779,8 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
     );
     assert!(
-        result_locations(server.response(&old_after_count_id)).is_empty(),
-        "the old declaration must disappear after an oversized watcher batch"
+        server.response(&old_after_count_id).error.is_some(),
+        "analysis must be refused after an oversized watcher batch"
     );
     let new_after_count_id =
         RequestId::from("oversized-watch-new-definition-after-count".to_string());
@@ -34789,13 +34789,10 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         "textDocument/definition",
         navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
     );
-    let new_locations = result_locations(server.response(&new_after_count_id));
-    assert_eq!(
-        new_locations.len(),
-        1,
-        "new provider declaration after count overflow"
+    assert!(
+        server.response(&new_after_count_id).error.is_some(),
+        "the fence must refuse even apparently fresh provider data"
     );
-    assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
 
     let diagnostic_after_count_id =
         RequestId::from("oversized-watch-diagnostic-after-count".to_string());
@@ -34804,14 +34801,9 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&provider)},"previousResultId":initial_result_id}),
     );
-    let diagnostic_after_count = server.response(&diagnostic_after_count_id);
-    assert!(diagnostic_after_count.error.is_none());
-    let diagnostic_after_count = diagnostic_after_count.result.expect("updated diagnostic");
-    assert_eq!(diagnostic_after_count["kind"], "full");
     assert!(
-        diagnostic_after_count["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().all(|item| item["code"] != "constant-naming") })
+        server.response(&diagnostic_after_count_id).error.is_some(),
+        "pull diagnostics must be refused after watcher count overflow"
     );
     let count_refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
@@ -34853,8 +34845,8 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
     );
     assert!(
-        result_locations(server.response(&new_after_bytes_id)).is_empty(),
-        "the new declaration must disappear after a URI-byte-overflow watcher batch"
+        server.response(&new_after_bytes_id).error.is_some(),
+        "the count-overflow fence must remain latched through later byte overflow"
     );
     let old_after_bytes_id =
         RequestId::from("oversized-watch-old-definition-after-bytes".to_string());
@@ -34863,28 +34855,21 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         "textDocument/definition",
         navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
     );
-    let old_locations = result_locations(server.response(&old_after_bytes_id));
-    assert_eq!(
-        old_locations.len(),
-        1,
-        "old provider declaration after byte overflow"
+    assert!(
+        server.response(&old_after_bytes_id).error.is_some(),
+        "a later watcher batch cannot release the analysis fence"
     );
-    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
 
     let diagnostic_after_bytes_id =
         RequestId::from("oversized-watch-diagnostic-after-bytes".to_string());
     server.send_request(
         diagnostic_after_bytes_id.clone(),
         "textDocument/diagnostic",
-        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":diagnostic_after_count["resultId"]}),
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
     );
-    let diagnostic_after_bytes = server.response(&diagnostic_after_bytes_id);
-    assert!(diagnostic_after_bytes.error.is_none());
-    let diagnostic_after_bytes = diagnostic_after_bytes.result.expect("restored diagnostic");
     assert!(
-        diagnostic_after_bytes["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
+        server.response(&diagnostic_after_bytes_id).error.is_some(),
+        "pull diagnostics remain unavailable while fenced"
     );
     let bytes_refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
@@ -34893,6 +34878,331 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         bytes_refresh.id,
         Value::Null,
     )));
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
+    for overflow_by_count in [true, false] {
+        for pull_diagnostics in [true, false] {
+            let root = tempfile::tempdir().expect("temporary workspace");
+            let provider = root.path().join("Provider.pas");
+            let consumer = root.path().join("Consumer.pas");
+            let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+            let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 1;\ntype TOldAlias = Provider.TOldThing;\nimplementation\nend.\n";
+            write_file(&provider, provider_source);
+            write_file(&consumer, consumer_source);
+            let mut server = TestServer::launch();
+            if pull_diagnostics {
+                server.initialize_with_pull_diagnostics(root.path());
+            } else {
+                server.initialize(root.path(), Value::Null);
+            }
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+            );
+            let before_definition = RequestId::from(format!(
+                "watcher-delete-before-{overflow_by_count}-{pull_diagnostics}"
+            ));
+            server.send_request(
+                before_definition.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, "TOldThing", 0),
+            );
+            let locations = result_locations(server.response(&before_definition));
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+
+            let prior_result_id = if pull_diagnostics {
+                let id = RequestId::from(format!("watcher-delete-prior-pull-{overflow_by_count}"));
+                server.send_request(
+                    id.clone(),
+                    "textDocument/diagnostic",
+                    json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+                );
+                let response = server.response(&id);
+                assert!(
+                    response.error.is_none(),
+                    "initial pull failed: {response:?}"
+                );
+                Some(
+                    response.result.expect("initial pull result")["resultId"]
+                        .as_str()
+                        .expect("initial result ID")
+                        .to_owned(),
+                )
+            } else {
+                let publication = server
+                    .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                    .expect("consumer push diagnostics before watcher overflow");
+                assert!(
+                    !publication["diagnostics"].as_array().unwrap().is_empty(),
+                    "seed a visible push diagnostic before watcher overflow"
+                );
+                None
+            };
+
+            let mut changes = Vec::new();
+            if overflow_by_count {
+                for index in 0..64 {
+                    changes.push(json!({
+                        "uri":uri(&root.path().join(format!("Noise{index}.pas"))),
+                        "type":2
+                    }));
+                }
+                assert!(
+                    changes
+                        .iter()
+                        .map(|event| event["uri"].as_str().unwrap().len())
+                        .sum::<usize>()
+                        < 32 * 1024
+                );
+            } else {
+                let component = "w".repeat(178);
+                for index in 0..20 {
+                    let mut long_path = root.path().join(format!("long{index}"));
+                    for _ in 0..20 {
+                        long_path.push(&component);
+                    }
+                    changes.push(json!({"uri":uri(&long_path.join("Noise.pas")),"type":2}));
+                }
+                assert!(changes.len() < 64);
+                assert!(
+                    changes
+                        .iter()
+                        .map(|event| event["uri"].as_str().unwrap().len())
+                        .sum::<usize>()
+                        > 32 * 1024
+                );
+            }
+            // Keep the actual Deleted endpoint last: at count overflow it is
+            // entry 65, and at byte overflow it follows the long noise URIs.
+            changes.push(json!({"uri":uri(&provider),"type":3}));
+            if overflow_by_count {
+                assert_eq!(changes.len(), 65);
+            } else {
+                let total_uri_bytes: usize = changes
+                    .iter()
+                    .map(|event| event["uri"].as_str().unwrap().len())
+                    .sum();
+                assert!(total_uri_bytes > 32 * 1024);
+            }
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({"changes":changes}),
+            );
+
+            if pull_diagnostics {
+                if let Some(refresh) =
+                    server.request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                {
+                    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+                }
+                let id = RequestId::from(format!("watcher-delete-pull-after-{overflow_by_count}"));
+                server.send_request(
+                    id.clone(),
+                    "textDocument/diagnostic",
+                    json!({
+                        "textDocument":{"uri":uri(&provider)},
+                        "previousResultId":prior_result_id.unwrap()
+                    }),
+                );
+                let response = server.response(&id);
+                assert!(
+                    response.error.is_some(),
+                    "overflow must not produce a current/unchanged closed-provider report: {response:?}"
+                );
+            } else {
+                let clear = server
+                    .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                    .expect("watcher overflow must clear prior push diagnostics");
+                assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+            }
+
+            let stale_definition = RequestId::from(format!(
+                "watcher-delete-definition-after-{overflow_by_count}-{pull_diagnostics}"
+            ));
+            server.send_request(
+                stale_definition.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, "TOldThing", 0),
+            );
+            assert!(
+                server.response(&stale_definition).error.is_some(),
+                "closed deleted provider must not be rediscovered while its bytes remain on disk"
+            );
+
+            // A later ordinary event cannot clear the permanent uncertainty.
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({"changes":[{"uri":uri(&consumer),"type":2}]}),
+            );
+            let after_valid = RequestId::from(format!(
+                "watcher-delete-after-valid-{overflow_by_count}-{pull_diagnostics}"
+            ));
+            server.send_request(
+                after_valid.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, "TOldThing", 0),
+            );
+            assert!(
+                server.response(&after_valid).error.is_some(),
+                "later valid watcher event cannot release the overflow fence"
+            );
+            fs::remove_file(&provider).expect("client unlink after watched Deleted");
+            server.shutdown();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn watcher_changed_on_unplanned_moved_open_provider_is_not_authoritative() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let moved_provider = root.path().join("MovedProvider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let old_source =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_source =
+        "unit Provider;\ninterface\ntype TNewThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    write_file(&provider, old_source);
+    write_file(&consumer, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification("textDocument/didOpen", json!({
+        "textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_source}
+    }));
+    let before = RequestId::from("watcher-changed-move-before".to_string());
+    server.send_request(
+        before.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&before))[0]["uri"],
+        uri(&provider).to_string()
+    );
+
+    let metadata = fs::metadata(&provider).expect("old provider metadata");
+    fs::rename(&provider, &moved_provider).expect("external client move without rename plan");
+    write_file(&moved_provider, new_source);
+    restore_mtime(&moved_provider, &metadata);
+    let mut changes: Vec<Value> = (0..64)
+        .map(|index| {
+            json!({
+                "uri":uri(&root.path().join(format!("ChangedNoise{index}.pas"))),
+                "type":2
+            })
+        })
+        .collect();
+    changes.push(json!({"uri":uri(&provider),"type":2}));
+    assert_eq!(changes.len(), 65);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+    let stale = RequestId::from("watcher-changed-move-after-overflow".to_string());
+    server.send_request(
+        stale.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    assert!(
+        server.response(&stale).error.is_some(),
+        "a Changed watcher event cannot disambiguate a client-owned move with a live old overlay"
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sixty_four_short_watched_file_events_remain_reconcilable() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let created = root.path().join("Created.pas");
+    let deleted = root.path().join("Deleted.pas");
+    let old_source =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_source =
+        "unit Provider;\ninterface\ntype TNewThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    assert_eq!(old_source.len(), new_source.len());
+    write_file(&provider, old_source);
+    write_file(&consumer, consumer_source);
+    write_file(&deleted, "unit Deleted; interface implementation end.\n");
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+
+    let before = RequestId::from("watched-64-before".to_string());
+    server.send_request(
+        before.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&before))[0]["uri"],
+        uri(&provider).to_string()
+    );
+
+    write_file(&created, "unit Created; interface implementation end.\n");
+    fs::remove_file(&deleted).expect("client-owned delete before notification");
+    let mut changes = vec![
+        json!({"uri":uri(&created),"type":1}),
+        json!({"uri":uri(&deleted),"type":3}),
+    ];
+    let metadata = fs::metadata(&provider).expect("provider metadata");
+    write_file(&provider, new_source);
+    restore_mtime(&provider, &metadata);
+    changes.push(json!({"uri":uri(&provider),"type":2}));
+    changes.extend((0..61).map(|index| {
+        json!({
+            "uri":uri(&root.path().join(format!("ShortNoise{index}.pas"))),
+            "type":2
+        })
+    }));
+    assert_eq!(changes.len(), 64);
+    let total_uri_bytes: usize = changes
+        .iter()
+        .map(|change| change["uri"].as_str().unwrap().len())
+        .sum();
+    assert!(total_uri_bytes <= 32 * 1024);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    let old = RequestId::from("watched-64-old-after".to_string());
+    server.send_request(
+        old.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    let old_response = server.response(&old);
+    assert!(
+        old_response.error.is_none(),
+        "in-bound batch must remain available: {old_response:?}"
+    );
+    assert!(result_locations(old_response).is_empty());
+    let new = RequestId::from("watched-64-new-after".to_string());
+    server.send_request(
+        new.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TNewThing", 0),
+    );
+    let new_response = server.response(&new);
+    assert!(
+        new_response.error.is_none(),
+        "in-bound batch must reconcile: {new_response:?}"
+    );
+    assert_eq!(
+        result_locations(new_response)[0]["uri"],
+        uri(&provider).to_string()
+    );
     server.shutdown();
 }
 

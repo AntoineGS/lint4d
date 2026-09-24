@@ -1244,8 +1244,14 @@ bounded recovery envelope, analysis is permanently fenced for that workspace
 instance before global invalidation; restart is required rather than publishing
 results from incomplete endpoint evidence.
 Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
-`didRenameFiles` notifications are not silently discarded. Oversized watched
-file batches retain their conservative workspace-wide invalidation behavior.
+`didRenameFiles` notifications are not silently discarded. A watched-file batch
+over 64 events or over 32 KiB of cumulative canonical URI bytes permanently
+fences workspace analysis before invalidation: the event list is not partially
+applied, because an uninspected late `Deleted` endpoint may still have readable
+old bytes or a `Changed` event may not explain an open overlay's move. The
+fence requests diagnostic cleanup/refresh, discards queued diagnostic
+publications, and is not lifted by later valid file events; restart the
+workspace/server instance to resume analysis.
 An over-64-entry create, delete, or rename file-operation batch, or an in-limit
 batch whose cumulative canonical URI bytes exceed 32 KiB, permanently fences
 analysis for that workspace instance before invalidation. The endpoint list

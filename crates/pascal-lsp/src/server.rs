@@ -10540,15 +10540,6 @@ fn add_file_operation_uri_bytes(total: &mut usize, uri: &Url) -> Result<(), Stri
     Ok(())
 }
 
-fn invalidate_for_file_notification_overflow(
-    workspace: &mut Workspace,
-) -> DiagnosticNotificationEffect {
-    workspace.invalidate_all_for_file_notification_overflow_bounded();
-    let mut effect = DiagnosticNotificationEffect::default();
-    effect.refresh_all_diagnostics();
-    effect
-}
-
 fn invalidate_ambiguous_file_notification(
     workspace: &mut Workspace,
     budget: Option<&ReconciliationBudget>,
@@ -11057,22 +11048,30 @@ fn handle_notification_with_control_inner(
             }
             if params.changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
                 eprintln!(
-                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; invalidating workspace file state"
+                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; fencing workspace analysis"
                 );
-                return Ok(invalidate_for_file_notification_overflow(workspace));
+                return Ok(permanently_fence_file_notification_analysis(
+                    workspace,
+                    budget,
+                    push_diagnostics_supported,
+                ));
             }
             let mut total_uri_bytes = 0usize;
             let mut changes = Vec::with_capacity(params.changes.len());
-            let mut oversized_uri_bytes = false;
             for change in params.changes {
                 let uri = canonical_file_uri(&change.uri);
                 if uri.to_file_path().is_err() {
                     return Err("watched file batch contains a non-file URI".into());
                 }
-                if !oversized_uri_bytes
-                    && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
-                {
-                    oversized_uri_bytes = true;
+                if add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err() {
+                    eprintln!(
+                        "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
+                    );
+                    return Ok(permanently_fence_file_notification_analysis(
+                        workspace,
+                        budget,
+                        push_diagnostics_supported,
+                    ));
                 }
                 let kind = if change.typ == FileChangeType::CREATED {
                     FileChange::Created
@@ -11082,12 +11081,6 @@ fn handle_notification_with_control_inner(
                     FileChange::Deleted
                 };
                 changes.push((uri, kind));
-            }
-            if oversized_uri_bytes {
-                eprintln!(
-                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
-                );
-                return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             if let Some(budget) = budget {
                 for (uri, kind) in &changes {

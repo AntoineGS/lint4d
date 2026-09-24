@@ -12801,6 +12801,120 @@ mod tests {
         );
     }
 
+    fn assert_source_refresh_budget_stops_before_the_next_project_entry(open: bool) {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let project = root.join("Original.dproj");
+        fs::write(&project, "<Project></Project>").expect("original project");
+        let source_path = root.join("Owner.pas");
+        let source = "unit Owner; interface implementation end.";
+        fs::write(&source_path, source).expect("cached source");
+        for index in 0..12 {
+            fs::write(root.join(format!("Noise{index:02}.txt")), "x").expect("directory noise");
+        }
+        let uri = Url::from_file_path(&source_path).expect("source URI");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        workspace
+            .open_document(uri.clone(), source.to_owned(), 1)
+            .expect("admit owner source and index");
+        let original_owner = workspace.document_owners[&uri].clone();
+        assert!(workspace.indexed_files.contains(&uri));
+        assert!(workspace.index.contains(&uri));
+        assert_eq!(
+            original_owner.key.project_file.as_deref(),
+            Some(project.as_path())
+        );
+
+        if !open {
+            assert!(workspace.close_document(&uri));
+            assert!(!workspace.open_documents.contains_key(&uri));
+            assert!(workspace.indexed_files.contains(&uri));
+            assert!(workspace.disk_stamps.contains_key(&uri));
+        }
+
+        let newly_added_project = root.join("NewCandidate.dproj");
+        fs::write(&newly_added_project, "<Project></Project>").expect("new project candidate");
+        let context_key = workspace.document_contexts[&uri].clone();
+        let budget = std::rc::Rc::new(ReconciliationBudget::new(std::sync::Arc::new(
+            AtomicBool::new(false),
+        )));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS - 32)
+            .expect("leave a controlled amount of source-refresh work");
+        let initial_visits = budget.used.get().filesystem_path_visits;
+        let advances = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let visits_before_saturation = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let hook_budget = std::rc::Rc::clone(&budget);
+        let hook_advances = std::rc::Rc::clone(&advances);
+        let hook_visits = std::rc::Rc::clone(&visits_before_saturation);
+        let hook_root = root.clone();
+        let _advance_guard =
+            pascal_project::test_before_project_directory_advance(move |directory| {
+                if directory != hook_root {
+                    return;
+                }
+                let step = hook_advances.get() + 1;
+                hook_advances.set(step);
+                if step == 1 {
+                    let used = hook_budget.used.get().filesystem_path_visits;
+                    hook_visits.set(used);
+                    let remaining =
+                        super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS.saturating_sub(used);
+                    hook_budget
+                        .charge_path_visits(remaining)
+                        .expect("test hook fills the shared visit envelope");
+                }
+            });
+
+        let result = workspace.load_source_with_reconciliation_budget(
+            &uri,
+            &context_key,
+            &HashSet::new(),
+            None,
+            Some(budget.as_ref()),
+        );
+
+        assert_eq!(
+            advances.get(),
+            1,
+            "the next iterator advancement is refused"
+        );
+        assert!(
+            visits_before_saturation.get() > initial_visits,
+            "the source-owner/root prefix must be charged before candidate iteration"
+        );
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS
+        );
+        assert_eq!(
+            result.expect_err("refresh must refuse at the next project-directory step"),
+            super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
+        );
+        assert_eq!(
+            workspace.document_owners[&uri].key, original_owner.key,
+            "partial candidate enumeration must not select the newly added project"
+        );
+        assert_eq!(workspace.index.document_count(), 1);
+        let source_generation_before_fallback = workspace.source_generation();
+
+        workspace.invalidate_for_reconciliation_budget(budget.as_ref());
+
+        assert!(!workspace.index.contains(&uri));
+        assert!(!workspace.document_contexts.contains_key(&uri));
+        assert!(workspace.source_generation() > source_generation_before_fallback);
+    }
+
+    #[test]
+    fn open_source_refresh_budget_refuses_before_project_directory_advances_again() {
+        assert_source_refresh_budget_stops_before_the_next_project_entry(true);
+    }
+
+    #[test]
+    fn cached_closed_source_refresh_budget_refuses_before_project_directory_advances_again() {
+        assert_source_refresh_budget_stops_before_the_next_project_entry(false);
+    }
+
     #[test]
     fn second_include_dependent_removal_budget_failure_uses_global_recovery() {
         let temp = tempfile::tempdir().expect("workspace root");

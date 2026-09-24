@@ -2207,6 +2207,8 @@ fn project_directory_entries(
             work_budget.check_cancelled()?;
             work_budget.charge_path_visits(1)?;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        run_test_project_directory_advance_hook(directory);
         let Some(entry) = entries.next() else {
             break;
         };
@@ -2242,6 +2244,46 @@ fn project_directory_entries(
         }
     }
     Ok(result)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type ProjectDirectoryAdvanceHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_BEFORE_PROJECT_DIRECTORY_ADVANCE:
+        std::cell::RefCell<Option<ProjectDirectoryAdvanceHook>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestProjectDirectoryAdvanceGuard(Option<ProjectDirectoryAdvanceHook>);
+
+/// Install a test-only callback after a directory-step budget charge succeeds
+/// and immediately before the iterator advances. This makes the admission
+/// boundary deterministic without sleeps or filesystem timing assumptions.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_before_project_directory_advance(
+    hook: impl FnMut(&Path) + 'static,
+) -> TestProjectDirectoryAdvanceGuard {
+    let previous = TEST_BEFORE_PROJECT_DIRECTORY_ADVANCE
+        .with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+    TestProjectDirectoryAdvanceGuard(previous)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestProjectDirectoryAdvanceGuard {
+    fn drop(&mut self) {
+        TEST_BEFORE_PROJECT_DIRECTORY_ADVANCE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_test_project_directory_advance_hook(directory: &Path) {
+    TEST_BEFORE_PROJECT_DIRECTORY_ADVANCE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(directory);
+        }
+    });
 }
 
 fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {

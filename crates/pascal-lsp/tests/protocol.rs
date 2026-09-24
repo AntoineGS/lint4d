@@ -718,6 +718,54 @@ impl TestServer {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    fn response_acknowledging_diagnostic_refresh(&mut self, expected_id: &RequestId) -> Response {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        loop {
+            if let Some(index) = self.pending.iter().position(|message| {
+                matches!(message, Message::Request(request) if request.method == "workspace/diagnostic/refresh")
+            }) {
+                let Message::Request(refresh) =
+                    self.pending.remove(index).expect("pending diagnostic refresh")
+                else {
+                    unreachable!("refresh request predicate");
+                };
+                self.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+                continue;
+            }
+            if let Some(index) = self.pending.iter().position(|message| {
+                matches!(message, Message::Response(response) if &response.id == expected_id)
+            }) {
+                return match self.pending.remove(index).expect("pending response") {
+                    Message::Response(response) => response,
+                    _ => unreachable!("response predicate"),
+                };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = match self.messages.recv_timeout(remaining) {
+                Ok(Ok(Some(message))) => message,
+                Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server disconnected waiting for {expected_id:?}")
+                }
+                Ok(Err(error)) => {
+                    panic!("failed reading while waiting for {expected_id:?}: {error}")
+                }
+                Err(RecvTimeoutError::Timeout) => panic!(
+                    "timed out waiting for {expected_id:?}; status {:?}, pending {:?}",
+                    self.child.try_wait(),
+                    self.pending
+                ),
+            };
+            match message {
+                Message::Request(request) if request.method == "workspace/diagnostic/refresh" => {
+                    self.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+                }
+                Message::Response(response) if &response.id == expected_id => return response,
+                other => self.pending.push_back(other),
+            }
+        }
+    }
+
     fn response_with_timeout(
         &mut self,
         expected_id: &RequestId,
@@ -35038,6 +35086,406 @@ fn exit_bypasses_full_workspace_fifo_and_overflow_without_releasing_worker_barri
 #[cfg(feature = "test-support")]
 fn shutdown_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline() {
     assert_saturated_control_bypasses_workspace_fifo(false, 1, false, Some(150), false, false);
+}
+
+#[test]
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+fn saturated_workspace_fifo_replays_watched_and_document_events_in_order() {
+    const FILLER_NOTIFICATIONS: usize = 57;
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let moved_provider = root.path().join("Provider.pas.moved");
+    let consumer = root.path().join("Consumer.pas");
+    let old_disk = "unit Provider;\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n";
+    let recreated_disk =
+        "unit Provider;\ninterface\ntype TOnDisk = Integer;\nimplementation\nend.\n";
+    let changed_overlay =
+        "unit Provider;\ninterface\ntype TChanged = Integer;\nimplementation\nend.\n";
+    let reopened_overlay =
+        "unit Provider;\ninterface\ntype TFinal = Integer;\nimplementation\nend.\n";
+    assert_eq!(old_disk.len(), recreated_disk.len());
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TBeforeUse = Provider.TBefore;\ntype TChangedUse = Provider.TChanged;\ntype TDiskUse = Provider.TOnDisk;\ntype TFinalUse = Provider.TFinal;\nimplementation\nend.\n";
+    write_file(&provider, old_disk);
+    write_file(&consumer, consumer_source);
+
+    let barrier_dir = root.path().join("saturated-order-barriers");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let discovery_barrier = TestBarrier {
+        entered: barrier_dir.join("discovery-entered"),
+        release: barrier_dir.join("discovery-release"),
+    };
+    let discovery_spec = format!(
+        "{}|{}",
+        discovery_barrier.entered.display(),
+        discovery_barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [(
+            "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+            discovery_spec.as_str(),
+        )],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_disk}}),
+    );
+    let prior_pull_id = RequestId::from("saturated-order-prior-pull".to_string());
+    server.send_request(
+        prior_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":null}),
+    );
+    let prior_pull = server.response(&prior_pull_id);
+    assert!(prior_pull.error.is_none(), "initial pull: {prior_pull:?}");
+    let prior_result_id = prior_pull.result.expect("initial pull result")["resultId"]
+        .as_str()
+        .expect("initial result ID")
+        .to_owned();
+
+    let trigger = root.path().join("block-discovery.pas");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&trigger),"type":2}]}),
+    );
+    discovery_barrier.wait_until_entered();
+
+    let mut queued_bytes = 0usize;
+    for index in 0..FILLER_NOTIFICATIONS {
+        let path = root.path().join(format!("Queued{index:02}.pas"));
+        let message = Message::Notification(Notification::new(
+            "textDocument/didOpen".to_string(),
+            json!({"textDocument":{"uri":uri(&path),"languageId":"pascal","version":1,"text":"unit Queued; interface implementation end."}}),
+        ));
+        queued_bytes = queued_bytes.saturating_add(
+            serde_json::to_vec(&message)
+                .expect("serialize deferred event")
+                .len(),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&path),"languageId":"pascal","version":1,"text":"unit Queued; interface implementation end."}}),
+        );
+    }
+
+    // FIFO entries 58–64: old provider delete is reported before unlink;
+    // create follows a same-size disk replacement with restored mtime. Then
+    // didChange/request/didClose/request/didOpen establish observable order.
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":3}]}),
+    );
+    let old_stamp = fs::metadata(&provider).expect("old provider stamp");
+    fs::rename(&provider, &moved_provider).expect("client move before watched create");
+    write_file(&provider, recreated_disk);
+    restore_mtime(&provider, &old_stamp);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":1}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":2},"contentChanges":[{"text":changed_overlay}]}),
+    );
+    let changed_pull_id = RequestId::from("saturated-order-pull-after-change".to_string());
+    server.send_request(
+        changed_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    let close_pull_id = RequestId::from("saturated-order-pull-after-close".to_string());
+    server.send_request(
+        close_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":3,"text":reopened_overlay}}),
+    );
+    // Entry 65 is the retained overflow slot; entry 66 is the final request.
+    let pull_after_id = RequestId::from("saturated-order-after-pull".to_string());
+    server.send_request(
+        pull_after_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+    );
+    // Entry 66 is an ordinary request behind the full FIFO and overflow slot.
+    // It must remain unanswered until the held worker is explicitly released.
+    let final_definition_id = RequestId::from("saturated-order-after-open".to_string());
+    server.send_request(
+        final_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "Provider.TFinal", 0),
+    );
+    assert_eq!(
+        FILLER_NOTIFICATIONS + 7,
+        64,
+        "fill the bounded FIFO exactly"
+    );
+    assert_eq!(
+        FILLER_NOTIFICATIONS + 8,
+        65,
+        "retain exactly one overflow frame"
+    );
+    assert_eq!(
+        FILLER_NOTIFICATIONS + 9,
+        66,
+        "place one ordinary request behind it"
+    );
+    // The eight post-filler accepted frames (including the overflow entry)
+    // each serialize below this conservative per-frame bound.
+    queued_bytes = queued_bytes.saturating_add(8 * 512);
+    assert!(
+        queued_bytes < 1024 * 1024,
+        "FIFO fixtures must stay within the byte cap"
+    );
+
+    assert!(
+        !discovery_barrier.release.exists(),
+        "worker remains blocked while requests are deferred"
+    );
+    assert!(
+        server
+            .response_with_timeout(&final_definition_id, Duration::from_millis(100))
+            .is_none(),
+        "66th request must remain unanswered until the held worker is released"
+    );
+    discovery_barrier.release();
+
+    for (request_id, stage) in [
+        (&changed_pull_id, "didChange"),
+        (&close_pull_id, "didClose"),
+        (&pull_after_id, "didOpen"),
+    ] {
+        let response = server.response_acknowledging_diagnostic_refresh(request_id);
+        assert!(
+            response.error.is_some()
+                || response
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result["kind"] != "unchanged"),
+            "{stage} must not reuse the pre-event pull result ID: {response:?}"
+        );
+    }
+    let final_response = server.response_acknowledging_diagnostic_refresh(&final_definition_id);
+    assert!(
+        final_response.error.is_none(),
+        "final request: {final_response:?}"
+    );
+    let final_locations = result_locations(final_response);
+    assert_eq!(final_locations[0]["uri"], uri(&provider).to_string());
+    let fresh_pull_id = RequestId::from("saturated-order-fresh-pull-after-release".to_string());
+    server.send_request(
+        fresh_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+    );
+    let fresh_pull = server.response_acknowledging_diagnostic_refresh(&fresh_pull_id);
+    assert!(
+        fresh_pull.error.is_none(),
+        "fresh post-release pull: {fresh_pull:?}"
+    );
+    assert_ne!(
+        fresh_pull.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "fresh pull must not reuse the pre-event result ID"
+    );
+
+    server.shutdown();
+}
+
+// Separate from the FIFO test above because this fixture holds a semantic
+// navigation job and a file-discovery worker concurrently, then observes the
+// push publication clear/fresh sequence. Combining those independent barriers
+// with the 66-frame FIFO would add synchronization complexity without more
+// queue-boundary evidence.
+#[test]
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+fn blocked_watched_delete_rejects_old_result_and_pushes_fresh_provider_diagnostics() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let moved_provider = root.path().join("Provider.pas.moved");
+    let consumer = root.path().join("Consumer.pas");
+    let blocker = root.path().join("Blocker.pas");
+    let old_disk = "unit Provider;\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n";
+    let recreated_disk =
+        "unit Provider;\ninterface\ntype TOnDisk = Integer;\nimplementation\nend.\n";
+    let changed_overlay =
+        "unit Provider;\ninterface\ntype TChanged = Integer;\nimplementation\nend.\n";
+    let reopened_overlay =
+        "unit Provider;\ninterface\ntype TNew = Integer;\nimplementation\nend.\n";
+    let consumer_v1 = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 1;\ntype TUseNew = Provider.TNew;\ntype TOldUse = Provider.TBefore;\nimplementation\nend.\n";
+    let consumer_v2 = "unit Consumer;\ninterface\nuses Provider;\nconst BAD_CONST = 2;\ntype TUseNew = Provider.TNew;\nimplementation\nend.\n";
+    let consumer_v3 = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 3;\ntype TUseNew = Provider.TNew;\nimplementation\nend.\n";
+    assert_eq!(old_disk.len(), recreated_disk.len());
+    write_file(&provider, old_disk);
+    write_file(&consumer, consumer_v1);
+    write_file(
+        &blocker,
+        "unit Blocker;\ninterface\ntype TBlock = Integer;\nimplementation\nend.\n",
+    );
+
+    let barrier_dir = root.path().join("provider-freshness-barriers");
+    fs::create_dir_all(&barrier_dir).expect("barrier directory");
+    let discovery_barrier = TestBarrier {
+        entered: barrier_dir.join("discovery-entered"),
+        release: barrier_dir.join("discovery-release"),
+    };
+    let navigation_barrier = TestBarrier {
+        entered: barrier_dir.join("navigation-entered"),
+        release: barrier_dir.join("navigation-release"),
+    };
+    let discovery_spec = format!(
+        "{}|{}",
+        discovery_barrier.entered.display(),
+        discovery_barrier.release.display()
+    );
+    let navigation_spec = format!(
+        "{}|{}",
+        navigation_barrier.entered.display(),
+        navigation_barrier.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                discovery_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                navigation_spec.as_str(),
+            ),
+        ],
+    );
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_v1}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_disk}}),
+    );
+    let initial = server
+        .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+        .expect("initial push diagnostics for the lower-case constant");
+    assert!(
+        !initial["diagnostics"].as_array().unwrap().is_empty(),
+        "initial consumer report must have a real naming diagnostic"
+    );
+    let blocker_symbols = RequestId::from("provider-freshness-load-blocker".to_string());
+    server.send_request(
+        blocker_symbols.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument":{"uri":uri(&blocker)}}),
+    );
+    assert!(server.response(&blocker_symbols).error.is_none());
+
+    let old_query_id = RequestId::from("provider-freshness-old-definition".to_string());
+    server.send_request(
+        old_query_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_v1, "Provider.TBefore", 0),
+    );
+    assert!(
+        server
+            .response_with_timeout(&old_query_id, Duration::from_millis(100))
+            .is_none(),
+        "old provider navigation must still be in flight before the barrier is inspected"
+    );
+    navigation_barrier.wait_until_entered();
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&blocker),"type":2}]}),
+    );
+    discovery_barrier.wait_until_entered();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":3}]}),
+    );
+    let old_stamp = fs::metadata(&provider).expect("old provider mtime");
+    fs::rename(&provider, &moved_provider).expect("client move after Deleted notification");
+    write_file(&provider, recreated_disk);
+    restore_mtime(&provider, &old_stamp);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":1}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":2},"contentChanges":[{"text":changed_overlay}]}),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":3,"text":reopened_overlay}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":2},"contentChanges":[{"text":consumer_v2}]}),
+    );
+    discovery_barrier.release();
+
+    let clear = server
+        .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+        .expect("clean current diagnostics after provider and consumer replay");
+    assert!(
+        clear["diagnostics"].as_array().is_some_and(Vec::is_empty),
+        "fresh v2 publication must clear the prior naming diagnostic: {clear}"
+    );
+    assert_eq!(clear["version"], 2);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":3},"contentChanges":[{"text":consumer_v3}]}),
+    );
+    let fresh = server
+        .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+        .expect("fresh push diagnostics after the v3 consumer edit");
+    assert_eq!(
+        fresh["version"], 3,
+        "fresh report must match the latest consumer overlay"
+    );
+    assert!(
+        !fresh["diagnostics"].as_array().unwrap().is_empty(),
+        "fresh report must reflect the current naming diagnostic"
+    );
+
+    let final_query_id = RequestId::from("provider-freshness-new-definition".to_string());
+    server.send_request(
+        final_query_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_v3, "Provider.TNew", 0),
+    );
+    navigation_barrier.release();
+    let old_response = server.response(&old_query_id);
+    assert!(
+        old_response.error.is_some() || result_locations(old_response).is_empty(),
+        "in-flight result against the old provider identity must be discarded"
+    );
+    let new_response = server.response(&final_query_id);
+    let new_locations = result_locations(new_response);
+    assert_eq!(new_locations.len(), 1);
+    assert_eq!(
+        new_locations[0]["uri"],
+        uri(&provider).to_string(),
+        "fresh navigation must resolve to the recreated, currently-open provider"
+    );
+    server.shutdown();
 }
 
 #[test]

@@ -1246,14 +1246,17 @@ results from incomplete endpoint evidence.
 Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
 `didRenameFiles` notifications are not silently discarded. Oversized watched
 file batches retain their conservative workspace-wide invalidation behavior.
-An over-64-entry create, delete, or rename file-operation batch permanently
-fences analysis for that workspace instance before invalidation, because the
-uninspected endpoint list may contain a delete-before-unlink or client-owned
-rename affecting an open overlay or selected provider. These batches request
-diagnostic cleanup/refresh but are not traversed or applied entry-by-entry;
+An over-64-entry create, delete, or rename file-operation batch, or an in-limit
+batch whose cumulative canonical URI bytes exceed 32 KiB, permanently fences
+analysis for that workspace instance before invalidation. The endpoint list
+may contain a delete-before-unlink or client-owned rename affecting an open
+overlay or selected provider; byte-overflow batches are therefore not treated
+as attributable merely because their bounded entries were parsed. These
+batches request diagnostic cleanup/refresh but are not applied entry-by-entry;
 later valid file events do not lift the fence. Restart the workspace/server
-instance to resume analysis. In-limit batches (up to 64 entries) continue
-through endpoint validation and normal bounded reconciliation. Pending
+instance to resume analysis. In-limit batches (up to 64 entries and 32 KiB of
+canonical URI bytes) continue through endpoint validation and normal bounded
+reconciliation. Pending
 unit-rename transitions are invalidated, and any open old/new endpoint overlay
 whose transition can no longer be proved is rejected until reopened. Ordinary
 file-event discovery and dependent-diagnostic fan-out run on a serialized

@@ -31648,7 +31648,10 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
-    assert!(server.response(&probe_id).error.is_none());
+    assert!(
+        server.response(&probe_id).error.is_some(),
+        "in-count URI-byte overflow must fence analysis before dropping its endpoint evidence"
+    );
     let byte_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
         byte_refresh.id,
@@ -31769,6 +31772,291 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
     let refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
     server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uri_byte_overflow_rename_fences_unplanned_move_for_push_and_pull() {
+    for pull_diagnostics in [false, true] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let renamed_provider = root.path().join("Renamed.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let old_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let new_source = "unit Provider;\ninterface\nconst GOODNAME = 2;\ntype TNewThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 1;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+        assert_eq!(old_source.len(), new_source.len());
+        write_file(&provider, old_source);
+        write_file(&consumer, consumer_source);
+        let mut server = TestServer::launch();
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(root.path());
+        } else {
+            server.initialize(root.path(), Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_source}}),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+        );
+        let before_definition =
+            RequestId::from(format!("byte-overflow-rename-before-{pull_diagnostics}"));
+        server.send_request(
+            before_definition.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        let locations = result_locations(server.response(&before_definition));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+
+        let prior_result_id = if pull_diagnostics {
+            let id = RequestId::from("byte-overflow-rename-pull-before".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "initial pull failed: {response:?}"
+            );
+            Some(
+                response.result.expect("pull result")["resultId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        } else {
+            let publication = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("provider diagnostics before move");
+            assert!(!publication["diagnostics"].as_array().unwrap().is_empty());
+            let consumer_publication = server
+                .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                .expect("consumer diagnostics before move");
+            assert!(
+                !consumer_publication["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            None
+        };
+
+        let original_metadata = fs::metadata(&provider).expect("provider metadata");
+        fs::rename(&provider, &renamed_provider).expect("client-owned move without will plan");
+        write_file(&renamed_provider, new_source);
+        restore_mtime(&renamed_provider, &original_metadata);
+        let component = "n".repeat(120);
+        let mut files: Vec<Value> = (0..62)
+            .map(|index| {
+                let mut path = root.path().join(format!("noise{index}"));
+                for _ in 0..5 {
+                    path.push(&component);
+                }
+                json!({"oldUri":uri(&path.join("Old.pas")),"newUri":uri(&path.join("New.pas"))})
+            })
+            .collect();
+        files.push(json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)}));
+        assert_eq!(files.len(), 63);
+        let bytes: usize = files
+            .iter()
+            .map(|pair| {
+                pair["oldUri"].as_str().unwrap().len() + pair["newUri"].as_str().unwrap().len()
+            })
+            .sum();
+        assert!(
+            bytes > 32 * 1024,
+            "test batch must overflow the URI budget: {bytes}"
+        );
+        server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+
+        if pull_diagnostics {
+            if let Some(refresh) =
+                server.request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            {
+                server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            }
+            let id = RequestId::from("byte-overflow-rename-pull-after".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":prior_result_id.unwrap()
+                }),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_some(),
+                "URI-byte overflow must not answer unchanged: {response:?}"
+            );
+        } else {
+            for file in [&provider, &consumer] {
+                let clear = server
+                    .diagnostic_with_timeout(&uri(file), IO_TIMEOUT)
+                    .expect("URI-byte overflow must clear previous push diagnostics");
+                assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+            }
+        }
+        let old_id = RequestId::from(format!("byte-overflow-rename-old-{pull_diagnostics}"));
+        server.send_request(
+            old_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        assert!(
+            server.response(&old_id).error.is_some(),
+            "old overlay/source must not remain authoritative"
+        );
+        let new_id = RequestId::from(format!("byte-overflow-rename-new-{pull_diagnostics}"));
+        server.send_request(
+            new_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TNewThing", 0),
+        );
+        assert!(
+            server.response(&new_id).error.is_some(),
+            "destination must not be inferred as authoritative"
+        );
+        server.send_notification(
+            "workspace/didCreateFiles",
+            json!({"files":[{"uri":uri(&renamed_provider)}]}),
+        );
+        let after_valid = RequestId::from(format!(
+            "byte-overflow-rename-after-valid-{pull_diagnostics}"
+        ));
+        server.send_request(
+            after_valid.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TNewThing", 0),
+        );
+        assert!(
+            server.response(&after_valid).error.is_some(),
+            "later valid event cannot release URI-byte fence"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uri_byte_overflow_delete_fences_closed_provider_before_unlink_for_push_and_pull() {
+    for pull_diagnostics in [false, true] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 1;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        let mut server = TestServer::launch();
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(root.path());
+        } else {
+            server.initialize(root.path(), Value::Null);
+        }
+        server.send_notification("textDocument/didOpen", json!({
+            "textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}
+        }));
+        let before_id = RequestId::from(format!("byte-overflow-delete-before-{pull_diagnostics}"));
+        server.send_request(
+            before_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        let locations = result_locations(server.response(&before_id));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+
+        let prior_result_id = if pull_diagnostics {
+            let id = RequestId::from("byte-overflow-delete-pull-before".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(response.error.is_none());
+            Some(
+                response.result.expect("pull result")["resultId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        } else {
+            let publication = server
+                .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                .expect("consumer warning before deleting provider");
+            assert!(!publication["diagnostics"].as_array().unwrap().is_empty());
+            None
+        };
+
+        let component = "d".repeat(120);
+        let mut files: Vec<Value> = (0..62)
+            .map(|index| {
+                let mut path = root.path().join(format!("noise{index}"));
+                for _ in 0..5 {
+                    path.push(&component);
+                }
+                json!({"uri":uri(&path.join("Noise.pas"))})
+            })
+            .collect();
+        files.push(json!({"uri":uri(&provider)}));
+        assert_eq!(files.len(), 63);
+        let bytes: usize = files
+            .iter()
+            .map(|file| file["uri"].as_str().unwrap().len())
+            .sum();
+        assert!(
+            bytes > 32 * 1024,
+            "test batch must overflow URI budget: {bytes}"
+        );
+        server.send_notification("workspace/didDeleteFiles", json!({"files":files}));
+
+        if pull_diagnostics {
+            if let Some(refresh) =
+                server.request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            {
+                server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            }
+            let id = RequestId::from("byte-overflow-delete-pull-after".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":prior_result_id.unwrap()
+                }),
+            );
+            assert!(
+                server.response(&id).error.is_some(),
+                "closed provider pull must not return unchanged"
+            );
+        } else {
+            let clear = server
+                .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                .expect("URI-byte overflow must clear open consumer diagnostics");
+            assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+        }
+        let after_id = RequestId::from(format!("byte-overflow-delete-after-{pull_diagnostics}"));
+        server.send_request(
+            after_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        assert!(
+            server.response(&after_id).error.is_some(),
+            "closed provider must not be rediscovered before unlink"
+        );
+        fs::remove_file(&provider).expect("client unlink after delete notification");
+        server.shutdown();
+    }
 }
 
 #[test]
@@ -36173,7 +36461,7 @@ fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
 #[cfg(feature = "test-support")]
 #[test]
 #[cfg(target_os = "linux")]
-fn oversized_unplanned_rename_rejects_inflight_and_queued_queries() {
+fn uri_byte_overflow_rename_rejects_inflight_and_queued_queries() {
     let environment = tempfile::tempdir().expect("test environment");
     let root = environment.path().join("workspace");
     fs::create_dir_all(&root).expect("workspace directory");
@@ -36207,13 +36495,23 @@ fn oversized_unplanned_rename_rejects_inflight_and_queued_queries() {
     fs::rename(&provider, &renamed_provider).expect("client-owned move without will plan");
     write_file(&renamed_provider, new_source);
     restore_mtime(&renamed_provider, &metadata);
-    let mut files = vec![json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)})];
-    files.extend((0..64).map(|index| {
-        json!({
-            "oldUri":uri(&root.join(format!("OldNoise{index}.pas"))),
-            "newUri":uri(&root.join(format!("NewNoise{index}.pas")))
+    let component = "q".repeat(120);
+    let mut files: Vec<Value> = (0..62)
+        .map(|index| {
+            let mut path = root.join(format!("noise{index}"));
+            for _ in 0..5 {
+                path.push(&component);
+            }
+            json!({"oldUri":uri(&path.join("Old.pas")),"newUri":uri(&path.join("New.pas"))})
         })
-    }));
+        .collect();
+    files.push(json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)}));
+    assert_eq!(files.len(), 63);
+    let uri_bytes: usize = files
+        .iter()
+        .map(|pair| pair["oldUri"].as_str().unwrap().len() + pair["newUri"].as_str().unwrap().len())
+        .sum();
+    assert!(uri_bytes > 32 * 1024);
     server.send_notification("workspace/didRenameFiles", json!({"files":files}));
 
     let queued_id = RequestId::from("oversized-unplanned-rename-queued".to_string());

@@ -11206,16 +11206,13 @@ fn handle_notification_with_control_inner(
             }
             if oversized_uri_bytes {
                 eprintln!(
-                    "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
+                    "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
                 );
-                if unretainable_endpoint {
-                    return Ok(permanently_fence_file_notification_analysis(
-                        workspace,
-                        budget,
-                        push_diagnostics_supported,
-                    ));
-                }
-                return Ok(invalidate_for_file_notification_overflow(workspace));
+                return Ok(permanently_fence_file_notification_analysis(
+                    workspace,
+                    budget,
+                    push_diagnostics_supported,
+                ));
             }
             if let Some(budget) = budget {
                 for uri in &uris {
@@ -11378,16 +11375,13 @@ fn handle_notification_with_control_inner(
             }
             if oversized_uri_bytes {
                 eprintln!(
-                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
+                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
                 );
-                if unretainable_endpoint {
-                    return Ok(permanently_fence_file_notification_analysis(
-                        workspace,
-                        budget,
-                        push_diagnostics_supported,
-                    ));
-                }
-                return Ok(invalidate_for_file_notification_overflow(workspace));
+                return Ok(permanently_fence_file_notification_analysis(
+                    workspace,
+                    budget,
+                    push_diagnostics_supported,
+                ));
             }
             if let Some(budget) = budget {
                 for (old_uri, new_uri) in &renames {

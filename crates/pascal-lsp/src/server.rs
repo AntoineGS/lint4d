@@ -10546,6 +10546,35 @@ fn invalidate_for_file_notification_overflow(
     effect
 }
 
+fn invalidate_ambiguous_file_notification(
+    workspace: &mut Workspace,
+    budget: Option<&ReconciliationBudget>,
+    endpoints: impl IntoIterator<Item = Url>,
+    push_diagnostics_supported: bool,
+) -> DiagnosticNotificationEffect {
+    let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+    let budget = budget.unwrap_or(&fallback_budget);
+    let mut unique_endpoints = HashSet::new();
+    for uri in endpoints {
+        if unique_endpoints.insert(uri.clone()) {
+            // For an ambiguous event, no endpoint is allowed to retain a
+            // positive disk observation. Recovery keeps these as tombstones
+            // until a later verified file event supersedes them.
+            budget.record_file_event(uri.clone(), FileChange::Deleted);
+            budget.record_rename_endpoint(uri);
+        }
+    }
+    workspace.invalidate_for_reconciliation_budget(budget);
+    let mut effect = DiagnosticNotificationEffect::default();
+    effect.refresh_all_diagnostics();
+    effect.discard_all_queued_diagnostics = true;
+    if push_diagnostics_supported {
+        effect.clear_publication_cursor =
+            Some(workspace.take_all_diagnostic_publication_uris(None));
+    }
+    effect
+}
+
 fn mark_publication_root_stale(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
@@ -11010,24 +11039,44 @@ fn handle_notification_with_control_inner(
             }
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
+            let mut recoverable_endpoints = Vec::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
+            let mut invalid_batch = false;
             for file in files {
-                let uri = file
+                let Some(uri) = file
                     .get("uri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                    .ok_or_else(|| "file operation entry requires a valid uri".to_string())?;
+                else {
+                    invalid_batch = true;
+                    continue;
+                };
                 let uri = canonical_file_uri(&uri);
-                if uri.to_file_path().is_err() || !unique.insert(uri.clone()) {
-                    return Err("file operation batch contains a non-file or duplicate URI".into());
+                if uri.to_file_path().is_err() {
+                    invalid_batch = true;
+                    continue;
                 }
+                recoverable_endpoints.push(uri.clone());
                 if !oversized_uri_bytes
                     && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
                 {
                     oversized_uri_bytes = true;
                 }
-                uris.push(uri);
+                if unique.insert(uri.clone()) {
+                    uris.push(uri);
+                }
+            }
+            if invalid_batch {
+                eprintln!(
+                    "pascal-lsp: malformed or non-file operation batch; invalidating workspace file state"
+                );
+                return Ok(invalidate_ambiguous_file_notification(
+                    workspace,
+                    budget,
+                    recoverable_endpoints,
+                    push_diagnostics_supported,
+                ));
             }
             if oversized_uri_bytes {
                 eprintln!(
@@ -11083,30 +11132,42 @@ fn handle_notification_with_control_inner(
             let mut renames = Vec::with_capacity(files.len());
             let mut old_uris = HashSet::with_capacity(files.len());
             let mut new_uris = HashSet::with_capacity(files.len());
+            let mut unique_renames = HashSet::with_capacity(files.len());
+            let mut recoverable_endpoints = Vec::with_capacity(files.len().saturating_mul(2));
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
+            let mut ambiguous_batch = false;
             for file in files {
-                let old_uri = file
+                let Some(old_uri) = file
                     .get("oldUri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                    .ok_or_else(|| "file rename entry requires a valid oldUri".to_string())?;
-                let new_uri = file
+                else {
+                    ambiguous_batch = true;
+                    continue;
+                };
+                let Some(new_uri) = file
                     .get("newUri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                    .ok_or_else(|| "file rename entry requires a valid newUri".to_string())?;
+                else {
+                    recoverable_endpoints.push(canonical_file_uri(&old_uri));
+                    ambiguous_batch = true;
+                    continue;
+                };
                 let old_uri = canonical_file_uri(&old_uri);
                 let new_uri = canonical_file_uri(&new_uri);
-                if old_uri.to_file_path().is_err()
-                    || new_uri.to_file_path().is_err()
-                    || old_uri == new_uri
-                    || !old_uris.insert(old_uri.clone())
-                    || !new_uris.insert(new_uri.clone())
-                {
-                    return Err(
-                        "file rename batch contains invalid, duplicate, or identical URIs".into(),
-                    );
+                let old_is_file = old_uri.to_file_path().is_ok();
+                let new_is_file = new_uri.to_file_path().is_ok();
+                if old_is_file {
+                    recoverable_endpoints.push(old_uri.clone());
+                }
+                if new_is_file {
+                    recoverable_endpoints.push(new_uri.clone());
+                }
+                if !old_is_file || !new_is_file {
+                    ambiguous_batch = true;
+                    continue;
                 }
                 if !oversized_uri_bytes
                     && (add_file_operation_uri_bytes(&mut total_uri_bytes, &old_uri).is_err()
@@ -11114,10 +11175,34 @@ fn handle_notification_with_control_inner(
                 {
                     oversized_uri_bytes = true;
                 }
+                if old_uri == new_uri {
+                    ambiguous_batch = true;
+                    continue;
+                }
+                if !unique_renames.insert((old_uri.clone(), new_uri.clone())) {
+                    // Replaying the exact same move in one batch is
+                    // idempotent; distinct reuse of either endpoint below is
+                    // ambiguous and takes the conservative recovery path.
+                    continue;
+                }
+                if !old_uris.insert(old_uri.clone()) || !new_uris.insert(new_uri.clone()) {
+                    ambiguous_batch = true;
+                }
                 renames.push((old_uri, new_uri));
             }
             if old_uris.iter().any(|uri| new_uris.contains(uri)) {
-                return Err("file rename batch contains chained or cyclic URI transitions".into());
+                ambiguous_batch = true;
+            }
+            if ambiguous_batch {
+                eprintln!(
+                    "pascal-lsp: ambiguous file-rename batch; invalidating workspace file state"
+                );
+                return Ok(invalidate_ambiguous_file_notification(
+                    workspace,
+                    budget,
+                    recoverable_endpoints,
+                    push_diagnostics_supported,
+                ));
             }
             if oversized_uri_bytes {
                 eprintln!(

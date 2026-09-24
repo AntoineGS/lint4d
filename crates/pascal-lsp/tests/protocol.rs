@@ -31326,6 +31326,288 @@ fn did_rename_accepts_verified_close_and_new_open_before_event() {
 }
 
 #[test]
+fn duplicated_create_file_events_refresh_negative_and_same_stamp_providers() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let old_consumer = root.join("OldConsumer.pas");
+    let new_consumer = root.join("NewConsumer.pas");
+    write_file(
+        &old_consumer,
+        "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n",
+    );
+    write_file(
+        &new_consumer,
+        "unit NewConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TNewThing;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("Main.pas"),
+        "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    let old_provider = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_provider = old_provider
+        .replace("badConst", "GOODNAME")
+        .replace("TOldThing", "TNewThing");
+    assert_eq!(old_provider.len(), new_provider.len());
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    let definition =
+        |server: &mut TestServer, id: &str, file: &Path, source: &str, symbol: &str| {
+            let request_id = RequestId::from(id.to_string());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/definition",
+                navigation_params(file, source, symbol, 0),
+            );
+            result_locations(server.response(&request_id))
+        };
+
+    let old_consumer_source = fs::read_to_string(&old_consumer).expect("old consumer source");
+    let new_consumer_source = fs::read_to_string(&new_consumer).expect("new consumer source");
+    assert!(
+        definition(
+            &mut server,
+            "duplicate-create-negative-old",
+            &old_consumer,
+            &old_consumer_source,
+            "TOldThing",
+        )
+        .is_empty()
+    );
+    assert!(
+        definition(
+            &mut server,
+            "duplicate-create-negative-new",
+            &new_consumer,
+            &new_consumer_source,
+            "TNewThing",
+        )
+        .is_empty()
+    );
+
+    write_file(&provider, old_provider);
+    let duplicate_create = || {
+        json!({"files":[
+            {"uri":uri(&provider)},
+            {"uri":uri(&root.join("./Provider.pas"))},
+        ]})
+    };
+    server.send_notification("workspace/didCreateFiles", duplicate_create());
+    let initial_refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("first duplicate create must refresh pull diagnostics");
+    server.send(Message::Response(Response::new_ok(
+        initial_refresh.id,
+        Value::Null,
+    )));
+    let old_locations = definition(
+        &mut server,
+        "duplicate-create-old-provider",
+        &old_consumer,
+        &old_consumer_source,
+        "TOldThing",
+    );
+    assert_eq!(old_locations.len(), 1);
+    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
+    assert!(
+        definition(
+            &mut server,
+            "duplicate-create-new-still-negative",
+            &new_consumer,
+            &new_consumer_source,
+            "TNewThing",
+        )
+        .is_empty()
+    );
+
+    let pull_id = RequestId::from("duplicate-create-prior-pull-id".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let initial_pull = server.response(&pull_id);
+    assert!(
+        initial_pull.error.is_none(),
+        "initial pull failed: {initial_pull:?}"
+    );
+    let previous_result_id = initial_pull.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("previous result ID")
+        .to_string();
+    assert!(
+        initial_pull.result.as_ref().unwrap()["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming"))
+    );
+
+    let initial_metadata = fs::metadata(&provider).expect("provider metadata");
+    write_file(&provider, &new_provider);
+    restore_mtime(&provider, &initial_metadata);
+    server.send_notification("workspace/didCreateFiles", duplicate_create());
+    let update_refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("second duplicate create must refresh pull diagnostics");
+    server.send(Message::Response(Response::new_ok(
+        update_refresh.id,
+        Value::Null,
+    )));
+
+    assert!(
+        definition(
+            &mut server,
+            "duplicate-create-old-identity-removed",
+            &old_consumer,
+            &old_consumer_source,
+            "TOldThing",
+        )
+        .is_empty()
+    );
+    let new_locations = definition(
+        &mut server,
+        "duplicate-create-new-identity-found",
+        &new_consumer,
+        &new_consumer_source,
+        "TNewThing",
+    );
+    assert_eq!(new_locations.len(), 1);
+    assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
+
+    let refreshed_pull_id = RequestId::from("duplicate-create-pull-after-same-stamp".to_string());
+    server.send_request(
+        refreshed_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument":{"uri":uri(&provider)},
+            "previousResultId":previous_result_id,
+        }),
+    );
+    let refreshed_pull = server.response(&refreshed_pull_id);
+    assert!(
+        refreshed_pull.error.is_none(),
+        "refreshed pull failed: {refreshed_pull:?}"
+    );
+    let refreshed_pull = refreshed_pull.result.expect("refreshed diagnostics");
+    assert_eq!(refreshed_pull["kind"], "full");
+    assert!(
+        refreshed_pull["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["code"] != "constant-naming"))
+    );
+    server.shutdown();
+}
+
+#[test]
+fn ambiguous_rename_batches_invalidate_and_reject_open_overlays() {
+    for ambiguous_kind in ["duplicate-endpoint", "chained-endpoint"] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let moved_directory = root.join("moved");
+        fs::create_dir_all(&moved_directory).expect("moved directory");
+        let moved_provider = moved_directory.join("Provider.pas");
+        let alternate_provider = root.join("Alternate.pas");
+        let intermediate_provider = root.join("Intermediate.pas");
+        let consumer = root.join("Consumer.pas");
+        let main = root.join("Main.pas");
+        let disk_provider =
+            "unit Provider;\ninterface\ntype TDiskThing = class end;\nimplementation\nend.\n";
+        let overlay_provider =
+            "unit Provider;\ninterface\ntype TOverlayThing = class end;\nimplementation\nend.\n";
+        let overlay_consumer = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOverlayThing;\nimplementation\nend.\n";
+        let disk_consumer = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TDiskThing;\nimplementation\nend.\n";
+        write_file(&provider, disk_provider);
+        write_file(&consumer, overlay_consumer);
+        write_file(
+            &main,
+            "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        server.initialize_with_pull_diagnostics(&root);
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":overlay_provider}}),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":overlay_consumer}}),
+        );
+        let initial_id = RequestId::from(format!("ambiguous-{ambiguous_kind}-overlay-before"));
+        server.send_request(
+            initial_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, overlay_consumer, "TOverlayThing", 0),
+        );
+        let initial_locations = result_locations(server.response(&initial_id));
+        assert_eq!(initial_locations.len(), 1);
+        assert_eq!(initial_locations[0]["uri"], uri(&provider).to_string());
+
+        fs::rename(&provider, &moved_provider).expect("client-owned physical move");
+        let files = if ambiguous_kind == "duplicate-endpoint" {
+            json!([
+                {"oldUri":uri(&provider),"newUri":uri(&moved_provider)},
+                {"oldUri":uri(&provider),"newUri":uri(&alternate_provider)},
+            ])
+        } else {
+            json!([
+                {"oldUri":uri(&provider),"newUri":uri(&intermediate_provider)},
+                {"oldUri":uri(&intermediate_provider),"newUri":uri(&moved_provider)},
+            ])
+        };
+        server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+        let refresh = server
+            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            .expect("ambiguous rename must request pull diagnostic refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+        let stale_overlay_id = RequestId::from(format!(
+            "ambiguous-{ambiguous_kind}-overlay-not-transferred"
+        ));
+        server.send_request(
+            stale_overlay_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, overlay_consumer, "TOverlayThing", 0),
+        );
+        let stale_overlay_locations = result_locations(server.response(&stale_overlay_id));
+        assert!(
+            stale_overlay_locations.is_empty(),
+            "ambiguous {ambiguous_kind} must not transfer the old open overlay: {stale_overlay_locations:?}"
+        );
+
+        server.send_notification(
+            "textDocument/didClose",
+            json!({"textDocument":{"uri":uri(&provider)}}),
+        );
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(&consumer),"version":2},"contentChanges":[{"text":disk_consumer}]}),
+        );
+        let disk_identity_id = RequestId::from(format!("ambiguous-{ambiguous_kind}-disk-identity"));
+        server.send_request(
+            disk_identity_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, disk_consumer, "TDiskThing", 0),
+        );
+        let disk_locations = result_locations(server.response(&disk_identity_id));
+        assert!(
+            disk_locations.is_empty(),
+            "ambiguous {ambiguous_kind} must stay fail-closed rather than partially transfer disk or overlay identity: {disk_locations:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
 #[cfg(feature = "test-support")]
 fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small_entries() {
     let root = tempfile::tempdir().expect("temporary workspace");
@@ -31450,7 +31732,11 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
     assert!(server.response(&malformed_probe_id).error.is_none());
-    server.assert_no_request("workspace/diagnostic/refresh");
+    let duplicate_create_refresh = server.request("workspace/diagnostic/refresh");
+    server.send(Message::Response(Response::new_ok(
+        duplicate_create_refresh.id,
+        Value::Null,
+    )));
 
     let small: Vec<_> = (0..64)
         .map(|index| root.path().join(format!("Generated{index}.pas")))

@@ -6037,19 +6037,11 @@ impl NavigationIndex {
         mut visit: impl FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
         for document in self.documents.values() {
-            let parsed = &document.parsed;
-            visit(
-                parsed
-                    .source
-                    .len()
-                    .saturating_add(parsed.parser_source.len()),
-            )?;
-            for symbol in &parsed.symbols {
-                visit(symbol.name.len().saturating_add(symbol.key.len()))?;
-            }
+            document.parsed.visit_recovery_payload(&mut visit)?;
             if let Some(bindings) = &document.import_bindings {
                 for (name, uri) in bindings {
-                    visit(name.len().saturating_add(uri.as_str().len()))?;
+                    visit(name.len())?;
+                    visit(uri.as_str().len())?;
                 }
             }
         }
@@ -15307,6 +15299,345 @@ pub(crate) struct ParsedDocument {
     generic_parameter_intervals: SourceIntervalIndex,
     helpers: Vec<HelperDefinition>,
     documentation: Vec<Option<Arc<documentation::Documentation>>>,
+}
+
+impl ParsedDocument {
+    pub(crate) fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        visit(self.source.len())?;
+        visit(self.parser_source.len())?;
+        visit(self.unit_name.len())?;
+        visit(self.unit_display_name.len())?;
+
+        // Tree-sitter owns a native syntax tree in addition to the Rust-side
+        // projections below. Walk it without allocating a traversal stack.
+        let mut cursor = self.tree.walk();
+        'tree: loop {
+            visit(0)?;
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    break 'tree;
+                }
+            }
+        }
+
+        for _ in &self.parser_recovery_spans {
+            visit(0)?;
+        }
+        for clause in &self.uses_clauses {
+            let _ = clause;
+            visit(0)?;
+        }
+        for name in self.interface_uses.iter().chain(&self.implementation_uses) {
+            visit(name.len())?;
+        }
+        for import in &self.imports {
+            visit(import.name.len())?;
+        }
+        for name in self
+            .unknown_imports
+            .iter()
+            .chain(&self.interface_routine_keys)
+            .chain(&self.unknown_class_owners)
+            .chain(&self.known_non_class_owners)
+        {
+            visit(name.len())?;
+        }
+        visit(self.conditionals.projected_source.len())?;
+        for _ in &self.conditionals.inactive_spans {
+            visit(0)?;
+        }
+        for _ in &self.conditionals.unknown_spans {
+            visit(0)?;
+        }
+        for directive in &self.conditionals.directives {
+            visit(directive.body.len())?;
+        }
+        self.conditional_context.visit_recovery_payload(visit)?;
+        for scope in &self.scopes {
+            visit(scope.owner_type.as_ref().map_or(0, String::len))?;
+        }
+        for interval in &self.scope_intervals.ranges {
+            let _ = interval;
+            visit(0)?;
+        }
+        for context in &self.with_contexts {
+            visit(0)?;
+            for _ in &context.receiver_spans {
+                visit(0)?;
+            }
+        }
+        for _ in &self.cache_unsafe_scopes {
+            visit(0)?;
+        }
+        for context in &self.owner_type_contexts {
+            visit(context.owner_type.len())?;
+        }
+        for interval in &self.owner_type_intervals.ranges {
+            let _ = interval;
+            visit(0)?;
+        }
+        for symbol in &self.symbols {
+            visit(symbol.name.len())?;
+            visit(symbol.key.len())?;
+            for value in [
+                symbol.owner_type.as_deref(),
+                symbol.owner_type_name.as_deref(),
+                symbol.generic_parameter.as_deref(),
+                symbol.type_name.as_deref(),
+                symbol.result_type_name.as_deref(),
+                symbol.routine_key.as_deref(),
+                symbol.routine_signature.as_deref(),
+                symbol.accessor.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                visit(value.len())?;
+            }
+            for parameter in &symbol.generic_parameters {
+                visit(parameter.name.len())?;
+                if let Some(constraint) = &parameter.constraint {
+                    visit_type_ref_recovery(constraint, visit)?;
+                }
+            }
+            for parameter in &symbol.routine_parameters {
+                visit(parameter.type_name.as_ref().map_or(0, String::len))?;
+                if let Some(type_ref) = &parameter.type_ref {
+                    visit_type_ref_recovery(type_ref, visit)?;
+                }
+                if let Some(type_shape) = &parameter.type_shape {
+                    visit_type_shape_recovery(type_shape, visit)?;
+                }
+            }
+            if let Some(type_ref) = &symbol.type_ref {
+                visit_type_ref_recovery(type_ref, visit)?;
+            }
+            if let Some(type_shape) = &symbol.type_shape {
+                visit_type_shape_recovery(type_shape, visit)?;
+            }
+            if let Some(type_ref) = &symbol.result_type_ref {
+                visit_type_ref_recovery(type_ref, visit)?;
+            }
+        }
+        for _ in &self.opaque_ranges {
+            visit(0)?;
+        }
+        for _ in &self.conditional_unknown_symbols {
+            visit(0)?;
+        }
+        for (key, indices) in &self.symbol_indices_by_scope_key {
+            visit(key.1.len())?;
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for indices in self.scope_symbol_indices.values() {
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for ((owner, member), indices) in &self.member_symbol_indices {
+            visit(owner.len())?;
+            visit(member.len())?;
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for (owner, keys) in &self.member_binding_keys_by_owner {
+            visit(owner.len())?;
+            for key in keys {
+                visit(key.len())?;
+            }
+        }
+        for keys in &self.scope_binding_keys {
+            for key in keys {
+                visit(key.len())?;
+            }
+        }
+        for (owner, indices) in &self.member_symbol_indices_by_owner {
+            visit(owner.len())?;
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for (name, ancestries) in &self.type_ancestry {
+            visit(name.len())?;
+            for ancestry in ancestries {
+                visit(0)?;
+                for parent in &ancestry.parents {
+                    for component in &parent.path {
+                        visit(component.len())?;
+                    }
+                    if let Some(type_ref) = &parent.type_ref {
+                        visit_type_ref_recovery(type_ref, visit)?;
+                    }
+                }
+            }
+        }
+        for (key, indices) in &self.type_symbol_indices {
+            visit(key.len())?;
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for _ in self.direct_symbol_indices.values().flatten() {
+            visit(0)?;
+        }
+        for (key, indices) in &self.routine_symbol_indices {
+            visit(key.len())?;
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for indices in self.routine_symbol_indices_by_body_scope.values() {
+            visit(0)?;
+            for _ in indices {
+                visit(0)?;
+            }
+        }
+        for _ in &self.exported_symbol_indices {
+            visit(0)?;
+        }
+        for (owner, methods) in &self.interface_member_routine_keys {
+            visit(owner.len())?;
+            for method in methods {
+                visit(method.len())?;
+            }
+        }
+        for resolution in &self.method_resolutions {
+            visit(resolution.class_owner.len())?;
+            visit(resolution.interface_owner.len())?;
+            visit(resolution.interface_method.len())?;
+            visit(resolution.implementation_method.len())?;
+        }
+        for delegation in &self.interface_delegations {
+            visit_type_ref_recovery(&delegation.interface, visit)?;
+            if let Some(uri) = &delegation.declaring_uri {
+                visit(uri.as_str().len())?;
+            }
+            if let Some(substitution) = &delegation.declaring_substitution {
+                visit_generic_substitution_recovery(substitution, visit, 0)?;
+            }
+        }
+        for context in &self.generic_parameter_contexts {
+            visit(0)?;
+            for name in &context.names {
+                visit(name.len())?;
+            }
+        }
+        for _ in &self.generic_parameter_intervals.ranges {
+            visit(0)?;
+        }
+        for helper in &self.helpers {
+            visit(0)?;
+            visit(helper.key.len())?;
+            visit_type_ref_recovery(&helper.target, visit)?;
+            if let Some(parent) = &helper.parent {
+                visit_type_ref_recovery(parent, visit)?;
+            }
+            for parameter in &helper.generic_parameters {
+                visit(parameter.name.len())?;
+                if let Some(constraint) = &parameter.constraint {
+                    visit_type_ref_recovery(constraint, visit)?;
+                }
+            }
+        }
+        for documentation in &self.documentation {
+            visit(0)?;
+            if let Some(documentation) = documentation {
+                documentation.visit_recovery_payload(visit)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn visit_type_ref_recovery(
+    reference: &TypeRef,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_type_ref_recovery_depth(reference, visit, 0)
+}
+
+fn visit_type_ref_recovery_depth(
+    reference: &TypeRef,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 256 {
+        return Err("nested parsed type exceeds the recovery inspection depth".into());
+    }
+    for component in &reference.path {
+        visit(component.len())?;
+    }
+    for argument in &reference.args {
+        visit(0)?;
+        visit_type_ref_recovery_depth(argument, visit, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn visit_type_shape_recovery(
+    shape: &TypeShape,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_type_shape_recovery_depth(shape, visit, 0)
+}
+
+fn visit_type_shape_recovery_depth(
+    shape: &TypeShape,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 256 {
+        return Err("nested parsed type-shape exceeds the recovery inspection depth".into());
+    }
+    visit(0)?;
+    match shape {
+        TypeShape::Named(reference) => visit_type_ref_recovery(reference, visit),
+        TypeShape::Pointer(inner) | TypeShape::Array { element: inner, .. } => {
+            visit_type_shape_recovery_depth(inner, visit, depth + 1)
+        }
+        TypeShape::Callable | TypeShape::Unknown => Ok(()),
+    }
+}
+
+fn visit_generic_substitution_recovery(
+    substitution: &GenericSubstitution,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 256 {
+        return Err("nested generic substitution exceeds the recovery inspection depth".into());
+    }
+    for (name, value) in &substitution.0 {
+        visit(name.len())?;
+        match value {
+            ResolvedType::Builtin(_) | ResolvedType::IntegerLiteral(_) => visit(0)?,
+            ResolvedType::Named(instance) => {
+                visit(instance.uri.as_str().len())?;
+                visit(instance.key.len())?;
+                for name in &instance.parameter_names {
+                    visit(name.len())?;
+                }
+                if let Some(owner) = &instance.helper_owner {
+                    visit(owner.uri.as_str().len())?;
+                    visit(0)?;
+                }
+                visit_generic_substitution_recovery(&instance.substitution, visit, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

@@ -272,6 +272,25 @@ pub struct ConditionalContext {
 }
 
 impl ConditionalContext {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for name in self.defines.keys() {
+            visit(name.len())?;
+        }
+        for name in self.options.keys() {
+            visit(name.len())?;
+        }
+        for (name, value) in &self.constants {
+            visit(name.len())?;
+            if let ConstantValue::String(value) = value {
+                visit(value.len())?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_defines(defines: &[String]) -> Self {
         let mut context = Self::default();
         for define in defines {

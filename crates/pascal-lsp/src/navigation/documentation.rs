@@ -31,6 +31,19 @@ pub(crate) struct Documentation {
 }
 
 impl Documentation {
+    pub(crate) fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.summary.visit_recovery_payload(visit)?;
+        self.remarks.visit_recovery_payload(visit)?;
+        for (name, value) in &self.parameters {
+            visit(name.len())?;
+            value.visit_recovery_payload(visit)?;
+        }
+        self.returns.visit_recovery_payload(visit)
+    }
+
     pub(crate) fn render(
         &self,
         format: MarkupKind,
@@ -271,6 +284,18 @@ struct RichText {
 }
 
 impl RichText {
+    fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for fragment in &self.fragments {
+            match fragment {
+                Fragment::Text(value) | Fragment::Code(value) => visit(value.len())?,
+            }
+        }
+        Ok(())
+    }
+
     fn is_empty(&self) -> bool {
         self.fragments.iter().all(|fragment| match fragment {
             Fragment::Text(value) | Fragment::Code(value) => value.trim().is_empty(),

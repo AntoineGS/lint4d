@@ -32455,13 +32455,12 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         navigation_params(&consumers[0], &consumer_sources[0], "TBefore", 0),
     );
     let fresh_definition = server.response(&fresh_definition_id);
-    let fresh_locations = result_locations(fresh_definition);
-    assert_eq!(
-        fresh_locations
-            .first()
-            .and_then(|location| location["uri"].as_str()),
-        Some(uri(&replacement_providers[0]).as_str()),
-        "same-size/restored-mtime project descriptor edits must select provider B after budget fallback"
+    assert!(
+        fresh_definition
+            .error
+            .as_ref()
+            .is_some_and(|error| { error.message.contains("analysis is disabled") }),
+        "over-cap retained project observations must fence fresh navigation instead of serving a partial candidate: {fresh_definition:?}"
     );
     let closed_definition_id = RequestId::from("metadata-budget-closed-provider".to_string());
     server.send_request(
@@ -32469,13 +32468,14 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         "textDocument/definition",
         navigation_params(&consumers[1], &consumer_sources[1], "TBefore", 0),
     );
-    let closed_locations = result_locations(server.response(&closed_definition_id));
     assert_eq!(
-        closed_locations
-            .first()
-            .and_then(|location| location["uri"].as_str()),
-        Some(uri(&replacement_providers[1]).as_str()),
-        "cached closed owner must not publish the stale provider after budget fallback"
+        server
+            .response(&closed_definition_id)
+            .error
+            .as_ref()
+            .map(|error| error.code),
+        Some(-32803),
+        "cached closed owners must be denied behind the same fail-closed fence"
     );
 
     let refreshed_id = RequestId::from("metadata-budget-refreshed-pull".to_string());
@@ -32485,11 +32485,12 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":previous_result_id}),
     );
     let refreshed = server.response(&refreshed_id);
-    assert!(refreshed.error.is_none(), "refreshed pull: {refreshed:?}");
-    assert_ne!(
-        refreshed.result.as_ref().unwrap()["kind"],
-        "unchanged",
-        "metadata reconciliation must not reuse the pre-event pull result ID"
+    assert!(
+        refreshed
+            .error
+            .as_ref()
+            .is_some_and(|error| { error.message.contains("analysis is disabled") }),
+        "pull diagnostics must not reuse or publish stale state behind the recovery fence: {refreshed:?}"
     );
     let closed_refreshed_id = RequestId::from("metadata-budget-closed-refreshed-pull".to_string());
     server.send_request(
@@ -32499,13 +32500,11 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
     );
     let closed_refreshed = server.response(&closed_refreshed_id);
     assert!(
-        closed_refreshed.error.is_none(),
-        "closed-owner refreshed pull: {closed_refreshed:?}"
-    );
-    assert_ne!(
-        closed_refreshed.result.as_ref().unwrap()["kind"],
-        "unchanged",
-        "cached closed-owner reconciliation must not reuse the pre-event pull result ID"
+        closed_refreshed
+            .error
+            .as_ref()
+            .is_some_and(|error| { error.message.contains("analysis is disabled") }),
+        "closed-owner pull diagnostics must also remain fenced: {closed_refreshed:?}"
     );
     assert!(
         wait_for_file(&metrics, IO_TIMEOUT),
@@ -32532,36 +32531,14 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
             < 2_048,
         "this case must exhaust the metadata byte budget before the separate diagnostic-work ceiling: {metrics}"
     );
-    assert_eq!(
-        metrics["recovery_target_reserve"].as_u64(),
-        Some((PROJECTS - 1) as u64),
-        "recovery must preflight the exact currently admitted open-document targets: {metrics}"
-    );
-    let open_uri_bytes = consumers
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != 1)
-        .map(|(_, consumer)| uri(consumer).as_str().len() as u64)
-        .sum::<u64>();
     assert!(
-        metrics["recovery_byte_reserve"]
+        metrics["recovery_preflight_bytes"]
             .as_u64()
             .unwrap_or_default()
-            >= 2 * open_uri_bytes,
-        "preflight plus recovery must reserve URI and retained nested-payload byte work: {metrics}"
+            <= (128 * 1024 * 1024) as u64,
+        "preflight accounting must never exceed its byte envelope even when refusing: {metrics}"
     );
-    assert!(
-        metrics["recovery_visits"].as_u64().unwrap_or_default() > PROJECTS as u64,
-        "cache invalidation and open-target recovery visits must be explicitly counted: {metrics}"
-    );
-    assert!(
-        metrics["recovery_visits"].as_u64().unwrap_or_default()
-            <= metrics["recovery_visit_reserve"]
-                .as_u64()
-                .unwrap_or_default(),
-        "recovery must consume no more work than it preflighted: {metrics}"
-    );
-    assert_eq!(metrics["recovery_refused"], false);
+    assert_eq!(metrics["recovery_refused"], true);
     server.shutdown();
 }
 

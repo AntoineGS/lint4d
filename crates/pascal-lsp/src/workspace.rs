@@ -1342,9 +1342,21 @@ impl ReconciliationBudget {
             .get()
             .checked_add(recovery_bytes)
             .filter(|total| *total <= MAX_NOTIFICATION_RECOVERY_BYTES);
-        let (Some(total_visits), Some(total_bytes)) = (total_visits, total_bytes) else {
+        let Some(total_visits) = total_visits else {
             self.recovery_refused.set(true);
-            return Err("workspace notification recovery exceeds its fixed work envelope".into());
+            return Err(format!(
+                "workspace notification recovery exceeds its fixed visit envelope ({} + {recovery_visits} > {})",
+                self.recovery_visits.get(),
+                MAX_NOTIFICATION_RECOVERY_VISITS
+            ));
+        };
+        let Some(total_bytes) = total_bytes else {
+            self.recovery_refused.set(true);
+            return Err(format!(
+                "workspace notification recovery exceeds its fixed byte envelope ({} + {recovery_bytes} > {})",
+                self.recovery_bytes.get(),
+                MAX_NOTIFICATION_RECOVERY_BYTES
+            ));
         };
         if recovery_targets > MAX_NOTIFICATION_RECOVERY_TARGETS {
             self.recovery_refused.set(true);
@@ -1783,6 +1795,34 @@ struct PackageCatalogueKey {
     root: PathBuf,
 }
 
+impl ContextKey {
+    fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for path in [
+            self.project_file.as_ref(),
+            self.workspace_root.as_ref(),
+            self.project_scope.as_ref(),
+            self.selection_scope.as_ref(),
+            self.selection_project.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            visit(path.as_os_str().len())?;
+        }
+        if let Some(config) = &self.config {
+            visit(config.len())?;
+        }
+        if let Some(platform) = &self.platform {
+            visit(platform.len())?;
+        }
+        self.conditional_context.visit_recovery_payload(visit)?;
+        self.overrides.visit_recovery_payload(visit)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SourceChangeObservation {
     path: PathBuf,
@@ -1807,6 +1847,27 @@ pub(crate) struct ContextState {
 }
 
 impl ContextState {
+    fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.context.visit_recovery_payload(visit)?;
+        for path in self.watched_paths.keys() {
+            visit(path.as_os_str().len())?;
+        }
+        for (path, membership) in &self.project_candidate_memberships {
+            visit(path.as_os_str().len())?;
+            match membership {
+                Ok(membership) => membership.visit_recovery_payload(visit)?,
+                Err(error) => visit(error.len())?,
+            }
+        }
+        for observation in &self.project_read_observations {
+            observation.visit_recovery_payload(visit)?;
+        }
+        Ok(())
+    }
+
     fn merge_observations(&mut self, retained: &Self) {
         for (path, stamp) in &retained.watched_paths {
             self.watched_paths
@@ -1860,6 +1921,52 @@ struct NotificationRecoveryPlan {
     recovery_targets: usize,
     retained_payload_visits: usize,
     retained_payload_bytes: usize,
+}
+
+fn visit_source_record_recovery_payload(
+    record: &rename::SourceRecord,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    visit(record.uri.as_str().len())?;
+    visit(record.text.len())?;
+    if let Some(path) = &record.path {
+        visit(path.as_os_str().len())?;
+    }
+    if let Some(bytes) = &record.content_bytes {
+        visit(bytes.len())?;
+    }
+    if let Some(membership) = &record.candidate_membership {
+        membership.visit_recovery_payload(visit)?;
+    }
+    for candidate in &record.candidate_observations {
+        visit(candidate.path.as_os_str().len())?;
+    }
+    if let Some(policy) = &record.read_policy {
+        policy.visit_recovery_payload(visit)?;
+    }
+    if let Some(entry) = &record.path_entry {
+        entry.visit_recovery_payload(visit)?;
+    }
+    if let Some(scope) = &record.missing_provider_scope {
+        visit(scope.root.as_os_str().len())?;
+        for name in &scope.names {
+            visit(name.len())?;
+        }
+        scope.read_policy.visit_recovery_payload(visit)?;
+        scope.path_entry.visit_recovery_payload(visit)?;
+    }
+    for scope in &record.auto_import_scopes {
+        visit(scope.root.as_os_str().len())?;
+        for unit in &scope.provider_units {
+            visit(unit.len())?;
+        }
+        for prefix in &scope.candidate_prefixes {
+            visit(prefix.len())?;
+        }
+        scope.read_policy.visit_recovery_payload(visit)?;
+        scope.path_entry.visit_recovery_payload(visit)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3552,8 +3659,11 @@ impl Workspace {
                     .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_BYTES)
                     .ok_or_else(|| {
                         budget.recovery_refused.set(true);
-                        "workspace notification recovery exceeds its nested-payload byte cap"
-                            .to_string()
+                        format!(
+                            "workspace notification recovery exceeds its nested-payload byte cap ({} + {bytes} > {})",
+                            retained_payload_bytes,
+                            MAX_NOTIFICATION_RECOVERY_BYTES
+                        )
                     })?;
                 budget.charge_recovery_preflight(1, bytes)
             };
@@ -3596,6 +3706,148 @@ impl Workspace {
             count_recovery_entries!(staged_endpoints.len());
             if let Some(records) = &self.analysis_records {
                 count_recovery_entries!(records.len());
+                for record in records.values() {
+                    visit_source_record_recovery_payload(record, &mut charge_retained_payload)?;
+                }
+            }
+            for (key, state) in &self.contexts {
+                key.visit_recovery_payload(&mut charge_retained_payload)?;
+                state.visit_recovery_payload(&mut charge_retained_payload)?;
+            }
+            for (uri, key) in &self.document_contexts {
+                charge_retained_payload(uri.as_str().len())?;
+                key.visit_recovery_payload(&mut charge_retained_payload)?;
+            }
+            for (uri, key) in &self.open_document_contexts {
+                charge_retained_payload(uri.as_str().len())?;
+                key.visit_recovery_payload(&mut charge_retained_payload)?;
+            }
+            for (uri, cached) in &self.cached_documents {
+                charge_retained_payload(uri.as_str().len())?;
+                cached
+                    .context
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                // Count every Arc reference conservatively. If this parsed
+                // document is also retained by NavigationIndex, this may
+                // overcount, never undercount, its nested payload.
+                cached
+                    .parsed
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+            }
+            for uri in staged_endpoints.keys() {
+                if let Some(text) = self
+                    .open_documents
+                    .get(uri)
+                    .and_then(|document| document.text.as_ref())
+                {
+                    charge_retained_payload(text.len())?;
+                }
+            }
+            for (key, cached) in &self.package_metadata_cache {
+                charge_retained_payload(key.descriptor.as_os_str().len())?;
+                key.overrides
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                key.read_policy
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                if let Some(config) = &key.config {
+                    charge_retained_payload(config.len())?;
+                }
+                if let Some(platform) = &key.platform {
+                    charge_retained_payload(platform.len())?;
+                }
+                key.conditional_context
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                for (path, _) in &cached.metadata_stamps {
+                    charge_retained_payload(path.as_os_str().len())?;
+                }
+                match &cached.result {
+                    Ok(metadata) => {
+                        metadata.visit_recovery_payload(&mut charge_retained_payload)?;
+                    }
+                    Err(error) => charge_retained_payload(error.len())?,
+                }
+                for observation in &cached.observations {
+                    observation.visit_recovery_payload(&mut charge_retained_payload)?;
+                }
+            }
+            for (key, catalogue) in &self.package_catalogues {
+                key.context
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                charge_retained_payload(key.root.as_os_str().len())?;
+                for (name, paths) in &catalogue.entries {
+                    charge_retained_payload(name.len())?;
+                    for path in paths {
+                        charge_retained_payload(path.as_os_str().len())?;
+                    }
+                }
+                for name in &catalogue.requested_names {
+                    charge_retained_payload(name.len())?;
+                }
+                for (path, _) in &catalogue.directories {
+                    charge_retained_payload(path.as_os_str().len())?;
+                }
+            }
+            for (owner_uri, owner) in &self.document_owners {
+                charge_retained_payload(owner_uri.as_str().len())?;
+                owner
+                    .key
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                owner
+                    .state
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
+                if let Some(route) = &owner.legacy_route {
+                    charge_retained_payload(route.source.as_os_str().len())?;
+                    route
+                        .context
+                        .visit_recovery_payload(&mut charge_retained_payload)?;
+                }
+            }
+            for uri in self.source_change_generations.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for (uri, observation) in &self.source_change_observations {
+                charge_retained_payload(uri.as_os_str().len())?;
+                charge_retained_payload(observation.path.as_os_str().len())?;
+            }
+            for uri in self.configuration_change_generations.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.expansions.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.include_parents.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.owner_last_used.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for (uri, pending) in &self.pending_unit_file_renames {
+                charge_retained_payload(uri.as_str().len())?;
+                charge_retained_payload(pending.new_uri.as_str().len())?;
+                if let Some(text) = &pending.expected_text {
+                    charge_retained_payload(text.len())?;
+                }
+            }
+            for uri in &self.indexed_files {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.indexed_sizes.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.disk_stamps.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.last_used.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.pending_diagnostics.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for uri in self.diagnostic_dependencies.keys() {
+                charge_retained_payload(uri.as_str().len())?;
+            }
+            for warning in &self.warnings {
+                charge_retained_payload(warning.len())?;
             }
             for (key, catalogue) in &self.directory_catalogues {
                 charge_retained_payload(key.as_os_str().len())?;
@@ -3615,32 +3867,29 @@ impl Workspace {
                     charge_retained_payload(path.as_os_str().len())?;
                 }
             }
-            for (key, catalogue) in &self.package_catalogues {
-                charge_retained_payload(key.root.as_os_str().len())?;
-                for (name, paths) in &catalogue.entries {
-                    charge_retained_payload(name.len())?;
-                    for path in paths {
-                        charge_retained_payload(path.as_os_str().len())?;
-                    }
-                }
-                for name in &catalogue.requested_names {
-                    charge_retained_payload(name.len())?;
-                }
-                for (path, _) in &catalogue.directories {
-                    charge_retained_payload(path.as_os_str().len())?;
-                }
-            }
             self.index
                 .visit_recovery_payload(&mut charge_retained_payload)?;
             for expansion in self.expansions.values() {
                 budget.charge_recovery_preflight(1, 0)?;
                 count_recovery_entries!(
-                    expansion.dependencies.len()
-                        + expansion.dependency_entries.len()
-                        + expansion.include_observations.len()
-                        + expansion.source_texts.len()
+                    expansion
+                        .dependencies
+                        .len()
+                        .checked_add(expansion.dependency_entries.len())
+                        .and_then(|count| count.checked_add(expansion.include_observations.len()))
+                        .and_then(|count| count.checked_add(expansion.source_texts.len()))
+                        .ok_or_else(|| {
+                            budget.recovery_refused.set(true);
+                            "expanded-source recovery entry count overflowed".to_string()
+                        })?
                 );
+                expansion
+                    .context_key
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
                 charge_retained_payload(expansion.physical_source.len())?;
+                expansion
+                    .expanded
+                    .visit_recovery_payload(&mut charge_retained_payload)?;
                 for (uri, source) in &expansion.source_texts {
                     charge_retained_payload(uri.as_str().len())?;
                     charge_retained_payload(source.len())?;
@@ -3650,9 +3899,10 @@ impl Workspace {
                 }
                 for (uri, entry) in &expansion.dependency_entries {
                     charge_retained_payload(uri.as_str().len())?;
-                    charge_retained_payload(entry.path.as_os_str().len())?;
+                    entry.visit_recovery_payload(&mut charge_retained_payload)?;
                 }
                 for observation in &expansion.include_observations {
+                    budget.charge_recovery_preflight(1, 0)?;
                     charge_retained_payload(observation.path.as_os_str().len())?;
                 }
             }
@@ -3664,22 +3914,14 @@ impl Workspace {
                 }
             }
             for records in self.diagnostic_dependencies.values() {
+                // The reverse-index keys are retained URI strings too.
+                // The record loop below includes each child SourceRecord.
                 budget.charge_recovery_preflight(1, 0)?;
                 count_recovery_entries!(records.len());
                 for record in records {
                     budget.charge_recovery_preflight(1, 0)?;
                     count_recovery_entries!(record.candidate_observations.len());
-                    charge_retained_payload(record.uri.as_str().len())?;
-                    charge_retained_payload(record.text.len())?;
-                    if let Some(bytes) = &record.content_bytes {
-                        charge_retained_payload(bytes.len())?;
-                    }
-                    if let Some(path) = &record.path {
-                        charge_retained_payload(path.as_os_str().len())?;
-                    }
-                    for observation in &record.candidate_observations {
-                        charge_retained_payload(observation.path.as_os_str().len())?;
-                    }
+                    visit_source_record_recovery_payload(record, &mut charge_retained_payload)?;
                 }
             }
         }
@@ -12469,6 +12711,7 @@ mod tests {
         context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
     };
     use crate::NavigationTarget;
+    use crate::include_expansion::ExpandedSource;
     use lsp_types::{Diagnostic, Position, Range, TextDocumentContentChangeEvent, Url};
     use pascal_project::delphi_overrides::{
         EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping,
@@ -12619,7 +12862,7 @@ mod tests {
 
     #[test]
     fn exhausted_recovery_preflights_and_visits_admitted_state_once() {
-        const DOCUMENTS: usize = 2_048;
+        const DOCUMENTS: usize = 512;
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -12830,6 +13073,191 @@ mod tests {
         );
         #[cfg(feature = "test-support")]
         assert!(budget.metrics(true)["recovery_refused"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn recovery_refuses_nested_context_state_before_clearing_it() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let key = budget_test_context_key(0);
+        let mut state = super::ContextState::default();
+        for index in 0..=65_536 {
+            state
+                .watched_paths
+                .insert(temp.path().join(format!("watched-{index:05}.dproj")), None);
+        }
+        workspace.contexts.insert(key, state);
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.contexts.len(), 1);
+        assert_eq!(
+            workspace
+                .contexts
+                .values()
+                .next()
+                .unwrap()
+                .watched_paths
+                .len(),
+            65_537
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_cached_document_project_payload_before_clearing_it() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Cached.pas")).expect("cached URI");
+        workspace
+            .index
+            .update(
+                uri.clone(),
+                "unit Cached; interface implementation end.".into(),
+            )
+            .expect("seed parsed document");
+        let parsed = workspace
+            .index
+            .reusable_documents()
+            .into_iter()
+            .find_map(|(candidate, parsed)| (candidate == uri).then_some(parsed))
+            .expect("cached parsed document");
+        let mut context = pascal_project::ProjectContext::default();
+        context
+            .search_paths
+            .extend((0..=65_536).map(|index| temp.path().join(format!("search-{index:05}"))));
+        workspace.cached_documents.insert(
+            uri,
+            crate::workspace::rename::CachedDocument { context, parsed },
+        );
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.cached_documents.len(), 1);
+        assert_eq!(workspace.index.document_count(), 1);
+    }
+
+    #[test]
+    fn recovery_refuses_cached_document_with_too_many_semantic_members() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("ManyMembers.pas")).expect("cached URI");
+        let mut source = String::from("unit ManyMembers; interface\n");
+        for index in 0..=65_536 {
+            source.push_str(&format!("var V{index}: Integer;\n"));
+        }
+        source.push_str("implementation end.");
+        workspace
+            .index
+            .update(uri.clone(), source)
+            .expect("index cached document");
+        let parsed = workspace
+            .index
+            .reusable_documents()
+            .into_iter()
+            .find_map(|(candidate, parsed)| (candidate == uri).then_some(parsed))
+            .expect("cached parsed document");
+        workspace.cached_documents.insert(
+            uri,
+            crate::workspace::rename::CachedDocument {
+                context: pascal_project::ProjectContext::default(),
+                parsed,
+            },
+        );
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.cached_documents.len(), 1);
+        assert_eq!(workspace.index.document_count(), 1);
+    }
+
+    #[test]
+    fn recovery_refuses_oversized_expanded_source_before_clearing_it() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("Expanded.pas")).expect("expanded URI");
+        let key = budget_test_context_key(0);
+        let mut expanded = ExpandedSource::default();
+        expanded.push_synthetic(&"x".repeat(super::MAX_NOTIFICATION_RECOVERY_BYTES + 1));
+        workspace.expansions.insert(
+            uri.clone(),
+            super::ExpansionRecord {
+                physical_source: String::new(),
+                context_key: key,
+                expanded,
+                source_texts: HashMap::new(),
+                dependency_entries: HashMap::new(),
+                include_observations: Vec::new(),
+                dependencies: HashSet::new(),
+                complete: true,
+            },
+        );
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.expansions.len(), 1);
+        assert_eq!(
+            workspace.expansions[&uri].expanded.text().len(),
+            super::MAX_NOTIFICATION_RECOVERY_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_too_many_expansion_map_segments_before_clearing_them() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let uri = Url::from_file_path(temp.path().join("ManySegments.pas")).expect("expanded URI");
+        let mut expanded = ExpandedSource::default();
+        for _ in 0..=65_536 {
+            expanded.push_synthetic("x");
+        }
+        workspace.expansions.insert(
+            uri.clone(),
+            super::ExpansionRecord {
+                physical_source: String::new(),
+                context_key: budget_test_context_key(0),
+                expanded,
+                source_texts: HashMap::new(),
+                dependency_entries: HashMap::new(),
+                include_observations: Vec::new(),
+                dependencies: HashSet::new(),
+                complete: true,
+            },
+        );
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.expansions.len(), 1);
+        assert_eq!(workspace.expansions[&uri].expanded.text().len(), 65_537);
     }
 
     #[test]

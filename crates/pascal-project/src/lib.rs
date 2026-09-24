@@ -103,6 +103,17 @@ struct ProvenanceRange {
 }
 
 impl ProjectPathEntry {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        visit(self.path.as_os_str().len())?;
+        if let ProjectPathProvenance::Mapped { root } = &self.provenance {
+            visit(root.as_os_str().len())?;
+        }
+        Ok(())
+    }
+
     pub fn legacy(path: PathBuf) -> Self {
         Self {
             path,
@@ -157,6 +168,32 @@ impl PartialEq for ReadPolicy {
 }
 
 impl Eq for ReadPolicy {}
+
+impl ReadPolicy {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for root in self.configured_roots.iter().chain(&self.mapped_roots) {
+            visit(root.path.as_os_str().len())?;
+            for base in &root.pattern_exclusion_bases {
+                visit(base.as_os_str().len())?;
+            }
+        }
+        for pattern in &self.exclusions {
+            visit(pattern.len())?;
+        }
+        for base in &self.exclusion_bases {
+            visit(base.as_os_str().len())?;
+        }
+        // globset does not expose compiled trie/DFA storage. Refuse recovery
+        // rather than pretend a single marker bounds an opaque compiled set.
+        if self.compiled_exclusions.as_ref().is_some() {
+            return Err("compiled project exclusions cannot be bounded for recovery".into());
+        }
+        Ok(())
+    }
+}
 
 impl Hash for ReadPolicy {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -557,6 +594,25 @@ pub enum MetadataObservation {
 }
 
 impl MetadataObservation {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Stat { path } => visit(path.as_os_str().len()),
+            Self::Payload {
+                path,
+                read_policy,
+                path_entry,
+                ..
+            } => {
+                visit(path.as_os_str().len())?;
+                read_policy.visit_recovery_payload(visit)?;
+                path_entry.visit_recovery_payload(visit)
+            }
+        }
+    }
+
     pub fn path(&self) -> &Path {
         match self {
             Self::Stat { path } | Self::Payload { path, .. } => path,
@@ -720,6 +776,84 @@ pub struct ProjectContext {
     pub override_error: Option<String>,
 }
 
+impl ProjectContext {
+    /// Visit each retained child and byte-bearing value that recovery would
+    /// release. Callers provide bounded/cancellable admission at every visit.
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(path) = &self.project_file {
+            visit(path.as_os_str().len())?;
+        }
+        if let Some(path) = &self.main_source {
+            visit(path.as_os_str().len())?;
+        }
+        for path in &self.search_paths {
+            visit(path.as_os_str().len())?;
+        }
+        for entry in &self.search_path_entries {
+            entry.visit_recovery_payload(visit)?;
+        }
+        if let Some(entry) = &self.main_source_entry {
+            entry.visit_recovery_payload(visit)?;
+        }
+        for (name, entries) in &self.explicit_unit_entries {
+            visit(name.len())?;
+            for entry in entries {
+                entry.visit_recovery_payload(visit)?;
+            }
+        }
+        for path in &self.include_paths {
+            visit(path.as_os_str().len())?;
+        }
+        for entry in &self.include_path_entries {
+            entry.visit_recovery_payload(visit)?;
+        }
+        for (name, paths) in &self.explicit_units {
+            visit(name.len())?;
+            for path in paths {
+                visit(path.as_os_str().len())?;
+            }
+        }
+        for namespace in &self.unit_namespaces {
+            visit(namespace.len())?;
+        }
+        for (alias, unit) in &self.unit_aliases {
+            visit(alias.len())?;
+            visit(unit.len())?;
+        }
+        for define in &self.defines {
+            visit(define.len())?;
+        }
+        self.conditional_context.visit_recovery_payload(visit)?;
+        if let Some(config) = &self.config {
+            visit(config.len())?;
+        }
+        if let Some(platform) = &self.platform {
+            visit(platform.len())?;
+        }
+        self.overrides.visit_recovery_payload(visit)?;
+        self.read_policy.visit_recovery_payload(visit)?;
+        for package in &self.packages {
+            visit(package.len())?;
+        }
+        for path in &self.metadata_files {
+            visit(path.as_os_str().len())?;
+        }
+        for observation in &self.metadata_observations {
+            observation.visit_recovery_payload(visit)?;
+        }
+        for warning in &self.warnings {
+            visit(warning.len())?;
+        }
+        if let Some(error) = &self.override_error {
+            visit(error.len())?;
+        }
+        Ok(())
+    }
+}
+
 /// One file observation captured at the read which supplied bytes to project
 /// discovery. Consumers use this instead of reopening the file after parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,6 +862,31 @@ pub struct ProjectReadObservation {
     pub stamp: ProjectReadStamp,
     pub content_hash: u64,
     pub content_bytes: Option<Vec<u8>>,
+}
+
+impl ProjectReadObservation {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        visit(self.path.as_os_str().len())?;
+        if let Some(bytes) = &self.content_bytes {
+            visit(bytes.len())?;
+        }
+        Ok(())
+    }
+}
+
+impl ProjectCandidateMembership {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for path in &self.paths {
+            visit(path.as_os_str().len())?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -843,6 +1002,36 @@ pub struct PackageMetadata {
     pub incomplete: bool,
     pub metadata_files: Vec<PathBuf>,
     pub metadata_observations: Vec<MetadataObservation>,
+}
+
+impl PackageMetadata {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for (name, paths) in &self.units {
+            visit(name.len())?;
+            for path in paths {
+                visit(path.as_os_str().len())?;
+            }
+        }
+        for (name, entries) in &self.unit_entries {
+            visit(name.len())?;
+            for entry in entries {
+                entry.visit_recovery_payload(visit)?;
+            }
+        }
+        for warning in &self.warnings {
+            visit(warning.len())?;
+        }
+        for path in &self.metadata_files {
+            visit(path.as_os_str().len())?;
+        }
+        for observation in &self.metadata_observations {
+            observation.visit_recovery_payload(visit)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

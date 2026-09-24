@@ -22,6 +22,28 @@ pub struct EffectiveOverrides {
     pub path_mappings: Vec<PathMapping>,
 }
 
+impl EffectiveOverrides {
+    pub fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for (name, value) in &self.properties {
+            visit(name.len())?;
+            visit(value.len())?;
+        }
+        for (name, path) in &self.property_origins {
+            visit(name.len())?;
+            visit(path.as_os_str().len())?;
+        }
+        for mapping in &self.path_mappings {
+            visit(mapping.from.len())?;
+            visit(mapping.to.as_os_str().len())?;
+            visit(mapping.config_file.as_os_str().len())?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPath {
     pub path: PathBuf,

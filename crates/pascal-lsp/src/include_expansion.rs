@@ -83,6 +83,21 @@ enum SegmentMapping {
 }
 
 impl ExpandedSource {
+    pub(crate) fn visit_recovery_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        visit(self.text.len())?;
+        for segment in &self.map.segments {
+            let uri_bytes = match &segment.mapping {
+                SegmentMapping::Physical { uri, .. } => uri.as_str().len(),
+                SegmentMapping::Synthetic => 0,
+            };
+            visit(uri_bytes)?;
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         Self::default()
     }
@@ -102,7 +117,7 @@ impl ExpandedSource {
         range
     }
 
-    fn push_synthetic(&mut self, source: &str) -> Range<usize> {
+    pub(crate) fn push_synthetic(&mut self, source: &str) -> Range<usize> {
         let range = self.push_text(source);
         if !range.is_empty() {
             self.map.segments.push(Segment {

@@ -3032,6 +3032,36 @@ fn document_links_omit_parent_traversal_even_when_legacy_include_can_resolve_it(
     server.shutdown();
 }
 
+#[test]
+fn document_links_omit_in_root_parent_traversal() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let source_dir = root.join("sub");
+    fs::create_dir_all(&source_dir).expect("source directory");
+    let main = source_dir.join("Main.pas");
+    let target = root.join("Selected.inc");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I ../Selected.inc}\nend.\n",
+    );
+    write_file(&target, "const Selected = 1;\n");
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-in-root-parent-traversal".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
 #[cfg(all(feature = "test-support", unix))]
 #[test]
 fn document_links_reject_an_ancestor_symlink_inserted_while_delivery_waits() {

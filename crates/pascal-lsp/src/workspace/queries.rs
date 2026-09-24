@@ -1327,6 +1327,9 @@ pub(crate) fn document_links_from_input(
             || path.contains(['*', '?', '$'])
             || path.contains('\\')
             || path.contains(['\'', '"']) && quote_prefix == 0
+            || Path::new(path)
+                .components()
+                .any(|component| component == Component::ParentDir)
         {
             continue;
         }
@@ -1552,6 +1555,12 @@ fn record_document_link_ancestors(
                 )
             })?
             .ok_or_else(|| format!("document-link ancestor disappeared: {}", path.display()))?;
+        if stamp.is_symlink {
+            return Err(format!(
+                "document-link ancestor became a symlink: {}",
+                path.display()
+            ));
+        }
         let uri = Url::from_file_path(path)
             .map_err(|_| format!("invalid document-link ancestor: {}", path.display()))?;
         records.push(SourceRecord {
@@ -2020,6 +2029,28 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::thread;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn document_link_ancestor_observation_rejects_symlink_at_capture() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("isolated workspace");
+        let root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).expect("workspace root");
+        fs::create_dir_all(&outside).expect("outside root");
+        fs::write(outside.join("Selected.inc"), "const Selected = 1;\n").expect("outside source");
+        symlink(&outside, root.join("assets")).expect("symlinked ancestor");
+
+        let error = super::record_document_link_ancestors(
+            &root.join("assets/Selected.inc"),
+            &mut Vec::new(),
+            &AtomicBool::new(false),
+        )
+        .expect_err("a symlinked ancestor must never become the trusted baseline");
+        assert!(error.contains("symlink"), "unexpected refusal: {error}");
+    }
 
     fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))

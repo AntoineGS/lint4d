@@ -1243,6 +1243,17 @@ documents to be recorded as file endpoints. If any endpoint cannot fit this
 bounded recovery envelope, analysis is permanently fenced for that workspace
 instance before global invalidation; restart is required rather than publishing
 results from incomplete endpoint evidence.
+Watched-file batches validate the complete event list before applying any
+`Created`, `Changed`, or `Deleted` event. For a malformed batch of at most 64
+events, parseable file endpoints use the same bounded recovery envelope as file
+operations (up to 128 distinct endpoints, each at most 4 KiB) and are treated
+as negative observations before global derived-state invalidation. This keeps a
+delete-before-unlink endpoint tombstoned and rejects an implicated open overlay
+instead of leaving partial event processing in effect. A later valid `Created`
+event can recover a path when its endpoint was retained. If no endpoint can be
+attributed, or any endpoint cannot fit the recovery envelope, analysis is
+permanently fenced for that workspace instance; later valid events do not lift
+that fence, and restart is required.
 Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
 `didRenameFiles` notifications are not silently discarded. A watched-file batch
 over 64 events or over 32 KiB of cumulative canonical URI bytes permanently

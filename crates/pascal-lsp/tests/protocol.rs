@@ -35208,6 +35208,337 @@ fn sixty_four_short_watched_file_events_remain_reconcilable() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
+    for malformed_kind in ["type", "uri", "non-file-uri", "unretainable-uri"] {
+        for has_known_endpoint in [false, true] {
+            if malformed_kind == "type" && !has_known_endpoint {
+                continue;
+            }
+            for pull_diagnostics in [true, false] {
+                let root = tempfile::tempdir().expect("temporary workspace");
+                let provider = root.path().join("Provider.pas");
+                let consumer = root.path().join("Consumer.pas");
+                let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+                let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 1;\ntype TOldAlias = Provider.TOldThing;\nimplementation\nend.\n";
+                write_file(&provider, provider_source);
+                write_file(&consumer, consumer_source);
+                let mut server = TestServer::launch();
+                if pull_diagnostics {
+                    server.initialize_with_pull_diagnostics(root.path());
+                } else {
+                    server.initialize(root.path(), Value::Null);
+                }
+                server.send_notification(
+                    "textDocument/didOpen",
+                    json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+                );
+
+                let before_definition = RequestId::from(format!(
+                    "malformed-watcher-before-{malformed_kind}-{has_known_endpoint}-{pull_diagnostics}"
+                ));
+                server.send_request(
+                    before_definition.clone(),
+                    "textDocument/definition",
+                    navigation_params(&consumer, consumer_source, "TOldThing", 0),
+                );
+                let locations = result_locations(server.response(&before_definition));
+                assert_eq!(locations.len(), 1, "case {malformed_kind}");
+                assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+
+                let prior_result_id = if pull_diagnostics {
+                    let id = RequestId::from(format!(
+                        "malformed-watcher-pull-before-{malformed_kind}-{has_known_endpoint}"
+                    ));
+                    server.send_request(
+                        id.clone(),
+                        "textDocument/diagnostic",
+                        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+                    );
+                    let response = server.response(&id);
+                    assert!(
+                        response.error.is_none(),
+                        "initial pull failed: {response:?}"
+                    );
+                    Some(
+                        response.result.expect("initial pull result")["resultId"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    )
+                } else {
+                    let publication = server
+                        .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                        .expect("seed push diagnostics before malformed watcher input");
+                    assert!(!publication["diagnostics"].as_array().unwrap().is_empty());
+                    None
+                };
+
+                let mut changes = Vec::new();
+                if has_known_endpoint {
+                    // These valid members precede the malformed member. The
+                    // whole notification must be recovered, not partially
+                    // applied as Created/Deleted before validation finishes.
+                    if malformed_kind == "type" {
+                        changes.push(json!({"uri":uri(&provider),"type":1}));
+                    }
+                    changes.push(json!({"uri":uri(&provider),"type":3}));
+                }
+                let malformed_event = match malformed_kind {
+                    "type" => json!({"uri":uri(&provider),"type":"deleted"}),
+                    "uri" => json!({"uri":17,"type":3}),
+                    "non-file-uri" => json!({"uri":"untitled:Provider.pas","type":3}),
+                    "unretainable-uri" => {
+                        let mut long_endpoint = root.path().join("long-endpoint");
+                        for _ in 0..5 {
+                            long_endpoint.push("u".repeat(1000));
+                        }
+                        json!({"uri":uri(&long_endpoint),"type":"malformed"})
+                    }
+                    _ => unreachable!(),
+                };
+                changes.push(malformed_event);
+                let endpoint_recoverable =
+                    has_known_endpoint && malformed_kind != "unretainable-uri";
+                assert!(changes.len() <= 64);
+                let uri_bytes: usize = changes
+                    .iter()
+                    .filter_map(|change| change["uri"].as_str())
+                    .map(str::len)
+                    .sum();
+                assert!(uri_bytes <= 32 * 1024);
+                server.send_notification(
+                    "workspace/didChangeWatchedFiles",
+                    json!({"changes":changes}),
+                );
+
+                if pull_diagnostics {
+                    if let Some(refresh) =
+                        server.request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                    {
+                        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+                    }
+                    let id = RequestId::from(format!(
+                        "malformed-watcher-pull-after-{malformed_kind}-{has_known_endpoint}"
+                    ));
+                    server.send_request(
+                        id.clone(),
+                        "textDocument/diagnostic",
+                        json!({
+                            "textDocument":{"uri":uri(&provider)},
+                            "previousResultId":prior_result_id.unwrap()
+                        }),
+                    );
+                    let response = server.response(&id);
+                    if endpoint_recoverable {
+                        if let Some(result) = response.result {
+                            assert_ne!(
+                                result["kind"], "unchanged",
+                                "known malformed endpoint must invalidate the prior pull: {result}"
+                            );
+                            assert!(result["items"].as_array().is_some_and(Vec::is_empty));
+                        } else {
+                            assert!(response.error.is_some());
+                        }
+                    } else {
+                        assert!(
+                            response.error.is_some(),
+                            "unattributable {malformed_kind} must permanently fence analysis: {response:?}"
+                        );
+                    }
+                } else {
+                    let clear = server
+                        .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                        .expect("malformed watcher recovery must clear old push diagnostics");
+                    assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+                }
+
+                let after_malformed = RequestId::from(format!(
+                    "malformed-watcher-definition-after-{malformed_kind}-{has_known_endpoint}-{pull_diagnostics}"
+                ));
+                server.send_request(
+                    after_malformed.clone(),
+                    "textDocument/definition",
+                    navigation_params(&consumer, consumer_source, "TOldThing", 0),
+                );
+                let response = server.response(&after_malformed);
+                if endpoint_recoverable {
+                    assert!(
+                        response.error.is_some() || result_locations(response).is_empty(),
+                        "known malformed endpoint must be tombstoned before unlink"
+                    );
+                } else {
+                    assert!(
+                        response.error.is_some(),
+                        "malformed {malformed_kind} without endpoint must fence"
+                    );
+                }
+
+                // The known endpoint is recoverable by a later valid create;
+                // an endpoint-free malformed event keeps the permanent fence.
+                fs::remove_file(&provider).expect("client delete after malformed notification");
+                write_file(&provider, provider_source);
+                server.send_notification(
+                    "workspace/didChangeWatchedFiles",
+                    json!({"changes":[{"uri":uri(&provider),"type":1}]}),
+                );
+                let after_create = RequestId::from(format!(
+                    "malformed-watcher-definition-after-create-{malformed_kind}-{has_known_endpoint}-{pull_diagnostics}"
+                ));
+                server.send_request(
+                    after_create.clone(),
+                    "textDocument/definition",
+                    navigation_params(&consumer, consumer_source, "TOldThing", 0),
+                );
+                let response = server.response(&after_create);
+                if endpoint_recoverable {
+                    assert!(
+                        response.error.is_none(),
+                        "known endpoint create recovery: {response:?}"
+                    );
+                    assert_eq!(
+                        result_locations(response)[0]["uri"],
+                        uri(&provider).to_string()
+                    );
+                } else {
+                    assert!(
+                        response.error.is_some(),
+                        "valid create cannot lift a fence with no prior endpoint evidence"
+                    );
+                }
+                server.shutdown();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_recovers() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let old_source =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_source =
+        "unit Provider;\ninterface\ntype TNewThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    write_file(&provider, old_source);
+    write_file(&consumer, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification("textDocument/didOpen", json!({
+        "textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_source}
+    }));
+    let before = RequestId::from("malformed-watcher-overlay-before".to_string());
+    server.send_request(
+        before.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&before))[0]["uri"],
+        uri(&provider).to_string()
+    );
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[
+            {"uri":uri(&provider),"type":3},
+            {"uri":uri(&provider),"type":"malformed"}
+        ]}),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("recoverable malformed endpoint must refresh pull diagnostics");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+    let stale = RequestId::from("malformed-watcher-overlay-after-delete".to_string());
+    server.send_request(
+        stale.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    let stale_response = server.response(&stale);
+    assert!(
+        stale_response.error.is_some() || result_locations(stale_response).is_empty(),
+        "malformed Deleted endpoint must reject its old open overlay"
+    );
+
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    fs::remove_file(&provider).expect("client unlink after malformed delete");
+    write_file(&provider, new_source);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&provider),"type":1}]}),
+    );
+    let fresh = RequestId::from("malformed-watcher-overlay-after-create".to_string());
+    server.send_request(
+        fresh.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TNewThing", 0),
+    );
+    let fresh_response = server.response(&fresh);
+    assert!(
+        fresh_response.error.is_none(),
+        "create recovery failed: {fresh_response:?}"
+    );
+    assert_eq!(
+        result_locations(fresh_response)[0]["uri"],
+        uri(&provider).to_string()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[cfg(target_os = "linux")]
+#[test]
+fn unattributable_malformed_watcher_fences_queued_and_inflight_queries() {
+    let environment = tempfile::tempdir().expect("test environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace directory");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let inflight_id = RequestId::from("malformed-watcher-inflight-before".to_string());
+    server.send_request(
+        inflight_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    barrier.wait_until_entered();
+
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":17,"type":3}]}),
+    );
+    let queued_id = RequestId::from("malformed-watcher-queued-after".to_string());
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    assert!(
+        server.response(&queued_id).error.is_some(),
+        "queued query must be refused by unattributable malformed-event fence"
+    );
+    barrier.release();
+    assert!(
+        server.response(&inflight_id).error.is_some(),
+        "in-flight query must not deliver a result after the permanent fence"
+    );
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[cfg(feature = "test-support")]
 fn worker_file_notification_error_after_mutation_recovers_staling_and_overlay_state() {
     for pull_diagnostics in [false, true] {

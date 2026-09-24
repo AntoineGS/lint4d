@@ -23,16 +23,15 @@ use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestI
 use lsp_types::{
     ClientCapabilities, CodeAction, CodeActionOrCommand, CodeActionParams, CompletionItem,
     CompletionList, CompletionParams, CompletionResponse, ConfigurationItem, ConfigurationParams,
-    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentDiagnosticParams, DocumentFormattingParams, DocumentHighlightParams, FileChangeType,
-    FileSystemWatcher, FoldingRangeParams, GlobPattern, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, InitializeParams, Location, MarkupKind, MessageType,
-    OneOf, Position, PrepareRenameResponse, ProgressToken, PublishDiagnosticsParams,
-    ReferenceParams, Registration, RegistrationParams, RelativePattern, SelectionRangeParams,
-    ServerInfo, ShowMessageParams, SignatureHelpParams, SymbolInformation, TextDocumentIdentifier,
-    Url, WatchKind, WorkDoneProgressCancelParams, WorkspaceDiagnosticParams, WorkspaceEdit,
-    WorkspaceFolder,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
+    DocumentFormattingParams, DocumentHighlightParams, FileSystemWatcher, FoldingRangeParams,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
+    Location, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse, ProgressToken,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
+    SelectionRangeParams, ServerInfo, ShowMessageParams, SignatureHelpParams, SymbolInformation,
+    TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams,
+    WorkspaceDiagnosticParams, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11042,11 +11041,20 @@ fn handle_notification_with_control_inner(
             Ok(effect)
         }
         "workspace/didChangeWatchedFiles" => {
-            let params: DidChangeWatchedFilesParams = parse_notification(&notification)?;
-            if params.changes.is_empty() {
+            let Some(changes) = notification.params.get("changes").and_then(Value::as_array) else {
+                eprintln!(
+                    "pascal-lsp: malformed watched-file batch has no attributable endpoint; fencing workspace analysis"
+                );
+                return Ok(permanently_fence_file_notification_analysis(
+                    workspace,
+                    budget,
+                    push_diagnostics_supported,
+                ));
+            };
+            if changes.is_empty() {
                 return Ok(DiagnosticNotificationEffect::default());
             }
-            if params.changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
+            if changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
                 eprintln!(
                     "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; fencing workspace analysis"
                 );
@@ -11057,15 +11065,67 @@ fn handle_notification_with_control_inner(
                 ));
             }
             let mut total_uri_bytes = 0usize;
-            let mut changes = Vec::with_capacity(params.changes.len());
-            for change in params.changes {
-                let uri = canonical_file_uri(&change.uri);
+            let mut parsed_changes = Vec::with_capacity(changes.len());
+            let mut recovered_endpoints = Vec::with_capacity(changes.len());
+            let mut unique_endpoints = HashSet::with_capacity(changes.len());
+            let mut recovery_endpoint_bytes = 0usize;
+            let mut oversized_uri_bytes = false;
+            let mut malformed_batch = false;
+            let mut unretainable_endpoint = false;
+            for change in changes {
+                let Some(uri) = change
+                    .get("uri")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Url>(value).ok())
+                else {
+                    malformed_batch = true;
+                    continue;
+                };
+                let uri = canonical_file_uri(&uri);
                 if uri.to_file_path().is_err() {
-                    return Err("watched file batch contains a non-file URI".into());
+                    malformed_batch = true;
+                    continue;
                 }
-                if add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err() {
+                if !oversized_uri_bytes
+                    && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
+                {
+                    oversized_uri_bytes = true;
+                }
+                if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+                    unretainable_endpoint = true;
+                } else if unique_endpoints.insert(uri.clone()) {
+                    let Some(next_bytes) = recovery_endpoint_bytes.checked_add(uri.as_str().len())
+                    else {
+                        unretainable_endpoint = true;
+                        continue;
+                    };
+                    if recovered_endpoints.len() >= MAX_FILE_OPERATION_RECOVERY_ENDPOINTS
+                        || next_bytes > MAX_FILE_OPERATION_RECOVERY_ENDPOINT_BYTES
+                    {
+                        unretainable_endpoint = true;
+                    } else {
+                        recovery_endpoint_bytes = next_bytes;
+                        recovered_endpoints.push(uri.clone());
+                    }
+                }
+                let kind = match change.get("type").and_then(Value::as_i64) {
+                    Some(1) => FileChange::Created,
+                    Some(2) => FileChange::Changed,
+                    Some(3) => FileChange::Deleted,
+                    _ => {
+                        malformed_batch = true;
+                        continue;
+                    }
+                };
+                parsed_changes.push((uri, kind));
+            }
+            if malformed_batch {
+                eprintln!(
+                    "pascal-lsp: malformed watched-file member; recovering attributable endpoints"
+                );
+                if unretainable_endpoint || recovered_endpoints.is_empty() {
                     eprintln!(
-                        "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
+                        "pascal-lsp: malformed watched-file batch has no bounded endpoint evidence; fencing workspace analysis"
                     );
                     return Ok(permanently_fence_file_notification_analysis(
                         workspace,
@@ -11073,22 +11133,30 @@ fn handle_notification_with_control_inner(
                         push_diagnostics_supported,
                     ));
                 }
-                let kind = if change.typ == FileChangeType::CREATED {
-                    FileChange::Created
-                } else if change.typ == FileChangeType::CHANGED {
-                    FileChange::Changed
-                } else {
-                    FileChange::Deleted
-                };
-                changes.push((uri, kind));
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    recovered_endpoints,
+                    push_diagnostics_supported,
+                ));
+            }
+            if oversized_uri_bytes {
+                eprintln!(
+                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
+                );
+                return Ok(permanently_fence_file_notification_analysis(
+                    workspace,
+                    budget,
+                    push_diagnostics_supported,
+                ));
             }
             if let Some(budget) = budget {
-                for (uri, kind) in &changes {
+                for (uri, kind) in &parsed_changes {
                     budget.record_file_event(uri.clone(), *kind);
                 }
             }
             let mut effect = DiagnosticNotificationEffect::default();
-            for (changed_uri, kind) in changes {
+            for (changed_uri, kind) in parsed_changes {
                 if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
                     return Err(rename::CANCELLATION_MESSAGE.to_string());
                 }

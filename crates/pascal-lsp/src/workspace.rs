@@ -55,7 +55,7 @@ pub const MAX_TREE_DEPTH: usize = 256;
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_FILES: usize = 10_000;
 pub(crate) const MAX_OPEN_DOCUMENTS: usize = DEFAULT_MAX_FILES;
-const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
+pub(crate) const MAX_OPEN_DOCUMENT_URI_BYTES: usize = 4_096;
 const MAX_REJECTED_OPEN_FENCE_URIS: usize = 64;
 const MAX_REJECTED_OPEN_FENCE_URI_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_PUBLISHED_DIAGNOSTIC_URI_BYTES: usize = 16 * 1024;
@@ -4118,6 +4118,13 @@ impl Workspace {
             }
             self.deleted_overrides.insert(uri.clone(), None);
         }
+    }
+
+    pub(crate) fn permanently_fence_notification_analysis(
+        &mut self,
+        budget: &ReconciliationBudget,
+    ) {
+        self.fail_closed_notification_recovery(budget);
     }
 
     pub(crate) fn unit_rename_position(
@@ -10719,6 +10726,9 @@ impl Workspace {
                     .to_file_path()
                     .map(absolute_path)
                     .map_err(|_| format!("not a file URI: {uri}"))?;
+                if self.deletion_blocks_load_with_control(uri, &path, Some(cancel), None)? {
+                    return Ok(single_diagnostic_publication(uri, None, Vec::new()));
+                }
                 let context_key = self.context_for_uri_with_cancel(uri, Some(cancel))?;
                 let context = self
                     .contexts

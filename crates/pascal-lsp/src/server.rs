@@ -11,9 +11,9 @@ use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
 use crate::workspace::{
     DiagnosticPublicationCursorStep, DiagnosticPublicationUriCursor, FileChange,
-    MAX_CONFIGURATION_WATCH_PATHS, NavigationState, PreparedWorkspaceOptions, ReconciliationBudget,
-    RuntimeOptionsOverride, RuntimeOptionsUpdate, Workspace, WorkspaceOptions, canonical_file_uri,
-    parse_runtime_options,
+    MAX_CONFIGURATION_WATCH_PATHS, MAX_OPEN_DOCUMENT_URI_BYTES, NavigationState,
+    PreparedWorkspaceOptions, ReconciliationBudget, RuntimeOptionsOverride, RuntimeOptionsUpdate,
+    Workspace, WorkspaceOptions, canonical_file_uri, parse_runtime_options,
 };
 use crate::{NavigationIndex, NavigationTarget};
 use crossbeam_channel::{
@@ -86,6 +86,9 @@ const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
 const MAX_WORKSPACE_MUTATION_DEFERRED_BYTES: usize = 1024 * 1024;
 const MAX_FILE_OPERATION_BATCH_ENTRIES: usize = 64;
 const MAX_FILE_OPERATION_BATCH_URI_BYTES: usize = 32 * 1024;
+const MAX_FILE_OPERATION_RECOVERY_ENDPOINTS: usize = 2 * MAX_FILE_OPERATION_BATCH_ENTRIES;
+const MAX_FILE_OPERATION_RECOVERY_ENDPOINT_BYTES: usize =
+    MAX_FILE_OPERATION_RECOVERY_ENDPOINTS * MAX_OPEN_DOCUMENT_URI_BYTES;
 // Keep one slot available for an authoritative state-changing notification
 // even when only retryable feature requests are arriving.
 const MAX_CONFIGURATION_DEFERRED_REQUESTS: usize =
@@ -10581,18 +10584,80 @@ fn invalidate_malformed_file_notification(
     known_endpoints: impl IntoIterator<Item = Url>,
     push_diagnostics_supported: bool,
 ) -> DiagnosticNotificationEffect {
-    // Malformed members can hide an unreported transition at any URI. Include
-    // all currently open documents so staged/active overlays cannot remain
-    // authoritative merely because the malformed member had no parseable URI.
+    let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+    let budget = budget.unwrap_or(&fallback_budget);
+    let mut endpoints = Vec::new();
+    let mut unique = HashSet::new();
+    if endpoints
+        .try_reserve(MAX_FILE_OPERATION_RECOVERY_ENDPOINTS)
+        .is_err()
+        || unique
+            .try_reserve(MAX_FILE_OPERATION_RECOVERY_ENDPOINTS)
+            .is_err()
+    {
+        return permanently_fence_malformed_file_notification(
+            workspace,
+            Some(budget),
+            push_diagnostics_supported,
+        );
+    }
+    let mut endpoint_bytes = 0usize;
+    for uri in known_endpoints {
+        if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+            return permanently_fence_malformed_file_notification(
+                workspace,
+                Some(budget),
+                push_diagnostics_supported,
+            );
+        }
+        if !unique.insert(uri.clone()) {
+            continue;
+        }
+        let Some(next_bytes) = endpoint_bytes.checked_add(uri.as_str().len()) else {
+            return permanently_fence_malformed_file_notification(
+                workspace,
+                Some(budget),
+                push_diagnostics_supported,
+            );
+        };
+        if endpoints.len() >= MAX_FILE_OPERATION_RECOVERY_ENDPOINTS
+            || next_bytes > MAX_FILE_OPERATION_RECOVERY_ENDPOINT_BYTES
+        {
+            return permanently_fence_malformed_file_notification(
+                workspace,
+                Some(budget),
+                push_diagnostics_supported,
+            );
+        }
+        endpoint_bytes = next_bytes;
+        endpoints.push(uri);
+    }
     invalidate_ambiguous_file_notification(
         workspace,
-        budget,
-        workspace
-            .open_document_uris()
-            .into_iter()
-            .chain(known_endpoints),
+        Some(budget),
+        endpoints,
         push_diagnostics_supported,
     )
+}
+
+fn permanently_fence_malformed_file_notification(
+    workspace: &mut Workspace,
+    budget: Option<&ReconciliationBudget>,
+    push_diagnostics_supported: bool,
+) -> DiagnosticNotificationEffect {
+    // Endpoint evidence cannot fit the explicit notification-recovery
+    // envelope. Latch the workspace-wide refusal before emitting any global
+    // invalidation effect; never continue with a truncated endpoint set.
+    let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+    workspace.permanently_fence_notification_analysis(budget.unwrap_or(&fallback_budget));
+    let mut effect = DiagnosticNotificationEffect::default();
+    effect.refresh_all_diagnostics();
+    effect.discard_all_queued_diagnostics = true;
+    if push_diagnostics_supported {
+        effect.clear_publication_cursor =
+            Some(workspace.take_all_diagnostic_publication_uris(None));
+    }
+    effect
 }
 
 fn mark_publication_root_stale(
@@ -11080,9 +11145,9 @@ fn handle_notification_with_control_inner(
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
-            let mut recovery_endpoint_bytes = 0usize;
             let mut oversized_uri_bytes = false;
             let mut malformed_batch = false;
+            let mut unretainable_endpoint = false;
             for file in files {
                 let Some(uri) = file
                     .get("uri")
@@ -11102,14 +11167,12 @@ fn handle_notification_with_control_inner(
                 {
                     oversized_uri_bytes = true;
                 }
-                // Keep a bounded copy of known endpoints for conservative
-                // recovery if another member makes the batch ambiguous.
-                if unique.insert(uri.clone())
-                    && recovery_endpoint_bytes
-                        .checked_add(uri.as_str().len())
-                        .is_some_and(|bytes| bytes <= MAX_FILE_OPERATION_BATCH_URI_BYTES)
-                {
-                    recovery_endpoint_bytes += uri.as_str().len();
+                // Preserve every admitted endpoint independently of the
+                // ordinary notification byte-accounting threshold. A URI
+                // that cannot fit the recovery envelope fences analysis.
+                if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+                    unretainable_endpoint = true;
+                } else if unique.insert(uri.clone()) {
                     uris.push(uri);
                 }
             }
@@ -11117,6 +11180,13 @@ fn handle_notification_with_control_inner(
                 eprintln!(
                     "pascal-lsp: malformed file-operation member; invalidating workspace file state"
                 );
+                if unretainable_endpoint {
+                    return Ok(permanently_fence_malformed_file_notification(
+                        workspace,
+                        budget,
+                        push_diagnostics_supported,
+                    ));
+                }
                 return Ok(invalidate_malformed_file_notification(
                     workspace,
                     budget,
@@ -11128,6 +11198,13 @@ fn handle_notification_with_control_inner(
                 eprintln!(
                     "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
                 );
+                if unretainable_endpoint {
+                    return Ok(permanently_fence_malformed_file_notification(
+                        workspace,
+                        budget,
+                        push_diagnostics_supported,
+                    ));
+                }
                 return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             if let Some(budget) = budget {
@@ -11191,11 +11268,11 @@ fn handle_notification_with_control_inner(
             let mut new_uris = HashSet::with_capacity(files.len());
             let mut unique_renames = HashSet::with_capacity(files.len());
             let mut recoverable_endpoints = Vec::with_capacity(files.len().saturating_mul(2));
-            let mut recovery_endpoint_bytes = 0usize;
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
             let mut ambiguous_batch = false;
             let mut malformed_batch = false;
+            let mut unretainable_endpoint = false;
             for file in files {
                 let old_uri = file
                     .get("oldUri")
@@ -11209,11 +11286,10 @@ fn handle_notification_with_control_inner(
                 let new_uri = new_uri.map(|uri| canonical_file_uri(&uri));
                 for uri in [old_uri.as_ref(), new_uri.as_ref()].into_iter().flatten() {
                     if uri.to_file_path().is_ok()
-                        && recovery_endpoint_bytes
-                            .checked_add(uri.as_str().len())
-                            .is_some_and(|bytes| bytes <= MAX_FILE_OPERATION_BATCH_URI_BYTES)
+                        && uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES
                     {
-                        recovery_endpoint_bytes += uri.as_str().len();
+                        unretainable_endpoint = true;
+                    } else if uri.to_file_path().is_ok() {
                         recoverable_endpoints.push(uri.clone());
                     }
                 }
@@ -11250,6 +11326,13 @@ fn handle_notification_with_control_inner(
                 eprintln!(
                     "pascal-lsp: malformed file-rename member; invalidating workspace file state"
                 );
+                if unretainable_endpoint {
+                    return Ok(permanently_fence_malformed_file_notification(
+                        workspace,
+                        budget,
+                        push_diagnostics_supported,
+                    ));
+                }
                 return Ok(invalidate_malformed_file_notification(
                     workspace,
                     budget,
@@ -11275,6 +11358,13 @@ fn handle_notification_with_control_inner(
                 eprintln!(
                     "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; invalidating workspace file state"
                 );
+                if unretainable_endpoint {
+                    return Ok(permanently_fence_malformed_file_notification(
+                        workspace,
+                        budget,
+                        push_diagnostics_supported,
+                    ));
+                }
                 return Ok(invalidate_for_file_notification_overflow(workspace));
             }
             if let Some(budget) = budget {

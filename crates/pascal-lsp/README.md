@@ -1233,6 +1233,16 @@ identical text. A late old-URI `didChange` after close does not restore it.
 Unverified/mismatched transitions fail closed and require reopening. A delayed
 `didClose` for the old URI cannot close an accepted new-URI overlay. Unmatched
 late rename notifications invalidate old/new path state conservatively.
+For a malformed batch within the 64-entry limit, every parseable file endpoint
+is retained separately from the ordinary 32 KiB admission accounting (up to
+128 distinct endpoints, each at most 4 KiB). Recoverable endpoints are treated
+as negative observations before global derived-state invalidation, so a
+delete/rename reported before the physical filesystem change cannot make old
+closed-file bytes authoritative again. Malformed entries do not cause all open
+documents to be recorded as file endpoints. If any endpoint cannot fit this
+bounded recovery envelope, analysis is permanently fenced for that workspace
+instance before global invalidation; restart is required rather than publishing
+results from incomplete endpoint evidence.
 Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
 `didRenameFiles` notifications are not silently discarded: they trigger a
 conservative workspace-wide source/configuration/catalogue invalidation, cancel

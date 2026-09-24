@@ -1177,9 +1177,13 @@ the client owns the move. The provider must satisfy the same simple
 unnamespaced declaration/basename, same-directory, preserved-extension,
 collision, authorization, project-metadata, and complete-binding checks as
 `willRenameFiles`. Selecting the actual unit spelling in a declaration, `uses`
-entry, or qualified unit prefix is supported; alias spellings, namespaced
-declarations, `in 'path'` uses, ambiguous/unknown bindings, and cross-project
-context changes fail atomically. `willRenameFiles` remains text-edit-only and
+entry, or qualified unit prefix is supported. A single-quoted explicit
+`uses Unit in 'relative/path/Unit.pas'` is supported only when the complete
+selected project context proves that the path resolves to that exact provider;
+only the filename component is changed. Alias spellings, namespaced
+declarations, absolute/traversing paths, symlink or non-regular targets,
+malformed/ambiguous path mappings, unknown bindings, and cross-project context
+changes fail atomically. `willRenameFiles` remains text-edit-only and
 never returns a `RenameFile` because the client already owns that move.
 
 ### Workspace file operations
@@ -1199,10 +1203,14 @@ directory and not exist, and one complete unambiguous project-selected binding
 family must be provable. Providers that are a selected `MainSource`, a
 `DCCReference`/explicit unit path, or belong to a project with package metadata
 are rejected because updating those project/package path consumers is not yet
-supported. Explicit `uses ... in 'path'` files, aliases, namespace
-  declarations, cross-directory moves, case-only renames, multi-file/directory
-  moves, open/rejected destination overlays, and unresolved includes/conditional
-or ownership uncertainty fail as a whole. The returned `documentChanges` are
+supported. Explicit `uses ... in 'path'` literals are edited only for a
+single-quoted safe relative path whose resolved target is the selected provider
+in the same complete project context; only its filename component changes.
+Absolute paths, `.`/`..` or empty components, symlink/non-regular targets,
+malformed/ambiguous path mappings, aliases, namespace declarations,
+cross-directory moves, case-only renames, multi-file/directory moves,
+open/rejected destination overlays, and unresolved includes/conditional or
+ownership uncertainty fail as a whole. The returned `documentChanges` are
 versioned for open documents; closed documents carry the LSP null version.
 There is no `RenameFile` resource operation in this file-operation handshake:
 the client already owns and performs the requested physical move after applying
@@ -1214,14 +1222,20 @@ After `didCreateFiles`, `didDeleteFiles`, and `didRenameFiles`, catalogues,
 loaded-source observations, negative path observations, and affected
 diagnostics are invalidated/refreshed, including for unopened sources; events
 do not synthesize/delete imports or mutate physical files. File-operation
-notifications accept bounded batches of at most 64 entries and reject
-malformed in-range batches before applying any entry; watched-file batches are
-likewise limited to 64 events. The cumulative UTF-8 length of canonical file
+notifications accept bounded batches of at most 64 entries; watched-file
+batches are likewise limited to 64 events. Repeated canonical endpoints in
+create/delete batches and repeated identical old/new rename pairs within one
+rename batch are deduplicated and applied once. Distinct pairs that reuse an
+endpoint, form a chain/cycle, or otherwise make attribution ambiguous are
+recovered as a whole: known endpoints are invalidated/tombstoned and implicated
+open overlays are rejected rather than partially transferred. A later,
+separate notification reusing the same URI pair is processed normally; there is
+no URI-pair-only duplicate suppression. Malformed in-range batches use bounded
+endpoint recovery (or permanently fence analysis when endpoint evidence is
+unattributable/unretainable), rather than silently dropping a physical event.
+The cumulative UTF-8 length of canonical file
 URIs in a notification batch is limited to 32 KiB; in-range batches are
-validated before per-entry mutations. Repeated old/new rename pairs
-conservatively invalidate and refresh again instead of being suppressed by URI
-pair alone; a later real reuse of those paths therefore cannot be mistaken for
-a stale duplicate. A pending, successful unit `willRenameFiles`
+validated before per-entry mutations. A pending, successful unit `willRenameFiles`
 plan accepts an open overlay only when the exact planned text and version/identity
 transition can be proved. This supports a monotonic old-URI `didChange` followed
 by `didClose`, client move, and exact new-URI `didOpen` before the file-operation
@@ -1229,7 +1243,10 @@ notification (even when the new URI starts a fresh version sequence), as well as
 the exact old-URI update before `didRenameFiles`. A new-URI overlay must match
 the planned text, and the old URI must have been closed after a verified planned
 update; a live old overlay plus a new target is rejected even if both contain
-identical text. A late old-URI `didChange` after close does not restore it.
+identical text. A target opened while the old URI is still open is a competing
+incarnation and remains rejected even if the old URI is subsequently updated
+and closed; close the verified old source before opening the target. A late
+old-URI `didChange` after close does not restore it.
 Unverified/mismatched transitions fail closed and require reopening. A delayed
 `didClose` for the old URI cannot close an accepted new-URI overlay. Unmatched
 late rename notifications invalidate old/new path state conservatively.

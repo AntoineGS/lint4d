@@ -31237,6 +31237,100 @@ fn did_rename_rejects_competing_new_uri_overlay_opened_before_event() {
 }
 
 #[test]
+fn did_rename_rejects_target_opened_before_verified_old_close() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let consumer = root.join("Consumer.pas");
+    let main = root.join("Main.pas");
+    let new_provider = root.join("Renamed.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    let init_id = RequestId::from("target-before-close-init".to_string());
+    server.send_request(
+        init_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}}}),
+    );
+    assert!(server.response(&init_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+    );
+
+    let will_id = RequestId::from("target-before-close-will".to_string());
+    server.send_request(
+        will_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+    let will = server.response(&will_id);
+    assert!(will.error.is_none(), "willRename failed: {will:?}");
+    let edit = will.result.expect("file rename edit");
+    let provider_updated = apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+    let consumer_updated = apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    write_file(&consumer, &consumer_updated);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+    );
+
+    // The target overlay appears while the original provider incarnation is
+    // still open. Even though its bytes match the planned edit and the old
+    // incarnation is subsequently updated and closed, the target's origin is
+    // ambiguous and must not be attributed to this transition.
+    fs::rename(&provider, &new_provider).expect("client-owned move");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&new_provider),"languageId":"pascal","version":1,"text":provider_updated}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&provider)}}),
+    );
+    write_file(&new_provider, &provider_source.replace("TThing", "TStale"));
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&new_provider)}]}),
+    );
+
+    let definition_id = RequestId::from("target-before-close-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let locations = result_locations(server.response(&definition_id));
+    assert!(
+        locations.is_empty(),
+        "a target opened before verified old-source close must not be attributed to the rename: {locations:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn did_rename_accepts_verified_close_and_new_open_before_event() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
@@ -31509,6 +31603,562 @@ fn duplicated_create_file_events_refresh_negative_and_same_stamp_providers() {
             .is_some_and(|items| items.iter().all(|item| item["code"] != "constant-naming"))
     );
     server.shutdown();
+}
+
+#[test]
+fn duplicate_delete_tombstone_and_verified_create_refresh_provider_identity() {
+    for pull_mode in [false, true] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        let provider = root.join("Provider.pas");
+        let old_consumer = root.join("OldConsumer.pas");
+        let new_consumer = root.join("NewConsumer.pas");
+        let main = root.join("Main.pas");
+        let old_provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let new_provider_source = old_provider_source
+            .replace("badConst", "GOODNAME")
+            .replace("TOldThing", "TNewThing");
+        assert_eq!(old_provider_source.len(), new_provider_source.len());
+        let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+        let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TNewThing;\nimplementation\nend.\n";
+        fs::create_dir_all(&root).expect("workspace directory");
+        write_file(&provider, old_provider_source);
+        write_file(&old_consumer, old_consumer_source);
+        write_file(&new_consumer, new_consumer_source);
+        write_file(
+            &main,
+            "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch();
+        if pull_mode {
+            server.initialize_with_pull_diagnostics(&root);
+        } else {
+            server.initialize_with_watched_registration(&root, Value::Null, false);
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_provider_source}}),
+            );
+            let initial_push = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("initial provider diagnostics");
+            assert!(initial_push["diagnostics"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["code"] == "constant-naming")
+            }));
+        }
+
+        let definition =
+            |server: &mut TestServer, id: &str, file: &Path, source: &str, name: &str| {
+                let request_id = RequestId::from(id.to_string());
+                server.send_request(
+                    request_id.clone(),
+                    "textDocument/definition",
+                    navigation_params(file, source, name, 0),
+                );
+                result_locations(server.response(&request_id))
+            };
+        let before = definition(
+            &mut server,
+            "duplicate-delete-old-before",
+            &old_consumer,
+            old_consumer_source,
+            "TOldThing",
+        );
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["uri"], uri(&provider).to_string());
+        assert!(
+            definition(
+                &mut server,
+                "duplicate-delete-new-negative-before",
+                &new_consumer,
+                new_consumer_source,
+                "TNewThing",
+            )
+            .is_empty()
+        );
+
+        let previous_result_id = if pull_mode {
+            let id = RequestId::from("duplicate-delete-pull-initial".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "initial pull failed: {response:?}"
+            );
+            Some(
+                response.result.expect("initial pull report")["resultId"]
+                    .as_str()
+                    .expect("pull result ID")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let delete = json!({"files":[
+            {"uri":uri(&provider)},
+            {"uri":uri(&root.join(".").join("Provider.pas"))},
+        ]});
+        // The old bytes deliberately remain present through reconciliation.
+        server.send_notification("workspace/didDeleteFiles", delete);
+        if pull_mode {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("duplicate delete must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+        } else {
+            let refreshed = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("duplicate delete must refresh the still-open provider diagnostics");
+            assert!(
+                refreshed["diagnostics"]
+                    .as_array()
+                    .is_some_and(|items| items
+                        .iter()
+                        .any(|item| item["code"] == "constant-naming")),
+                "the open editor overlay remains authoritative until close: {refreshed:?}"
+            );
+            server.send_notification(
+                "textDocument/didClose",
+                json!({"textDocument":{"uri":uri(&provider)}}),
+            );
+            let clear = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("closed deleted provider must clear push diagnostics");
+            assert!(
+                clear["diagnostics"]
+                    .as_array()
+                    .is_some_and(|items| items.is_empty())
+            );
+        }
+        assert!(provider.exists(), "delete event precedes physical unlink");
+        assert!(
+            definition(
+                &mut server,
+                "duplicate-delete-old-tombstoned",
+                &old_consumer,
+                old_consumer_source,
+                "TOldThing",
+            )
+            .is_empty()
+        );
+        assert!(
+            definition(
+                &mut server,
+                "duplicate-delete-new-still-negative",
+                &new_consumer,
+                new_consumer_source,
+                "TNewThing",
+            )
+            .is_empty()
+        );
+        let mut result_id_after_delete = None;
+        if let Some(previous_result_id) = previous_result_id {
+            let id = RequestId::from("duplicate-delete-pull-after-delete".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":previous_result_id}),
+            );
+            let response = server.response(&id);
+            assert!(response.error.is_none(), "delete pull failed: {response:?}");
+            let report = response.result.expect("delete pull report");
+            assert_eq!(report["kind"], "full");
+            result_id_after_delete = report["resultId"].as_str().map(str::to_owned);
+        }
+
+        fs::remove_file(&provider).expect("client-owned unlink after delete notification");
+        write_file(&provider, &new_provider_source);
+        server.send_notification(
+            "workspace/didCreateFiles",
+            json!({"files":[
+                {"uri":uri(&provider)},
+                {"uri":uri(&root.join(".").join("Provider.pas"))},
+            ]}),
+        );
+        if pull_mode {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("verified duplicate create must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+        } else {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":new_provider_source}}),
+            );
+            let refreshed = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("verified create/open must publish fresh diagnostics");
+            assert!(refreshed["diagnostics"].as_array().is_some_and(|items| {
+                items.iter().all(|item| item["code"] != "constant-naming")
+            }));
+        }
+        assert!(
+            definition(
+                &mut server,
+                "duplicate-delete-old-identity-gone",
+                &old_consumer,
+                old_consumer_source,
+                "TOldThing",
+            )
+            .is_empty()
+        );
+        let after = definition(
+            &mut server,
+            "duplicate-delete-new-identity-restored",
+            &new_consumer,
+            new_consumer_source,
+            "TNewThing",
+        );
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["uri"], uri(&provider).to_string());
+        if let Some(previous_result_id) = result_id_after_delete {
+            let id = RequestId::from("duplicate-delete-pull-after-create".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":previous_result_id}),
+            );
+            let response = server.response(&id);
+            assert!(response.error.is_none(), "create pull failed: {response:?}");
+            let report = response.result.expect("created provider report");
+            assert_eq!(report["kind"], "full");
+            assert!(report["items"].as_array().is_some_and(|items| {
+                items.iter().all(|item| item["code"] != "constant-naming")
+            }));
+        }
+        server.shutdown();
+    }
+}
+
+#[test]
+fn duplicate_exact_rename_pair_transfers_staged_open_overlay_once() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("fixture");
+    let provider = root.join("Provider.pas");
+    let renamed_provider = root.join("Renamed.pas");
+    let consumer = root.join("Consumer.pas");
+    let negative_consumer = root.join("NegativeConsumer.pas");
+    let main = root.join("Main.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    let negative_source = "unit NegativeConsumer;\ninterface\nuses MissingProvider;\ntype TAlias = MissingProvider.TMissing;\nimplementation\nend.\n";
+    fs::create_dir_all(&root).expect("workspace directory");
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&negative_consumer, negative_source);
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Consumer, NegativeConsumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    let init_id = RequestId::from("duplicate-pair-init".to_string());
+    server.send_request(
+        init_id.clone(),
+        "initialize",
+        json!({"processId":null,"rootUri":uri(&root),"capabilities":{
+            "textDocument":{"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":true}},
+            "workspace":{"diagnostics":{"refreshSupport":true},"workspaceFolders":true,
+                "workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}
+        }}),
+    );
+    assert!(server.response(&init_id).error.is_none());
+    server.send_notification("initialized", json!({}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+    );
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+    );
+
+    let will_id = RequestId::from("duplicate-pair-will".to_string());
+    server.send_request(
+        will_id.clone(),
+        "workspace/willRenameFiles",
+        json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&renamed_provider)}]}),
+    );
+    let will = server.response(&will_id);
+    assert!(will.error.is_none(), "willRename failed: {will:?}");
+    let edit = will.result.expect("coordinated rename edit");
+    let provider_updated = apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+    let consumer_updated = apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+    write_file(&consumer, &consumer_updated);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+    );
+    fs::rename(&provider, &renamed_provider).expect("client-owned move");
+    write_file(
+        &renamed_provider,
+        &provider_updated.replace("TThing", "TStale"),
+    );
+
+    let pair = json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)});
+    server.send_notification(
+        "workspace/didRenameFiles",
+        json!({"files":[pair.clone(), pair]}),
+    );
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("duplicate exact pair must complete and refresh pull diagnostics");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+    let new_id = RequestId::from("duplicate-pair-new-definition".to_string());
+    server.send_request(
+        new_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    let new_locations = result_locations(server.response(&new_id));
+    assert_eq!(
+        new_locations.len(),
+        1,
+        "staged pair must transfer exactly once"
+    );
+    assert_eq!(new_locations[0]["uri"], uri(&renamed_provider).to_string());
+
+    let negative_id = RequestId::from("duplicate-pair-negative-consumer".to_string());
+    server.send_request(
+        negative_id.clone(),
+        "textDocument/definition",
+        navigation_params(&negative_consumer, negative_source, "TMissing", 0),
+    );
+    assert!(result_locations(server.response(&negative_id)).is_empty());
+
+    let old_pull_id = RequestId::from("duplicate-pair-old-uri-pull".to_string());
+    server.send_request(
+        old_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    assert!(
+        server.response(&old_pull_id).result.is_some(),
+        "the old URI must be refreshable but must not own the transferred overlay"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn valid_sixty_four_pair_rename_batch_replays_with_selected_open_provider() {
+    for pull_mode in [false, true] {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(&root).expect("workspace directory");
+        let provider = root.join("Provider.pas");
+        let renamed_provider = root.join("Renamed.pas");
+        let consumer = root.join("Consumer.pas");
+        let negative_consumer = root.join("NegativeConsumer.pas");
+        let main = root.join("Main.pas");
+        let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+        let negative_source = "unit NegativeConsumer;\ninterface\nuses MissingProvider;\ntype TAlias = MissingProvider.TMissing;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        write_file(&negative_consumer, negative_source);
+        write_file(
+            &main,
+            "unit Main;\ninterface\nuses Consumer, NegativeConsumer;\nimplementation\nend.\n",
+        );
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+        let noise_moves = (0..63)
+            .map(|index| {
+                let old = root.join(format!("Noise{index:02}.pas"));
+                let new = root.join(format!("MovedNoise{index:02}.pas"));
+                write_file(
+                    &old,
+                    &format!("unit Noise{index:02};\ninterface\nimplementation\nend.\n"),
+                );
+                (old, new)
+            })
+            .collect::<Vec<_>>();
+
+        let mut server = TestServer::launch();
+        let init_id = RequestId::from(format!("64-pair-init-{pull_mode}"));
+        let mut capabilities = json!({
+            "workspace":{"workspaceEdit":{"documentChanges":true},"fileOperations":{"willRename":true}}
+        });
+        if pull_mode {
+            capabilities["textDocument"] =
+                json!({"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":true}});
+            capabilities["workspace"]["diagnostics"] = json!({"refreshSupport":true});
+            capabilities["workspace"]["workspaceFolders"] = json!(true);
+        }
+        server.send_request(
+            init_id.clone(),
+            "initialize",
+            json!({"processId":null,"rootUri":uri(&root),"capabilities":capabilities}),
+        );
+        assert!(server.response(&init_id).error.is_none());
+        server.send_notification("initialized", json!({}));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":3,"text":provider_source}}),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":7,"text":consumer_source}}),
+        );
+        let initial_definition_id = RequestId::from(format!("64-pair-before-{pull_mode}"));
+        server.send_request(
+            initial_definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TThing", 0),
+        );
+        let initial = result_locations(server.response(&initial_definition_id));
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0]["uri"], uri(&provider).to_string());
+        let initial_negative_id = RequestId::from(format!("64-pair-negative-before-{pull_mode}"));
+        server.send_request(
+            initial_negative_id.clone(),
+            "textDocument/definition",
+            navigation_params(&negative_consumer, negative_source, "TMissing", 0),
+        );
+        assert!(result_locations(server.response(&initial_negative_id)).is_empty());
+
+        let previous_result_id = if pull_mode {
+            let id = RequestId::from(format!("64-pair-pull-before-{pull_mode}"));
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "initial pull failed: {response:?}"
+            );
+            Some(
+                response.result.expect("initial pull")["resultId"]
+                    .as_str()
+                    .expect("result ID")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let will_id = RequestId::from(format!("64-pair-will-{pull_mode}"));
+        server.send_request(
+            will_id.clone(),
+            "workspace/willRenameFiles",
+            json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&renamed_provider)}]}),
+        );
+        let will = server.response(&will_id);
+        assert!(
+            will.error.is_none(),
+            "selected-provider plan failed: {will:?}"
+        );
+        let edit = will.result.expect("selected provider edit");
+        let provider_updated =
+            apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+        let consumer_updated =
+            apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+        write_file(&consumer, &consumer_updated);
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(&provider),"version":4},"contentChanges":[{"text":provider_updated}]}),
+        );
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(&consumer),"version":8},"contentChanges":[{"text":consumer_updated}]}),
+        );
+        fs::rename(&provider, &renamed_provider).expect("client-owned selected-provider move");
+        write_file(
+            &renamed_provider,
+            &provider_updated.replace("TThing", "TStale"),
+        );
+        let mut pairs = vec![json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)})];
+        for (old, new) in &noise_moves {
+            fs::rename(old, new).expect("client-owned noise move");
+            pairs.push(json!({"oldUri":uri(old),"newUri":uri(new)}));
+        }
+        assert_eq!(pairs.len(), 64);
+        let uri_bytes = pairs
+            .iter()
+            .map(|pair| {
+                pair["oldUri"].as_str().unwrap().len() + pair["newUri"].as_str().unwrap().len()
+            })
+            .sum::<usize>();
+        assert!(
+            uri_bytes <= 32 * 1024,
+            "fixture exceeds URI bound: {uri_bytes}"
+        );
+        server.send_notification("workspace/didRenameFiles", json!({"files":pairs}));
+
+        // These ordinary messages follow the batch and therefore exercise
+        // replay only after the worker has reconciled all 64 client moves.
+        let queued_id = RequestId::from(format!("64-pair-query-after-replay-{pull_mode}"));
+        server.send_request(
+            queued_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, &consumer_updated, "TThing", 0),
+        );
+        let moved_locations = result_locations(server.response(&queued_id));
+        assert_eq!(
+            moved_locations.len(),
+            1,
+            "64-pair batch must not partially apply"
+        );
+        assert_eq!(
+            moved_locations[0]["uri"],
+            uri(&renamed_provider).to_string()
+        );
+        let negative_id = RequestId::from(format!("64-pair-negative-after-{pull_mode}"));
+        server.send_request(
+            negative_id.clone(),
+            "textDocument/definition",
+            navigation_params(&negative_consumer, negative_source, "TMissing", 0),
+        );
+        assert!(result_locations(server.response(&negative_id)).is_empty());
+
+        if let Some(previous_result_id) = previous_result_id {
+            let id = RequestId::from("64-pair-pull-after".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":previous_result_id}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "post-rename pull failed: {response:?}"
+            );
+            assert_eq!(
+                response.result.expect("full old-URI report")["kind"],
+                "full"
+            );
+        } else {
+            let publication = server
+                .diagnostic_with_timeout(&uri(&renamed_provider), IO_TIMEOUT)
+                .expect("push diagnostics must follow the moved open provider");
+            assert_eq!(publication["version"], 4);
+            assert!(publication["diagnostics"].as_array().is_some());
+        }
+        server.shutdown();
+    }
 }
 
 #[test]

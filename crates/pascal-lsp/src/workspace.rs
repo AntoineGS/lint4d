@@ -1687,6 +1687,7 @@ struct PendingUnitFileRename {
     original_version: Option<i32>,
     expected_text: Option<String>,
     closed_verified_version: Option<i32>,
+    target_opened_before_verified_close: bool,
 }
 
 struct DiskSource {
@@ -2929,6 +2930,12 @@ impl Workspace {
     }
 
     pub fn open_document(&mut self, uri: Url, text: String, version: i32) -> Result<(), String> {
+        let canonical_uri = canonical_file_uri(&uri);
+        for (old_uri, pending) in &mut self.pending_unit_file_renames {
+            if pending.new_uri == canonical_uri && self.open_documents.contains_key(old_uri) {
+                pending.target_opened_before_verified_close = true;
+            }
+        }
         if !self.open_documents.contains_key(&uri)
             && self.open_documents.len() >= MAX_OPEN_DOCUMENTS
         {
@@ -4253,6 +4260,7 @@ impl Workspace {
                 original_version,
                 expected_text,
                 closed_verified_version: None,
+                target_opened_before_verified_close: false,
             },
         );
         Ok(())
@@ -4375,6 +4383,9 @@ impl Workspace {
             let target_matches_plan = target_document.text.as_deref() == Some(expected_text)
                 && target_document.rejection.is_none();
             if !old_uri_is_closed || !closed_source_version_is_proven || !target_matches_plan {
+                return false;
+            }
+            if pending.target_opened_before_verified_close {
                 return false;
             }
             return self.open_document_contexts.contains_key(new_uri)
@@ -13125,6 +13136,7 @@ mod tests {
                 original_version: Some(3),
                 expected_text: Some("unit RenamedTo;".into()),
                 closed_verified_version: None,
+                target_opened_before_verified_close: false,
             },
         );
         workspace.pending_unit_file_rename_bytes = "unit RenamedTo;".len();
@@ -13239,6 +13251,7 @@ mod tests {
                 original_version: Some(4),
                 expected_text: Some("unit After;".to_owned()),
                 closed_verified_version: None,
+                target_opened_before_verified_close: false,
             },
         );
         workspace.pending_unit_file_rename_bytes = "unit After;".len();

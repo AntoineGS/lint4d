@@ -10575,6 +10575,26 @@ fn invalidate_ambiguous_file_notification(
     effect
 }
 
+fn invalidate_malformed_file_notification(
+    workspace: &mut Workspace,
+    budget: Option<&ReconciliationBudget>,
+    known_endpoints: impl IntoIterator<Item = Url>,
+    push_diagnostics_supported: bool,
+) -> DiagnosticNotificationEffect {
+    // Malformed members can hide an unreported transition at any URI. Include
+    // all currently open documents so staged/active overlays cannot remain
+    // authoritative merely because the malformed member had no parseable URI.
+    invalidate_ambiguous_file_notification(
+        workspace,
+        budget,
+        workspace
+            .open_document_uris()
+            .into_iter()
+            .chain(known_endpoints),
+        push_diagnostics_supported,
+    )
+}
+
 fn mark_publication_root_stale(
     connection: &dyn ProtocolSender,
     workspace: &mut Workspace,
@@ -11033,11 +11053,22 @@ fn handle_notification_with_control_inner(
         "workspace/didCreateFiles" | "workspace/didDeleteFiles" => {
             let created = notification.method == "workspace/didCreateFiles";
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
-                return Err("file operation notification requires a files array".into());
+                eprintln!(
+                    "pascal-lsp: malformed file-operation batch; invalidating workspace file state"
+                );
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    [],
+                    push_diagnostics_supported,
+                ));
             };
             if files.is_empty() {
-                return Err(format!(
-                    "file operation batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    [],
+                    push_diagnostics_supported,
                 ));
             }
             if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
@@ -11049,25 +11080,49 @@ fn handle_notification_with_control_inner(
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
+            let mut recovery_endpoint_bytes = 0usize;
             let mut oversized_uri_bytes = false;
+            let mut malformed_batch = false;
             for file in files {
-                let uri = file
+                let Some(uri) = file
                     .get("uri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                    .ok_or_else(|| "file operation entry requires a valid uri".to_string())?;
+                else {
+                    malformed_batch = true;
+                    continue;
+                };
                 let uri = canonical_file_uri(&uri);
                 if uri.to_file_path().is_err() {
-                    return Err("file operation batch contains a non-file URI".into());
+                    malformed_batch = true;
+                    continue;
                 }
                 if !oversized_uri_bytes
                     && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
                 {
                     oversized_uri_bytes = true;
                 }
-                if unique.insert(uri.clone()) {
+                // Keep a bounded copy of known endpoints for conservative
+                // recovery if another member makes the batch ambiguous.
+                if unique.insert(uri.clone())
+                    && recovery_endpoint_bytes
+                        .checked_add(uri.as_str().len())
+                        .is_some_and(|bytes| bytes <= MAX_FILE_OPERATION_BATCH_URI_BYTES)
+                {
+                    recovery_endpoint_bytes += uri.as_str().len();
                     uris.push(uri);
                 }
+            }
+            if malformed_batch {
+                eprintln!(
+                    "pascal-lsp: malformed file-operation member; invalidating workspace file state"
+                );
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    uris,
+                    push_diagnostics_supported,
+                ));
             }
             if oversized_uri_bytes {
                 eprintln!(
@@ -11107,11 +11162,22 @@ fn handle_notification_with_control_inner(
         }
         "workspace/didRenameFiles" => {
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
-                return Err("file operation notification requires a files array".into());
+                eprintln!(
+                    "pascal-lsp: malformed file-rename batch; invalidating workspace file state"
+                );
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    [],
+                    push_diagnostics_supported,
+                ));
             };
             if files.is_empty() {
-                return Err(format!(
-                    "file rename batch must contain between 1 and {MAX_FILE_OPERATION_BATCH_ENTRIES} entries"
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    [],
+                    push_diagnostics_supported,
                 ));
             }
             if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
@@ -11125,29 +11191,40 @@ fn handle_notification_with_control_inner(
             let mut new_uris = HashSet::with_capacity(files.len());
             let mut unique_renames = HashSet::with_capacity(files.len());
             let mut recoverable_endpoints = Vec::with_capacity(files.len().saturating_mul(2));
+            let mut recovery_endpoint_bytes = 0usize;
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
             let mut ambiguous_batch = false;
+            let mut malformed_batch = false;
             for file in files {
                 let old_uri = file
                     .get("oldUri")
                     .cloned()
-                    .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                    .ok_or_else(|| "file rename entry requires a valid oldUri".to_string())?;
+                    .and_then(|value| serde_json::from_value::<Url>(value).ok());
                 let new_uri = file
                     .get("newUri")
                     .cloned()
-                    .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                    .ok_or_else(|| "file rename entry requires a valid newUri".to_string())?;
-                let old_uri = canonical_file_uri(&old_uri);
-                let new_uri = canonical_file_uri(&new_uri);
-                let old_is_file = old_uri.to_file_path().is_ok();
-                let new_is_file = new_uri.to_file_path().is_ok();
-                if !old_is_file || !new_is_file {
-                    return Err("file rename batch contains a non-file URI".into());
+                    .and_then(|value| serde_json::from_value::<Url>(value).ok());
+                let old_uri = old_uri.map(|uri| canonical_file_uri(&uri));
+                let new_uri = new_uri.map(|uri| canonical_file_uri(&uri));
+                for uri in [old_uri.as_ref(), new_uri.as_ref()].into_iter().flatten() {
+                    if uri.to_file_path().is_ok()
+                        && recovery_endpoint_bytes
+                            .checked_add(uri.as_str().len())
+                            .is_some_and(|bytes| bytes <= MAX_FILE_OPERATION_BATCH_URI_BYTES)
+                    {
+                        recovery_endpoint_bytes += uri.as_str().len();
+                        recoverable_endpoints.push(uri.clone());
+                    }
                 }
-                recoverable_endpoints.push(old_uri.clone());
-                recoverable_endpoints.push(new_uri.clone());
+                let (Some(old_uri), Some(new_uri)) = (old_uri, new_uri) else {
+                    malformed_batch = true;
+                    continue;
+                };
+                if old_uri.to_file_path().is_err() || new_uri.to_file_path().is_err() {
+                    malformed_batch = true;
+                    continue;
+                }
                 if !oversized_uri_bytes
                     && (add_file_operation_uri_bytes(&mut total_uri_bytes, &old_uri).is_err()
                         || add_file_operation_uri_bytes(&mut total_uri_bytes, &new_uri).is_err())
@@ -11155,7 +11232,8 @@ fn handle_notification_with_control_inner(
                     oversized_uri_bytes = true;
                 }
                 if old_uri == new_uri {
-                    return Err("file rename batch contains identical URIs".into());
+                    malformed_batch = true;
+                    continue;
                 }
                 if !unique_renames.insert((old_uri.clone(), new_uri.clone())) {
                     // Replaying the exact same move in one batch is
@@ -11167,6 +11245,17 @@ fn handle_notification_with_control_inner(
                     ambiguous_batch = true;
                 }
                 renames.push((old_uri, new_uri));
+            }
+            if malformed_batch {
+                eprintln!(
+                    "pascal-lsp: malformed file-rename member; invalidating workspace file state"
+                );
+                return Ok(invalidate_malformed_file_notification(
+                    workspace,
+                    budget,
+                    recoverable_endpoints,
+                    push_diagnostics_supported,
+                ));
             }
             if old_uris.iter().any(|uri| new_uris.contains(uri)) {
                 ambiguous_batch = true;

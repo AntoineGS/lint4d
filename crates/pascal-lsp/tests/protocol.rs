@@ -34823,7 +34823,7 @@ fn worker_file_notification_error_after_mutation_recovers_staling_and_overlay_st
 }
 
 #[test]
-fn prevalidated_malformed_file_batch_has_no_mutation_or_refresh() {
+fn malformed_file_batch_forces_global_refresh_even_when_entries_cannot_be_attributed() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let main = root.path().join("Main.pas");
     write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
@@ -34833,11 +34833,10 @@ fn prevalidated_malformed_file_batch_has_no_mutation_or_refresh() {
         "workspace/didCreateFiles",
         json!({"files":[{"uri":uri(&main)},{"notUri":"malformed"}]}),
     );
-    assert!(
-        server
-            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(150))
-            .is_none()
-    );
+    let refresh = server
+        .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+        .expect("unattributable file notification must fail closed with global refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
     let diagnostic_id = RequestId::from("prevalidated-malformed-input-diagnostics".to_string());
     server.send_request(
         diagnostic_id.clone(),
@@ -34850,6 +34849,421 @@ fn prevalidated_malformed_file_batch_has_no_mutation_or_refresh() {
         "diagnostic request failed: {response:?}"
     );
     server.shutdown();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn malformed_mixed_create_and_delete_batches_tombstone_then_verified_create_recovers() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let old_consumer = root.path().join("OldConsumer.pas");
+    let new_consumer = root.path().join("NewConsumer.pas");
+    let old_source = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_source = old_source
+        .replace("badConst", "GOODNAME")
+        .replace("TOldThing", "TNewThing");
+    let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+    let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    write_file(&old_consumer, old_consumer_source);
+    write_file(&new_consumer, new_consumer_source);
+    write_file(
+        &root.path().join("Main.pas"),
+        "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let definition =
+        |server: &mut TestServer, id: &str, file: &Path, source: &str, symbol: &str| {
+            let request_id = RequestId::from(id.to_string());
+            server.send_request(
+                request_id.clone(),
+                "textDocument/definition",
+                navigation_params(file, source, symbol, 0),
+            );
+            result_locations(server.response(&request_id))
+        };
+    let refresh = |server: &mut TestServer, reason: &str| {
+        let request = server
+            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            .unwrap_or_else(|| panic!("{reason} must refresh pull diagnostics"));
+        server.send(Message::Response(Response::new_ok(request.id, Value::Null)));
+    };
+
+    assert!(
+        definition(
+            &mut server,
+            "mixed-create-old-before",
+            &old_consumer,
+            old_consumer_source,
+            "TOldThing",
+        )
+        .is_empty()
+    );
+    write_file(&provider, old_source);
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&provider)},{"missing":"uri"}]}),
+    );
+    refresh(&mut server, "mixed create with malformed member");
+    assert!(
+        definition(
+            &mut server,
+            "mixed-create-must-not-trust-provider",
+            &old_consumer,
+            old_consumer_source,
+            "TOldThing",
+        )
+        .is_empty()
+    );
+
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&provider)}]}),
+    );
+    refresh(&mut server, "verified create repair");
+    let old_locations = definition(
+        &mut server,
+        "mixed-create-repair-old-provider",
+        &old_consumer,
+        old_consumer_source,
+        "TOldThing",
+    );
+    assert_eq!(old_locations.len(), 1);
+    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
+
+    let prior_pull_id = RequestId::from("mixed-create-prior-pull".to_string());
+    server.send_request(
+        prior_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+    );
+    let prior_pull = server.response(&prior_pull_id);
+    assert!(
+        prior_pull.error.is_none(),
+        "initial pull failed: {prior_pull:?}"
+    );
+    let prior_result_id = prior_pull.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("prior pull result ID")
+        .to_string();
+    let original_metadata = fs::metadata(&provider).expect("provider metadata");
+    write_file(&provider, &new_source);
+    restore_mtime(&provider, &original_metadata);
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&provider)},{"malformed":true}]}),
+    );
+    refresh(&mut server, "same-stamp malformed create");
+    let post_create_pull_id =
+        RequestId::from("mixed-create-pull-after-invalidated-event".to_string());
+    server.send_request(
+        post_create_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument":{"uri":uri(&provider)},
+            "previousResultId":prior_result_id,
+        }),
+    );
+    let post_create_pull = server.response(&post_create_pull_id);
+    assert!(post_create_pull.error.is_none());
+    assert_eq!(post_create_pull.result.as_ref().unwrap()["kind"], "full");
+    assert!(
+        definition(
+            &mut server,
+            "mixed-create-old-identity-cleared",
+            &old_consumer,
+            old_consumer_source,
+            "TOldThing",
+        )
+        .is_empty()
+    );
+    assert!(
+        definition(
+            &mut server,
+            "mixed-create-new-identity-held-by-tombstone",
+            &new_consumer,
+            new_consumer_source,
+            "TNewThing",
+        )
+        .is_empty()
+    );
+
+    // A didDeleteFiles event is reported while the old bytes still exist. The
+    // tombstone must win over that stale on-disk provider until unlink/recreate.
+    server.send_notification(
+        "workspace/didDeleteFiles",
+        json!({"files":[{"uri":uri(&provider)},{"badEntry":"missing uri"}]}),
+    );
+    refresh(&mut server, "mixed delete before unlink");
+    assert!(
+        definition(
+            &mut server,
+            "mixed-delete-before-unlink-stays-absent",
+            &new_consumer,
+            new_consumer_source,
+            "TNewThing",
+        )
+        .is_empty()
+    );
+    fs::remove_file(&provider).expect("client-owned physical deletion");
+    write_file(&provider, &new_source);
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&provider)}]}),
+    );
+    refresh(&mut server, "verified create after delete");
+    let new_locations = definition(
+        &mut server,
+        "mixed-delete-create-repairs-provider",
+        &new_consumer,
+        new_consumer_source,
+        "TNewThing",
+    );
+    assert_eq!(new_locations.len(), 1);
+    assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
+    server.shutdown();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
+    for pull_diagnostics in [false, true] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let renamed_provider = root.path().join("Renamed.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let main = root.path().join("Main.pas");
+        let sibling = root.path().join("Sibling.pas");
+        let provider_source = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        write_file(
+            &main,
+            "unit Main;\ninterface\nuses Consumer;\nimplementation\nend.\n",
+        );
+        write_file(&sibling, "unit Sibling;\ninterface\nimplementation\nend.\n");
+        write_file(
+            &root.path().join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+        let mut server = TestServer::launch();
+        let init_id = RequestId::from(format!("malformed-move-init-{pull_diagnostics}"));
+        let mut capabilities = json!({
+            "workspace": {
+                "workspaceEdit": {"documentChanges": true},
+                "fileOperations": {"willRename": true},
+                "workspaceFolders": true,
+            }
+        });
+        if pull_diagnostics {
+            capabilities["textDocument"] = json!({
+                "diagnostic": {"dynamicRegistration": false, "relatedDocumentSupport": true}
+            });
+            capabilities["workspace"]["diagnostics"] = json!({"refreshSupport": true});
+        }
+        server.send_request(
+            init_id.clone(),
+            "initialize",
+            json!({"processId":null,"rootUri":uri(root.path()),"capabilities":capabilities}),
+        );
+        let init_response = server.response(&init_id);
+        assert!(
+            init_response.error.is_none(),
+            "initialize failed: {init_response:?}"
+        );
+        server.send_notification("initialized", json!({}));
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":5,"text":provider_source}}),
+        );
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":9,"text":consumer_source}}),
+        );
+
+        let before_id = RequestId::from(format!("malformed-move-before-{pull_diagnostics}"));
+        server.send_request(
+            before_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TThing", 0),
+        );
+        let before_locations = result_locations(server.response(&before_id));
+        assert_eq!(before_locations.len(), 1);
+        assert_eq!(before_locations[0]["uri"], uri(&provider).to_string());
+
+        let will_id = RequestId::from(format!("malformed-move-will-{pull_diagnostics}"));
+        server.send_request(
+            will_id.clone(),
+            "workspace/willRenameFiles",
+            json!({"files":[{"oldUri":uri(&provider),"newUri":uri(&renamed_provider)}]}),
+        );
+        let will_response = server.response(&will_id);
+        assert!(
+            will_response.error.is_none(),
+            "willRename failed: {will_response:?}"
+        );
+        let edit = will_response.result.expect("willRename edit");
+        let provider_updated =
+            apply_workspace_edit_to_source(provider_source, &edit, &uri(&provider));
+        let consumer_updated =
+            apply_workspace_edit_to_source(consumer_source, &edit, &uri(&consumer));
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(&provider),"version":6},"contentChanges":[{"text":provider_updated}]}),
+        );
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(&consumer),"version":10},"contentChanges":[{"text":consumer_updated}]}),
+        );
+        server.send_notification(
+            "textDocument/didClose",
+            json!({"textDocument":{"uri":uri(&provider)}}),
+        );
+        fs::rename(&provider, &renamed_provider).expect("client-owned physical provider move");
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&renamed_provider),"languageId":"pascal","version":1,"text":provider_updated}}),
+        );
+        // This mirrors the current exact close/new-open transition proof: a
+        // post-close old-URI change is not used to accept a malformed batch.
+        server.send_notification(
+            "textDocument/didChange",
+            json!({"textDocument":{"uri":uri(&provider),"version":7},"contentChanges":[{"text":provider_updated}]}),
+        );
+        let moved_metadata = fs::metadata(&renamed_provider).expect("moved provider metadata");
+        let stale_disk = provider_updated.replace("TThing", "TStale");
+        assert_eq!(stale_disk.len(), provider_updated.len());
+        write_file(&renamed_provider, &stale_disk);
+        restore_mtime(&renamed_provider, &moved_metadata);
+
+        let prior_result_id = if pull_diagnostics {
+            let pull_id = RequestId::from(format!("malformed-move-pull-before-{pull_diagnostics}"));
+            server.send_request(
+                pull_id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&renamed_provider)},"previousResultId":null}),
+            );
+            let response = server.response(&pull_id);
+            assert!(
+                response.error.is_none(),
+                "pre-batch pull failed: {response:?}"
+            );
+            Some(
+                response.result.as_ref().unwrap()["resultId"]
+                    .as_str()
+                    .expect("pre-batch pull result ID")
+                    .to_string(),
+            )
+        } else {
+            let report = server
+                .diagnostic_with_timeout(&uri(&renamed_provider), IO_TIMEOUT)
+                .expect("new open overlay must publish diagnostics");
+            assert!(report["diagnostics"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["code"] == "constant-naming")
+            }));
+            None
+        };
+
+        server.send_notification(
+            "workspace/didRenameFiles",
+            json!({"files":[
+                {"oldUri":uri(&provider),"newUri":uri(&renamed_provider)},
+                {"oldUri":uri(&sibling),"malformed":"missing newUri"},
+            ]}),
+        );
+        if pull_diagnostics {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("mixed malformed rename must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            let pull_id = RequestId::from(format!("malformed-move-pull-after-{pull_diagnostics}"));
+            server.send_request(
+                pull_id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&renamed_provider)},
+                    "previousResultId":prior_result_id,
+                }),
+            );
+            let response = server.response(&pull_id);
+            assert!(
+                response.error.is_none(),
+                "post-batch pull failed: {response:?}"
+            );
+            assert_eq!(response.result.as_ref().unwrap()["kind"], "full");
+        } else {
+            let clear = server
+                .diagnostic_with_timeout(&uri(&renamed_provider), IO_TIMEOUT)
+                .expect("mixed malformed rename must clear queued push diagnostics");
+            assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+        }
+
+        let rejected_overlay_id = RequestId::from(format!(
+            "malformed-move-overlay-not-transferred-{pull_diagnostics}"
+        ));
+        server.send_request(
+            rejected_overlay_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, &consumer_updated, "TThing", 0),
+        );
+        assert!(
+            result_locations(server.response(&rejected_overlay_id)).is_empty(),
+            "malformed mixed rename must reject the target overlay and not trust stale disk bytes"
+        );
+        let old_overlay_id = RequestId::from(format!(
+            "malformed-move-old-overlay-rejected-{pull_diagnostics}"
+        ));
+        server.send_request(
+            old_overlay_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, &consumer_updated, "TThing", 0),
+        );
+        assert!(
+            result_locations(server.response(&old_overlay_id)).is_empty(),
+            "malformed rename must not leave the old-URI overlay authoritative"
+        );
+
+        // A later physically verified create after closing the rejected target
+        // clears its tombstone and allows fresh disk binding without a permanent fence.
+        server.send_notification(
+            "textDocument/didClose",
+            json!({"textDocument":{"uri":uri(&renamed_provider)}}),
+        );
+        server.send_notification(
+            "textDocument/didClose",
+            json!({"textDocument":{"uri":uri(&consumer)}}),
+        );
+        write_file(&consumer, &consumer_updated);
+        write_file(&renamed_provider, &provider_updated);
+        server.send_notification(
+            "workspace/didCreateFiles",
+            json!({"files":[{"uri":uri(&renamed_provider)}]}),
+        );
+        if pull_diagnostics {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("verified rename destination repair must refresh diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+        }
+        let repaired_id = RequestId::from(format!("malformed-move-repaired-{pull_diagnostics}"));
+        server.send_request(
+            repaired_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, &consumer_updated, "TThing", 0),
+        );
+        let repaired_locations = result_locations(server.response(&repaired_id));
+        assert_eq!(repaired_locations.len(), 1);
+        assert_eq!(
+            repaired_locations[0]["uri"],
+            uri(&renamed_provider).to_string()
+        );
+        server.shutdown();
+    }
 }
 
 #[cfg(target_os = "linux")]

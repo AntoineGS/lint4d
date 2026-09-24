@@ -36979,7 +36979,7 @@ fn sixty_four_short_watched_file_events_remain_reconcilable() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
+fn malformed_watched_file_batches_with_any_bad_member_fence() {
     for malformed_kind in ["type", "uri", "non-file-uri", "unretainable-uri"] {
         for has_known_endpoint in [false, true] {
             if malformed_kind == "type" && !has_known_endpoint {
@@ -37068,8 +37068,6 @@ fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
                     _ => unreachable!(),
                 };
                 changes.push(malformed_event);
-                let endpoint_recoverable =
-                    has_known_endpoint && malformed_kind != "unretainable-uri";
                 assert!(changes.len() <= 64);
                 let uri_bytes: usize = changes
                     .iter()
@@ -37100,26 +37098,14 @@ fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
                         }),
                     );
                     let response = server.response(&id);
-                    if endpoint_recoverable {
-                        if let Some(result) = response.result {
-                            assert_ne!(
-                                result["kind"], "unchanged",
-                                "known malformed endpoint must invalidate the prior pull: {result}"
-                            );
-                            assert!(result["items"].as_array().is_some_and(Vec::is_empty));
-                        } else {
-                            assert!(response.error.is_some());
-                        }
-                    } else {
-                        assert!(
-                            response.error.is_some(),
-                            "unattributable {malformed_kind} must permanently fence analysis: {response:?}"
-                        );
-                    }
+                    assert!(
+                        response.error.is_some(),
+                        "malformed {malformed_kind} must permanently fence analysis: {response:?}"
+                    );
                 } else {
                     let clear = server
                         .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
-                        .expect("malformed watcher recovery must clear old push diagnostics");
+                        .expect("malformed watcher fence must clear old push diagnostics");
                     assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
                 }
 
@@ -37132,20 +37118,13 @@ fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
                     navigation_params(&consumer, consumer_source, "TOldThing", 0),
                 );
                 let response = server.response(&after_malformed);
-                if endpoint_recoverable {
-                    assert!(
-                        response.error.is_some() || result_locations(response).is_empty(),
-                        "known malformed endpoint must be tombstoned before unlink"
-                    );
-                } else {
-                    assert!(
-                        response.error.is_some(),
-                        "malformed {malformed_kind} without endpoint must fence"
-                    );
-                }
+                assert!(
+                    response.error.is_some(),
+                    "malformed {malformed_kind} must fence all workspace analysis"
+                );
 
-                // The known endpoint is recoverable by a later valid create;
-                // an endpoint-free malformed event keeps the permanent fence.
+                // No later valid event can repair a batch whose complete
+                // endpoint/event evidence was not attributable.
                 fs::remove_file(&provider).expect("client delete after malformed notification");
                 write_file(&provider, provider_source);
                 server.send_notification(
@@ -37161,21 +37140,10 @@ fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
                     navigation_params(&consumer, consumer_source, "TOldThing", 0),
                 );
                 let response = server.response(&after_create);
-                if endpoint_recoverable {
-                    assert!(
-                        response.error.is_none(),
-                        "known endpoint create recovery: {response:?}"
-                    );
-                    assert_eq!(
-                        result_locations(response)[0]["uri"],
-                        uri(&provider).to_string()
-                    );
-                } else {
-                    assert!(
-                        response.error.is_some(),
-                        "valid create cannot lift a fence with no prior endpoint evidence"
-                    );
-                }
+                assert!(
+                    response.error.is_some(),
+                    "valid create cannot lift a permanent malformed-batch fence"
+                );
                 server.shutdown();
             }
         }
@@ -37184,7 +37152,199 @@ fn malformed_watched_file_batches_recover_known_endpoints_or_fence() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_recovers() {
+fn mixed_malformed_closed_delete_fences_before_unlink() {
+    for pull_diagnostics in [true, false] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let unrelated = root.path().join("Unrelated.pas");
+        let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\nconst badConst = 1;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        write_file(&unrelated, "unit Unrelated; interface end.\n");
+        let mut server = TestServer::launch();
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(root.path());
+        } else {
+            server.initialize(root.path(), Value::Null);
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+            );
+        }
+
+        let before_id = RequestId::from(format!("mixed-delete-before-{pull_diagnostics}"));
+        server.send_request(
+            before_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TThing", 0),
+        );
+        assert_eq!(result_locations(server.response(&before_id)).len(), 1);
+
+        let prior_result_id = if pull_diagnostics {
+            let id = RequestId::from("mixed-delete-prior-pull".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(response.error.is_none(), "seed pull: {response:?}");
+            Some(
+                response.result.unwrap()["resultId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        } else {
+            let publication = server
+                .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                .expect("seed push finding before malformed delete");
+            assert!(
+                !publication["diagnostics"].as_array().unwrap().is_empty(),
+                "provider must have a nonempty prior push report"
+            );
+            None
+        };
+
+        // The provider's delete is reported before unlink, but that URI is
+        // malformed/unattributable. The unrelated valid member must not make
+        // endpoint recovery look complete.
+        server.send_notification(
+            "workspace/didDeleteFiles",
+            json!({"files":[
+                {"uri":uri(&unrelated)},
+                {"uri":"not-a-uri"}
+            ]}),
+        );
+
+        if pull_diagnostics {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("permanent delete-batch fence must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            let id = RequestId::from("mixed-delete-pull-after".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":prior_result_id.unwrap()
+                }),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_some(),
+                "fenced pull must not be unchanged/full: {response:?}"
+            );
+        } else {
+            let publication = server
+                .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
+                .expect("permanent delete-batch fence must clear prior push finding");
+            assert!(
+                publication["diagnostics"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            );
+        }
+
+        let before_unlink_id = RequestId::from("mixed-delete-definition-before-unlink".to_string());
+        server.send_request(
+            before_unlink_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TThing", 0),
+        );
+        assert!(
+            server.response(&before_unlink_id).error.is_some(),
+            "closed provider must not remain resolvable after unbounded delete evidence"
+        );
+        fs::remove_file(&provider).expect("client-owned unlink after notification");
+        server.shutdown();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn malformed_create_missing_uri_and_watcher_unknown_type_fence_unrelated_batches() {
+    for malformed_kind in ["create-missing-uri", "watcher-unknown-type"] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let unrelated = root.path().join("Unrelated.pas");
+        let provider_source =
+            "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+        write_file(&consumer, consumer_source);
+        write_file(&unrelated, "unit Unrelated; interface end.\n");
+        let mut server = TestServer::launch();
+        server.initialize_with_pull_diagnostics(root.path());
+
+        if malformed_kind == "create-missing-uri" {
+            let before_id = RequestId::from("malformed-create-negative-before".to_string());
+            server.send_request(
+                before_id.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, "TThing", 0),
+            );
+            assert!(result_locations(server.response(&before_id)).is_empty());
+            write_file(&provider, provider_source);
+            server.send_notification(
+                "workspace/didCreateFiles",
+                json!({"files":[
+                    {"uri":uri(&unrelated)},
+                    {"missing":"provider URI"}
+                ]}),
+            );
+        } else {
+            write_file(&provider, provider_source);
+            let before_id = RequestId::from("malformed-watcher-before".to_string());
+            server.send_request(
+                before_id.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, "TThing", 0),
+            );
+            assert_eq!(result_locations(server.response(&before_id)).len(), 1);
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({"changes":[
+                    {"uri":uri(&unrelated),"type":1},
+                    {"uri":uri(&provider),"type":"deleted"}
+                ]}),
+            );
+        }
+        let refresh = server
+            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            .expect("unknown batch member must permanently fence and request pull refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+        let id = RequestId::from(format!("{malformed_kind}-pull-after"));
+        server.send_request(
+            id.clone(),
+            "textDocument/diagnostic",
+            json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+        );
+        let pull = server.response(&id);
+        assert!(
+            pull.error.is_some(),
+            "unbounded {malformed_kind} batch must fence pull diagnostics: {pull:?}"
+        );
+        let after_id = RequestId::from(format!("{malformed_kind}-definition-after"));
+        server.send_request(
+            after_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TThing", 0),
+        );
+        assert!(
+            server.response(&after_id).error.is_some(),
+            "unknown {malformed_kind} member cannot leave stale/negative provider authority"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_stays_fenced() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let consumer = root.path().join("Consumer.pas");
@@ -37220,7 +37380,7 @@ fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_recovers() {
     );
     let refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-        .expect("recoverable malformed endpoint must refresh pull diagnostics");
+        .expect("malformed watcher batch must refresh pull diagnostics");
     server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
     let stale = RequestId::from("malformed-watcher-overlay-after-delete".to_string());
     server.send_request(
@@ -37252,12 +37412,8 @@ fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_recovers() {
     );
     let fresh_response = server.response(&fresh);
     assert!(
-        fresh_response.error.is_none(),
-        "create recovery failed: {fresh_response:?}"
-    );
-    assert_eq!(
-        result_locations(fresh_response)[0]["uri"],
-        uri(&provider).to_string()
+        fresh_response.error.is_some(),
+        "later valid create cannot lift a malformed-batch analysis fence: {fresh_response:?}"
     );
     server.shutdown();
 }
@@ -37271,11 +37427,13 @@ fn unattributable_malformed_watcher_fences_queued_and_inflight_queries() {
     fs::create_dir_all(&root).expect("workspace directory");
     let provider = root.join("Provider.pas");
     let consumer = root.join("Consumer.pas");
+    let unrelated = root.join("Unrelated.pas");
     let provider_source =
         "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
     let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
     write_file(&provider, provider_source);
     write_file(&consumer, consumer_source);
+    write_file(&unrelated, "unit Unrelated; interface end.\n");
     let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
     server.initialize(&root, Value::Null);
     let inflight_id = RequestId::from("malformed-watcher-inflight-before".to_string());
@@ -37288,7 +37446,10 @@ fn unattributable_malformed_watcher_fences_queued_and_inflight_queries() {
 
     server.send_notification(
         "workspace/didChangeWatchedFiles",
-        json!({"changes":[{"uri":17,"type":3}]}),
+        json!({"changes":[
+            {"uri":uri(&unrelated),"type":1},
+            {"uri":17,"type":3}
+        ]}),
     );
     let queued_id = RequestId::from("malformed-watcher-queued-after".to_string());
     server.send_request(
@@ -37535,7 +37696,7 @@ fn worker_file_notification_error_after_mutation_recovers_staling_and_overlay_st
 }
 
 #[test]
-fn malformed_file_batch_forces_global_refresh_even_when_entries_cannot_be_attributed() {
+fn malformed_file_batch_fences_analysis_and_requests_global_refresh() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let main = root.path().join("Main.pas");
     write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
@@ -37557,8 +37718,8 @@ fn malformed_file_batch_forces_global_refresh_even_when_entries_cannot_be_attrib
     );
     let response = server.response(&diagnostic_id);
     assert!(
-        response.error.is_none(),
-        "diagnostic request failed: {response:?}"
+        response.error.is_some(),
+        "permanently fenced malformed batch must refuse diagnostics: {response:?}"
     );
     server.shutdown();
 }
@@ -37577,7 +37738,7 @@ fn distinct_long_file_operation_uris(root: &Path, count: usize) -> Vec<Url> {
 }
 
 #[test]
-fn malformed_delete_after_uri_byte_overflow_preserves_late_tombstone() {
+fn malformed_delete_after_uri_byte_overflow_permanently_fences_analysis() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let consumer = root.path().join("Consumer.pas");
@@ -37644,8 +37805,8 @@ fn malformed_delete_after_uri_byte_overflow_preserves_late_tombstone() {
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
     assert!(
-        result_locations(server.response(&after_id)).is_empty(),
-        "late delete endpoint must remain tombstoned while the old file still exists"
+        server.response(&after_id).error.is_some(),
+        "malformed over-budget batch must fence analysis rather than partially tombstone"
     );
     let pull_after_id = RequestId::from("late-tombstone-pull-after".to_string());
     server.send_request(
@@ -37657,16 +37818,9 @@ fn malformed_delete_after_uri_byte_overflow_preserves_late_tombstone() {
         }),
     );
     let pull_after = server.response(&pull_after_id);
-    assert!(pull_after.error.is_none());
-    assert_eq!(
-        pull_after.result.as_ref().unwrap()["kind"],
-        "full",
-        "late delete must invalidate the prior pull report: {pull_after:?}"
-    );
     assert!(
-        pull_after.result.as_ref().unwrap()["items"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
+        pull_after.error.is_some(),
+        "permanent malformed-batch fence must refuse pull diagnostics: {pull_after:?}"
     );
     fs::remove_file(&provider).expect("client-owned physical unlink");
     server.shutdown();
@@ -37796,183 +37950,6 @@ fn malformed_file_batch_with_unretainable_endpoint_fences_analysis() {
         response.error.is_some(),
         "analysis must remain fail-closed when endpoint evidence cannot be retained"
     );
-    server.shutdown();
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn malformed_mixed_create_and_delete_batches_tombstone_then_verified_create_recovers() {
-    let root = tempfile::tempdir().expect("temporary workspace");
-    let provider = root.path().join("Provider.pas");
-    let old_consumer = root.path().join("OldConsumer.pas");
-    let new_consumer = root.path().join("NewConsumer.pas");
-    let old_source = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
-    let new_source = old_source
-        .replace("badConst", "GOODNAME")
-        .replace("TOldThing", "TNewThing");
-    let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
-    let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TNewThing;\nimplementation\nend.\n";
-    write_file(&old_consumer, old_consumer_source);
-    write_file(&new_consumer, new_consumer_source);
-    write_file(
-        &root.path().join("Main.pas"),
-        "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n",
-    );
-    write_file(
-        &root.path().join("App.dproj"),
-        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
-    );
-    let mut server = TestServer::launch();
-    server.initialize_with_pull_diagnostics(root.path());
-    let definition =
-        |server: &mut TestServer, id: &str, file: &Path, source: &str, symbol: &str| {
-            let request_id = RequestId::from(id.to_string());
-            server.send_request(
-                request_id.clone(),
-                "textDocument/definition",
-                navigation_params(file, source, symbol, 0),
-            );
-            result_locations(server.response(&request_id))
-        };
-    let refresh = |server: &mut TestServer, reason: &str| {
-        let request = server
-            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-            .unwrap_or_else(|| panic!("{reason} must refresh pull diagnostics"));
-        server.send(Message::Response(Response::new_ok(request.id, Value::Null)));
-    };
-
-    assert!(
-        definition(
-            &mut server,
-            "mixed-create-old-before",
-            &old_consumer,
-            old_consumer_source,
-            "TOldThing",
-        )
-        .is_empty()
-    );
-    write_file(&provider, old_source);
-    server.send_notification(
-        "workspace/didCreateFiles",
-        json!({"files":[{"uri":uri(&provider)},{"missing":"uri"}]}),
-    );
-    refresh(&mut server, "mixed create with malformed member");
-    assert!(
-        definition(
-            &mut server,
-            "mixed-create-must-not-trust-provider",
-            &old_consumer,
-            old_consumer_source,
-            "TOldThing",
-        )
-        .is_empty()
-    );
-
-    server.send_notification(
-        "workspace/didCreateFiles",
-        json!({"files":[{"uri":uri(&provider)}]}),
-    );
-    refresh(&mut server, "verified create repair");
-    let old_locations = definition(
-        &mut server,
-        "mixed-create-repair-old-provider",
-        &old_consumer,
-        old_consumer_source,
-        "TOldThing",
-    );
-    assert_eq!(old_locations.len(), 1);
-    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
-
-    let prior_pull_id = RequestId::from("mixed-create-prior-pull".to_string());
-    server.send_request(
-        prior_pull_id.clone(),
-        "textDocument/diagnostic",
-        json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
-    );
-    let prior_pull = server.response(&prior_pull_id);
-    assert!(
-        prior_pull.error.is_none(),
-        "initial pull failed: {prior_pull:?}"
-    );
-    let prior_result_id = prior_pull.result.as_ref().unwrap()["resultId"]
-        .as_str()
-        .expect("prior pull result ID")
-        .to_string();
-    let original_metadata = fs::metadata(&provider).expect("provider metadata");
-    write_file(&provider, &new_source);
-    restore_mtime(&provider, &original_metadata);
-    server.send_notification(
-        "workspace/didCreateFiles",
-        json!({"files":[{"uri":uri(&provider)},{"malformed":true}]}),
-    );
-    refresh(&mut server, "same-stamp malformed create");
-    let post_create_pull_id =
-        RequestId::from("mixed-create-pull-after-invalidated-event".to_string());
-    server.send_request(
-        post_create_pull_id.clone(),
-        "textDocument/diagnostic",
-        json!({
-            "textDocument":{"uri":uri(&provider)},
-            "previousResultId":prior_result_id,
-        }),
-    );
-    let post_create_pull = server.response(&post_create_pull_id);
-    assert!(post_create_pull.error.is_none());
-    assert_eq!(post_create_pull.result.as_ref().unwrap()["kind"], "full");
-    assert!(
-        definition(
-            &mut server,
-            "mixed-create-old-identity-cleared",
-            &old_consumer,
-            old_consumer_source,
-            "TOldThing",
-        )
-        .is_empty()
-    );
-    assert!(
-        definition(
-            &mut server,
-            "mixed-create-new-identity-held-by-tombstone",
-            &new_consumer,
-            new_consumer_source,
-            "TNewThing",
-        )
-        .is_empty()
-    );
-
-    // A didDeleteFiles event is reported while the old bytes still exist. The
-    // tombstone must win over that stale on-disk provider until unlink/recreate.
-    server.send_notification(
-        "workspace/didDeleteFiles",
-        json!({"files":[{"uri":uri(&provider)},{"badEntry":"missing uri"}]}),
-    );
-    refresh(&mut server, "mixed delete before unlink");
-    assert!(
-        definition(
-            &mut server,
-            "mixed-delete-before-unlink-stays-absent",
-            &new_consumer,
-            new_consumer_source,
-            "TNewThing",
-        )
-        .is_empty()
-    );
-    fs::remove_file(&provider).expect("client-owned physical deletion");
-    write_file(&provider, &new_source);
-    server.send_notification(
-        "workspace/didCreateFiles",
-        json!({"files":[{"uri":uri(&provider)}]}),
-    );
-    refresh(&mut server, "verified create after delete");
-    let new_locations = definition(
-        &mut server,
-        "mixed-delete-create-repairs-provider",
-        &new_consumer,
-        new_consumer_source,
-        "TNewThing",
-    );
-    assert_eq!(new_locations.len(), 1);
-    assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
     server.shutdown();
 }
 

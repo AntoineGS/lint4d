@@ -1230,9 +1230,10 @@ endpoint, form a chain/cycle, or otherwise make attribution ambiguous are
 recovered as a whole: known endpoints are invalidated/tombstoned and implicated
 open overlays are rejected rather than partially transferred. A later,
 separate notification reusing the same URI pair is processed normally; there is
-no URI-pair-only duplicate suppression. Malformed in-range batches use bounded
-endpoint recovery (or permanently fence analysis when endpoint evidence is
-unattributable/unretainable), rather than silently dropping a physical event.
+no URI-pair-only duplicate suppression. Bounded ambiguity recovery applies only
+to fully parsed rename pairs. Malformed batches across any of the four
+file-notification families permanently fence analysis before per-entry effects,
+rather than silently dropping a physical event or recovering only a subset.
 The cumulative UTF-8 length of canonical file
 URIs in a notification batch is limited to 32 KiB; in-range batches are
 validated before per-entry mutations. A pending, successful unit `willRenameFiles`
@@ -1250,34 +1251,21 @@ old-URI `didChange` after close does not restore it.
 Unverified/mismatched transitions fail closed and require reopening. A delayed
 `didClose` for the old URI cannot close an accepted new-URI overlay. Unmatched
 late rename notifications invalidate old/new path state conservatively.
-For a malformed `didCreateFiles` or `didDeleteFiles` batch within the 64-entry
-limit, every parseable file endpoint is retained separately from the ordinary
-32 KiB admission accounting (up to 128 distinct endpoints, each at most 4 KiB).
-Recoverable endpoints are treated as negative observations before global
-derived-state invalidation. Malformed entries do not cause all open documents to
-be recorded as file endpoints. If any endpoint cannot fit this bounded recovery
-envelope, analysis is permanently fenced for that workspace instance before
-global invalidation.
-Malformed `didRenameFiles` batches use a stricter rule: if any member lacks a
-provable file `oldUri` or `newUri`, the missing side could hide the source of a
-move. The server therefore permanently fences analysis for the workspace
-instance before invalidation, even if another member is a complete, parseable
-pair or some endpoints from the malformed member were retained. A later valid
-file event does not lift this fence; restart is required. Fully parsed exact
+All four file-notification families (`didCreateFiles`, `didDeleteFiles`,
+`didRenameFiles`, and `didChangeWatchedFiles`) validate the entire batch before
+processing any member. If any member's URI, rename endpoint, or watched-file
+change kind cannot be parsed and attributed to a file event, the server
+permanently fences workspace analysis before invalidation—even when other
+members are valid or some endpoints of the malformed member are known. This
+prevents partial recovery from leaving an unreported create/delete/move as
+authoritative (including a closed indexed source deleted before physical unlink)
+or from publishing partial candidate results. Later valid file events do not
+lift the fence; restart the workspace/server instance to resume analysis.
+Fully parsed in-range batches remain functional. Fully parsed exact rename
 duplicate pairs are deduplicated; conflicting endpoint reuse and chained pairs
-remain subject to bounded ambiguity recovery, while oversized and unretainable
-batches fence analysis.
-Watched-file batches validate the complete event list before applying any
-`Created`, `Changed`, or `Deleted` event. For a malformed batch of at most 64
-events, parseable file endpoints use the bounded recovery envelope (up to 128
-distinct endpoints, each at most 4 KiB) and are treated
-as negative observations before global derived-state invalidation. This keeps a
-delete-before-unlink endpoint tombstoned and rejects an implicated open overlay
-instead of leaving partial event processing in effect. A later valid `Created`
-event can recover a path when its endpoint was retained. If no endpoint can be
-attributed, or any endpoint cannot fit the recovery envelope, analysis is
-permanently fenced for that workspace instance; later valid events do not lift
-that fence, and restart is required.
+retain bounded ambiguity recovery. Oversized batches, excessive canonical URI
+bytes, and unretainable recovery endpoints permanently fence analysis rather
+than partially applying entries.
 Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
 `didRenameFiles` notifications are not silently discarded. A watched-file batch
 over 64 events or over 32 KiB of cumulative canonical URI bytes permanently

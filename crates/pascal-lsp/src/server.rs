@@ -11196,12 +11196,8 @@ fn handle_notification_with_control_inner(
             }
             let mut total_uri_bytes = 0usize;
             let mut parsed_changes = Vec::with_capacity(changes.len());
-            let mut recovered_endpoints = Vec::with_capacity(changes.len());
-            let mut unique_endpoints = HashSet::with_capacity(changes.len());
-            let mut recovery_endpoint_bytes = 0usize;
             let mut oversized_uri_bytes = false;
             let mut malformed_batch = false;
-            let mut unretainable_endpoint = false;
             for change in changes {
                 let Some(uri) = change
                     .get("uri")
@@ -11221,23 +11217,6 @@ fn handle_notification_with_control_inner(
                 {
                     oversized_uri_bytes = true;
                 }
-                if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
-                    unretainable_endpoint = true;
-                } else if unique_endpoints.insert(uri.clone()) {
-                    let Some(next_bytes) = recovery_endpoint_bytes.checked_add(uri.as_str().len())
-                    else {
-                        unretainable_endpoint = true;
-                        continue;
-                    };
-                    if recovered_endpoints.len() >= MAX_FILE_OPERATION_RECOVERY_ENDPOINTS
-                        || next_bytes > MAX_FILE_OPERATION_RECOVERY_ENDPOINT_BYTES
-                    {
-                        unretainable_endpoint = true;
-                    } else {
-                        recovery_endpoint_bytes = next_bytes;
-                        recovered_endpoints.push(uri.clone());
-                    }
-                }
                 let kind = match change.get("type").and_then(Value::as_i64) {
                     Some(1) => FileChange::Created,
                     Some(2) => FileChange::Changed,
@@ -11251,22 +11230,11 @@ fn handle_notification_with_control_inner(
             }
             if malformed_batch {
                 eprintln!(
-                    "pascal-lsp: malformed watched-file member; recovering attributable endpoints"
+                    "pascal-lsp: malformed watched-file member has unknown batch attribution; fencing workspace analysis"
                 );
-                if unretainable_endpoint || recovered_endpoints.is_empty() {
-                    eprintln!(
-                        "pascal-lsp: malformed watched-file batch has no bounded endpoint evidence; fencing workspace analysis"
-                    );
-                    return Ok(permanently_fence_file_notification_analysis(
-                        workspace,
-                        budget,
-                        push_diagnostics_supported,
-                    ));
-                }
-                return Ok(invalidate_malformed_file_notification(
+                return Ok(permanently_fence_file_notification_analysis(
                     workspace,
                     budget,
-                    recovered_endpoints,
                     push_diagnostics_supported,
                 ));
             }
@@ -11316,12 +11284,11 @@ fn handle_notification_with_control_inner(
             let created = notification.method == "workspace/didCreateFiles";
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 eprintln!(
-                    "pascal-lsp: malformed file-operation batch; invalidating workspace file state"
+                    "pascal-lsp: malformed file-operation batch has unknown endpoint attribution; fencing workspace analysis"
                 );
-                return Ok(invalidate_malformed_file_notification(
+                return Ok(permanently_fence_file_notification_analysis(
                     workspace,
                     budget,
-                    [],
                     push_diagnostics_supported,
                 ));
             };
@@ -11348,7 +11315,6 @@ fn handle_notification_with_control_inner(
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
             let mut malformed_batch = false;
-            let mut unretainable_endpoint = false;
             for file in files {
                 let Some(uri) = file
                     .get("uri")
@@ -11368,30 +11334,19 @@ fn handle_notification_with_control_inner(
                 {
                     oversized_uri_bytes = true;
                 }
-                // Preserve every admitted endpoint independently of the
-                // ordinary notification byte-accounting threshold. A URI
-                // that cannot fit the recovery envelope fences analysis.
-                if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
-                    unretainable_endpoint = true;
-                } else if unique.insert(uri.clone()) {
+                // Keep the complete canonical endpoint set for accounting and
+                // deterministic deduplication before any file-event effects.
+                if unique.insert(uri.clone()) {
                     uris.push(uri);
                 }
             }
             if malformed_batch {
                 eprintln!(
-                    "pascal-lsp: malformed file-operation member; invalidating workspace file state"
+                    "pascal-lsp: malformed file-operation member has unknown batch attribution; fencing workspace analysis"
                 );
-                if unretainable_endpoint {
-                    return Ok(permanently_fence_file_notification_analysis(
-                        workspace,
-                        budget,
-                        push_diagnostics_supported,
-                    ));
-                }
-                return Ok(invalidate_malformed_file_notification(
+                return Ok(permanently_fence_file_notification_analysis(
                     workspace,
                     budget,
-                    uris,
                     push_diagnostics_supported,
                 ));
             }

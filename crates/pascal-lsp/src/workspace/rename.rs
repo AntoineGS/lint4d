@@ -1710,7 +1710,7 @@ fn revalidate_path_record(
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
-        if actual.is_some() {
+        if actual.is_some() || case_insensitive_document_link_candidate_exists(path, cancel)? {
             return Err(format!(
                 "include candidate appeared while resolving {}; retry the request",
                 path.display()
@@ -1822,6 +1822,69 @@ fn revalidate_path_record(
         return Err(CANCELLATION_MESSAGE.to_string());
     }
     Ok(())
+}
+
+/// A missing include candidate is also a negative witness for the resolver's
+/// case-insensitive search, not just for its exact spelling. Directory stamps
+/// alone cannot prove this: a replacement entry can preserve size and mtime.
+fn case_insensitive_document_link_candidate_exists(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
+    let mut base = path.to_path_buf();
+    while !base.exists() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        if !base.pop() {
+            return Err("could not locate include candidate search directory".to_string());
+        }
+    }
+    let relative = path
+        .strip_prefix(&base)
+        .map_err(|error| error.to_string())?;
+    let mut current = base;
+    let mut visits = 0usize;
+    let mut name_bytes = 0usize;
+    for component in relative.components() {
+        if is_cancelled(cancel) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Component::Normal(wanted) = component else {
+            return Err("uninspectable include candidate path component".to_string());
+        };
+        let entries = fs::read_dir(&current).map_err(|error| {
+            format!(
+                "could not inspect include candidate directory {}: {error}",
+                current.display()
+            )
+        })?;
+        let mut found = None;
+        for entry in entries {
+            if is_cancelled(cancel) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            visits = visits.saturating_add(1);
+            name_bytes = name_bytes.saturating_add(name.len());
+            if visits > 4_096 || name_bytes > 1_048_576 {
+                return Err(
+                    "include candidate validation exceeded directory scan limit".to_string()
+                );
+            }
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&wanted.to_string_lossy())
+                && found.replace(entry.path()).is_some()
+            {
+                return Err("ambiguous case-insensitive include candidate".to_string());
+            }
+        }
+        let Some(next) = found else { return Ok(false) };
+        current = next;
+    }
+    Ok(true)
 }
 
 fn effective_overlay_text_changed(

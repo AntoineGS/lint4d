@@ -11,17 +11,20 @@ It is not a replacement for Delphi's compiler or its complete type system.
 
 ### Document links
 
-`textDocument/documentLink` runs on the cancellable analysis worker and currently
-links only directly active, statically named `{$I ...}` / `{$INCLUDE ...}` paths
-whose target is uniquely resolved by the selected project context and existing
-include read-policy. Ranges cover the path operand in UTF-16 coordinates; targets
-are canonical file URIs. Source, project metadata, include observations, and
-overlay versions are revalidated before delivery. Inactive/unknown conditional
-branches, unresolved or ambiguous paths, wildcard/variable/escaped names,
-resource directives, more than 64 directives, and any incomplete or unauthorized
-target produce no link. Freshness evidence is bounded to 4,096 records and 32 MiB
-of observed path/source bytes per request; exceeding either limit withholds the
-link result.
+`textDocument/documentLink` runs on the cancellable analysis worker and links
+directly active, statically named `{$I ...}` / `{$INCLUDE ...}` paths uniquely
+resolved by the selected project and local `{$R ...}` resources with a proven
+regular file under the requester's authorized roots. Resources may use up to
+eight ordinary relative path components (`/` separator); each is limited to
+256 KiB, with an 8 MiB cumulative read allowance. Ranges cover the path
+operand in UTF-16 coordinates; targets are file URIs. Source, project metadata,
+include search candidates (including case-insensitive matches), target contents,
+and overlay versions are revalidated before delivery. Inactive/unknown
+conditional branches, unresolved or ambiguous paths, wildcard/variable names,
+backslash paths, traversal, symlinked targets, more than 64 directives, and
+incomplete or unauthorized targets produce no link. Include freshness evidence
+is bounded to 4,096 records and 32 MiB of observed path/source bytes per
+request; exceeding either limit withholds the link result.
 This is intentionally read-only; link resolution does not edit files.
 
 ### References, highlights, and rename families

@@ -18,14 +18,17 @@ use lsp_types::{
     DocumentHighlight, DocumentSymbol, FoldingRange, Hover, Location, MarkupKind, Position, Range,
     SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
-use pascal_project::has_invalid_project_selection;
+use pascal_project::{ProjectPathEntry, ProjectPathProvenance, has_invalid_project_selection};
 use std::collections::HashMap;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 const MAX_DOCUMENT_LINK_DIRECTIVES: usize = 64;
 const MAX_DOCUMENT_LINK_FRESHNESS_RECORDS: usize = 4_096;
 const MAX_DOCUMENT_LINK_FRESHNESS_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DOCUMENT_LINK_RESOURCE_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DOCUMENT_LINK_RESOURCE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct NavigationResult {
     pub(crate) locations: Vec<Location>,
@@ -1276,9 +1279,15 @@ pub(crate) fn document_links_from_input(
     let mut links = Vec::new();
     let mut freshness_records = 0usize;
     let mut freshness_bytes = 0usize;
+    let mut resource_bytes = 0usize;
+    let mut resource_records = Vec::new();
     for directive in conditionals.directives.iter().filter(|directive| {
-        directive.kind == pascal_core::conditional::DirectiveKind::Include
-            && directive.activity == pascal_core::conditional::Truth::True
+        directive.activity == pascal_core::conditional::Truth::True
+            && matches!(
+                directive.kind,
+                pascal_core::conditional::DirectiveKind::Include
+                    | pascal_core::conditional::DirectiveKind::Harmless
+            )
     }) {
         if is_cancelled(cancel) {
             return cancelled(source_generation, configuration_generation);
@@ -1296,7 +1305,8 @@ pub(crate) fn document_links_from_input(
         let Some((keyword, operand)) = body.split_once(char::is_whitespace) else {
             continue;
         };
-        if !matches!(keyword.to_ascii_uppercase().as_str(), "I" | "INCLUDE") {
+        let resource = keyword.eq_ignore_ascii_case("R");
+        if !resource && !matches!(keyword.to_ascii_uppercase().as_str(), "I" | "INCLUDE") {
             continue;
         }
         let operand = operand.trim_start();
@@ -1318,43 +1328,134 @@ pub(crate) fn document_links_from_input(
         {
             continue;
         }
-        let target_source = format!("{{${}}}", directive.body);
-        let expansion = match workspace.expand_source_with_cancel(
-            &uri,
-            &target_source,
-            &context_key,
-            Some(cancel),
-        ) {
-            Ok(expansion) => expansion,
-            Err(_) => continue,
-        };
-        if !expansion.complete {
-            continue;
-        }
-        let (record_count, observation_bytes) = match workspace
-            .record_document_link_expansion_sources(
-                &expansion,
-                &context,
-                cancel,
-                MAX_DOCUMENT_LINK_FRESHNESS_RECORDS.saturating_sub(freshness_records),
-                MAX_DOCUMENT_LINK_FRESHNESS_BYTES.saturating_sub(freshness_bytes),
-            ) {
-            Ok(counts) => counts,
-            Err(error) if error == CANCELLATION_MESSAGE => {
+        let target = if resource {
+            let remainder = &operand[quote_prefix + path.len()..];
+            let quoted_end = match quote_prefix {
+                1 if operand.starts_with('\'') => "'",
+                1 => "\"",
+                _ => "",
+            };
+            let components = Path::new(path).components().collect::<Vec<_>>();
+            if remainder.trim() != quoted_end
+                || components.is_empty()
+                || components.len() > 8
+                || !components
+                    .iter()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            {
+                continue;
+            }
+            let Ok(source_path) = uri.to_file_path() else {
+                continue;
+            };
+            let Some(directory) = source_path.parent() else {
+                continue;
+            };
+            let target_path = directory.join(path);
+            let Some(entry) = context.read_policy.entry_for_path(&target_path) else {
+                continue;
+            };
+            if !context.read_policy.allows_location(&entry) {
+                continue;
+            }
+            let bytes = match context
+                .read_policy
+                .read_payload_bytes(&entry, MAX_DOCUMENT_LINK_RESOURCE_FILE_BYTES)
+            {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            if is_cancelled(cancel) {
                 return cancelled(source_generation, configuration_generation);
             }
-            Err(error) => {
-                return failed(source_generation, configuration_generation, error);
+            resource_bytes = resource_bytes.saturating_add(bytes.len());
+            if resource_bytes > MAX_DOCUMENT_LINK_RESOURCE_TOTAL_BYTES {
+                return failed(
+                    source_generation,
+                    configuration_generation,
+                    "document-link resource read limit exceeded".to_string(),
+                );
             }
-        };
-        freshness_records = freshness_records.saturating_add(record_count);
-        freshness_bytes = freshness_bytes.saturating_add(observation_bytes);
-        let Some(target) = expansion
-            .dependencies
-            .first()
-            .map(|dependency| dependency.uri.clone())
-        else {
-            continue;
+            let Some(target) = Url::from_file_path(&target_path).ok() else {
+                continue;
+            };
+            resource_records.push(SourceRecord {
+                uri: target.clone(),
+                text: String::new(),
+                version: None,
+                stamp: None,
+                open: false,
+                path: Some(target_path.clone()),
+                path_stamp: super::path_stamp(&target_path),
+                content_hash: Some(super::content_hash_bytes(&bytes)),
+                parsed_text_hash: None,
+                content_bytes: None,
+                candidate_membership: None,
+                candidate_observations: Vec::new(),
+                read_policy: Some(context.read_policy.clone()),
+                path_entry: Some(entry),
+                include_payload: false,
+                missing_provider_candidate: false,
+                document_link_missing_candidate: false,
+                directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            });
+            target
+        } else {
+            let target_source = format!("{{${}}}", directive.body);
+            let expansion = match workspace.expand_source_with_cancel(
+                &uri,
+                &target_source,
+                &context_key,
+                Some(cancel),
+            ) {
+                Ok(expansion) => expansion,
+                Err(_) => continue,
+            };
+            if !expansion.complete {
+                continue;
+            }
+            let (record_count, observation_bytes) = match workspace
+                .record_document_link_expansion_sources(
+                    &expansion,
+                    &context,
+                    cancel,
+                    MAX_DOCUMENT_LINK_FRESHNESS_RECORDS.saturating_sub(freshness_records),
+                    MAX_DOCUMENT_LINK_FRESHNESS_BYTES.saturating_sub(freshness_bytes),
+                ) {
+                Ok(counts) => counts,
+                Err(error) if error == CANCELLATION_MESSAGE => {
+                    return cancelled(source_generation, configuration_generation);
+                }
+                Err(error) => {
+                    return failed(source_generation, configuration_generation, error);
+                }
+            };
+            freshness_records = freshness_records.saturating_add(record_count);
+            freshness_bytes = freshness_bytes.saturating_add(observation_bytes);
+            let Some(target) = expansion
+                .dependencies
+                .first()
+                .map(|dependency| dependency.uri.clone())
+            else {
+                continue;
+            };
+            // A legacy include may be readable through a symlink. A document link
+            // must not point at a lexical URI whose actual file escapes the
+            // requester's authorized location; refuse symlink components without
+            // changing the legacy include expansion policy used by navigation.
+            let Ok(target_path) = target.to_file_path() else {
+                continue;
+            };
+            if !context.read_policy.allows_location(&ProjectPathEntry {
+                path: target_path,
+                provenance: ProjectPathProvenance::LegacyNative,
+            }) {
+                continue;
+            }
+            target
         };
         let start = body_start + leading_trivia + lead + quote_prefix;
         let end = start + path.len();
@@ -1378,6 +1479,7 @@ pub(crate) fn document_links_from_input(
         Ok(mut records) => {
             records.push(source_record);
             records.extend(metadata_records);
+            records.extend(resource_records);
             records
         }
         Err(error) if error == CANCELLATION_MESSAGE => {

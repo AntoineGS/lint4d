@@ -2454,6 +2454,144 @@ fn document_links_target_only_active_proven_include_paths() {
 }
 
 #[test]
+fn document_links_target_concrete_local_resource_without_linking_wildcards() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let resource = temp.path().join("Main.dfm");
+    write_file(
+        &main,
+        "unit Main;\r\ninterface\r\nimplementation\r\n{$R 'Main.dfm'}\r\n{$R *.dfm}\r\nend.\r\n",
+    );
+    write_file(&resource, "object Form1: TForm1\nend\n");
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("document-links-concrete-resource".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    let links = response.result.expect("document links");
+    assert_eq!(links.as_array().expect("links").len(), 1);
+    assert_eq!(links[0]["target"], uri(&resource).as_str());
+    assert_eq!(
+        links[0]["range"],
+        json!({"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 13}})
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_links_target_bounded_nested_resource_but_not_parent_traversal() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let resource = root.join("assets").join("Form.dfm");
+    fs::create_dir_all(resource.parent().expect("resource directory")).expect("assets");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$R assets/Form.dfm}\n{$R ../Outside.dfm}\nend.\n",
+    );
+    write_file(&resource, "object Form1: TForm1\nend\n");
+    write_file(
+        &temp.path().join("Outside.dfm"),
+        "object External: TForm1\nend\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-nested-resource".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    let links = response.result.expect("document links");
+    assert_eq!(links.as_array().expect("links").len(), 1);
+    assert_eq!(links[0]["target"], uri(&resource).as_str());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn document_links_revalidate_resource_bytes_after_restored_stamp_replacement() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let main = root.join("Main.pas");
+    let resource = root.join("Main.dfm");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$R Main.dfm}\nend.\n",
+    );
+    write_file(&resource, "object A: TForm1\nend\n");
+    let original_stamp = fs::metadata(&resource).expect("resource metadata");
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-resource-changed".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    write_file(&resource, "object B: TForm1\nend\n");
+    restore_mtime(&resource, &original_stamp);
+    barrier.release();
+    let response = server.response(&id);
+    assert_eq!(
+        response
+            .error
+            .expect("changed resource must stale the link")
+            .code,
+        -32803
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn document_links_omit_symlinked_resource_outside_workspace() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    let main = root.join("Main.pas");
+    let resource = root.join("Main.dfm");
+    let external = temp.path().join("External.dfm");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$R Main.dfm}\nend.\n",
+    );
+    write_file(&external, "object External: TForm1\nend\n");
+    symlink(&external, &resource).expect("external resource symlink");
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-resource-symlink".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
+#[test]
 fn document_link_path_ranges_include_leading_directive_trivia_in_utf16() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");
@@ -2732,6 +2870,100 @@ fn document_links_reject_a_new_higher_priority_include_candidate() {
     let links = retry.result.expect("fresh document links");
     assert_eq!(links.as_array().expect("links").len(), 1);
     assert_eq!(links[0]["target"], uri(&higher_priority_target).as_str());
+    server.shutdown();
+}
+
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+#[test]
+fn document_links_reject_case_variant_higher_priority_candidate_with_restored_directory_stamp() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let library = root.join("lib");
+    let main = root.join("Main.pas");
+    let project = root.join("App.dproj");
+    let old_target = library.join("Selected.inc");
+    let noise = root.join("Shadowed.inc");
+    let new_target = root.join("selected.inc");
+    fs::create_dir_all(&library).expect("include search directory");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_IncludePath>lib</DCC_IncludePath></PropertyGroup></Project>",
+    );
+    write_file(&old_target, "const Selected = 1;\n");
+    write_file(&noise, "const Shadowed = 1;\n");
+    let metadata = fs::metadata(&root).expect("workspace directory metadata");
+
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-case-variant-candidate".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    barrier.wait_until_entered();
+    fs::rename(&noise, &new_target).expect("replace unrelated entry with case-variant candidate");
+    restore_mtime(&root, &metadata);
+    barrier.release();
+    let response = server.response(&id);
+    assert_eq!(
+        response
+            .error
+            .expect("case-variant target must stale the link")
+            .code,
+        -32803
+    );
+
+    let retry = RequestId::from("document-links-case-variant-retry".to_string());
+    server.send_request(
+        retry.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&retry);
+    assert!(response.error.is_none(), "retry failed: {response:?}");
+    assert_eq!(
+        response.result.expect("fresh links")[0]["target"],
+        uri(&new_target).as_str()
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn document_links_omit_legacy_symlink_targets_outside_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let link = root.join("Selected.inc");
+    let external = temp.path().join("External.inc");
+    fs::create_dir_all(&root).expect("workspace root");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Selected.inc}\nend.\n",
+    );
+    write_file(&external, "const Selected = 1;\n");
+    symlink(&external, &link).expect("legacy symlink include");
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("document-links-symlink-escape".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
     server.shutdown();
 }
 

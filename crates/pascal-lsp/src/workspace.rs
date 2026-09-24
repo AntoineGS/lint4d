@@ -1030,6 +1030,8 @@ pub(crate) struct ReconciliationBudget {
     exhausted: Cell<bool>,
     #[cfg(test)]
     cancel_after_path_visits: Cell<Option<usize>>,
+    #[cfg(test)]
+    cancel_after_project_path_key_bytes: Cell<Option<usize>>,
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
     recovery_target_reserve: Cell<usize>,
@@ -1044,6 +1046,8 @@ impl ReconciliationBudget {
             exhausted: Cell::new(false),
             #[cfg(test)]
             cancel_after_path_visits: Cell::new(None),
+            #[cfg(test)]
+            cancel_after_project_path_key_bytes: Cell::new(None),
             deleted_uris: RefCell::new(HashSet::new()),
             rename_endpoints: RefCell::new(HashSet::new()),
             recovery_target_reserve: Cell::new(0),
@@ -1116,7 +1120,23 @@ impl ReconciliationBudget {
             amount,
             MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES,
             |used, next| used.project_path_key_bytes = next,
-        )
+        )?;
+        #[cfg(test)]
+        if self
+            .cancel_after_project_path_key_bytes
+            .get()
+            .is_some_and(|threshold| self.used.get().project_path_key_bytes >= threshold)
+        {
+            self.cancel_after_project_path_key_bytes.set(None);
+            self.cancellation.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn cancel_after_project_path_key_bytes(&self, threshold: usize) {
+        self.cancel_after_project_path_key_bytes
+            .set(Some(threshold));
     }
 
     fn charge_package_path_visits(&self, amount: usize) -> Result<(), String> {
@@ -3811,6 +3831,36 @@ impl Workspace {
         records: Vec<rename::SourceRecord>,
     ) {
         if self.open_documents.contains_key(&uri) {
+            #[cfg(feature = "test-support")]
+            let records = {
+                let mut records = records;
+                if let Some(additional) =
+                    std::env::var_os("PASCAL_LSP_TEST_DIAGNOSTIC_CANDIDATE_OBSERVATIONS")
+                        .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
+                {
+                    for record in &mut records {
+                        let Some(parent) = record.path.as_deref().and_then(Path::parent) else {
+                            continue;
+                        };
+                        let available = rename::MAX_RESOLVER_CANDIDATE_OBSERVATIONS
+                            .saturating_sub(record.candidate_observations.len());
+                        let additional = additional.min(available);
+                        record.candidate_observations.reserve(additional);
+                        for index in 0..additional {
+                            record.candidate_observations.push(
+                                rename::ResolverCandidateObservation {
+                                    path: parent.join(format!(
+                                        ".notification-budget-candidate-{index:04}-{}",
+                                        "p".repeat(512)
+                                    )),
+                                    present: false,
+                                },
+                            );
+                        }
+                    }
+                }
+                records
+            };
             self.diagnostic_dependencies.insert(uri, records);
         }
     }
@@ -3844,6 +3894,18 @@ impl Workspace {
         budget: &ReconciliationBudget,
         mut visit: impl FnMut(&Url) -> Result<(), String>,
     ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
+        let changed_uri = canonical_file_uri(changed_uri);
+        let changed_path = changed_uri.to_file_path().ok().map(absolute_path);
+        budget.charge_path_visits(1)?;
+        budget.charge_project_path_key_bytes(
+            changed_uri.as_str().len().saturating_add(
+                changed_path
+                    .as_ref()
+                    .map_or(0, |path| path.as_os_str().len()),
+            ),
+        )?;
+        check_workspace_cancel(cancel)?;
         for (consumer, records) in &self.diagnostic_dependencies {
             check_workspace_cancel(cancel)?;
             if !self.open_documents.contains_key(consumer) {
@@ -3853,7 +3915,14 @@ impl Workspace {
             for record in records {
                 budget.charge_dependency_edges(1)?;
                 budget.charge_diagnostic_check()?;
-                if source_record_matches_change(record, changed_uri, include_parent) {
+                if source_record_matches_change_with_control(
+                    record,
+                    &changed_uri,
+                    changed_path.as_deref(),
+                    include_parent,
+                    cancel,
+                    Some(budget),
+                )? {
                     matches = true;
                     break;
                 }
@@ -11377,17 +11446,63 @@ fn source_record_matches_change(
     include_parent: bool,
 ) -> bool {
     let changed_uri = canonical_file_uri(changed_uri);
+    let changed_path = changed_uri.to_file_path().ok().map(absolute_path);
+    source_record_matches_change_with_control(
+        record,
+        &changed_uri,
+        changed_path.as_deref(),
+        include_parent,
+        None,
+        None,
+    )
+    .unwrap_or(false)
+}
+
+fn source_record_matches_change_with_control(
+    record: &rename::SourceRecord,
+    changed_uri: &Url,
+    changed_path: Option<&Path>,
+    include_parent: bool,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<bool, String> {
+    check_workspace_cancel(cancel)?;
+    if let Some(budget) = budget {
+        let record_path_bytes = record
+            .path
+            .as_ref()
+            .map_or(0, |path| path.as_os_str().len())
+            .saturating_add(record.uri.as_str().len());
+        budget.charge_path_visits(1)?;
+        budget.charge_project_path_key_bytes(record_path_bytes)?;
+    }
+    check_workspace_cancel(cancel)?;
+    let changed_uri = canonical_file_uri(changed_uri);
     if source_record_dependency_uri(record) == changed_uri {
-        return true;
+        check_workspace_cancel(cancel)?;
+        return Ok(true);
     }
 
-    if let Ok(changed_path) = changed_uri.to_file_path() {
-        if record
-            .candidate_observations
-            .iter()
-            .any(|candidate| paths_equal_ci(&candidate.path, &changed_path))
-        {
-            return true;
+    if let Some(changed_path) = changed_path {
+        for candidate in &record.candidate_observations {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                // Charge both path operands before conversion/comparison; the
+                // candidate list is retained resolver input and can be large
+                // across many records and notification entries.
+                budget.charge_dependency_edges(1)?;
+                budget.charge_project_path_key_bytes(
+                    candidate
+                        .path
+                        .as_os_str()
+                        .len()
+                        .saturating_add(changed_path.as_os_str().len()),
+                )?;
+            }
+            check_workspace_cancel(cancel)?;
+            if paths_equal_ci(&candidate.path, changed_path) {
+                return Ok(true);
+            }
         }
     }
 
@@ -11397,24 +11512,28 @@ fn source_record_matches_change(
         && record
             .path
             .as_deref()
-            .zip(changed_uri.to_file_path().ok())
+            .zip(changed_path)
             .is_some_and(|(directory, changed_path)| {
-                absolute_path(changed_path)
+                absolute_path(changed_path.to_path_buf())
                     .parent()
                     .is_some_and(|parent| paths_equal_ci(directory, parent))
             })
     {
-        return true;
+        check_workspace_cancel(cancel)?;
+        return Ok(true);
     }
 
-    record.missing_provider_candidate
+    let matches_missing_candidate = record.missing_provider_candidate
         && record
             .path
             .as_deref()
-            .zip(changed_uri.to_file_path().ok())
-            .is_some_and(|(candidate, changed_path)| {
-                paths_equal_ci(candidate, &absolute_path(changed_path))
-            })
+            .zip(changed_path)
+            .is_some_and(|(candidate, changed_path)| paths_equal_ci(candidate, changed_path));
+    check_workspace_cancel(cancel)?;
+    if let Some(budget) = budget {
+        budget.check_cancelled()?;
+    }
+    Ok(matches_missing_candidate)
 }
 
 fn mark_dependency_change(
@@ -12009,6 +12128,65 @@ mod tests {
     }
 
     #[test]
+    fn second_include_dependent_removal_budget_failure_uses_global_recovery() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let changed_uri =
+            Url::from_file_path(temp.path().join("Shared.inc")).expect("changed include URI");
+        let mut roots = Vec::new();
+        for index in 0..2 {
+            let root_uri = Url::from_file_path(temp.path().join(format!("Root{index}.pas")))
+                .expect("root URI");
+            workspace
+                .include_parents
+                .entry(changed_uri.clone())
+                .or_default()
+                .insert(root_uri.clone());
+            workspace.expansions.insert(
+                root_uri.clone(),
+                super::ExpansionRecord {
+                    physical_source: format!("unit Root{index};"),
+                    context_key: budget_test_context_key(index),
+                    expanded: crate::include_expansion::ExpandedSource::default(),
+                    source_texts: HashMap::new(),
+                    dependency_entries: HashMap::new(),
+                    include_observations: Vec::new(),
+                    dependencies: HashSet::from([changed_uri.clone()]),
+                    complete: true,
+                },
+            );
+            workspace
+                .index
+                .update(
+                    root_uri.clone(),
+                    format!("unit Root{index}; interface implementation end."),
+                )
+                .expect("seed indexed root");
+            workspace.indexed_files.insert(root_uri.clone());
+            workspace.indexed_sizes.insert(root_uri.clone(), 16);
+            workspace.indexed_bytes += 16;
+            roots.push(root_uri);
+        }
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS - 11)
+            .expect("leave room for graph discovery and one complete removal");
+
+        let error = workspace
+            .invalidate_expansion_dependents_with_control(&changed_uri, None, Some(&budget))
+            .expect_err("the second dependent removal must exceed the shared work account");
+
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert_eq!(workspace.indexed_files.len(), 1);
+        assert_eq!(workspace.expansions.len(), 1);
+        workspace.invalidate_for_reconciliation_budget(&budget);
+        assert!(workspace.indexed_files.is_empty());
+        assert!(workspace.expansions.is_empty());
+        assert!(roots.iter().all(|uri| !workspace.index.contains(uri)));
+    }
+
+    #[test]
     fn metadata_owner_invalidation_charges_linear_scan_and_removal_work() {
         const OWNERS: usize = 64;
         let temp = tempfile::tempdir().expect("workspace root");
@@ -12151,6 +12329,196 @@ mod tests {
         assert_eq!(budget.used.get().filesystem_path_visits, 8);
         assert!(workspace.contexts.contains_key(&key));
         assert_eq!(workspace.contexts[&key].watched_paths.len(), 128);
+    }
+
+    #[test]
+    fn diagnostic_candidate_observation_scan_charges_path_bytes_before_late_match() {
+        const OBSERVATIONS: usize = 1_000;
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let changed_uri =
+            Url::from_file_path(temp.path().join("Changed.pas")).expect("changed source URI");
+        let mut consumers = Vec::new();
+        let mut records = Vec::new();
+        for consumer_index in 0..2 {
+            let consumer_path = temp.path().join(format!("Consumer{consumer_index}.pas"));
+            let consumer_uri = Url::from_file_path(&consumer_path).expect("consumer URI");
+            workspace.open_documents.insert(
+                consumer_uri.clone(),
+                OpenDocument {
+                    text: Some("unit Consumer; interface implementation end.".to_owned()),
+                    version: 1,
+                    rejection: None,
+                    identity_generation: 0,
+                },
+            );
+            let mut candidate_observations = (0..OBSERVATIONS)
+                .map(|index| super::rename::ResolverCandidateObservation {
+                    path: temp
+                        .path()
+                        .join(format!("Candidate{index:04}-{}", "p".repeat(48))),
+                    present: false,
+                })
+                .collect::<Vec<_>>();
+            // Matching only the last observation proves refusal occurs before
+            // a full inner scan could publish this dependent as current.
+            candidate_observations.push(super::rename::ResolverCandidateObservation {
+                path: changed_uri.to_file_path().expect("changed file path"),
+                present: false,
+            });
+            records.push((
+                consumer_uri.clone(),
+                vec![super::rename::SourceRecord {
+                    uri: consumer_uri.clone(),
+                    text: String::new(),
+                    version: Some(1),
+                    stamp: None,
+                    open: true,
+                    path: Some(consumer_path),
+                    path_stamp: None,
+                    content_hash: None,
+                    parsed_text_hash: None,
+                    content_bytes: None,
+                    candidate_membership: None,
+                    candidate_observations,
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
+                    missing_provider_candidate: false,
+                    directory_observation: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
+                }],
+            ));
+            consumers.push(consumer_uri);
+        }
+        workspace.diagnostic_dependencies.extend(records);
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(std::sync::Arc::clone(&cancellation));
+        budget
+            .charge_project_path_key_bytes(super::MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES - 384)
+            .expect("leave only a few candidate comparisons in the path-byte account");
+        let mut refreshed = Vec::new();
+
+        let error = workspace
+            .visit_diagnostic_dependents_for_change(
+                &changed_uri,
+                false,
+                Some(&cancellation),
+                &budget,
+                |uri| {
+                    refreshed.push(uri.clone());
+                    Ok(())
+                },
+            )
+            .expect_err("candidate path comparison must exhaust during the inner scan");
+
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert!(
+            refreshed.is_empty(),
+            "partial dependent scan cannot publish a current result"
+        );
+        assert_eq!(budget.used.get().diagnostic_record_checks, 1);
+        assert!(
+            budget.used.get().project_path_key_bytes
+                > super::MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES - 384
+        );
+        assert_eq!(consumers.len(), 2);
+    }
+
+    #[test]
+    fn diagnostic_candidate_observation_scan_checks_cancellation_inside_inner_loop() {
+        const OBSERVATIONS: usize = 1_000;
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let changed_uri =
+            Url::from_file_path(temp.path().join("Changed.pas")).expect("changed source URI");
+        let consumer_path = temp.path().join("Consumer.pas");
+        let consumer_uri = Url::from_file_path(&consumer_path).expect("consumer URI");
+        workspace.open_documents.insert(
+            consumer_uri.clone(),
+            OpenDocument {
+                text: Some("unit Consumer; interface implementation end.".to_owned()),
+                version: 1,
+                rejection: None,
+                identity_generation: 0,
+            },
+        );
+        workspace.diagnostic_dependencies.insert(
+            consumer_uri.clone(),
+            vec![super::rename::SourceRecord {
+                uri: consumer_uri.clone(),
+                text: String::new(),
+                version: Some(1),
+                stamp: None,
+                open: true,
+                path: Some(consumer_path.clone()),
+                path_stamp: None,
+                content_hash: None,
+                parsed_text_hash: None,
+                content_bytes: None,
+                candidate_membership: None,
+                candidate_observations: (0..OBSERVATIONS)
+                    .map(|index| super::rename::ResolverCandidateObservation {
+                        path: temp
+                            .path()
+                            .join(format!("CancellationCandidate{index:04}.pas")),
+                        present: false,
+                    })
+                    .collect(),
+                read_policy: None,
+                path_entry: None,
+                include_payload: false,
+                missing_provider_candidate: false,
+                directory_observation: false,
+                missing_provider_scope: None,
+                auto_import_provider_observation: false,
+                auto_import_scopes: Vec::new(),
+            }],
+        );
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(std::sync::Arc::clone(&cancellation));
+        let changed_path = changed_uri.to_file_path().expect("changed path");
+        let record_path_bytes = consumer_path.as_os_str().len();
+        let changed_path_bytes = changed_path.as_os_str().len();
+        let first_candidate_path_bytes = temp
+            .path()
+            .join("CancellationCandidate0000.pas")
+            .as_os_str()
+            .len();
+        let before_candidates = changed_uri
+            .as_str()
+            .len()
+            .saturating_add(changed_path_bytes)
+            .saturating_add(record_path_bytes)
+            .saturating_add(consumer_uri.as_str().len());
+        let per_candidate = first_candidate_path_bytes.saturating_add(changed_path_bytes);
+        budget.cancel_after_project_path_key_bytes(before_candidates + per_candidate * 5);
+        let mut refreshed = Vec::new();
+
+        let error = workspace
+            .visit_diagnostic_dependents_for_change(
+                &changed_uri,
+                false,
+                Some(&cancellation),
+                &budget,
+                |uri| {
+                    refreshed.push(uri.clone());
+                    Ok(())
+                },
+            )
+            .expect_err("cancellation must interrupt the candidate-observation loop");
+
+        assert_eq!(error, super::CANCELLATION_MESSAGE);
+        assert_eq!(
+            budget.used.get().project_path_key_bytes,
+            before_candidates + per_candidate * 5
+        );
+        assert_eq!(budget.used.get().diagnostic_record_checks, 1);
+        assert!(refreshed.is_empty());
     }
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {

@@ -32538,6 +32538,135 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
 
 #[test]
 #[cfg(feature = "test-support")]
+fn diagnostic_candidate_observation_budget_fallback_drops_stale_provider_and_pull_result() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let consumer_source =
+        "unit Consumer;\ninterface\nuses Provider;\ntype TUse = TBefore;\nimplementation\nend.\n";
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n",
+    );
+    write_file(&consumer, consumer_source);
+
+    let metrics = root.path().join("diagnostic-candidate-reconciliation.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            ("PASCAL_LSP_TEST_DIAGNOSTIC_CANDIDATE_OBSERVATIONS", "3072"),
+            (
+                "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+                metrics_value.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&consumer),"languageId":"pascal","version":1,"text":consumer_source}}),
+    );
+    let initial_pull_id = RequestId::from("candidate-observation-initial-pull".to_string());
+    server.send_request(
+        initial_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":null}),
+    );
+    let initial_pull = server.response(&initial_pull_id);
+    assert!(
+        initial_pull.error.is_none(),
+        "initial pull: {initial_pull:?}"
+    );
+    let previous_result_id = initial_pull.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("initial result ID")
+        .to_owned();
+
+    let initial_definition_id =
+        RequestId::from("candidate-observation-initial-definition".to_string());
+    server.send_request(
+        initial_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TBefore", 0),
+    );
+    let initial_locations = result_locations(server.response(&initial_definition_id));
+    assert_eq!(
+        initial_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&provider).as_str()),
+        "fixture starts with a live provider definition"
+    );
+
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype TAfter = string;\nimplementation\nend.\n",
+    );
+    let changes = (0..64)
+        .map(|index| {
+            json!({
+                "uri": uri(&root.path().join(format!("Unrelated{index:02}.pas"))),
+                "type": 3
+            })
+        })
+        .collect::<Vec<_>>();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    let current_definition_id =
+        RequestId::from("candidate-observation-current-definition".to_string());
+    server.send_request(
+        current_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TBefore", 0),
+    );
+    let current_locations = result_locations(server.response(&current_definition_id));
+    assert!(
+        current_locations.is_empty(),
+        "budget fallback must not leave the old provider as a current definition: {current_locations:?}"
+    );
+
+    let refreshed_pull_id = RequestId::from("candidate-observation-refreshed-pull".to_string());
+    server.send_request(
+        refreshed_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":previous_result_id}),
+    );
+    let refreshed_pull = server.response(&refreshed_pull_id);
+    assert!(
+        refreshed_pull.error.is_none(),
+        "refreshed pull: {refreshed_pull:?}"
+    );
+    assert_ne!(
+        refreshed_pull.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "fallback must invalidate the previous pull result even when refusal occurs inside candidate matching"
+    );
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "worker metrics must be written"
+    );
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(metrics).expect("read metrics")).expect("parse metrics");
+    assert!(
+        metrics["budget_exceeded"].as_bool().unwrap_or(false),
+        "candidate comparison exhaustion must take the conservative fallback: {metrics}"
+    );
+    assert!(
+        metrics["project_path_key_bytes"]
+            .as_u64()
+            .unwrap_or_default()
+            > 12 * 1024 * 1024,
+        "path-byte accounting must show candidate comparisons as the exhausted work: {metrics}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn watched_override_refresh_rebinds_same_stamp_provider_and_invalidates_pull_result() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let sdk = root.path().join("SDK");

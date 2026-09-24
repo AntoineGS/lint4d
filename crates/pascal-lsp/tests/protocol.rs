@@ -32169,7 +32169,16 @@ fn high_fanout_file_batch_reports_shared_actual_work_and_replays_fresh_requests(
 
     barrier.release();
     let definition = server.response_with_timeout(&definition_id, IO_TIMEOUT);
-    let refreshed_diagnostics = diagnostics_for_uri(&mut server, &uri(&updated_consumer));
+    let first_refreshed_diagnostics = diagnostics_for_uri(&mut server, &uri(&updated_consumer));
+    let refreshed_diagnostics = if first_refreshed_diagnostics["version"].is_null()
+        && first_refreshed_diagnostics["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    {
+        diagnostics_for_uri(&mut server, &uri(&updated_consumer))
+    } else {
+        first_refreshed_diagnostics
+    };
     let metrics_written = wait_for_file(&metrics, IO_TIMEOUT);
     if definition.is_none() || !metrics_written {
         let _ = server.child.kill();
@@ -32525,14 +32534,32 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
     );
     assert_eq!(
         metrics["recovery_target_reserve"].as_u64(),
-        Some(10_000),
-        "fallback must reserve bounded recovery for the maximum admitted open-document count: {metrics}"
+        Some((PROJECTS - 1) as u64),
+        "recovery must preflight the exact currently admitted open-document targets: {metrics}"
     );
+    let open_uri_bytes = consumers
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, consumer)| uri(consumer).as_str().len() as u64)
+        .sum::<u64>();
     assert_eq!(
         metrics["recovery_uri_byte_reserve"].as_u64(),
-        Some(10_000 * 4_096),
-        "fallback URI staging must have an explicit pre-reserved byte ceiling: {metrics}"
+        Some(2 * open_uri_bytes),
+        "preflight plus recovery must reserve exact URI bytes for the admitted open documents: {metrics}"
     );
+    assert!(
+        metrics["recovery_visits"].as_u64().unwrap_or_default() > PROJECTS as u64,
+        "cache invalidation and open-target recovery visits must be explicitly counted: {metrics}"
+    );
+    assert!(
+        metrics["recovery_visits"].as_u64().unwrap_or_default()
+            <= metrics["recovery_visit_reserve"]
+                .as_u64()
+                .unwrap_or_default(),
+        "recovery must consume no more work than it preflighted: {metrics}"
+    );
+    assert_eq!(metrics["recovery_refused"], false);
     server.shutdown();
 }
 
@@ -32662,6 +32689,208 @@ fn diagnostic_candidate_observation_budget_fallback_drops_stale_provider_and_pul
             > 12 * 1024 * 1024,
         "path-byte accounting must show candidate comparisons as the exhausted work: {metrics}"
     );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn recovery_push_clears_remain_bounded_under_writer_backpressure() {
+    const ROOTS: usize = 64;
+    let environment = tempfile::tempdir().expect("workspace and server environment");
+    let root = environment.path().to_path_buf();
+    let mut expected_uris = HashSet::new();
+    let mut sources = Vec::with_capacity(ROOTS);
+    let mut files = Vec::with_capacity(ROOTS);
+    for index in 0..ROOTS {
+        let source = format!(
+            "unit Root{index:02};\ninterface\nconst\n  badConst = 1;\nimplementation\nend.\n"
+        );
+        let file = root.join(format!("Root{index:02}.pas"));
+        write_file(&file, &source);
+        expected_uris.insert(uri(&file));
+        sources.push(source);
+        files.push(file);
+    }
+
+    let barrier_directory = root.join("outbound-recovery-barrier");
+    fs::create_dir_all(&barrier_directory).expect("barrier directory");
+    let writer_barrier = OutboundWriterBarrier {
+        armed: barrier_directory.join("armed"),
+        entered: barrier_directory.join("entered"),
+        release: barrier_directory.join("release"),
+        control_limit: 8,
+    };
+    let barrier_value = format!(
+        "{}|{}|{}|{}",
+        writer_barrier.armed.display(),
+        writer_barrier.entered.display(),
+        writer_barrier.release.display(),
+        writer_barrier.control_limit
+    );
+    let metrics = root.join("recovery-work.json");
+    let metrics_value = metrics.display().to_string();
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        &root,
+        [
+            (
+                "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER",
+                barrier_value.as_str(),
+            ),
+            ("PASCAL_LSP_TEST_DIAGNOSTIC_CANDIDATE_OBSERVATIONS", "8"),
+            (
+                "PASCAL_LSP_TEST_RECONCILIATION_WORK_RESULT",
+                metrics_value.as_str(),
+            ),
+        ],
+    );
+    server._environment = Some(environment);
+    server.initialize(&root, Value::Null);
+    for (index, file) in files.iter().enumerate() {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(file),"languageId":"pascal","version":1,"text":sources[index]}}),
+        );
+    }
+    let mut initial_publications = HashSet::new();
+    let initial_deadline = Instant::now() + Duration::from_secs(60);
+    while initial_publications.len() < ROOTS {
+        assert!(
+            Instant::now() < initial_deadline,
+            "only got {} initial diagnostic publications of {ROOTS}",
+            initial_publications.len()
+        );
+        let message = match server.messages.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(Some(message))) => message,
+            Ok(Ok(None)) => panic!("server exited before initial diagnostics"),
+            Ok(Err(error)) => panic!("server output read failed: {error}"),
+            Err(error) => panic!(
+                "initial diagnostics stalled after {} roots; server status: {:?}; {error}",
+                initial_publications.len(),
+                server.child.try_wait().expect("inspect LSP server")
+            ),
+        };
+        match message {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                let published_uri = Url::parse(
+                    notification.params["uri"]
+                        .as_str()
+                        .expect("initial diagnostic URI"),
+                )
+                .expect("valid initial diagnostic URI");
+                if expected_uris.contains(&published_uri) {
+                    initial_publications.insert(published_uri);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(initial_publications, expected_uris);
+
+    fs::write(&writer_barrier.armed, b"pause").expect("arm writer barrier");
+    let changes = (0..64)
+        .map(|index| {
+            json!({
+                "uri": uri(&root.join(format!("Unrelated{index:02}.pas"))),
+                "type": 2
+            })
+        })
+        .collect::<Vec<_>>();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    let request_id = RequestId::from("request-during-recovery-push-clear".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument":{"uri":uri(&files[0])}}),
+    );
+    writer_barrier.wait_until_entered();
+    thread::sleep(Duration::from_millis(300));
+    let process_status = server.child.try_wait().expect("inspect server status");
+    writer_barrier.release();
+    assert!(
+        process_status.is_none(),
+        "server must remain alive while recovery clears are backpressured: {process_status:?}"
+    );
+
+    let mut clear_counts = HashMap::<Url, usize>::new();
+    let mut request_response = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while clear_counts.len() < ROOTS || request_response.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "bounded recovery output did not drain: cleared={}, response={:?}",
+            clear_counts.len(),
+            request_response
+        );
+        let next_message = match server.messages.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(Some(message))) => message,
+            Ok(Ok(None)) => panic!("server exited during recovery push cleanup"),
+            Ok(Err(error)) => panic!("server output read failed: {error}"),
+            Err(error) => panic!(
+                "recovery output stalled: clears={}, response={:?}, metrics={:?}, server={:?}, {error}",
+                clear_counts.len(),
+                request_response,
+                fs::read(&metrics)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()),
+                server.child.try_wait().expect("inspect LSP server")
+            ),
+        };
+        match next_message {
+            Message::Notification(notification)
+                if notification.method == "textDocument/publishDiagnostics" =>
+            {
+                let published_uri = Url::parse(
+                    notification.params["uri"]
+                        .as_str()
+                        .expect("recovery diagnostic URI"),
+                )
+                .expect("valid recovery diagnostic URI");
+                if expected_uris.contains(&published_uri)
+                    && notification.params["diagnostics"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                {
+                    *clear_counts.entry(published_uri).or_default() += 1;
+                }
+            }
+            Message::Response(response) if response.id == request_id => {
+                request_response = Some(response);
+            }
+            _ => {}
+        }
+    }
+    assert!(clear_counts.values().all(|count| *count == 1));
+    let response = request_response.expect("unrelated request response");
+    assert!(
+        response.error.is_none(),
+        "an unrelated request must still be serviced after recovery: {response:?}"
+    );
+    assert!(
+        wait_for_file(&metrics, IO_TIMEOUT),
+        "worker metrics must be written"
+    );
+    let metrics: Value = serde_json::from_slice(&fs::read(metrics).expect("read worker metrics"))
+        .expect("parse worker metrics");
+    assert!(metrics["budget_exceeded"].as_bool().unwrap_or(false));
+    assert_eq!(metrics["recovery_target_reserve"], ROOTS);
+    assert!(
+        metrics["recovery_visits"].as_u64().unwrap_or_default() > ROOTS as u64,
+        "retained source/open-owner entries must be invalidated under the recovery account: {metrics}"
+    );
+    assert!(
+        metrics["recovery_visits"].as_u64().unwrap_or_default()
+            <= metrics["recovery_visit_reserve"]
+                .as_u64()
+                .unwrap_or_default(),
+        "recovery must stay within its preflight envelope: {metrics}"
+    );
+    assert_eq!(metrics["recovery_refused"], false);
     server.shutdown();
 }
 
@@ -33388,16 +33617,22 @@ fn assert_saturated_control_bypasses_workspace_fifo(
             let _ = server.child.wait();
             panic!("deferred query was not replayed after the notification deadline");
         }
-        let locations = result_locations(response.expect("query response was checked"));
+        let response = response.expect("query response was checked");
+        let locations = if final_delete_after_barrier && deadline_ms.is_some() {
+            assert!(
+                response.error.is_some(),
+                "cancellation during fallback must fail closed rather than answer from partially reconciled state: {response:?}"
+            );
+            Vec::new()
+        } else {
+            result_locations(response)
+        };
         let expected_provider_uri = uri(&provider).to_string();
         let location_uri = locations
             .first()
             .and_then(|location| location["uri"].as_str());
         if final_delete_after_barrier {
-            assert!(
-                locations.is_empty(),
-                "timeout fallback must restore a final delete tombstone even when that entry was not reached"
-            );
+            assert!(locations.is_empty());
         } else {
             assert_eq!(
                 location_uri,
@@ -33714,25 +33949,37 @@ fn assert_rename_overlay_is_invalidated_on_reconciliation_fallback(deadline_ms: 
             "diagnostic comparison counter must establish the actual overrun: {metrics}"
         );
     }
-    let definition = result_locations(server.response(&definition_id));
-    assert!(
-        definition.is_empty(),
-        "fallback must reject the already-transferred B overlay rather than resolve stale B disk: {definition:?}"
-    );
-    let fifo_definition = result_locations(server.response(&fifo_definition_id));
-    assert_eq!(
-        fifo_definition.len(),
-        1,
-        "deferred didChange must replay before query"
-    );
-    assert_eq!(fifo_definition[0]["uri"], uri(&consumers[0]).to_string());
-    let pull = server.response(&pull_id);
-    assert!(pull.error.is_none(), "post-fallback pull failed: {pull:?}");
-    let result = pull.result.expect("fresh post-fallback pull result");
-    assert_eq!(
-        result["kind"], "full",
-        "old pull result ID must be invalidated: {result}"
-    );
+    let definition = server.response(&definition_id);
+    if deadline_ms.is_some() {
+        assert!(
+            definition.error.is_some(),
+            "deadline cancellation during recovery must fail closed instead of publishing a partial candidate: {definition:?}"
+        );
+        let fifo_definition = server.response(&fifo_definition_id);
+        assert!(fifo_definition.error.is_some());
+        let pull = server.response(&pull_id);
+        assert!(pull.error.is_some());
+    } else {
+        let definition = result_locations(definition);
+        assert!(
+            definition.is_empty(),
+            "fallback must reject the already-transferred B overlay rather than resolve stale B disk: {definition:?}"
+        );
+        let fifo_definition = result_locations(server.response(&fifo_definition_id));
+        assert_eq!(
+            fifo_definition.len(),
+            1,
+            "deferred didChange must replay before query"
+        );
+        assert_eq!(fifo_definition[0]["uri"], uri(&consumers[0]).to_string());
+        let pull = server.response(&pull_id);
+        assert!(pull.error.is_none(), "post-fallback pull failed: {pull:?}");
+        let result = pull.result.expect("fresh post-fallback pull result");
+        assert_eq!(
+            result["kind"], "full",
+            "old pull result ID must be invalidated: {result}"
+        );
+    }
     server.shutdown();
 }
 

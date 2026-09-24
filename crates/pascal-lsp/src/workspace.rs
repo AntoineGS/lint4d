@@ -1002,7 +1002,19 @@ const MAX_NOTIFICATION_DIAGNOSTIC_TARGETS: usize = 4_096;
 const MAX_NOTIFICATION_DIAGNOSTIC_URI_BYTES: usize = 256 * 1024;
 const MAX_NOTIFICATION_RECOVERY_TARGETS: usize = DEFAULT_MAX_FILES;
 const MAX_NOTIFICATION_RECOVERY_URI_BYTES: usize =
-    MAX_NOTIFICATION_RECOVERY_TARGETS * MAX_OPEN_DOCUMENT_URI_BYTES;
+    2 * MAX_OPEN_DOCUMENTS * MAX_OPEN_DOCUMENT_URI_BYTES + 2 * MAX_PENDING_FILE_RENAME_BYTES;
+const MAX_NOTIFICATION_RECOVERY_RENAME_ENDPOINTS: usize =
+    2 * (MAX_PENDING_FILE_RENAMES + MAX_NOTIFICATION_FILE_RENAME_BATCH_ENTRIES);
+const MAX_NOTIFICATION_FILE_RENAME_BATCH_ENTRIES: usize = 64;
+// Recovery admits one bounded teardown pass for each retained source plus its
+// capped dependency work, then a bounded pass over open-document targets.
+const MAX_NOTIFICATION_RECOVERY_VISITS: usize = DEFAULT_MAX_FILES * (MAX_DEPENDENCY_WORK + 32)
+    + MAX_RETAINED_DIAGNOSTIC_PUBLICATION_TARGETS * 4
+    + MAX_PENDING_DIAGNOSTIC_PUBLICATION_TARGETS
+    + MAX_DOCUMENT_OWNERS * 8
+    + MAX_OPEN_DOCUMENTS * 8
+    + MAX_NOTIFICATION_RECOVERY_RENAME_ENDPOINTS * 4
+    + 32_768;
 const NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED: &str =
     "workspace notification reconciliation work budget exceeded";
 
@@ -1036,6 +1048,12 @@ pub(crate) struct ReconciliationBudget {
     rename_endpoints: RefCell<HashSet<Url>>,
     recovery_target_reserve: Cell<usize>,
     recovery_uri_byte_reserve: Cell<usize>,
+    recovery_visit_reserve: Cell<usize>,
+    recovery_preflight_visits: Cell<usize>,
+    recovery_preflight_uri_bytes: Cell<usize>,
+    recovery_visits: Cell<usize>,
+    recovery_uri_bytes: Cell<usize>,
+    recovery_refused: Cell<bool>,
 }
 
 impl ReconciliationBudget {
@@ -1052,6 +1070,12 @@ impl ReconciliationBudget {
             rename_endpoints: RefCell::new(HashSet::new()),
             recovery_target_reserve: Cell::new(0),
             recovery_uri_byte_reserve: Cell::new(0),
+            recovery_visit_reserve: Cell::new(0),
+            recovery_preflight_visits: Cell::new(0),
+            recovery_preflight_uri_bytes: Cell::new(0),
+            recovery_visits: Cell::new(0),
+            recovery_uri_bytes: Cell::new(0),
+            recovery_refused: Cell::new(false),
         }
     }
 
@@ -1254,27 +1278,107 @@ impl ReconciliationBudget {
         }
     }
 
-    pub(crate) fn deleted_uris(&self) -> HashSet<Url> {
-        self.deleted_uris.borrow().clone()
-    }
-
     pub(crate) fn record_rename_endpoint(&self, uri: Url) {
         self.rename_endpoints.borrow_mut().insert(uri);
     }
 
-    pub(crate) fn rename_endpoints(&self) -> HashSet<Url> {
-        self.rename_endpoints.borrow().clone()
+    fn charge_recovery_preflight(&self, visits: usize, uri_bytes: usize) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let next_visits = self
+            .recovery_preflight_visits
+            .get()
+            .checked_add(visits)
+            .filter(|next| *next <= MAX_NOTIFICATION_RECOVERY_VISITS);
+        let next_uri_bytes = self
+            .recovery_preflight_uri_bytes
+            .get()
+            .checked_add(uri_bytes)
+            .filter(|next| *next <= MAX_NOTIFICATION_RECOVERY_URI_BYTES);
+        let (Some(next_visits), Some(next_uri_bytes)) = (next_visits, next_uri_bytes) else {
+            self.recovery_refused.set(true);
+            return Err(
+                "workspace notification recovery preflight exceeds its fixed envelope".into(),
+            );
+        };
+        self.recovery_preflight_visits.set(next_visits);
+        self.recovery_preflight_uri_bytes.set(next_uri_bytes);
+        self.recovery_visits.set(
+            self.recovery_visits
+                .get()
+                .checked_add(visits)
+                .ok_or_else(|| {
+                    "workspace notification recovery accounting overflowed".to_string()
+                })?,
+        );
+        self.recovery_uri_bytes.set(
+            self.recovery_uri_bytes
+                .get()
+                .checked_add(uri_bytes)
+                .ok_or_else(|| {
+                    "workspace notification recovery accounting overflowed".to_string()
+                })?,
+        );
+        Ok(())
     }
 
-    pub(crate) fn reserve_recovery_envelope(&self) {
-        // Recovery remains available after normal-work exhaustion or
-        // cancellation. Its maximum is derived from Workspace's admitted
-        // open-document count and URI length limits, and is recorded before
-        // the invalidation path traverses those documents.
-        self.recovery_target_reserve
-            .set(MAX_NOTIFICATION_RECOVERY_TARGETS);
-        self.recovery_uri_byte_reserve
-            .set(MAX_NOTIFICATION_RECOVERY_URI_BYTES);
+    fn reserve_recovery_envelope(
+        &self,
+        recovery_visits: usize,
+        recovery_uri_bytes: usize,
+        recovery_targets: usize,
+    ) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let total_visits = self
+            .recovery_visits
+            .get()
+            .checked_add(recovery_visits)
+            .filter(|total| *total <= MAX_NOTIFICATION_RECOVERY_VISITS);
+        let total_uri_bytes = self
+            .recovery_uri_bytes
+            .get()
+            .checked_add(recovery_uri_bytes)
+            .filter(|total| *total <= MAX_NOTIFICATION_RECOVERY_URI_BYTES);
+        let (Some(total_visits), Some(total_uri_bytes)) = (total_visits, total_uri_bytes) else {
+            self.recovery_refused.set(true);
+            return Err("workspace notification recovery exceeds its fixed work envelope".into());
+        };
+        if recovery_targets > MAX_NOTIFICATION_RECOVERY_TARGETS {
+            self.recovery_refused.set(true);
+            return Err("workspace notification recovery exceeds its admitted target cap".into());
+        }
+        self.recovery_visit_reserve.set(total_visits);
+        self.recovery_uri_byte_reserve.set(total_uri_bytes);
+        self.recovery_target_reserve.set(recovery_targets);
+        Ok(())
+    }
+
+    fn charge_recovery_work(&self, visits: usize, uri_bytes: usize) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let next_visits = self.recovery_visits.get().checked_add(visits);
+        let next_uri_bytes = self.recovery_uri_bytes.get().checked_add(uri_bytes);
+        let (Some(next_visits), Some(next_uri_bytes)) = (next_visits, next_uri_bytes) else {
+            self.recovery_refused.set(true);
+            return Err("workspace notification recovery accounting overflowed".into());
+        };
+        if next_visits > self.recovery_visit_reserve.get()
+            || next_uri_bytes > self.recovery_uri_byte_reserve.get()
+        {
+            self.recovery_refused.set(true);
+            return Err(format!(
+                "workspace notification recovery exceeded its reserved envelope (visits {next_visits}/{}, URI bytes {next_uri_bytes}/{})",
+                self.recovery_visit_reserve.get(),
+                self.recovery_uri_byte_reserve.get()
+            ));
+        }
+        self.recovery_visits.set(next_visits);
+        self.recovery_uri_bytes.set(next_uri_bytes);
+        Ok(())
     }
 
     #[cfg(feature = "test-support")]
@@ -1294,6 +1398,12 @@ impl ReconciliationBudget {
             "diagnostic_uri_bytes": used.diagnostic_uri_bytes,
             "recovery_target_reserve": self.recovery_target_reserve.get(),
             "recovery_uri_byte_reserve": self.recovery_uri_byte_reserve.get(),
+            "recovery_visit_reserve": self.recovery_visit_reserve.get(),
+            "recovery_preflight_visits": self.recovery_preflight_visits.get(),
+            "recovery_preflight_uri_bytes": self.recovery_preflight_uri_bytes.get(),
+            "recovery_visits": self.recovery_visits.get(),
+            "recovery_uri_bytes": self.recovery_uri_bytes.get(),
+            "recovery_refused": self.recovery_refused.get(),
             "budget_exceeded": budget_exceeded,
         })
     }
@@ -1739,6 +1849,15 @@ pub(crate) struct NavigationState {
     document_owners: HashMap<Url, KnownDocumentOwner>,
     owner_last_used: HashMap<Url, u64>,
     use_clock: u64,
+}
+
+struct NotificationRecoveryPlan {
+    rename_rejections: HashMap<Url, i32>,
+    deleted_uris: Vec<Url>,
+    clear_work_visits: usize,
+    open_document_visits: usize,
+    open_document_uri_bytes: usize,
+    recovery_targets: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3331,96 +3450,308 @@ impl Workspace {
     }
 
     pub(crate) fn invalidate_all_for_file_notification_overflow_bounded(&mut self) {
-        self.invalidate_all_for_file_notification_overflow_inner();
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        self.invalidate_for_reconciliation_budget(&budget);
     }
 
-    fn invalidate_all_for_file_notification_overflow_inner(&mut self) {
-        // The notification has no response channel, so rejecting it would
-        // silently lose the only invalidation signal for arbitrary paths.
-        // Drop bounded derived state and force subsequent requests to reread
-        // disk rather than trying to process an unbounded event list here.
+    pub(crate) fn invalidate_for_reconciliation_budget(&mut self, budget: &ReconciliationBudget) {
+        let result = self
+            .prepare_notification_recovery(budget)
+            .and_then(|plan| self.apply_notification_recovery(plan, budget));
+        if let Err(error) = result {
+            eprintln!("pascal-lsp: notification recovery failed closed: {error}");
+            self.fail_closed_notification_recovery(budget);
+        }
+    }
+
+    fn prepare_notification_recovery(
+        &self,
+        budget: &ReconciliationBudget,
+    ) -> Result<NotificationRecoveryPlan, String> {
+        if self.open_documents.len() > MAX_NOTIFICATION_RECOVERY_TARGETS
+            || self.indexed_files.len() > DEFAULT_MAX_FILES
+            || self.pending_unit_file_renames.len() > MAX_PENDING_FILE_RENAMES
+            || budget.rename_endpoints.borrow().len()
+                > 2 * MAX_NOTIFICATION_FILE_RENAME_BATCH_ENTRIES
+            || budget.deleted_uris.borrow().len() > 2 * MAX_NOTIFICATION_FILE_RENAME_BATCH_ENTRIES
+        {
+            budget.recovery_refused.set(true);
+            return Err("workspace state exceeds an admitted notification-recovery cap".into());
+        }
+
+        let mut seen_endpoints = HashSet::new();
+        seen_endpoints
+            .try_reserve(MAX_NOTIFICATION_RECOVERY_RENAME_ENDPOINTS)
+            .map_err(|error| format!("could not reserve rename recovery set: {error}"))?;
+        let mut staged_endpoints = HashMap::new();
+        staged_endpoints
+            .try_reserve(MAX_NOTIFICATION_RECOVERY_RENAME_ENDPOINTS)
+            .map_err(|error| format!("could not reserve rename recovery endpoints: {error}"))?;
+        let mut stage_endpoint = |uri: &Url| -> Result<(), String> {
+            budget.charge_recovery_preflight(1, uri.as_str().len())?;
+            if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+                budget.recovery_refused.set(true);
+                return Err("rename recovery URI exceeds the admitted document URI cap".into());
+            }
+            if seen_endpoints.insert(uri.clone()) {
+                if let Some(document) = self.open_documents.get(uri) {
+                    if document.text.is_some() {
+                        staged_endpoints.insert(uri.clone(), document.version);
+                    }
+                }
+            }
+            Ok(())
+        };
+        for (old_uri, pending) in &self.pending_unit_file_renames {
+            stage_endpoint(old_uri)?;
+            stage_endpoint(&pending.new_uri)?;
+        }
+        for uri in budget.rename_endpoints.borrow().iter() {
+            stage_endpoint(uri)?;
+        }
+
+        let mut deleted_uris = Vec::new();
+        deleted_uris
+            .try_reserve(budget.deleted_uris.borrow().len())
+            .map_err(|error| format!("could not reserve recovery tombstones: {error}"))?;
+        for uri in budget.deleted_uris.borrow().iter() {
+            budget.charge_recovery_preflight(1, uri.as_str().len())?;
+            deleted_uris.push(uri.clone());
+        }
+
+        let mut open_document_uri_bytes = 0usize;
+        for uri in self.open_documents.keys() {
+            let bytes = uri.as_str().len();
+            if bytes > MAX_OPEN_DOCUMENT_URI_BYTES {
+                budget.recovery_refused.set(true);
+                return Err("open-document recovery URI exceeds its admission cap".into());
+            }
+            budget.charge_recovery_preflight(1, bytes)?;
+            open_document_uri_bytes = open_document_uri_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| "recovery URI byte count overflowed".to_string())?;
+        }
+
+        let mut clear_work_visits = 0usize;
+        macro_rules! count_recovery_entries {
+            ($count:expr) => {{
+                clear_work_visits = clear_work_visits
+                    .checked_add($count)
+                    .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_VISITS)
+                    .ok_or_else(|| {
+                        budget.recovery_refused.set(true);
+                        "workspace notification recovery exceeds its fixed visit envelope"
+                            .to_string()
+                    })?;
+            }};
+        }
+        count_recovery_entries!(self.contexts.len());
+        count_recovery_entries!(self.document_contexts.len());
+        count_recovery_entries!(self.open_document_contexts.len());
+        count_recovery_entries!(self.cached_documents.len());
+        count_recovery_entries!(self.directory_catalogues.len());
+        count_recovery_entries!(self.filename_catalogues.len());
+        count_recovery_entries!(self.package_catalogues.len());
+        count_recovery_entries!(self.package_metadata_cache.len());
+        count_recovery_entries!(self.source_change_generations.len());
+        count_recovery_entries!(self.source_change_observations.len());
+        count_recovery_entries!(self.configuration_change_generations.len());
+        count_recovery_entries!(self.expansions.len());
+        count_recovery_entries!(self.include_parents.len());
+        count_recovery_entries!(self.document_owners.len());
+        count_recovery_entries!(self.owner_last_used.len());
+        count_recovery_entries!(self.pending_unit_file_renames.len());
+        count_recovery_entries!(self.indexed_files.len());
+        count_recovery_entries!(self.indexed_sizes.len());
+        count_recovery_entries!(self.disk_stamps.len());
+        count_recovery_entries!(self.last_used.len());
+        count_recovery_entries!(self.pending_diagnostics.len());
+        count_recovery_entries!(self.diagnostic_dependencies.len());
+        count_recovery_entries!(self.warnings.len());
+        count_recovery_entries!(self.index.document_count());
+        count_recovery_entries!(staged_endpoints.len());
+        if let Some(records) = &self.analysis_records {
+            count_recovery_entries!(records.len());
+        }
+        for expansion in self.expansions.values() {
+            budget.charge_recovery_preflight(1, 0)?;
+            count_recovery_entries!(
+                expansion.dependencies.len()
+                    + expansion.dependency_entries.len()
+                    + expansion.include_observations.len()
+                    + expansion.source_texts.len()
+            );
+        }
+        for parents in self.include_parents.values() {
+            budget.charge_recovery_preflight(1, 0)?;
+            count_recovery_entries!(parents.len());
+        }
+        for records in self.diagnostic_dependencies.values() {
+            budget.charge_recovery_preflight(1, 0)?;
+            count_recovery_entries!(records.len());
+            for record in records {
+                budget.charge_recovery_preflight(1, 0)?;
+                count_recovery_entries!(record.candidate_observations.len());
+            }
+        }
+        let recovery_targets = self.open_documents.len();
+        let clear_work_visits = clear_work_visits
+            .checked_add(self.open_documents.len())
+            .and_then(|count| count.checked_add(deleted_uris.len()))
+            .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_VISITS)
+            .ok_or_else(|| {
+                budget.recovery_refused.set(true);
+                "workspace notification recovery exceeds its fixed visit envelope".to_string()
+            })?;
+        budget.reserve_recovery_envelope(
+            clear_work_visits,
+            open_document_uri_bytes
+                .saturating_add(deleted_uris.iter().map(|uri| uri.as_str().len()).sum())
+                .saturating_add(self.pending_unit_file_rename_bytes),
+            recovery_targets,
+        )?;
+
+        Ok(NotificationRecoveryPlan {
+            rename_rejections: staged_endpoints,
+            deleted_uris,
+            clear_work_visits,
+            open_document_visits: self.open_documents.len(),
+            open_document_uri_bytes,
+            recovery_targets,
+        })
+    }
+
+    fn apply_notification_recovery(
+        &mut self,
+        plan: NotificationRecoveryPlan,
+        budget: &ReconciliationBudget,
+    ) -> Result<(), String> {
+        let mut rejected_rename_uris = HashSet::new();
+        rejected_rename_uris
+            .try_reserve(plan.rename_rejections.len())
+            .map_err(|error| format!("could not reserve rejected rename endpoints: {error}"))?;
+        for uri in plan.rename_rejections.keys() {
+            budget.charge_recovery_work(1, 0)?;
+            rejected_rename_uris.insert(uri.clone());
+        }
+        let deadline = Instant::now() + DIAGNOSTIC_DEBOUNCE;
+
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_global_change();
-        let ambiguous_rename_uris: HashSet<Url> = self
-            .pending_unit_file_renames
-            .iter()
-            .flat_map(|(old_uri, pending)| [old_uri.clone(), pending.new_uri.clone()])
-            .collect();
-        self.pending_unit_file_renames.clear();
-        self.pending_unit_file_rename_bytes = 0;
-        self.contexts.clear();
-        self.document_contexts.clear();
-        self.open_document_contexts.clear();
+        macro_rules! clear_recovery_map {
+            ($map:expr) => {{
+                let len = $map.len();
+                budget.charge_recovery_work(len, 0)?;
+                $map.clear();
+            }};
+        }
+        clear_recovery_map!(self.contexts);
+        clear_recovery_map!(self.document_contexts);
+        clear_recovery_map!(self.open_document_contexts);
+        clear_recovery_map!(self.cached_documents);
+        clear_recovery_map!(self.directory_catalogues);
+        clear_recovery_map!(self.filename_catalogues);
+        clear_recovery_map!(self.package_catalogues);
+        clear_recovery_map!(self.package_metadata_cache);
+        clear_recovery_map!(self.source_change_generations);
+        clear_recovery_map!(self.source_change_observations);
+        clear_recovery_map!(self.configuration_change_generations);
+        clear_recovery_map!(self.expansions);
+        clear_recovery_map!(self.include_parents);
+        clear_recovery_map!(self.diagnostic_dependencies);
+        clear_recovery_map!(self.pending_unit_file_renames);
+        clear_recovery_map!(self.indexed_files);
+        clear_recovery_map!(self.indexed_sizes);
+        clear_recovery_map!(self.disk_stamps);
+        clear_recovery_map!(self.last_used);
+        clear_recovery_map!(self.pending_diagnostics);
+        clear_recovery_map!(self.owner_last_used);
+        clear_recovery_map!(self.warnings);
+        if let Some(records) = self.analysis_records.as_mut() {
+            budget.charge_recovery_work(records.len(), 0)?;
+            records.clear();
+        }
+        budget.charge_recovery_work(self.document_owners.len(), 0)?;
         for owner in self.document_owners.values_mut() {
             owner.needs_revalidation = true;
             owner.legacy_route = None;
         }
-        self.cached_documents.clear();
-        self.directory_catalogues.clear();
-        self.filename_catalogues.clear();
-        self.package_catalogues.clear();
-        self.package_metadata_cache.clear();
-        self.source_change_generations.clear();
-        self.source_change_observations.clear();
-        self.configuration_change_generations.clear();
-        self.expansions.clear();
-        self.include_parents.clear();
-        self.diagnostic_dependencies.clear();
-        self.deleted_overrides.clear();
-        self.pending_diagnostics.clear();
-
+        budget.charge_recovery_work(0, self.pending_unit_file_rename_bytes)?;
+        self.pending_unit_file_rename_bytes = 0;
+        budget.charge_recovery_work(self.index.document_count(), 0)?;
         self.index = NavigationIndex::new();
-        self.indexed_files.clear();
-        self.indexed_sizes.clear();
         self.indexed_bytes = 0;
-        self.disk_stamps.clear();
-        self.last_used.clear();
         self.file_cap_warning_sent = false;
         self.total_cap_warning_sent = false;
-        if let Some(records) = self.analysis_records.as_mut() {
-            records.clear();
+
+        for uri in &plan.deleted_uris {
+            budget.charge_recovery_work(1, uri.as_str().len())?;
+            check_workspace_cancel(Some(&budget.cancellation))?;
+            // disk_stamp performs synchronous OS metadata calls and cannot be
+            // interrupted. Check cancellation on both sides; if it lands
+            // during the syscall the worker latches the global fail-closed
+            // fence and restores every batch tombstone without further I/O.
+            self.remember_deleted(uri);
+            check_workspace_cancel(Some(&budget.cancellation))?;
         }
 
-        // An oversized file-operation batch cannot prove which staged rename
-        // pair it contains. Keep neither endpoint's open incarnation as an
-        // authoritative source; clients must reopen these documents.
-        for uri in ambiguous_rename_uris {
-            if let Some(version) = self.open_documents.get(&uri).map(|doc| doc.version) {
-                self.reject_open_document(
-                    uri,
-                    version,
-                    "file-operation batch overflow invalidated a pending rename transition"
-                        .to_string(),
-                );
-            }
-        }
-
-        let deadline = Instant::now() + DIAGNOSTIC_DEBOUNCE;
-        let pending_diagnostics = &mut self.pending_diagnostics;
-        for uri in self.open_documents.keys() {
-            pending_diagnostics.insert(uri.clone(), deadline);
-        }
-    }
-
-    pub(crate) fn invalidate_for_reconciliation_budget(&mut self, budget: &ReconciliationBudget) {
-        budget.reserve_recovery_envelope();
-        let deleted_uris = budget.deleted_uris();
-        let rename_endpoints = budget.rename_endpoints();
-        self.invalidate_all_for_file_notification_overflow_inner();
-        for uri in deleted_uris {
-            self.remember_deleted(&uri);
-        }
-        for uri in rename_endpoints {
-            if let Some(document) = self.open_documents.get(&uri) {
-                if document.text.is_some() {
-                    self.reject_open_document(
-                        uri.clone(),
-                        document.version,
-                        "reconciliation budget overflow abandoned a multi-file rename batch; close and reopen this document".to_string(),
-                    );
+        let source_generation = self.source_generation;
+        for (uri, document) in &mut self.open_documents {
+            budget.charge_recovery_work(1, uri.as_str().len())?;
+            if let Some(expected_version) = plan.rename_rejections.get(uri) {
+                if document.text.is_some() && document.version != *expected_version {
+                    return Err("rename endpoint changed after recovery preflight".into());
                 }
             }
+            if rejected_rename_uris.contains(uri) && document.text.is_some() {
+                if let Some(text) = document.text.take() {
+                    self.open_text_bytes = self.open_text_bytes.saturating_sub(text.len());
+                }
+                document.version = plan.rename_rejections[uri];
+                document.rejection = Some(
+                    "document rejected: reconciliation fallback abandoned a file rename transition; close and reopen this document".to_string(),
+                );
+                document.identity_generation = source_generation;
+            }
+            self.pending_diagnostics.insert(uri.clone(), deadline);
+        }
+        debug_assert_eq!(plan.open_document_visits, self.open_documents.len());
+        debug_assert_eq!(plan.recovery_targets, self.open_documents.len());
+        debug_assert_eq!(
+            plan.open_document_uri_bytes,
+            self.open_documents
+                .keys()
+                .map(|uri| uri.as_str().len())
+                .sum::<usize>()
+        );
+        debug_assert!(
+            budget.recovery_visits.get()
+                <= plan.clear_work_visits
+                    + budget.recovery_preflight_visits.get()
+                    + plan.rename_rejections.len()
+        );
+        check_workspace_cancel(Some(&budget.cancellation))?;
+        Ok(())
+    }
+
+    fn fail_closed_notification_recovery(&mut self, budget: &ReconciliationBudget) {
+        self.rejected_open_fence_permanent = true;
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_global_change();
+        // Preserve ordered deletion evidence without making non-interruptible
+        // metadata calls while the worker is already cancelled or out of its
+        // admitted recovery envelope. A later stamp mismatch clears it.
+        for uri in budget.deleted_uris.borrow().iter() {
+            if self.deleted_overrides.len() >= MAX_DELETED_OVERRIDES
+                && !self.deleted_overrides.contains_key(uri)
+            {
+                if let Some(victim) = self.deleted_overrides.keys().next().cloned() {
+                    self.deleted_overrides.remove(&victim);
+                }
+            }
+            self.deleted_overrides.insert(uri.clone(), None);
         }
     }
 
@@ -12184,6 +12515,179 @@ mod tests {
         assert!(workspace.indexed_files.is_empty());
         assert!(workspace.expansions.is_empty());
         assert!(roots.iter().all(|uri| !workspace.index.contains(uri)));
+    }
+
+    #[test]
+    fn exhausted_recovery_preflights_and_visits_admitted_state_once() {
+        const DOCUMENTS: usize = 2_048;
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let rename_old =
+            Url::from_file_path(temp.path().join("RenamedFrom.pas")).expect("old rename URI");
+        let rename_new =
+            Url::from_file_path(temp.path().join("RenamedTo.pas")).expect("new rename URI");
+        let context_key = budget_test_context_key(0);
+        for index in 0..DOCUMENTS {
+            let uri = if index == 0 {
+                rename_old.clone()
+            } else if index == 1 {
+                rename_new.clone()
+            } else {
+                Url::from_file_path(temp.path().join(format!("Owner{index:04}.pas")))
+                    .expect("owner URI")
+            };
+            workspace.open_documents.insert(
+                uri.clone(),
+                OpenDocument {
+                    text: Some("unit RecoveryOwner; interface implementation end.".into()),
+                    version: 3,
+                    rejection: None,
+                    identity_generation: 7,
+                },
+            );
+            workspace.open_text_bytes += "unit RecoveryOwner; interface implementation end.".len();
+            workspace
+                .index
+                .update(
+                    uri.clone(),
+                    "unit RecoveryOwner; interface implementation end.".into(),
+                )
+                .expect("seed navigation index");
+            workspace.indexed_files.insert(uri.clone());
+            workspace.indexed_sizes.insert(uri.clone(), 64);
+            workspace.indexed_bytes += 64;
+            workspace
+                .document_contexts
+                .insert(uri.clone(), context_key.clone());
+            workspace
+                .open_document_contexts
+                .insert(uri.clone(), context_key.clone());
+            workspace.document_owners.insert(
+                uri.clone(),
+                super::KnownDocumentOwner {
+                    key: context_key.clone(),
+                    state: super::ContextState::default(),
+                    origin: super::OwnerOrigin::Automatic,
+                    needs_revalidation: false,
+                    follow_current_project_file: false,
+                    legacy_route: None,
+                },
+            );
+            workspace.owner_last_used.insert(uri.clone(), index as u64);
+            workspace
+                .pending_diagnostics
+                .insert(uri, std::time::Instant::now());
+        }
+        workspace.pending_unit_file_renames.insert(
+            rename_old.clone(),
+            super::PendingUnitFileRename {
+                new_uri: rename_new.clone(),
+                original_identity_generation: Some(7),
+                original_version: Some(3),
+                expected_text: Some("unit RenamedTo;".into()),
+                closed_verified_version: None,
+            },
+        );
+        workspace.pending_unit_file_rename_bytes = "unit RenamedTo;".len();
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(cancellation);
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("fill normal reconciliation account");
+        let _ = budget.charge_path_visits(1);
+        budget.record_rename_endpoint(rename_old.clone());
+        budget.record_rename_endpoint(rename_new.clone());
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        let old_document = &workspace.open_documents[&rename_old];
+        let new_document = &workspace.open_documents[&rename_new];
+        assert!(
+            old_document.text.is_none(),
+            "old rename overlay is rejected"
+        );
+        assert!(
+            new_document.text.is_none(),
+            "new rename overlay is rejected"
+        );
+        assert!(old_document.rejection.is_some());
+        assert!(new_document.rejection.is_some());
+        assert!(workspace.indexed_files.is_empty());
+        assert!(workspace.pending_unit_file_renames.is_empty());
+        #[cfg(feature = "test-support")]
+        {
+            let metrics = budget.metrics(true);
+            let recovery_visits = metrics["recovery_visits"]
+                .as_u64()
+                .expect("recovery work is explicitly counted");
+            assert!(recovery_visits >= DOCUMENTS as u64);
+            assert!(recovery_visits <= 1_000_000);
+            assert_eq!(
+                metrics["recovery_visit_reserve"].as_u64(),
+                Some(recovery_visits)
+            );
+            assert!(
+                metrics["recovery_uri_bytes"].as_u64().unwrap_or_default()
+                    <= super::MAX_NOTIFICATION_RECOVERY_URI_BYTES as u64
+            );
+            assert_eq!(metrics["recovery_refused"], false);
+        }
+    }
+
+    #[test]
+    fn cancelled_recovery_latches_global_fence_before_mutating_rename_overlays() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let old_uri = Url::from_file_path(temp.path().join("Before.pas")).expect("old URI");
+        let new_uri = Url::from_file_path(temp.path().join("After.pas")).expect("new URI");
+        for (uri, text) in [
+            (
+                old_uri.clone(),
+                "unit Before; interface implementation end.",
+            ),
+            (new_uri.clone(), "unit After; interface implementation end."),
+        ] {
+            workspace.open_documents.insert(
+                uri.clone(),
+                OpenDocument {
+                    text: Some(text.to_owned()),
+                    version: 4,
+                    rejection: None,
+                    identity_generation: 9,
+                },
+            );
+            workspace.open_text_bytes += text.len();
+        }
+        workspace.pending_unit_file_renames.insert(
+            old_uri.clone(),
+            super::PendingUnitFileRename {
+                new_uri: new_uri.clone(),
+                original_identity_generation: Some(9),
+                original_version: Some(4),
+                expected_text: Some("unit After;".to_owned()),
+                closed_verified_version: None,
+            },
+        );
+        workspace.pending_unit_file_rename_bytes = "unit After;".len();
+        let cancellation = std::sync::Arc::new(AtomicBool::new(true));
+        let budget = ReconciliationBudget::new(cancellation);
+        budget.record_rename_endpoint(old_uri.clone());
+        budget.record_rename_endpoint(new_uri.clone());
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert!(workspace.open_documents[&old_uri].text.is_some());
+        assert!(workspace.open_documents[&new_uri].text.is_some());
+        assert!(workspace.pending_unit_file_renames.contains_key(&old_uri));
+        #[cfg(feature = "test-support")]
+        {
+            let metrics = budget.metrics(true);
+            assert_eq!(metrics["recovery_visits"], 0);
+            assert_eq!(metrics["recovery_visit_reserve"], 0);
+        }
     }
 
     #[test]

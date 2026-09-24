@@ -8383,6 +8383,10 @@ fn spawn_workspace_file_notification(
                 workspace.invalidate_for_reconciliation_budget(&budget);
                 let mut effect = DiagnosticNotificationEffect::default();
                 effect.refresh_all_diagnostics();
+                if push_diagnostics_supported {
+                    effect.clear_publication_cursor =
+                        Some(workspace.take_all_diagnostic_publication_uris(None));
+                }
                 result = Ok(effect);
             }
             #[cfg(feature = "test-support")]
@@ -8520,6 +8524,11 @@ fn event_loop(
                         completed_workspace.invalidate_for_reconciliation_budget(&budget);
                         let mut effect = DiagnosticNotificationEffect::default();
                         effect.refresh_all_diagnostics();
+                        if !pull_diagnostics_supported {
+                            effect.clear_publication_cursor = Some(
+                                completed_workspace.take_all_diagnostic_publication_uris(None),
+                            );
+                        }
                         result = Ok(effect);
                     }
                     *workspace = completed_workspace;

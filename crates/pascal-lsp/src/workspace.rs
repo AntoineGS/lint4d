@@ -12860,9 +12860,7 @@ mod tests {
         assert!(roots.iter().all(|uri| !workspace.index.contains(uri)));
     }
 
-    #[test]
-    fn exhausted_recovery_preflights_and_visits_admitted_state_once() {
-        const DOCUMENTS: usize = 512;
+    fn assert_exhausted_recovery_case(documents: usize, should_recover: bool) {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -12871,7 +12869,7 @@ mod tests {
         let rename_new =
             Url::from_file_path(temp.path().join("RenamedTo.pas")).expect("new rename URI");
         let context_key = budget_test_context_key(0);
-        for index in 0..DOCUMENTS {
+        for index in 0..documents {
             let uri = if index == 0 {
                 rename_old.clone()
             } else if index == 1 {
@@ -12946,36 +12944,69 @@ mod tests {
 
         let old_document = &workspace.open_documents[&rename_old];
         let new_document = &workspace.open_documents[&rename_new];
-        assert!(
-            old_document.text.is_none(),
-            "old rename overlay is rejected"
-        );
-        assert!(
-            new_document.text.is_none(),
-            "new rename overlay is rejected"
-        );
-        assert!(old_document.rejection.is_some());
-        assert!(new_document.rejection.is_some());
-        assert!(workspace.indexed_files.is_empty());
-        assert!(workspace.pending_unit_file_renames.is_empty());
+        if should_recover {
+            assert!(
+                old_document.text.is_none(),
+                "old rename overlay is rejected"
+            );
+            assert!(
+                new_document.text.is_none(),
+                "new rename overlay is rejected"
+            );
+            assert!(old_document.rejection.is_some());
+            assert!(new_document.rejection.is_some());
+            assert!(workspace.indexed_files.is_empty());
+            assert!(workspace.pending_unit_file_renames.is_empty());
+        } else {
+            assert!(workspace.analysis_admission_fenced());
+            assert!(old_document.text.is_some());
+            assert!(new_document.text.is_some());
+            assert_eq!(workspace.index.document_count(), documents);
+            assert_eq!(workspace.indexed_files.len(), documents);
+            assert!(
+                workspace
+                    .pending_unit_file_renames
+                    .contains_key(&rename_old)
+            );
+        }
         #[cfg(feature = "test-support")]
         {
             let metrics = budget.metrics(true);
-            let recovery_visits = metrics["recovery_visits"]
-                .as_u64()
-                .expect("recovery work is explicitly counted");
-            assert!(recovery_visits >= DOCUMENTS as u64);
-            assert!(recovery_visits <= 1_000_000);
-            assert_eq!(
-                metrics["recovery_visit_reserve"].as_u64(),
-                Some(recovery_visits)
-            );
-            assert!(
-                metrics["recovery_bytes"].as_u64().unwrap_or_default()
-                    <= super::MAX_NOTIFICATION_RECOVERY_BYTES as u64
-            );
-            assert_eq!(metrics["recovery_refused"], false);
+            assert_eq!(metrics["recovery_refused"], !should_recover);
+            if should_recover {
+                let recovery_visits = metrics["recovery_visits"]
+                    .as_u64()
+                    .expect("recovery work is explicitly counted");
+                assert!(recovery_visits >= documents as u64);
+                assert!(recovery_visits <= 1_000_000);
+                assert_eq!(
+                    metrics["recovery_visit_reserve"].as_u64(),
+                    Some(recovery_visits)
+                );
+                assert!(
+                    metrics["recovery_bytes"].as_u64().unwrap_or_default()
+                        <= super::MAX_NOTIFICATION_RECOVERY_BYTES as u64
+                );
+            } else {
+                assert!(
+                    metrics["recovery_preflight_visits"]
+                        .as_u64()
+                        .unwrap_or_default()
+                        > 0
+                );
+                assert_eq!(metrics["recovery_visit_reserve"], 0);
+            }
         }
+    }
+
+    #[test]
+    fn exhausted_recovery_preflights_and_visits_admitted_state_once() {
+        assert_exhausted_recovery_case(512, true);
+    }
+
+    #[test]
+    fn oversized_recovery_at_2048_owners_refuses_without_mutating_state() {
+        assert_exhausted_recovery_case(2_048, false);
     }
 
     #[test]
@@ -13073,6 +13104,74 @@ mod tests {
         );
         #[cfg(feature = "test-support")]
         assert!(budget.metrics(true)["recovery_refused"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn recovery_refuses_provider_map_entries_before_clearing_navigation_index() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let unit_providers = (0..32_768)
+            .map(|index| {
+                Url::from_file_path(temp.path().join(format!("units/provider-{index}.pas")))
+                    .expect("unit provider URI")
+            })
+            .collect::<Vec<_>>();
+        let auto_import_providers = (0..32_767)
+            .map(|index| {
+                Url::from_file_path(
+                    temp.path()
+                        .join(format!("auto-import/provider-{index}.pas")),
+                )
+                .expect("auto-import provider URI")
+            })
+            .collect::<Vec<_>>();
+        let mut units = HashMap::new();
+        units.insert("SharedUnit".to_owned(), unit_providers);
+        let mut auto_import_unit_providers = HashMap::new();
+        auto_import_unit_providers.insert("SharedAutoImport".to_owned(), auto_import_providers);
+        workspace
+            .index
+            .seed_recovery_test_provider_maps(units, auto_import_unit_providers);
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.index.document_count(), 0);
+        assert_eq!(
+            workspace.index.recovery_test_provider_map_lengths(),
+            (32_768, 32_767)
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_large_provider_uri_bytes_before_clearing_navigation_index() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let mut provider_uri = String::with_capacity(super::MAX_NOTIFICATION_RECOVERY_BYTES + 32);
+        provider_uri.push_str("file:///provider.pas?");
+        provider_uri.push_str(&"x".repeat(super::MAX_NOTIFICATION_RECOVERY_BYTES + 1));
+        let provider_uri = Url::parse(&provider_uri).expect("large provider URI");
+        assert!(provider_uri.as_str().len() > super::MAX_NOTIFICATION_RECOVERY_BYTES);
+        let mut auto_import_unit_providers = HashMap::new();
+        auto_import_unit_providers.insert("LargeProvider".to_owned(), vec![provider_uri]);
+        workspace
+            .index
+            .seed_recovery_test_provider_maps(HashMap::new(), auto_import_unit_providers);
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.index.recovery_test_provider_map_lengths(), (0, 1));
     }
 
     #[test]

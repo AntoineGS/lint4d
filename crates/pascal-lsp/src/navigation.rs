@@ -555,6 +555,24 @@ impl NavigationIndex {
         self.auto_import_unit_providers = providers;
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_recovery_test_provider_maps(
+        &mut self,
+        units: HashMap<String, Vec<Url>>,
+        auto_import_unit_providers: HashMap<String, Vec<Url>>,
+    ) {
+        self.units = units;
+        self.auto_import_unit_providers = auto_import_unit_providers;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_test_provider_map_lengths(&self) -> (usize, usize) {
+        (
+            self.units.values().map(Vec::len).sum(),
+            self.auto_import_unit_providers.values().map(Vec::len).sum(),
+        )
+    }
+
     /// Return the source-accurate outline for one indexed document.
     pub fn document_symbols(&self, uri: &Url) -> Result<Vec<lsp_types::DocumentSymbol>, String> {
         symbols::document_symbols(self, uri)
@@ -6043,6 +6061,18 @@ impl NavigationIndex {
                     visit(name.len())?;
                     visit(uri.as_str().len())?;
                 }
+            }
+        }
+        for (unit_name, providers) in &self.units {
+            visit(unit_name.len())?;
+            for provider in providers {
+                visit(provider.as_str().len())?;
+            }
+        }
+        for (unit_name, providers) in &self.auto_import_unit_providers {
+            visit(unit_name.len())?;
+            for provider in providers {
+                visit(provider.as_str().len())?;
             }
         }
         Ok(())

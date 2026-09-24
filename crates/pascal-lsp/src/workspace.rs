@@ -3504,6 +3504,10 @@ impl Workspace {
                 self.deleted_overrides.remove(uri);
             }
         }
+        #[cfg(feature = "test-support")]
+        if Self::fail_file_event_after_mutation_for_test(uri) {
+            return Err("injected file-event failure after workspace mutation".into());
+        }
         if override_changed {
             if let Ok(path) = uri.to_file_path() {
                 match change {
@@ -3564,6 +3568,16 @@ impl Workspace {
             }
         }
         Ok(diagnostic_uris)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn fail_file_event_after_mutation_for_test(uri: &Url) -> bool {
+        static INJECTED: AtomicBool = AtomicBool::new(false);
+        std::env::var("PASCAL_LSP_TEST_FILE_EVENT_FAIL_AFTER_MUTATION_URI")
+            .is_ok_and(|expected| expected == uri.as_str())
+            && INJECTED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 
     pub(crate) fn invalidate_all_for_file_notification_overflow_bounded(&mut self) {

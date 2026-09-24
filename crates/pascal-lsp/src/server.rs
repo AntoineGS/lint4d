@@ -10725,10 +10725,7 @@ fn handle_notification_with_control(
     control: NotificationWorkControl<'_>,
 ) -> Result<DiagnosticNotificationEffect, String> {
     let method = notification.method.clone();
-    let worker_owned_recovery = control.budget.is_some();
-    let cancellation_requested = control
-        .cancel
-        .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+    let budget = control.budget;
     let source_generation = workspace.source_generation();
     let configuration_generation = workspace.configuration_generation();
     let staling = DiagnosticPublicationBatchSender::new(connection, false);
@@ -10741,10 +10738,16 @@ fn handle_notification_with_control(
         control,
     );
 
-    if staling.is_stale_all() {
+    // Work-budget exhaustion has a worker-level fallback immediately after
+    // this call. Leave that case to the worker so the same reconciliation
+    // budget is not applied twice; non-budget partial errors still recover
+    // here even when cancellation was not requested.
+    let budget_exhausted = budget.is_some_and(ReconciliationBudget::is_exhausted);
+    if staling.is_stale_all() && !budget_exhausted {
         return Ok(recover_failed_diagnostic_notification(
             workspace,
             push_diagnostics_supported,
+            budget,
         ));
     }
 
@@ -10754,7 +10757,7 @@ fn handle_notification_with_control(
             Ok(effect)
         }
         Err(error)
-            if (!worker_owned_recovery || cancellation_requested)
+            if !budget_exhausted
                 && notification_may_have_mutated_workspace(&method)
                 && (staling.staling_requested()
                     || source_generation != workspace.source_generation()
@@ -10765,6 +10768,7 @@ fn handle_notification_with_control(
             Ok(recover_failed_diagnostic_notification(
                 workspace,
                 push_diagnostics_supported,
+                budget,
             ))
         }
         Err(error) => Err(error),
@@ -10789,8 +10793,13 @@ fn notification_may_have_mutated_workspace(method: &str) -> bool {
 fn recover_failed_diagnostic_notification(
     workspace: &mut Workspace,
     push_diagnostics_supported: bool,
+    budget: Option<&ReconciliationBudget>,
 ) -> DiagnosticNotificationEffect {
-    workspace.invalidate_all_for_file_notification_overflow_bounded();
+    if let Some(budget) = budget {
+        workspace.invalidate_for_reconciliation_budget(budget);
+    } else {
+        workspace.invalidate_all_for_file_notification_overflow_bounded();
+    }
     let mut effect = DiagnosticNotificationEffect::default();
     effect.refresh_all_diagnostics();
     effect.discard_all_queued_diagnostics = true;
@@ -11039,25 +11048,18 @@ fn handle_notification_with_control_inner(
             }
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
-            let mut recoverable_endpoints = Vec::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
-            let mut invalid_batch = false;
             for file in files {
-                let Some(uri) = file
+                let uri = file
                     .get("uri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                else {
-                    invalid_batch = true;
-                    continue;
-                };
+                    .ok_or_else(|| "file operation entry requires a valid uri".to_string())?;
                 let uri = canonical_file_uri(&uri);
                 if uri.to_file_path().is_err() {
-                    invalid_batch = true;
-                    continue;
+                    return Err("file operation batch contains a non-file URI".into());
                 }
-                recoverable_endpoints.push(uri.clone());
                 if !oversized_uri_bytes
                     && add_file_operation_uri_bytes(&mut total_uri_bytes, &uri).is_err()
                 {
@@ -11066,17 +11068,6 @@ fn handle_notification_with_control_inner(
                 if unique.insert(uri.clone()) {
                     uris.push(uri);
                 }
-            }
-            if invalid_batch {
-                eprintln!(
-                    "pascal-lsp: malformed or non-file operation batch; invalidating workspace file state"
-                );
-                return Ok(invalidate_ambiguous_file_notification(
-                    workspace,
-                    budget,
-                    recoverable_endpoints,
-                    push_diagnostics_supported,
-                ));
             }
             if oversized_uri_bytes {
                 eprintln!(
@@ -11138,37 +11129,25 @@ fn handle_notification_with_control_inner(
             let mut oversized_uri_bytes = false;
             let mut ambiguous_batch = false;
             for file in files {
-                let Some(old_uri) = file
+                let old_uri = file
                     .get("oldUri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                else {
-                    ambiguous_batch = true;
-                    continue;
-                };
-                let Some(new_uri) = file
+                    .ok_or_else(|| "file rename entry requires a valid oldUri".to_string())?;
+                let new_uri = file
                     .get("newUri")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<Url>(value).ok())
-                else {
-                    recoverable_endpoints.push(canonical_file_uri(&old_uri));
-                    ambiguous_batch = true;
-                    continue;
-                };
+                    .ok_or_else(|| "file rename entry requires a valid newUri".to_string())?;
                 let old_uri = canonical_file_uri(&old_uri);
                 let new_uri = canonical_file_uri(&new_uri);
                 let old_is_file = old_uri.to_file_path().is_ok();
                 let new_is_file = new_uri.to_file_path().is_ok();
-                if old_is_file {
-                    recoverable_endpoints.push(old_uri.clone());
-                }
-                if new_is_file {
-                    recoverable_endpoints.push(new_uri.clone());
-                }
                 if !old_is_file || !new_is_file {
-                    ambiguous_batch = true;
-                    continue;
+                    return Err("file rename batch contains a non-file URI".into());
                 }
+                recoverable_endpoints.push(old_uri.clone());
+                recoverable_endpoints.push(new_uri.clone());
                 if !oversized_uri_bytes
                     && (add_file_operation_uri_bytes(&mut total_uri_bytes, &old_uri).is_err()
                         || add_file_operation_uri_bytes(&mut total_uri_bytes, &new_uri).is_err())
@@ -11176,8 +11155,7 @@ fn handle_notification_with_control_inner(
                     oversized_uri_bytes = true;
                 }
                 if old_uri == new_uri {
-                    ambiguous_batch = true;
-                    continue;
+                    return Err("file rename batch contains identical URIs".into());
                 }
                 if !unique_renames.insert((old_uri.clone(), new_uri.clone())) {
                     // Replaying the exact same move in one batch is

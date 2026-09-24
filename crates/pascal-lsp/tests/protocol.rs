@@ -235,6 +235,15 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_file_event_failure(environment: &TempDir, uri: &Url) -> Self {
+        Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_FILE_EVENT_FAIL_AFTER_MUTATION_URI"),
+            Some(uri.as_str()),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_barrier_and_configuration(
         environment: TempDir,
     ) -> (Self, TestBarrier) {
@@ -34584,6 +34593,262 @@ fn oversized_watched_file_notifications_broadly_invalidate_cached_provider_state
         bytes_refresh.id,
         Value::Null,
     )));
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg(feature = "test-support")]
+fn worker_file_notification_error_after_mutation_recovers_staling_and_overlay_state() {
+    for pull_diagnostics in [false, true] {
+        let environment = tempfile::tempdir().expect("isolated server environment");
+        let root = environment.path().join("workspace");
+        fs::create_dir_all(&root).expect("workspace root");
+        let provider = root.join("Provider.pas");
+        let sibling = root.join("Sibling.pas");
+        let old_consumer = root.join("OldConsumer.pas");
+        let new_consumer = root.join("NewConsumer.pas");
+        let old_provider_source = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let new_provider_source = old_provider_source
+            .replace("badConst", "GOODNAME")
+            .replace("TOldThing", "TNewThing");
+        let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+        let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TNewThing;\nimplementation\nend.\n";
+        let main_source =
+            "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n";
+        write_file(&provider, old_provider_source);
+        write_file(&sibling, "unit Sibling;\ninterface\nimplementation\nend.\n");
+        write_file(&old_consumer, old_consumer_source);
+        write_file(&new_consumer, new_consumer_source);
+        write_file(&root.join("Main.pas"), main_source);
+        write_file(
+            &root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+
+        let mut server = TestServer::launch_with_file_event_failure(&environment, &uri(&sibling));
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(&root);
+        } else {
+            server.initialize_with_watched_registration(&root, Value::Null, false);
+        }
+        if !pull_diagnostics {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri(&provider),
+                        "languageId": "pascal",
+                        "version": 1,
+                        "text": old_provider_source,
+                    }
+                }),
+            );
+        }
+
+        let old_definition_id =
+            RequestId::from(format!("worker-error-old-before-{pull_diagnostics}"));
+        server.send_request(
+            old_definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+        );
+        let old_locations = result_locations(server.response(&old_definition_id));
+        assert_eq!(old_locations.len(), 1);
+        assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
+
+        let new_definition_id =
+            RequestId::from(format!("worker-error-new-negative-{pull_diagnostics}"));
+        server.send_request(
+            new_definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
+        );
+        assert!(result_locations(server.response(&new_definition_id)).is_empty());
+
+        let previous_result_id = if pull_diagnostics {
+            let id = RequestId::from(format!("worker-error-pull-before-{pull_diagnostics}"));
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "initial pull failed: {response:?}"
+            );
+            let report = response.result.expect("initial pull result");
+            assert!(report["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["code"] == "constant-naming")
+            }));
+            Some(
+                report["resultId"]
+                    .as_str()
+                    .expect("initial pull result ID")
+                    .to_string(),
+            )
+        } else {
+            let initial = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("open overlay must publish initial diagnostics");
+            assert!(initial["diagnostics"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["code"] == "constant-naming")
+            }));
+            None
+        };
+
+        let old_metadata = fs::metadata(&provider).expect("provider metadata before edit");
+        write_file(&provider, &new_provider_source);
+        restore_mtime(&provider, &old_metadata);
+        server.send_notification(
+            "workspace/didCreateFiles",
+            json!({"files":[{"uri":uri(&provider)},{"uri":uri(&sibling)}]}),
+        );
+
+        if pull_diagnostics {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("partially mutating worker error must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            let id = RequestId::from(format!("worker-error-pull-after-{pull_diagnostics}"));
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":previous_result_id,
+                }),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "post-error pull failed: {response:?}"
+            );
+            assert_eq!(response.result.as_ref().unwrap()["kind"], "full");
+            assert!(
+                response.result.as_ref().unwrap()["items"]
+                    .as_array()
+                    .is_some_and(|items| items
+                        .iter()
+                        .all(|item| item["code"] != "constant-naming"))
+            );
+        } else {
+            let clear = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("partially mutating worker error must clear stale push diagnostics");
+            assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+        }
+
+        if !pull_diagnostics {
+            // This worker notification is not a rename: the provider overlay
+            // stays attached to its original URI and hides changed disk bytes.
+            let overlay_definition_id =
+                RequestId::from("worker-error-overlay-not-transferred-push".to_string());
+            server.send_request(
+                overlay_definition_id.clone(),
+                "textDocument/definition",
+                navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+            );
+            let overlay_locations = result_locations(server.response(&overlay_definition_id));
+            assert_eq!(overlay_locations.len(), 1);
+            assert_eq!(overlay_locations[0]["uri"], uri(&provider).to_string());
+            let still_negative_id =
+                RequestId::from("worker-error-overlay-hides-disk-push".to_string());
+            server.send_request(
+                still_negative_id.clone(),
+                "textDocument/definition",
+                navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
+            );
+            assert!(result_locations(server.response(&still_negative_id)).is_empty());
+        } else {
+            let old_after_error_id =
+                RequestId::from("worker-error-old-disk-identity-after-fallback".to_string());
+            server.send_request(
+                old_after_error_id.clone(),
+                "textDocument/definition",
+                navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+            );
+            assert!(result_locations(server.response(&old_after_error_id)).is_empty());
+            let new_after_error_id =
+                RequestId::from("worker-error-new-disk-identity-after-fallback".to_string());
+            server.send_request(
+                new_after_error_id.clone(),
+                "textDocument/definition",
+                navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
+            );
+            let locations = result_locations(server.response(&new_after_error_id));
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+        }
+
+        // A later valid event after closing the overlay proves recovery can
+        // resume from fresh disk state rather than remaining permanently fenced.
+        if !pull_diagnostics {
+            server.send_notification(
+                "textDocument/didClose",
+                json!({"textDocument":{"uri":uri(&provider)}}),
+            );
+        }
+        server.send_notification(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes":[{"uri":uri(&provider),"type":2}]}),
+        );
+        if pull_diagnostics {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("repair event must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+        }
+        let old_after_repair_id =
+            RequestId::from(format!("worker-error-old-after-repair-{pull_diagnostics}"));
+        server.send_request(
+            old_after_repair_id.clone(),
+            "textDocument/definition",
+            navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
+        );
+        assert!(result_locations(server.response(&old_after_repair_id)).is_empty());
+        let new_after_repair_id =
+            RequestId::from(format!("worker-error-new-after-repair-{pull_diagnostics}"));
+        server.send_request(
+            new_after_repair_id.clone(),
+            "textDocument/definition",
+            navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
+        );
+        let new_locations = result_locations(server.response(&new_after_repair_id));
+        assert_eq!(new_locations.len(), 1);
+        assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
+        server.shutdown();
+    }
+}
+
+#[test]
+fn prevalidated_malformed_file_batch_has_no_mutation_or_refresh() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let main = root.path().join("Main.pas");
+    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&main)},{"notUri":"malformed"}]}),
+    );
+    assert!(
+        server
+            .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(150))
+            .is_none()
+    );
+    let diagnostic_id = RequestId::from("prevalidated-malformed-input-diagnostics".to_string());
+    server.send_request(
+        diagnostic_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    let response = server.response(&diagnostic_id);
+    assert!(
+        response.error.is_none(),
+        "diagnostic request failed: {response:?}"
+    );
     server.shutdown();
 }
 

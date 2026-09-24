@@ -10649,7 +10649,12 @@ fn permanently_fence_malformed_file_notification(
     // envelope. Latch the workspace-wide refusal before emitting any global
     // invalidation effect; never continue with a truncated endpoint set.
     let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
-    workspace.permanently_fence_notification_analysis(budget.unwrap_or(&fallback_budget));
+    let budget = budget.unwrap_or(&fallback_budget);
+    // Latch before recovery is allowed to clear any derived cache. Even if
+    // bounded invalidation refuses or is cancelled, this workspace instance
+    // cannot serve a result based on unattributable notification state.
+    workspace.permanently_fence_notification_analysis(budget);
+    workspace.invalidate_for_reconciliation_budget(budget);
     let mut effect = DiagnosticNotificationEffect::default();
     effect.refresh_all_diagnostics();
     effect.discard_all_queued_diagnostics = true;
@@ -11240,20 +11245,18 @@ fn handle_notification_with_control_inner(
         "workspace/didRenameFiles" => {
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 eprintln!(
-                    "pascal-lsp: malformed file-rename batch; invalidating workspace file state"
+                    "pascal-lsp: malformed file-rename batch has no attributable endpoint; fencing workspace analysis"
                 );
-                return Ok(invalidate_malformed_file_notification(
+                return Ok(permanently_fence_malformed_file_notification(
                     workspace,
                     budget,
-                    [],
                     push_diagnostics_supported,
                 ));
             };
             if files.is_empty() {
-                return Ok(invalidate_malformed_file_notification(
+                return Ok(permanently_fence_malformed_file_notification(
                     workspace,
                     budget,
-                    [],
                     push_diagnostics_supported,
                 ));
             }
@@ -11327,6 +11330,16 @@ fn handle_notification_with_control_inner(
                     "pascal-lsp: malformed file-rename member; invalidating workspace file state"
                 );
                 if unretainable_endpoint {
+                    return Ok(permanently_fence_malformed_file_notification(
+                        workspace,
+                        budget,
+                        push_diagnostics_supported,
+                    ));
+                }
+                if recoverable_endpoints.is_empty() {
+                    eprintln!(
+                        "pascal-lsp: malformed file-rename batch has no attributable endpoint; fencing workspace analysis"
+                    );
                     return Ok(permanently_fence_malformed_file_notification(
                         workspace,
                         budget,

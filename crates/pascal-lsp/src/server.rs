@@ -933,6 +933,7 @@ impl AnalysisPriority {
             | AnalysisRequest::ResolveCompletion(_)
             | AnalysisRequest::DocumentHighlights { .. }
             | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
+            AnalysisRequest::DocumentLinks { .. } => Self::Bulk,
             AnalysisRequest::Diagnostics { .. }
             | AnalysisRequest::DocumentDiagnostics { .. }
             | AnalysisRequest::WorkspaceDiagnostics { .. } => Self::Diagnostics,
@@ -2001,6 +2002,9 @@ enum AnalysisRequest {
         tab_size: u32,
         insert_spaces: bool,
     },
+    DocumentLinks {
+        uri: Url,
+    },
     Diagnostics {
         uri: Url,
     },
@@ -2068,6 +2072,7 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
         AnalysisRequest::Rename { .. } => "Preparing rename",
         AnalysisRequest::CodeActions(_) | AnalysisRequest::Resolve(_) => "Preparing code actions",
         AnalysisRequest::Formatting { .. } => "Formatting document",
+        AnalysisRequest::DocumentLinks { .. } => "Resolving document links",
         AnalysisRequest::DocumentSymbols { .. } => "Indexing document symbols",
         AnalysisRequest::SemanticTokens { .. } => "Computing semantic tokens",
         AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
@@ -2091,6 +2096,7 @@ enum AnalysisResultValue {
     SignatureHelp(Result<Option<lsp_types::SignatureHelp>, String>),
     Navigation(NavigationAnalysis),
     Formatting(Result<Vec<lsp_types::TextEdit>, String>),
+    DocumentLinks(Result<Vec<lsp_types::DocumentLink>, String>),
     Diagnostics(DiagnosticsAnalysis),
     DocumentDiagnostics(Result<DocumentDiagnosticsAnalysis, String>),
     WorkspaceDiagnostics(Result<WorkspaceDiagnosticsAnalysis, String>),
@@ -4709,7 +4715,8 @@ impl ObservationKey {
             | AnalysisRequest::Rename { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
-            | AnalysisRequest::ResolveCompletion(_) => return None,
+            | AnalysisRequest::ResolveCompletion(_)
+            | AnalysisRequest::DocumentLinks { .. } => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
@@ -5001,6 +5008,9 @@ impl AnalysisJobs {
             AnalysisRequest::Formatting { .. } => AnalysisResultValue::Formatting(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
+            AnalysisRequest::DocumentLinks { .. } => AnalysisResultValue::DocumentLinks(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
             AnalysisRequest::Diagnostics { uri } => {
                 AnalysisResultValue::Diagnostics(DiagnosticsAnalysis {
                     uri: uri.clone(),
@@ -5255,6 +5265,20 @@ impl AnalysisJobs {
                                     records: computed.records,
                                     value: AnalysisResultValue::Formatting(computed.value),
                                 }
+                            }
+                        }
+                        AnalysisRequest::DocumentLinks { uri } => {
+                            let computed = queries::document_links_from_input(
+                                input,
+                                &uri,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::DocumentLinks(computed.value),
                             }
                         }
                         AnalysisRequest::Diagnostics { uri } => {
@@ -7577,6 +7601,7 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::SignatureHelp(_)
                 | AnalysisResultValue::Navigation(_)
                 | AnalysisResultValue::Formatting(_)
+                | AnalysisResultValue::DocumentLinks(_)
                 | AnalysisResultValue::Diagnostics(_)
                 | AnalysisResultValue::DocumentDiagnostics(_)
                 | AnalysisResultValue::WorkspaceDiagnostics(_)
@@ -7775,6 +7800,12 @@ fn deliver_analysis_result_with_store(
                 ErrorCode::RequestFailed,
                 format!("formatting failed: {error}"),
             ),
+        },
+        AnalysisResultValue::DocumentLinks(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
         },
         AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
             Ok(publications) => {
@@ -8230,6 +8261,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
             navigation.value = Err(error);
         }
         AnalysisResultValue::Formatting(value) => *value = Err(error),
+        AnalysisResultValue::DocumentLinks(value) => *value = Err(error),
         AnalysisResultValue::Diagnostics(diagnostics) => {
             diagnostics.value = Err(error);
             diagnostics.discard = true;
@@ -10685,6 +10717,27 @@ fn handle_request(
                 work_done_token.clone(),
             )?;
         }
+        "textDocument/documentLink" => {
+            let id = request.id.clone();
+            let params: lsp_types::DocumentLinkParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::DocumentLinks {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
         "textDocument/rangeFormatting" => {
             let id = request.id.clone();
             let params: lsp_types::DocumentRangeFormattingParams = match parse_params(&request) {
@@ -12096,6 +12149,7 @@ fn server_capabilities(
         "documentFormattingProvider": {"workDoneProgress": true},
         "documentRangeFormattingProvider": {"workDoneProgress": true},
         "documentOnTypeFormattingProvider": {"firstTriggerCharacter": ";"},
+        "documentLinkProvider": {"resolveProvider": false},
         "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
             "codeActionKinds": [

@@ -2418,6 +2418,93 @@ fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() 
 }
 
 #[test]
+fn document_links_target_only_active_proven_include_paths() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let include = temp.path().join("Active.inc");
+    let source = "unit Main;\r\ninterface\r\nimplementation\r\n{$I Active.inc}\r\nend.\r\n";
+    write_file(&main, source);
+    write_file(&include, "const Active = 1;\n");
+
+    let mut server = TestServer::launch();
+    let initialized = server.initialize(temp.path(), Value::Null);
+    assert_eq!(
+        initialized["capabilities"]["documentLinkProvider"]["resolveProvider"],
+        false
+    );
+    let request_id = RequestId::from("document-links-active-include".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    let links = response.result.expect("document links");
+    assert_eq!(links.as_array().expect("links").len(), 1);
+    assert_eq!(
+        links[0]["range"],
+        json!({"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 14}})
+    );
+    assert_eq!(links[0]["target"], uri(&include).as_str());
+    server.shutdown();
+}
+
+#[test]
+fn document_links_refuse_unknown_conditional_include_paths() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$IFDEF UNKNOWN_DEFINE}\n{$I Maybe.inc}\n{$ENDIF}\nend.\n",
+    );
+    write_file(&temp.path().join("Maybe.inc"), "const Maybe = 1;\n");
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("document-links-unknown-conditional".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn document_links_omit_unresolved_includes_and_wildcard_resources() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nimplementation\n{$I Missing.inc}\n{$R *.dfm}\nend.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let request_id = RequestId::from("document-links-unresolved-targets".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/documentLink",
+        json!({"textDocument": {"uri": uri(&main)}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "document links failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("document links"), json!([]));
+    server.shutdown();
+}
+
+#[test]
 fn diagnostics_report_a_missing_member_with_utf16_and_crlf_coordinates() {
     let root = tempfile::tempdir().expect("workspace");
     let source_path = root.path().join("Main.pas");

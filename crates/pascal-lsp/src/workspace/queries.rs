@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+const MAX_DOCUMENT_LINK_DIRECTIVES: usize = 64;
+
 pub(crate) struct NavigationResult {
     pub(crate) locations: Vec<Location>,
     pub(crate) state: super::NavigationState,
@@ -1213,6 +1215,158 @@ pub(crate) fn formatting_from_input(
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     with_records(source_generation, configuration_generation, value, records)
+}
+
+pub(crate) fn document_links_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<lsp_types::DocumentLink>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "document is outside configured workspace roots or source paths".to_string(),
+        );
+    }
+    let (source, source_record) =
+        match source_for_input_with_owner(&input, &uri, &owner, Some(cancel)) {
+            Ok(result) => result,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    let (context, metadata_records) = match project_context_and_metadata_for_owner(&owner, cancel) {
+        Ok(result) => result,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let conditionals = pascal_core::conditional::analyze_with_context_and_cancel(
+        &source,
+        &context.effective_conditional_context(),
+        cancel,
+    );
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    if !conditionals.complete || conditionals.directives.len() > MAX_DOCUMENT_LINK_DIRECTIVES {
+        let mut records = vec![source_record];
+        records.extend(metadata_records);
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Ok(Vec::new()),
+            records,
+        );
+    }
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    let context_key = match workspace.context_for_uri_with_cancel(&uri, Some(cancel)) {
+        Ok(key) => key,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let mut links = Vec::new();
+    for directive in conditionals.directives.iter().filter(|directive| {
+        directive.kind == pascal_core::conditional::DirectiveKind::Include
+            && directive.activity == pascal_core::conditional::Truth::True
+    }) {
+        if is_cancelled(cancel) {
+            return cancelled(source_generation, configuration_generation);
+        }
+        let Some(body_start) = source
+            .get(directive.start..directive.end)
+            .and_then(|fragment| fragment.find(&directive.body))
+            .map(|offset| directive.start + offset)
+        else {
+            continue;
+        };
+        let body = directive.body.trim_start();
+        let Some((keyword, operand)) = body.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !matches!(keyword.to_ascii_uppercase().as_str(), "I" | "INCLUDE") {
+            continue;
+        }
+        let operand = operand.trim_start();
+        let lead = body.len().saturating_sub(operand.len());
+        let (path, quote_prefix) = if let Some(rest) = operand.strip_prefix('\'') {
+            let Some(end) = rest.find('\'') else { continue };
+            (&rest[..end], 1)
+        } else if let Some(rest) = operand.strip_prefix('"') {
+            let Some(end) = rest.find('"') else { continue };
+            (&rest[..end], 1)
+        } else {
+            let end = operand.find(char::is_whitespace).unwrap_or(operand.len());
+            (&operand[..end], 0)
+        };
+        if path.is_empty()
+            || path.len() > 4096
+            || path.contains(['*', '?', '$'])
+            || path.contains('\\')
+        {
+            continue;
+        }
+        let target_source = format!("{{${}}}", directive.body);
+        let expansion = match workspace.expand_source_with_cancel(
+            &uri,
+            &target_source,
+            &context_key,
+            Some(cancel),
+        ) {
+            Ok(expansion) => expansion,
+            Err(_) => continue,
+        };
+        if !expansion.complete {
+            continue;
+        }
+        let Some(target) = expansion
+            .dependencies
+            .first()
+            .map(|dependency| dependency.uri.clone())
+        else {
+            continue;
+        };
+        let start = body_start + lead + quote_prefix;
+        let end = start + path.len();
+        let (Some(start), Some(end)) = (
+            crate::text::offset_to_position(&source, start),
+            crate::text::offset_to_position(&source, end),
+        ) else {
+            continue;
+        };
+        links.push(lsp_types::DocumentLink {
+            range: lsp_types::Range::new(start, end),
+            target: Some(target),
+            tooltip: None,
+            data: None,
+        });
+        if links.len() >= MAX_DOCUMENT_LINK_DIRECTIVES {
+            break;
+        }
+    }
+    let records = match workspace.analysis_records(cancel) {
+        Ok(mut records) => {
+            records.push(source_record);
+            records.extend(metadata_records);
+            records
+        }
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    with_records(
+        source_generation,
+        configuration_generation,
+        Ok(links),
+        records,
+    )
 }
 
 pub(crate) fn range_formatting_from_input(

@@ -33570,7 +33570,7 @@ fn assert_rename_overlay_is_invalidated_on_reconciliation_fallback(deadline_ms: 
         "fallback must use the work-budget or deadline cause as configured: {metrics}"
     );
     if deadline_ms.is_none() {
-        let rename_path_visits = metrics["filesystem_path_visits"]
+        let rename_path_visits = metrics["file_event_path_visits"]
             .as_u64()
             .unwrap_or_default();
         assert!(

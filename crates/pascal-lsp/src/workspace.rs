@@ -1009,6 +1009,7 @@ const NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED: &str =
 #[derive(Clone, Copy, Debug, Default)]
 struct ReconciliationWorkUsed {
     filesystem_path_visits: usize,
+    file_event_path_visits: usize,
     project_path_key_bytes: usize,
     package_path_visits: usize,
     include_path_visits: usize,
@@ -1027,6 +1028,8 @@ pub(crate) struct ReconciliationBudget {
     cancellation: std::sync::Arc<AtomicBool>,
     used: Cell<ReconciliationWorkUsed>,
     exhausted: Cell<bool>,
+    #[cfg(test)]
+    cancel_after_path_visits: Cell<Option<usize>>,
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
     recovery_target_reserve: Cell<usize>,
@@ -1039,6 +1042,8 @@ impl ReconciliationBudget {
             cancellation,
             used: Cell::new(ReconciliationWorkUsed::default()),
             exhausted: Cell::new(false),
+            #[cfg(test)]
+            cancel_after_path_visits: Cell::new(None),
             deleted_uris: RefCell::new(HashSet::new()),
             rename_endpoints: RefCell::new(HashSet::new()),
             recovery_target_reserve: Cell::new(0),
@@ -1075,7 +1080,34 @@ impl ReconciliationBudget {
             amount,
             MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
             |used, next| used.filesystem_path_visits = next,
-        )
+        )?;
+        #[cfg(test)]
+        if self
+            .cancel_after_path_visits
+            .get()
+            .is_some_and(|threshold| self.used.get().filesystem_path_visits >= threshold)
+        {
+            self.cancel_after_path_visits.set(None);
+            self.cancellation.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn charge_file_event_path_visit(&self, package_descriptor: bool) -> Result<(), String> {
+        if package_descriptor {
+            self.charge_package_path_visits(1)?;
+        } else {
+            self.charge_path_visits(1)?;
+        }
+        let mut used = self.used.get();
+        used.file_event_path_visits = used.file_event_path_visits.saturating_add(1);
+        self.used.set(used);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn cancel_after_path_visits(&self, threshold: usize) {
+        self.cancel_after_path_visits.set(Some(threshold));
     }
 
     fn charge_project_path_key_bytes(&self, amount: usize) -> Result<(), String> {
@@ -1230,6 +1262,7 @@ impl ReconciliationBudget {
         let used = self.used.get();
         serde_json::json!({
             "filesystem_path_visits": used.filesystem_path_visits,
+            "file_event_path_visits": used.file_event_path_visits,
             "project_path_key_bytes": used.project_path_key_bytes,
             "package_path_visits": used.package_path_visits,
             "include_path_visits": used.include_path_visits,
@@ -3190,11 +3223,7 @@ impl Workspace {
                 .to_file_path()
                 .ok()
                 .is_some_and(|path| extension_is(&path, "dpk"));
-            if package_descriptor_event {
-                budget.charge_package_path_visits(1)?;
-            } else {
-                budget.charge_path_visits(1)?;
-            }
+            budget.charge_file_event_path_visit(package_descriptor_event)?;
         }
         let mut diagnostic_uris = Vec::new();
         let override_changed = uri
@@ -3202,7 +3231,7 @@ impl Workspace {
             .is_ok_and(|path| is_immutable_override_file(&path));
         if !override_changed {
             self.bump_source_generation();
-            diagnostic_uris.extend(self.mark_source_change(uri, true));
+            diagnostic_uris.extend(self.mark_source_change_with_control(uri, cancel, budget)?);
         }
         let configuration_changed = is_configuration_path(uri);
         if configuration_changed || (override_changed && budget.is_some()) {
@@ -3273,7 +3302,7 @@ impl Workspace {
             }
         }
         match change {
-            FileChange::Deleted => self.remove_indexed(uri),
+            FileChange::Deleted => self.remove_indexed_with_control(uri, cancel, budget, true)?,
             FileChange::Created | FileChange::Changed => {
                 self.refresh_loaded_disk_with_control(uri, cancel, budget)?
             }
@@ -4502,7 +4531,7 @@ impl Workspace {
         wait_at_file_discovery_test_barrier(cancel)?;
         check_workspace_cancel(cancel)?;
         let Some(context_key) = self.document_contexts.get(uri).cloned() else {
-            self.remove_indexed(uri);
+            self.remove_indexed_with_control(uri, cancel, budget, true)?;
             return Ok(());
         };
         let pins = HashSet::new();
@@ -5025,12 +5054,18 @@ impl Workspace {
             return Ok(indexed);
         }
 
-        let Some(current_stamp) = disk_stamp(&path) else {
-            self.remove_indexed(uri);
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
+        let current_stamp = disk_stamp(&path);
+        check_workspace_cancel(cancel)?;
+        let Some(current_stamp) = current_stamp else {
+            self.remove_indexed_with_control(uri, cancel, budget, true)?;
             return Ok(false);
         };
-        if self.deletion_blocks_load(uri, &path) {
-            self.remove_indexed(uri);
+        if self.deletion_blocks_load_with_control(uri, &path, cancel, budget)? {
+            self.remove_indexed_with_control(uri, cancel, budget, true)?;
             return Ok(false);
         }
         if self.index.contains(uri) && self.disk_stamps.get(uri) == Some(&current_stamp) {
@@ -5060,10 +5095,15 @@ impl Workspace {
             budget,
         ) {
             Ok(source) => source,
-            Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+            Err(error)
+                if error == CANCELLATION_MESSAGE
+                    || budget.is_some_and(|budget| budget.is_exhausted()) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 self.warn(format!("skipping {}: {error}", path.display()));
-                self.remove_indexed(uri);
+                self.remove_indexed_with_control(uri, cancel, budget, true)?;
                 return Ok(false);
             }
         };
@@ -5136,7 +5176,7 @@ impl Workspace {
     ) -> Result<bool, String> {
         check_workspace_cancel(cancel)?;
         let size = disk_size.unwrap_or(source.len());
-        if !self.make_room_for(uri, size, pinned, 0) {
+        if !self.make_room_for_with_control(uri, size, pinned, 0, cancel, budget)? {
             if !self.open_documents.contains_key(uri) {
                 self.warn(format!(
                     "source cache limit prevented retaining {}; navigation is incomplete",
@@ -5169,7 +5209,7 @@ impl Workspace {
             // sources.  The navigation parser still performs the normal
             // conditional analysis below; only source-bearing include roots
             // need a virtual buffer and reverse map.
-            self.remove_expansion(uri);
+            self.remove_expansion_with_control(uri, cancel, budget)?;
             None
         };
         // `NavigationIndex` performs the conditional projection itself.  It
@@ -5212,10 +5252,10 @@ impl Workspace {
             }
         };
         if let Err(error) = update {
-            if error == CANCELLATION_MESSAGE {
+            if error == CANCELLATION_MESSAGE || budget.is_some_and(|budget| budget.is_exhausted()) {
                 return Err(error);
             }
-            self.remove_indexed(uri);
+            self.remove_indexed_with_control(uri, cancel, budget, true)?;
             self.warn(format!("cannot index {uri}: {error}"));
             return Ok(false);
         }
@@ -5230,13 +5270,16 @@ impl Workspace {
         self.indexed_bytes = self.indexed_bytes.saturating_add(indexed_source.len());
         if let Err(error) = self.set_document_context_with_control(uri, context_key, cancel, budget)
         {
-            self.remove_indexed(uri);
+            if budget.is_some_and(|budget| budget.is_exhausted()) || error == CANCELLATION_MESSAGE {
+                return Err(error);
+            }
+            self.remove_indexed_with_control(uri, cancel, budget, true)?;
             return Err(error);
         }
         self.index.clear_import_bindings(uri);
         self.touch(uri);
         if let Some(expansion) = expansion {
-            self.store_expansion(uri, context_key, source, expansion);
+            self.store_expansion_with_control(uri, context_key, source, expansion, cancel, budget)?;
             let context = self
                 .contexts
                 .get(context_key)
@@ -5301,21 +5344,48 @@ impl Workspace {
         physical_source: String,
         result: crate::include_expansion::ExpansionResult,
     ) {
-        if let Some(previous) = self.expansions.remove(uri) {
-            for dependency in previous.dependencies {
-                if let Some(parents) = self.include_parents.get_mut(&dependency) {
-                    parents.remove(uri);
-                    if parents.is_empty() {
-                        self.include_parents.remove(&dependency);
-                    }
-                }
-            }
-        }
+        let _ = self.store_expansion_with_control(
+            uri,
+            context_key,
+            physical_source,
+            result,
+            None,
+            None,
+        );
+    }
+
+    fn store_expansion_with_control(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        physical_source: String,
+        result: crate::include_expansion::ExpansionResult,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
         let mut source_texts = HashMap::from([(uri.clone(), physical_source.clone())]);
         let mut dependency_entries = HashMap::new();
         let mut include_observations = Vec::new();
         let mut dependencies = HashSet::new();
         for dependency in result.dependencies {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+                budget.charge_path_visits(dependency.observations.len())?;
+            }
+            dependencies.try_reserve(1).map_err(|error| {
+                format!("could not reserve include expansion dependencies: {error}")
+            })?;
+            source_texts
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve include source texts: {error}"))?;
+            dependency_entries
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve include path entries: {error}"))?;
+            include_observations
+                .try_reserve(dependency.observations.len())
+                .map_err(|error| format!("could not reserve include observations: {error}"))?;
             dependencies.insert(dependency.uri.clone());
             source_texts.insert(dependency.uri.clone(), dependency.text);
             include_observations.extend(dependency.observations);
@@ -5323,6 +5393,10 @@ impl Workspace {
                 dependency_entries.insert(dependency.uri.clone(), path_entry);
             }
         }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(include_observations.len()))?;
+        }
+        check_workspace_cancel(cancel)?;
         include_observations.sort_by(|left, right| {
             left.path
                 .to_string_lossy()
@@ -5331,7 +5405,16 @@ impl Workspace {
                 .then_with(|| left.overlay_version.cmp(&right.overlay_version))
         });
         include_observations.dedup();
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        self.remove_expansion_with_control(uri, cancel, budget)?;
         for dependency in &dependencies {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
             self.include_parents
                 .entry(dependency.clone())
                 .or_default()
@@ -5350,6 +5433,11 @@ impl Workspace {
                 complete: result.complete,
             },
         );
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        Ok(())
     }
 
     fn record_expansion_analysis_sources(
@@ -5514,11 +5602,34 @@ impl Workspace {
         );
     }
 
-    fn remove_expansion(&mut self, uri: &Url) {
+    fn remove_expansion_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
+        let Some(previous) = self.expansions.get(uri) else {
+            return Ok(());
+        };
+        let dependency_count = previous.dependencies.len();
+        for _ in &previous.dependencies {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+        }
+        if let Some(budget) = budget {
+            // Account for removal from the reverse parent sets before mutating
+            // either side of the graph.
+            budget.charge_path_visits(dependency_count.saturating_add(1))?;
+        }
+        check_workspace_cancel(cancel)?;
         let Some(previous) = self.expansions.remove(uri) else {
-            return;
+            return Ok(());
         };
         for dependency in previous.dependencies {
+            check_workspace_cancel(cancel)?;
             if let Some(parents) = self.include_parents.get_mut(&dependency) {
                 parents.remove(uri);
                 if parents.is_empty() {
@@ -5526,32 +5637,78 @@ impl Workspace {
                 }
             }
         }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        Ok(())
     }
 
-    fn invalidate_expansion_dependents(&mut self, uri: &Url) -> Vec<Url> {
+    fn invalidate_expansion_dependents_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Url>, String> {
         let uri = canonical_file_uri(uri);
-        let mut queue = vec![uri.clone()];
+        check_workspace_cancel(cancel)?;
+        let mut queue = Vec::new();
+        queue
+            .try_reserve(1)
+            .map_err(|error| format!("could not reserve include invalidation queue: {error}"))?;
+        queue.push(uri.clone());
         let mut visited = HashSet::new();
         let mut affected = Vec::new();
         while let Some(current) = queue.pop() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            visited
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve visited include roots: {error}"))?;
             if !visited.insert(current.clone()) {
                 continue;
             }
             if self.expansions.contains_key(&current) {
+                affected.try_reserve(1).map_err(|error| {
+                    format!("could not reserve affected include roots: {error}")
+                })?;
                 affected.push(current.clone());
             }
-            if let Some(parents) = self.include_parents.get(&current).cloned() {
-                queue.extend(parents);
+            if let Some(parents) = self.include_parents.get(&current) {
+                for parent in parents {
+                    check_workspace_cancel(cancel)?;
+                    if let Some(budget) = budget {
+                        budget.charge_path_visits(1)?;
+                    }
+                    queue.try_reserve(1).map_err(|error| {
+                        format!("could not reserve include invalidation queue: {error}")
+                    })?;
+                    queue.push(parent.clone());
+                }
             }
         }
-        affected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        for root in &affected {
-            self.remove_indexed(root);
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
         }
-        affected
-            .into_iter()
-            .filter(|root| self.open_documents.contains_key(root))
-            .collect()
+        let mut diagnostic_uris = Vec::new();
+        for root in &affected {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if self.open_documents.contains_key(root) {
+                diagnostic_uris
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve dependent diagnostics: {error}"))?;
+                diagnostic_uris.push(root.clone());
+            }
+            self.remove_indexed_with_control(root, cancel, budget, false)?;
+        }
+        self.prune_unused_contexts_with_control(cancel, budget)?;
+        Ok(diagnostic_uris)
     }
 
     fn source_text_for_mapping(&self, uri: &Url) -> Option<String> {
@@ -5689,6 +5846,20 @@ impl Workspace {
         pinned: &HashSet<Url>,
         additional_bytes: usize,
     ) -> bool {
+        self.make_room_for_with_control(uri, size, pinned, additional_bytes, None, None)
+            .unwrap_or(false)
+    }
+
+    fn make_room_for_with_control(
+        &mut self,
+        uri: &Url,
+        size: usize,
+        pinned: &HashSet<Url>,
+        additional_bytes: usize,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
+        check_workspace_cancel(cancel)?;
         loop {
             let old_size = self.indexed_sizes.get(uri).copied().unwrap_or(0);
             let indexed_after = self
@@ -5701,10 +5872,66 @@ impl Workspace {
             let over_bytes = indexed_after.saturating_add(additional_bytes)
                 > self.options.limits.max_total_bytes;
             if !over_files && !over_bytes {
-                return true;
+                self.prune_unused_contexts_with_control(cancel, budget)?;
+                return Ok(true);
             }
 
-            let Some(victim) = self.oldest_evictable(pinned, uri) else {
+            let mut evictable = Vec::new();
+            evictable
+                .try_reserve(self.indexed_files.len())
+                .map_err(|error| {
+                    format!("could not reserve source eviction candidates: {error}")
+                })?;
+            for candidate in &self.indexed_files {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                if candidate != uri
+                    && !pinned.contains(candidate)
+                    && !self.open_documents.contains_key(candidate)
+                {
+                    evictable.push((
+                        self.last_used.get(candidate).copied().unwrap_or(0),
+                        candidate.clone(),
+                    ));
+                }
+            }
+            let sort_work = sort_work_estimate(evictable.len());
+            if let Some(budget) = budget {
+                budget.charge_path_visits(sort_work)?;
+            }
+            check_workspace_cancel(cancel)?;
+            evictable.sort_by(|(left_used, left_uri), (right_used, right_uri)| {
+                left_used
+                    .cmp(right_used)
+                    .then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+            });
+            check_workspace_cancel(cancel)?;
+            let mut removed = false;
+            for (_, victim) in evictable {
+                check_workspace_cancel(cancel)?;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                self.remove_indexed_with_control(&victim, cancel, budget, false)?;
+                removed = true;
+                let indexed_after = self
+                    .indexed_bytes
+                    .saturating_sub(self.indexed_sizes.get(uri).copied().unwrap_or(0))
+                    .saturating_add(size);
+                let files_after =
+                    self.indexed_files.len() + usize::from(!self.indexed_files.contains(uri));
+                let over_files = files_after > self.options.limits.max_files;
+                let over_bytes = indexed_after.saturating_add(additional_bytes)
+                    > self.options.limits.max_total_bytes;
+                if !over_files && !over_bytes {
+                    self.prune_unused_contexts_with_control(cancel, budget)?;
+                    return Ok(true);
+                }
+            }
+            self.prune_unused_contexts_with_control(cancel, budget)?;
+            if !removed {
                 if over_files && !self.file_cap_warning_sent {
                     self.file_cap_warning_sent = true;
                     self.warn(format!(
@@ -5719,22 +5946,9 @@ impl Workspace {
                         self.options.limits.max_total_bytes
                     ));
                 }
-                return false;
-            };
-            self.remove_indexed(&victim);
+                return Ok(false);
+            }
         }
-    }
-
-    fn oldest_evictable(&self, pinned: &HashSet<Url>, requested: &Url) -> Option<Url> {
-        self.indexed_files
-            .iter()
-            .filter(|uri| {
-                *uri != requested
-                    && !pinned.contains(*uri)
-                    && !self.open_documents.contains_key(*uri)
-            })
-            .min_by_key(|uri| self.last_used.get(*uri).copied().unwrap_or(0))
-            .cloned()
     }
 
     fn touch(&mut self, uri: &Url) {
@@ -6065,7 +6279,11 @@ impl Workspace {
                     self.remember_document_owner(uri, &existing);
                     return Ok(existing);
                 }
-                self.invalidate_context(&existing);
+                self.invalidate_contexts_with_control(
+                    &HashSet::from([existing.clone()]),
+                    cancel,
+                    budget,
+                )?;
             }
             rediscover_open_context = true;
         }
@@ -6082,7 +6300,11 @@ impl Workspace {
                         self.remember_document_owner(uri, &existing);
                         return Ok(existing);
                     }
-                    self.invalidate_context(&existing);
+                    self.invalidate_contexts_with_control(
+                        &HashSet::from([existing.clone()]),
+                        cancel,
+                        budget,
+                    )?;
                 }
             }
         }
@@ -6136,7 +6358,7 @@ impl Workspace {
                 // Once project candidates change, freshness fails and normal
                 // automatic discovery is allowed to reconsider the owner.
                 self.contexts.insert(owner.key.clone(), owner.state.clone());
-                self.select_document_context(uri, &owner.key, owner.origin);
+                self.select_document_context(uri, &owner.key, owner.origin, cancel, budget)?;
                 return Ok(owner.key);
             }
         }
@@ -6181,7 +6403,13 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.select_document_context(uri, &key, self.owner_origin_for_context_key(&key));
+        self.select_document_context(
+            uri,
+            &key,
+            self.owner_origin_for_context_key(&key),
+            cancel,
+            budget,
+        )?;
         Ok(key)
     }
 
@@ -6200,7 +6428,7 @@ impl Workspace {
             && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
         {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
-            self.select_document_context(uri, &owner.key, owner.origin);
+            self.select_document_context(uri, &owner.key, owner.origin, cancel, budget)?;
             return Ok(owner.key.clone());
         }
 
@@ -6218,7 +6446,7 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.select_document_context(uri, &key, owner.origin);
+        self.select_document_context(uri, &key, owner.origin, cancel, budget)?;
         Ok(key)
     }
 
@@ -7233,31 +7461,113 @@ impl Workspace {
             .is_some_and(|state| state.context.override_error.is_some())
     }
 
-    fn invalidate_context(&mut self, key: &ContextKey) {
-        self.contexts.remove(key);
-        for owner in self.document_owners.values_mut() {
-            if owner.key == *key {
+    fn invalidate_contexts_with_control(
+        &mut self,
+        keys: &HashSet<ContextKey>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Url>, String> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut affected = HashSet::new();
+        affected
+            .try_reserve(
+                self.document_contexts
+                    .len()
+                    .saturating_add(self.open_document_contexts.len()),
+            )
+            .map_err(|error| format!("could not reserve context invalidation owners: {error}"))?;
+        let mut stale_owners = Vec::new();
+        let mut retained_keys = Vec::new();
+        for key in keys {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if self.contexts.contains_key(key) {
+                retained_keys.push(key.clone());
+            }
+        }
+        for (uri, owner) in &self.document_owners {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(&owner.key) {
+                stale_owners
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve invalidated owners: {error}"))?;
+                stale_owners.push(uri.clone());
+            }
+        }
+        for (owner_uri, context_key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(context_key)
+                && (self.index.contains(owner_uri)
+                    || self
+                        .open_documents
+                        .get(owner_uri)
+                        .is_some_and(|document| document.text.is_some()))
+            {
+                affected.insert(owner_uri.clone());
+            }
+        }
+        for (owner_uri, context_key) in &self.open_document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(context_key)
+                && self
+                    .open_documents
+                    .get(owner_uri)
+                    .is_some_and(|document| document.text.is_some())
+            {
+                affected.insert(owner_uri.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(
+                retained_keys
+                    .len()
+                    .saturating_add(stale_owners.len())
+                    .saturating_add(affected.len()),
+            )?;
+        }
+        check_workspace_cancel(cancel)?;
+
+        for key in retained_keys {
+            self.contexts.remove(&key);
+        }
+        for owner_uri in stale_owners {
+            if let Some(owner) = self.document_owners.get_mut(&owner_uri) {
                 owner.legacy_route = None;
                 owner.needs_revalidation = true;
             }
         }
-        let mut affected: HashSet<Url> = self
-            .document_contexts
-            .iter()
-            .filter_map(|(uri, document_key)| (document_key == key).then_some(uri.clone()))
-            .collect();
-        affected.extend(
-            self.open_document_contexts
-                .iter()
-                .filter_map(|(uri, document_key)| (document_key == key).then_some(uri.clone())),
-        );
-        for uri in affected {
-            // Project defines participate in the parser projection, so a
-            // context change invalidates the indexed source itself, not only
-            // its import bindings. Open buffers remain authoritative and are
-            // re-indexed from `open_documents` on the next request.
-            self.remove_indexed(&uri);
+        for uri in &affected {
+            self.remove_indexed_with_control(uri, cancel, budget, false)?;
         }
+        self.prune_unused_contexts_with_control(cancel, budget)?;
+        let mut diagnostic_uris = affected
+            .into_iter()
+            .filter(|uri| {
+                self.open_documents
+                    .get(uri)
+                    .is_some_and(|document| document.text.is_some())
+            })
+            .collect::<Vec<_>>();
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(diagnostic_uris.len()))?;
+        }
+        check_workspace_cancel(cancel)?;
+        diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        check_workspace_cancel(cancel)?;
+        Ok(diagnostic_uris)
     }
 
     fn invalidate_metadata_for_uri(
@@ -7270,7 +7580,10 @@ impl Workspace {
             return Ok(Vec::new());
         };
         let path = absolute_path(path);
-        let mut affected = Vec::new();
+        let mut affected = HashSet::new();
+        affected
+            .try_reserve(self.contexts.len())
+            .map_err(|error| format!("could not reserve invalidated contexts: {error}"))?;
         for (key, state) in &self.contexts {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
@@ -7288,48 +7601,13 @@ impl Workspace {
                 }
             }
             if watches_changed_path {
-                affected.push(key.clone());
+                affected.insert(key.clone());
             }
         }
         if affected.is_empty() {
             return Ok(Vec::new());
         }
-        let affected_set: HashSet<_> = affected.iter().cloned().collect();
-        let mut owners = HashSet::new();
-        for (owner_uri, context_key) in &self.document_contexts {
-            check_workspace_cancel(cancel)?;
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            if affected_set.contains(context_key)
-                && (self.index.contains(owner_uri)
-                    || self
-                        .open_documents
-                        .get(owner_uri)
-                        .is_some_and(|document| document.text.is_some()))
-            {
-                owners.insert(owner_uri.clone());
-            }
-        }
-        for (owner_uri, context_key) in &self.open_document_contexts {
-            check_workspace_cancel(cancel)?;
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            if affected_set.contains(context_key)
-                && self
-                    .open_documents
-                    .get(owner_uri)
-                    .is_some_and(|document| document.text.is_some())
-            {
-                owners.insert(owner_uri.clone());
-            }
-        }
-        for key in affected {
-            self.invalidate_context(&key);
-        }
-        let mut owners = owners.into_iter().collect::<Vec<_>>();
-        owners.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let owners = self.invalidate_contexts_with_control(&affected, cancel, budget)?;
         Ok(owners)
     }
 
@@ -8885,8 +9163,22 @@ impl Workspace {
     }
 
     fn remove_indexed(&mut self, uri: &Url) {
+        let _ = self.remove_indexed_with_control(uri, None, None, true);
+    }
+
+    fn remove_indexed_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        prune: bool,
+    ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
+        self.remove_expansion_with_control(uri, cancel, budget)?;
         self.index.remove(uri);
-        self.remove_expansion(uri);
         self.indexed_files.remove(uri);
         self.last_used.remove(uri);
         self.document_contexts.remove(uri);
@@ -8895,7 +9187,14 @@ impl Workspace {
         if let Some(size) = self.indexed_sizes.remove(uri) {
             self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
         }
-        self.prune_unused_contexts();
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        if prune {
+            self.prune_unused_contexts_with_control(cancel, budget)?;
+        }
+        Ok(())
     }
 
     fn prune_unused_contexts(&mut self) {
@@ -9035,15 +9334,47 @@ impl Workspace {
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
         check_workspace_cancel(cancel)?;
-        if let Some(budget) = budget {
-            let work = self
-                .document_contexts
+        let mut used = HashSet::new();
+        used.try_reserve(
+            self.document_contexts
                 .len()
-                .saturating_add(self.open_document_contexts.len())
-                .saturating_add(self.contexts.len());
-            budget.charge_path_visits(work)?;
+                .saturating_add(self.open_document_contexts.len()),
+        )
+        .map_err(|error| format!("could not reserve live context keys: {error}"))?;
+        for key in self.document_contexts.values() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            used.insert(key.clone());
         }
-        self.prune_unused_contexts();
+        for key in self.open_document_contexts.values() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            used.insert(key.clone());
+        }
+        let mut unused = Vec::new();
+        unused
+            .try_reserve(self.contexts.len())
+            .map_err(|error| format!("could not reserve unused context keys: {error}"))?;
+        for key in self.contexts.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !used.contains(key) {
+                unused.push(key.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(unused.len())?;
+        }
+        for key in unused {
+            check_workspace_cancel(cancel)?;
+            self.contexts.remove(&key);
+        }
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
             budget.check_cancelled()?;
@@ -9056,7 +9387,13 @@ impl Workspace {
         uri: &Url,
         context_key: &ContextKey,
         origin: OwnerOrigin,
-    ) {
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         if self.open_documents.contains_key(uri) {
             self.open_document_contexts
                 .insert(uri.clone(), context_key.clone());
@@ -9064,7 +9401,7 @@ impl Workspace {
         self.document_contexts
             .insert(uri.clone(), context_key.clone());
         self.remember_document_owner_with_origin(uri, context_key, origin);
-        self.prune_unused_contexts();
+        self.prune_unused_contexts_with_control(cancel, budget)
     }
 
     fn remember_deleted(&mut self, uri: &Url) {
@@ -9125,15 +9462,33 @@ impl Workspace {
         Ok(unique)
     }
 
-    fn deletion_blocks_load(&mut self, uri: &Url, path: &Path) -> bool {
+    fn deletion_blocks_load_with_control(
+        &mut self,
+        uri: &Url,
+        path: &Path,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
+        check_workspace_cancel(cancel)?;
         let Some(deleted_stamp) = self.deleted_overrides.get(uri).cloned() else {
-            return false;
+            return Ok(false);
         };
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
         if disk_stamp(path) == deleted_stamp {
-            return true;
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+            }
+            return Ok(true);
+        }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
         }
         self.deleted_overrides.remove(uri);
-        false
+        Ok(false)
     }
 
     /// Number of parsed documents currently retained. This intentionally does
@@ -9392,7 +9747,18 @@ impl Workspace {
     }
 
     fn mark_source_change(&mut self, uri: &Url, _include_parent: bool) -> Vec<Url> {
-        let dependent_diagnostics = self.invalidate_expansion_dependents(uri);
+        self.mark_source_change_with_control(uri, None, None)
+            .unwrap_or_default()
+    }
+
+    fn mark_source_change_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<Url>, String> {
+        let dependent_diagnostics =
+            self.invalidate_expansion_dependents_with_control(uri, cancel, budget)?;
         // Worker freshness uses exact source observations and the bounded
         // provider scopes recorded by the resolver.  Parent-directory entries
         // here would make an unrelated child stale every directory scan, while
@@ -9407,34 +9773,46 @@ impl Workspace {
             let path = absolute_path(path);
             if let Some(change) = self.source_change_observations.get_mut(&path) {
                 change.generation = self.source_generation;
-                for dependent in &dependent_diagnostics {
-                    self.schedule_diagnostics(dependent.clone());
+            } else {
+                if self.source_change_observations.len() >= MAX_SOURCE_CHANGE_OBSERVATIONS {
+                    // Dropping observations without a marker could let an older
+                    // worker accept a result after the evicted change. Treat an
+                    // overflow as a workspace-wide source change once; requests
+                    // captured after this generation can use the fresh bounded
+                    // observation set.
+                    if let Some(budget) = budget {
+                        budget.charge_path_visits(self.source_change_observations.len())?;
+                    }
+                    check_workspace_cancel(cancel)?;
+                    self.global_source_change_generation = self
+                        .global_source_change_generation
+                        .max(self.source_generation);
+                    self.source_change_observations.clear();
                 }
-                return dependent_diagnostics;
+                if let Some(budget) = budget {
+                    budget.charge_path_visits(1)?;
+                }
+                self.source_change_observations.insert(
+                    path.clone(),
+                    SourceChangeObservation {
+                        path,
+                        generation: self.source_generation,
+                    },
+                );
             }
-            if self.source_change_observations.len() >= MAX_SOURCE_CHANGE_OBSERVATIONS {
-                // Dropping observations without a marker could let an older
-                // worker accept a result after the evicted change. Treat an
-                // overflow as a workspace-wide source change once; requests
-                // captured after this generation can use the fresh bounded
-                // observation set.
-                self.global_source_change_generation = self
-                    .global_source_change_generation
-                    .max(self.source_generation);
-                self.source_change_observations.clear();
-            }
-            self.source_change_observations.insert(
-                path.clone(),
-                SourceChangeObservation {
-                    path,
-                    generation: self.source_generation,
-                },
-            );
         }
         for dependent in &dependent_diagnostics {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
             self.schedule_diagnostics(dependent.clone());
         }
-        dependent_diagnostics
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        Ok(dependent_diagnostics)
     }
 
     fn mark_configuration_change(&mut self, uri: &Url, include_parent: bool) {
@@ -11557,6 +11935,223 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
+
+    fn budget_test_context_key(index: usize) -> ContextKey {
+        ContextKey {
+            project_file: None,
+            workspace_root: Some(PathBuf::from(format!("/workspace-{index}"))),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        }
+    }
+
+    #[test]
+    fn file_event_budget_refusal_inside_wide_include_parent_walk_keeps_graph_intact() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let changed_path = temp.path().join("Shared.inc");
+        let changed_uri = Url::from_file_path(&changed_path).expect("include file URI");
+        let mut roots = Vec::new();
+        for index in 0..128 {
+            let root_path = temp.path().join(format!("Root{index:03}.pas"));
+            let root_uri = Url::from_file_path(root_path).expect("root file URI");
+            roots.push(root_uri.clone());
+            workspace
+                .include_parents
+                .entry(changed_uri.clone())
+                .or_default()
+                .insert(root_uri.clone());
+            workspace.indexed_files.insert(root_uri.clone());
+            workspace.indexed_sizes.insert(root_uri.clone(), 8);
+            workspace.indexed_bytes += 8;
+            workspace.expansions.insert(
+                root_uri,
+                super::ExpansionRecord {
+                    physical_source: String::new(),
+                    context_key: budget_test_context_key(index),
+                    expanded: crate::include_expansion::ExpandedSource::default(),
+                    source_texts: HashMap::new(),
+                    dependency_entries: HashMap::new(),
+                    include_observations: Vec::new(),
+                    dependencies: HashSet::from([changed_uri.clone()]),
+                    complete: true,
+                },
+            );
+        }
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS - 12)
+            .expect("leave room for notification admission and a partial graph walk");
+
+        let error = workspace
+            .file_event_with_control(&changed_uri, FileChange::Changed, None, Some(&budget))
+            .expect_err("the high-fan-out parent walk must refuse inside the graph traversal");
+
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
+            "the account must be charged through the traversal, not just checked on entry"
+        );
+        assert_eq!(workspace.expansions.len(), roots.len());
+        assert_eq!(workspace.indexed_files.len(), roots.len());
+        assert!(
+            roots
+                .iter()
+                .all(|uri| workspace.expansions.contains_key(uri))
+        );
+    }
+
+    #[test]
+    fn metadata_owner_invalidation_charges_linear_scan_and_removal_work() {
+        const OWNERS: usize = 64;
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let metadata_path = root.join("App.dproj");
+        let metadata_uri = Url::from_file_path(&metadata_path).expect("metadata file URI");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let mut owner_uris = Vec::new();
+        for index in 0..OWNERS {
+            let key = budget_test_context_key(index);
+            workspace.contexts.insert(
+                key.clone(),
+                ContextState {
+                    watched_paths: HashMap::from([(metadata_path.clone(), None)]),
+                    ..ContextState::default()
+                },
+            );
+            let owner_uri =
+                Url::from_file_path(root.join(format!("Owner{index:03}.pas"))).expect("owner URI");
+            owner_uris.push(owner_uri.clone());
+            workspace
+                .index
+                .update(
+                    owner_uri.clone(),
+                    format!("unit Owner{index:03}; interface implementation end."),
+                )
+                .expect("seed owner index");
+            workspace.document_contexts.insert(owner_uri.clone(), key);
+            workspace.indexed_files.insert(owner_uri);
+        }
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+
+        let invalidated = workspace
+            .invalidate_metadata_for_uri(&metadata_uri, None, Some(&budget))
+            .expect("linear metadata-owner invalidation");
+
+        assert!(
+            invalidated.is_empty(),
+            "closed owners do not schedule open diagnostics"
+        );
+        assert_eq!(workspace.contexts.len(), 0);
+        assert!(
+            owner_uris
+                .iter()
+                .all(|owner| !workspace.indexed_files.contains(owner))
+        );
+        assert!(
+            budget.used.get().filesystem_path_visits >= OWNERS * 5,
+            "the shared account must charge context, owner-map, removal, and prune work: {:?}",
+            budget.used.get()
+        );
+        assert!(
+            budget.used.get().filesystem_path_visits <= OWNERS * 8,
+            "owners must be gathered and removed in bounded linear passes, not rescanned once per context: {:?}",
+            budget.used.get()
+        );
+    }
+
+    #[test]
+    fn source_cache_eviction_budget_refusal_during_candidate_scan_keeps_entries() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace = test_workspace(
+            vec![temp.path().to_path_buf()],
+            WorkspaceOptions {
+                limits: ResourceLimits {
+                    max_files: 1,
+                    ..ResourceLimits::default()
+                },
+                ..WorkspaceOptions::default()
+            },
+        );
+        let mut retained = Vec::new();
+        for index in 0..4 {
+            let uri = Url::from_file_path(temp.path().join(format!("Retained{index}.pas")))
+                .expect("retained source URI");
+            workspace
+                .index
+                .update(
+                    uri.clone(),
+                    format!("unit Retained{index}; interface implementation end."),
+                )
+                .expect("seed retained index");
+            workspace.indexed_files.insert(uri.clone());
+            workspace.indexed_sizes.insert(uri.clone(), 16);
+            workspace.indexed_bytes += 16;
+            workspace.last_used.insert(uri.clone(), index as u64);
+            retained.push(uri);
+        }
+        let requested =
+            Url::from_file_path(temp.path().join("Requested.pas")).expect("requested source URI");
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS - 4)
+            .expect("leave budget for only part of candidate scan");
+
+        let error = workspace
+            .make_room_for_with_control(&requested, 16, &HashSet::new(), 0, None, Some(&budget))
+            .expect_err("eviction must stop at candidate accounting exhaustion");
+
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        assert_eq!(
+            budget.used.get().filesystem_path_visits,
+            super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS
+        );
+        assert_eq!(workspace.indexed_files.len(), retained.len());
+        assert!(
+            retained
+                .iter()
+                .all(|uri| workspace.indexed_files.contains(uri))
+        );
+    }
+
+    #[test]
+    fn metadata_invalidation_cancellation_inside_watch_scan_keeps_context_current() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().to_path_buf();
+        let metadata_path = root.join("App.dproj");
+        let metadata_uri = Url::from_file_path(&metadata_path).expect("metadata URI");
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let key = budget_test_context_key(0);
+        let watched_paths = (0..128)
+            .map(|index| (root.join(format!("Metadata{index}.dproj")), None))
+            .collect::<HashMap<_, _>>();
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                watched_paths,
+                ..ContextState::default()
+            },
+        );
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = ReconciliationBudget::new(std::sync::Arc::clone(&cancellation));
+        budget.cancel_after_path_visits(8);
+
+        let error = workspace
+            .invalidate_metadata_for_uri(&metadata_uri, Some(&cancellation), Some(&budget))
+            .expect_err("cancellation must be observed inside watched-path comparisons");
+
+        assert_eq!(error, super::CANCELLATION_MESSAGE);
+        assert_eq!(budget.used.get().filesystem_path_visits, 8);
+        assert!(workspace.contexts.contains_key(&key));
+        assert_eq!(workspace.contexts[&key].watched_paths.len(), 128);
+    }
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))

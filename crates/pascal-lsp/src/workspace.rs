@@ -995,6 +995,7 @@ pub enum FileChange {
 const MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS: usize = 65_536;
 const MAX_NOTIFICATION_RECONCILIATION_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NOTIFICATION_RECONCILIATION_INDEX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NOTIFICATION_RECONCILIATION_DEPENDENCY_EDGES: usize = 65_536;
 const MAX_NOTIFICATION_DIAGNOSTIC_RECORD_CHECKS: usize = 2_048;
 const MAX_NOTIFICATION_DIAGNOSTIC_TARGETS: usize = 4_096;
@@ -1008,6 +1009,7 @@ const NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED: &str =
 #[derive(Clone, Copy, Debug, Default)]
 struct ReconciliationWorkUsed {
     filesystem_path_visits: usize,
+    project_path_key_bytes: usize,
     package_path_visits: usize,
     include_path_visits: usize,
     file_bytes_read: usize,
@@ -1073,6 +1075,15 @@ impl ReconciliationBudget {
             amount,
             MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
             |used, next| used.filesystem_path_visits = next,
+        )
+    }
+
+    fn charge_project_path_key_bytes(&self, amount: usize) -> Result<(), String> {
+        self.charge(
+            self.used.get().project_path_key_bytes,
+            amount,
+            MAX_NOTIFICATION_PROJECT_PATH_KEY_BYTES,
+            |used, next| used.project_path_key_bytes = next,
         )
     }
 
@@ -1219,6 +1230,7 @@ impl ReconciliationBudget {
         let used = self.used.get();
         serde_json::json!({
             "filesystem_path_visits": used.filesystem_path_visits,
+            "project_path_key_bytes": used.project_path_key_bytes,
             "package_path_visits": used.package_path_visits,
             "include_path_visits": used.include_path_visits,
             "file_bytes_read": used.file_bytes_read,
@@ -1247,6 +1259,10 @@ impl ProjectWorkBudget for ReconciliationBudget {
 
     fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
         ReconciliationBudget::charge_path_visits(self, amount)
+    }
+
+    fn charge_path_bytes(&self, amount: usize) -> Result<(), String> {
+        self.charge_project_path_key_bytes(amount)
     }
 
     fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String> {

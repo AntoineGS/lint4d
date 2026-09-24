@@ -752,6 +752,12 @@ pub struct ProjectDiscovery {
 pub trait ProjectWorkBudget {
     fn check_cancelled(&self) -> Result<(), String>;
     fn charge_path_visits(&self, amount: usize) -> Result<(), String>;
+    /// Account for bytes materialized while building path identities or sort keys.
+    /// Implementations that only expose path-visit accounting can conservatively
+    /// treat each byte as one unit of path work.
+    fn charge_path_bytes(&self, amount: usize) -> Result<(), String> {
+        self.charge_path_visits(amount)
+    }
     fn ensure_file_read_fits(&self, max_bytes: usize) -> Result<(), String>;
     fn charge_file_bytes(&self, amount: usize) -> Result<(), String>;
 
@@ -1648,14 +1654,13 @@ fn find_project_candidates(
     loop {
         check_project_scan_cancel(cancel)?;
         let entries = project_directory_entries(&directory, cancel, work_budget)?;
-        let mut project_files = entries.dproj;
-        project_files.retain(|path| !is_deleted_path(path, deleted_paths));
+        let mut project_files =
+            filter_deleted_candidates(entries.dproj, deleted_paths, cancel, work_budget)?;
         if !project_files.is_empty() {
-            let mut files = project_files;
-            files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            sort_project_candidates(&mut project_files, cancel, work_budget)?;
             return Ok(ProjectCandidates {
                 directory: Some(directory),
-                files,
+                files: project_files,
             });
         }
         if workspace_root.is_some_and(|root| project_paths_equal(&directory, root)) {
@@ -1692,13 +1697,27 @@ fn record_candidate_memberships(
                 } else {
                     let mut paths = entries.dproj;
                     paths.extend(entries.dpr_or_dpk);
-                    paths.retain(|path| !is_deleted_path(path, deleted_paths));
-                    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
-                    Ok(ProjectCandidateMembership { paths, readable: true })
+                    let mut paths = filter_deleted_candidates(
+                        paths,
+                        deleted_paths,
+                        cancel,
+                        tracker.work_budget,
+                    )?;
+                    sort_project_candidates(&mut paths, cancel, tracker.work_budget)?;
+                    Ok(ProjectCandidateMembership {
+                        paths,
+                        readable: true,
+                    })
                 }
             });
-        if matches!(&membership, Err(error) if error == "request cancelled") {
-            return Err("request cancelled".to_string());
+        if let Err(error) = &membership {
+            if error == "request cancelled"
+                || tracker
+                    .work_budget
+                    .is_some_and(|budget| budget.is_transient_error(error))
+            {
+                return Err(error.clone());
+            }
         }
         tracker.record_candidate_membership(directory.clone(), membership);
         if boundary.is_some_and(|root| paths_equal_ci(&directory, root)) {
@@ -1741,7 +1760,7 @@ pub fn project_candidate_membership_with_deleted_paths_and_budget(
     deleted_paths: &[PathBuf],
     work_budget: Option<&dyn ProjectWorkBudget>,
 ) -> Result<ProjectCandidateMembership, String> {
-    let entries = project_directory_entries(directory, cancel, work_budget)?;
+    let mut entries = project_directory_entries(directory, cancel, work_budget)?;
     if entries.candidate_overflow {
         return Err(format!(
             "project candidate membership limit ({MAX_OWNERSHIP_CANDIDATES}) reached in {}",
@@ -1749,41 +1768,191 @@ pub fn project_candidate_membership_with_deleted_paths_and_budget(
         ));
     }
     let mut dproj = entries.dproj;
-    let mut dpr_or_dpk = entries.dpr_or_dpk;
-    dproj.append(&mut dpr_or_dpk);
-    let mut retained = Vec::with_capacity(dproj.len());
-    for path in dproj {
-        check_project_scan_cancel(cancel)?;
-        if let Some(work_budget) = work_budget {
-            work_budget.check_cancelled()?;
-        }
-        if !is_deleted_path_with_budget(&path, deleted_paths, work_budget)? {
-            retained.push(path);
-        }
-    }
-    let mut dproj = retained;
-    dproj.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    dproj.append(&mut entries.dpr_or_dpk);
+    let mut dproj = filter_deleted_candidates(dproj, deleted_paths, cancel, work_budget)?;
+    sort_project_candidates(&mut dproj, cancel, work_budget)?;
     Ok(ProjectCandidateMembership {
         paths: dproj,
         readable: true,
     })
 }
 
-fn is_deleted_path_with_budget(
+#[cfg(windows)]
+type ProjectPathIdentity = Vec<String>;
+#[cfg(not(windows))]
+type ProjectPathIdentity = Vec<std::ffi::OsString>;
+
+fn project_path_identity(
     path: &Path,
-    deleted_paths: &[PathBuf],
+    cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
-) -> Result<bool, String> {
-    for deleted in deleted_paths {
-        if let Some(work_budget) = work_budget {
-            work_budget.check_cancelled()?;
-            work_budget.charge_path_visits(1)?;
+) -> Result<ProjectPathIdentity, String> {
+    let mut identity = Vec::new();
+    for component in path.components() {
+        check_project_scan_cancel(cancel)?;
+        if let Some(budget) = work_budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+            budget.charge_path_bytes(project_path_materialization_bytes(component.as_os_str())?)?;
         }
-        if project_paths_equal(path, deleted) {
-            return Ok(true);
+        #[cfg(windows)]
+        {
+            let mut key = component.as_os_str().to_string_lossy().into_owned();
+            key.make_ascii_lowercase();
+            identity.push(key);
+        }
+        #[cfg(not(windows))]
+        identity.push(component.as_os_str().to_os_string());
+    }
+    Ok(identity)
+}
+
+fn project_path_materialization_bytes(path: &std::ffi::OsStr) -> Result<usize, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(path.as_bytes().len())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.encode_wide()
+            .count()
+            .checked_mul(3)
+            .ok_or_else(|| "project path key size overflow".to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(path.to_string_lossy().len())
+    }
+}
+
+fn filter_deleted_candidates(
+    paths: Vec<PathBuf>,
+    deleted_paths: &[PathBuf],
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut deleted = HashSet::new();
+    for path in deleted_paths {
+        check_project_scan_cancel(cancel)?;
+        if let Some(budget) = work_budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
+        deleted.insert(project_path_identity(path, cancel, work_budget)?);
+    }
+
+    let mut retained = Vec::new();
+    for path in paths {
+        check_project_scan_cancel(cancel)?;
+        if let Some(budget) = work_budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
+        if !deleted.contains(&project_path_identity(&path, cancel, work_budget)?) {
+            retained.push(path);
         }
     }
-    Ok(false)
+    Ok(retained)
+}
+
+fn sort_project_candidates(
+    paths: &mut Vec<PathBuf>,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<(), String> {
+    check_project_scan_cancel(cancel)?;
+    if let Some(budget) = work_budget {
+        budget.check_cancelled()?;
+        let slots = paths
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| "project candidate sort storage overflow".to_string())?;
+        budget.charge_path_visits(slots)?;
+    }
+    let mut keyed_paths = Vec::with_capacity(paths.len());
+    for path in paths.iter() {
+        check_project_scan_cancel(cancel)?;
+        if let Some(budget) = work_budget {
+            budget.check_cancelled()?;
+            budget.charge_path_bytes(project_path_materialization_bytes(path.as_os_str())?)?;
+        }
+        let key = path.to_string_lossy();
+        keyed_paths.push(key.into_owned());
+    }
+
+    let mut source = std::mem::take(paths)
+        .into_iter()
+        .zip(keyed_paths)
+        .map(Some)
+        .collect::<Vec<_>>();
+    let mut destination = (0..source.len()).map(|_| None).collect::<Vec<_>>();
+    let mut width = 1usize;
+    while width < source.len() {
+        let run_width = width.saturating_mul(2);
+        for start in (0..source.len()).step_by(run_width) {
+            let middle = start.saturating_add(width).min(source.len());
+            let end = start.saturating_add(run_width).min(source.len());
+            let (mut left, mut right, mut output) = (start, middle, start);
+            while left < middle && right < end {
+                check_project_scan_cancel(cancel)?;
+                if let Some(budget) = work_budget {
+                    budget.check_cancelled()?;
+                    budget.charge_path_visits(1)?;
+                }
+                let left_key = &source[left].as_ref().expect("unconsumed left merge item").1;
+                let right_key = &source[right]
+                    .as_ref()
+                    .expect("unconsumed right merge item")
+                    .1;
+                if left_key <= right_key {
+                    destination[output] = source[left].take();
+                    left += 1;
+                } else {
+                    destination[output] = source[right].take();
+                    right += 1;
+                }
+                output += 1;
+            }
+            while left < middle {
+                check_project_scan_cancel(cancel)?;
+                if let Some(budget) = work_budget {
+                    budget.check_cancelled()?;
+                    budget.charge_path_visits(1)?;
+                }
+                destination[output] = source[left].take();
+                left += 1;
+                output += 1;
+            }
+            while right < end {
+                check_project_scan_cancel(cancel)?;
+                if let Some(budget) = work_budget {
+                    budget.check_cancelled()?;
+                    budget.charge_path_visits(1)?;
+                }
+                destination[output] = source[right].take();
+                right += 1;
+                output += 1;
+            }
+        }
+        std::mem::swap(&mut source, &mut destination);
+        width = width.saturating_mul(2);
+    }
+    for item in source {
+        check_project_scan_cancel(cancel)?;
+        if let Some(budget) = work_budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
+        let (path, _) = item.expect("sorted candidate item remains present");
+        paths.push(path);
+    }
+    check_project_scan_cancel(cancel)?;
+    if let Some(budget) = work_budget {
+        budget.check_cancelled()?;
+    }
+    Ok(())
 }
 
 fn project_path_starts_with(path: &Path, root: &Path) -> bool {
@@ -6635,11 +6804,77 @@ mod tests {
         test_before_project_read_at, test_cancel_project_scan_after_checks,
     };
     use crate::delphi_overrides::OverrideSession;
+    use std::cell::Cell;
     use std::fs;
     use std::io::Write;
     #[cfg(unix)]
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
+
+    struct TestProjectWorkBudget {
+        remaining_visits: Cell<usize>,
+        path_visits: Cell<usize>,
+        cancel_after_visits: Option<usize>,
+        cancelled: AtomicBool,
+    }
+
+    impl TestProjectWorkBudget {
+        fn limited_path_visits(limit: usize) -> Self {
+            Self {
+                remaining_visits: Cell::new(limit),
+                path_visits: Cell::new(0),
+                cancel_after_visits: None,
+                cancelled: AtomicBool::new(false),
+            }
+        }
+
+        fn cancel_after_path_visits(limit: usize) -> Self {
+            Self {
+                remaining_visits: Cell::new(usize::MAX),
+                path_visits: Cell::new(0),
+                cancel_after_visits: Some(limit),
+                cancelled: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::ProjectWorkBudget for TestProjectWorkBudget {
+        fn check_cancelled(&self) -> Result<(), String> {
+            if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                Err("request cancelled".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+            self.check_cancelled()?;
+            if amount > self.remaining_visits.get() {
+                return Err("test work budget exceeded".to_string());
+            }
+            self.remaining_visits
+                .set(self.remaining_visits.get().saturating_sub(amount));
+            let next = self.path_visits.get().saturating_add(amount);
+            self.path_visits.set(next);
+            if self.cancel_after_visits.is_some_and(|limit| next >= limit) {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn ensure_file_read_fits(&self, _max_bytes: usize) -> Result<(), String> {
+            self.check_cancelled()
+        }
+
+        fn charge_file_bytes(&self, _amount: usize) -> Result<(), String> {
+            self.check_cancelled()
+        }
+
+        fn is_transient_error(&self, error: &str) -> bool {
+            error == "test work budget exceeded"
+        }
+    }
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -6698,6 +6933,128 @@ mod tests {
         let error = project_candidate_membership(temp.path(), Some(&cancel))
             .expect_err("cancellation during enumeration must abort the observation");
         assert_eq!(error, "request cancelled");
+    }
+
+    #[test]
+    fn project_candidates_refuse_unbudgeted_tombstone_postprocessing() {
+        const PROJECTS: usize = 512;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path();
+        let source = root.join("Consumer.pas");
+        fs::write(&source, "unit Consumer; interface implementation end.").expect("source file");
+        for index in 0..PROJECTS {
+            fs::write(root.join(format!("Project{index:03}.dproj")), b"<Project/>")
+                .expect("project candidate");
+        }
+        let deleted_paths = (0..PROJECTS)
+            .map(|index| root.join(format!("Deleted{index:03}.dproj")))
+            .collect::<Vec<_>>();
+        // Enumeration charges one directory probe and one visit for each entry
+        // plus the terminal iterator advance. No budget remains for filtering,
+        // key materialization, or sort admission.
+        let enumeration_visits = 1 + PROJECTS + 1 + 1; // probe, entries, terminal advance
+        let budget = TestProjectWorkBudget::limited_path_visits(enumeration_visits);
+
+        let error = super::find_project_candidates(
+            &source,
+            Some(root),
+            None,
+            Some(&budget),
+            &deleted_paths,
+        )
+        .expect_err("candidate list post-processing must share the enumeration account");
+        assert_eq!(error, "test work budget exceeded");
+        assert_eq!(budget.path_visits.get(), enumeration_visits);
+    }
+
+    #[test]
+    fn project_candidate_sort_charges_storage_keys_and_each_comparison() {
+        const CANDIDATES: usize = 512;
+        let mut paths = (0..CANDIDATES)
+            .map(|index| std::path::PathBuf::from(format!("/workspace/Project{index:03}.dproj")))
+            .collect::<Vec<_>>();
+        let key_bytes = paths
+            .iter()
+            .map(|path| path.to_string_lossy().len())
+            .sum::<usize>();
+        let admitted_pre_sort_work = CANDIDATES * 4 + key_bytes;
+        let budget = TestProjectWorkBudget::limited_path_visits(admitted_pre_sort_work);
+
+        let error = super::sort_project_candidates(&mut paths, None, Some(&budget))
+            .expect_err("sorting must charge comparison work after storage and keys");
+        assert_eq!(error, "test work budget exceeded");
+        assert_eq!(budget.path_visits.get(), admitted_pre_sort_work);
+    }
+
+    #[test]
+    fn candidate_membership_cancellation_after_enumeration_is_not_published() {
+        const PROJECTS: usize = MAX_OWNERSHIP_CANDIDATES;
+        const TOMBSTONES: usize = 512;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path();
+        let source = root.join("Consumer.pas");
+        fs::write(&source, "unit Consumer; interface implementation end.").expect("source file");
+        for index in 0..PROJECTS {
+            fs::write(root.join(format!("Project{index:03}.dproj")), b"<Project/>")
+                .expect("project candidate");
+        }
+        let deleted_paths = (0..TOMBSTONES)
+            .map(|index| root.join(format!("Deleted{index:03}.dproj")))
+            .collect::<Vec<_>>();
+        let enumeration_visits = 1 + PROJECTS + 1 + 1; // probe, entries, terminal advance
+        let budget = TestProjectWorkBudget::cancel_after_path_visits(enumeration_visits + 20);
+        let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+
+        let error = super::record_candidate_memberships(
+            &source,
+            Some(root),
+            &mut tracker,
+            None,
+            &deleted_paths,
+        )
+        .expect_err("cancelled candidate membership must not be returned as successful");
+        assert_eq!(error, "request cancelled");
+        assert!(
+            tracker.candidate_memberships.is_empty(),
+            "no partial/stale candidate membership may be published"
+        );
+        assert!(budget.path_visits.get() > enumeration_visits);
+    }
+
+    #[test]
+    fn candidate_membership_budget_exhaustion_after_enumeration_is_not_published() {
+        const PROJECTS: usize = MAX_OWNERSHIP_CANDIDATES;
+        const TOMBSTONES: usize = 512;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path();
+        let source = root.join("Consumer.pas");
+        fs::write(&source, "unit Consumer; interface implementation end.").expect("source file");
+        for index in 0..PROJECTS {
+            fs::write(root.join(format!("Project{index:03}.dproj")), b"<Project/>")
+                .expect("project candidate");
+        }
+        let deleted_paths = (0..TOMBSTONES)
+            .map(|index| root.join(format!("Deleted{index:03}.dproj")))
+            .collect::<Vec<_>>();
+        let enumeration_visits = 1 + PROJECTS + 1 + 1; // probe, entries, terminal advance
+        let budget = TestProjectWorkBudget::limited_path_visits(enumeration_visits + 20);
+        let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+
+        let error = super::record_candidate_memberships(
+            &source,
+            Some(root),
+            &mut tracker,
+            None,
+            &deleted_paths,
+        )
+        .expect_err("transient post-enumeration exhaustion must fail the membership refresh");
+        assert_eq!(error, "test work budget exceeded");
+        assert!(
+            tracker.candidate_memberships.is_empty(),
+            "no partial/stale candidate membership may be published"
+        );
+        assert!(budget.path_visits.get() > enumeration_visits);
+        assert!(budget.path_visits.get() <= enumeration_visits + 20);
     }
 
     #[test]

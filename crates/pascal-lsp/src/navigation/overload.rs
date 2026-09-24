@@ -181,6 +181,112 @@ pub(super) enum ParameterModeResolution {
     Intrinsic(Option<ParameterMode>),
 }
 
+/// Return positional parameter spellings only when overload selection proves
+/// one callable target. This deliberately shares the same compatibility and
+/// uncertainty checks as argument-mode resolution.
+pub(super) fn parameter_names_for_call(
+    index: &NavigationIndex,
+    current_uri: &Url,
+    current_document: &Document,
+    call: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(entity) = call.child_by_field_name("entity") else {
+        return Ok(None);
+    };
+    let lookup_identifier = super::callable_lookup_identifier(entity);
+    let mut state = ResolutionState::new();
+    let candidates = index.resolve_candidates_at_with_state_and_budget(
+        current_uri,
+        current_document,
+        lookup_identifier.start_byte(),
+        lookup_identifier,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    if candidates.is_empty()
+        || candidates
+            .iter()
+            .any(|candidate| index.candidate_is_conditionally_unknown(candidate))
+        || state_has_uncertainty(&state)
+    {
+        return Ok(None);
+    }
+    let owner_instances = super::callable_owner_node(entity)
+        .map(|owner| {
+            index.resolve_receivers_with_state_and_budget(
+                current_uri,
+                current_document,
+                entity.start_byte(),
+                owner,
+                owner,
+                &mut state,
+                cancel,
+                budget,
+                0,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|receiver| match receiver {
+            Receiver::Type(instance) => Some(instance),
+            Receiver::Unit(_) | Receiver::Builtin(_) | Receiver::IntegerLiteral(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if state_has_uncertainty(&state) {
+        return Ok(None);
+    }
+    let selection = select(
+        index,
+        current_uri,
+        current_document,
+        call,
+        &candidates,
+        &GenericSubstitution::empty(),
+        &owner_instances,
+        &mut state,
+        0,
+        cancel,
+        budget,
+    )?;
+    let Some(group) = selection.selected_group else {
+        return Ok(None);
+    };
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate_in_group(index, candidate, &group));
+    let Some(symbol) = selected.and_then(|candidate| index.symbol(candidate)) else {
+        return Ok(None);
+    };
+    if symbol.routine_parameters.len() > MAX_OVERLOAD_ARGUMENTS {
+        return Err(format!(
+            "inlay parameter mapping exceeds the {MAX_OVERLOAD_ARGUMENTS}-parameter limit"
+        ));
+    }
+    budget.require_work(symbol.routine_parameters.len(), cancel)?;
+    let Some(symbol_document) = selected.and_then(|candidate| index.documents.get(&candidate.uri))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        symbol
+            .routine_parameters
+            .iter()
+            .map(|parameter| {
+                symbol_document
+                    .source
+                    .get(parameter.span.start..parameter.span.end)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect(),
+    ))
+}
+
 /// Resolve the parameter mode used by one call argument.  A missing mode is
 /// intentional: overloaded, unsupported, or otherwise uncertain calls must
 /// not make document highlights claim a read or write that the resolver has

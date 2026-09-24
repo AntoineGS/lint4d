@@ -4,7 +4,7 @@
 use crate::navigation::CompletionResolutionSeed;
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FOLDING_KIND_COMMENT,
-    FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
+    FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions, InlayHintOptions,
 };
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
@@ -943,7 +943,8 @@ impl AnalysisPriority {
             | AnalysisRequest::References { .. }
             | AnalysisRequest::Rename { .. }
             | AnalysisRequest::SemanticTokens { .. }
-            | AnalysisRequest::FoldingRanges { .. } => Self::Bulk,
+            | AnalysisRequest::FoldingRanges { .. }
+            | AnalysisRequest::InlayHints { .. } => Self::Bulk,
         }
     }
 }
@@ -2061,6 +2062,10 @@ enum AnalysisRequest {
     FoldingRanges {
         uri: Url,
     },
+    InlayHints {
+        uri: Url,
+        range: lsp_types::Range,
+    },
 }
 
 fn progress_title(request: &AnalysisRequest) -> &'static str {
@@ -2077,6 +2082,7 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
         AnalysisRequest::DocumentSymbols { .. } => "Indexing document symbols",
         AnalysisRequest::SemanticTokens { .. } => "Computing semantic tokens",
         AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
+        AnalysisRequest::InlayHints { .. } => "Computing inlay hints",
         AnalysisRequest::Hover { .. }
         | AnalysisRequest::Completion { .. }
         | AnalysisRequest::SignatureHelp { .. }
@@ -2120,6 +2126,7 @@ enum AnalysisResultValue {
     SelectionRanges(Result<Vec<lsp_types::SelectionRange>, String>),
     SemanticTokens(Result<lsp_types::SemanticTokens, String>),
     FoldingRanges(Result<Vec<lsp_types::FoldingRange>, String>),
+    InlayHints(Result<Vec<lsp_types::InlayHint>, String>),
 }
 
 #[derive(Clone)]
@@ -4508,6 +4515,7 @@ enum ObservationMethod {
         range: Option<ObservationRange>,
     },
     FoldingRanges,
+    InlayHints(ObservationRange),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4691,6 +4699,22 @@ impl ObservationKey {
             ),
             AnalysisRequest::FoldingRanges { uri } => (
                 ObservationMethod::FoldingRanges,
+                Some(uri.clone()),
+                None,
+                None,
+                None,
+            ),
+            AnalysisRequest::InlayHints { uri, range } => (
+                ObservationMethod::InlayHints(ObservationRange {
+                    start: ObservationPosition {
+                        line: range.start.line,
+                        character: range.start.character,
+                    },
+                    end: ObservationPosition {
+                        line: range.end.line,
+                        character: range.end.character,
+                    },
+                }),
                 Some(uri.clone()),
                 None,
                 None,
@@ -5087,6 +5111,9 @@ impl AnalysisJobs {
                 "analysis worker failed without changing workspace state".to_string(),
             )),
             AnalysisRequest::FoldingRanges { .. } => AnalysisResultValue::FoldingRanges(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::InlayHints { .. } => AnalysisResultValue::InlayHints(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
@@ -5848,6 +5875,22 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::FoldingRanges(computed.value),
+                            }
+                        }
+                        AnalysisRequest::InlayHints { uri, range } => {
+                            let computed = queries::inlay_hints_from_input(
+                                input,
+                                &uri,
+                                range,
+                                InlayHintOptions::default(),
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::InlayHints(computed.value),
                             }
                         }
                     }));
@@ -7626,6 +7669,7 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::SelectionRanges(_)
                 | AnalysisResultValue::SemanticTokens(_)
                 | AnalysisResultValue::FoldingRanges(_)
+                | AnalysisResultValue::InlayHints(_)
         )
 }
 
@@ -7983,6 +8027,12 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
+        AnalysisResultValue::InlayHints(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
     }
 }
 
@@ -8293,6 +8343,7 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::SelectionRanges(value) => *value = Err(error),
         AnalysisResultValue::SemanticTokens(value) => *value = Err(error),
         AnalysisResultValue::FoldingRanges(value) => *value = Err(error),
+        AnalysisResultValue::InlayHints(value) => *value = Err(error),
     }
 }
 
@@ -10590,6 +10641,28 @@ fn handle_request(
                 work_done_token.clone(),
             )?;
         }
+        "textDocument/inlayHint" => {
+            let id = request.id.clone();
+            let params: lsp_types::InlayHintParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::InlayHints {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    range: params.range,
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -12153,6 +12226,7 @@ fn server_capabilities(
         "documentHighlightProvider": {"workDoneProgress": true},
         "selectionRangeProvider": {"workDoneProgress": true},
         "foldingRangeProvider": {"workDoneProgress": true},
+        "inlayHintProvider": {"resolveProvider": false, "workDoneProgress": true},
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),
             "range": true,

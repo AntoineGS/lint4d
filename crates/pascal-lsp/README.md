@@ -1613,6 +1613,29 @@ Empty documents return a valid zero-length document range. Selection requests
 also honor cancellation and the same generation/read-set stale-result checks as
 the other bounded analysis queries.
 
+### Inlay hints
+
+The server advertises `textDocument/inlayHint` with `resolveProvider: false`;
+labels are emitted as strings and no deferred properties, edits, tooltips, or
+commands are returned. The requested LSP range is interpreted in UTF-16 and is
+inclusive for hint positions. Results are sorted, deduplicated, and bounded by
+the requested range, a 2 MiB range ceiling, 100,000 AST nodes, 2,000 calls,
+512 hints, and 16 KiB of labels. Cancellation and source/dependency read-set
+revalidation use the normal analysis-worker path.
+
+Parameter labels are emitted only when workspace binding and overload
+selection prove one callable and its positional parameter mapping. Named
+arguments, same-named identifier arguments, and uncertain/rejected conditional
+contexts are suppressed. Type labels are currently deliberately narrow: an
+omitted-type `const` whose complete initializer is the reserved Pascal
+`True`/`False` literal receives `: Boolean`. Strings, numeric literals,
+compound expressions, explicit types, parser recovery, inactive/unknown
+conditional regions, and unsupported declarations receive no inferred-type
+label. The parser's reserved boolean token is the proof; this is not a general
+expression inference engine. Clients may request the standard `resolveSupport`,
+but the server does not advertise resolution and therefore emits only complete
+hint values.
+
 ### Source documentation comments
 
 Hover, completion items, and signature help include source documentation when a

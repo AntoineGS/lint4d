@@ -21,6 +21,7 @@ use tree_sitter::{Node, Tree};
 mod assistance;
 mod documentation;
 mod folding;
+mod inlay;
 mod overload;
 mod rename;
 pub(crate) use rename::BindingWorkBudget;
@@ -83,6 +84,7 @@ pub(crate) struct MissingInterfaceMethodImplementationCandidate {
 pub(crate) use folding::{
     FOLDING_KIND_COMMENT, FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions,
 };
+pub(crate) use inlay::InlayHintOptions;
 pub(crate) use rename::RenameBindingInfo;
 #[cfg(test)]
 pub(crate) use rename::test_cancel_after_checks;
@@ -608,6 +610,16 @@ impl NavigationIndex {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<lsp_types::FoldingRange>, String> {
         folding::folding_ranges_with_cancel(self, uri, options, cancel)
+    }
+
+    pub(crate) fn inlay_hints_with_cancel(
+        &self,
+        uri: &Url,
+        range: Range,
+        options: InlayHintOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<lsp_types::InlayHint>, String> {
+        inlay::inlay_hints_with_cancel(self, uri, range, options, cancel)
     }
 
     pub(crate) fn document_symbols_with_cancel(

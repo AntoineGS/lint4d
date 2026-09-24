@@ -1141,6 +1141,30 @@ impl TestServer {
         response.result.expect("initialize result")
     }
 
+    fn initialize_with_inlay_hint_capabilities(
+        &mut self,
+        root: &Path,
+        inlay_hint_capabilities: Value,
+    ) -> Value {
+        let root_uri = Url::from_file_path(root).expect("workspace URI");
+        let id = RequestId::from("initialize-inlay-hint".to_string());
+        self.send_request(
+            id.clone(),
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {"inlayHint": inlay_hint_capabilities}
+                }
+            }),
+        );
+        let response = self.response(&id);
+        assert!(response.error.is_none(), "initialize failed: {response:?}");
+        self.send_notification("initialized", json!({}));
+        response.result.expect("initialize result")
+    }
+
     fn initialize_with_workspace_folders(
         &mut self,
         root: &Path,
@@ -11251,6 +11275,135 @@ fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
             .any(|range| { range["startLine"] == 6 && range["endLine"] == 9 }),
         "if range missing from response: {ranges:?}"
     );
+    server.shutdown();
+}
+
+#[test]
+fn inlay_hints_show_bound_parameter_names_and_proven_boolean_constants() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("InlayHints.pas");
+    let source = "unit InlayHints;\ninterface\nprocedure Draw(Width, Height: Integer);\nprocedure Choose(Value: Integer); overload;\nprocedure Choose(Value: string); overload;\nimplementation\nconst Enabled = True;\nconst Disabled = False;\nconst TextValue = 'text';\nconst Typed: Boolean = True;\n{$IFDEF UNCERTAIN_SYMBOL}\nconst Maybe = True;\n{$ENDIF}\nprocedure Draw(Width, Height: Integer);\nbegin\nend;\nprocedure Run;\nbegin\n  Draw(Width, Height);\n  Draw(10, 20);\n  Choose(Unknown);\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize_with_inlay_hint_capabilities(
+        temp.path(),
+        json!({"resolveSupport": {"properties": ["tooltip", "label.tooltip"]}}),
+    );
+    assert_eq!(
+        initialize["capabilities"]["inlayHintProvider"]["resolveProvider"],
+        false
+    );
+
+    let id = RequestId::from("inlay-hints".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 23, "character": 0}
+            }
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "inlay hint request failed: {response:?}"
+    );
+    let hints = response.result.expect("inlay hint result");
+    let hints = hints.as_array().expect("inlay hint array");
+    let labels = hints
+        .iter()
+        .map(|hint| hint["label"].as_str().expect("string label"))
+        .collect::<Vec<_>>();
+    assert!(
+        labels.contains(&"Width:"),
+        "missing parameter hint: {hints:?}"
+    );
+    assert!(
+        labels.contains(&"Height:"),
+        "missing parameter hint: {hints:?}"
+    );
+    assert_eq!(
+        labels.iter().filter(|label| **label == ": Boolean").count(),
+        2,
+        "only intrinsic True/False constants should receive inferred types: {hints:?}"
+    );
+    assert_eq!(
+        labels.iter().filter(|label| **label == "Width:").count(),
+        1,
+        "same-named argument should suppress a redundant hint: {hints:?}"
+    );
+    assert!(
+        !labels.contains(&"Value:"),
+        "uncertain overload selection must not produce parameter labels: {hints:?}"
+    );
+
+    let range_id = RequestId::from("inlay-hints-range".to_string());
+    server.send_request(
+        range_id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": {"line": 6, "character": 0},
+                "end": {"line": 6, "character": 21}
+            }
+        }),
+    );
+    let ranged = server.response(&range_id);
+    assert!(
+        ranged.error.is_none(),
+        "ranged inlay hint request failed: {ranged:?}"
+    );
+    let ranged = ranged.result.expect("ranged inlay hints");
+    let ranged = ranged.as_array().expect("ranged inlay hint array");
+    assert_eq!(
+        ranged.len(),
+        1,
+        "range must exclude all hints outside Enabled: {ranged:?}"
+    );
+    assert_eq!(ranged[0]["label"], ": Boolean");
+    server.shutdown();
+}
+
+#[test]
+fn inlay_hint_positions_use_utf16_with_crlf_and_non_bmp_arguments() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("InlayCoordinates.pas");
+    let source = "unit InlayCoordinates;\r\ninterface\r\nprocedure Draw(Value: string);\r\nimplementation\r\nprocedure Draw(Value: string);\r\nbegin\r\nend;\r\nprocedure Run(Text: string);\r\nbegin\r\n  {😀} Draw(Text);\r\nend;\r\nend.\r\n";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("inlay-coordinates".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 12, "character": 0}
+            }
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "inlay request failed: {response:?}"
+    );
+    let hints = response.result.expect("inlay hints");
+    let hints = hints.as_array().expect("inlay hint array");
+    assert_eq!(
+        hints.len(),
+        1,
+        "expected exactly one parameter hint: {hints:?}"
+    );
+    assert_eq!(hints[0]["label"], "Value:");
+    assert_eq!(hints[0]["position"]["line"], 9);
+    assert_eq!(hints[0]["position"]["character"], 16);
     server.shutdown();
 }
 

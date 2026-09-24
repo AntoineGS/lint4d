@@ -8,15 +8,15 @@ use super::rename::{
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
 use crate::navigation::{
-    CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions,
+    CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
     SemanticTokenResolutionMode, completion_prefix_at_position,
 };
 use crate::{NavigationIndex, NavigationTarget};
 #[cfg(test)]
 use lsp_types::CompletionList;
 use lsp_types::{
-    DocumentHighlight, DocumentSymbol, FoldingRange, Hover, Location, MarkupKind, Position, Range,
-    SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
+    DocumentHighlight, DocumentSymbol, FoldingRange, Hover, InlayHint, Location, MarkupKind,
+    Position, Range, SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use pascal_project::{ProjectPathEntry, ProjectPathProvenance, has_invalid_project_selection};
 use std::collections::HashMap;
@@ -501,6 +501,47 @@ pub(crate) fn folding_ranges_from_input(
     let value = index.folding_ranges_with_cancel(&uri, options, cancel);
     let mut records = vec![record];
     records.extend(metadata_records);
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+pub(crate) fn inlay_hints_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    range: Range,
+    options: InlayHintOptions,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<InlayHint>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("document is outside configured workspace roots or source paths: {uri}"),
+        );
+    }
+    let snapshot = match assistance_snapshot(&input, &uri, None, cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let value = snapshot
+        .index
+        .inlay_hints_with_cancel(&uri, range, options, cancel);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
     with_records(source_generation, configuration_generation, value, records)
 }
 

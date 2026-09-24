@@ -35073,6 +35073,290 @@ fn include_owner_catalogue_protocol_reports_actual_candidate_work() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn include_owner_catalogue_cancellation_limit_and_fresh_retry_are_conservative() {
+    const DECOYS: usize = 257;
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let main = root.path().join("Main.pas");
+    let include = root.path().join("Use.inc");
+    let disk_source = "unit Main;\ninterface\nconst RootValue = 1;\nimplementation\nprocedure Run;\nbegin\n{$I Use.inc}\nend;\nend.\n";
+    let overlay_source = disk_source.replace("= 1", "= 2");
+    assert_eq!(disk_source.len(), overlay_source.len());
+    let include_source = "Log(RootValue);\n";
+    write_file(&main, disk_source);
+    write_file(&include, include_source);
+    let mut decoys = Vec::with_capacity(DECOYS);
+    for index in 0..DECOYS {
+        let path = root.path().join(format!("Decoy{index:03}.pas"));
+        write_file(
+            &path,
+            &format!("unit Decoy{index:03}; interface implementation end.\n"),
+        );
+        decoys.push(path);
+    }
+
+    let barrier_dir = root.path().join("include-catalogue-cancel-barrier");
+    fs::create_dir_all(&barrier_dir).expect("catalogue barrier directory");
+    let barrier_entered = barrier_dir.join("entered.json");
+    let barrier_release = barrier_dir.join("release");
+    let barrier_spec = format!(
+        "{}|{}",
+        barrier_entered.display(),
+        barrier_release.display()
+    );
+    let references_entered = barrier_dir.join("references-entered");
+    let references_release = barrier_dir.join("references-release");
+    let references_spec = format!(
+        "{}|{}",
+        references_entered.display(),
+        references_release.display()
+    );
+    let rename_entered = barrier_dir.join("rename-entered");
+    let rename_release = barrier_dir.join("rename-release");
+    fs::write(&rename_release, b"release").expect("initially release navigation barrier");
+    let navigation_spec = format!("{}|{}", rename_entered.display(), rename_release.display());
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_INCLUDE_CATALOGUE_BARRIER",
+                barrier_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_REFERENCES_BARRIER",
+                references_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                navigation_spec.as_str(),
+            ),
+        ],
+    );
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&main),"languageId":"pascal","version":1,"text":overlay_source}}),
+    );
+    let prior_pull_id = RequestId::from("include-catalogue-prior-pull".to_string());
+    server.send_request(
+        prior_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
+    );
+    let prior_pull = server.response(&prior_pull_id);
+    assert!(
+        prior_pull.error.is_none(),
+        "prior pull diagnostics: {prior_pull:?}"
+    );
+    let prior_result_id = prior_pull.result.unwrap()["resultId"]
+        .as_str()
+        .expect("prior result ID")
+        .to_owned();
+    assert!(
+        !barrier_entered.exists(),
+        "the include-owner iterator barrier must be attributable to the following navigation request"
+    );
+
+    let cancelled_definition_id =
+        RequestId::from("include-catalogue-cancelled-definition".to_string());
+    server.send_request(
+        cancelled_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&include, include_source, "RootValue", 0),
+    );
+    assert!(
+        wait_for_file(&barrier_entered, IO_TIMEOUT),
+        "request must rendezvous after an actual charged filename-catalogue iterator step"
+    );
+    let barrier_evidence: Value =
+        serde_json::from_slice(&fs::read(&barrier_entered).expect("catalogue barrier evidence"))
+            .expect("catalogue barrier JSON");
+    assert!(
+        barrier_evidence["charged_visits"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
+    server.send_notification("$/cancelRequest", json!({"id":cancelled_definition_id}));
+    let unrelated_id = RequestId::from("include-catalogue-control-request".to_string());
+    server.send_request(
+        unrelated_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument":{"uri":uri(&main)}}),
+    );
+    let unrelated = server.response(&unrelated_id);
+    assert!(
+        unrelated.error.is_none(),
+        "unrelated control request must be served during catalogue cancellation: {unrelated:?}"
+    );
+    let cancelled = server.response(&cancelled_definition_id);
+    assert_eq!(
+        cancelled.error.expect("cancelled definition response").code,
+        -32800
+    );
+    assert!(
+        cancelled.result.is_none(),
+        "cancelled definition cannot return partial locations"
+    );
+
+    fs::remove_file(&rename_entered).ok();
+    fs::remove_file(&rename_release).expect("arm navigation barrier for rename cancellation");
+    let cancelled_rename_id = RequestId::from("include-catalogue-cancelled-rename".to_string());
+    server.send_request(
+        cancelled_rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument":{"uri":uri(&main)},
+            "position":position_of(&overlay_source,"RootValue",0),
+            "newName":"CancelledRootValue"
+        }),
+    );
+    assert!(
+        wait_for_file(&rename_entered, IO_TIMEOUT),
+        "rename request barrier reached"
+    );
+    server.send_notification("$/cancelRequest", json!({"id":cancelled_rename_id}));
+    let rename_control_id = RequestId::from("include-catalogue-rename-control".to_string());
+    server.send_request(
+        rename_control_id.clone(),
+        "textDocument/foldingRange",
+        json!({"textDocument":{"uri":uri(&main)}}),
+    );
+    let rename_control = server.response(&rename_control_id);
+    assert!(
+        rename_control.error.is_none(),
+        "unrelated control request during rename cancellation: {rename_control:?}"
+    );
+    let rename_cancelled = server.response(&cancelled_rename_id);
+    assert_eq!(
+        rename_cancelled
+            .error
+            .expect("cancelled rename response")
+            .code,
+        -32800
+    );
+    assert!(
+        rename_cancelled.result.is_none(),
+        "cancelled rename cannot return partial workspace edits"
+    );
+    fs::write(&rename_release, b"release").expect("release navigation barrier after cancellation");
+
+    let limited_definition_id = RequestId::from("include-catalogue-limited-definition".to_string());
+    server.send_request(
+        limited_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&include, include_source, "RootValue", 0),
+    );
+    let limited_definition = server.response(&limited_definition_id);
+    assert!(
+        limited_definition.error.is_some()
+            || limited_definition.result.as_ref().is_none_or(|result| {
+                result.is_null() || result.as_array().is_some_and(Vec::is_empty)
+            }),
+        "candidate-limit definition must fail closed without partial locations: {limited_definition:?}"
+    );
+
+    fs::remove_file(&references_entered).ok();
+    fs::remove_file(&references_release).ok();
+    let references_id = RequestId::from("include-catalogue-cancelled-references".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument":{"uri":uri(&include)},
+            "position":position_of(include_source,"RootValue",0),
+            "context":{"includeDeclaration":true}
+        }),
+    );
+    assert!(
+        wait_for_file(&references_entered, IO_TIMEOUT),
+        "reference request barrier reached"
+    );
+    server.send_notification("$/cancelRequest", json!({"id":references_id}));
+    let references = server.response(&references_id);
+    assert_eq!(
+        references.error.expect("cancelled reference response").code,
+        -32800
+    );
+    assert!(
+        references.result.is_none(),
+        "cancelled references cannot return partial locations"
+    );
+    fs::write(&references_release, b"release")
+        .expect("release references barrier after cancellation");
+
+    let main_stamp = fs::metadata(&main).expect("main disk stamp before same-size edit");
+    let changed_disk_source = disk_source.replace("RootValue", "DiskValue");
+    assert_eq!(disk_source.len(), changed_disk_source.len());
+    write_file(&main, &changed_disk_source);
+    restore_mtime(&main, &main_stamp);
+    let changed_include_source = "Log(UnknownValue);\n";
+    write_file(&include, changed_include_source);
+    for decoy in &decoys {
+        fs::remove_file(decoy).expect("remove owner-catalogue decoy");
+    }
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[
+            {"uri":uri(&decoys[0]),"type":3},
+            {"uri":uri(&include),"type":2}
+        ]}),
+    );
+    let repaired_pull_id = RequestId::from("include-catalogue-repaired-pull".to_string());
+    server.send_request(
+        repaired_pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&main)},"previousResultId":prior_result_id}),
+    );
+    let repaired_pull = server.response(&repaired_pull_id);
+    assert!(
+        repaired_pull.error.is_none(),
+        "repaired pull diagnostics: {repaired_pull:?}"
+    );
+    assert_ne!(
+        repaired_pull.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "relevant watcher event must invalidate the prior pull result ID"
+    );
+    write_file(&include, include_source);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&include),"type":2}]}),
+    );
+    let fresh_definition_id = RequestId::from("include-catalogue-fresh-definition".to_string());
+    server.send_request(
+        fresh_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&include, include_source, "RootValue", 0),
+    );
+    assert_eq!(
+        result_locations(server.response(&fresh_definition_id))[0]["uri"],
+        uri(&main).to_string(),
+        "complete retry must select the open owner overlay, not same-stamp disk contents"
+    );
+    let fresh_references_id = RequestId::from("include-catalogue-fresh-references".to_string());
+    server.send_request(
+        fresh_references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument":{"uri":uri(&include)},
+            "position":position_of(include_source,"RootValue",0),
+            "context":{"includeDeclaration":true}
+        }),
+    );
+    let fresh_references = server.response(&fresh_references_id);
+    assert!(
+        fresh_references.error.is_none(),
+        "fresh owner references: {fresh_references:?}"
+    );
+    assert_eq!(
+        fresh_references.result.unwrap().as_array().unwrap().len(),
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn shutdown_cancels_workspace_worker_while_diagnostic_fanout_is_blocked() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

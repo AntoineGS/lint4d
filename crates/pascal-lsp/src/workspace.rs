@@ -9930,6 +9930,8 @@ impl Workspace {
             .find(|workspace_root| path_starts_with_ci(&root, &workspace_root.path))
             .map(|workspace_root| workspace_root.excludes.clone());
         let mut walk = WalkDir::new(&root).follow_links(false).into_iter();
+        let mut charged_iterator_visits = 0usize;
+        let mut iterator_steps = 0usize;
         loop {
             check_workspace_cancel(cancel)?;
             if visited >= entry_limit {
@@ -9938,7 +9940,15 @@ impl Workspace {
             }
             if let Some(budget) = budget {
                 budget.charge_include_path_visits(1)?;
+                charged_iterator_visits = charged_iterator_visits.saturating_add(1);
             }
+            iterator_steps = iterator_steps.saturating_add(1);
+            #[cfg(feature = "test-support")]
+            wait_at_include_catalogue_test_barrier(
+                cancel,
+                iterator_steps,
+                charged_iterator_visits,
+            )?;
             let Some(entry) = walk.next() else {
                 break;
             };
@@ -11435,6 +11445,46 @@ fn wait_at_file_discovery_test_barrier(cancel: Option<&AtomicBool>) -> Result<()
     while !std::path::Path::new(release).exists() {
         check_workspace_cancel(cancel)?;
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn wait_at_include_catalogue_test_barrier(
+    cancel: Option<&AtomicBool>,
+    iterator_steps: usize,
+    charged_visits: usize,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_INCLUDE_CATALOGUE_BARRIER") else {
+        return Ok(());
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return Ok(());
+    };
+    let entered = std::path::Path::new(&entered);
+    if entered.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = entered.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut marker) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(entered)
+    else {
+        return Ok(());
+    };
+    let _ = write!(
+        marker,
+        "{{\"iterator_steps\":{iterator_steps},\"charged_visits\":{charged_visits},\"iterator\":\"filename_catalogue\"}}"
+    );
+    drop(marker);
+    while !std::path::Path::new(&release).exists() {
+        check_workspace_cancel(cancel)?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     Ok(())
 }

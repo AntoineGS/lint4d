@@ -11522,31 +11522,23 @@ fn handle_notification_with_control_inner(
                 }
                 renames.push((old_uri, new_uri));
             }
-            if malformed_batch {
+            if unretainable_endpoint {
                 eprintln!(
-                    "pascal-lsp: malformed file-rename member; invalidating workspace file state"
+                    "pascal-lsp: file-rename endpoint cannot be retained; fencing workspace analysis"
                 );
-                if unretainable_endpoint {
-                    return Ok(permanently_fence_file_notification_analysis(
-                        workspace,
-                        budget,
-                        push_diagnostics_supported,
-                    ));
-                }
-                if recoverable_endpoints.is_empty() {
-                    eprintln!(
-                        "pascal-lsp: malformed file-rename batch has no attributable endpoint; fencing workspace analysis"
-                    );
-                    return Ok(permanently_fence_file_notification_analysis(
-                        workspace,
-                        budget,
-                        push_diagnostics_supported,
-                    ));
-                }
-                return Ok(invalidate_malformed_file_notification(
+                return Ok(permanently_fence_file_notification_analysis(
                     workspace,
                     budget,
-                    recoverable_endpoints,
+                    push_diagnostics_supported,
+                ));
+            }
+            if malformed_batch {
+                eprintln!(
+                    "pascal-lsp: malformed file-rename member has unbounded source identity; fencing workspace analysis"
+                );
+                return Ok(permanently_fence_file_notification_analysis(
+                    workspace,
+                    budget,
                     push_diagnostics_supported,
                 ));
             }

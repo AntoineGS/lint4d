@@ -1250,20 +1250,27 @@ old-URI `didChange` after close does not restore it.
 Unverified/mismatched transitions fail closed and require reopening. A delayed
 `didClose` for the old URI cannot close an accepted new-URI overlay. Unmatched
 late rename notifications invalidate old/new path state conservatively.
-For a malformed batch within the 64-entry limit, every parseable file endpoint
-is retained separately from the ordinary 32 KiB admission accounting (up to
-128 distinct endpoints, each at most 4 KiB). Recoverable endpoints are treated
-as negative observations before global derived-state invalidation, so a
-delete/rename reported before the physical filesystem change cannot make old
-closed-file bytes authoritative again. Malformed entries do not cause all open
-documents to be recorded as file endpoints. If any endpoint cannot fit this
-bounded recovery envelope, analysis is permanently fenced for that workspace
-instance before global invalidation; restart is required rather than publishing
-results from incomplete endpoint evidence.
+For a malformed `didCreateFiles` or `didDeleteFiles` batch within the 64-entry
+limit, every parseable file endpoint is retained separately from the ordinary
+32 KiB admission accounting (up to 128 distinct endpoints, each at most 4 KiB).
+Recoverable endpoints are treated as negative observations before global
+derived-state invalidation. Malformed entries do not cause all open documents to
+be recorded as file endpoints. If any endpoint cannot fit this bounded recovery
+envelope, analysis is permanently fenced for that workspace instance before
+global invalidation.
+Malformed `didRenameFiles` batches use a stricter rule: if any member lacks a
+provable file `oldUri` or `newUri`, the missing side could hide the source of a
+move. The server therefore permanently fences analysis for the workspace
+instance before invalidation, even if another member is a complete, parseable
+pair or some endpoints from the malformed member were retained. A later valid
+file event does not lift this fence; restart is required. Fully parsed exact
+duplicate pairs are deduplicated; conflicting endpoint reuse and chained pairs
+remain subject to bounded ambiguity recovery, while oversized and unretainable
+batches fence analysis.
 Watched-file batches validate the complete event list before applying any
 `Created`, `Changed`, or `Deleted` event. For a malformed batch of at most 64
-events, parseable file endpoints use the same bounded recovery envelope as file
-operations (up to 128 distinct endpoints, each at most 4 KiB) and are treated
+events, parseable file endpoints use the bounded recovery envelope (up to 128
+distinct endpoints, each at most 4 KiB) and are treated
 as negative observations before global derived-state invalidation. This keeps a
 delete-before-unlink endpoint tombstoned and rejects an implicated open overlay
 instead of leaving partial event processing in effect. A later valid `Created`

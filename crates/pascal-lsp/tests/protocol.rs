@@ -37673,12 +37673,11 @@ fn malformed_delete_after_uri_byte_overflow_preserves_late_tombstone() {
 }
 
 #[test]
-fn malformed_rename_with_128_and_129_unrelated_open_documents_recovers() {
+fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
     for open_count in [128usize, 129] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
         let consumer = root.path().join("Consumer.pas");
-        let unrelated_target = root.path().join("CreatedLater.pas");
         let unrelated_old = root.path().join("UnrelatedOld.pas");
         let unrelated_new = root.path().join("UnrelatedNew.pas");
         let provider_source =
@@ -37714,7 +37713,7 @@ fn malformed_rename_with_128_and_129_unrelated_open_documents_recovers() {
         );
         let refresh = server
             .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-            .expect("known-endpoint malformed rename recovery must request a refresh");
+            .expect("malformed rename fence must request a refresh");
         server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
         let definition_id = RequestId::from(format!("open-boundary-definition-{open_count}"));
         server.send_request(
@@ -37722,26 +37721,26 @@ fn malformed_rename_with_128_and_129_unrelated_open_documents_recovers() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TThing", 0),
         );
-        let locations = result_locations(server.response(&definition_id));
-        assert_eq!(locations.len(), 1, "unrelated open overlay remains usable");
-        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+        let response = server.response(&definition_id);
+        assert!(
+            response.error.is_some(),
+            "known endpoints from a different member cannot bound the malformed member's source identity: {response:?}"
+        );
 
-        write_file(&unrelated_target, "unit CreatedLater; interface end.\n");
         server.send_notification(
             "workspace/didCreateFiles",
-            json!({"files":[{"uri":uri(&unrelated_target)}]}),
+            json!({"files":[{"uri":uri(&unrelated_new)}]}),
         );
-        let refresh = server
-            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-            .expect("later verified create must not be blocked by permanent recovery fence");
-        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
         let after_id = RequestId::from(format!("open-boundary-after-create-{open_count}"));
         server.send_request(
             after_id.clone(),
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TThing", 0),
         );
-        assert_eq!(result_locations(server.response(&after_id)).len(), 1);
+        assert!(
+            server.response(&after_id).error.is_some(),
+            "a later valid create must not lift the permanent analysis fence"
+        );
         server.shutdown();
     }
 }
@@ -38148,16 +38147,158 @@ fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
     }
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_identity() {
+    for pull_diagnostics in [false, true] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let moved_provider = root.path().join("MovedProvider.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let noise = root.path().join("Noise.pas");
+        let other_noise = root.path().join("OtherNoise.pas");
+        let provider_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let moved_source = "unit Provider;\ninterface\nconst GOODNAME = 2;\ntype TNewThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        write_file(&noise, "unit Noise; interface end.\n");
+        write_file(&other_noise, "unit OtherNoise; interface end.\n");
+
+        let mut server = TestServer::launch();
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(root.path());
+        } else {
+            server.initialize(root.path(), Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":provider_source}}),
+        );
+
+        let before_definition_id =
+            RequestId::from(format!("mixed-unparseable-old-before-{pull_diagnostics}"));
+        server.send_request(
+            before_definition_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        let before_definition = result_locations(server.response(&before_definition_id));
+        assert_eq!(before_definition.len(), 1);
+        assert_eq!(before_definition[0]["uri"], uri(&provider).to_string());
+
+        let prior_result_id = if pull_diagnostics {
+            let pull_id = RequestId::from("mixed-unparseable-old-prior-pull".to_string());
+            server.send_request(
+                pull_id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&pull_id);
+            assert!(
+                response.error.is_none(),
+                "prior pull response: {response:?}"
+            );
+            Some(
+                response.result.expect("prior pull result")["resultId"]
+                    .as_str()
+                    .expect("prior pull result ID")
+                    .to_owned(),
+            )
+        } else {
+            let push = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("initial provider push diagnostics");
+            assert!(
+                !push["diagnostics"].as_array().unwrap().is_empty(),
+                "fixture needs an existing nonempty provider diagnostic"
+            );
+            None
+        };
+
+        fs::rename(&provider, &moved_provider).expect("client-owned provider move");
+        write_file(&moved_provider, moved_source);
+        server.send_notification(
+            "workspace/didRenameFiles",
+            json!({"files":[
+                {"oldUri":uri(&noise),"newUri":uri(&other_noise)},
+                {"oldUri":"not-a-uri","newUri":uri(&moved_provider)}
+            ]}),
+        );
+
+        if pull_diagnostics {
+            let refresh = server
+                .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+                .expect("malformed rename fence must refresh pull diagnostics");
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            let pull_id = RequestId::from("mixed-unparseable-old-pull-after".to_string());
+            server.send_request(
+                pull_id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":prior_result_id.expect("pull mode result ID")
+                }),
+            );
+            let response = server.response(&pull_id);
+            assert!(
+                response.error.is_some(),
+                "old provider pull state must be permanently fenced, not returned unchanged: {response:?}"
+            );
+        } else {
+            let clear = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("malformed rename must clear prior push diagnostics");
+            assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+        }
+
+        for (label, symbol) in [("old", "TOldThing"), ("new", "TNewThing")] {
+            let id = RequestId::from(format!(
+                "mixed-unparseable-{label}-definition-{pull_diagnostics}"
+            ));
+            server.send_request(
+                id.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, symbol, 0),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_some(),
+                "both old and destination provider identity must be fenced: {response:?}"
+            );
+        }
+        let rename_id =
+            RequestId::from(format!("mixed-unparseable-rename-edit-{pull_diagnostics}"));
+        server.send_request(
+            rename_id.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument":{"uri":uri(&consumer)},
+                "position":position_of(consumer_source,"TOldThing",0),
+                "newName":"TReplacement"
+            }),
+        );
+        let rename = server.response(&rename_id);
+        assert!(
+            rename.error.is_some(),
+            "an unbounded malformed rename must not produce partial edits: {rename:?}"
+        );
+        server.shutdown();
+    }
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 #[cfg(target_os = "linux")]
-fn wholly_unattributable_malformed_rename_fences_queued_and_inflight_queries() {
+fn mixed_malformed_rename_fences_queued_and_inflight_queries() {
     let environment = tempfile::tempdir().expect("test environment");
     let root = environment.path().join("workspace");
     fs::create_dir_all(&root).expect("workspace directory");
     let provider = root.join("Provider.pas");
     let renamed_provider = root.join("Renamed.pas");
     let consumer = root.join("Consumer.pas");
+    let noise = root.join("Noise.pas");
+    let other_noise = root.join("OtherNoise.pas");
     let provider_source =
         "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
     let renamed_source =
@@ -38165,6 +38306,8 @@ fn wholly_unattributable_malformed_rename_fences_queued_and_inflight_queries() {
     let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
     write_file(&provider, provider_source);
     write_file(&consumer, consumer_source);
+    write_file(&noise, "unit Noise; interface end.\n");
+    write_file(&other_noise, "unit OtherNoise; interface end.\n");
 
     let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
     server.initialize(&root, Value::Null);
@@ -38184,7 +38327,10 @@ fn wholly_unattributable_malformed_rename_fences_queued_and_inflight_queries() {
     write_file(&renamed_provider, renamed_source);
     server.send_notification(
         "workspace/didRenameFiles",
-        json!({"files":[{"notOldUri":"unattributable","notNewUri":"unattributable"}]}),
+        json!({"files":[
+            {"oldUri":uri(&noise),"newUri":uri(&other_noise)},
+            {"oldUri":"not-a-uri","newUri":uri(&renamed_provider)}
+        ]}),
     );
     let queued_id = RequestId::from("unattributable-rename-queued-after".to_string());
     server.send_request(
@@ -38209,7 +38355,7 @@ fn wholly_unattributable_malformed_rename_fences_queued_and_inflight_queries() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
+fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fences() {
     for pull_diagnostics in [false, true] {
         for overflow_uri_bytes in [false, true] {
             let root = tempfile::tempdir().expect("temporary workspace");
@@ -38382,10 +38528,9 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
                 );
                 let response = server.response(&pull_id);
                 assert!(
-                    response.error.is_none(),
-                    "post-batch pull failed: {response:?}"
+                    response.error.is_some(),
+                    "unbounded malformed endpoint evidence must fence pull diagnostics: {response:?}"
                 );
-                assert_eq!(response.result.as_ref().unwrap()["kind"], "full");
             } else {
                 let clear = server
                     .diagnostic_with_timeout(&uri(&renamed_provider), IO_TIMEOUT)
@@ -38401,8 +38546,8 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
                 navigation_params(&consumer, &consumer_updated, "TThing", 0),
             );
             assert!(
-                result_locations(server.response(&rejected_overlay_id)).is_empty(),
-                "malformed mixed rename must reject the target overlay and not trust stale disk bytes"
+                server.response(&rejected_overlay_id).error.is_some(),
+                "permanent fence rejects destination queries"
             );
             let old_overlay_id = RequestId::from(format!(
                 "malformed-move-old-overlay-rejected-{pull_diagnostics}"
@@ -38413,8 +38558,8 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
                 navigation_params(&consumer, &consumer_updated, "TThing", 0),
             );
             assert!(
-                result_locations(server.response(&old_overlay_id)).is_empty(),
-                "malformed rename must not leave the old-URI overlay authoritative"
+                server.response(&old_overlay_id).error.is_some(),
+                "permanent fence rejects old-provider queries"
             );
             let old_consumer = root.path().join("OldConsumer.pas");
             let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
@@ -38427,12 +38572,12 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
                 navigation_params(&old_consumer, old_consumer_source, "TThing", 0),
             );
             assert!(
-                result_locations(server.response(&old_source_id)).is_empty(),
-                "late A endpoint must be tombstoned rather than rediscovered from disk"
+                server.response(&old_source_id).error.is_some(),
+                "permanent fence rejects old source queries"
             );
 
-            // A later physically verified create after closing the rejected target
-            // clears its tombstone and allows fresh disk binding without a permanent fence.
+            // A later physically verified create and closing the rejected
+            // overlay cannot reconstruct the hidden source transition proof.
             server.send_notification(
                 "textDocument/didClose",
                 json!({"textDocument":{"uri":uri(&renamed_provider)}}),
@@ -38447,12 +38592,6 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
                 "workspace/didCreateFiles",
                 json!({"files":[{"uri":uri(&renamed_provider)}]}),
             );
-            if pull_diagnostics {
-                let refresh = server
-                    .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-                    .expect("verified rename destination repair must refresh diagnostics");
-                server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
-            }
             let repaired_id =
                 RequestId::from(format!("malformed-move-repaired-{pull_diagnostics}"));
             server.send_request(
@@ -38460,11 +38599,9 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
                 "textDocument/definition",
                 navigation_params(&consumer, &consumer_updated, "TThing", 0),
             );
-            let repaired_locations = result_locations(server.response(&repaired_id));
-            assert_eq!(repaired_locations.len(), 1);
-            assert_eq!(
-                repaired_locations[0]["uri"],
-                uri(&renamed_provider).to_string()
+            assert!(
+                server.response(&repaired_id).error.is_some(),
+                "later verified file events must not lift the permanent analysis fence"
             );
             server.shutdown();
         }

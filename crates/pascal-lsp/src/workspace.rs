@@ -61,6 +61,22 @@ struct FormattingTokenBudget {
     bytes: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FormattingToken {
+    kind: String,
+    text: String,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyntaxAnchor {
+    kind: String,
+    token_start: usize,
+    token_end: usize,
+    child_index: usize,
+}
+
 #[derive(Debug)]
 struct FormattingStatement<'tree> {
     node: tree_sitter::Node<'tree>,
@@ -91,14 +107,14 @@ fn is_supported_range_statement(kind: &str) -> bool {
     )
 }
 
-fn formatting_statement_tokens(
-    node: tree_sitter::Node<'_>,
+fn collect_formatting_tokens(
+    tree: &tree_sitter::Tree,
     source: &[u8],
     cancel: &AtomicBool,
-    budget: &mut FormattingTokenBudget,
-) -> Result<Vec<(String, String)>, String> {
+    mut budget: FormattingTokenBudget,
+) -> Result<Vec<FormattingToken>, String> {
     let mut tokens = Vec::new();
-    let mut stack = vec![node];
+    let mut stack = vec![tree.root_node()];
     let mut visits = 0usize;
     while let Some(current) = stack.pop() {
         visits = visits.saturating_add(1);
@@ -110,14 +126,12 @@ fn formatting_statement_tokens(
             check_workspace_cancel(Some(cancel))?;
         }
         if current.child_count() == 0 {
-            if current.is_missing() || current.kind() == K::COMMENT {
-                return Err(
-                    "range formatting refused a recovered or comment-bearing statement".to_string(),
-                );
+            if current.is_missing() {
+                return Err("range formatting refused a recovered token stream".to_string());
             }
             let bytes = source
                 .get(current.byte_range())
-                .ok_or_else(|| "statement token lies outside its source snapshot".to_string())?;
+                .ok_or_else(|| "syntax token lies outside its source snapshot".to_string())?;
             if bytes.len() > budget.bytes {
                 return Err("range formatting token mapping exceeds its byte limit".to_string());
             }
@@ -125,14 +139,12 @@ fn formatting_statement_tokens(
             if bytes.is_empty() {
                 continue;
             }
-            let value = String::from_utf8_lossy(bytes).into_owned();
-            let kind = current.kind().to_string();
-            let value = if kind == K::IDENTIFIER || kind.starts_with('k') {
-                value.to_ascii_uppercase()
-            } else {
-                value
-            };
-            tokens.push((kind, value));
+            tokens.push(FormattingToken {
+                kind: current.kind().to_string(),
+                text: String::from_utf8_lossy(bytes).into_owned(),
+                start_byte: current.start_byte(),
+                end_byte: current.end_byte(),
+            });
         } else {
             for index in (0..current.child_count()).rev() {
                 if let Some(child) = current.child(index) {
@@ -142,6 +154,70 @@ fn formatting_statement_tokens(
         }
     }
     Ok(tokens)
+}
+
+fn syntax_token_span(
+    node: tree_sitter::Node<'_>,
+    tokens: &[FormattingToken],
+) -> Option<(usize, usize)> {
+    let start = tokens.partition_point(|token| token.end_byte <= node.start_byte());
+    let end = tokens.partition_point(|token| token.start_byte < node.end_byte());
+    if start >= end
+        || tokens[start..end]
+            .iter()
+            .any(|token| token.start_byte < node.start_byte() || token.end_byte > node.end_byte())
+    {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn syntax_path_identity(
+    node: tree_sitter::Node<'_>,
+    tokens: &[FormattingToken],
+    cancel: &AtomicBool,
+) -> Result<Vec<SyntaxAnchor>, String> {
+    let mut reversed = Vec::new();
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        if reversed.len() >= MAX_TREE_DEPTH {
+            return Err(
+                "range formatting syntax parent mapping exceeds its depth limit".to_string(),
+            );
+        }
+        if reversed.len() % 32 == 0 {
+            check_workspace_cancel(Some(cancel))?;
+        }
+        let child_index = (0..parent.child_count())
+            .find(|index| {
+                parent
+                    .child(*index)
+                    .is_some_and(|candidate| candidate.id() == child.id())
+            })
+            .ok_or_else(|| {
+                "range formatting could not map a syntax parent/child edge".to_string()
+            })?;
+        let (token_start, token_end) = syntax_token_span(parent, tokens).ok_or_else(|| {
+            "range formatting could not anchor a syntax parent to tokens".to_string()
+        })?;
+        reversed.push(SyntaxAnchor {
+            kind: parent.kind().to_string(),
+            token_start,
+            token_end,
+            child_index,
+        });
+        child = parent;
+    }
+    let (token_start, token_end) = syntax_token_span(child, tokens)
+        .ok_or_else(|| "range formatting could not anchor a syntax node to tokens".to_string())?;
+    reversed.push(SyntaxAnchor {
+        kind: child.kind().to_string(),
+        token_start,
+        token_end,
+        child_index: 0,
+    });
+    reversed.reverse();
+    Ok(reversed)
 }
 
 fn collect_formatting_statements<'tree>(
@@ -5465,6 +5541,32 @@ impl Workspace {
                     .to_string(),
             );
         }
+        let source_tokens = collect_formatting_tokens(
+            &source_tree,
+            source.as_bytes(),
+            cancel,
+            FormattingTokenBudget {
+                nodes: MAX_RANGE_MAPPING_NODES,
+                bytes: MAX_RANGE_TOKEN_MAPPING_BYTES,
+            },
+        )?;
+        let formatted_tokens = collect_formatting_tokens(
+            &formatted_tree,
+            formatted.as_bytes(),
+            cancel,
+            FormattingTokenBudget {
+                nodes: MAX_RANGE_MAPPING_NODES,
+                bytes: MAX_RANGE_TOKEN_MAPPING_BYTES,
+            },
+        )?;
+        if source_tokens.len() != formatted_tokens.len()
+            || source_tokens
+                .iter()
+                .zip(&formatted_tokens)
+                .any(|(before, after)| before.kind != after.kind || before.text != after.text)
+        {
+            return Err("range formatting refused because full-document formatting changed the ordered token stream".to_string());
+        }
         let source_statements = collect_formatting_statements(&source_tree, cancel)?;
         let line_statements = source_statements
             .iter()
@@ -5486,16 +5588,13 @@ impl Workspace {
             }
             ancestor = parent;
         }
-        let mut token_budget = FormattingTokenBudget {
-            nodes: MAX_RANGE_MAPPING_NODES,
-            bytes: MAX_RANGE_TOKEN_MAPPING_BYTES,
-        };
-        let statement_tokens = formatting_statement_tokens(
-            statement.node,
-            source.as_bytes(),
-            cancel,
-            &mut token_budget,
-        )?;
+        let statement_token_span =
+            syntax_token_span(statement.node, &source_tokens).ok_or_else(|| {
+                "range formatting could not map the selected statement to its global token span"
+                    .to_string()
+            })?;
+        let statement_parent_identity =
+            syntax_path_identity(statement.node, &source_tokens, cancel)?;
         let source_line = original_lines
             .get(selected_line)
             .ok_or_else(|| "selected source line is outside the document".to_string())?;
@@ -5524,61 +5623,25 @@ impl Workspace {
             );
         }
         let formatted_statements = collect_formatting_statements(&formatted_tree, cancel)?;
-        let source_line_count = original_lines.len();
-        let formatted_line_count = formatted_lines.len();
         let mut matches = Vec::new();
         for candidate in &formatted_statements {
-            if candidate.kind == statement.kind
-                && formatting_statement_tokens(
-                    candidate.node,
-                    formatted.as_bytes(),
-                    cancel,
-                    &mut token_budget,
-                )? == statement_tokens
+            if candidate.kind != statement.kind
+                || syntax_token_span(candidate.node, &formatted_tokens)
+                    != Some(statement_token_span)
+            {
+                continue;
+            }
+            if syntax_path_identity(candidate.node, &formatted_tokens, cancel)?
+                == statement_parent_identity
             {
                 matches.push(candidate);
             }
         }
-        let mapped = if source_line_count == formatted_line_count {
-            let on_same_line = matches
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    candidate.start_line == selected_line && candidate.end_line == selected_line
-                })
-                .collect::<Vec<_>>();
-            if on_same_line.len() == 1 {
-                on_same_line[0]
-            } else {
-                return Err(
-                    "range formatting refused because the full-document line mapping is ambiguous"
-                        .to_string(),
-                );
-            }
-        } else if matches.len() == 1 {
-            let mut source_occurrences = 0usize;
-            for candidate in &source_statements {
-                if candidate.kind == statement.kind
-                    && formatting_statement_tokens(
-                        candidate.node,
-                        source.as_bytes(),
-                        cancel,
-                        &mut token_budget,
-                    )? == statement_tokens
-                {
-                    source_occurrences = source_occurrences.saturating_add(1);
-                }
-            }
-            if source_occurrences == 1 {
-                matches[0]
-            } else {
-                return Err(
-                    "range formatting refused because statement anchors are not unique".to_string(),
-                );
-            }
+        let mapped = if matches.len() == 1 {
+            matches[0]
         } else {
             return Err(
-                "range formatting refused because the full-document statement mapping is ambiguous"
+                "range formatting refused because the full-document statement parent/span mapping is ambiguous"
                     .to_string(),
             );
         };

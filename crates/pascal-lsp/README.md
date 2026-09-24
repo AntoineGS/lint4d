@@ -917,12 +917,13 @@ honors the request's standard `tabSize` and `insertSpaces` options for that
 request, overriding only indentation in the project formatter configuration.
 Range formatting currently accepts a single complete statement line (expanded
 to that whole line) and emits edits only within it. It maps the statement using
-the original and full-document formatted syntax trees, so nested indentation
-comes from the real surrounding context; comments, compiler directives,
-`FMT.OFF` regions, parser recovery, neighboring same-line syntax, and ambiguous
-line/statement mappings fail closed. Wider selections and ranges whose formatting
-cannot be mapped safely (including ambiguous `uses` ownership) are refused
-rather than replacing the full document.
+the globally ordered source/output token stream and stable syntax-parent/token
+spans, so repeated statements retain their occurrence identity and nested
+indentation comes from the real surrounding context. If formatting changes any
+token order or identity (for example, by sorting a `uses` clause), mapping fails
+closed. Comments, compiler directives, `FMT.OFF` regions, parser recovery,
+neighboring same-line syntax, and ambiguous statement mappings are also refused
+rather than replacing the full document. Wider selections are refused as well.
 Include files (`.inc`)
 participate in source analysis but are rejected as direct formatting targets;
 only `.pas`, `.dpr`, and `.dpk` buffers are formatted.

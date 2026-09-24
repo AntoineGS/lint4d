@@ -30230,21 +30230,93 @@ fn range_formatting_refuses_ambiguous_ownership_and_preserves_formatter_context(
         }),
     );
     let uses_response = server.response(&uses_id);
-    if let Some(edits) = uses_response.result {
-        let edits = edits.as_array().expect("range edits");
-        assert_eq!(edits.len(), 1, "the isolated statement should format once");
-        for edit in edits {
-            assert_eq!(edit["range"]["start"]["line"], 5);
-            assert_eq!(edit["range"]["end"]["line"], 5);
-            assert_eq!(edit["newText"], "  X := 1;");
-        }
-    } else {
-        let error = uses_response
-            .error
-            .expect("statement after a uses clause must edit locally or fail closed");
-        assert_eq!(error.code, -32803, "unexpected error: {error:?}");
-    }
+    assert!(
+        uses_response.error.is_some() || uses_response.result == Some(json!([])),
+        "token reordering in the uses clause must refuse the entire range: {uses_response:?}"
+    );
     server.shutdown();
+}
+
+#[test]
+fn range_formatting_maps_repeated_statements_by_global_occurrence_identity() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nif Flag then\n\n\n\n\nX:=1;\nX:=1;\nend;\nend.\n";
+    assert_eq!(source.lines().count(), 14);
+
+    for (label, tab_size, insert_spaces, expected_first, expected_second) in [
+        ("spaces", 2, true, "    X := 1;", "  X := 1;"),
+        ("tabs", 4, false, "\t\tX := 1;", "\tX := 1;"),
+    ] {
+        let style_root = root.join(label);
+        fs::create_dir_all(&style_root).expect("style fixture directory");
+        let main = style_root.join("Repeated.pas");
+        let indent_style = if insert_spaces { "space" } else { "tab" };
+        write_file(
+            &style_root.join(".fmt4d.toml"),
+            &format!("[format]\nindent_size = {tab_size}\nindent_style = \"{indent_style}\"\n"),
+        );
+        write_file(&main, source);
+        let mut server = TestServer::launch();
+        server.initialize(&style_root, Value::Null);
+        let options = json!({"tabSize": tab_size, "insertSpaces": insert_spaces});
+        let full_id = RequestId::from(format!("repeat-full-{label}"));
+        server.send_request(
+            full_id.clone(),
+            "textDocument/formatting",
+            json!({"textDocument": {"uri": uri(&main)}, "options": options}),
+        );
+        let full = server.response(&full_id);
+        assert!(full.error.is_none(), "full formatting failed: {full:?}");
+        let full_edits = full.result.expect("whole-document edit array");
+        let formatted = full_edits[0]["newText"].as_str().expect("formatted source");
+        let expected_lines = formatted.lines().collect::<Vec<_>>();
+        assert_eq!(
+            expected_lines[9], expected_first,
+            "formatted source: {formatted:?}"
+        );
+        assert_eq!(expected_lines[10], expected_second);
+
+        for (source_line, expected, occurrence) in [
+            (10, expected_first, "first"),
+            (11, expected_second, "second"),
+        ] {
+            let id = RequestId::from(format!("repeat-range-{label}-{occurrence}"));
+            server.send_request(
+                id.clone(),
+                "textDocument/rangeFormatting",
+                json!({
+                    "textDocument": {"uri": uri(&main)},
+                    "range": {"start": {"line": source_line, "character": 0}, "end": {"line": source_line, "character": 5}},
+                    "options": options
+                }),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "{occurrence} range failed: {response:?}"
+            );
+            let edits = response.result.expect("range edit array");
+            assert_eq!(edits.as_array().expect("array").len(), 1);
+            let edit = &edits[0];
+            assert_eq!(edit["range"]["start"]["line"], source_line);
+            assert_eq!(edit["range"]["end"]["line"], source_line);
+            assert_eq!(
+                edit["newText"], expected,
+                "wrong {occurrence} occurrence mapping for {label}"
+            );
+            if occurrence == "first" {
+                let mut applied_lines = source.lines().map(str::to_owned).collect::<Vec<_>>();
+                applied_lines[source_line as usize] = expected.to_string();
+                assert_eq!(applied_lines[source_line as usize], expected_first);
+                assert_eq!(
+                    applied_lines[11], "X:=1;",
+                    "the separate second source occurrence must remain untouched"
+                );
+            }
+        }
+        server.shutdown();
+    }
 }
 
 #[test]
@@ -30274,9 +30346,7 @@ fn range_formatting_fails_closed_when_syntax_mapping_work_is_exhausted() {
     let response = server.response(&id);
     let error = response.error.expect("work limit must refuse the result");
     assert!(
-        error
-            .message
-            .contains("syntax mapping exceeds its work limit"),
+        error.message.contains("mapping exceeds its work limit"),
         "unexpected refusal: {error:?}"
     );
     server.shutdown();

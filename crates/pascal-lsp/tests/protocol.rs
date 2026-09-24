@@ -31618,7 +31618,7 @@ fn ambiguous_rename_batches_invalidate_and_reject_open_overlays() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small_entries() {
+fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let main = root.path().join("Main.pas");
     write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
@@ -31668,7 +31668,10 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
-    assert!(server.response(&count_probe_id).error.is_none());
+    assert!(
+        server.response(&count_probe_id).error.is_some(),
+        "an over-limit endpoint list must fence even unrelated document diagnostics"
+    );
     let count_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
         count_refresh.id,
@@ -31685,7 +31688,10 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
-    assert!(server.response(&delete_probe_id).error.is_none());
+    assert!(
+        server.response(&delete_probe_id).error.is_some(),
+        "the permanent fence must remain latched for later oversized delete events"
+    );
     let delete_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
         delete_refresh.id,
@@ -31723,7 +31729,10 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
-    assert!(server.response(&rename_probe_id).error.is_none());
+    assert!(
+        server.response(&rename_probe_id).error.is_some(),
+        "oversized rename URI batches must not lift an already permanent file-operation fence"
+    );
     let rename_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
         rename_refresh.id,
@@ -31740,7 +31749,10 @@ fn file_operation_batches_bound_cumulative_uri_bytes_and_accept_sixty_four_small
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
-    assert!(server.response(&malformed_probe_id).error.is_none());
+    assert!(
+        server.response(&malformed_probe_id).error.is_some(),
+        "later malformed events cannot lift the permanent count-overflow fence"
+    );
     let duplicate_create_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
         duplicate_create_refresh.id,
@@ -35761,199 +35773,124 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_recovers() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn oversized_create_and_delete_file_notifications_refresh_same_size_provider_state() {
-    let temp = tempfile::tempdir().expect("temporary workspace");
-    let root = temp.path().join("fixture");
-    let provider = root.join("Provider.pas");
-    let old_consumer = root.join("OldConsumer.pas");
-    let new_consumer = root.join("NewConsumer.pas");
-    let main = root.join("Main.pas");
-    let initial_provider = "unit Provider;\ninterface\nconst\n  badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
-    let updated_provider = initial_provider
-        .replace("badConst", "GOODNAME")
-        .replace("TOldThing", "TNewThing");
-    assert_eq!(initial_provider.len(), updated_provider.len());
-    let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\nimplementation\nend.\n";
-    let new_consumer_source = "unit NewConsumer;\ninterface\nuses Provider;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
-    write_file(&provider, initial_provider);
-    write_file(&old_consumer, old_consumer_source);
-    write_file(&new_consumer, new_consumer_source);
-    write_file(
-        &main,
-        "unit Main;\ninterface\nuses OldConsumer, NewConsumer;\nimplementation\nend.\n",
-    );
-    write_file(
-        &root.join("App.dproj"),
-        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
-    );
-
-    let mut server = TestServer::launch();
-    server.initialize_with_pull_diagnostics(&root);
-    let pull_definition =
-        |server: &mut TestServer, id: &str, file: &Path, source: &str, name: &str| {
-            let request_id = RequestId::from(id.to_string());
-            server.send_request(
-                request_id.clone(),
-                "textDocument/definition",
-                navigation_params(file, source, name, 0),
-            );
-            result_locations(server.response(&request_id))
-        };
-    let pull_diagnostic = |server: &mut TestServer, id: &str, previous: Option<&str>| {
-        let request_id = RequestId::from(id.to_string());
-        server.send_request(
-            request_id.clone(),
-            "textDocument/diagnostic",
-            json!({"textDocument":{"uri":uri(&provider)},"previousResultId":previous}),
+fn oversized_create_and_delete_file_batches_permanently_fence_open_overlays() {
+    for (event, pull_diagnostics) in [
+        ("workspace/didCreateFiles", false),
+        ("workspace/didCreateFiles", true),
+        ("workspace/didDeleteFiles", false),
+        ("workspace/didDeleteFiles", true),
+    ] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let old_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let new_source = "unit Provider;\ninterface\nconst GOODNAME = 2;\ntype TNewThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+        assert_eq!(old_source.len(), new_source.len());
+        write_file(&provider, old_source);
+        write_file(&consumer, consumer_source);
+        let mut server = TestServer::launch();
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(root.path());
+        } else {
+            server.initialize(root.path(), Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_source}}),
         );
-        let response = server.response(&request_id);
-        assert!(response.error.is_none(), "diagnostic failed: {response:?}");
-        response.result.expect("diagnostic result")
-    };
 
-    let old_locations = pull_definition(
-        &mut server,
-        "oversized-create-delete-old-initial",
-        &old_consumer,
-        old_consumer_source,
-        "TOldThing",
-    );
-    assert_eq!(old_locations.len(), 1);
-    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
-    let initial_diagnostic =
-        pull_diagnostic(&mut server, "oversized-create-delete-diag-initial", None);
-    assert!(
-        initial_diagnostic["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
-    );
-    let initial_result_id = initial_diagnostic["resultId"]
-        .as_str()
-        .expect("initial result ID")
-        .to_string();
+        let before_id = RequestId::from(format!("{event}-{pull_diagnostics}-before"));
+        server.send_request(
+            before_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        let before = result_locations(server.response(&before_id));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["uri"], uri(&provider).to_string());
 
-    let original_metadata = fs::metadata(&provider).expect("initial provider metadata");
-    write_file(&provider, &updated_provider);
-    restore_mtime(&provider, &original_metadata);
-    let create_batch: Vec<_> = (0..64)
-        .map(|index| json!({"uri":uri(&root.join(format!("CreateNoise{index}.pas")))}))
-        .chain(std::iter::once(json!({"uri":uri(&provider)})))
-        .collect();
-    assert_eq!(create_batch.len(), 65);
-    server.send_notification("workspace/didCreateFiles", json!({"files":create_batch}));
+        let prior_result_id = if pull_diagnostics {
+            let id = RequestId::from(format!("{event}-pull-before"));
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "initial pull failed: {response:?}"
+            );
+            Some(
+                response.result.expect("initial pull report")["resultId"]
+                    .as_str()
+                    .expect("initial pull result ID")
+                    .to_string(),
+            )
+        } else {
+            let diagnostic = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("open overlay must publish before oversized file operation");
+            assert!(!diagnostic["diagnostics"].as_array().unwrap().is_empty());
+            None
+        };
 
-    let old_after_create = pull_definition(
-        &mut server,
-        "oversized-create-delete-old-after-create",
-        &old_consumer,
-        old_consumer_source,
-        "TOldThing",
-    );
-    assert!(
-        old_after_create.is_empty(),
-        "old identity after didCreate overflow"
-    );
-    let new_after_create = pull_definition(
-        &mut server,
-        "oversized-create-delete-new-after-create",
-        &new_consumer,
-        new_consumer_source,
-        "TNewThing",
-    );
-    assert_eq!(
-        new_after_create.len(),
-        1,
-        "new identity after didCreate overflow"
-    );
-    assert_eq!(new_after_create[0]["uri"], uri(&provider).to_string());
-    let diagnostic_after_create = pull_diagnostic(
-        &mut server,
-        "oversized-create-delete-diag-after-create",
-        Some(&initial_result_id),
-    );
-    assert_eq!(diagnostic_after_create["kind"], "full");
-    assert!(
-        diagnostic_after_create["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().all(|item| item["code"] != "constant-naming") })
-    );
-    let create_refresh = server
-        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
-        .expect("oversized didCreate must request pull-diagnostic refresh");
-    server.send(Message::Response(Response::new_ok(
-        create_refresh.id,
-        Value::Null,
-    )));
+        let original_metadata = fs::metadata(&provider).expect("initial provider metadata");
+        if event == "workspace/didCreateFiles" {
+            write_file(&provider, new_source);
+            restore_mtime(&provider, &original_metadata);
+        }
+        let mut files: Vec<_> = (0..64)
+            .map(|index| json!({"uri":uri(&root.path().join(format!("Noise{index}.pas")))}))
+            .collect();
+        files.push(json!({"uri":uri(&provider)}));
+        assert_eq!(files.len(), 65);
+        server.send_notification(event, json!({"files":files}));
 
-    let before_delete = fs::metadata(&provider).expect("provider metadata before reversal");
-    write_file(&provider, initial_provider);
-    restore_mtime(&provider, &before_delete);
-    let long_component = "d".repeat(178);
-    let mut delete_batch: Vec<_> = (0..20)
-        .map(|index| {
-            let mut path = root.join(format!("delete{index}"));
-            for _ in 0..20 {
-                path.push(&long_component);
+        if pull_diagnostics {
+            if let Some(refresh) =
+                server.request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            {
+                server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
             }
-            json!({"uri":uri(&path.join("Ignored.pas"))})
-        })
-        .collect();
-    delete_batch.push(json!({"uri":uri(&provider)}));
-    let delete_uri_bytes: usize = delete_batch
-        .iter()
-        .map(|file| file["uri"].as_str().expect("URI").len())
-        .sum();
-    assert!(delete_uri_bytes > 32 * 1024);
-    assert!(delete_batch.len() < 64);
-    server.send_notification("workspace/didDeleteFiles", json!({"files":delete_batch}));
+            let id = RequestId::from(format!("{event}-pull-after"));
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":prior_result_id.expect("pull mode ID")
+                }),
+            );
+            assert!(
+                server.response(&id).error.is_some(),
+                "oversized {event} must not return a prior diagnostic as unchanged"
+            );
+        } else {
+            let clear = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("oversized file operation must clear prior push diagnostics");
+            assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+        }
 
-    let new_after_delete = pull_definition(
-        &mut server,
-        "oversized-create-delete-new-after-delete",
-        &new_consumer,
-        new_consumer_source,
-        "TNewThing",
-    );
-    assert!(
-        new_after_delete.is_empty(),
-        "new identity after didDelete overflow"
-    );
-    let old_after_delete = pull_definition(
-        &mut server,
-        "oversized-create-delete-old-after-delete",
-        &old_consumer,
-        old_consumer_source,
-        "TOldThing",
-    );
-    assert_eq!(
-        old_after_delete.len(),
-        1,
-        "old identity after didDelete overflow"
-    );
-    assert_eq!(old_after_delete[0]["uri"], uri(&provider).to_string());
-    let diagnostic_after_delete = pull_diagnostic(
-        &mut server,
-        "oversized-create-delete-diag-after-delete",
-        Some(
-            diagnostic_after_create["resultId"]
-                .as_str()
-                .expect("updated result ID"),
-        ),
-    );
-    assert_eq!(diagnostic_after_delete["kind"], "full");
-    assert!(
-        diagnostic_after_delete["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["code"] == "constant-naming") })
-    );
-    let delete_refresh = server
-        .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
-        .expect("oversized didDelete must request pull-diagnostic refresh");
-    server.send(Message::Response(Response::new_ok(
-        delete_refresh.id,
-        Value::Null,
-    )));
-    server.shutdown();
+        let after_id = RequestId::from(format!("{event}-{pull_diagnostics}-after"));
+        server.send_request(
+            after_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        assert!(
+            server.response(&after_id).error.is_some(),
+            "oversized {event} must fail closed rather than trust an open provider overlay"
+        );
+        if event == "workspace/didDeleteFiles" {
+            // The file remains physically present through the notification and
+            // fenced request, reproducing delete-before-unlink ordering.
+            fs::remove_file(&provider).expect("client physical unlink after notification");
+        }
+        server.shutdown();
+    }
 }
 
 #[test]
@@ -36064,13 +36001,279 @@ fn oversized_did_rename_invalidates_pending_open_overlay_without_transferring_it
     );
     let response = server.response(&definition_id);
     assert!(
-        response.error.is_none(),
-        "definition query failed: {response:?}"
+        response.error.is_some(),
+        "an over-limit rename list cannot prove that its staged transition matches the actual move"
+    );
+    server.send_notification(
+        "workspace/didCreateFiles",
+        json!({"files":[{"uri":uri(&renamed_provider)}]}),
+    );
+    let after_create = RequestId::from("oversized-did-rename-permanent-fence".to_string());
+    server.send_request(
+        after_create.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, &consumer_updated, "TThing", 0),
+    );
+    assert!(server.response(&after_create).error.is_some());
+    server.shutdown();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
+    for pull_diagnostics in [false, true] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let renamed_provider = root.path().join("Renamed.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let old_source = "unit Provider;\ninterface\nconst badConst = 1;\ntype TOldThing = class end;\nimplementation\nend.\n";
+        let new_source = "unit Provider;\ninterface\nconst GOODNAME = 2;\ntype TNewThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+        assert_eq!(old_source.len(), new_source.len());
+        write_file(&provider, old_source);
+        write_file(&consumer, consumer_source);
+        let mut server = TestServer::launch();
+        if pull_diagnostics {
+            server.initialize_with_pull_diagnostics(root.path());
+        } else {
+            server.initialize(root.path(), Value::Null);
+        }
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_source}}),
+        );
+
+        let before_id = RequestId::from(format!(
+            "oversized-unplanned-rename-before-{pull_diagnostics}"
+        ));
+        server.send_request(
+            before_id.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TOldThing", 0),
+        );
+        let before = result_locations(server.response(&before_id));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["uri"], uri(&provider).to_string());
+
+        let prior_result_id = if pull_diagnostics {
+            let id = RequestId::from("oversized-unplanned-rename-pull-before".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_none(),
+                "initial pull failed: {response:?}"
+            );
+            Some(
+                response.result.expect("initial pull report")["resultId"]
+                    .as_str()
+                    .expect("initial pull result ID")
+                    .to_string(),
+            )
+        } else {
+            let diagnostic = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("open overlay must publish before oversized rename");
+            assert!(!diagnostic["diagnostics"].as_array().unwrap().is_empty());
+            None
+        };
+
+        let old_metadata = fs::metadata(&provider).expect("old provider metadata");
+        fs::rename(&provider, &renamed_provider).expect("client-owned move without will plan");
+        write_file(&renamed_provider, new_source);
+        restore_mtime(&renamed_provider, &old_metadata);
+        let mut files = vec![json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)})];
+        files.extend((0..64).map(|index| {
+            json!({
+                "oldUri":uri(&root.path().join(format!("OldNoise{index}.pas"))),
+                "newUri":uri(&root.path().join(format!("NewNoise{index}.pas")))
+            })
+        }));
+        assert_eq!(files.len(), 65);
+        server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+
+        if pull_diagnostics {
+            if let Some(refresh) =
+                server.request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            {
+                server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            }
+            let id = RequestId::from("oversized-unplanned-rename-pull-after".to_string());
+            server.send_request(
+                id.clone(),
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument":{"uri":uri(&provider)},
+                    "previousResultId":prior_result_id.expect("pull mode ID")
+                }),
+            );
+            let response = server.response(&id);
+            assert!(
+                response.error.is_some(),
+                "oversized rename must not preserve a prior pull report: {response:?}"
+            );
+        } else {
+            let clear = server
+                .diagnostic_with_timeout(&uri(&provider), IO_TIMEOUT)
+                .expect("oversized rename must clear prior push diagnostics");
+            assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
+        }
+
+        for (label, needle) in [("old", "TOldThing"), ("destination", "TNewThing")] {
+            let id = RequestId::from(format!(
+                "oversized-unplanned-rename-{label}-{pull_diagnostics}"
+            ));
+            server.send_request(
+                id.clone(),
+                "textDocument/definition",
+                navigation_params(&consumer, consumer_source, needle, 0),
+            );
+            assert!(
+                server.response(&id).error.is_some(),
+                "analysis fence must reject {label} provider resolution"
+            );
+        }
+        let rename_id = RequestId::from(format!(
+            "oversized-unplanned-rename-edit-{pull_diagnostics}"
+        ));
+        server.send_request(
+            rename_id.clone(),
+            "textDocument/rename",
+            json!({
+                "textDocument":{"uri":uri(&consumer)},
+                "position":position_of(consumer_source, "TOldThing", 0),
+                "newName":"TReplacement"
+            }),
+        );
+        assert!(server.response(&rename_id).error.is_some());
+
+        server.send_notification(
+            "workspace/didCreateFiles",
+            json!({"files":[{"uri":uri(&renamed_provider)}]}),
+        );
+        let after_valid = RequestId::from(format!(
+            "oversized-unplanned-rename-after-create-{pull_diagnostics}"
+        ));
+        server.send_request(
+            after_valid.clone(),
+            "textDocument/definition",
+            navigation_params(&consumer, consumer_source, "TNewThing", 0),
+        );
+        assert!(
+            server.response(&after_valid).error.is_some(),
+            "later bounded file events must not lift the permanent overflow fence"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+#[cfg(target_os = "linux")]
+fn oversized_unplanned_rename_rejects_inflight_and_queued_queries() {
+    let environment = tempfile::tempdir().expect("test environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace directory");
+    let provider = root.join("Provider.pas");
+    let renamed_provider = root.join("Renamed.pas");
+    let consumer = root.join("Consumer.pas");
+    let old_source =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_source =
+        "unit Provider;\ninterface\ntype TNewThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TOldThing;\nimplementation\nend.\n";
+    assert_eq!(old_source.len(), new_source.len());
+    write_file(&provider, old_source);
+    write_file(&consumer, consumer_source);
+
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":1,"text":old_source}}),
+    );
+    let inflight_id = RequestId::from("oversized-unplanned-rename-inflight".to_string());
+    server.send_request(
+        inflight_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
+    );
+    barrier.wait_until_entered();
+
+    let metadata = fs::metadata(&provider).expect("old provider metadata");
+    fs::rename(&provider, &renamed_provider).expect("client-owned move without will plan");
+    write_file(&renamed_provider, new_source);
+    restore_mtime(&renamed_provider, &metadata);
+    let mut files = vec![json!({"oldUri":uri(&provider),"newUri":uri(&renamed_provider)})];
+    files.extend((0..64).map(|index| {
+        json!({
+            "oldUri":uri(&root.join(format!("OldNoise{index}.pas"))),
+            "newUri":uri(&root.join(format!("NewNoise{index}.pas")))
+        })
+    }));
+    server.send_notification("workspace/didRenameFiles", json!({"files":files}));
+
+    let queued_id = RequestId::from("oversized-unplanned-rename-queued".to_string());
+    server.send_request(
+        queued_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
     assert!(
-        result_locations(response).is_empty(),
-        "overflow cannot attribute a pending staged transition to this rename batch or retain its destination overlay"
+        server.response(&queued_id).error.is_some(),
+        "queued query must be rejected by oversized-notification fence"
     );
+    barrier.release();
+    assert!(
+        server.response(&inflight_id).error.is_some(),
+        "in-flight query must not deliver a stale old-provider definition"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn sixty_four_entry_file_operation_batch_remains_reconcilable() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let old_source =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_source =
+        "unit Provider;\ninterface\ntype TNewThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\nimplementation\nend.\n";
+    write_file(&provider, old_source);
+    write_file(&consumer, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+
+    let original_metadata = fs::metadata(&provider).expect("original provider metadata");
+    write_file(&provider, new_source);
+    restore_mtime(&provider, &original_metadata);
+    let mut files: Vec<_> = (0..63)
+        .map(|index| json!({"uri":uri(&root.path().join(format!("Noise{index}.pas")))}))
+        .collect();
+    files.push(json!({"uri":uri(&provider)}));
+    assert_eq!(files.len(), 64);
+    server.send_notification("workspace/didCreateFiles", json!({"files":files}));
+
+    let id = RequestId::from("sixty-four-entry-create-provider".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumer, consumer_source, "TNewThing", 0),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "64-entry batch was fenced: {response:?}"
+    );
+    let locations = result_locations(response);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
     server.shutdown();
 }
 

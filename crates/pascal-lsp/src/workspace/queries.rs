@@ -1215,6 +1215,44 @@ pub(crate) fn formatting_from_input(
     with_records(source_generation, configuration_generation, value, records)
 }
 
+pub(crate) fn range_formatting_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    range: Range,
+    tab_size: u32,
+    insert_spaces: bool,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<lsp_types::TextEdit>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let mut workspace = super::Workspace::from_analysis_input(&input);
+    let value = match workspace.range_formatting_edits_with_cancel(
+        &uri,
+        range,
+        tab_size,
+        insert_spaces,
+        cancel,
+    ) {
+        Ok(edits) => Ok(edits),
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => Err(error),
+    };
+    let records = match workspace.analysis_records(cancel) {
+        Ok(records) => records,
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    with_records(source_generation, configuration_generation, value, records)
+}
+
 pub(crate) fn diagnostics_from_input(
     input: WorkspaceInput,
     uri: &Url,

@@ -911,12 +911,17 @@ exclude potential consumers.
 `.lint4d.toml` is discovered for each open file's lint settings and suppressions.
 Excludes from that sidecar suppress lint diagnostics for matching files; they do
 not apply to source discovery. The initialization `exclude` option controls
-source discovery. `.fmt4d.toml` controls formatting; this slice does not
-translate LSP indentation options into formatter settings. Formatting is
-explicit and returns an edit to the client: the server does not write files.
-Include files (`.inc`) participate in source analysis but are rejected as
-direct formatting targets; only `.pas`, `.dpr`, and `.dpk` buffers are
-formatted.
+source discovery. `.fmt4d.toml` controls formatter style. Document formatting
+returns an edit to the client and never writes files. Range formatting also
+honors the request's standard `tabSize` and `insertSpaces` options for that
+request, overriding only indentation in the project formatter configuration.
+Range formatting currently accepts a single complete statement line (expanded
+to that whole line) and emits edits only within it. Wider selections and ranges
+whose formatting cannot be mapped safely (including comments/directives or
+ambiguous `uses` ownership) are refused rather than replacing the full document.
+Include files (`.inc`)
+participate in source analysis but are rejected as direct formatting targets;
+only `.pas`, `.dpr`, and `.dpk` buffers are formatted.
 DCU-dependent lint rules are not enabled through a project context in this
 slice, and the CLI's baseline filtering is not applied.
 

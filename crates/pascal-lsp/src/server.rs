@@ -1996,6 +1996,9 @@ enum AnalysisRequest {
     },
     Formatting {
         uri: Url,
+        range: Option<lsp_types::Range>,
+        tab_size: u32,
+        insert_spaces: bool,
     },
     Diagnostics {
         uri: Url,
@@ -2086,7 +2089,7 @@ enum AnalysisResultValue {
     ResolveCompletion(CompletionResolutionAnalysis),
     SignatureHelp(Result<Option<lsp_types::SignatureHelp>, String>),
     Navigation(NavigationAnalysis),
-    Formatting(Result<Option<lsp_types::TextEdit>, String>),
+    Formatting(Result<Vec<lsp_types::TextEdit>, String>),
     Diagnostics(DiagnosticsAnalysis),
     DocumentDiagnostics(Result<DocumentDiagnosticsAnalysis, String>),
     WorkspaceDiagnostics(Result<WorkspaceDiagnosticsAnalysis, String>),
@@ -5199,7 +5202,12 @@ impl AnalysisJobs {
                                 }
                             }
                         }
-                        AnalysisRequest::Formatting { uri } => {
+                        AnalysisRequest::Formatting {
+                            uri,
+                            range,
+                            tab_size,
+                            insert_spaces,
+                        } => {
                             if let Err(error) = wait_at_test_barrier(
                                 TestBarrier::Formatting,
                                 &test_barriers,
@@ -5213,11 +5221,30 @@ impl AnalysisJobs {
                                     value: AnalysisResultValue::Formatting(Err(error)),
                                 }
                             } else {
-                                let computed = queries::formatting_from_input(
-                                    input,
-                                    &uri,
-                                    &worker_cancellation,
-                                );
+                                let computed = if let Some(range) = range {
+                                    queries::range_formatting_from_input(
+                                        input,
+                                        &uri,
+                                        range,
+                                        tab_size,
+                                        insert_spaces,
+                                        &worker_cancellation,
+                                    )
+                                } else {
+                                    let computed = queries::formatting_from_input(
+                                        input,
+                                        &uri,
+                                        &worker_cancellation,
+                                    );
+                                    rename::Computed {
+                                        source_generation: computed.source_generation,
+                                        configuration_generation: computed.configuration_generation,
+                                        value: computed
+                                            .value
+                                            .map(|edit| edit.into_iter().collect()),
+                                        records: computed.records,
+                                    }
+                                };
                                 AnalysisResult {
                                     id: worker_id,
                                     source_generation: computed.source_generation,
@@ -7723,18 +7750,21 @@ fn deliver_analysis_result_with_store(
             }
         },
         AnalysisResultValue::Formatting(value) => match value {
-            Ok(Some(edit)) => send_ok(
-                connection,
-                client_id.clone().expect("client result"),
-                vec![edit],
-            ),
-            Ok(None) => send_ok(
-                connection,
-                client_id.clone().expect("client result"),
-                Vec::<lsp_types::TextEdit>::new(),
-            ),
+            Ok(edits) => send_ok(connection, client_id.clone().expect("client result"), edits),
             Err(error) if error == rename::CANCELLATION_MESSAGE => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+            Err(error)
+                if error.starts_with("range start")
+                    || error.starts_with("range end")
+                    || error.starts_with("formatting tabSize") =>
+            {
+                send_error(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    ErrorCode::InvalidParams,
+                    format!("invalid range formatting parameters: {error}"),
+                )
             }
             Err(error) => send_error(
                 connection,
@@ -9804,6 +9834,7 @@ fn request_requires_configuration(method: &str) -> bool {
             | "textDocument/definition"
             | "textDocument/implementation"
             | "textDocument/formatting"
+            | "textDocument/rangeFormatting"
             | "workspace/willCreateFiles"
             | "workspace/willRenameFiles"
             | "workspace/willDeleteFiles"
@@ -10641,6 +10672,33 @@ fn handle_request(
                 request.id,
                 AnalysisRequest::Formatting {
                     uri: canonical_file_uri(&params.text_document.uri),
+                    range: None,
+                    tab_size: params.options.tab_size,
+                    insert_spaces: params.options.insert_spaces,
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "textDocument/rangeFormatting" => {
+            let id = request.id.clone();
+            let params: lsp_types::DocumentRangeFormattingParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Formatting {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                    range: Some(params.range),
+                    tab_size: params.options.tab_size,
+                    insert_spaces: params.options.insert_spaces,
                 },
                 client_features,
                 work_done_token.clone(),
@@ -11994,6 +12052,7 @@ fn server_capabilities(
             "workDoneProgress": true
         },
         "documentFormattingProvider": {"workDoneProgress": true},
+        "documentRangeFormattingProvider": {"workDoneProgress": true},
         "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
             "codeActionKinds": [

@@ -4444,6 +4444,10 @@ fn initialize_advertises_utf16_sync_navigation_and_formatting() {
         capabilities["documentFormattingProvider"]["workDoneProgress"],
         true
     );
+    assert_eq!(
+        capabilities["documentRangeFormattingProvider"]["workDoneProgress"],
+        true
+    );
     assert_eq!(capabilities["experimental"]["projectSelection"], true);
     server.shutdown();
 }
@@ -29875,6 +29879,215 @@ fn diagnostics_use_utf16_columns_and_formatting_is_in_memory() {
         fs::read_to_string(&format_path).expect("read original"),
         format_source
     );
+    server.shutdown();
+}
+
+#[test]
+fn range_formatting_formats_selected_lines_without_replacing_unrelated_text() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:= 1+2;\nend;\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join(".fmt.toml"),
+        "[format]\nindent_size = 8\nindent_style = \"tab\"\n",
+    );
+    let mut server = TestServer::launch();
+    let capabilities = server.initialize(root, Value::Null);
+    assert_eq!(
+        capabilities["capabilities"]["documentRangeFormattingProvider"]["workDoneProgress"],
+        true
+    );
+
+    let request_id = RequestId::from("range-format-interior".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 8}},
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "range formatting failed: {response:?}"
+    );
+    let edits = response.result.expect("range formatting result");
+    assert!(edits.is_array());
+    assert!(
+        !edits.as_array().expect("edits").is_empty(),
+        "selected statement should be formatted"
+    );
+    let edit = &edits[0];
+    assert!(edit["range"]["start"]["line"].as_u64().expect("start line") >= 5);
+    assert!(edit["range"]["end"]["line"].as_u64().expect("end line") <= 5);
+    assert_eq!(
+        edit["newText"], "    X := 1 + 2;",
+        "client indent settings override project defaults"
+    );
+    let start_line = edit["range"]["start"]["line"].as_u64().expect("start line") as usize;
+    let end_line = edit["range"]["end"]["line"].as_u64().expect("end line") as usize;
+    assert_eq!(
+        (start_line, end_line),
+        (5, 5),
+        "edits stay within the expanded selected line"
+    );
+    let lines = source.split_inclusive('\n').collect::<Vec<_>>();
+    let applied = format!(
+        "{}{}\n{}",
+        lines[..5].concat(),
+        edit["newText"].as_str().expect("replacement"),
+        lines[6..].concat()
+    );
+    assert!(
+        applied.starts_with(&lines[..5].concat()),
+        "prefix bytes outside the edit must remain exact"
+    );
+    assert!(
+        applied.ends_with(&lines[6..].concat()),
+        "suffix bytes outside the edit must remain exact"
+    );
+    assert!(applied.contains("    X := 1 + 2;\n"));
+    assert_eq!(
+        fs::read_to_string(&main).expect("read source"),
+        source,
+        "formatting must not write the file"
+    );
+
+    let tabs_id = RequestId::from("range-format-client-tabs".to_string());
+    server.send_request(
+        tabs_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 8}},
+            "options": {"tabSize": 3, "insertSpaces": false}
+        }),
+    );
+    let tabs = server.response(&tabs_id);
+    assert!(
+        tabs.error.is_none(),
+        "tab range formatting failed: {tabs:?}"
+    );
+    assert_eq!(
+        tabs.result.expect("tab edits")[0]["newText"],
+        "\tX := 1 + 2;"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn range_formatting_preserves_bom_crlf_and_validates_utf16_ranges() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source = "\u{feff}unit Main;\r\ninterface\r\nimplementation\r\nprocedure Run;\r\nbegin\r\n  { 😀 }\r\nX:='😀';\r\nend;\r\nend.\r\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let request_id = RequestId::from("range-format-crlf-bom".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 6, "character": 0}, "end": {"line": 6, "character": 8}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "range formatting failed: {response:?}"
+    );
+    let edits = response.result.expect("range formatting result");
+    assert_eq!(edits.as_array().expect("edits").len(), 1);
+    let edit = &edits[0];
+    assert_eq!(edit["range"]["start"]["line"], 6);
+    assert_eq!(edit["range"]["end"]["line"], 6);
+    assert_eq!(
+        edit["range"]["end"]["character"], 8,
+        "range positions use UTF-16 code units"
+    );
+    assert!(
+        edit["newText"]
+            .as_str()
+            .expect("replacement")
+            .contains("X := '😀';")
+    );
+    assert!(source.starts_with('\u{feff}'));
+    assert!(source.contains("\r\n"));
+
+    let invalid_id = RequestId::from("range-format-invalid".to_string());
+    server.send_request(
+        invalid_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 99, "character": 0}, "end": {"line": 99, "character": 1}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let invalid = server.response(&invalid_id);
+    assert_eq!(invalid.error.expect("invalid range error").code, -32602);
+
+    let no_op_id = RequestId::from("range-format-noop".to_string());
+    server.send_request(
+        no_op_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 6, "character": 3}, "end": {"line": 6, "character": 3}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    assert_eq!(
+        server.response(&no_op_id).result.expect("no-op result"),
+        json!([])
+    );
+    server.shutdown();
+}
+
+#[test]
+fn range_formatting_uses_open_overlay_instead_of_disk_contents() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let disk =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nDisk:= 1;\nend;\nend.\n";
+    let overlay =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nOverlay:=1+2;\nend;\nend.\n";
+    write_file(&main, disk);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": overlay}}),
+    );
+    let _ = server.notification("textDocument/publishDiagnostics");
+    let request_id = RequestId::from("range-format-overlay".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 11}},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "overlay range formatting failed: {response:?}"
+    );
+    let edit = &response.result.expect("range edits")[0];
+    assert_eq!(edit["newText"], "  Overlay := 1 + 2;");
+    assert_eq!(fs::read_to_string(&main).expect("read disk source"), disk);
     server.shutdown();
 }
 

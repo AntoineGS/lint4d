@@ -6029,6 +6029,33 @@ impl NavigationIndex {
         self.documents.len()
     }
 
+    /// Work and retained byte payload that recovery must destroy with this
+    /// index. This is intentionally a bounded-accounting view, not an attempt
+    /// to estimate allocator capacity or Rust object layout.
+    pub(crate) fn visit_recovery_payload(
+        &self,
+        mut visit: impl FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for document in self.documents.values() {
+            let parsed = &document.parsed;
+            visit(
+                parsed
+                    .source
+                    .len()
+                    .saturating_add(parsed.parser_source.len()),
+            )?;
+            for symbol in &parsed.symbols {
+                visit(symbol.name.len().saturating_add(symbol.key.len()))?;
+            }
+            if let Some(bindings) = &document.import_bindings {
+                for (name, uri) in bindings {
+                    visit(name.len().saturating_add(uri.as_str().len()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve the identifier at `position` in `uri`.
     ///
     /// Unknown names and unknown receivers return an empty vector. In

@@ -32543,10 +32543,12 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         .filter(|(index, _)| *index != 1)
         .map(|(_, consumer)| uri(consumer).as_str().len() as u64)
         .sum::<u64>();
-    assert_eq!(
-        metrics["recovery_uri_byte_reserve"].as_u64(),
-        Some(2 * open_uri_bytes),
-        "preflight plus recovery must reserve exact URI bytes for the admitted open documents: {metrics}"
+    assert!(
+        metrics["recovery_byte_reserve"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 2 * open_uri_bytes,
+        "preflight plus recovery must reserve URI and retained nested-payload byte work: {metrics}"
     );
     assert!(
         metrics["recovery_visits"].as_u64().unwrap_or_default() > PROJECTS as u64,

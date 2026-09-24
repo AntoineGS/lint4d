@@ -1001,8 +1001,8 @@ const MAX_NOTIFICATION_DIAGNOSTIC_RECORD_CHECKS: usize = 2_048;
 const MAX_NOTIFICATION_DIAGNOSTIC_TARGETS: usize = 4_096;
 const MAX_NOTIFICATION_DIAGNOSTIC_URI_BYTES: usize = 256 * 1024;
 const MAX_NOTIFICATION_RECOVERY_TARGETS: usize = DEFAULT_MAX_FILES;
-const MAX_NOTIFICATION_RECOVERY_URI_BYTES: usize =
-    2 * MAX_OPEN_DOCUMENTS * MAX_OPEN_DOCUMENT_URI_BYTES + 2 * MAX_PENDING_FILE_RENAME_BYTES;
+const MAX_NOTIFICATION_RECOVERY_BYTES: usize = 128 * 1024 * 1024;
+const MAX_NOTIFICATION_RECOVERY_NESTED_ENTRIES: usize = 65_536;
 const MAX_NOTIFICATION_RECOVERY_RENAME_ENDPOINTS: usize =
     2 * (MAX_PENDING_FILE_RENAMES + MAX_NOTIFICATION_FILE_RENAME_BATCH_ENTRIES);
 const MAX_NOTIFICATION_FILE_RENAME_BATCH_ENTRIES: usize = 64;
@@ -1047,12 +1047,12 @@ pub(crate) struct ReconciliationBudget {
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
     recovery_target_reserve: Cell<usize>,
-    recovery_uri_byte_reserve: Cell<usize>,
+    recovery_byte_reserve: Cell<usize>,
     recovery_visit_reserve: Cell<usize>,
     recovery_preflight_visits: Cell<usize>,
-    recovery_preflight_uri_bytes: Cell<usize>,
+    recovery_preflight_bytes: Cell<usize>,
     recovery_visits: Cell<usize>,
-    recovery_uri_bytes: Cell<usize>,
+    recovery_bytes: Cell<usize>,
     recovery_refused: Cell<bool>,
 }
 
@@ -1069,12 +1069,12 @@ impl ReconciliationBudget {
             deleted_uris: RefCell::new(HashSet::new()),
             rename_endpoints: RefCell::new(HashSet::new()),
             recovery_target_reserve: Cell::new(0),
-            recovery_uri_byte_reserve: Cell::new(0),
+            recovery_byte_reserve: Cell::new(0),
             recovery_visit_reserve: Cell::new(0),
             recovery_preflight_visits: Cell::new(0),
-            recovery_preflight_uri_bytes: Cell::new(0),
+            recovery_preflight_bytes: Cell::new(0),
             recovery_visits: Cell::new(0),
-            recovery_uri_bytes: Cell::new(0),
+            recovery_bytes: Cell::new(0),
             recovery_refused: Cell::new(false),
         }
     }
@@ -1282,7 +1282,7 @@ impl ReconciliationBudget {
         self.rename_endpoints.borrow_mut().insert(uri);
     }
 
-    fn charge_recovery_preflight(&self, visits: usize, uri_bytes: usize) -> Result<(), String> {
+    fn charge_recovery_preflight(&self, visits: usize, bytes: usize) -> Result<(), String> {
         if self.is_cancelled() {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
@@ -1291,19 +1291,19 @@ impl ReconciliationBudget {
             .get()
             .checked_add(visits)
             .filter(|next| *next <= MAX_NOTIFICATION_RECOVERY_VISITS);
-        let next_uri_bytes = self
-            .recovery_preflight_uri_bytes
+        let next_bytes = self
+            .recovery_preflight_bytes
             .get()
-            .checked_add(uri_bytes)
-            .filter(|next| *next <= MAX_NOTIFICATION_RECOVERY_URI_BYTES);
-        let (Some(next_visits), Some(next_uri_bytes)) = (next_visits, next_uri_bytes) else {
+            .checked_add(bytes)
+            .filter(|next| *next <= MAX_NOTIFICATION_RECOVERY_BYTES);
+        let (Some(next_visits), Some(next_bytes)) = (next_visits, next_bytes) else {
             self.recovery_refused.set(true);
             return Err(
                 "workspace notification recovery preflight exceeds its fixed envelope".into(),
             );
         };
         self.recovery_preflight_visits.set(next_visits);
-        self.recovery_preflight_uri_bytes.set(next_uri_bytes);
+        self.recovery_preflight_bytes.set(next_bytes);
         self.recovery_visits.set(
             self.recovery_visits
                 .get()
@@ -1312,10 +1312,10 @@ impl ReconciliationBudget {
                     "workspace notification recovery accounting overflowed".to_string()
                 })?,
         );
-        self.recovery_uri_bytes.set(
-            self.recovery_uri_bytes
+        self.recovery_bytes.set(
+            self.recovery_bytes
                 .get()
-                .checked_add(uri_bytes)
+                .checked_add(bytes)
                 .ok_or_else(|| {
                     "workspace notification recovery accounting overflowed".to_string()
                 })?,
@@ -1326,7 +1326,7 @@ impl ReconciliationBudget {
     fn reserve_recovery_envelope(
         &self,
         recovery_visits: usize,
-        recovery_uri_bytes: usize,
+        recovery_bytes: usize,
         recovery_targets: usize,
     ) -> Result<(), String> {
         if self.is_cancelled() {
@@ -1337,12 +1337,12 @@ impl ReconciliationBudget {
             .get()
             .checked_add(recovery_visits)
             .filter(|total| *total <= MAX_NOTIFICATION_RECOVERY_VISITS);
-        let total_uri_bytes = self
-            .recovery_uri_bytes
+        let total_bytes = self
+            .recovery_bytes
             .get()
-            .checked_add(recovery_uri_bytes)
-            .filter(|total| *total <= MAX_NOTIFICATION_RECOVERY_URI_BYTES);
-        let (Some(total_visits), Some(total_uri_bytes)) = (total_visits, total_uri_bytes) else {
+            .checked_add(recovery_bytes)
+            .filter(|total| *total <= MAX_NOTIFICATION_RECOVERY_BYTES);
+        let (Some(total_visits), Some(total_bytes)) = (total_visits, total_bytes) else {
             self.recovery_refused.set(true);
             return Err("workspace notification recovery exceeds its fixed work envelope".into());
         };
@@ -1351,33 +1351,33 @@ impl ReconciliationBudget {
             return Err("workspace notification recovery exceeds its admitted target cap".into());
         }
         self.recovery_visit_reserve.set(total_visits);
-        self.recovery_uri_byte_reserve.set(total_uri_bytes);
+        self.recovery_byte_reserve.set(total_bytes);
         self.recovery_target_reserve.set(recovery_targets);
         Ok(())
     }
 
-    fn charge_recovery_work(&self, visits: usize, uri_bytes: usize) -> Result<(), String> {
+    fn charge_recovery_work(&self, visits: usize, bytes: usize) -> Result<(), String> {
         if self.is_cancelled() {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         let next_visits = self.recovery_visits.get().checked_add(visits);
-        let next_uri_bytes = self.recovery_uri_bytes.get().checked_add(uri_bytes);
-        let (Some(next_visits), Some(next_uri_bytes)) = (next_visits, next_uri_bytes) else {
+        let next_bytes = self.recovery_bytes.get().checked_add(bytes);
+        let (Some(next_visits), Some(next_bytes)) = (next_visits, next_bytes) else {
             self.recovery_refused.set(true);
             return Err("workspace notification recovery accounting overflowed".into());
         };
         if next_visits > self.recovery_visit_reserve.get()
-            || next_uri_bytes > self.recovery_uri_byte_reserve.get()
+            || next_bytes > self.recovery_byte_reserve.get()
         {
             self.recovery_refused.set(true);
             return Err(format!(
-                "workspace notification recovery exceeded its reserved envelope (visits {next_visits}/{}, URI bytes {next_uri_bytes}/{})",
+                "workspace notification recovery exceeded its reserved envelope (visits {next_visits}/{}, byte work {next_bytes}/{})",
                 self.recovery_visit_reserve.get(),
-                self.recovery_uri_byte_reserve.get()
+                self.recovery_byte_reserve.get()
             ));
         }
         self.recovery_visits.set(next_visits);
-        self.recovery_uri_bytes.set(next_uri_bytes);
+        self.recovery_bytes.set(next_bytes);
         Ok(())
     }
 
@@ -1397,12 +1397,12 @@ impl ReconciliationBudget {
             "unique_targets": used.unique_diagnostic_targets,
             "diagnostic_uri_bytes": used.diagnostic_uri_bytes,
             "recovery_target_reserve": self.recovery_target_reserve.get(),
-            "recovery_uri_byte_reserve": self.recovery_uri_byte_reserve.get(),
+            "recovery_byte_reserve": self.recovery_byte_reserve.get(),
             "recovery_visit_reserve": self.recovery_visit_reserve.get(),
             "recovery_preflight_visits": self.recovery_preflight_visits.get(),
-            "recovery_preflight_uri_bytes": self.recovery_preflight_uri_bytes.get(),
+            "recovery_preflight_bytes": self.recovery_preflight_bytes.get(),
             "recovery_visits": self.recovery_visits.get(),
-            "recovery_uri_bytes": self.recovery_uri_bytes.get(),
+            "recovery_bytes": self.recovery_bytes.get(),
             "recovery_refused": self.recovery_refused.get(),
             "budget_exceeded": budget_exceeded,
         })
@@ -1858,6 +1858,8 @@ struct NotificationRecoveryPlan {
     open_document_visits: usize,
     open_document_uri_bytes: usize,
     recovery_targets: usize,
+    retained_payload_visits: usize,
+    retained_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3533,67 +3535,161 @@ impl Workspace {
         }
 
         let mut clear_work_visits = 0usize;
-        macro_rules! count_recovery_entries {
-            ($count:expr) => {{
-                clear_work_visits = clear_work_visits
-                    .checked_add($count)
-                    .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_VISITS)
+        let mut retained_payload_visits = 0usize;
+        let mut retained_payload_bytes = 0usize;
+        {
+            let mut charge_retained_payload = |bytes: usize| -> Result<(), String> {
+                retained_payload_visits = retained_payload_visits
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_NESTED_ENTRIES)
                     .ok_or_else(|| {
                         budget.recovery_refused.set(true);
-                        "workspace notification recovery exceeds its fixed visit envelope"
+                        "workspace notification recovery exceeds its nested-payload entry cap"
                             .to_string()
                     })?;
-            }};
-        }
-        count_recovery_entries!(self.contexts.len());
-        count_recovery_entries!(self.document_contexts.len());
-        count_recovery_entries!(self.open_document_contexts.len());
-        count_recovery_entries!(self.cached_documents.len());
-        count_recovery_entries!(self.directory_catalogues.len());
-        count_recovery_entries!(self.filename_catalogues.len());
-        count_recovery_entries!(self.package_catalogues.len());
-        count_recovery_entries!(self.package_metadata_cache.len());
-        count_recovery_entries!(self.source_change_generations.len());
-        count_recovery_entries!(self.source_change_observations.len());
-        count_recovery_entries!(self.configuration_change_generations.len());
-        count_recovery_entries!(self.expansions.len());
-        count_recovery_entries!(self.include_parents.len());
-        count_recovery_entries!(self.document_owners.len());
-        count_recovery_entries!(self.owner_last_used.len());
-        count_recovery_entries!(self.pending_unit_file_renames.len());
-        count_recovery_entries!(self.indexed_files.len());
-        count_recovery_entries!(self.indexed_sizes.len());
-        count_recovery_entries!(self.disk_stamps.len());
-        count_recovery_entries!(self.last_used.len());
-        count_recovery_entries!(self.pending_diagnostics.len());
-        count_recovery_entries!(self.diagnostic_dependencies.len());
-        count_recovery_entries!(self.warnings.len());
-        count_recovery_entries!(self.index.document_count());
-        count_recovery_entries!(staged_endpoints.len());
-        if let Some(records) = &self.analysis_records {
-            count_recovery_entries!(records.len());
-        }
-        for expansion in self.expansions.values() {
-            budget.charge_recovery_preflight(1, 0)?;
-            count_recovery_entries!(
-                expansion.dependencies.len()
-                    + expansion.dependency_entries.len()
-                    + expansion.include_observations.len()
-                    + expansion.source_texts.len()
-            );
-        }
-        for parents in self.include_parents.values() {
-            budget.charge_recovery_preflight(1, 0)?;
-            count_recovery_entries!(parents.len());
-        }
-        for records in self.diagnostic_dependencies.values() {
-            budget.charge_recovery_preflight(1, 0)?;
-            count_recovery_entries!(records.len());
-            for record in records {
+                retained_payload_bytes = retained_payload_bytes
+                    .checked_add(bytes)
+                    .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_BYTES)
+                    .ok_or_else(|| {
+                        budget.recovery_refused.set(true);
+                        "workspace notification recovery exceeds its nested-payload byte cap"
+                            .to_string()
+                    })?;
+                budget.charge_recovery_preflight(1, bytes)
+            };
+            macro_rules! count_recovery_entries {
+                ($count:expr) => {{
+                    clear_work_visits = clear_work_visits
+                        .checked_add($count)
+                        .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_VISITS)
+                        .ok_or_else(|| {
+                            budget.recovery_refused.set(true);
+                            "workspace notification recovery exceeds its fixed visit envelope"
+                                .to_string()
+                        })?;
+                }};
+            }
+            count_recovery_entries!(self.contexts.len());
+            count_recovery_entries!(self.document_contexts.len());
+            count_recovery_entries!(self.open_document_contexts.len());
+            count_recovery_entries!(self.cached_documents.len());
+            count_recovery_entries!(self.directory_catalogues.len());
+            count_recovery_entries!(self.filename_catalogues.len());
+            count_recovery_entries!(self.package_catalogues.len());
+            count_recovery_entries!(self.package_metadata_cache.len());
+            count_recovery_entries!(self.source_change_generations.len());
+            count_recovery_entries!(self.source_change_observations.len());
+            count_recovery_entries!(self.configuration_change_generations.len());
+            count_recovery_entries!(self.expansions.len());
+            count_recovery_entries!(self.include_parents.len());
+            count_recovery_entries!(self.document_owners.len());
+            count_recovery_entries!(self.owner_last_used.len());
+            count_recovery_entries!(self.pending_unit_file_renames.len());
+            count_recovery_entries!(self.indexed_files.len());
+            count_recovery_entries!(self.indexed_sizes.len());
+            count_recovery_entries!(self.disk_stamps.len());
+            count_recovery_entries!(self.last_used.len());
+            count_recovery_entries!(self.pending_diagnostics.len());
+            count_recovery_entries!(self.diagnostic_dependencies.len());
+            count_recovery_entries!(self.warnings.len());
+            count_recovery_entries!(self.index.document_count());
+            count_recovery_entries!(staged_endpoints.len());
+            if let Some(records) = &self.analysis_records {
+                count_recovery_entries!(records.len());
+            }
+            for (key, catalogue) in &self.directory_catalogues {
+                charge_retained_payload(key.as_os_str().len())?;
+                for path in &catalogue.entries {
+                    charge_retained_payload(path.as_os_str().len())?;
+                }
+            }
+            for (key, catalogue) in &self.filename_catalogues {
+                charge_retained_payload(key.as_os_str().len())?;
+                for (name, paths) in &catalogue.entries {
+                    charge_retained_payload(name.len())?;
+                    for path in paths {
+                        charge_retained_payload(path.as_os_str().len())?;
+                    }
+                }
+                for (path, _) in &catalogue.directories {
+                    charge_retained_payload(path.as_os_str().len())?;
+                }
+            }
+            for (key, catalogue) in &self.package_catalogues {
+                charge_retained_payload(key.root.as_os_str().len())?;
+                for (name, paths) in &catalogue.entries {
+                    charge_retained_payload(name.len())?;
+                    for path in paths {
+                        charge_retained_payload(path.as_os_str().len())?;
+                    }
+                }
+                for name in &catalogue.requested_names {
+                    charge_retained_payload(name.len())?;
+                }
+                for (path, _) in &catalogue.directories {
+                    charge_retained_payload(path.as_os_str().len())?;
+                }
+            }
+            self.index
+                .visit_recovery_payload(&mut charge_retained_payload)?;
+            for expansion in self.expansions.values() {
                 budget.charge_recovery_preflight(1, 0)?;
-                count_recovery_entries!(record.candidate_observations.len());
+                count_recovery_entries!(
+                    expansion.dependencies.len()
+                        + expansion.dependency_entries.len()
+                        + expansion.include_observations.len()
+                        + expansion.source_texts.len()
+                );
+                charge_retained_payload(expansion.physical_source.len())?;
+                for (uri, source) in &expansion.source_texts {
+                    charge_retained_payload(uri.as_str().len())?;
+                    charge_retained_payload(source.len())?;
+                }
+                for uri in &expansion.dependencies {
+                    charge_retained_payload(uri.as_str().len())?;
+                }
+                for (uri, entry) in &expansion.dependency_entries {
+                    charge_retained_payload(uri.as_str().len())?;
+                    charge_retained_payload(entry.path.as_os_str().len())?;
+                }
+                for observation in &expansion.include_observations {
+                    charge_retained_payload(observation.path.as_os_str().len())?;
+                }
+            }
+            for parents in self.include_parents.values() {
+                budget.charge_recovery_preflight(1, 0)?;
+                count_recovery_entries!(parents.len());
+                for parent in parents {
+                    charge_retained_payload(parent.as_str().len())?;
+                }
+            }
+            for records in self.diagnostic_dependencies.values() {
+                budget.charge_recovery_preflight(1, 0)?;
+                count_recovery_entries!(records.len());
+                for record in records {
+                    budget.charge_recovery_preflight(1, 0)?;
+                    count_recovery_entries!(record.candidate_observations.len());
+                    charge_retained_payload(record.uri.as_str().len())?;
+                    charge_retained_payload(record.text.len())?;
+                    if let Some(bytes) = &record.content_bytes {
+                        charge_retained_payload(bytes.len())?;
+                    }
+                    if let Some(path) = &record.path {
+                        charge_retained_payload(path.as_os_str().len())?;
+                    }
+                    for observation in &record.candidate_observations {
+                        charge_retained_payload(observation.path.as_os_str().len())?;
+                    }
+                }
             }
         }
+        clear_work_visits = clear_work_visits
+            .checked_add(retained_payload_visits)
+            .filter(|count| *count <= MAX_NOTIFICATION_RECOVERY_VISITS)
+            .ok_or_else(|| {
+                budget.recovery_refused.set(true);
+                "workspace notification recovery exceeds its fixed visit envelope".to_string()
+            })?;
         let recovery_targets = self.open_documents.len();
         let clear_work_visits = clear_work_visits
             .checked_add(self.open_documents.len())
@@ -3607,7 +3703,8 @@ impl Workspace {
             clear_work_visits,
             open_document_uri_bytes
                 .saturating_add(deleted_uris.iter().map(|uri| uri.as_str().len()).sum())
-                .saturating_add(self.pending_unit_file_rename_bytes),
+                .saturating_add(self.pending_unit_file_rename_bytes)
+                .saturating_add(retained_payload_bytes),
             recovery_targets,
         )?;
 
@@ -3618,6 +3715,8 @@ impl Workspace {
             open_document_visits: self.open_documents.len(),
             open_document_uri_bytes,
             recovery_targets,
+            retained_payload_visits,
+            retained_payload_bytes,
         })
     }
 
@@ -3639,6 +3738,7 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_global_change();
+        budget.charge_recovery_work(plan.retained_payload_visits, plan.retained_payload_bytes)?;
         macro_rules! clear_recovery_map {
             ($map:expr) => {{
                 let len = $map.len();
@@ -3747,9 +3847,10 @@ impl Workspace {
             if self.deleted_overrides.len() >= MAX_DELETED_OVERRIDES
                 && !self.deleted_overrides.contains_key(uri)
             {
-                if let Some(victim) = self.deleted_overrides.keys().next().cloned() {
-                    self.deleted_overrides.remove(&victim);
-                }
+                // We cannot discard an earlier authoritative negative
+                // observation. The permanent global fence prevents serving
+                // state that could depend on the unretained deletion.
+                continue;
             }
             self.deleted_overrides.insert(uri.clone(), None);
         }
@@ -9808,9 +9909,8 @@ impl Workspace {
         if self.deleted_overrides.len() >= MAX_DELETED_OVERRIDES
             && !self.deleted_overrides.contains_key(uri)
         {
-            if let Some(victim) = self.deleted_overrides.keys().next().cloned() {
-                self.deleted_overrides.remove(&victim);
-            }
+            self.rejected_open_fence_permanent = true;
+            return;
         }
         let stamp = uri
             .to_file_path()
@@ -12628,8 +12728,8 @@ mod tests {
                 Some(recovery_visits)
             );
             assert!(
-                metrics["recovery_uri_bytes"].as_u64().unwrap_or_default()
-                    <= super::MAX_NOTIFICATION_RECOVERY_URI_BYTES as u64
+                metrics["recovery_bytes"].as_u64().unwrap_or_default()
+                    <= super::MAX_NOTIFICATION_RECOVERY_BYTES as u64
             );
             assert_eq!(metrics["recovery_refused"], false);
         }
@@ -12688,6 +12788,81 @@ mod tests {
             assert_eq!(metrics["recovery_visits"], 0);
             assert_eq!(metrics["recovery_visit_reserve"], 0);
         }
+    }
+
+    #[test]
+    fn recovery_refuses_nested_catalogue_payload_before_clearing_it() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let catalogue_root = temp.path().join("catalogue");
+        let key = super::PackageCatalogueKey {
+            context: budget_test_context_key(0),
+            root: catalogue_root.clone(),
+        };
+        let mut catalogue = super::PackageCatalogue::default();
+        catalogue.entries.insert(
+            "many-children".into(),
+            (0..=65_536)
+                .map(|entry| catalogue_root.join(format!("child-{entry:05}.pas")))
+                .collect(),
+        );
+        workspace.package_catalogues.insert(key, catalogue);
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget
+            .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
+            .expect("force notification recovery");
+        let retained_catalogues = workspace.package_catalogues.len();
+
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(workspace.package_catalogues.len(), retained_catalogues);
+        assert_eq!(
+            workspace
+                .package_catalogues
+                .values()
+                .next()
+                .unwrap()
+                .entries["many-children"]
+                .len(),
+            65_537
+        );
+        #[cfg(feature = "test-support")]
+        assert!(budget.metrics(true)["recovery_refused"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn tombstone_capacity_overflow_keeps_global_analysis_fenced() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let first_uri =
+            Url::from_file_path(temp.path().join("Deleted000.pas")).expect("first deleted URI");
+        for index in 0..super::MAX_DELETED_OVERRIDES {
+            let uri = Url::from_file_path(temp.path().join(format!("Deleted{index:03}.pas")))
+                .expect("deleted URI");
+            workspace.remember_deleted(&uri);
+        }
+        let overflow_uri = Url::from_file_path(temp.path().join("Deleted256.pas"))
+            .expect("recovery-batch deleted URI");
+        let cancellation = std::sync::Arc::new(AtomicBool::new(true));
+        let budget = ReconciliationBudget::new(cancellation);
+        budget.record_file_event(overflow_uri, super::FileChange::Deleted);
+        workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert!(workspace.analysis_admission_fenced());
+        assert!(workspace.deleted_overrides.contains_key(&first_uri));
+        assert_eq!(
+            workspace.deleted_overrides.len(),
+            super::MAX_DELETED_OVERRIDES
+        );
+
+        workspace
+            .file_event_with_cancel(&first_uri, super::FileChange::Changed, None)
+            .expect("later event is handled without clearing the global fence");
+        assert!(workspace.analysis_admission_fenced());
+        assert!(!workspace.deleted_overrides.contains_key(&first_uri));
     }
 
     #[test]

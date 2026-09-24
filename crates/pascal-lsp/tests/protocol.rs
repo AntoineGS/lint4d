@@ -699,6 +699,12 @@ impl TestServer {
             .expect("write LSP message");
     }
 
+    #[cfg(feature = "test-support")]
+    fn send_tracked(&mut self, message: Message, sent: &mut Vec<Message>) {
+        sent.push(message.clone());
+        self.send(message);
+    }
+
     fn response(&mut self, expected_id: &RequestId) -> Response {
         if let Some(index) = self.pending.iter().position(
             |message| matches!(message, Message::Response(response) if &response.id == expected_id),
@@ -35091,11 +35097,12 @@ fn shutdown_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline() {
 #[test]
 #[cfg(all(feature = "test-support", target_os = "linux"))]
 fn saturated_workspace_fifo_replays_watched_and_document_events_in_order() {
-    const FILLER_NOTIFICATIONS: usize = 57;
+    const FILLER_NOTIFICATIONS: usize = 56;
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let moved_provider = root.path().join("Provider.pas.moved");
     let consumer = root.path().join("Consumer.pas");
+    let unrelated = root.path().join("Unrelated.pas");
     let old_disk = "unit Provider;\ninterface\ntype TBefore = Integer;\nimplementation\nend.\n";
     let recreated_disk =
         "unit Provider;\ninterface\ntype TOnDisk = Integer;\nimplementation\nend.\n";
@@ -35107,6 +35114,9 @@ fn saturated_workspace_fifo_replays_watched_and_document_events_in_order() {
     let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TBeforeUse = Provider.TBefore;\ntype TChangedUse = Provider.TChanged;\ntype TDiskUse = Provider.TOnDisk;\ntype TFinalUse = Provider.TFinal;\nimplementation\nend.\n";
     write_file(&provider, old_disk);
     write_file(&consumer, consumer_source);
+    let unrelated_source =
+        "unit Unrelated;\ninterface\ntype TLocal = Integer;\nimplementation\nend.\n";
+    write_file(&unrelated, unrelated_source);
 
     let barrier_dir = root.path().join("saturated-order-barriers");
     fs::create_dir_all(&barrier_dir).expect("barrier directory");
@@ -35114,17 +35124,45 @@ fn saturated_workspace_fifo_replays_watched_and_document_events_in_order() {
         entered: barrier_dir.join("discovery-entered"),
         release: barrier_dir.join("discovery-release"),
     };
+    let navigation_barrier = TestBarrier {
+        entered: barrier_dir.join("navigation-entered"),
+        release: barrier_dir.join("navigation-release"),
+    };
+    let fifo_state = barrier_dir.join("fifo-state.json");
+    let reader_pending = barrier_dir.join("reader-pending.json");
     let discovery_spec = format!(
         "{}|{}",
         discovery_barrier.entered.display(),
         discovery_barrier.release.display()
     );
+    let navigation_spec = format!(
+        "{}|{}",
+        navigation_barrier.entered.display(),
+        navigation_barrier.release.display()
+    );
+    let fifo_probe_spec = format!(
+        "{}|{}|{}|{}",
+        fifo_state.display(),
+        reader_pending.display(),
+        discovery_barrier.entered.display(),
+        discovery_barrier.release.display()
+    );
     let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
         root.path(),
-        [(
-            "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
-            discovery_spec.as_str(),
-        )],
+        [
+            (
+                "PASCAL_LSP_TEST_FILE_DISCOVERY_BARRIER",
+                discovery_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_NAVIGATION_BARRIER",
+                navigation_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_WORKSPACE_FIFO_PROBE",
+                fifo_probe_spec.as_str(),
+            ),
+        ],
     );
     server.initialize_with_pull_diagnostics(root.path());
     server.send_notification(
@@ -35155,112 +35193,183 @@ fn saturated_workspace_fifo_replays_watched_and_document_events_in_order() {
     );
     discovery_barrier.wait_until_entered();
 
-    let mut queued_bytes = 0usize;
+    let mut sent_fifo_frames = Vec::new();
     for index in 0..FILLER_NOTIFICATIONS {
         let path = root.path().join(format!("Queued{index:02}.pas"));
         let message = Message::Notification(Notification::new(
             "textDocument/didOpen".to_string(),
             json!({"textDocument":{"uri":uri(&path),"languageId":"pascal","version":1,"text":"unit Queued; interface implementation end."}}),
         ));
-        queued_bytes = queued_bytes.saturating_add(
-            serde_json::to_vec(&message)
-                .expect("serialize deferred event")
-                .len(),
-        );
-        server.send_notification(
-            "textDocument/didOpen",
-            json!({"textDocument":{"uri":uri(&path),"languageId":"pascal","version":1,"text":"unit Queued; interface implementation end."}}),
-        );
+        server.send_tracked(message, &mut sent_fifo_frames);
     }
+
+    let cancel_target_id = RequestId::from("saturated-order-unrelated-cancel-target".to_string());
+    server.send_tracked(
+        Message::Request(Request::new(
+            cancel_target_id.clone(),
+            "textDocument/definition".to_string(),
+            navigation_params(&unrelated, unrelated_source, "TLocal", 0),
+        )),
+        &mut sent_fifo_frames,
+    );
 
     // FIFO entries 58–64: old provider delete is reported before unlink;
     // create follows a same-size disk replacement with restored mtime. Then
     // didChange/request/didClose/request/didOpen establish observable order.
-    server.send_notification(
-        "workspace/didChangeWatchedFiles",
-        json!({"changes":[{"uri":uri(&provider),"type":3}]}),
+    server.send_tracked(
+        Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_string(),
+            json!({"changes":[{"uri":uri(&provider),"type":3}]}),
+        )),
+        &mut sent_fifo_frames,
     );
     let old_stamp = fs::metadata(&provider).expect("old provider stamp");
     fs::rename(&provider, &moved_provider).expect("client move before watched create");
     write_file(&provider, recreated_disk);
     restore_mtime(&provider, &old_stamp);
-    server.send_notification(
-        "workspace/didChangeWatchedFiles",
-        json!({"changes":[{"uri":uri(&provider),"type":1}]}),
+    server.send_tracked(
+        Message::Notification(Notification::new(
+            "workspace/didChangeWatchedFiles".to_string(),
+            json!({"changes":[{"uri":uri(&provider),"type":1}]}),
+        )),
+        &mut sent_fifo_frames,
     );
-    server.send_notification(
-        "textDocument/didChange",
-        json!({"textDocument":{"uri":uri(&provider),"version":2},"contentChanges":[{"text":changed_overlay}]}),
+    server.send_tracked(
+        Message::Notification(Notification::new(
+            "textDocument/didChange".to_string(),
+            json!({"textDocument":{"uri":uri(&provider),"version":2},"contentChanges":[{"text":changed_overlay}]}),
+        )),
+        &mut sent_fifo_frames,
     );
     let changed_pull_id = RequestId::from("saturated-order-pull-after-change".to_string());
-    server.send_request(
-        changed_pull_id.clone(),
-        "textDocument/diagnostic",
-        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+    server.send_tracked(
+        Message::Request(Request::new(
+            changed_pull_id.clone(),
+            "textDocument/diagnostic".to_string(),
+            json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+        )),
+        &mut sent_fifo_frames,
     );
-    server.send_notification(
-        "textDocument/didClose",
-        json!({"textDocument":{"uri":uri(&provider)}}),
+    server.send_tracked(
+        Message::Notification(Notification::new(
+            "textDocument/didClose".to_string(),
+            json!({"textDocument":{"uri":uri(&provider)}}),
+        )),
+        &mut sent_fifo_frames,
     );
     let close_pull_id = RequestId::from("saturated-order-pull-after-close".to_string());
-    server.send_request(
-        close_pull_id.clone(),
-        "textDocument/diagnostic",
-        json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+    server.send_tracked(
+        Message::Request(Request::new(
+            close_pull_id.clone(),
+            "textDocument/diagnostic".to_string(),
+            json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
+        )),
+        &mut sent_fifo_frames,
     );
-    server.send_notification(
-        "textDocument/didOpen",
-        json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":3,"text":reopened_overlay}}),
+    server.send_tracked(
+        Message::Notification(Notification::new(
+            "textDocument/didOpen".to_string(),
+            json!({"textDocument":{"uri":uri(&provider),"languageId":"pascal","version":3,"text":reopened_overlay}}),
+        )),
+        &mut sent_fifo_frames,
     );
     // Entry 65 is the retained overflow slot; entry 66 is the final request.
     let pull_after_id = RequestId::from("saturated-order-after-pull".to_string());
-    server.send_request(
+    let overflow_message = Message::Request(Request::new(
         pull_after_id.clone(),
-        "textDocument/diagnostic",
+        "textDocument/diagnostic".to_string(),
         json!({"textDocument":{"uri":uri(&consumer)},"previousResultId":prior_result_id}),
-    );
+    ));
+    sent_fifo_frames.push(overflow_message.clone());
+    server.send(overflow_message);
     // Entry 66 is an ordinary request behind the full FIFO and overflow slot.
     // It must remain unanswered until the held worker is explicitly released.
     let final_definition_id = RequestId::from("saturated-order-after-open".to_string());
-    server.send_request(
+    let final_message = Message::Request(Request::new(
         final_definition_id.clone(),
-        "textDocument/definition",
+        "textDocument/definition".to_string(),
         navigation_params(&consumer, consumer_source, "Provider.TFinal", 0),
-    );
+    ));
+    assert_eq!(sent_fifo_frames.len(), 65, "64 FIFO frames plus overflow");
+    assert_eq!(FILLER_NOTIFICATIONS + 1 + 7, 64, "fill the FIFO exactly");
     assert_eq!(
-        FILLER_NOTIFICATIONS + 7,
-        64,
-        "fill the bounded FIFO exactly"
-    );
-    assert_eq!(
-        FILLER_NOTIFICATIONS + 8,
-        65,
-        "retain exactly one overflow frame"
-    );
-    assert_eq!(
-        FILLER_NOTIFICATIONS + 9,
+        sent_fifo_frames.len() + 1,
         66,
-        "place one ordinary request behind it"
+        "66th frame is ordinary input"
     );
-    // The eight post-filler accepted frames (including the overflow entry)
-    // each serialize below this conservative per-frame bound.
-    queued_bytes = queued_bytes.saturating_add(8 * 512);
+
     assert!(
-        queued_bytes < 1024 * 1024,
-        "FIFO fixtures must stay within the byte cap"
+        wait_until_json_bool(&fifo_state, "full", true, IO_TIMEOUT),
+        "must observe actual full FIFO/overflow admission while discovery remains held"
     );
+    let full_state: Value = serde_json::from_slice(&fs::read(&fifo_state).expect("FIFO state"))
+        .expect("valid FIFO probe JSON");
+    let fifo_bytes = sent_fifo_frames[..64]
+        .iter()
+        .map(|message| {
+            serde_json::to_vec(message)
+                .expect("serialize admitted FIFO message")
+                .len()
+        })
+        .sum::<usize>();
+    let overflow_bytes = serde_json::to_vec(&sent_fifo_frames[64])
+        .expect("serialize overflow message")
+        .len();
+    assert_eq!(
+        full_state["queued_count"], 64,
+        "probe snapshot: {full_state}"
+    );
+    assert_eq!(full_state["queued_bytes"], fifo_bytes);
+    assert_eq!(full_state["overflow_occupied"], true);
+    assert_eq!(full_state["overflow_bytes"], overflow_bytes);
+    assert_eq!(full_state["worker_held"], true);
+    assert_eq!(full_state["reader_pending"], false);
+    assert_eq!(full_state["full"], true);
+    assert!(fifo_bytes + overflow_bytes <= 1024 * 1024);
+    let final_frame_bytes = serde_json::to_vec(&final_message)
+        .expect("serialize 66th request")
+        .len();
 
     assert!(
         !discovery_barrier.release.exists(),
         "worker remains blocked while requests are deferred"
     );
+    server.send(final_message);
+    assert!(
+        wait_until_json_bool(&fifo_state, "reader_pending", true, IO_TIMEOUT),
+        "66th frame must be pending at reader rendezvous"
+    );
+    let pending_state: Value =
+        serde_json::from_slice(&fs::read(&fifo_state).expect("reader-pending FIFO state"))
+            .expect("valid reader-pending JSON");
+    assert_eq!(pending_state["reader_pending"], true);
+    assert_eq!(
+        pending_state["reader_pending_method"],
+        "textDocument/definition"
+    );
+    assert_eq!(pending_state["reader_pending_bytes"], final_frame_bytes);
+    assert_eq!(pending_state["worker_held"], true);
+    assert!(wait_for_file(&reader_pending, IO_TIMEOUT));
+    let reader_state: Value =
+        serde_json::from_slice(&fs::read(&reader_pending).expect("reader pending marker"))
+            .expect("valid reader marker");
+    assert_eq!(reader_state["reader_pending"], true);
+    assert_eq!(reader_state["method"], "textDocument/definition");
+    assert_eq!(reader_state["frame_bytes"], final_frame_bytes);
+    assert_eq!(reader_state["worker_held"], true);
+    assert!(fifo_bytes + overflow_bytes + final_frame_bytes <= 1024 * 1024);
     assert!(
         server
             .response_with_timeout(&final_definition_id, Duration::from_millis(100))
             .is_none(),
-        "66th request must remain unanswered until the held worker is released"
+        "66th request remains unread by event loop while full FIFO holds the worker"
     );
+    server.send_notification("$/cancelRequest", json!({"id":cancel_target_id}));
     discovery_barrier.release();
+
+    navigation_barrier.wait_until_entered();
+    let cancelled = server.response(&cancel_target_id);
+    assert_eq!(cancelled.error.expect("cancel response").code, -32800);
 
     for (request_id, stage) in [
         (&changed_pull_id, "didChange"),
@@ -35277,6 +35386,7 @@ fn saturated_workspace_fifo_replays_watched_and_document_events_in_order() {
             "{stage} must not reuse the pre-event pull result ID: {response:?}"
         );
     }
+    navigation_barrier.release();
     let final_response = server.response_acknowledging_diagnostic_refresh(&final_definition_id);
     assert!(
         final_response.error.is_none(),
@@ -35779,6 +35889,22 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
         thread::sleep(Duration::from_millis(5));
     }
     path.exists()
+}
+
+#[cfg(feature = "test-support")]
+fn wait_until_json_bool(path: &Path, field: &str, expected: bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                if value[field].as_bool() == Some(expected) {
+                    return true;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]

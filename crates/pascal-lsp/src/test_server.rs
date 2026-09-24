@@ -12,6 +12,7 @@ const TEST_REFERENCES_BARRIER_ENV: &str = "PASCAL_LSP_TEST_REFERENCES_BARRIER";
 const TEST_PARTIAL_VALIDATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER";
 const TEST_OUTBOUND_WRITER_BARRIER_ENV: &str = "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
+const TEST_WORKSPACE_FIFO_PROBE_ENV: &str = "PASCAL_LSP_TEST_WORKSPACE_FIFO_PROBE";
 
 fn barrier_from_environment(variable: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
     let Some(spec) = std::env::var_os(variable) else {
@@ -50,6 +51,29 @@ fn outbound_writer_barrier_from_environment(
     )))
 }
 
+fn workspace_fifo_probe_from_environment(
+    variable: &str,
+) -> Result<Option<(PathBuf, PathBuf, PathBuf, PathBuf)>, String> {
+    let Some(spec) = std::env::var_os(variable) else {
+        return Ok(None);
+    };
+    let spec = spec.to_string_lossy();
+    let mut paths = spec.splitn(4, '|');
+    let (Some(state), Some(reader_pending), Some(worker_entered), Some(worker_release)) =
+        (paths.next(), paths.next(), paths.next(), paths.next())
+    else {
+        return Err(format!(
+            "{variable} must contain <state>|<reader-pending>|<worker-entered>|<worker-release>"
+        ));
+    };
+    Ok(Some((
+        PathBuf::from(state),
+        PathBuf::from(reader_pending),
+        PathBuf::from(worker_entered),
+        PathBuf::from(worker_release),
+    )))
+}
+
 fn test_barrier_config() -> Result<TestBarrierConfig, String> {
     Ok(TestBarrierConfig::new(
         barrier_from_environment(TEST_NAVIGATION_BARRIER_ENV)?,
@@ -69,6 +93,9 @@ fn test_barrier_config() -> Result<TestBarrierConfig, String> {
     )?)
     .with_outbound_writer(outbound_writer_barrier_from_environment(
         TEST_OUTBOUND_WRITER_BARRIER_ENV,
+    )?)
+    .with_workspace_fifo_probe(workspace_fifo_probe_from_environment(
+        TEST_WORKSPACE_FIFO_PROBE_ENV,
     )?)
     .with_dispatch(std::env::var_os(TEST_DISPATCH_LOG_ENV).map(PathBuf::from)))
 }

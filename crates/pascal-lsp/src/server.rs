@@ -746,6 +746,8 @@ struct ProtocolConnection {
     connection: Connection,
     outbound: RefCell<OutboundQueue>,
     priority_receiver: Option<Receiver<Message>>,
+    #[cfg(feature = "test-support")]
+    workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
 }
 
 impl ProtocolConnection {
@@ -767,7 +769,35 @@ impl ProtocolConnection {
             connection,
             outbound: RefCell::new(outbound),
             priority_receiver: Some(priority_receiver),
+            #[cfg(feature = "test-support")]
+            workspace_fifo_probe: test_barriers.workspace_fifo_probe.clone(),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn record_workspace_fifo_state(
+        &self,
+        queued_count: usize,
+        queued_bytes: usize,
+        overflow: Option<&Message>,
+    ) {
+        let Some(probe) = self.workspace_fifo_probe.as_ref() else {
+            return;
+        };
+        let overflow_bytes = overflow
+            .and_then(|message| serde_json::to_vec(message).ok())
+            .map_or(0, |bytes| bytes.len());
+        let worker_held = probe.worker_entered.exists() && !probe.worker_release.exists();
+        let snapshot = serde_json::json!({
+            "queued_count": queued_count,
+            "queued_bytes": queued_bytes,
+            "overflow_occupied": overflow.is_some(),
+            "overflow_bytes": overflow_bytes,
+            "full": queued_count >= MAX_CONFIGURATION_DEFERRED_MESSAGES && overflow.is_some(),
+            "reader_pending": false,
+            "worker_held": worker_held,
+        });
+        let _ = std::fs::write(&probe.state, snapshot.to_string());
     }
 
     fn initialize_start(&self) -> Result<(RequestId, Value), lsp_server::ProtocolError> {
@@ -1068,6 +1098,7 @@ pub struct TestBarrierConfig {
     partial_validation: Option<TestBarrierPaths>,
     outbound_writer: Option<OutboundWriterBarrierPaths>,
     outbound_control_limit: Option<usize>,
+    workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
     dispatch: Option<PathBuf>,
 }
 
@@ -1084,6 +1115,15 @@ struct OutboundWriterBarrierPaths {
     armed: PathBuf,
     entered: PathBuf,
     release: PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+struct WorkspaceFifoProbePaths {
+    state: PathBuf,
+    reader_pending: PathBuf,
+    worker_entered: PathBuf,
+    worker_release: PathBuf,
 }
 
 #[cfg(feature = "test-support")]
@@ -1105,6 +1145,7 @@ impl TestBarrierConfig {
             partial_validation: None,
             outbound_writer: None,
             outbound_control_limit: None,
+            workspace_fifo_probe: None,
             dispatch: None,
         }
     }
@@ -1122,6 +1163,65 @@ impl TestBarrierConfig {
             }
         });
         self
+    }
+
+    pub fn with_workspace_fifo_probe(
+        mut self,
+        probe: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>,
+    ) -> Self {
+        self.workspace_fifo_probe =
+            probe.map(|(state, reader_pending, worker_entered, worker_release)| {
+                WorkspaceFifoProbePaths {
+                    state,
+                    reader_pending,
+                    worker_entered,
+                    worker_release,
+                }
+            });
+        self
+    }
+
+    fn record_workspace_fifo_reader_pending(&self, message: &Message) {
+        let Some(probe) = self.workspace_fifo_probe.as_ref() else {
+            return;
+        };
+        let frame_bytes = serde_json::to_vec(message).map_or(0, |bytes| bytes.len());
+        let method = match message {
+            Message::Request(request) => request.method.as_str(),
+            Message::Notification(notification) => notification.method.as_str(),
+            Message::Response(_) => "<response>",
+        };
+        let mut snapshot = std::fs::read(&probe.state)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let worker_held = probe.worker_entered.exists() && !probe.worker_release.exists();
+        if snapshot["full"] != true || !worker_held {
+            return;
+        }
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert("reader_pending".to_string(), Value::Bool(true));
+            object.insert(
+                "reader_pending_method".to_string(),
+                Value::String(method.to_string()),
+            );
+            object.insert(
+                "reader_pending_bytes".to_string(),
+                Value::from(frame_bytes as u64),
+            );
+            object.insert("worker_held".to_string(), Value::Bool(worker_held));
+        }
+        let _ = std::fs::write(&probe.state, snapshot.to_string());
+        let _ = std::fs::write(
+            &probe.reader_pending,
+            serde_json::json!({
+                "reader_pending": true,
+                "method": method,
+                "frame_bytes": frame_bytes,
+                "worker_held": worker_held,
+            })
+            .to_string(),
+        );
     }
 
     pub fn with_selection(mut self, selection: Option<(PathBuf, PathBuf)>) -> Self {
@@ -8244,6 +8344,8 @@ impl StdioThreads {
 fn bounded_stdio(
     test_barriers: TestBarrierConfig,
 ) -> (Connection, Receiver<Message>, StdioThreads) {
+    #[cfg(feature = "test-support")]
+    let reader_test_barriers = test_barriers.clone();
     let (writer_sender, writer_receiver) = bounded::<Message>(MAX_OUTBOUND_MESSAGES);
     let writer = thread::Builder::new()
         .name("PascalLspWriter".to_string())
@@ -8300,6 +8402,8 @@ fn bounded_stdio(
                         // Ordinary protocol traffic remains retained and
                         // backpressures stdin; only control frames may bypass
                         // this rendezvous through the separate bounded lane.
+                        #[cfg(feature = "test-support")]
+                        reader_test_barriers.record_workspace_fifo_reader_pending(&message);
                         if reader_sender.send(message).is_err() {
                             return Ok(());
                         }
@@ -8728,6 +8832,14 @@ fn queue_workspace_message(
                 "workspace mutation overflow slot occupied while reading continued",
             ));
         }
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("PASCAL_LSP_TEST_DISABLE_WORKSPACE_FIFO_OVERFLOW")
+            .is_some_and(|value| value == "1")
+        {
+            return Err(io::Error::other(
+                "test hook disabled workspace mutation overflow admission",
+            ));
+        }
         *overflow = Some(message);
         return Ok(());
     }
@@ -9129,6 +9241,12 @@ fn event_loop(
                     &mut deferred_workspace_overflow,
                     Message::Request(request),
                 )?;
+                #[cfg(feature = "test-support")]
+                connection.record_workspace_fifo_state(
+                    deferred_workspace_messages.len(),
+                    deferred_workspace_message_bytes,
+                    deferred_workspace_overflow.as_ref(),
+                );
             }
             Message::Request(request) => {
                 if shutdown_received {
@@ -9365,6 +9483,12 @@ fn event_loop(
                         &mut deferred_workspace_overflow,
                         Message::Notification(notification),
                     )?;
+                    #[cfg(feature = "test-support")]
+                    connection.record_workspace_fifo_state(
+                        deferred_workspace_messages.len(),
+                        deferred_workspace_message_bytes,
+                        deferred_workspace_overflow.as_ref(),
+                    );
                     continue;
                 }
                 let notification_method = notification.method.clone();
@@ -9476,6 +9600,12 @@ fn event_loop(
                         &mut deferred_workspace_overflow,
                         Message::Response(response),
                     )?;
+                    #[cfg(feature = "test-support")]
+                    connection.record_workspace_fifo_state(
+                        deferred_workspace_messages.len(),
+                        deferred_workspace_message_bytes,
+                        deferred_workspace_overflow.as_ref(),
+                    );
                     continue;
                 }
                 if diagnostic_refresh.handle_response(connection, &response)? {

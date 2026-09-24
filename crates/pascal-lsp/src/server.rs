@@ -1997,6 +1997,7 @@ enum AnalysisRequest {
     Formatting {
         uri: Url,
         range: Option<lsp_types::Range>,
+        on_type_cursor: Option<Position>,
         tab_size: u32,
         insert_spaces: bool,
     },
@@ -5205,6 +5206,7 @@ impl AnalysisJobs {
                         AnalysisRequest::Formatting {
                             uri,
                             range,
+                            on_type_cursor,
                             tab_size,
                             insert_spaces,
                         } => {
@@ -5226,6 +5228,7 @@ impl AnalysisJobs {
                                         input,
                                         &uri,
                                         range,
+                                        on_type_cursor,
                                         tab_size,
                                         insert_spaces,
                                         &worker_cancellation,
@@ -9835,6 +9838,7 @@ fn request_requires_configuration(method: &str) -> bool {
             | "textDocument/implementation"
             | "textDocument/formatting"
             | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
             | "workspace/willCreateFiles"
             | "workspace/willRenameFiles"
             | "workspace/willDeleteFiles"
@@ -10673,6 +10677,7 @@ fn handle_request(
                 AnalysisRequest::Formatting {
                     uri: canonical_file_uri(&params.text_document.uri),
                     range: None,
+                    on_type_cursor: None,
                     tab_size: params.options.tab_size,
                     insert_spaces: params.options.insert_spaces,
                 },
@@ -10697,6 +10702,43 @@ fn handle_request(
                 AnalysisRequest::Formatting {
                     uri: canonical_file_uri(&params.text_document.uri),
                     range: Some(params.range),
+                    on_type_cursor: None,
+                    tab_size: params.options.tab_size,
+                    insert_spaces: params.options.insert_spaces,
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "textDocument/onTypeFormatting" => {
+            let id = request.id.clone();
+            let params: lsp_types::DocumentOnTypeFormattingParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            if params.ch != ";" {
+                send_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams,
+                    "unsupported on-type formatting trigger".to_string(),
+                )?;
+                return Ok(());
+            }
+            let position = params.text_document_position.position;
+            let range = lsp_types::Range::new(Position::new(position.line, 0), position);
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::Formatting {
+                    uri: canonical_file_uri(&params.text_document_position.text_document.uri),
+                    range: Some(range),
+                    on_type_cursor: Some(position),
                     tab_size: params.options.tab_size,
                     insert_spaces: params.options.insert_spaces,
                 },
@@ -12053,6 +12095,7 @@ fn server_capabilities(
         },
         "documentFormattingProvider": {"workDoneProgress": true},
         "documentRangeFormattingProvider": {"workDoneProgress": true},
+        "documentOnTypeFormattingProvider": {"firstTriggerCharacter": ";"},
         "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
             "codeActionKinds": [

@@ -1219,6 +1219,7 @@ pub(crate) fn range_formatting_from_input(
     input: WorkspaceInput,
     uri: &Url,
     range: Range,
+    on_type_cursor: Option<Position>,
     tab_size: u32,
     insert_spaces: bool,
     cancel: &AtomicBool,
@@ -1233,6 +1234,7 @@ pub(crate) fn range_formatting_from_input(
     let value = match workspace.range_formatting_edits_with_cancel(
         &uri,
         range,
+        on_type_cursor,
         tab_size,
         insert_spaces,
         cancel,

@@ -924,6 +924,14 @@ token order or identity (for example, by sorting a `uses` clause), mapping fails
 closed. Comments, compiler directives, `FMT.OFF` regions, parser recovery,
 neighboring same-line syntax, and ambiguous statement mappings are also refused
 rather than replacing the full document. Wider selections are refused as well.
+On-type formatting is advertised only for `;`: it requires the cursor to be
+immediately after the actual semicolon ending one complete statement on that
+physical line, and reuses the same contextual token-span proof and single-line
+edit boundary. Cursor mismatches, comments, disabled regions, ambiguous syntax,
+and other unsupported cases fail closed. Newline indentation is not advertised
+because this server does not yet prove a unique safe blank-line indentation
+edit. On-type formatting honors the same client indentation options and does not
+write to disk.
 Include files (`.inc`)
 participate in source analysis but are rejected as direct formatting targets;
 only `.pas`, `.dpr`, and `.dpk` buffers are formatted.

@@ -29981,6 +29981,176 @@ fn range_formatting_formats_selected_lines_without_replacing_unrelated_text() {
 }
 
 #[test]
+fn on_type_formatting_formats_only_the_completed_statement_line() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:= 1+2;\nY:= 3+4;\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    let capabilities = server.initialize(root, Value::Null);
+    assert_eq!(
+        capabilities["capabilities"]["documentOnTypeFormattingProvider"]["firstTriggerCharacter"],
+        ";"
+    );
+    assert_eq!(
+        capabilities["capabilities"]["documentOnTypeFormattingProvider"]["moreTriggerCharacter"],
+        Value::Null
+    );
+
+    let request_id = RequestId::from("on-type-semicolon".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 5, "character": 8},
+            "ch": ";",
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "on-type formatting failed: {response:?}"
+    );
+    let edits = response.result.expect("on-type edits");
+    assert_eq!(edits.as_array().expect("edits").len(), 1);
+    assert_eq!(edits[0]["range"]["start"]["line"], 5);
+    assert_eq!(edits[0]["range"]["end"]["line"], 5);
+    assert_eq!(edits[0]["newText"], "  X := 1 + 2;");
+    let unrelated = RequestId::from("on-type-wrong-cursor".to_string());
+    server.send_request(
+        unrelated.clone(),
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 5, "character": 7},
+            "ch": ";",
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&unrelated);
+    assert!(
+        response.error.is_some(),
+        "cursor not after semicolon must fail closed: {response:?}"
+    );
+    assert_eq!(fs::read_to_string(&main).expect("read source"), source);
+
+    let mut applied = source.to_string();
+    let line_start = applied
+        .split_inclusive('\n')
+        .take(5)
+        .map(str::len)
+        .sum::<usize>();
+    let line_end = applied[line_start..]
+        .find('\n')
+        .map(|n| line_start + n)
+        .expect("statement line");
+    applied.replace_range(
+        line_start..line_end,
+        edits[0]["newText"].as_str().expect("replacement"),
+    );
+    write_file(&main, &applied);
+    let repeat_id = RequestId::from("on-type-idempotent".to_string());
+    server.send_request(
+        repeat_id.clone(),
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 5, "character": 13},
+            "ch": ";",
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    );
+    let response = server.response(&repeat_id);
+    assert!(
+        response.error.is_none(),
+        "repeat formatting failed: {response:?}"
+    );
+    assert_eq!(response.result.expect("repeat edits"), json!([]));
+
+    for (name, statement) in [
+        ("comment", "(* X:=1; *)"),
+        ("fmt-off", "{$FMT.OFF}\nX:=1;\n{$FMT.ON}"),
+        ("ambiguous", "X:=1; Y:=2;"),
+    ] {
+        let path = root.join(format!("{name}.pas"));
+        let source = format!(
+            "unit {name};\ninterface\nimplementation\nprocedure Run;\nbegin\n{statement}\nend;\nend.\n"
+        );
+        write_file(&path, &source);
+        let (line, cursor) = match name {
+            "fmt-off" => (6, 5),
+            "ambiguous" => (5, "X:=1; Y:=2;".len() as u32),
+            _ => (
+                5,
+                statement.find(';').expect("comment semicolon") as u32 + 1,
+            ),
+        };
+        let request_id = RequestId::from(format!("on-type-refuse-{name}"));
+        server.send_request(
+            request_id.clone(),
+            "textDocument/onTypeFormatting",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "position": {"line": line, "character": cursor},
+                "ch": ";",
+                "options": {"tabSize": 2, "insertSpaces": true}
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_some(),
+            "unsafe {name} line must refuse: {response:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn on_type_formatting_uses_utf16_positions_with_bom_and_crlf() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source = "\u{feff}unit Main;\r\ninterface\r\nimplementation\r\nprocedure Run;\r\nbegin\r\nX:='😀';\r\nend;\r\nend.\r\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let request_id = RequestId::from("on-type-bom-crlf-utf16".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 5, "character": 8},
+            "ch": ";",
+            "options": {"tabSize": 4, "insertSpaces": false}
+        }),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "on-type formatting failed: {response:?}"
+    );
+    let edits = response.result.expect("on-type edits");
+    assert_eq!(edits.as_array().expect("edits").len(), 1);
+    assert_eq!(
+        edits[0]["range"]["start"],
+        json!({"line": 5, "character": 0})
+    );
+    assert_eq!(edits[0]["range"]["end"], json!({"line": 5, "character": 8}));
+    assert!(
+        edits[0]["newText"]
+            .as_str()
+            .expect("edit")
+            .contains("X := '😀';")
+    );
+    assert_eq!(fs::read_to_string(&main).expect("read source"), source);
+    server.shutdown();
+}
+
+#[test]
 fn range_formatting_preserves_bom_crlf_and_validates_utf16_ranges() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();

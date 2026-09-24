@@ -5439,6 +5439,7 @@ impl Workspace {
         &mut self,
         uri: &Url,
         range: Range,
+        on_type_cursor: Option<Position>,
         tab_size: u32,
         insert_spaces: bool,
         cancel: &AtomicBool,
@@ -5504,6 +5505,14 @@ impl Workspace {
         let end = text::position_to_offset(&source, range.end).ok_or_else(|| {
             "range end is outside the document or splits a UTF-16 scalar".to_string()
         })?;
+        if let Some(cursor) = on_type_cursor {
+            let cursor_offset = text::position_to_offset(&source, cursor).ok_or_else(|| {
+                "on-type cursor is outside the document or splits a UTF-16 scalar".to_string()
+            })?;
+            if source.as_bytes().get(cursor_offset.wrapping_sub(1)) != Some(&b';') {
+                return Err("on-type cursor must be immediately after a semicolon".to_string());
+            }
+        }
         if start == end {
             return Ok(Vec::new());
         }
@@ -5611,6 +5620,12 @@ impl Workspace {
         })?;
         if start > statement.start_byte || end < statement.end_byte + source_terminator {
             return Err("range formatting refused because the selection cuts through the statement or one of its tokens".to_string());
+        }
+        if on_type_cursor.is_some() && end != statement.end_byte + source_terminator {
+            return Err(
+                "on-type cursor must immediately follow the complete statement terminator"
+                    .to_string(),
+            );
         }
         if statement.start_byte < line_start_byte
             || statement.end_byte > line_end_byte

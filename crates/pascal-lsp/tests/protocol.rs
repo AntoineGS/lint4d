@@ -32386,6 +32386,26 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         .expect("initial result ID")
         .to_string();
 
+    let closed_initial_id = RequestId::from("metadata-budget-closed-initial-pull".to_string());
+    server.send_request(
+        closed_initial_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[1])},"previousResultId":null}),
+    );
+    let closed_initial = server.response(&closed_initial_id);
+    assert!(
+        closed_initial.error.is_none(),
+        "closed-owner initial pull: {closed_initial:?}"
+    );
+    let closed_previous_result_id = closed_initial.result.as_ref().unwrap()["resultId"]
+        .as_str()
+        .expect("closed-owner initial result ID")
+        .to_string();
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":uri(&consumers[1])}}),
+    );
+
     let initial_definition_id = RequestId::from("metadata-budget-initial-provider".to_string());
     server.send_request(
         initial_definition_id.clone(),
@@ -32434,6 +32454,20 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         Some(uri(&replacement_providers[0]).as_str()),
         "same-size/restored-mtime project descriptor edits must select provider B after budget fallback"
     );
+    let closed_definition_id = RequestId::from("metadata-budget-closed-provider".to_string());
+    server.send_request(
+        closed_definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&consumers[1], &consumer_sources[1], "TBefore", 0),
+    );
+    let closed_locations = result_locations(server.response(&closed_definition_id));
+    assert_eq!(
+        closed_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&replacement_providers[1]).as_str()),
+        "cached closed owner must not publish the stale provider after budget fallback"
+    );
 
     let refreshed_id = RequestId::from("metadata-budget-refreshed-pull".to_string());
     server.send_request(
@@ -32447,6 +32481,22 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         refreshed.result.as_ref().unwrap()["kind"],
         "unchanged",
         "metadata reconciliation must not reuse the pre-event pull result ID"
+    );
+    let closed_refreshed_id = RequestId::from("metadata-budget-closed-refreshed-pull".to_string());
+    server.send_request(
+        closed_refreshed_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&consumers[1])},"previousResultId":closed_previous_result_id}),
+    );
+    let closed_refreshed = server.response(&closed_refreshed_id);
+    assert!(
+        closed_refreshed.error.is_none(),
+        "closed-owner refreshed pull: {closed_refreshed:?}"
+    );
+    assert_ne!(
+        closed_refreshed.result.as_ref().unwrap()["kind"],
+        "unchanged",
+        "cached closed-owner reconciliation must not reuse the pre-event pull result ID"
     );
     assert!(
         wait_for_file(&metrics, IO_TIMEOUT),

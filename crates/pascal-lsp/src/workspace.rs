@@ -5003,20 +5003,21 @@ impl Workspace {
             if self.index.contains(uri) {
                 check_workspace_cancel(cancel)?;
                 self.touch(uri);
-                self.set_document_context(uri, context_key)?;
+                self.set_document_context_with_control(uri, context_key, cancel, budget)?;
                 if legacy_route_granted {
                     self.remember_legacy_route(uri, context_key, &path);
                 }
                 self.record_open_analysis_source(uri, &source, version);
                 return Ok(true);
             }
-            let indexed = self.index_source_with_cancel(
+            let indexed = self.index_source_with_budget(
                 uri,
                 source.clone(),
                 None,
                 context_key,
                 pinned,
                 cancel,
+                budget,
             )?;
             if indexed {
                 self.record_open_analysis_source(uri, &source, version);
@@ -5035,7 +5036,7 @@ impl Workspace {
         if self.index.contains(uri) && self.disk_stamps.get(uri) == Some(&current_stamp) {
             check_workspace_cancel(cancel)?;
             self.touch(uri);
-            self.set_document_context(uri, context_key)?;
+            self.set_document_context_with_control(uri, context_key, cancel, budget)?;
             if let Some(source) = self.index.source_text(uri).map(str::to_owned) {
                 self.record_closed_analysis_source(
                     uri,
@@ -5227,7 +5228,8 @@ impl Workspace {
             self.indexed_files.insert(uri.clone());
         }
         self.indexed_bytes = self.indexed_bytes.saturating_add(indexed_source.len());
-        if let Err(error) = self.set_document_context(uri, context_key) {
+        if let Err(error) = self.set_document_context_with_control(uri, context_key, cancel, budget)
+        {
             self.remove_indexed(uri);
             return Err(error);
         }
@@ -8912,18 +8914,38 @@ impl Workspace {
     }
 
     fn set_document_context(&mut self, uri: &Url, context_key: &ContextKey) -> Result<(), String> {
+        self.set_document_context_with_control(uri, context_key, None, None)
+    }
+
+    fn set_document_context_with_control(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
         let path = uri.to_file_path().ok().map(absolute_path);
-        let current_selection = path
-            .as_deref()
-            .and_then(|path| self.runtime_selection_for_path_default(path));
-        let known_owner = path.as_deref().and_then(|path| {
-            self.document_owners
-                .get(uri)
-                .filter(|owner| self.known_owner_selection_is_current(path, owner))
-                .cloned()
-        });
+        let current_selection = if let Some(path) = path.as_deref() {
+            let roots = self.workspace_root_paths_with_control(cancel, budget)?;
+            self.runtime_selection_for_path_with_cancel_and_budget(path, &roots, cancel, budget)?
+        } else {
+            None
+        };
+        let known_owner =
+            if let (Some(path), Some(owner)) = (path.as_deref(), self.document_owners.get(uri)) {
+                self.known_owner_selection_is_current_with_cancel_and_budget(
+                    path, owner, cancel, budget,
+                )?
+                .then(|| owner.clone())
+            } else {
+                None
+            };
         let effective_context_key = if let Some(owner) = &known_owner {
-            if self.context_state_is_fresh_with_open_documents(&owner.state, None, None)? {
+            if self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)? {
                 self.contexts
                     .entry(owner.key.clone())
                     .or_insert_with(|| owner.state.clone());
@@ -8936,15 +8958,15 @@ impl Workspace {
                     uri.to_file_path()
                         .map_err(|_| format!("document context requires a file URI: {uri}"))?,
                 );
-                let roots = self.workspace_root_paths();
+                let roots = self.workspace_root_paths_with_control(cancel, budget)?;
                 let (key, discovery) = self
                     .rediscover_known_owner(
                         &path,
                         owner,
                         &roots,
                         &self.project_options(),
-                        None,
-                        None,
+                        cancel,
+                        budget,
                     )
                     .map_err(|error| {
                         format!("could not rediscover known project owner for {uri}: {error}")
@@ -8955,8 +8977,8 @@ impl Workspace {
                     discovery.observations,
                     discovery.candidate_memberships,
                     &path,
-                    None,
-                    None,
+                    cancel,
+                    budget,
                 )?;
                 key
             }
@@ -8964,7 +8986,7 @@ impl Workspace {
             if self.context_matches_selection(context_key, scope, selected) {
                 context_key.clone()
             } else {
-                self.context_for_uri(uri)?
+                self.context_for_uri_with_cancel_and_budget(uri, cancel, budget)?
             }
         } else {
             context_key.clone()
@@ -8999,7 +9021,33 @@ impl Workspace {
         if let Some(selected) = selected {
             self.remember_document_owner(uri, &selected);
         }
+        self.prune_unused_contexts_with_control(cancel, budget)?;
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        Ok(())
+    }
+
+    fn prune_unused_contexts_with_control(
+        &mut self,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            let work = self
+                .document_contexts
+                .len()
+                .saturating_add(self.open_document_contexts.len())
+                .saturating_add(self.contexts.len());
+            budget.charge_path_visits(work)?;
+        }
         self.prune_unused_contexts();
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
         Ok(())
     }
 

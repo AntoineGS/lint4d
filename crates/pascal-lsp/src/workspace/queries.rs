@@ -583,6 +583,127 @@ pub(crate) fn prepare_call_hierarchy_from_input(
     )
 }
 
+pub(crate) fn prepare_type_hierarchy_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("document is outside configured workspace roots or source paths: {uri}"),
+        );
+    }
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    with_records(
+        source_generation,
+        configuration_generation,
+        snapshot
+            .index
+            .prepare_type_hierarchy_with_cancel(&uri, position, cancel),
+        records,
+    )
+}
+
+pub(crate) fn type_hierarchy_supertypes_from_input(
+    input: WorkspaceInput,
+    item: &lsp_types::TypeHierarchyItem,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+    type_hierarchy_edges_from_input(input, item, cancel, true)
+}
+
+pub(crate) fn type_hierarchy_subtypes_from_input(
+    input: WorkspaceInput,
+    item: &lsp_types::TypeHierarchyItem,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+    type_hierarchy_edges_from_input(input, item, cancel, false)
+}
+
+fn type_hierarchy_edges_from_input(
+    input: WorkspaceInput,
+    item: &lsp_types::TypeHierarchyItem,
+    cancel: &AtomicBool,
+    supertypes: bool,
+) -> super::rename::Computed<Option<Vec<lsp_types::TypeHierarchyItem>>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(&item.uri);
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("type hierarchy item is outside the selected project: {uri}"),
+        );
+    }
+    let classification =
+        match reference_binding_info_for_input(&input, &uri, item.selection_range.start, cancel) {
+            Ok(classification) => classification,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if classification.ignored_or_empty {
+        let mut records = vec![classification.record];
+        records.extend(classification.consumed_configuration);
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Ok(None),
+            records,
+        );
+    }
+    let snapshot = match binding_snapshot(
+        &input,
+        &uri,
+        item.selection_range.start,
+        false,
+        classification,
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    if let Err(error) = ensure_reference_ready(&snapshot, &uri) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            records,
+        );
+    }
+    let value = if supertypes {
+        snapshot
+            .index
+            .type_hierarchy_supertypes_with_cancel(item, cancel)
+    } else {
+        snapshot
+            .index
+            .type_hierarchy_subtypes_with_cancel(item, cancel)
+    };
+    with_records(source_generation, configuration_generation, value, records)
+}
+
 pub(crate) fn incoming_calls_from_input(
     input: WorkspaceInput,
     item: &lsp_types::CallHierarchyItem,

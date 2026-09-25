@@ -29,6 +29,7 @@ pub(crate) use rename::BindingWorkBudget;
 mod selection;
 mod semantic_tokens;
 mod symbols;
+mod type_hierarchy;
 #[cfg(test)]
 pub(crate) use assistance::CompletionResolutionSeed;
 pub(crate) use assistance::completion_prefix_at_position;
@@ -630,6 +631,31 @@ impl NavigationIndex {
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<lsp_types::CallHierarchyItem>>, String> {
         call_hierarchy::prepare(self, uri, position, cancel)
+    }
+
+    pub(crate) fn prepare_type_hierarchy_with_cancel(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String> {
+        type_hierarchy::prepare(self, uri, position, cancel)
+    }
+
+    pub(crate) fn type_hierarchy_supertypes_with_cancel(
+        &self,
+        item: &lsp_types::TypeHierarchyItem,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String> {
+        type_hierarchy::supertypes(self, item, cancel)
+    }
+
+    pub(crate) fn type_hierarchy_subtypes_with_cancel(
+        &self,
+        item: &lsp_types::TypeHierarchyItem,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String> {
+        type_hierarchy::subtypes(self, item, cancel)
     }
 
     pub(crate) fn incoming_calls_with_cancel(

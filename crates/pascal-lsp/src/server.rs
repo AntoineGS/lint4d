@@ -929,6 +929,9 @@ impl AnalysisPriority {
             | AnalysisRequest::TypeDefinitions { .. }
             | AnalysisRequest::Prepare { .. }
             | AnalysisRequest::PrepareCallHierarchy { .. }
+            | AnalysisRequest::PrepareTypeHierarchy { .. }
+            | AnalysisRequest::TypeHierarchySupertypes { .. }
+            | AnalysisRequest::TypeHierarchySubtypes { .. }
             | AnalysisRequest::IncomingCalls { .. }
             | AnalysisRequest::OutgoingCalls { .. }
             | AnalysisRequest::CodeActions(_)
@@ -2079,6 +2082,16 @@ enum AnalysisRequest {
     OutgoingCalls {
         item: lsp_types::CallHierarchyItem,
     },
+    PrepareTypeHierarchy {
+        uri: Url,
+        position: Position,
+    },
+    TypeHierarchySupertypes {
+        item: lsp_types::TypeHierarchyItem,
+    },
+    TypeHierarchySubtypes {
+        item: lsp_types::TypeHierarchyItem,
+    },
 }
 
 fn progress_title(request: &AnalysisRequest) -> &'static str {
@@ -2097,6 +2110,9 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
         AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
         AnalysisRequest::InlayHints { .. } => "Computing inlay hints",
         AnalysisRequest::PrepareCallHierarchy { .. } => "Preparing call hierarchy",
+        AnalysisRequest::PrepareTypeHierarchy { .. } => "Preparing type hierarchy",
+        AnalysisRequest::TypeHierarchySupertypes { .. } => "Resolving type supertypes",
+        AnalysisRequest::TypeHierarchySubtypes { .. } => "Searching type subtypes",
         AnalysisRequest::IncomingCalls { .. } => "Searching incoming calls",
         AnalysisRequest::OutgoingCalls { .. } => "Searching outgoing calls",
         AnalysisRequest::Hover { .. }
@@ -2146,6 +2162,9 @@ enum AnalysisResultValue {
     PrepareCallHierarchy(Result<Option<Vec<lsp_types::CallHierarchyItem>>, String>),
     IncomingCalls(Result<Vec<lsp_types::CallHierarchyIncomingCall>, String>),
     OutgoingCalls(Result<Vec<lsp_types::CallHierarchyOutgoingCall>, String>),
+    PrepareTypeHierarchy(Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String>),
+    TypeHierarchySupertypes(Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String>),
+    TypeHierarchySubtypes(Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String>),
 }
 
 #[derive(Clone)]
@@ -4522,6 +4541,7 @@ enum ObservationMethod {
     TypeDefinitions,
     Prepare,
     PrepareCallHierarchy,
+    PrepareTypeHierarchy,
     DocumentSymbols {
         hierarchical: bool,
     },
@@ -4667,6 +4687,16 @@ impl ObservationKey {
                 None,
                 None,
             ),
+            AnalysisRequest::PrepareTypeHierarchy { uri, position } => (
+                ObservationMethod::PrepareTypeHierarchy,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+                None,
+            ),
             AnalysisRequest::DocumentSymbols { uri, hierarchical } => (
                 ObservationMethod::DocumentSymbols {
                     hierarchical: *hierarchical,
@@ -4775,7 +4805,9 @@ impl ObservationKey {
             | AnalysisRequest::ResolveCompletion(_)
             | AnalysisRequest::DocumentLinks { .. }
             | AnalysisRequest::IncomingCalls { .. }
-            | AnalysisRequest::OutgoingCalls { .. } => return None,
+            | AnalysisRequest::OutgoingCalls { .. }
+            | AnalysisRequest::TypeHierarchySupertypes { .. }
+            | AnalysisRequest::TypeHierarchySubtypes { .. } => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
@@ -5151,6 +5183,21 @@ impl AnalysisJobs {
             AnalysisRequest::PrepareCallHierarchy { .. } => {
                 AnalysisResultValue::PrepareCallHierarchy(Err(
                     "analysis worker failed without changing workspace state".to_string(),
+                ))
+            }
+            AnalysisRequest::PrepareTypeHierarchy { .. } => {
+                AnalysisResultValue::PrepareTypeHierarchy(Err(
+                    "analysis worker panicked".to_string()
+                ))
+            }
+            AnalysisRequest::TypeHierarchySupertypes { .. } => {
+                AnalysisResultValue::TypeHierarchySupertypes(Err(
+                    "analysis worker panicked".to_string()
+                ))
+            }
+            AnalysisRequest::TypeHierarchySubtypes { .. } => {
+                AnalysisResultValue::TypeHierarchySubtypes(Err(
+                    "analysis worker panicked".to_string()
                 ))
             }
             AnalysisRequest::IncomingCalls { .. } => AnalysisResultValue::IncomingCalls(Err(
@@ -5979,6 +6026,49 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::OutgoingCalls(computed.value),
                             }
                         }
+                        AnalysisRequest::PrepareTypeHierarchy { uri, position } => {
+                            let computed = queries::prepare_type_hierarchy_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::PrepareTypeHierarchy(computed.value),
+                            }
+                        }
+                        AnalysisRequest::TypeHierarchySupertypes { item } => {
+                            let computed = queries::type_hierarchy_supertypes_from_input(
+                                input,
+                                &item,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::TypeHierarchySupertypes(computed.value),
+                            }
+                        }
+                        AnalysisRequest::TypeHierarchySubtypes { item } => {
+                            let computed = queries::type_hierarchy_subtypes_from_input(
+                                input,
+                                &item,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::TypeHierarchySubtypes(computed.value),
+                            }
+                        }
                     }));
                 let mut result = result.unwrap_or_else(|_| AnalysisResult {
                     id: panic_id,
@@ -5994,6 +6084,8 @@ impl AnalysisJobs {
                         | AnalysisResultValue::InlayHints(_)
                         | AnalysisResultValue::IncomingCalls(_)
                         | AnalysisResultValue::OutgoingCalls(_)
+                        | AnalysisResultValue::TypeHierarchySupertypes(_)
+                        | AnalysisResultValue::TypeHierarchySubtypes(_)
                 ) {
                     if let Err(error) = wait_at_test_barrier(
                         TestBarrier::PartialValidation,
@@ -8134,6 +8226,14 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
+        AnalysisResultValue::PrepareTypeHierarchy(value)
+        | AnalysisResultValue::TypeHierarchySupertypes(value)
+        | AnalysisResultValue::TypeHierarchySubtypes(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
         AnalysisResultValue::IncomingCalls(value) => match value {
             Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
             Err(error) => {
@@ -8460,6 +8560,9 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::PrepareCallHierarchy(value) => *value = Err(error),
         AnalysisResultValue::IncomingCalls(value) => *value = Err(error),
         AnalysisResultValue::OutgoingCalls(value) => *value = Err(error),
+        AnalysisResultValue::PrepareTypeHierarchy(value)
+        | AnalysisResultValue::TypeHierarchySupertypes(value)
+        | AnalysisResultValue::TypeHierarchySubtypes(value) => *value = Err(error),
     }
 }
 
@@ -10841,6 +10944,68 @@ fn handle_request(
                 work_done_token.clone(),
             )?;
         }
+        "textDocument/prepareTypeHierarchy" => {
+            let id = request.id.clone();
+            let params: lsp_types::TypeHierarchyPrepareParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::PrepareTypeHierarchy {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "typeHierarchy/supertypes" => {
+            let id = request.id.clone();
+            let params: lsp_types::TypeHierarchySupertypesParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::TypeHierarchySupertypes { item: params.item },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "typeHierarchy/subtypes" => {
+            let id = request.id.clone();
+            let params: lsp_types::TypeHierarchySubtypesParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::TypeHierarchySubtypes { item: params.item },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -12406,6 +12571,7 @@ fn server_capabilities(
         "foldingRangeProvider": {"workDoneProgress": true},
         "inlayHintProvider": {"resolveProvider": false, "workDoneProgress": true},
         "callHierarchyProvider": true,
+        "typeHierarchyProvider": true,
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),
             "range": true,

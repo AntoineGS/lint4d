@@ -1194,6 +1194,37 @@ binding shares the navigation resolver's 100,000-work and 8 MiB budget across
 the request. These limits and the subset are implementation policy, not a claim
 of complete Pascal call-graph semantics.
 
+### Type hierarchy
+
+The server advertises `typeHierarchyProvider` and implements prepare,
+`typeHierarchy/supertypes`, and `typeHierarchy/subtypes` on cancellable,
+worker-backed selected-project snapshots. Only uniquely indexed source class
+and interface declarations are prepared. Every supplied item is treated as
+untrusted and its URI, kind, name, full/selection ranges, and source fingerprint
+are checked against the current snapshot before traversal. Returned ranges use
+physical source coordinates (including UTF-16 conversion), and item identities
+are based on the declaration rather than display name alone.
+
+Edges are limited to explicit, uniquely resolved direct superclass links and
+interface-to-interface inheritance links that the existing type-ancestry
+resolver can prove. The resolver's URI-qualified symbol identity is used in
+both directions, so homonyms in unrelated units are not joined by spelling.
+Cross-unit edges are included only when both declarations belong to the
+selected project snapshot. Implicit compiler ancestors such as `TObject`,
+implemented interfaces on classes, aliases, generic specializations, ambiguous
+or missing parent references, conditional-unknown declarations, and parser
+recovery regions are not synthesized as edges. If ancestry resolution for a
+prepared type is incomplete, its supertypes request returns no result rather
+than a partial list; unproven subtype candidates are omitted.
+
+Traversal reuses the navigation resolver's 100,000-work/8 MiB budget, examines
+at most 4,096 candidates, returns at most 2,048 items, and reserves a 2 MiB
+result-construction budget. Cancellation, work/output exhaustion, forged or
+stale identity, and changed source/project read sets fail closed without
+publishing partial results. This deliberately conservative subset is not a
+complete model of Delphi inheritance, generic specialization, visibility, or
+conditional compilation.
+
 ### Document outlines
 
 `textDocument/documentSymbol` returns full declaration ranges and identifier

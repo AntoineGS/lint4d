@@ -2558,6 +2558,441 @@ fn call_hierarchy_prepare_returns_only_bound_routine_items() {
 }
 
 #[test]
+fn type_hierarchy_advertises_prepare_and_returns_bound_type_item() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Main.pas");
+    let source = "unit Main; interface type TBase = class end; TChild = class(TBase) end; implementation end.";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(root.path(), Value::Null);
+    assert_eq!(initialize["capabilities"]["typeHierarchyProvider"], true);
+    server.send_notification("textDocument/didOpen", json!({
+        "textDocument": {"uri": uri(&source_path), "languageId": "pascal", "version": 1, "text": source}
+    }));
+    let id = RequestId::from("type-hierarchy-prepare".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": position_of(source, "TChild", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "prepare failed: {response:?}");
+    let item = response.result.expect("type hierarchy item")[0].clone();
+    assert_eq!(item["name"], "TChild");
+    assert_eq!(item["uri"], uri(&source_path).to_string());
+    assert!(item["data"].is_object());
+    let selection = position_of(source, "TChild", 0);
+    assert_eq!(item["selectionRange"]["start"], json!(selection));
+    assert_eq!(
+        item["selectionRange"]["end"],
+        json!(Position::new(selection.line, selection.character + 6))
+    );
+    assert_eq!(item["range"]["start"]["line"], 0);
+    assert_eq!(item["range"]["end"]["line"], 0);
+    server.shutdown();
+}
+
+#[test]
+fn type_hierarchy_resolves_local_and_cross_unit_parent_child_edges() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let unrelated = root.path().join("Unrelated.pas");
+    let provider_source =
+        "unit Provider; interface type TBase = class end; TBox<T> = class end; implementation end.";
+    let consumer_source = "unit Consumer; interface uses Provider; type TLocal = class(TBase) end; TChild = class(TLocal) end; TCross = class(TBase) end; TSpecialized = class(TBox<Integer>) end; implementation end.";
+    let unrelated_source = "unit Unrelated; interface type TBase = class end; TStranger = class(TBase) end; implementation end.";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    write_file(&unrelated, unrelated_source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare =
+        |server: &mut TestServer, id: &str, path: &std::path::Path, source: &str, name: &str| {
+            let request = RequestId::from(id.to_string());
+            server.send_request(
+                request.clone(),
+                "textDocument/prepareTypeHierarchy",
+                json!({
+                    "textDocument": {"uri": uri(path)}, "position": position_of(source, name, 0)
+                }),
+            );
+            let response = server.response(&request);
+            assert!(
+                response.error.is_none(),
+                "type prepare failed: {response:?}"
+            );
+            response.result.expect("type hierarchy item")[0].clone()
+        };
+    let base = prepare(
+        &mut server,
+        "type-base",
+        &provider,
+        provider_source,
+        "TBase",
+    );
+    let local = prepare(
+        &mut server,
+        "type-local",
+        &consumer,
+        consumer_source,
+        "TLocal",
+    );
+    let child = prepare(
+        &mut server,
+        "type-child",
+        &consumer,
+        consumer_source,
+        "TChild",
+    );
+    let cross = prepare(
+        &mut server,
+        "type-cross",
+        &consumer,
+        consumer_source,
+        "TCross",
+    );
+    let specialized = prepare(
+        &mut server,
+        "type-specialized",
+        &consumer,
+        consumer_source,
+        "TSpecialized",
+    );
+    let stranger = prepare(
+        &mut server,
+        "type-stranger",
+        &unrelated,
+        unrelated_source,
+        "TStranger",
+    );
+
+    let request = RequestId::from("type-local-parent".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": local}),
+    );
+    let parents = server.response(&request).result.expect("local parent list");
+    assert_eq!(parents[0]["name"], "TBase");
+    assert_eq!(parents[0]["uri"], uri(&provider).to_string());
+
+    let request = RequestId::from("type-local-child".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": local}),
+    );
+    let children = server.response(&request).result.expect("local child list");
+    assert_eq!(children[0]["name"], "TChild");
+    let request = RequestId::from("type-child-parent".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": child}),
+    );
+    let parents = server.response(&request).result.expect("child parent list");
+    assert_eq!(parents[0]["name"], "TLocal");
+
+    let request = RequestId::from("type-cross-parent".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": cross}),
+    );
+    let parents = server
+        .response(&request)
+        .result
+        .expect("cross-unit parent list");
+    assert_eq!(parents[0]["name"], "TBase");
+    assert_eq!(parents[0]["uri"], uri(&provider).to_string());
+
+    let request = RequestId::from("type-cross-children".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": base}),
+    );
+    let children = server
+        .response(&request)
+        .result
+        .expect("cross-unit children");
+    let children = children.as_array().expect("array of subtype items");
+    assert!(
+        children
+            .iter()
+            .any(|item| item["uri"] == uri(&consumer).to_string() && item["name"] == "TLocal")
+    );
+    assert!(
+        children
+            .iter()
+            .any(|item| item["uri"] == uri(&consumer).to_string() && item["name"] == "TCross")
+    );
+    assert!(
+        !children
+            .iter()
+            .any(|item| item["uri"] == uri(&unrelated).to_string() && item["name"] == "TStranger")
+    );
+
+    let request = RequestId::from("type-generic-parent".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": specialized}),
+    );
+    let specialized_parents = server.response(&request);
+    assert!(
+        specialized_parents.error.is_none(),
+        "generic parent query failed: {specialized_parents:?}"
+    );
+    let no_specialized_edge = match specialized_parents.result.as_ref() {
+        None => true,
+        Some(result) => result.is_null(),
+    };
+    assert!(
+        no_specialized_edge,
+        "generic specialization is not an identity-proven hierarchy edge: {specialized_parents:?}"
+    );
+
+    let mut forged = base;
+    forged["name"] = json!("TStranger");
+    let request = RequestId::from("type-forged".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": forged}),
+    );
+    assert!(server.response(&request).error.is_some());
+    let mut stale = stranger;
+    stale["data"]["fingerprint"] = json!(0);
+    let request = RequestId::from("type-stale".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": stale}),
+    );
+    assert!(server.response(&request).error.is_some());
+    server.shutdown();
+}
+
+#[test]
+fn type_hierarchy_candidate_cap_refuses_partial_subtypes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("ManyTypes.pas");
+    let mut source = String::from("unit ManyTypes; interface type TBase = class end;\n");
+    for index in 0..4_100 {
+        source.push_str(&format!("TChild{index} = class(TBase) end;\n"));
+    }
+    source.push_str("implementation end.");
+    write_file(&path, &source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("type-cap-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(&source, "TBase", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(prepare.error.is_none(), "type prepare failed: {prepare:?}");
+    let item = prepare.result.expect("base item")[0].clone();
+    let request = RequestId::from("type-cap-subtypes".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": item}),
+    );
+    let response = server.response(&request);
+    assert!(
+        response.error.is_some(),
+        "candidate limit must fail closed: {response:?}"
+    );
+    assert!(
+        response.result.is_none(),
+        "candidate limit must not publish partial subtypes"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn type_hierarchy_rejects_queued_overlay_change_and_unknown_parent() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("FreshTypes.pas");
+    let source = "unit FreshTypes; interface type TBase = class end; TChild = class(TBase) end; TUnknown = class(TMissing) end; implementation end.";
+    write_file(&path, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(path.parent().expect("workspace root"), json!({}));
+    let uri_value = uri(&path);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri_value, "languageId": "pascal", "version": 1, "text": source
+        }}),
+    );
+    let prepare_id = RequestId::from("type-fresh-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "TChild", 0)
+        }),
+    );
+    let item = server.response(&prepare_id).result.expect("prepared item")[0].clone();
+    let query_id = RequestId::from("type-fresh-children".to_string());
+    server.send_request(
+        query_id.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": item}),
+    );
+    barrier.wait_until_entered();
+    let changed = source.replace("TChild", "TChanged");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_value, "version": 2}, "contentChanges": [{"text": changed}]
+        }),
+    );
+    barrier.release();
+    let response = server.response(&query_id);
+    assert!(
+        response.error.is_some(),
+        "stale result should be rejected: {response:?}"
+    );
+
+    let unknown_id = RequestId::from("type-unknown-prepare".to_string());
+    server.send_request(
+        unknown_id.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(&changed, "TUnknown", 0)
+        }),
+    );
+    let unknown = server
+        .response(&unknown_id)
+        .result
+        .expect("unknown type item")[0]
+        .clone();
+    let parent_id = RequestId::from("type-unknown-parent".to_string());
+    server.send_request(
+        parent_id.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": unknown}),
+    );
+    let parent = server.response(&parent_id);
+    assert!(
+        parent.error.is_none(),
+        "unknown parent query should fail closed without exposing an edge: {parent:?}"
+    );
+    let no_parent_result = match parent.result.as_ref() {
+        None => true,
+        Some(result) => result.is_null(),
+    };
+    assert!(
+        no_parent_result,
+        "unresolved parent is not an edge: {parent:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn type_hierarchy_rejects_queued_project_owner_change() {
+    let root = tempfile::tempdir().expect("workspace");
+    let project = root.path().join("App.dproj");
+    let provider = root.path().join("Provider.pas");
+    let other = root.path().join("Other.pas");
+    let owner_source = "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>ONE</DCC_Define></PropertyGroup></Project>";
+    write_file(&project, owner_source);
+    let provider_source = "unit Provider; interface type TBase = class end; implementation end.";
+    write_file(&provider, provider_source);
+    write_file(
+        &root.path().join("Main.pas"),
+        "program Main; uses Provider; type TChild = class(TBase) end; begin end.",
+    );
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(
+        project.parent().expect("project root"),
+        json!({"projectFile": "App.dproj"}),
+    );
+    let prepare_id = RequestId::from("type-owner-prepare".to_string());
+    server.send_request(prepare_id.clone(), "textDocument/prepareTypeHierarchy", json!({
+        "textDocument": {"uri": uri(&provider)}, "position": position_of(provider_source, "TBase", 0)
+    }));
+    let prepared = server.response(&prepare_id);
+    assert!(
+        prepared.error.is_none(),
+        "project parent prepare failed: {prepared:?}"
+    );
+    let item = prepared.result.expect("parent type item")[0].clone();
+    let id = RequestId::from("type-owner-subtypes".to_string());
+    server.send_request(id.clone(), "typeHierarchy/subtypes", json!({"item": item}));
+    barrier.wait_until_entered();
+    write_file(
+        &project,
+        &owner_source
+            .replace("Main.pas", "Other.pas")
+            .replace("ONE", "TWO"),
+    );
+    write_file(&other, "program Other; begin end.");
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.result.is_none(),
+        "stale project subtype result must not publish: {response:?}"
+    );
+    let error = response.error.expect("project read-set invalidation");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .contains("workspace metadata or membership changed"),
+        "unexpected freshness error: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn type_hierarchy_cancellation_discards_computed_subtypes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("CancelledTypes.pas");
+    let source = "unit CancelledTypes; interface type TBase = class end; TChild = class(TBase) end; implementation end.";
+    write_file(&path, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(path.parent().expect("workspace root"), json!({}));
+    let prepare_id = RequestId::from("type-cancel-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "TBase", 0)
+        }),
+    );
+    let item = server.response(&prepare_id).result.expect("base item")[0].clone();
+    let id = RequestId::from("type-cancel-subtypes".to_string());
+    server.send_request(id.clone(), "typeHierarchy/subtypes", json!({"item": item}));
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": id}));
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.result.is_none(),
+        "cancelled subtype result must not publish: {response:?}"
+    );
+    assert!(
+        response.error.is_some(),
+        "cancelled request should fail: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn call_hierarchy_resolves_cross_unit_calls_in_both_directions() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let provider = temp.path().join("Provider.pas");

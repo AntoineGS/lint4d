@@ -8,6 +8,7 @@ use super::rename::{
     may_contain_include_directive, snapshot_records, snapshot_records_bounded,
     source_for_input_with_cancel, source_record_owned_bytes, text_content_hash, workspace_edit,
 };
+use super::signature;
 use super::{
     absolute_path, canonical_file_uri, is_configuration_file, is_lint_excluded, path_stamp,
 };
@@ -598,11 +599,13 @@ pub(crate) fn code_actions_from_input(
     let requests_interface_method = requests_interface_method(&params.context);
     let requests_organize_imports = requests_organize_imports(&params.context);
     let requests_extraction = requests_extraction(&params.context);
+    let requests_signature = requests_signature_change(&params.context);
     let fix_all_scopes = requested_fix_all_scopes(&params.context);
     if !requests_quickfix
         && !requests_interface_method
         && !requests_organize_imports
         && !requests_extraction
+        && !requests_signature
         && fix_all_scopes.is_empty()
     {
         return Computed {
@@ -694,7 +697,42 @@ pub(crate) fn code_actions_from_input(
     } else {
         Vec::new()
     };
-    if requests_extraction
+    let mut supplementary_actions = extraction_actions;
+    if requests_signature && input_source_is_writable(&input, &uri) {
+        let signature_edits = match signature::plan(&source, params.range, cancel) {
+            Ok(edits) => edits,
+            Err(error) if is_cancelled(cancel) => {
+                return failed(source_generation, configuration_generation, error);
+            }
+            Err(_) => None,
+        };
+        if let Some(edits) = signature_edits {
+            let edit = workspace_edit(
+                HashMap::from([(uri.clone(), edits)]),
+                &HashMap::from([(uri.clone(), target_record.clone())]),
+                features.document_changes,
+            );
+            if let Ok(edit) = edit {
+                let action = CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Swap private procedure parameters".to_string(),
+                    kind: Some(CodeActionKind::new("refactor.rewrite.changeSignature")),
+                    diagnostics: None,
+                    edit: Some(edit),
+                    command: None,
+                    is_preferred: Some(false),
+                    disabled: None,
+                    data: None,
+                });
+                match push_bounded_code_action(&mut supplementary_actions, action) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        return failed(source_generation, configuration_generation, error);
+                    }
+                }
+            }
+        }
+    }
+    if (requests_extraction || requests_signature)
         && !requests_quickfix
         && !requests_interface_method
         && !requests_organize_imports
@@ -705,7 +743,7 @@ pub(crate) fn code_actions_from_input(
         return Computed {
             source_generation,
             configuration_generation,
-            value: Ok(extraction_actions),
+            value: Ok(supplementary_actions),
             records,
         };
     }
@@ -860,7 +898,7 @@ pub(crate) fn code_actions_from_input(
         (plans, records)
     };
     if features.resolve {
-        let mut actions: Vec<CodeActionOrCommand> = extraction_actions.clone();
+        let mut actions: Vec<CodeActionOrCommand> = supplementary_actions.clone();
         for candidate in &candidates {
             let action = CodeActionOrCommand::CodeAction({
                 let data =
@@ -1062,7 +1100,7 @@ pub(crate) fn code_actions_from_input(
             format!("code-action document is outside configured workspace roots: {uri}"),
         );
     }
-    let mut actions = extraction_actions;
+    let mut actions = supplementary_actions;
     for candidate in candidates {
         if is_cancelled(cancel) {
             return cancelled(source_generation, configuration_generation);
@@ -5353,6 +5391,17 @@ fn requests_extraction(context: &CodeActionContext) -> bool {
                     kind,
                     &CodeActionKind::new("refactor.extract.function"),
                 )
+        })
+    })
+}
+
+fn requests_signature_change(context: &CodeActionContext) -> bool {
+    context.only.as_ref().is_none_or(|kinds| {
+        kinds.iter().any(|kind| {
+            code_action_kind_contains(
+                kind,
+                &CodeActionKind::new("refactor.rewrite.changeSignature"),
+            )
         })
     })
 }

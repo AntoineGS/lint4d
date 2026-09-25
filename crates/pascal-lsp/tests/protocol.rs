@@ -46407,6 +46407,210 @@ fn source_action_deduplication_preserves_binding_before_and_after_apply() {
 }
 
 #[test]
+fn change_signature_swaps_all_proven_nested_calls_and_literal_defaults() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Sample.pas");
+    let source = "unit Sample;\ninterface\nimplementation\nprocedure Run;\n  procedure Pair(A: Integer; B: Integer);\n  begin\n  end;\nbegin\n  Pair(1, 2);\n  Pair(3, 4);\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    let initialized = server.initialize_with_action_support(root, Value::Null);
+    let kinds = initialized["capabilities"]["codeActionProvider"]["codeActionKinds"]
+        .as_array()
+        .expect("advertised action kinds");
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| kind == "refactor.rewrite.changeSignature")
+    );
+    let request = |server: &mut TestServer, id: &str, only: &str| {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/codeAction",
+            json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 4, "character": 12}, "end": {"line": 4, "character": 16}}, "context": {"diagnostics": [], "only": [only]}}),
+        );
+        server.response(&id)
+    };
+    let response = request(
+        &mut server,
+        "change-signature-plain",
+        "refactor.rewrite.changeSignature",
+    );
+    assert!(
+        response.error.is_none(),
+        "signature request failed: {response:?}"
+    );
+    let actions = response.result.expect("signature actions");
+    let actions = actions.as_array().expect("actions array");
+    assert_eq!(actions.len(), 1, "expected one complete edit: {actions:?}");
+    assert_eq!(actions[0]["kind"], "refactor.rewrite.changeSignature");
+    assert_eq!(
+        apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&main)),
+        source
+            .replace(
+                "Pair(A: Integer; B: Integer)",
+                "Pair(B: Integer; A: Integer)"
+            )
+            .replace("Pair(1, 2)", "Pair(2, 1)")
+            .replace("Pair(3, 4)", "Pair(4, 3)")
+    );
+
+    let defaults = source.replace("A: Integer; B: Integer", "A: Integer = 7; B: Integer = 8");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": defaults}}),
+    );
+    let default_response = request(&mut server, "change-signature-defaults", "refactor.rewrite");
+    assert!(
+        default_response.error.is_none(),
+        "defaulted signature failed: {default_response:?}"
+    );
+    let actions = default_response.result.expect("defaulted actions");
+    let actions = actions.as_array().expect("actions array");
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected complete defaulted edit: {actions:?}"
+    );
+    assert_eq!(
+        apply_workspace_edit_to_source(&defaults, &actions[0]["edit"], &uri(&main)),
+        defaults
+            .replace(
+                "Pair(A: Integer = 7; B: Integer = 8)",
+                "Pair(B: Integer = 8; A: Integer = 7)"
+            )
+            .replace("Pair(1, 2)", "Pair(2, 1)")
+            .replace("Pair(3, 4)", "Pair(4, 3)")
+    );
+
+    let quickfix = request(&mut server, "change-signature-quickfix-only", "quickfix");
+    assert!(quickfix.error.is_none());
+    assert!(
+        !quickfix
+            .result
+            .expect("quickfix actions")
+            .as_array()
+            .expect("actions")
+            .iter()
+            .any(|action| action["kind"] == "refactor.rewrite.changeSignature")
+    );
+    let omitted = defaults.replace("Pair(3, 4)", "Pair(3)");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 2}, "contentChanges": [{"text": omitted}]}),
+    );
+    let missing_call = request(
+        &mut server,
+        "change-signature-omitted-default",
+        "refactor.rewrite.changeSignature",
+    );
+    assert!(
+        missing_call.error.is_none(),
+        "omitted default request failed: {missing_call:?}"
+    );
+    assert!(
+        missing_call
+            .result
+            .expect("omitted actions")
+            .as_array()
+            .expect("actions")
+            .is_empty()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn change_signature_queued_source_edit_rejects_old_call_set() {
+    let environment = tempfile::tempdir().expect("server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Sample.pas");
+    let source = "unit Sample;\ninterface\nimplementation\nprocedure Run;\n  procedure Pair(A: Integer; B: Integer);\n  begin\n  end;\nbegin\n  Pair(1, 2);\nend;\nend.\n";
+    write_file(&main, source);
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    for number in 0..2 {
+        let blocker = root.join(format!("Blocker{number}.pas"));
+        write_file(
+            &blocker,
+            &format!("unit Blocker{number};\ninterface\nimplementation\nend.\n"),
+        );
+        server.send_request(
+            RequestId::from(format!("signature-blocker-{number}")),
+            "textDocument/definition",
+            json!({"textDocument": {"uri": uri(&blocker)}, "position": {"line": 0, "character": 5}}),
+        );
+    }
+    barrier.wait_for_entries(2);
+    let id = RequestId::from("queued-change-signature".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 4, "character": 12}, "end": {"line": 4, "character": 16}}, "context": {"diagnostics": [], "only": ["refactor.rewrite.changeSignature"]}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 2}, "contentChanges": [{"text": source.replace("Pair(1, 2)", "Pair(Next(), 2)")}]}),
+    );
+    let fence_id = RequestId::from("signature-queued-overlay-fence".to_string());
+    server.send_request(
+        fence_id.clone(),
+        "workspace/willCreateFiles",
+        json!({"files": []}),
+    );
+    assert!(server.response(&fence_id).error.is_none());
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some()
+            || response
+                .result
+                .as_ref()
+                .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty)),
+        "stale signature edit published: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn change_signature_read_only_source_offers_no_edit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Sample.pas");
+    write_file(
+        &main,
+        "unit Sample;\ninterface\nimplementation\nprocedure Run;\n  procedure Pair(A: Integer; B: Integer);\n  begin\n  end;\nbegin\n  Pair(1, 2);\nend;\nend.\n",
+    );
+    fs::set_permissions(&main, fs::Permissions::from_mode(0o444)).expect("read-only source");
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("change-signature-read-only".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 4, "character": 12}, "end": {"line": 4, "character": 16}}, "context": {"diagnostics": [], "only": ["refactor.rewrite.changeSignature"]}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some()
+            || response
+                .result
+                .as_ref()
+                .is_some_and(|result| result.as_array().is_some_and(Vec::is_empty)),
+        "read-only source offered signature edit: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn extract_local_integer_assignment_preserves_value_and_single_output() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();

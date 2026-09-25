@@ -55,6 +55,7 @@ pub(crate) mod queries;
 pub(crate) mod rename;
 #[allow(dead_code)]
 pub(crate) mod resolver;
+pub(crate) mod signature;
 
 /// Maximum syntax-tree depth used before invoking the recursive lint/format pipelines.
 pub const MAX_TREE_DEPTH: usize = 256;

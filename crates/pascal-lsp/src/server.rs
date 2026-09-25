@@ -12881,6 +12881,7 @@ fn server_capabilities(
                 "quickfix.implement-interface-method",
                 "refactor.extract.variable",
                 "refactor.extract.function",
+                "refactor.rewrite.changeSignature",
                 "source.fixAll",
                 "source.fixAll.constant-naming",
                 "source.fixAll.local-variable-naming",

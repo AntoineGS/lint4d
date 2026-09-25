@@ -2596,6 +2596,36 @@ fn type_hierarchy_advertises_prepare_and_returns_bound_type_item() {
 }
 
 #[test]
+fn type_hierarchy_ranges_use_utf16_with_bom_crlf_and_non_bmp_text() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("Utf16Types.pas");
+    let source = "\u{feff}unit Utf16Types;\r\ninterface\r\n// 😀 before declarations\r\ntype\r\n  TBase = class end;\r\n  TChild = class(TBase) end;\r\nimplementation\r\nend.\r\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let id = RequestId::from("type-utf16-prepare".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "TChild", 0)
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "UTF-16 prepare failed: {response:?}"
+    );
+    let item = response.result.expect("UTF-16 hierarchy item")[0].clone();
+    let selection = position_of(source, "TChild", 0);
+    assert_eq!(selection, Position::new(5, 2));
+    assert_eq!(item["selectionRange"]["start"], json!(selection));
+    assert_eq!(item["selectionRange"]["end"], json!(Position::new(5, 8)));
+    assert_eq!(item["uri"], uri(&path).to_string());
+    server.shutdown();
+}
+
+#[test]
 fn type_hierarchy_resolves_local_and_cross_unit_parent_child_edges() {
     let root = tempfile::tempdir().expect("workspace");
     let provider = root.path().join("Provider.pas");

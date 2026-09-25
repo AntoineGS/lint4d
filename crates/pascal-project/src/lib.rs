@@ -25,6 +25,7 @@ use crate::delphi_overrides::{
 };
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -39,6 +40,8 @@ const MAX_PROJECT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MAIN_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PACKAGE_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_LOCAL_PROJECT_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_LOCAL_PROJECT_CONFIG_CANDIDATES: usize = 128;
 const MAX_IMPORT_COUNT: usize = 64;
 const MAX_METADATA_FILES: usize = MAX_IMPORT_COUNT + 1;
 const MAX_EXPANDED_VALUE_BYTES: usize = 1024 * 1024;
@@ -67,6 +70,20 @@ pub struct ProjectOptions {
     /// facts remain unknown; project metadata is merged without overwriting a
     /// fact explicitly supplied here.
     pub conditional_context: ConditionalContext,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalProjectConfig {
+    version: u32,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    source_paths: Vec<String>,
+    #[serde(default)]
+    defines: Vec<String>,
+    #[serde(default)]
+    build_configuration: Option<String>,
 }
 
 pub type ProjectSelections = HashMap<PathBuf, PathBuf>;
@@ -930,7 +947,9 @@ pub trait ProjectWorkBudget {
 #[derive(Default)]
 struct ProjectReadTracker<'a> {
     observations: Vec<ProjectReadObservation>,
+    metadata_observations: Vec<MetadataObservation>,
     candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    metadata_paths: Vec<PathBuf>,
     work_budget: Option<&'a dyn ProjectWorkBudget>,
     deleted_paths: &'a [PathBuf],
 }
@@ -963,6 +982,20 @@ impl<'a> ProjectReadTracker<'a> {
         });
     }
 
+    fn record_metadata_path(&mut self, path: PathBuf) {
+        if !self
+            .metadata_paths
+            .iter()
+            .any(|existing| project_paths_equal(existing, &path))
+        {
+            self.metadata_paths.push(path);
+        }
+    }
+
+    fn record_metadata_observation(&mut self, observation: MetadataObservation) {
+        add_metadata_observation(&mut self.metadata_observations, observation);
+    }
+
     fn record_candidate_membership(
         &mut self,
         path: PathBuf,
@@ -978,7 +1011,19 @@ impl<'a> ProjectReadTracker<'a> {
         self.candidate_memberships.insert(path, membership);
     }
 
-    fn into_discovery(self, context: ProjectContext) -> ProjectDiscovery {
+    fn into_discovery(self, mut context: ProjectContext) -> ProjectDiscovery {
+        for path in &self.metadata_paths {
+            if !context
+                .metadata_files
+                .iter()
+                .any(|existing| project_paths_equal(existing, path))
+            {
+                context.metadata_files.push(path.clone());
+            }
+        }
+        for observation in self.metadata_observations {
+            add_metadata_observation(&mut context.metadata_observations, observation);
+        }
         ProjectDiscovery {
             context,
             observations: self.observations,
@@ -1496,6 +1541,114 @@ fn discover_context(
     .map(|discovery| discovery.context)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn load_local_project_config(
+    file: &Path,
+    workspace_root: Option<&Path>,
+    roots: &[PathBuf],
+    options: &ProjectOptions,
+    overrides: &OverrideSession,
+    exclusions: &[String],
+    tracker: &mut ProjectReadTracker<'_>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<(PathBuf, LocalProjectConfig)>, String> {
+    let Some(workspace_root) = workspace_root else {
+        return Ok(None);
+    };
+    let project_directory = file.parent();
+    // Override loading has its own established diagnostic path in project
+    // discovery. A local config can still be bounded/read safely under the
+    // workspace roots without mappings when that independent layer is invalid.
+    let effective_overrides = overrides
+        .effective_for(Some(workspace_root), project_directory)
+        .unwrap_or_default();
+    let policy = ReadPolicy::new(
+        roots,
+        &options.source_paths,
+        exclusions,
+        &effective_overrides,
+    );
+    let mut current = project_directory;
+    let mut candidates = 0;
+    while let Some(directory) = current {
+        check_project_scan_cancel(cancel)?;
+        if let Some(budget) = tracker.work_budget {
+            budget.charge_path_visits(1)?;
+        }
+        candidates += 1;
+        if candidates > MAX_LOCAL_PROJECT_CONFIG_CANDIDATES {
+            return Err(format!(
+                ".delphilsp.json ancestor candidate limit ({MAX_LOCAL_PROJECT_CONFIG_CANDIDATES}) exceeded"
+            ));
+        }
+        if !project_path_starts_with(directory, workspace_root) {
+            break;
+        }
+        let candidate = directory.join(".delphilsp.json");
+        tracker.record_metadata_path(candidate.clone());
+        if !is_deleted_path(&candidate, tracker.deleted_paths)
+            && fs::symlink_metadata(&candidate).is_ok()
+        {
+            let entry = ProjectPathEntry {
+                path: candidate.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            };
+            if !policy.allows_entry(&entry) {
+                return Err(format!(
+                    ".delphilsp.json is outside authorized read roots or uses a symlink: {}",
+                    candidate.display()
+                ));
+            }
+            let (contents, observation) =
+                read_payload_with_tracker(&policy, &entry, MAX_LOCAL_PROJECT_CONFIG_BYTES, tracker)
+                    .map_err(|error| format!("could not read {}: {error}", candidate.display()))?;
+            tracker.record_metadata_observation(observation);
+            let config: LocalProjectConfig = serde_json::from_str(&contents).map_err(|error| {
+                format!(
+                    "invalid .delphilsp.json at {}: {error}",
+                    candidate.display()
+                )
+            })?;
+            if config.version != 1 {
+                return Err(format!(
+                    "unsupported .delphilsp.json version {} at {}",
+                    config.version,
+                    candidate.display()
+                ));
+            }
+            if config
+                .build_configuration
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+            {
+                return Err(".delphilsp.json buildConfiguration must be 1..=128 bytes".to_string());
+            }
+            return Ok(Some((candidate, config)));
+        }
+        if directory == workspace_root {
+            break;
+        }
+        current = directory.parent();
+    }
+    Ok(None)
+}
+
+fn validate_local_config_path(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > 4096
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            ".delphilsp.json path must be a relative path without traversal: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
 // Discovery orchestration keeps the immutable request inputs, observation
 // tracker, and cancellation token explicit at this boundary.
 #[allow(clippy::too_many_arguments)]
@@ -1520,6 +1673,60 @@ fn discover_context_with_selections(
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
+    let config_path = load_local_project_config(
+        &file_path,
+        relevant_root.as_deref(),
+        &roots,
+        options,
+        overrides,
+        exclusions,
+        &mut read_tracker,
+        cancel,
+    )?;
+    let mut options = options.clone();
+    if let Some((config_file, config)) = config_path {
+        if options.project_file.is_none() && selections.is_empty() {
+            if let Some(project) = config.project.as_deref() {
+                validate_local_config_path(project)?;
+                let project_directory = config_file.parent().unwrap_or_else(|| Path::new("."));
+                options.project_file = Some(project_directory.join(project));
+            }
+        }
+        for source_path in config.source_paths {
+            validate_local_config_path(&source_path)?;
+            let config_directory = config_file.parent().unwrap_or_else(|| Path::new("."));
+            let source_path = absolute_lexical(&config_directory.join(source_path))?;
+            if !project_path_starts_with(
+                &source_path,
+                relevant_root.as_deref().unwrap_or(config_directory),
+            ) {
+                return Err(format!(
+                    ".delphilsp.json source path escapes its authorized root: {}",
+                    source_path.display()
+                ));
+            }
+            let source_path = source_path.to_string_lossy().into_owned();
+            if !options.source_paths.contains(&source_path) {
+                options.source_paths.push(source_path);
+            }
+        }
+        for define in config.defines {
+            if define.trim().is_empty() || define.len() > 256 || define.contains(';') {
+                return Err(
+                    ".delphilsp.json defines must be non-empty symbols of at most 256 bytes"
+                        .to_string(),
+                );
+            }
+            if options.conditional_context.define(&define) == ConditionalFact::Unknown {
+                options
+                    .conditional_context
+                    .set_define(&define, ConditionalFact::True);
+            }
+        }
+        if options.build_config.is_none() {
+            options.build_config = config.build_configuration;
+        }
+    }
     record_candidate_memberships(
         &file_path,
         relevant_root.as_deref(),
@@ -1550,7 +1757,7 @@ fn discover_context_with_selections(
                 let context = build_standalone_context_with_overrides(
                     &file_path,
                     &roots,
-                    options,
+                    &options,
                     warnings,
                     false,
                     Vec::new(),
@@ -1585,7 +1792,7 @@ fn discover_context_with_selections(
                 let context = build_standalone_context_with_overrides(
                     &file_path,
                     &roots,
-                    options,
+                    &options,
                     warnings,
                     false,
                     candidates,
@@ -1611,7 +1818,7 @@ fn discover_context_with_selections(
                 &file_path,
                 relevant_root.as_deref(),
                 &roots,
-                options,
+                &options,
                 overrides,
                 &mut warnings,
                 &mut read_tracker,
@@ -1654,7 +1861,7 @@ fn discover_context_with_selections(
                             project_file,
                             &file_path,
                             &roots,
-                            options,
+                            &options,
                             EffectiveOverrides::default(),
                             warnings,
                             explicit,
@@ -1676,7 +1883,7 @@ fn discover_context_with_selections(
                 project_file,
                 &file_path,
                 &roots,
-                options,
+                &options,
                 effective_overrides,
                 warnings,
                 explicit,
@@ -1698,7 +1905,7 @@ fn discover_context_with_selections(
             let context = build_standalone_context_with_overrides(
                 &file_path,
                 &roots,
-                options,
+                &options,
                 warnings,
                 true,
                 metadata_files,
@@ -1719,7 +1926,7 @@ fn discover_context_with_selections(
             let mut context = build_standalone_context_with_overrides(
                 &file_path,
                 &roots,
-                options,
+                &options,
                 warnings,
                 false,
                 metadata_files,
@@ -4758,6 +4965,44 @@ pub fn content_hash_bytes(bytes: &[u8]) -> u64 {
     project_content_hash(bytes)
 }
 
+/// Re-read one previously authorized metadata payload and verify the exact
+/// bytes that discovery consumed. File metadata alone is not a freshness proof
+/// because content can change while size and modification time are restored.
+pub fn metadata_payload_is_current(
+    observation: &MetadataObservation,
+    read_limit: u64,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<bool, String> {
+    let MetadataObservation::Payload {
+        path,
+        read_policy,
+        path_entry,
+        content_hash,
+        ..
+    } = observation
+    else {
+        return Ok(true);
+    };
+    if !project_paths_equal(path, &path_entry.path) {
+        return Ok(false);
+    }
+    let mut tracker = ProjectReadTracker::with_budget(work_budget, &[]);
+    match read_payload_with_tracker(read_policy, path_entry, read_limit, &mut tracker) {
+        Ok(_) => Ok(tracker
+            .observations
+            .iter()
+            .find(|read| project_paths_equal(&read.path, path))
+            .is_some_and(|read| read.content_hash == *content_hash)),
+        Err(error)
+            if error == "request cancelled"
+                || work_budget.is_some_and(|budget| budget.is_transient_error(&error)) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 pub fn path_stamp_result(path: &Path) -> io::Result<Option<ProjectReadStamp>> {
     let link_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -5352,6 +5597,7 @@ impl ProjectBuilder {
                             unknown_properties: &self.unknown_properties,
                             unknown_import_taint: self.unknown_import_taint,
                             overrides: &self.overrides,
+                            read_policy: &self.read_policy,
                         },
                         base,
                         &mut self.metadata_files,
@@ -5391,6 +5637,7 @@ impl ProjectBuilder {
                 unknown_properties: &self.unknown_properties,
                 unknown_import_taint: self.unknown_import_taint,
                 overrides: &self.overrides,
+                read_policy: &self.read_policy,
             },
             base,
             &mut self.metadata_files,
@@ -5416,6 +5663,7 @@ impl ProjectBuilder {
                     unknown_properties: &self.unknown_properties,
                     unknown_import_taint: self.unknown_import_taint,
                     overrides: &self.overrides,
+                    read_policy: &self.read_policy,
                 },
                 base,
                 &mut self.metadata_files,
@@ -5585,9 +5833,9 @@ impl ProjectBuilder {
         tracker: &mut ProjectReadTracker<'_>,
         source_provenance: &ProjectPathProvenance,
     ) {
-        if !import_may_be_optset(&import.project) {
+        if !import_may_be_evaluated(&import.project) {
             self.warnings.push(format!(
-                "ignored non-optset project import in {} (targets are not executed): {}",
+                "ignored unsupported MSBuild import in {} (targets are not executed): {}",
                 source_file.display(),
                 import.project
             ));
@@ -5616,16 +5864,16 @@ impl ProjectBuilder {
             base,
             &self.overrides,
             &mut self.warnings,
-            "optset import",
+            "project import",
         ) else {
             self.incomplete = true;
             self.taint_unknown_import();
             return;
         };
         let candidate = lexical_normalize(&resolved.path);
-        if !extension_is(&candidate, "optset") {
+        if !is_supported_project_import(&candidate) {
             self.warnings.push(format!(
-                "ignored non-optset project import in {} (targets are not executed): {}",
+                "ignored unsupported MSBuild import in {} (targets are not executed): {}",
                 source_file.display(),
                 import.project
             ));
@@ -5636,7 +5884,7 @@ impl ProjectBuilder {
             &resolved,
             &expanded.value,
             &mut self.warnings,
-            "optset import",
+            "project import",
         );
         let path = match &path_status {
             ExistingPathStatus::Found(path) => path,
@@ -5657,7 +5905,7 @@ impl ProjectBuilder {
             self.incomplete = true;
             self.taint_unknown_import();
             self.warnings.push(format!(
-                "ignored optset import outside authorized read roots: {}",
+                "ignored project import outside authorized read roots: {}",
                 path.display()
             ));
             return;
@@ -5667,7 +5915,7 @@ impl ProjectBuilder {
             path.clone(),
             &mut self.warnings,
             source_file,
-            "optset",
+            "project import",
         ) {
             self.incomplete = true;
             self.taint_unknown_import();
@@ -5680,6 +5928,7 @@ impl ProjectBuilder {
                 unknown_properties: &self.unknown_properties,
                 unknown_import_taint: self.unknown_import_taint,
                 overrides: &self.overrides,
+                read_policy: &self.read_policy,
             },
             base,
             &mut self.metadata_files,
@@ -5699,7 +5948,7 @@ impl ProjectBuilder {
             self.incomplete = true;
             self.taint_unknown_import();
             self.warnings.push(format!(
-                "optset import limit ({MAX_IMPORT_COUNT}) reached while reading {}",
+                "project import limit ({MAX_IMPORT_COUNT}) reached while reading {}",
                 source_file.display()
             ));
             return;
@@ -5708,7 +5957,7 @@ impl ProjectBuilder {
             self.incomplete = true;
             self.taint_unknown_import();
             self.warnings.push(missing_path_warning(
-                "optset import",
+                "project import",
                 &expanded.value,
                 &candidate,
                 &resolved,
@@ -5716,8 +5965,10 @@ impl ProjectBuilder {
             return;
         };
         if !self.active_imports.insert(path.clone()) {
-            self.warnings
-                .push(format!("optset import cycle ignored at {}", path.display()));
+            self.warnings.push(format!(
+                "project import cycle ignored at {}",
+                path.display()
+            ));
             return;
         }
         self.import_count += 1;
@@ -5735,7 +5986,7 @@ impl ProjectBuilder {
                 self.incomplete = true;
                 self.taint_unknown_import();
                 self.warnings.push(format!(
-                    "could not read optset import {}: {error}",
+                    "could not read project import {}: {error}",
                     path.display()
                 ));
             }
@@ -5779,17 +6030,24 @@ enum XmlOperation {
     Unsupported(String),
 }
 
-fn looks_like_optset(project: &str) -> bool {
+fn is_supported_project_import(path: &Path) -> bool {
+    extension_is(path, "optset") || extension_is(path, "props")
+}
+
+fn looks_like_supported_project_import(project: &str) -> bool {
     project
         .replace('\\', "/")
         .rsplit('/')
         .next()
-        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".optset"))
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with(".optset") || name.ends_with(".props")
+        })
 }
 
-fn import_may_be_optset(project: &str) -> bool {
+fn import_may_be_evaluated(project: &str) -> bool {
     let project = project.trim();
-    if looks_like_optset(project) {
+    if looks_like_supported_project_import(project) {
         return true;
     }
     let normalized = project.replace('\\', "/");
@@ -5800,7 +6058,11 @@ fn import_may_be_optset(project: &str) -> bool {
         return false;
     }
     match name.rfind(')') {
-        Some(end) => name[end + 1..].is_empty(),
+        Some(end) => {
+            let suffix = &name[end + 1..];
+            suffix.is_empty()
+                || matches!(suffix.to_ascii_lowercase().as_str(), ".props" | ".optset")
+        }
         None => true,
     }
 }
@@ -6348,6 +6610,7 @@ struct ConditionEnvironment<'a> {
     unknown_properties: &'a HashSet<String>,
     unknown_import_taint: bool,
     overrides: &'a EffectiveOverrides,
+    read_policy: &'a ReadPolicy,
 }
 
 fn expand_condition_value(
@@ -6469,6 +6732,7 @@ fn condition_matches(
         unknown_properties: environment.unknown_properties,
         unknown_import_taint: environment.unknown_import_taint,
         overrides: environment.overrides,
+        read_policy: environment.read_policy,
         base,
         metadata_files,
         warnings,
@@ -6639,6 +6903,7 @@ struct ConditionParser<'a> {
     unknown_properties: &'a HashSet<String>,
     unknown_import_taint: bool,
     overrides: &'a EffectiveOverrides,
+    read_policy: &'a ReadPolicy,
     base: &'a Path,
     metadata_files: &'a mut Vec<PathBuf>,
     warnings: &'a mut Vec<String>,
@@ -6699,9 +6964,15 @@ impl ConditionParser<'_> {
                 self.warnings,
                 "Exists condition",
             ) else {
-                return Ok(TruthValue::False);
+                self.unknown_seen = true;
+                return Ok(TruthValue::Unknown);
             };
             let candidate = lexical_normalize(&resolved.path);
+            let entry = ProjectPathEntry::resolved(candidate.clone(), &resolved, true);
+            if !self.read_policy.allows_location(&entry) {
+                self.unknown_seen = true;
+                return Ok(TruthValue::Unknown);
+            }
             let path_status = resolve_existing_path_status_with_provenance(
                 &candidate,
                 &resolved,

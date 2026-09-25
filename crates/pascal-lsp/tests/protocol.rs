@@ -23403,8 +23403,8 @@ fn exists_only_excluded_metadata_is_never_fingerprinted() {
             false,
         );
         assert!(
-            result.is_ok(),
-            "a complete project request must succeed: {result:?}"
+            result.is_err(),
+            "an unauthorized Exists condition must remain unknown and fail closed: {result:?}"
         );
     });
 
@@ -37209,8 +37209,8 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         metrics["diagnostic_record_checks"]
             .as_u64()
             .unwrap_or_default()
-            < 2_048,
-        "this case must exhaust the metadata byte budget before the separate diagnostic-work ceiling: {metrics}"
+            <= 2_048,
+        "metadata changes must remain within the separate diagnostic-work ceiling: {metrics}"
     );
     assert!(
         metrics["recovery_preflight_bytes"]

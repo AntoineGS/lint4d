@@ -898,6 +898,7 @@ dependencies = [
  "globset",
  "quick-xml",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

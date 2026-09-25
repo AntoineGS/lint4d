@@ -2945,6 +2945,7 @@ mod tests {
             fixture.project.clone(),
             fixture.main.clone(),
             fixture.provider.clone(),
+            fixture.root.join(".delphilsp.json"),
         ]);
         assert!(
             records

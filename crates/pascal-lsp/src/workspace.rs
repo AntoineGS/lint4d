@@ -25,7 +25,8 @@ use pascal_project::{
     discover_with_selections_and_observations_with_overrides_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths,
-    has_invalid_project_selection, project_candidate_membership_with_deleted_paths_and_budget,
+    has_invalid_project_selection, metadata_payload_is_current,
+    project_candidate_membership_with_deleted_paths_and_budget,
     project_candidates_with_work_budget_and_deleted_paths,
     read_package_metadata_with_observations_and_work_budget, runtime_project_selection,
     selected_project_is_current_with_budget_and_deleted_paths,
@@ -12519,6 +12520,43 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
 
+    for observation in &state.context.metadata_observations {
+        check_workspace_cancel(cancel)?;
+        let MetadataObservation::Payload { path, .. } = observation else {
+            continue;
+        };
+        if !(extension_is(path, "json")
+            || extension_is(path, "dproj")
+            || extension_is(path, "dpr")
+            || extension_is(path, "dpk")
+            || extension_is(path, "optset")
+            || extension_is(path, "props"))
+            || !state
+                .project_read_observations
+                .iter()
+                .any(|read| package_paths_equal(&read.path, path) && read.content_bytes.is_some())
+        {
+            continue;
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
+        let read_limit = if extension_is(path, "json") {
+            64 * 1024
+        } else if extension_is(path, "dpr") {
+            8 * 1024 * 1024
+        } else {
+            4 * 1024 * 1024
+        };
+        if !metadata_payload_is_current(
+            observation,
+            read_limit,
+            budget.map(|budget| budget as &dyn ProjectWorkBudget),
+        )? {
+            return Ok(false);
+        }
+    }
+
     for (directory, expected) in &state.project_candidate_memberships {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
@@ -17198,6 +17236,78 @@ mod tests {
                 .any(|warning| warning.contains(&user_config.display().to_string())),
             "project context lost malformed user override provenance: {:?}",
             context.warnings
+        );
+    }
+
+    #[test]
+    fn local_project_configuration_invalidation_reselects_project_for_open_context() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let source = root.join("Main.pas");
+        let config = root.join(".delphilsp.json");
+        fs::create_dir_all(&root).expect("workspace directory");
+        fs::write(&source, "unit Main; interface implementation end.\n").expect("source");
+        for (name, main) in [("A", "A.dpr"), ("B", "B.dpr")] {
+            fs::write(root.join(format!("{name}.dpr")), "program P; begin end.\n")
+                .expect("main source");
+            fs::write(
+                root.join(format!("{name}.dproj")),
+                format!("<Project><PropertyGroup><MainSource>{main}</MainSource></PropertyGroup></Project>"),
+            )
+            .expect("project");
+        }
+        let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+        let uri = Url::from_file_path(&source).expect("source URI");
+        workspace
+            .open_document(
+                uri.clone(),
+                "unit Main; interface implementation end.\n".to_string(),
+                1,
+            )
+            .expect("open source document");
+        let initial = workspace
+            .project_context(&uri)
+            .expect("initial project context");
+        assert_eq!(initial.selected_project_uri, None);
+
+        fs::write(&config, r#"{"version":1,"project":"A.dproj"}"#).expect("create local config");
+        let config_uri = Url::from_file_path(&config).expect("config URI");
+        workspace.file_event(&config_uri, FileChange::Created);
+        let created = workspace
+            .project_context(&uri)
+            .expect("context after configuration creation");
+        assert_eq!(
+            created.selected_project_uri,
+            Url::from_file_path(root.join("A.dproj")).ok()
+        );
+
+        let original_modified = fs::metadata(&config)
+            .expect("config metadata")
+            .modified()
+            .expect("config modified time");
+        fs::write(&config, r#"{"version":1,"project":"B.dproj"}"#).expect("update local config");
+        fs::File::options()
+            .write(true)
+            .open(&config)
+            .expect("open config timestamp")
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .expect("restore config timestamp");
+        let updated = workspace
+            .project_context(&uri)
+            .expect("updated project context");
+        assert_eq!(
+            updated.selected_project_uri,
+            Url::from_file_path(root.join("B.dproj")).ok()
+        );
+
+        fs::remove_file(&config).expect("delete local config");
+        workspace.file_event(&config_uri, FileChange::Deleted);
+        let deleted = workspace
+            .project_context(&uri)
+            .expect("context after configuration deletion");
+        assert_ne!(
+            deleted.selected_project_uri,
+            Url::from_file_path(root.join("B.dproj")).ok()
         );
     }
 

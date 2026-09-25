@@ -4373,7 +4373,9 @@ fn selected_explicit_uses_path_edits(
             }
             let (consumer_context, _) =
                 project_context_and_metadata_for_input(input, source_uri, cancel)?;
-            if !consumer_context.discovery_complete || &consumer_context != provider_context {
+            if !consumer_context.discovery_complete
+                || !project_contexts_match_for_explicit_in_path(&consumer_context, provider_context)
+            {
                 return Err(
                     "explicit unit in-path consumer and provider contexts are incomplete or differ"
                         .to_string(),
@@ -4395,6 +4397,27 @@ fn selected_explicit_uses_path_edits(
         }
     }
     Ok(result)
+}
+
+fn project_contexts_match_for_explicit_in_path(
+    left: &pascal_project::ProjectContext,
+    right: &pascal_project::ProjectContext,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for context in [&mut left, &mut right] {
+        context.metadata_files.retain(|path| {
+            let is_absent_local_config_candidate = path
+                .file_name()
+                .is_some_and(|name| name == ".delphilsp.json")
+                && !context
+                    .metadata_observations
+                    .iter()
+                    .any(|observation| observation.path() == path);
+            !is_absent_local_config_candidate
+        });
+    }
+    left == right
 }
 
 /// Apply the proposed source edits to immutable proof snapshots, reparse every
@@ -10797,7 +10820,7 @@ mod tests {
     fn worker_revalidates_exists_only_stat_metadata_without_opening_its_payload() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().to_path_buf();
-        let private = root.join("vendor/private/settings.optset");
+        let private = root.join("vendor/public/settings.optset");
         let target = root.join("Provider.pas");
         let target_source =
             "unit Provider;\ninterface\nconst BadConst = 1;\nimplementation\nend.\n";
@@ -10808,7 +10831,7 @@ mod tests {
         fs::write(root.join("App.dpr"), "program App; begin end.\n").expect("main source");
         fs::write(
             root.join("App.dproj"),
-            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><PropertyGroup Condition=\"Exists('vendor/private/settings.optset')\"><DCC_Define>PRIVATE_SETTINGS</DCC_Define></PropertyGroup></Project>",
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><PropertyGroup Condition=\"Exists('vendor/public/settings.optset')\"><DCC_Define>PRIVATE_SETTINGS</DCC_Define></PropertyGroup></Project>",
         )
         .expect("project descriptor");
 

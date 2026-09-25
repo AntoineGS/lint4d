@@ -175,7 +175,7 @@ fn unknown_bds_target_import_is_ignored_without_tainting_context() {
     assert_eq!(context.defines, ["AFTER", "KNOWN"]);
     assert_eq!(context.search_paths, vec![root.to_path_buf(), units]);
     assert!(context.warnings.iter().any(|warning| {
-        warning.contains("ignored non-optset project import")
+        warning.contains("ignored unsupported MSBuild import")
             && warning.contains("CodeGear.Delphi.Targets")
     }));
     assert!(
@@ -214,7 +214,7 @@ fn known_unmapped_bds_target_import_is_ignored_without_tainting_context() {
     assert_eq!(context.defines, ["AFTER", "KNOWN"]);
     assert_eq!(context.search_paths, vec![root.to_path_buf(), units]);
     assert!(context.warnings.iter().any(|warning| {
-        warning.contains("ignored non-optset project import")
+        warning.contains("ignored unsupported MSBuild import")
             && warning.contains("CodeGear.Delphi.Targets")
     }));
     assert!(
@@ -258,7 +258,7 @@ fn macro_before_literal_non_optset_suffix_is_ignored_without_tainting_context() 
         "$(TargetName).targets",
     ] {
         assert!(context.warnings.iter().any(|warning| {
-            warning.contains("ignored non-optset project import") && warning.contains(import)
+            warning.contains("ignored unsupported MSBuild import") && warning.contains(import)
         }));
     }
     assert!(
@@ -294,7 +294,14 @@ fn native_xml_bds_paths_normalize_delphi_separators_for_exists_and_references() 
         ),
     );
 
-    let context = discover(&main, root, &options());
+    let session = OverrideSession::new(None);
+    let context = ProjectContext::discover_with_overrides(
+        &main,
+        &[root.to_path_buf(), sdk.to_path_buf()],
+        &options(),
+        &session,
+    )
+    .expect("discover project with authorized SDK root");
 
     assert!(context.search_paths.contains(&sdk.join("source")));
     assert_eq!(context.defines, ["NATIVE_EXISTS"]);
@@ -336,7 +343,14 @@ fn native_override_bds_paths_normalize_delphi_separators_for_exists_and_referenc
 </Project>"#,
     );
 
-    let context = discover(&main, root, &options());
+    let session = OverrideSession::new(None);
+    let context = ProjectContext::discover_with_overrides(
+        &main,
+        &[root.to_path_buf(), sdk.to_path_buf()],
+        &options(),
+        &session,
+    )
+    .expect("discover project with authorized SDK root");
 
     assert!(context.search_paths.contains(&sdk.join("source")));
     assert_eq!(context.defines, ["NATIVE_OVERRIDE_EXISTS"]);
@@ -2682,7 +2696,7 @@ fn mapped_optset_import_rechecks_the_final_extension_before_reading() {
         context
             .warnings
             .iter()
-            .any(|warning| warning.contains("ignored non-optset project import"))
+            .any(|warning| warning.contains("ignored unsupported MSBuild import"))
     );
     assert!(!context.metadata_files.contains(&destination));
 }
@@ -2827,7 +2841,7 @@ fn mapped_target_imports_are_ignored_without_reading_the_destination() {
         context
             .warnings
             .iter()
-            .any(|warning| warning.contains("ignored non-optset project import"))
+            .any(|warning| warning.contains("ignored unsupported MSBuild import"))
     );
     assert!(!context.metadata_files.contains(&target));
 }

@@ -28,5 +28,20 @@ The public APIs accept an explicit [`delphi_overrides::OverrideSession`] when a
 caller needs deterministic, environment-independent discovery. Filesystem
 payload reads are bounded and use the provenance-aware [`ReadPolicy`].
 
+Project imports support deterministic literal or property-expanded `.optset`
+and `.props` files, including nested relative imports. The evaluator handles
+ordered property assignments and boolean/comparison conditions; it does not
+execute targets or expand wildcard imports. Unsupported functions, unknown
+conditions, and unauthorized imports are not treated as proven false.
+
+Project discovery loads the nearest `.delphilsp.json` (version `1`) from the
+source directory up to the supplied workspace root. Supported properties are
+`project`, `sourcePaths`, `defines`, and `buildConfiguration`; paths are
+relative to the config file and reject absolute paths and `..`. Client project
+selection and explicitly supplied client facts/configuration take precedence.
+Unknown fields, malformed or oversized files, path escapes, and symlinked
+config files fail closed. The config payload and nearest absent config
+candidates are retained for freshness and invalidation.
+
 For the resolver, CFG adapter, CLI, and LSP ownership boundary, see the
 [shared resolver integration guide](../../docs/shared-resolver-architecture.md).

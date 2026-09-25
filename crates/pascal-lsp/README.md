@@ -1832,8 +1832,8 @@ Not implemented or incomplete:
   not infer host compiler state. Unknown alternatives and Pascal-dependent
   include expressions therefore produce no navigation result, withhold
   diagnostics, or block rename rather than being guessed.
-- Full MSBuild evaluation, arbitrary `.dproj` targets, and `.delphilsp.json`
-  compiler-equivalent search-path/configuration loading.
+ - Full MSBuild evaluation, arbitrary `.dproj` targets, and compiler-equivalent
+  search-path/configuration loading are not implemented.
 - Compiler-equivalent overload selection and anonymous callable inference are
   not implemented. Completion and signature help remain conservative when
   imports, conditionals, receivers, or parser state are unknown; snippets are
@@ -1845,6 +1845,44 @@ Not implemented or incomplete:
 
 Unsupported expressions can return no location. Results should be evaluated
 against your own projects before treating navigation as compiler-equivalent.
+
+### Supported project evaluation and `.delphilsp.json`
+
+Project discovery evaluates literal, relative `.optset` and `.props` imports,
+including nested imports and property-expanded paths with those extensions.
+Imports and property groups are processed in document order. `.targets` are
+not executed; wildcard imports are not expanded or treated as a known empty
+set. Cycles are detected, while missing imports, unknown conditions, unsafe
+paths, malformed metadata, and read/work limits leave project discovery
+incomplete rather than producing a trusted partial context. Conditions support
+parentheses, `And`/`Or`, `==`/`!=`, and `Exists(...)` only for a known,
+authorized path. Unknown values, unsupported functions, and `Exists` outside
+the authorized roots remain unknown, not false.
+
+An applicable workspace/project directory may contain `.delphilsp.json` with
+this small version-1 schema:
+
+```json
+{
+  "version": 1,
+  "project": "App.dproj",
+  "sourcePaths": ["src", "generated"],
+  "defines": ["FEATURE_X"],
+  "buildConfiguration": "Debug"
+}
+```
+
+`version` is required; the other properties are optional. Paths are relative
+to the config file's directory and reject absolute paths and `..`. Source paths
+must remain under authorized roots. The nearest config from the document
+directory to its workspace root wins. An explicit runtime/client project
+selection takes precedence over `project`; runtime source paths are retained
+first, with local paths appended; explicitly supplied defines and build
+configuration take precedence over local values. Unknown JSON fields, other
+versions, malformed or over-64-KiB files, symlinked config files, and unsafe
+paths fail closed. Config payloads and nearer missing candidate paths are
+tracked for project-context freshness, so creation, change, and deletion can
+rebuild contexts for open or unopened documents.
 
 ## Rename and naming code actions
 

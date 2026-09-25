@@ -129,6 +129,297 @@ fn public_api_resolves_dproj_optset_configuration_and_metadata() {
 }
 
 #[test]
+fn public_api_evaluates_nested_relative_props_import_with_property_condition() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let project = project_dir.join("App.dproj");
+    let nested = project_dir.join("configuration").join("shared.props");
+    let paths = project_dir
+        .join("configuration")
+        .join("settings")
+        .join("paths.props");
+    let include = project_dir.join("Include");
+    write(&source, "program App; begin end.");
+    fs::create_dir_all(&include).expect("include path");
+    write(
+        &project,
+        r#"<Project>
+  <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+  <Import Project="configuration/shared.props" Condition="'$(Config)'=='Debug'" />
+</Project>"#,
+    );
+    write(
+        &nested,
+        r#"<Project><Import Project="settings/paths.props" /></Project>"#,
+    );
+    write(
+        &paths,
+        r#"<Project><PropertyGroup><DCC_IncludePath>Include</DCC_IncludePath><DCC_Define>NESTED_IMPORT</DCC_Define></PropertyGroup></Project>"#,
+    );
+    let options = ProjectOptions {
+        build_config: Some("Debug".to_string()),
+        ..ProjectOptions::default()
+    };
+
+    let context = ProjectContext::discover(&source, &[root.to_path_buf()], &options)
+        .expect("project discovery");
+
+    assert!(context.discovery_complete, "{:?}", context.warnings);
+    assert!(
+        context.include_paths.contains(&include),
+        "paths={:?}; warnings={:?}",
+        context.include_paths,
+        context.warnings
+    );
+    assert!(context.defines.contains(&"NESTED_IMPORT".to_string()));
+    assert!(context.metadata_files.contains(&nested));
+    assert!(context.metadata_files.contains(&paths));
+    for imported in [&nested, &paths] {
+        assert!(
+            context.metadata_observations.iter().any(|observation| {
+                observation.path() == imported
+                    && matches!(observation, MetadataObservation::Payload { .. })
+            }),
+            "imported props file must retain the bytes actually consumed: {imported:?}"
+        );
+    }
+}
+
+#[test]
+fn public_api_applies_versioned_local_configuration_without_overriding_explicit_options() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let project = project_dir.join("App.dproj");
+    let configured_units = project_dir.join("ConfiguredUnits");
+    let client_units = project_dir.join("ClientUnits");
+    fs::create_dir_all(&configured_units).expect("configured units");
+    fs::create_dir_all(&client_units).expect("client units");
+    write(&source, "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    let configured_project = project_dir.join("Configured.dproj");
+    write(
+        &configured_project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        &project_dir.join(".delphilsp.json"),
+        r#"{"version":1,"project":"Configured.dproj","sourcePaths":["ConfiguredUnits"],"defines":["LOCAL_CONFIG"]}"#,
+    );
+
+    let context =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("discovery with local configuration");
+    assert_eq!(context.project_file, Some(configured_project));
+    assert!(
+        context.search_paths.contains(&configured_units),
+        "paths={:?}; metadata={:?}; warnings={:?}",
+        context.search_paths,
+        context.metadata_files,
+        context.warnings
+    );
+    assert!(context.defines.contains(&"LOCAL_CONFIG".to_string()));
+
+    let mut conditional_context = ConditionalContext::default();
+    conditional_context.set_define("CLIENT_DEFINE", ConditionalFact::True);
+    let explicit = ProjectContext::discover(
+        &source,
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project.clone()),
+            source_paths: vec![client_units.to_string_lossy().into_owned()],
+            conditional_context,
+            ..ProjectOptions::default()
+        },
+    )
+    .expect("discovery with explicit client options");
+    assert!(explicit.search_paths.contains(&client_units));
+    assert!(explicit.defines.contains(&"CLIENT_DEFINE".to_string()));
+    assert_eq!(explicit.project_file, Some(project));
+    assert!(
+        explicit
+            .metadata_files
+            .contains(&project_dir.join(".delphilsp.json"))
+    );
+    assert!(explicit.metadata_observations.iter().any(|observation| {
+        observation.path() == project_dir.join(".delphilsp.json")
+            && matches!(observation, MetadataObservation::Payload { .. })
+    }));
+}
+
+#[test]
+fn public_api_rejects_malformed_unknown_and_traversing_local_configuration() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    write(&source, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    let config_path = project_dir.join(".delphilsp.json");
+    for invalid in [
+        r#"{"version":1,"define":["TYPO"]}"#,
+        r#"{"version":2,"defines":["NEW_SCHEMA"]}"#,
+        r#"{"version":1,"sourcePaths":["../outside"]}"#,
+    ] {
+        write(&config_path, invalid);
+        let error =
+            ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+                .expect_err("invalid local configuration must fail closed");
+        assert!(
+            error.contains(".delphilsp.json"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn public_api_rejects_a_symlinked_local_configuration() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let outside = root.join("outside.json");
+    write(&source, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(&outside, r#"{"version":1,"defines":["OUTSIDE"]}"#);
+    symlink(&outside, project_dir.join(".delphilsp.json")).expect("symlink configuration");
+
+    let error =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect_err("symlinked config must not be followed");
+    assert!(error.contains("symlink"), "unexpected error: {error}");
+}
+
+#[test]
+fn public_api_configuration_delete_stops_contributing_local_defines() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    write(&source, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    let config = project_dir.join(".delphilsp.json");
+    write(&config, r#"{"version":1,"defines":["LOCAL_CONFIG"]}"#);
+    let before =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("configured discovery");
+    assert!(before.defines.contains(&"LOCAL_CONFIG".to_string()));
+
+    fs::remove_file(&config).expect("delete local configuration");
+    let after =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("discovery after config deletion");
+    assert!(!after.defines.contains(&"LOCAL_CONFIG".to_string()));
+    assert!(after.metadata_files.contains(&config));
+}
+
+#[test]
+fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let project = project_dir.join("App.dproj");
+    write(&source, "program App; begin end.");
+
+    write(
+        &project,
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project="missing.props" /></Project>"#,
+    );
+    let missing =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("incomplete context is still reported");
+    assert!(!missing.discovery_complete);
+    assert!(
+        missing
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("does not exist"))
+    );
+
+    write(
+        &project,
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project="conditional.props" Condition="'$(UnknownProperty)'=='enabled'" /></Project>"#,
+    );
+    write(
+        &project_dir.join("conditional.props"),
+        r#"<Project><PropertyGroup><DCC_Define>MUST_NOT_BE_ASSUMED</DCC_Define></PropertyGroup></Project>"#,
+    );
+    let unknown =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("unknown condition context is reported");
+    assert!(!unknown.discovery_complete);
+    assert!(!unknown.defines.contains(&"MUST_NOT_BE_ASSUMED".to_string()));
+    assert!(
+        unknown
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unknown project condition"))
+    );
+
+    write(
+        &project,
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><PropertyGroup Condition="Exists('../../outside.marker')"><DCC_Define>OUTSIDE_EXISTS</DCC_Define></PropertyGroup></Project>"#,
+    );
+    let outside_exists =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("outside Exists condition stays conservative");
+    assert!(!outside_exists.discovery_complete);
+    assert!(
+        !outside_exists
+            .defines
+            .contains(&"OUTSIDE_EXISTS".to_string())
+    );
+    assert!(
+        outside_exists
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unknown project condition"))
+    );
+
+    write(
+        &project,
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><Import Project="first.props" /></Project>"#,
+    );
+    write(
+        &project_dir.join("first.props"),
+        r#"<Project><PropertyGroup><DCC_Define>FIRST</DCC_Define></PropertyGroup><Import Project="second.props" /></Project>"#,
+    );
+    write(
+        &project_dir.join("second.props"),
+        r#"<Project><PropertyGroup><DCC_Define>SECOND</DCC_Define></PropertyGroup><Import Project="first.props" /></Project>"#,
+    );
+    let cyclic =
+        ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
+            .expect("cycle is handled conservatively");
+    assert!(
+        cyclic
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("project import cycle"))
+    );
+    assert!(cyclic.defines.contains(&"SECOND".to_string()));
+}
+
+#[test]
 fn public_api_rejects_a_precancelled_discovery() {
     let directory = tempdir().expect("temporary workspace");
     let source = directory.path().join("main.pas");

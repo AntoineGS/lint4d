@@ -610,6 +610,41 @@ mod export_scope_tests {
     }
 
     #[test]
+    fn provider_parse_rejects_unknown_class_member_before_root_stop() {
+        let mut bytes = Vec::new();
+        append_type(&mut bytes, "TExported");
+        bytes.push(DR_CLASS_DEF);
+        bytes.extend_from_slice(&[0; 4]); // type definition header
+        bytes.extend_from_slice(&[0, 0, 0]); // D13 class flags
+        bytes.extend_from_slice(&[0; 9]); // class definition indices/counts
+        bytes.push(0); // no implemented interfaces
+        bytes.push(0xFF); // unknown class member, not a class terminator
+        bytes.push(DR_STOP); // valid root terminator must not mask the bad class
+
+        assert!(
+            strict_parse(&bytes, 16, 1024).is_err(),
+            "a malformed class body cannot authorize a compiled type shell"
+        );
+    }
+
+    #[test]
+    fn provider_parse_rejects_incomplete_class_field() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&[0; 9]);
+        bytes.push(0);
+        bytes.push(crate::dcu::tags::AR_FLD);
+        bytes.extend_from_slice(&[0, 0, 0]); // incomplete field record
+        let mut reader = DcuReader::new_for_provider(&bytes, DcuVersion::D13, 16, 1024);
+
+        assert!(
+            crate::dcu::class_parser::parse_class_def(&mut reader).is_err(),
+            "a failed class member decoder must not authorize a type"
+        );
+    }
+
+    #[test]
     fn provider_class_evidence_requires_dr_class_def_not_dotted_procedure_name() {
         let mut bytes = Vec::new();
         append_type(&mut bytes, "TRecord");

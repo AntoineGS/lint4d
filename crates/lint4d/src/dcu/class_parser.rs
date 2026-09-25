@@ -389,6 +389,7 @@ pub(crate) fn parse_class_def(
                         });
                     }
                 }
+                Err(error) if reader.is_provider_reader() => return Err(error),
                 Err(_) => break,
             },
             AR_METHOD | AR_CONSTR | AR_DESTR => match read_method_info(reader, fixed) {
@@ -403,19 +404,23 @@ pub(crate) fn parse_class_def(
                         });
                     }
                 }
+                Err(error) if reader.is_provider_reader() => return Err(error),
                 Err(_) => break,
             },
             AR_PROPERTY => match skip_property_decl(reader) {
                 Ok(()) => {}
+                Err(error) if reader.is_provider_reader() => return Err(error),
                 Err(_) => break,
             },
             AR_CLASS_VAR => match skip_local_decl(reader, false, false) {
                 Ok(()) => {}
+                Err(error) if reader.is_provider_reader() => return Err(error),
                 Err(_) => break,
             },
             AR_VAL | AR_VAR | AR_RESULT | AR_ABS_LOC_VAR | AR_LABEL => {
                 match skip_local_decl(reader, false, false) {
                     Ok(()) => {}
+                    Err(error) if reader.is_provider_reader() => return Err(error),
                     Err(_) => break,
                 }
             }
@@ -437,11 +442,13 @@ pub(crate) fn parse_class_def(
                 let mut dummy_types = Vec::new();
                 match skip_proc_decl(reader, &mut dummy_types) {
                     Ok(_) => {}
+                    Err(error) if reader.is_provider_reader() => return Err(error),
                     Err(_) => break,
                 }
             }
             DR_CONST => match skip_const_decl(reader) {
                 Ok(()) => {}
+                Err(error) if reader.is_provider_reader() => return Err(error),
                 Err(_) => break,
             },
             // Nested class def: parse but discard.
@@ -485,14 +492,31 @@ pub(crate) fn parse_class_def(
             DR_VAR | DR_VAR_C | DR_SPEC_VAR | DR_THREAD_VAR | DR_RES_STR => {
                 skip_var_decl(reader)?;
             }
-            // Stop tags: end of class member list.
-            DR_STOP | DR_STOP1 | DR_STOP_A | DR_CBLOCK | DR_FIXUP => {
+            // The supported provider's D13 class bodies end in DR_STOP1.
+            // A structural/root stop is not proof that a class body completed.
+            DR_STOP1 => {
+                break;
+            }
+            DR_STOP | DR_STOP_A | DR_CBLOCK | DR_FIXUP => {
+                if reader.is_provider_reader() {
+                    return Err(DcuError::UnknownTag {
+                        tag,
+                        offset: reader.position().saturating_sub(1),
+                    });
+                }
                 break;
             }
             // Try shared type-def handler; unknown tag stops gracefully.
             _ => match try_skip_type_def(fixed, reader) {
                 Ok(true) => {}
+                Ok(false) if reader.is_provider_reader() => {
+                    return Err(DcuError::UnknownTag {
+                        tag,
+                        offset: reader.position().saturating_sub(1),
+                    });
+                }
                 Ok(false) => break,
+                Err(error) if reader.is_provider_reader() => return Err(error),
                 Err(_) => break,
             },
         }

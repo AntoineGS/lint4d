@@ -162,12 +162,19 @@ pub(crate) fn plan(
         }
         let first_value = &source[literals[0].start_byte()..literals[0].end_byte()];
         let second_value = &source[literals[1].start_byte()..literals[1].end_byte()];
-        let call_start = call_args.start_byte().saturating_sub(1);
-        let call_end = call_args.end_byte().saturating_add(1);
+        let call_start = entity.end_byte();
+        let call_end = call.end_byte();
         if !plain_i32_literal(first_value)
             || !plain_i32_literal(second_value)
-            || source.get(call_start..call_end)
-                != Some(format!("({first_value}, {second_value})").as_str())
+            || source
+                .get(call_start..literals[0].start_byte())
+                .is_none_or(|prefix| prefix.trim() != "(")
+            || source
+                .get(literals[0].end_byte()..literals[1].start_byte())
+                .is_none_or(|separator| separator.trim() != ",")
+            || source
+                .get(literals[1].end_byte()..call_end)
+                .is_none_or(|suffix| suffix.trim() != ")")
         {
             return Ok(None);
         }
@@ -215,8 +222,12 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
 }
 
 fn plain_i32_literal(source: &str) -> bool {
-    !source.is_empty()
-        && source.bytes().all(|byte| byte.is_ascii_digit())
+    let digits = source
+        .strip_prefix('-')
+        .or_else(|| source.strip_prefix('+'))
+        .unwrap_or(source);
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
         && source.parse::<i32>().is_ok()
 }
 
@@ -224,40 +235,54 @@ fn plain_integer_argument<'a>(
     argument: Node<'_>,
     source: &'a str,
 ) -> Option<(&'a str, bool, &'a str)> {
-    let name = argument.child_by_field_name("name")?;
+    let name_node = argument.child_by_field_name("name")?;
     let ty = argument.child_by_field_name("type")?;
-    let name = &source[name.start_byte()..name.end_byte()];
+    let name = &source[name_node.start_byte()..name_node.end_byte()];
     if name.is_empty()
         || !name.as_bytes()[0].is_ascii_alphabetic()
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         || !source[ty.start_byte()..ty.end_byte()].eq_ignore_ascii_case("Integer")
+        || !source[argument.start_byte()..name_node.start_byte()]
+            .chars()
+            .all(char::is_whitespace)
+        || source[name_node.end_byte()..ty.start_byte()].trim() != ":"
     {
         return None;
     }
     let original = &source[argument.start_byte()..argument.end_byte()];
-    let expected = if let Some(default) = argument.child_by_field_name("defaultValue") {
+    let has_default = if let Some(default) = argument.child_by_field_name("defaultValue") {
         let mut default_cursor = default.walk();
-        let literal = default
+        let literal_node = default
             .named_children(&mut default_cursor)
             .find(|node| node.kind() == "literalNumber")?;
-        let literal = &source[literal.start_byte()..literal.end_byte()];
-        if !plain_i32_literal(literal) {
+        let literal = &source[literal_node.start_byte()..literal_node.end_byte()];
+        if !plain_i32_literal(literal)
+            || !source[ty.end_byte()..default.start_byte()]
+                .chars()
+                .all(char::is_whitespace)
+            || source[default.start_byte()..default.end_byte()]
+                .trim()
+                .strip_prefix('=')
+                .is_none_or(|value| value.trim() != literal)
+            || !source[default.end_byte()..argument.end_byte()]
+                .chars()
+                .all(char::is_whitespace)
+        {
             return None;
         }
-        format!("{name}: Integer = {literal}")
+        true
     } else {
-        format!("{name}: Integer")
+        if !source[ty.end_byte()..argument.end_byte()]
+            .chars()
+            .all(char::is_whitespace)
+        {
+            return None;
+        }
+        false
     };
-    if original != expected {
-        return None;
-    }
-    Some((
-        name,
-        argument.child_by_field_name("defaultValue").is_some(),
-        original,
-    ))
+    Some((name, has_default, original))
 }
 
 fn count_name_occurrences(source: &str, name: &str, cancel: &AtomicBool) -> Result<usize, String> {
@@ -314,6 +339,47 @@ mod tests {
     }
 
     #[test]
+    fn swaps_tight_literal_calls_without_moving_evaluation() {
+        let cancel = AtomicBool::new(false);
+        let compact = SOURCE.replace("Pair(1, 2)", "Pair(1,2)");
+        let edits = plan(&compact, selected_name(), &cancel)
+            .unwrap()
+            .expect("compact two-literal call");
+        assert!(edits.iter().any(|edit| edit.new_text == "(2, 1)"));
+    }
+
+    #[test]
+    fn preserves_parameter_type_case_and_spacing_while_swapping() {
+        let cancel = AtomicBool::new(false);
+        let changed = SOURCE.replace("A: Integer; B: Integer", "A: integer ; B : INTEGER");
+        let edits = plan(&changed, selected_name(), &cancel)
+            .unwrap()
+            .expect("ordinary spaced and cased parameter list");
+        assert!(
+            edits
+                .iter()
+                .any(|edit| edit.new_text.contains("B : INTEGER; A: integer"))
+        );
+    }
+
+    #[test]
+    fn swaps_signed_integer_literals_in_calls_and_defaults() {
+        let cancel = AtomicBool::new(false);
+        let changed = SOURCE
+            .replace("A: Integer; B: Integer", "A: Integer = -7; B: Integer = 8")
+            .replace("Pair(1, 2)", "Pair(-1, 2)");
+        let edits = plan(&changed, selected_name(), &cancel)
+            .unwrap()
+            .expect("negative integer literals do not change evaluation order");
+        assert!(edits.iter().any(|edit| edit.new_text == "(2, -1)"));
+        assert!(
+            edits
+                .iter()
+                .any(|edit| edit.new_text == "(B: Integer = 8; A: Integer = -7)")
+        );
+    }
+
+    #[test]
     fn preserves_literal_defaults_and_refuses_partial_or_impure_calls() {
         let cancel = AtomicBool::new(false);
         let defaults = SOURCE.replace("A: Integer; B: Integer", "A: Integer = 7; B: Integer = 8");
@@ -345,6 +411,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let by_reference = SOURCE.replace("A: Integer; B: Integer", "var A: Integer; B: Integer");
+        assert!(
+            plan(&by_reference, selected_name(), &cancel)
+                .unwrap()
+                .is_none()
+        );
+        let grouped = SOURCE.replace("A: Integer; B: Integer", "A, C: Integer; B: Integer");
+        assert!(plan(&grouped, selected_name(), &cancel).unwrap().is_none());
         let outside = SOURCE.replace("end.\n", "procedure Other; begin Pair(5, 6); end;\nend.\n");
         assert!(plan(&outside, selected_name(), &cancel).unwrap().is_none());
         assert!(

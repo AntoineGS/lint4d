@@ -1220,8 +1220,11 @@ are not synthesized as edges. An uncertain direct parent prevents the complete
 direct-parent result; unproven subtype candidates are omitted. Self-inheritance
 and known cycles in the direct ancestry chain are refused in both directions;
 the bounded cycle check compares resolved `(URI, symbol-key)` identities. A
-missing or otherwise unresolved ancestor stops cycle traversal without hiding
-an independently proven immediate edge.
+missing or otherwise unresolved parent is not emitted as an edge, but does not
+hide other individually proven parents from cycle detection. Any confirmed
+cycle refuses the result. An incomplete direct-parent list is never published;
+an independently proven immediate edge remains visible when only a more distant
+ancestor is unresolved.
 
 Traversal reuses the navigation resolver's 100,000-work/8 MiB budget, examines
 at most 4,096 subtype candidates and 256 ancestry entries per request, returns

@@ -13046,6 +13046,7 @@ impl NavigationIndex {
             cancel,
         )?;
         let mut parents = Vec::with_capacity(entry.parents.len());
+        let mut complete = true;
         for parent in entry.parents.iter().filter(|parent| {
             matches!(
                 (entry.kind, parent.relation),
@@ -13056,7 +13057,8 @@ impl NavigationIndex {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
             if parent.path.is_empty() || document.conditionals.is_unknown_at(parent.span.start) {
-                return Ok(unknown_ancestry());
+                complete = false;
+                continue;
             }
             let candidates = dedup_candidates(self.type_parent_candidates_with_budget(
                 type_uri,
@@ -13072,14 +13074,17 @@ impl NavigationIndex {
                     .iter()
                     .any(|candidate| self.candidate_is_conditionally_unknown(candidate))
             {
-                return Ok(unknown_ancestry());
+                complete = false;
+                continue;
             }
             let candidate = &candidates[0];
             let Some(symbol) = self.symbol(candidate) else {
-                return Ok(unknown_ancestry());
+                complete = false;
+                continue;
             };
             if symbol.kind != SymbolKind::Type {
-                return Ok(unknown_ancestry());
+                complete = false;
+                continue;
             }
             if entry.kind == TypeKind::Class && symbol.type_kind == TypeKind::Interface {
                 continue;
@@ -13090,7 +13095,8 @@ impl NavigationIndex {
                 _ => continue,
             };
             if symbol.type_kind != expected_kind {
-                return Ok(unknown_ancestry());
+                complete = false;
+                continue;
             }
             budget.require_owned_bytes(
                 std::mem::size_of::<(Url, String)>()
@@ -13100,7 +13106,11 @@ impl NavigationIndex {
             )?;
             parents.push((candidate.uri.clone(), symbol.key.clone()));
         }
-        Ok(complete_ancestry(parents))
+        Ok(if complete {
+            complete_ancestry(parents)
+        } else {
+            incomplete_ancestry(parents)
+        })
     }
 
     fn type_parent_candidates_with_budget(
@@ -16606,11 +16616,15 @@ fn complete_ancestry(parents: Vec<(Url, String)>) -> TypeAncestryResolution {
     }
 }
 
-fn unknown_ancestry() -> TypeAncestryResolution {
+fn incomplete_ancestry(parents: Vec<(Url, String)>) -> TypeAncestryResolution {
     TypeAncestryResolution {
         status: AncestryStatus::Unknown,
-        parents: Vec::new(),
+        parents,
     }
+}
+
+fn unknown_ancestry() -> TypeAncestryResolution {
+    incomplete_ancestry(Vec::new())
 }
 
 fn push_unique_candidate(candidates: &mut Vec<Candidate>, candidate: Candidate) {

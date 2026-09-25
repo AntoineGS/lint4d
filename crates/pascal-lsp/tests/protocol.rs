@@ -2996,6 +2996,135 @@ fn type_hierarchy_refuses_cycles_but_keeps_edges_before_unknown_grandparents() {
 }
 
 #[test]
+fn type_hierarchy_refuses_mixed_unknown_parent_interface_cycles_in_both_directions() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("MixedInterfaceCycle.pas");
+    let source = "unit MixedInterfaceCycle; interface type IAlpha = interface(IBeta, IMissing) end; IBeta = interface(IAlpha) end; implementation end.";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+
+    let prepare = |server: &mut TestServer, name: &str| {
+        let request = RequestId::from(format!("mixed-cycle-prepare-{name}"));
+        server.send_request(
+            request.clone(),
+            "textDocument/prepareTypeHierarchy",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "position": position_of(source, name, usize::from(name == "IBeta"))
+            }),
+        );
+        let response = server.response(&request);
+        assert!(response.error.is_none(), "prepare {name}: {response:?}");
+        response
+            .result
+            .clone()
+            .unwrap_or_else(|| panic!("prepare {name} returned no result: {response:?}"))[0]
+            .clone()
+    };
+    let alpha = prepare(&mut server, "IAlpha");
+    let beta = prepare(&mut server, "IBeta");
+
+    let alpha_supers = RequestId::from("mixed-cycle-alpha-super".to_string());
+    server.send_request(
+        alpha_supers.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": alpha.clone()}),
+    );
+    let response = server.response(&alpha_supers);
+    assert!(
+        response.result.is_none() || response.result.as_ref().is_some_and(Value::is_null),
+        "incomplete direct parent list must not be returned: {response:?}"
+    );
+
+    let beta_supers = RequestId::from("mixed-cycle-beta-super".to_string());
+    server.send_request(
+        beta_supers.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": beta.clone()}),
+    );
+    let response = server.response(&beta_supers);
+    assert!(
+        response.result.is_none() || response.result.as_ref().is_some_and(Value::is_null),
+        "a parent participating in a mixed known cycle must not be emitted: {response:?}"
+    );
+
+    for (id, item) in [
+        ("mixed-cycle-alpha-sub", alpha),
+        ("mixed-cycle-beta-sub", beta),
+    ] {
+        let request = RequestId::from(id.to_string());
+        server.send_request(
+            request.clone(),
+            "typeHierarchy/subtypes",
+            json!({"item": item}),
+        );
+        let response = server.response(&request);
+        assert!(
+            response.result.is_none() || response.result.as_ref().is_some_and(Value::is_null),
+            "a known mixed-parent cycle must not produce subtype edges: {response:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn type_hierarchy_withholds_incomplete_multi_parent_interface_without_cycle() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("UnknownInterfaceParent.pas");
+    let source = "unit UnknownInterfaceParent; interface type IAlpha = interface(IBeta, IMissing) end; IBeta = interface end; implementation end.";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+
+    let prepare = |server: &mut TestServer, name: &str| {
+        let request = RequestId::from(format!("unknown-parent-prepare-{name}"));
+        server.send_request(
+            request.clone(),
+            "textDocument/prepareTypeHierarchy",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "position": position_of(source, name, usize::from(name == "IBeta"))
+            }),
+        );
+        let response = server.response(&request);
+        assert!(response.error.is_none(), "prepare {name}: {response:?}");
+        response
+            .result
+            .clone()
+            .unwrap_or_else(|| panic!("prepare {name} returned no result: {response:?}"))[0]
+            .clone()
+    };
+    let alpha = prepare(&mut server, "IAlpha");
+    let beta = prepare(&mut server, "IBeta");
+
+    let supers = RequestId::from("unknown-parent-alpha-super".to_string());
+    server.send_request(
+        supers.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": alpha}),
+    );
+    let response = server.response(&supers);
+    assert!(
+        response.result.is_none() || response.result.as_ref().is_some_and(Value::is_null),
+        "incomplete multi-parent list must not be partially published: {response:?}"
+    );
+
+    let subtypes = RequestId::from("unknown-parent-beta-subtypes".to_string());
+    server.send_request(
+        subtypes.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": beta}),
+    );
+    let response = server.response(&subtypes);
+    let children = response
+        .result
+        .expect("complete query returns an empty proven-child list");
+    assert!(children.as_array().expect("subtype array").is_empty());
+    server.shutdown();
+}
+
+#[test]
 fn type_hierarchy_refuses_conditionally_unknown_direct_parent_reference() {
     let root = tempfile::tempdir().expect("workspace");
     let path = root.path().join("ConditionalParent.pas");

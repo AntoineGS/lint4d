@@ -265,16 +265,14 @@ impl<'a> TypeHierarchyCycleCheck<'a> {
         self.active.insert(identity.clone());
         let result = self.direct_ancestry(uri, key)?;
         let mut acyclic = true;
-        if result.status == super::AncestryStatus::Complete {
-            for (parent_uri, parent_key) in result.parents {
-                if !self.has_acyclic_known_ancestry(&parent_uri, &parent_key)? {
-                    acyclic = false;
-                    break;
-                }
+        for (parent_uri, parent_key) in result.parents {
+            if !self.has_acyclic_known_ancestry(&parent_uri, &parent_key)? {
+                acyclic = false;
+                break;
             }
         }
         self.active.remove(&identity);
-        if acyclic {
+        if acyclic && result.status == super::AncestryStatus::Complete {
             self.known_acyclic.insert(identity);
         }
         Ok(acyclic)

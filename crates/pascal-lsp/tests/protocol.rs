@@ -2571,6 +2571,30 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
         "unproven members must be omitted: {text}"
     );
 
+    let symbols_id = RequestId::from("compiled-unit-document-symbols".to_string());
+    server.send_request(
+        symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    let symbols = server.response(&symbols_id);
+    assert!(
+        symbols.error.is_none(),
+        "compiled symbols failed: {symbols:?}"
+    );
+    let symbols = symbols.result.expect("compiled symbols");
+    let symbols = symbols.as_array().expect("symbol information array");
+    assert!(
+        symbols.iter().any(|symbol| {
+            symbol["name"] == "TSimpleClass" && symbol["location"]["uri"] == virtual_uri
+        }),
+        "proven compiled class missing from document symbols: {symbols:?}"
+    );
+    assert!(
+        !symbols.iter().any(|symbol| symbol["name"] == "Create"),
+        "unproven members cannot become document symbols: {symbols:?}"
+    );
+
     let other = root.join("Other.pas");
     write_file(
         &other,
@@ -2602,20 +2626,24 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
         retained_content.error.is_none(),
         "unrelated navigation discarded Consumer's current provider binding: {retained_content:?}"
     );
-    let virtual_symbols_id = RequestId::from("compiled-document-symbols-unsupported".to_string());
+    let virtual_symbols_id =
+        RequestId::from("compiled-document-symbols-after-navigation".to_string());
     server.send_request(
         virtual_symbols_id.clone(),
         "textDocument/documentSymbol",
         json!({"textDocument": {"uri": virtual_uri}}),
     );
     let virtual_symbols = server.response(&virtual_symbols_id);
-    assert_eq!(
-        virtual_symbols
-            .error
-            .as_ref()
-            .map(|error| error.message.as_str()),
-        Some("document symbols are not supported for compiled virtual documents"),
-        "virtual-document symbol behavior must be an explicit refusal: {virtual_symbols:?}"
+    assert!(
+        virtual_symbols.error.is_none()
+            && virtual_symbols.result.as_ref().is_some_and(|result| {
+                result.as_array().is_some_and(|symbols| {
+                    symbols
+                        .iter()
+                        .any(|symbol| symbol["name"] == "TSimpleClass")
+                })
+            }),
+        "unrelated navigation discarded proven compiled symbols: {virtual_symbols:?}"
     );
 
     let mut forged = Url::parse(virtual_uri).expect("canonical virtual URI");
@@ -2644,6 +2672,16 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
         server.response(&forged_id).error.is_some(),
         "forged provider must not be authorized"
     );
+    let forged_symbols_id = RequestId::from("forged-compiled-unit-symbols".to_string());
+    server.send_request(
+        forged_symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": forged.as_str()}}),
+    );
+    assert!(
+        server.response(&forged_symbols_id).error.is_some(),
+        "forged provider must not expose compiled document symbols"
+    );
 
     let original_dcu = fs::read(&dcu).expect("compiled fixture bytes");
     let original_metadata = fs::metadata(&dcu).expect("compiled fixture metadata");
@@ -2661,6 +2699,16 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     assert!(
         server.response(&stale_dcu_id).error.is_some(),
         "a same-size DCU rewrite with restored mtime must invalidate virtual content"
+    );
+    let stale_symbols_id = RequestId::from("stale-compiled-unit-symbols".to_string());
+    server.send_request(
+        stale_symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    assert!(
+        server.response(&stale_symbols_id).error.is_some(),
+        "a same-size DCU rewrite must invalidate compiled document symbols"
     );
     fs::write(&dcu, &original_dcu).expect("restore compiled fixture");
 

@@ -1984,6 +1984,7 @@ struct SelectProjectRequestParams {
 enum AnalysisRequest {
     CompiledContent {
         snapshot: crate::workspace::CompiledContentSnapshot,
+        symbols: Option<(Url, bool)>,
     },
     Hover {
         uri: Url,
@@ -5094,30 +5095,57 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<PendingAnalysis, String> {
-        if let AnalysisRequest::CompiledContent { snapshot } = request {
+        if let AnalysisRequest::CompiledContent { snapshot, symbols } = request {
             let (source_generation, configuration_generation) = workspace.analysis_generations();
             let cancellation = Arc::new(AtomicBool::new(false));
             let worker_cancellation = Arc::clone(&cancellation);
             let sender = self.sender.clone();
             let worker_id = id;
+            let panic_symbols = symbols.clone();
             let handle = thread::Builder::new()
                 .name("PascalLspCompiledContent".to_string())
                 .spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Workspace::read_compiled_virtual_document_snapshot(
+                    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let result = Workspace::read_compiled_virtual_document_snapshot(
                             snapshot,
                             &worker_cancellation,
-                        )
+                        );
+                        match symbols {
+                            Some((uri, hierarchical)) => {
+                                let value = result.and_then(|text| {
+                                    let text = text.ok_or_else(|| {
+                                        "compiled virtual document is not current or authorized"
+                                            .to_string()
+                                    })?;
+                                    let mut index = NavigationIndex::new();
+                                    index.update(uri.clone(), text)?;
+                                    index.document_symbols_with_cancel(&uri, &worker_cancellation)
+                                });
+                                AnalysisResultValue::DocumentSymbols {
+                                    uri,
+                                    hierarchical,
+                                    value,
+                                }
+                            }
+                            None => AnalysisResultValue::CompiledContent(result),
+                        }
                     }))
-                    .unwrap_or_else(|_| {
-                        Err("compiled virtual-document worker panicked".to_string())
+                    .unwrap_or_else(|_| match panic_symbols {
+                        Some((uri, hierarchical)) => AnalysisResultValue::DocumentSymbols {
+                            uri,
+                            hierarchical,
+                            value: Err("compiled virtual-document worker panicked".to_string()),
+                        },
+                        None => AnalysisResultValue::CompiledContent(Err(
+                            "compiled virtual-document worker panicked".to_string(),
+                        )),
                     });
                     let _ = sender.send(AnalysisResult {
                         id: worker_id,
                         source_generation,
                         configuration_generation,
                         records: Vec::new(),
-                        value: AnalysisResultValue::CompiledContent(result),
+                        value,
                     });
                 })
                 .map_err(|error| format!("could not start compiled content worker: {error}"))?;
@@ -6154,7 +6182,7 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::TypeHierarchySubtypes(computed.value),
                             }
                         }
-                        AnalysisRequest::CompiledContent { snapshot } => AnalysisResult {
+                        AnalysisRequest::CompiledContent { snapshot, .. } => AnalysisResult {
                             id: worker_id,
                             source_generation,
                             configuration_generation,
@@ -6446,7 +6474,7 @@ impl AnalysisJobs {
         }
 
         let primary_id = self.next_computation_id()?;
-        if let AnalysisRequest::CompiledContent { snapshot } = &request {
+        if let AnalysisRequest::CompiledContent { snapshot, .. } = &request {
             self.compiled_content_payload_budget
                 .try_reserve(primary_id, snapshot.retained_payload_bytes())?;
         }
@@ -10488,26 +10516,47 @@ fn handle_request(
             workspace,
             jobs,
             request.id,
-            AnalysisRequest::CompiledContent { snapshot },
+            AnalysisRequest::CompiledContent {
+                snapshot,
+                symbols: None,
+            },
             client_features,
             None,
         )?;
         return Ok(());
     }
-    if request.method == "textDocument/documentSymbol"
-        && request
-            .params
-            .get("textDocument")
-            .and_then(|document| document.get("uri"))
-            .and_then(Value::as_str)
-            .and_then(|value| Url::parse(value).ok())
-            .is_some_and(|uri| uri.scheme() == "lint4d-dcu")
-    {
-        send_error(
+    let compiled_symbols_uri = (request.method == "textDocument/documentSymbol")
+        .then(|| {
+            request
+                .params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Value::as_str)
+                .and_then(|value| Url::parse(value).ok())
+        })
+        .flatten()
+        .filter(|uri| uri.scheme() == "lint4d-dcu");
+    if let Some(uri) = compiled_symbols_uri {
+        let Some(snapshot) = workspace.compiled_virtual_document_snapshot(&uri) else {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::RequestFailed,
+                "compiled virtual document is not current or authorized",
+            )?;
+            return Ok(());
+        };
+        start_analysis(
             connection,
+            workspace,
+            jobs,
             request.id,
-            ErrorCode::RequestFailed,
-            "document symbols are not supported for compiled virtual documents",
+            AnalysisRequest::CompiledContent {
+                snapshot,
+                symbols: Some((uri, client_features.hierarchical_document_symbols)),
+            },
+            client_features,
+            None,
         )?;
         return Ok(());
     }

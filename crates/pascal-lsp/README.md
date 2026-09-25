@@ -718,8 +718,9 @@ methods, fields, signatures, generics and other symbols whose visibility or
 identity the DCU parser cannot prove. Source files always take priority over
 DCUs. Navigation, completion and hover can use a proven compiled type; the
 virtual view is served via `textDocument/content` and never accepted as an edit
-target. `textDocument/documentSymbol` on a virtual URI is explicitly refused;
-symbol lists remain source-only. A URI is valid only for its selected project, bound source importer and
+target. `textDocument/documentSymbol` exposes the proven generated class types
+from the validated read-only view, omitting unproven members. A URI is valid only
+for its selected project, bound source importer and
 unchanged DCU bytes; stale or forged URIs are refused.
 
 Discovery is bounded to 128 imported names, 128 search directories, 4,096

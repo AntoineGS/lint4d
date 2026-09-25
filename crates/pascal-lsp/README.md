@@ -1628,13 +1628,23 @@ selection prove one callable and its positional parameter mapping. Named
 arguments, same-named identifier arguments, and uncertain/rejected conditional
 contexts are suppressed. Type labels are currently deliberately narrow: an
 omitted-type `const` whose complete initializer is the reserved Pascal
-`True`/`False` literal receives `: Boolean`. Strings, numeric literals,
-compound expressions, explicit types, parser recovery, inactive/unknown
-conditional regions, and unsupported declarations receive no inferred-type
-label. The parser's reserved boolean token is the proof; this is not a general
-expression inference engine. Clients may request the standard `resolveSupport`,
-but the server does not advertise resolution and therefore emits only complete
-hint values.
+`True`/`False` literal directly under the declaration's `defaultValue` wrapper
+receives `: Boolean`. The initializer checker does not recursively unwrap
+expression nodes: unary/operator expressions such as `-True` and `not False`,
+parenthesized expressions, strings, numeric literals, other compound
+expressions, explicit types, parser recovery, inactive/unknown conditional
+regions, and unsupported declarations receive no inferred-type label. The
+parser's reserved boolean token is the proof; this is not a general expression
+inference engine.
+
+Pascal's supported call grammar has positional `exprArgs` (expressions with
+optional legacy format suffixes), not named-call-argument syntax. An attempted
+`Draw(Value := 1)` is a parser-recovery construct, not a recognized named
+argument; recovery overlapping that call suppresses its hints rather than
+guessing a positional mapping. Comments and string contents are syntax leaves
+and do not create nested calls. Clients may request the standard
+`resolveSupport`, but the server does not advertise resolution and therefore
+emits only complete string-label values.
 
 ### Source documentation comments
 

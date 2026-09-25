@@ -11282,7 +11282,7 @@ fn folding_ranges_return_multiline_syntax_ranges_over_the_protocol() {
 fn inlay_hints_show_bound_parameter_names_and_proven_boolean_constants() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("InlayHints.pas");
-    let source = "unit InlayHints;\ninterface\nprocedure Draw(Width, Height: Integer);\nprocedure Choose(Value: Integer); overload;\nprocedure Choose(Value: string); overload;\nimplementation\nconst Enabled = True;\nconst Disabled = False;\nconst TextValue = 'text';\nconst Typed: Boolean = True;\n{$IFDEF UNCERTAIN_SYMBOL}\nconst Maybe = True;\n{$ENDIF}\nprocedure Draw(Width, Height: Integer);\nbegin\nend;\nprocedure Run;\nbegin\n  Draw(Width, Height);\n  Draw(10, 20);\n  Choose(Unknown);\nend;\nend.\n";
+    let source = "unit InlayHints;\ninterface\nprocedure Draw(Width, Height: Integer);\nprocedure Choose(Value: Integer); overload;\nprocedure Choose(Value: string); overload;\nimplementation\nconst Enabled = True;\nconst Disabled = False;\nconst TextValue = 'text';\nconst Typed: Boolean = True;\nconst Negated = -True;\nconst NegatedBoolean = not False;\nconst Parenthesized = ((True));\n{$IFDEF UNCERTAIN_SYMBOL}\nconst Maybe = True;\n{$ENDIF}\nprocedure Draw(Width, Height: Integer);\nbegin\nend;\nprocedure Run;\nbegin\n  Draw(Width, Height);\n  Draw(10, 20);\n  Choose(Unknown);\nend;\nend.\n";
     write_file(&source_path, source);
 
     let mut server = TestServer::launch();
@@ -11303,7 +11303,7 @@ fn inlay_hints_show_bound_parameter_names_and_proven_boolean_constants() {
             "textDocument": {"uri": uri(&source_path)},
             "range": {
                 "start": {"line": 0, "character": 0},
-                "end": {"line": 23, "character": 0}
+                "end": {"line": 26, "character": 0}
             }
         }),
     );
@@ -11330,6 +11330,12 @@ fn inlay_hints_show_bound_parameter_names_and_proven_boolean_constants() {
         labels.iter().filter(|label| **label == ": Boolean").count(),
         2,
         "only intrinsic True/False constants should receive inferred types: {hints:?}"
+    );
+    assert!(
+        hints
+            .iter()
+            .all(|hint| !matches!(hint["position"]["line"].as_u64(), Some(10..=12))),
+        "unary and parenthesized expressions are outside the proven direct-literal subset: {hints:?}"
     );
     assert_eq!(
         labels.iter().filter(|label| **label == "Width:").count(),
@@ -11404,6 +11410,324 @@ fn inlay_hint_positions_use_utf16_with_crlf_and_non_bmp_arguments() {
     assert_eq!(hints[0]["label"], "Value:");
     assert_eq!(hints[0]["position"]["line"], 9);
     assert_eq!(hints[0]["position"]["character"], 16);
+    server.shutdown();
+}
+
+#[test]
+fn inlay_hints_fail_closed_for_named_arguments_and_ignore_comment_string_contents() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("InlayLexical.pas");
+    let source = "unit InlayLexical;\ninterface\nprocedure Draw(Value: string);\nimplementation\nprocedure Draw(Value: string);\nbegin\nend;\nprocedure Run;\nbegin\n  { Draw(1); }\n  Draw('Draw(2)');\n  Draw(Value := 'named');\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("inlay-lexical-fail-closed".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 14, "character": 0}}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "request failed: {response:?}");
+    let hints = response.result.expect("inlay hints");
+    let hints = hints.as_array().expect("hint array");
+    assert_eq!(
+        hints.len(),
+        1,
+        "comments, string contents, and named-argument recovery must add no hints: {hints:?}"
+    );
+    assert_eq!(hints[0]["label"], "Value:");
+    assert_eq!(hints[0]["position"]["line"], 10);
+    server.shutdown();
+}
+
+#[test]
+fn inlay_parameter_names_resolve_from_a_cross_unit_owner() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider = temp.path().join("Renderer.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    write_file(
+        &provider,
+        "unit Renderer;\ninterface\nprocedure Render(Title: string);\nimplementation\nprocedure Render(Title: string);\nbegin\nend;\nend.\n",
+    );
+    let source = "unit Consumer;\ninterface\nuses Renderer;\nimplementation\nprocedure Run;\nbegin\n  Render('cross-unit');\nend;\nend.\n";
+    write_file(&consumer, source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let id = RequestId::from("inlay-cross-unit-owner".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&consumer)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "cross-unit request failed: {response:?}"
+    );
+    let hints = response.result.expect("inlay hints");
+    let hints = hints.as_array().expect("hint array");
+    assert_eq!(
+        hints.len(),
+        1,
+        "expected one uniquely bound imported parameter: {hints:?}"
+    );
+    assert_eq!(hints[0]["label"], "Title:");
+    server.shutdown();
+}
+
+#[test]
+fn inlay_hints_refresh_disk_sources_and_prefer_open_overlays() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("DiskOverlay.pas");
+    let disk_source = |parameter: &str| {
+        format!(
+            "unit DiskOverlay;\ninterface\nprocedure Draw({parameter}: Integer);\nimplementation\nprocedure Draw({parameter}: Integer);\nbegin\nend;\nprocedure Run;\nbegin\n  Draw(1);\nend;\nend.\n"
+        )
+    };
+    let original = disk_source("DiskName");
+    write_file(&source_path, &original);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let request_labels = |server: &mut TestServer, suffix: &str| {
+        let id = RequestId::from(format!("inlay-disk-overlay-{suffix}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": {"uri": uri(&source_path)},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 11, "character": 0}}
+            }),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "inlay request failed: {response:?}"
+        );
+        response
+            .result
+            .expect("inlay hints")
+            .as_array()
+            .expect("hint array")
+            .iter()
+            .map(|hint| hint["label"].as_str().expect("label").to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert!(request_labels(&mut server, "initial").contains(&"DiskName:".to_owned()));
+    let changed_disk = disk_source("ChangedOnDisk");
+    fs::write(&source_path, &changed_disk).expect("update disk source");
+    assert!(request_labels(&mut server, "changed-disk").contains(&"ChangedOnDisk:".to_owned()));
+
+    let overlay = disk_source("OverlayName");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&source_path), "languageId": "pascal", "version": 1, "text": overlay}}),
+    );
+    let labels = request_labels(&mut server, "open-overlay");
+    assert!(
+        labels.contains(&"OverlayName:".to_owned()),
+        "open content must outrank disk: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"ChangedOnDisk:".to_owned()),
+        "stale disk spelling leaked through overlay: {labels:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn inlay_invalid_ranges_return_no_hints() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("InvalidRange.pas");
+    let source = "unit InvalidRange;\ninterface\nprocedure Draw(Value: Integer);\nimplementation\nprocedure Draw(Value: Integer);\nbegin end;\nprocedure Run;\nbegin Draw(1); end;\nend.\n";
+    write_file(&source_path, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (suffix, range) in [
+        (
+            "reversed",
+            json!({"start": {"line": 7, "character": 5}, "end": {"line": 2, "character": 0}}),
+        ),
+        (
+            "past-eof",
+            json!({"start": {"line": 200, "character": 0}, "end": {"line": 201, "character": 0}}),
+        ),
+    ] {
+        let id = RequestId::from(format!("inlay-invalid-range-{suffix}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/inlayHint",
+            json!({"textDocument": {"uri": uri(&source_path)}, "range": range}),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "invalid range should fail closed as an empty result: {response:?}"
+        );
+        assert_eq!(response.result, Some(json!([])));
+    }
+    server.shutdown();
+}
+
+#[test]
+fn inlay_work_and_output_limits_fail_without_partial_results() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let output_limited = temp.path().join("OutputLimited.pas");
+    let mut output_source = String::from(
+        "unit OutputLimited;\ninterface\nprocedure Draw(Value: Integer);\nimplementation\nprocedure Draw(Value: Integer);\nbegin end;\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..513 {
+        output_source.push_str("  Draw(1);\n");
+    }
+    output_source.push_str("end;\nend.\n");
+    write_file(&output_limited, &output_source);
+
+    let work_limited = temp.path().join("WorkLimited.pas");
+    let mut work_source = String::from(
+        "unit WorkLimited;\ninterface\nprocedure Touch;\nimplementation\nprocedure Touch;\nbegin end;\nprocedure Run;\nbegin\n",
+    );
+    for _ in 0..2_001 {
+        work_source.push_str("  Touch();\n");
+    }
+    work_source.push_str("end;\nend.\n");
+    write_file(&work_limited, &work_source);
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    let output_id = RequestId::from("inlay-output-hint-limit".to_string());
+    server.send_request(
+        output_id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&output_limited)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 521, "character": 0}}
+        }),
+    );
+    let output_response = server.response(&output_id);
+    assert!(
+        output_response.error.is_some(),
+        "over-limit output must fail rather than truncate to a partial result: {output_response:?}"
+    );
+    assert!(
+        output_response
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("512-hint limit")
+    );
+
+    let work_id = RequestId::from("inlay-call-work-limit".to_string());
+    server.send_request(
+        work_id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&work_limited)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2_010, "character": 0}}
+        }),
+    );
+    let work_response = server.response(&work_id);
+    assert!(
+        work_response.error.is_some(),
+        "over-limit call work must fail rather than return a partial result: {work_response:?}"
+    );
+    assert!(
+        work_response
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("2000-call limit")
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelled_inlay_request_returns_cancellation_error() {
+    let environment = tempfile::tempdir().expect("test environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace");
+    let source_path = root.join("CancelledInlay.pas");
+    let source = "unit CancelledInlay;\ninterface\nprocedure Draw(Value: Integer);\nimplementation\nprocedure Draw(Value: Integer);\nbegin end;\nprocedure Run;\nbegin Draw(1); end;\nend.\n";
+    write_file(&source_path, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("cancel-inlay-request".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}}
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": id}));
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("cancelled inlay request must not return a result");
+    assert_eq!(error.code, -32800);
+    barrier.release();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_inlay_result_is_rejected_after_open_document_edit() {
+    let environment = tempfile::tempdir().expect("test environment");
+    let root = environment.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace");
+    let source_path = root.join("StaleInlay.pas");
+    let original = "unit StaleInlay;\ninterface\nprocedure Draw(OldName: Integer);\nimplementation\nprocedure Draw(OldName: Integer);\nbegin end;\nprocedure Run;\nbegin Draw(1); end;\nend.\n";
+    let edited = original.replace("OldName", "NewName");
+    write_file(&source_path, original);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&source_path), "languageId": "pascal", "version": 1, "text": original
+        }}),
+    );
+    let id = RequestId::from("stale-inlay-result".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}}
+        }),
+    );
+    barrier.wait_until_entered();
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&source_path), "version": 2},
+            "contentChanges": [{"text": edited}]
+        }),
+    );
+    barrier.release();
+    let response = server.response(&id);
+    let error = response
+        .error
+        .expect("stale inlay result must not be delivered");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("stale"),
+        "unexpected stale-result error: {error:?}"
+    );
     server.shutdown();
 }
 

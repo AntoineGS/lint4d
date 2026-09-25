@@ -11,7 +11,6 @@ const MAX_INLAY_HINTS: usize = 512;
 const MAX_INLAY_LABEL_BYTES: usize = 16 * 1024;
 const MAX_INLAY_RANGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INLAY_EXCLUSIONS: usize = 100_000;
-const MAX_INLAY_TYPE_EXPRESSION_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InlayHintOptions {
@@ -234,29 +233,16 @@ fn collect_boolean_constant_hint(
     let Some(initializer) = declaration.child_by_field_name("defaultValue") else {
         return Ok(());
     };
-    let mut current = initializer;
-    let mut depth = 0_usize;
-    loop {
-        check_cancel(cancel)?;
-        depth = depth.saturating_add(1);
-        if depth > MAX_INLAY_TYPE_EXPRESSION_DEPTH {
-            return Ok(());
-        }
-        let mut cursor = current.walk();
-        let children = current
-            .named_children(&mut cursor)
-            .filter(|child| child.kind() != "kEq")
-            .collect::<Vec<_>>();
-        if current.kind() == "kTrue" || current.kind() == "kFalse" {
-            if !children.is_empty() {
-                return Ok(());
-            }
-            break;
-        }
-        if children.len() != 1 {
-            return Ok(());
-        }
-        current = children[0];
+    check_cancel(cancel)?;
+    // `defaultValue` is the grammar's declaration-initializer wrapper; do not
+    // unwrap arbitrary expression nodes (e.g. unary operators or parentheses).
+    let mut cursor = initializer.walk();
+    let children = initializer
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "kEq")
+        .collect::<Vec<_>>();
+    if children.len() != 1 || !matches!(children[0].kind(), "kTrue" | "kFalse") {
+        return Ok(());
     }
     let Some(name) = declaration.child_by_field_name("name") else {
         return Ok(());

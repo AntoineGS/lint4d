@@ -5902,7 +5902,10 @@ impl AnalysisJobs {
                     value: panic_value,
                 });
                 #[cfg(feature = "test-support")]
-                if matches!(result.value, AnalysisResultValue::DocumentLinks(_)) {
+                if matches!(
+                    result.value,
+                    AnalysisResultValue::DocumentLinks(_) | AnalysisResultValue::InlayHints(_)
+                ) {
                     if let Err(error) = wait_at_test_barrier(
                         TestBarrier::PartialValidation,
                         &test_barriers,

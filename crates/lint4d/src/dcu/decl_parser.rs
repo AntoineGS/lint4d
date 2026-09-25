@@ -32,20 +32,61 @@ pub(crate) fn read_decl_list_into(
     types: &mut Vec<TypeInfo>,
     in_args: bool,
 ) -> Result<(), DcuError> {
+    read_decl_list_inner(reader, tag, types, in_args, false, None)
+}
+
+/// Walk a unit-root declaration list and retain the parser-proven indices of
+/// declarations encountered directly in that scope. Nested procedure and
+/// embedded-procedure lists continue to share the decoded type vector, but do
+/// not contribute export evidence.
+pub(crate) fn read_decl_list_into_with_exports(
+    reader: &mut DcuReader,
+    tag: &mut u8,
+    types: &mut Vec<TypeInfo>,
+    exported_type_indices: &mut Vec<usize>,
+) -> Result<(), DcuError> {
+    read_decl_list_inner(reader, tag, types, false, true, Some(exported_type_indices))
+}
+
+fn read_decl_list_inner(
+    reader: &mut DcuReader,
+    tag: &mut u8,
+    types: &mut Vec<TypeInfo>,
+    in_args: bool,
+    unit_root: bool,
+    mut exported_type_indices: Option<&mut Vec<usize>>,
+) -> Result<(), DcuError> {
+    let mut last_type_index = None;
     loop {
         let fixed = fix_tag(*tag);
         match fixed {
             // Type declaration: extract name.
             DR_TYPE => {
+                last_type_index = None;
                 if let Some(ti) = read_type_decl(reader)? {
+                    let type_index = types.len();
                     types.push(ti);
+                    last_type_index = Some(type_index);
+                    if unit_root {
+                        if let Some(indices) = exported_type_indices.as_deref_mut() {
+                            indices.push(type_index);
+                        }
+                    }
                 }
             }
             // Type P declaration (VMT pointer type, names usually start with '.').
             // In D13 this has an extra ReadUIndex field after hDef.
             DR_TYPE_P => {
+                last_type_index = None;
                 if let Some(ti) = read_type_p_decl(reader)? {
+                    let type_index = types.len();
                     types.push(ti);
+                    last_type_index = Some(type_index);
+                    if unit_root {
+                        if let Some(indices) = exported_type_indices.as_deref_mut() {
+                            indices.push(type_index);
+                        }
+                    }
                 }
             }
             // drUnitAddInfo: namespace segments with nested declaration lists.
@@ -180,8 +221,10 @@ pub(crate) fn read_decl_list_into(
             // Class definition: parse and associate with the last type declaration.
             DR_CLASS_DEF => {
                 let members = parse_class_def(reader)?;
-                // Associate parsed members with the most recently declared type.
-                if let Some(last_type) = types.last_mut() {
+                // Associate within this declaration scope. Shared vectors may
+                // contain nested routine-local types that are not the current
+                // scope's declaration.
+                if let Some(last_type) = last_type_index.and_then(|index| types.get_mut(index)) {
                     last_type.kind = TypeKind::Class;
                     last_type.fields = members.0;
                     last_type.methods = members.1;
@@ -382,5 +425,57 @@ pub(crate) fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo])
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod export_scope_tests {
+    use super::read_decl_list_into_with_exports;
+    use crate::dcu::DcuVersion;
+    use crate::dcu::reader::DcuReader;
+    use crate::dcu::tags::{
+        DR_CLASS_DEF, DR_EMBEDDED_PROC_END, DR_EMBEDDED_PROC_START, DR_STOP, DR_STOP1, DR_TYPE,
+    };
+
+    fn append_type(bytes: &mut Vec<u8>, name: &str) {
+        bytes.push(DR_TYPE);
+        bytes.push(name.len() as u8);
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // name flags and definition index
+    }
+
+    fn append_empty_class_def(bytes: &mut Vec<u8>) {
+        bytes.push(DR_CLASS_DEF);
+        bytes.extend_from_slice(&[0; 4]); // type definition header
+        bytes.extend_from_slice(&[0, 0, 0]); // D13 class flags
+        bytes.extend_from_slice(&[0; 9]); // class definition indices/counts
+        bytes.push(0); // no implemented interfaces
+        bytes.push(DR_STOP1); // no class members
+    }
+
+    #[test]
+    fn embedded_routine_local_class_is_parsed_but_not_an_exported_root_type() {
+        let mut bytes = Vec::new();
+        append_type(&mut bytes, "TExported");
+        append_empty_class_def(&mut bytes);
+        bytes.push(DR_EMBEDDED_PROC_START);
+        append_type(&mut bytes, "TLocalClass");
+        append_empty_class_def(&mut bytes);
+        bytes.push(DR_STOP1);
+        bytes.push(DR_EMBEDDED_PROC_END);
+        bytes.push(DR_STOP);
+
+        let mut reader = DcuReader::new(&bytes, DcuVersion::D13);
+        let mut tag = reader.read_byte().unwrap();
+        let mut types = Vec::new();
+        let mut exported = Vec::new();
+        read_decl_list_into_with_exports(&mut reader, &mut tag, &mut types, &mut exported).unwrap();
+
+        assert_eq!(types.len(), 2, "the decoder still sees both records");
+        assert_eq!(types[0].name, "TExported");
+        assert_eq!(types[1].name, "TLocalClass");
+        assert_eq!(types[0].kind, crate::dcu::TypeKind::Class);
+        assert_eq!(types[1].kind, crate::dcu::TypeKind::Class);
+        assert_eq!(exported, [0], "nested scope is not exported by the unit");
     }
 }

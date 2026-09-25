@@ -163,6 +163,33 @@ fn selected_context_loads_only_unique_authorized_dcu_without_source_shadowing() 
 }
 
 #[test]
+fn selected_context_discovery_honors_cancellation_and_import_caps() {
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug");
+    let selected = selected_context(std::slice::from_ref(&fixture_root));
+    let cancelled = AtomicBool::new(true);
+    assert_eq!(
+        discover_compiled_units(
+            &selected,
+            &["Lint4dFixture.Classes".to_string()],
+            &cancelled,
+        )
+        .expect_err("pre-cancelled discovery must stop"),
+        "request cancelled"
+    );
+
+    let over_cap = (0..129)
+        .map(|index| format!("Unit{index}"))
+        .collect::<Vec<_>>();
+    assert!(
+        discover_compiled_units(&selected, &over_cap, &AtomicBool::new(false))
+            .expect("cap refusal is not a partial error")
+            .is_empty(),
+        "over-cap import lists must not produce partial providers"
+    );
+}
+
+#[test]
 fn compiled_unit_content_observation_detects_same_size_replacement() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("Lint4dFixture.Classes.dcu");

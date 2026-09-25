@@ -1,6 +1,6 @@
 use crate::dcu::DcuUnit;
 use crate::dcu::const_add_info::skip_decl_const_add_info;
-use crate::dcu::decl_parser::read_decl_list_into;
+use crate::dcu::decl_parser::read_decl_list_into_with_exports;
 use crate::dcu::header::parse_unit_header;
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
@@ -8,6 +8,16 @@ use crate::dcu::tags::*;
 /// Parse a complete DCU file, extracting the unit name, version, platform,
 /// the list of imported unit names, and type declarations.
 pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
+    parse_dcu_with_exported_type_indices(data).map(|(unit, _)| unit)
+}
+
+/// Parse a DCU and return indices of type records proven to occur directly in
+/// the unit-root declaration list. `DcuUnit::types` intentionally retains the
+/// historical flattened parser view; callers that expose unit exports must use
+/// this provenance instead of treating every decoded record as public.
+pub fn parse_dcu_with_exported_type_indices(
+    data: &[u8],
+) -> Result<(DcuUnit, Vec<usize>), DcuError> {
     let header = parse_unit_header(data)?;
     let mut reader = DcuReader::new(data, header.version);
     reader.set_position(header.body_offset);
@@ -34,20 +44,29 @@ pub fn parse_dcu(data: &[u8]) -> Result<DcuUnit, DcuError> {
 
     // Walk the declaration list to extract type names.
     let mut types = Vec::new();
+    let mut exported_type_indices = Vec::new();
     // EOF is tolerated: the parser may read past the declaration section
     // into data blocks or debug info, hitting EOF gracefully.
-    match read_decl_list_into(&mut reader, &mut tag, &mut types, false) {
+    match read_decl_list_into_with_exports(
+        &mut reader,
+        &mut tag,
+        &mut types,
+        &mut exported_type_indices,
+    ) {
         Ok(()) | Err(DcuError::UnexpectedEof { .. }) => {}
         Err(e) => return Err(e),
     }
 
-    Ok(DcuUnit {
-        name: header.name,
-        version: header.version,
-        platform: header.platform,
-        imported_units,
-        types,
-    })
+    Ok((
+        DcuUnit {
+            name: header.name,
+            version: header.version,
+            platform: header.platform,
+            imported_units,
+            types,
+        },
+        exported_type_indices,
+    ))
 }
 
 /// Apply the D2006+ tag fixup: raw tags in 0x2D..0x36 are remapped.

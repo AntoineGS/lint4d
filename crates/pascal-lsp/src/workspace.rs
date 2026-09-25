@@ -3,7 +3,9 @@
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::include_expansion::{ExpandedSource, ExpansionLimits};
-use crate::navigation::compiled_dcu::{discover_compiled_units, virtual_unit_identity};
+use crate::navigation::compiled_dcu::{
+    AuthorizedCompiledUnit, discover_compiled_units, virtual_unit_identity,
+};
 use crate::navigation::{SemanticDiagnostic, SemanticDiagnosticKind};
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{GlobSet, GlobSetBuilder};
@@ -318,6 +320,7 @@ const MAX_PACKAGE_UNIT_CANDIDATES: usize = 1_024;
 const MAX_WORKSPACE_WARNINGS: usize = 256;
 const MAX_DELETED_OVERRIDES: usize = 256;
 const MAX_DOCUMENT_OWNERS: usize = 4_096;
+const MAX_COMPILED_PROVIDER_BINDINGS: usize = 4_096;
 const MAX_FORMAT_EXTERNAL_TRAVERSAL_ENTRIES: usize = 1_048_576;
 const DIAGNOSTIC_RETRY: Duration = Duration::from_millis(25);
 pub(crate) const MAX_CONFIGURATION_WATCH_PATHS: usize = 256;
@@ -2140,6 +2143,7 @@ pub(crate) struct NavigationState {
     open_document_contexts: HashMap<Url, ContextKey>,
     document_owners: HashMap<Url, KnownDocumentOwner>,
     compiled_provider_bindings: Vec<CompiledProviderBinding>,
+    compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
     use_clock: u64,
 }
@@ -2150,6 +2154,17 @@ struct CompiledProviderBinding {
     provider: Url,
     importer_source_hash: u64,
     context_fingerprint: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledContentSnapshot {
+    uri: Url,
+    importer: Url,
+    importer_source_hash: u64,
+    context_fingerprint: u64,
+    context: ContextState,
+    open_source: Option<String>,
+    unit: AuthorizedCompiledUnit,
 }
 
 struct NotificationRecoveryPlan {
@@ -2487,6 +2502,7 @@ pub struct Workspace {
     open_document_contexts: HashMap<Url, ContextKey>,
     document_owners: HashMap<Url, KnownDocumentOwner>,
     compiled_provider_bindings: Vec<CompiledProviderBinding>,
+    compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
@@ -2537,6 +2553,111 @@ struct SharedLintResult {
 }
 
 impl Workspace {
+    pub(crate) fn analysis_generations(&self) -> (u64, u64) {
+        (self.source_generation, self.configuration_generation)
+    }
+
+    /// Capture only the bounded, already-authorized immutable data needed by a
+    /// content worker. This path performs no filesystem access; URI and binding
+    /// authorization are still required before a snapshot is created.
+    pub(crate) fn compiled_virtual_document_snapshot(
+        &self,
+        uri: &Url,
+    ) -> Option<CompiledContentSnapshot> {
+        let (fingerprint, _, _) = virtual_unit_identity(uri)?;
+        if self.document_contexts.len() > self.options.limits.max_files
+            || self.compiled_provider_bindings.len() > MAX_COMPILED_PROVIDER_BINDINGS
+        {
+            return None;
+        }
+        let binding = self.compiled_provider_bindings.iter().find(|binding| {
+            binding.provider == *uri
+                && self
+                    .document_contexts
+                    .get(&binding.importer)
+                    .is_some_and(|key| {
+                        self.contexts.get(key).is_some_and(|state| {
+                            crate::navigation::compiled_dcu::project_context_fingerprint(
+                                &state.context,
+                            ) == fingerprint
+                                && binding.context_fingerprint == fingerprint
+                        })
+                    })
+        })?;
+        let key = self.document_contexts.get(&binding.importer)?;
+        let context = self.contexts.get(key)?.clone();
+        let unit = self.compiled_units.get(uri)?.clone();
+        (unit.document.uri() == uri).then(|| CompiledContentSnapshot {
+            uri: uri.clone(),
+            importer: binding.importer.clone(),
+            importer_source_hash: binding.importer_source_hash,
+            context_fingerprint: binding.context_fingerprint,
+            context,
+            open_source: self
+                .open_documents
+                .get(&binding.importer)
+                .and_then(|document| document.text.clone()),
+            unit,
+        })
+    }
+
+    pub(crate) fn read_compiled_virtual_document_snapshot(
+        snapshot: CompiledContentSnapshot,
+        cancel: &AtomicBool,
+    ) -> Result<Option<String>, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        let Some((fingerprint, _, _)) = virtual_unit_identity(&snapshot.uri) else {
+            return Ok(None);
+        };
+        if fingerprint != snapshot.context_fingerprint
+            || crate::navigation::compiled_dcu::project_context_fingerprint(
+                &snapshot.context.context,
+            ) != fingerprint
+            || !context_state_is_fresh_with_cancel(&snapshot.context, Some(cancel), None)?
+        {
+            return Ok(None);
+        }
+        let source_hash = if let Some(source) = snapshot.open_source {
+            content_hash_bytes(source.as_bytes())
+        } else {
+            let path = snapshot.importer.to_file_path().ok();
+            let entry = path
+                .as_deref()
+                .and_then(|path| snapshot.context.context.read_policy.entry_for_path(path));
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            let bytes = match snapshot
+                .context
+                .context
+                .read_policy
+                .read_payload_bytes(&entry, 8 * 1024 * 1024)
+            {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(None),
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            content_hash_bytes(resolver::decode_source_bytes(&bytes).as_bytes())
+        };
+        if source_hash != snapshot.importer_source_hash {
+            return Ok(None);
+        }
+        if !snapshot
+            .unit
+            .is_current_with_cancel(&snapshot.context.context.read_policy, cancel)?
+        {
+            return Ok(None);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLATION_MESSAGE.to_string());
+        }
+        Ok(Some(snapshot.unit.document.text().to_owned()))
+    }
+
     /// Read a generated compiled-unit view only from a currently retained
     /// project context whose fingerprint matches the canonical provider URI.
     /// The URI is never interpreted as a filesystem path.
@@ -2900,6 +3021,7 @@ impl Workspace {
             open_document_contexts: self.open_document_contexts.clone(),
             document_owners: self.document_owners.clone(),
             compiled_provider_bindings,
+            compiled_units: self.compiled_units.clone(),
             owner_last_used: self.owner_last_used.clone(),
             use_clock: self.use_clock,
         }
@@ -2929,7 +3051,58 @@ impl Workspace {
                 self.document_owners.insert(uri, incoming);
             }
         }
-        self.compiled_provider_bindings = state.compiled_provider_bindings;
+        let mut compiled_provider_bindings = std::mem::take(&mut self.compiled_provider_bindings);
+        compiled_provider_bindings.extend(state.compiled_provider_bindings);
+        compiled_provider_bindings.sort_by(|left, right| {
+            left.importer
+                .as_str()
+                .cmp(right.importer.as_str())
+                .then_with(|| left.provider.as_str().cmp(right.provider.as_str()))
+        });
+        compiled_provider_bindings.dedup_by(|left, right| {
+            left.importer == right.importer && left.provider == right.provider
+        });
+        if compiled_provider_bindings.len() > MAX_COMPILED_PROVIDER_BINDINGS {
+            compiled_provider_bindings.clear();
+        } else {
+            compiled_provider_bindings.retain(|binding| {
+                self.document_contexts
+                    .get(&binding.importer)
+                    .and_then(|key| self.contexts.get(key))
+                    .is_some_and(|state| {
+                        crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
+                            == binding.context_fingerprint
+                            && context_state_is_fresh_with_cancel(state, None, None)
+                                .is_ok_and(|fresh| fresh)
+                    })
+                    && self
+                        .current_importer_source_hash(&binding.importer)
+                        .is_some_and(|hash| hash == binding.importer_source_hash)
+            });
+        }
+        self.compiled_provider_bindings = compiled_provider_bindings;
+        let retained_compiled_bytes = self
+            .compiled_units
+            .values()
+            .map(|unit| unit.document.text().len())
+            .sum::<usize>();
+        let incoming_compiled_bytes = state
+            .compiled_units
+            .values()
+            .map(|unit| unit.document.text().len())
+            .sum::<usize>();
+        if self
+            .compiled_units
+            .len()
+            .saturating_add(state.compiled_units.len())
+            > 128
+            || retained_compiled_bytes.saturating_add(incoming_compiled_bytes) > 4 * 1024 * 1024
+        {
+            self.compiled_units.clear();
+            self.compiled_provider_bindings.clear();
+        } else {
+            self.compiled_units.extend(state.compiled_units);
+        }
         self.owner_last_used.extend(state.owner_last_used);
         self.use_clock = self.use_clock.max(state.use_clock);
         self.trim_document_owners();
@@ -6382,6 +6555,8 @@ impl Workspace {
                 self.index
                     .update_compiled_unit_document(&unit.document)
                     .map_err(|error| format!("could not index compiled unit: {error}"))?;
+                self.compiled_units
+                    .insert(unit.document.uri().clone(), unit.clone());
                 bindings.insert(requested_name, unit.document.uri().clone());
                 let (path, path_entry, content_hash) = unit.observation();
                 if let Some(record) = rename::path_record_at(

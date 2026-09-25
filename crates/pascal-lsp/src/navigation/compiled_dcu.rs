@@ -50,7 +50,10 @@ impl CompiledUnitDocument {
         if bytes.is_empty() || bytes.len() > MAX_DCU_BYTES {
             return Err("compiled unit exceeds the DCU byte limit".to_string());
         }
-        let unit = lint4d::dcu::types::parse_dcu(bytes).map_err(|error| error.to_string())?;
+        let (unit, exported_type_indices) =
+            lint4d::dcu::types::parse_dcu_with_exported_type_indices(bytes)
+                .map_err(|error| error.to_string())?;
+        let exported_type_indices = exported_type_indices.into_iter().collect::<HashSet<_>>();
         if unit.version != DcuVersion::D13 || unit.platform != DcuPlatform::Win64 {
             return Err(
                 "compiled unit version/platform is not supported for navigation".to_string(),
@@ -61,8 +64,11 @@ impl CompiledUnitDocument {
         }
 
         let mut type_name_counts = HashMap::<String, usize>::new();
-        for ty in &unit.types {
-            if ty.kind == TypeKind::Class && safe_identifier(&ty.name) {
+        for (type_index, ty) in unit.types.iter().enumerate() {
+            if exported_type_indices.contains(&type_index)
+                && ty.kind == TypeKind::Class
+                && safe_identifier(&ty.name)
+            {
                 *type_name_counts
                     .entry(ty.name.to_ascii_lowercase())
                     .or_default() += 1;
@@ -72,12 +78,13 @@ impl CompiledUnitDocument {
         let mut text = format!("unit {};\n\ninterface\n\n", unit.name);
         let mut emitted = 0usize;
         let mut emitted_names = HashSet::new();
-        for ty in &unit.types {
+        for (type_index, ty) in unit.types.iter().enumerate() {
             // The parser proves class type declarations for this version, but
             // does not prove the class member signatures/visibility. Emit a
             // type shell only, and refuse case-insensitively ambiguous names.
             let canonical_name = ty.name.to_ascii_lowercase();
             if ty.kind != TypeKind::Class
+                || !exported_type_indices.contains(&type_index)
                 || !safe_identifier(&ty.name)
                 || type_name_counts.get(&canonical_name) != Some(&1)
                 || !emitted_names.insert(canonical_name)
@@ -174,6 +181,24 @@ impl AuthorizedCompiledUnit {
         policy
             .read_payload_bytes(&self.path_entry, MAX_DCU_BYTES as u64)
             .is_ok_and(|bytes| content_hash_bytes(&bytes) == self.content_hash)
+    }
+
+    pub(crate) fn is_current_with_cancel(
+        &self,
+        policy: &ReadPolicy,
+        cancel: &AtomicBool,
+    ) -> Result<bool, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
+        let bytes = match policy.read_payload_bytes(&self.path_entry, MAX_DCU_BYTES as u64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(false),
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled".to_string());
+        }
+        Ok(content_hash_bytes(&bytes) == self.content_hash)
     }
 
     pub fn source_path(&self) -> &Path {

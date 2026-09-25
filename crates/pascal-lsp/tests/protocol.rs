@@ -2463,6 +2463,50 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     );
     let mut server = TestServer::launch();
     server.initialize(root, Value::Null);
+    // Assistance snapshots must discover/index selected-context DCUs on their
+    // own; these queries deliberately precede navigation and provider binding.
+    let completion_id = RequestId::from("compiled-unit-completion".to_string());
+    server.send_request(
+        completion_id.clone(),
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 3, "character": 21}
+        }),
+    );
+    let completion = server.response(&completion_id);
+    assert!(
+        completion.error.is_none(),
+        "completion failed: {completion:?}"
+    );
+    assert!(
+        completion.result.as_ref().is_some_and(|result| {
+            result["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["label"] == "TSimpleClass"))
+        }),
+        "compiled type absent from real LSP completion without prior navigation: {completion:?}"
+    );
+
+    let hover_id = RequestId::from("compiled-unit-hover".to_string());
+    server.send_request(
+        hover_id.clone(),
+        "textDocument/hover",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 3, "character": 18}
+        }),
+    );
+    let hover = server.response(&hover_id);
+    assert!(hover.error.is_none(), "hover failed: {hover:?}");
+    assert!(
+        hover
+            .result
+            .as_ref()
+            .is_some_and(|result| { result["contents"].to_string().contains("TSimpleClass") }),
+        "compiled type absent from real LSP hover without prior navigation: {hover:?}"
+    );
+
     let id = RequestId::from("compiled-unit-definition".to_string());
     server.send_request(
         id.clone(),
@@ -2504,6 +2548,53 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     assert!(
         !text.contains("Create;"),
         "unproven members must be omitted: {text}"
+    );
+
+    let other = root.join("Other.pas");
+    write_file(
+        &other,
+        "unit Other;\ninterface\ntype TLocal = Integer;\nimplementation\nend.\n",
+    );
+    let other_navigation_id = RequestId::from("unrelated-navigation".to_string());
+    server.send_request(
+        other_navigation_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&other)},
+            "position": {"line": 2, "character": 7}
+        }),
+    );
+    let other_navigation = server.response(&other_navigation_id);
+    assert!(
+        other_navigation.error.is_none(),
+        "unrelated navigation failed: {other_navigation:?}"
+    );
+    let retained_content_id =
+        RequestId::from("compiled-content-after-unrelated-navigation".to_string());
+    server.send_request(
+        retained_content_id.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    let retained_content = server.response(&retained_content_id);
+    assert!(
+        retained_content.error.is_none(),
+        "unrelated navigation discarded Consumer's current provider binding: {retained_content:?}"
+    );
+    let virtual_symbols_id = RequestId::from("compiled-document-symbols-unsupported".to_string());
+    server.send_request(
+        virtual_symbols_id.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    let virtual_symbols = server.response(&virtual_symbols_id);
+    assert_eq!(
+        virtual_symbols
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some("document symbols are not supported for compiled virtual documents"),
+        "virtual-document symbol behavior must be an explicit refusal: {virtual_symbols:?}"
     );
 
     let mut forged = Url::parse(virtual_uri).expect("canonical virtual URI");
@@ -2593,6 +2684,55 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     assert!(
         server.response(&edit_id).error.is_some(),
         "compiled virtual text is read-only"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_compiled_navigation_rejects_same_size_restored_mtime_dcu_change() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let root = temp.path();
+    let lib = root.join("lib");
+    fs::create_dir_all(&lib).expect("library directory");
+    let dcu = lib.join("Lint4dFixture.Classes.dcu");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+    fs::copy(&fixture, &dcu).expect("real D13 Win64 fixture");
+    let main = root.join("Consumer.pas");
+    write_file(
+        &main,
+        "unit Consumer;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let (mut server, barrier) =
+        TestServer::launch_with_partial_validation_barrier(tempfile::tempdir().unwrap());
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("queued-compiled-navigation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 3, "character": 16}
+        }),
+    );
+    barrier.wait_until_entered();
+
+    let original_metadata = fs::metadata(&dcu).expect("DCU metadata");
+    let mut replacement = fs::read(&dcu).expect("DCU bytes");
+    *replacement.last_mut().expect("nonempty fixture") ^= 1;
+    fs::write(&dcu, replacement).expect("same-size DCU replacement");
+    restore_mtime(&dcu, &original_metadata);
+    barrier.release();
+
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "queued definition must be discarded after the DCU bytes change with restored mtime: {response:?}"
     );
     server.shutdown();
 }

@@ -1165,6 +1165,34 @@ The server advertises the standard query capabilities
 `textDocument/references`, `textDocument/documentHighlight`, and semantic
 tokens. These queries are read-only: the server does not write source files.
 
+### Call hierarchy
+
+The server advertises `callHierarchyProvider` and implements prepare, incoming,
+and outgoing call-hierarchy requests on the worker-backed selected-project
+snapshot. Prepare accepts only a routine declaration/definition whose ordinary
+definition navigation resolves to one current source definition. The opaque
+item `data`, URI, name, kind, full range, and selection range are revalidated
+against the current indexed source before either edge request is evaluated;
+client-supplied item text is never used as a binding.
+
+The current conservative edge subset walks AST `exprCall` nodes (calls with
+explicit argument parentheses), resolves each call through existing
+definition/overload navigation, and groups edges by exact source routine
+identity. From-ranges cover only the callee designator and use LSP UTF-16
+positions. The selected-project workspace snapshot permits proven cross-unit
+calls. Ambiguous/unresolved calls, unknown callers, parser-recovery/unknown
+conditional sites, and routines marked virtual/dynamic/override are omitted.
+Bare procedure statements without an `exprCall` node, indirect/function-value
+calls, dynamic dispatch, and other unsupported call forms are not counted.
+
+AST scanning is bounded to 200,000 visited nodes and 4,096 call expressions
+per request, and retained result data is bounded to 2 MiB. Exceeding a bound or
+observing cancellation/freshness failure returns an error rather than a partial
+call graph. Edges are read-only and ordered/deduplicated by source identity and
+location. Candidate binding shares the navigation resolver's 100,000-work and
+8 MiB budget across the request. These limits and the subset are implementation
+policy, not a claim of complete Pascal call-graph semantics.
+
 ### Document outlines
 
 `textDocument/documentSymbol` returns full declaration ranges and identifier

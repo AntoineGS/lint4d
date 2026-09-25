@@ -545,6 +545,158 @@ pub(crate) fn inlay_hints_from_input(
     with_records(source_generation, configuration_generation, value, records)
 }
 
+pub(crate) fn prepare_call_hierarchy_from_input(
+    input: WorkspaceInput,
+    uri: &Url,
+    position: Position,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Option<Vec<lsp_types::CallHierarchyItem>>> {
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(uri);
+    if is_cancelled(cancel) {
+        return cancelled(source_generation, configuration_generation);
+    }
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("document is outside configured workspace roots or source paths: {uri}"),
+        );
+    }
+    let snapshot = match assistance_snapshot(&input, &uri, Some(position), cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    with_records(
+        source_generation,
+        configuration_generation,
+        snapshot
+            .index
+            .prepare_call_hierarchy_with_cancel(&uri, position, cancel),
+        records,
+    )
+}
+
+pub(crate) fn incoming_calls_from_input(
+    input: WorkspaceInput,
+    item: &lsp_types::CallHierarchyItem,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<lsp_types::CallHierarchyIncomingCall>> {
+    call_hierarchy_edges_from_input(input, item, cancel, true)
+}
+
+pub(crate) fn outgoing_calls_from_input(
+    input: WorkspaceInput,
+    item: &lsp_types::CallHierarchyItem,
+    cancel: &AtomicBool,
+) -> super::rename::Computed<Vec<lsp_types::CallHierarchyOutgoingCall>> {
+    call_hierarchy_edges_from_input(input, item, cancel, false)
+}
+
+fn call_hierarchy_edges_from_input<T>(
+    input: WorkspaceInput,
+    item: &lsp_types::CallHierarchyItem,
+    cancel: &AtomicBool,
+    incoming: bool,
+) -> super::rename::Computed<T>
+where
+    T: FromCallHierarchyEdges,
+{
+    let source_generation = input.source_generation;
+    let configuration_generation = input.configuration_generation;
+    let uri = super::canonical_file_uri(&item.uri);
+    let owner = match owner_for_input(&input, &uri, cancel) {
+        Ok(owner) => owner,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    if !input_source_is_readable_with_owner(&input, &uri, &owner) {
+        return failed(
+            source_generation,
+            configuration_generation,
+            format!("call hierarchy item is outside the selected project: {uri}"),
+        );
+    }
+    let classification =
+        match reference_binding_info_for_input(&input, &uri, item.selection_range.start, cancel) {
+            Ok(classification) => classification,
+            Err(error) => return failed(source_generation, configuration_generation, error),
+        };
+    if classification.ignored_or_empty {
+        return failed(
+            source_generation,
+            configuration_generation,
+            "call hierarchy target is not an active bound routine".to_string(),
+        );
+    }
+    let snapshot = match binding_snapshot(
+        &input,
+        &uri,
+        item.selection_range.start,
+        false,
+        classification,
+        cancel,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
+    let records = snapshot_records(&snapshot);
+    if let Err(error) = ensure_reference_ready(&snapshot, &uri) {
+        return with_records(
+            source_generation,
+            configuration_generation,
+            Err(error),
+            records,
+        );
+    }
+    let value = if incoming {
+        T::incoming(snapshot.index.incoming_calls_with_cancel(item, cancel))
+    } else {
+        T::outgoing(snapshot.index.outgoing_calls_with_cancel(item, cancel))
+    };
+    with_records(source_generation, configuration_generation, value, records)
+}
+
+trait FromCallHierarchyEdges: Sized {
+    fn incoming(
+        value: Result<Vec<lsp_types::CallHierarchyIncomingCall>, String>,
+    ) -> Result<Self, String>;
+    fn outgoing(
+        value: Result<Vec<lsp_types::CallHierarchyOutgoingCall>, String>,
+    ) -> Result<Self, String>;
+}
+
+impl FromCallHierarchyEdges for Vec<lsp_types::CallHierarchyIncomingCall> {
+    fn incoming(
+        value: Result<Vec<lsp_types::CallHierarchyIncomingCall>, String>,
+    ) -> Result<Self, String> {
+        value
+    }
+    fn outgoing(
+        _: Result<Vec<lsp_types::CallHierarchyOutgoingCall>, String>,
+    ) -> Result<Self, String> {
+        unreachable!()
+    }
+}
+
+impl FromCallHierarchyEdges for Vec<lsp_types::CallHierarchyOutgoingCall> {
+    fn incoming(
+        _: Result<Vec<lsp_types::CallHierarchyIncomingCall>, String>,
+    ) -> Result<Self, String> {
+        unreachable!()
+    }
+    fn outgoing(
+        value: Result<Vec<lsp_types::CallHierarchyOutgoingCall>, String>,
+    ) -> Result<Self, String> {
+        value
+    }
+}
+
 pub(crate) fn type_definitions_from_input(
     input: WorkspaceInput,
     uri: &Url,

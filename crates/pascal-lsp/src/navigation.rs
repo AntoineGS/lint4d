@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Tree};
 
 mod assistance;
+mod call_hierarchy;
 mod documentation;
 mod folding;
 mod inlay;
@@ -620,6 +621,31 @@ impl NavigationIndex {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<lsp_types::InlayHint>, String> {
         inlay::inlay_hints_with_cancel(self, uri, range, options, cancel)
+    }
+
+    pub(crate) fn prepare_call_hierarchy_with_cancel(
+        &self,
+        uri: &Url,
+        position: Position,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyItem>>, String> {
+        call_hierarchy::prepare(self, uri, position, cancel)
+    }
+
+    pub(crate) fn incoming_calls_with_cancel(
+        &self,
+        item: &lsp_types::CallHierarchyItem,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::CallHierarchyIncomingCall>, String> {
+        call_hierarchy::incoming(self, item, cancel)
+    }
+
+    pub(crate) fn outgoing_calls_with_cancel(
+        &self,
+        item: &lsp_types::CallHierarchyItem,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::CallHierarchyOutgoingCall>, String> {
+        call_hierarchy::outgoing(self, item, cancel)
     }
 
     pub(crate) fn document_symbols_with_cancel(
@@ -6187,9 +6213,8 @@ impl NavigationIndex {
     }
 
     /// Resolve one navigation target while consuming the caller's request-wide
-    /// cancellation and work budget. Fix-all proof uses this instead of the
-    /// public convenience method so semantic resolution cannot silently create
-    /// a fresh overload budget for every transformed query.
+    /// cancellation and work budget. Callers sharing one budget across many
+    /// sites avoid silently multiplying per-site semantic work limits.
     pub(crate) fn navigate_with_cancel_and_budget(
         &self,
         uri: &Url,
@@ -6199,9 +6224,6 @@ impl NavigationIndex {
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<Location>, String> {
         check_navigation_cancel(cancel)?;
-        if target != NavigationTarget::Declaration {
-            return Err("budgeted fix-all navigation only supports declarations".to_string());
-        }
         let Some(document) = self.documents.get(uri) else {
             return Ok(Vec::new());
         };

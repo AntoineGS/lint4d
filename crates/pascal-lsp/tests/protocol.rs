@@ -2445,6 +2445,422 @@ fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() 
 }
 
 #[test]
+fn call_hierarchy_prepare_returns_only_bound_routine_items() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let source_path = temp.path().join("CallHierarchy.pas");
+    let source = "unit CallHierarchy;\ninterface\nfunction Target: Integer;\nfunction Caller: Integer;\nimplementation\nfunction Target: Integer;\nbegin\n  Result := 1;\nend;\nfunction Caller: Integer;\nbegin\n  Result := Target();\nend;\nend.\n";
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    let initialize = server.initialize(temp.path(), json!({}));
+    assert_eq!(initialize["capabilities"]["callHierarchyProvider"], true);
+    let id = RequestId::from("call-hierarchy-prepare".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&source_path)},
+            "position": {"line": 2, "character": 12}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "prepare failed: {response:?}");
+    let items = response.result.expect("hierarchy items");
+    let items = items.as_array().expect("hierarchy item array");
+    assert_eq!(items.len(), 1, "one unique routine: {items:?}");
+    assert_eq!(items[0]["name"], "Target");
+    assert_eq!(items[0]["kind"], 12);
+    assert_eq!(items[0]["uri"], uri(&source_path).to_string());
+    assert!(items[0]["data"].is_object());
+    assert_eq!(items[0]["selectionRange"]["start"]["line"], 5);
+    assert_eq!(items[0]["selectionRange"]["start"]["character"], 9);
+    assert_eq!(items[0]["selectionRange"]["end"]["character"], 15);
+    let target_item = items[0].clone();
+
+    let caller_prepare_id = RequestId::from("call-hierarchy-prepare-caller".to_string());
+    server.send_request(
+        caller_prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({"textDocument": {"uri": uri(&source_path)}, "position": {"line": 3, "character": 10}}),
+    );
+    let caller_prepare = server.response(&caller_prepare_id);
+    assert!(
+        caller_prepare.error.is_none(),
+        "caller prepare failed: {caller_prepare:?}"
+    );
+    let caller_item = caller_prepare.result.expect("caller hierarchy item")[0].clone();
+
+    let outgoing_id = RequestId::from("call-hierarchy-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": caller_item}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(outgoing.error.is_none(), "outgoing failed: {outgoing:?}");
+    let outgoing = outgoing.result.expect("outgoing calls");
+    let outgoing = outgoing.as_array().expect("outgoing array");
+    assert_eq!(outgoing.len(), 1, "local bound edge expected: {outgoing:?}");
+    assert_eq!(outgoing[0]["to"]["name"], target_item["name"]);
+    assert_eq!(outgoing[0]["fromRanges"][0]["start"]["line"], 11);
+    assert_eq!(outgoing[0]["fromRanges"][0]["start"]["character"], 12);
+    assert_eq!(outgoing[0]["fromRanges"][0]["end"]["character"], 18);
+
+    let incoming_id = RequestId::from("call-hierarchy-incoming".to_string());
+    server.send_request(
+        incoming_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": target_item.clone()}),
+    );
+    let incoming = server.response(&incoming_id);
+    assert!(incoming.error.is_none(), "incoming failed: {incoming:?}");
+    let incoming = incoming.result.expect("incoming calls");
+    let incoming = incoming.as_array().expect("incoming array");
+    assert_eq!(incoming.len(), 1, "local caller expected: {incoming:?}");
+    assert_eq!(incoming[0]["from"]["name"], "Caller");
+    assert_eq!(incoming[0]["fromRanges"][0]["start"]["line"], 11);
+
+    let changed_source = source.replace("function Target: Integer;", "function Target: Boolean;");
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&source_path), "languageId": "pascal", "version": 1, "text": changed_source
+        }}),
+    );
+    let stale_id = RequestId::from("call-hierarchy-stale-item".to_string());
+    server.send_request(
+        stale_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": target_item.clone()}),
+    );
+    let stale = server.response(&stale_id);
+    assert!(
+        stale.result.is_none(),
+        "stale identity must not return edges: {stale:?}"
+    );
+    assert!(stale.error.is_some(), "stale item should fail closed");
+
+    let mut forged_item = target_item;
+    forged_item["data"]["name"] = json!("NotTarget");
+    let forged_id = RequestId::from("call-hierarchy-forged".to_string());
+    server.send_request(
+        forged_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": forged_item}),
+    );
+    let forged = server.response(&forged_id);
+    assert!(
+        forged.result.is_none(),
+        "forged item must not return edges: {forged:?}"
+    );
+    assert!(forged.error.is_some(), "forged item should fail closed");
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_resolves_cross_unit_calls_in_both_directions() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider = temp.path().join("Provider.pas");
+    let consumer = temp.path().join("Consumer.pas");
+    let provider_source = "unit Provider;\ninterface\nfunction CrossTarget: Integer;\nimplementation\nfunction CrossTarget: Integer;\nbegin\n  Result := 7;\nend;\nend.\n";
+    let consumer_source = "\u{feff}unit Consumer;\r\ninterface\r\nuses Provider;\r\nimplementation\r\nfunction CrossCaller: Integer;\r\nbegin\r\n  // 😀 before the invocation\r\n  Result := CrossTarget();\r\nend;\r\nend.\r\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({}));
+
+    let target_id = RequestId::from("cross-target-prepare".to_string());
+    server.send_request(target_id.clone(), "textDocument/prepareCallHierarchy", json!({
+        "textDocument": {"uri": uri(&provider)}, "position": position_of(provider_source, "CrossTarget", 0)
+    }));
+    let target_response = server.response(&target_id);
+    assert!(
+        target_response.error.is_none(),
+        "target prepare failed: {target_response:?}"
+    );
+    let target_item = target_response.result.expect("target item")[0].clone();
+
+    let caller_id = RequestId::from("cross-caller-prepare".to_string());
+    server.send_request(caller_id.clone(), "textDocument/prepareCallHierarchy", json!({
+        "textDocument": {"uri": uri(&consumer)}, "position": position_of(consumer_source, "CrossCaller", 0)
+    }));
+    let caller_response = server.response(&caller_id);
+    assert!(
+        caller_response.error.is_none(),
+        "caller prepare failed: {caller_response:?}"
+    );
+    let caller_item = caller_response.result.expect("caller item")[0].clone();
+
+    let outgoing_id = RequestId::from("cross-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": caller_item}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(
+        outgoing.error.is_none(),
+        "cross outgoing failed: {outgoing:?}"
+    );
+    let outgoing = outgoing.result.expect("outgoing");
+    assert_eq!(outgoing[0]["to"]["uri"], uri(&provider).to_string());
+    assert_eq!(outgoing[0]["fromRanges"][0]["start"]["line"], 7);
+    assert_eq!(outgoing[0]["fromRanges"][0]["start"]["character"], 12);
+    assert_eq!(outgoing[0]["fromRanges"][0]["end"]["character"], 23);
+
+    let incoming_id = RequestId::from("cross-incoming".to_string());
+    server.send_request(
+        incoming_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": target_item}),
+    );
+    let incoming = server.response(&incoming_id);
+    assert!(
+        incoming.error.is_none(),
+        "cross incoming failed: {incoming:?}"
+    );
+    let incoming = incoming.result.expect("incoming");
+    assert_eq!(incoming[0]["from"]["uri"], uri(&consumer).to_string());
+    assert_eq!(incoming[0]["fromRanges"][0]["start"]["line"], 7);
+    assert_eq!(incoming[0]["fromRanges"][0]["start"]["character"], 12);
+    assert_eq!(incoming[0]["fromRanges"][0]["end"]["character"], 23);
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn call_hierarchy_result_is_rejected_when_open_overlay_changes_before_delivery() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("FreshCalls.pas");
+    let source = "unit FreshCalls;\ninterface\nfunction Target: Integer;\nfunction Caller: Integer;\nimplementation\nfunction Target: Integer;\nbegin Result := 1; end;\nfunction Caller: Integer;\nbegin Result := Target(); end;\nend.\n";
+    write_file(&path, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(path.parent().expect("workspace root"), json!({}));
+    let uri_value = uri(&path);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri_value, "languageId": "pascal", "version": 1, "text": source
+        }}),
+    );
+    let prepare_id = RequestId::from("fresh-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(prepare.error.is_none(), "prepare failed: {prepare:?}");
+    let item = prepare.result.expect("caller item")[0].clone();
+
+    let outgoing_id = RequestId::from("fresh-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    barrier.wait_until_entered();
+    let changed = source.replace("Target()", "Target(1)");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_value, "version": 2},
+            "contentChanges": [{"text": changed}]
+        }),
+    );
+    barrier.release();
+    let outgoing = server.response(&outgoing_id);
+    assert!(
+        outgoing.result.is_none(),
+        "stale call edges must not be published: {outgoing:?}"
+    );
+    assert!(outgoing.error.is_some(), "stale request should fail closed");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn call_hierarchy_cancellation_discards_completed_edges() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("CancelledCalls.pas");
+    let source = "unit CancelledCalls;\ninterface\nfunction Target: Integer;\nfunction Caller: Integer;\nimplementation\nfunction Target: Integer;\nbegin Result := 1; end;\nfunction Caller: Integer;\nbegin Result := Target(); end;\nend.\n";
+    write_file(&path, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(path.parent().expect("workspace root"), json!({}));
+    let prepare_id = RequestId::from("cancelled-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(prepare.error.is_none(), "prepare failed: {prepare:?}");
+    let item = prepare.result.expect("caller item")[0].clone();
+    let id = RequestId::from("cancelled-call-edges".to_string());
+    server.send_request(
+        id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    barrier.wait_until_entered();
+    server.send_notification("$/cancelRequest", json!({"id": id}));
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.result.is_none(),
+        "cancelled edges must not publish: {response:?}"
+    );
+    assert!(response.error.is_some(), "cancellation should be reported");
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_omits_named_references_and_ambiguous_overloads() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("UncertainCalls.pas");
+    let source = "unit UncertainCalls;\ninterface\nfunction Overloaded(Value: Integer): Integer; overload;\nfunction Overloaded(Value: string): Integer; overload;\nfunction Caller: Integer;\nimplementation\nfunction Overloaded(Value: Integer): Integer;\nbegin Result := Value; end;\nfunction Overloaded(Value: string): Integer;\nbegin Result := 0; end;\nfunction Caller: Integer;\nbegin\n  // Overloaded is a name, not a call here.\n  Result := Overloaded(UnknownValue);\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("uncertain-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "caller prepare failed: {prepare:?}"
+    );
+    let item = prepare.result.expect("caller item")[0].clone();
+    let outgoing_id = RequestId::from("uncertain-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(
+        outgoing.error.is_none(),
+        "uncertain edges should be omitted: {outgoing:?}"
+    );
+    assert_eq!(outgoing.result.expect("outgoing"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_keeps_uniquely_selected_overloads_as_distinct_items() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("OverloadCalls.pas");
+    let source = "unit OverloadCalls;\ninterface\nprocedure Draw(Value: Integer); overload;\nprocedure Draw(Value: string); overload;\nprocedure Caller;\nimplementation\nprocedure Draw(Value: Integer);\nbegin end;\nprocedure Draw(Value: string);\nbegin end;\nprocedure Caller;\nbegin\n  Draw(1);\n  Draw('text');\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let int_id = RequestId::from("integer-overload-prepare".to_string());
+    server.send_request(
+        int_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Draw", 0)
+        }),
+    );
+    let int_response = server.response(&int_id);
+    assert!(
+        int_response.error.is_none(),
+        "integer overload prepare failed: {int_response:?}"
+    );
+    let int_item = int_response.result.expect("integer overload")[0].clone();
+    let string_id = RequestId::from("string-overload-prepare".to_string());
+    server.send_request(
+        string_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Draw", 1)
+        }),
+    );
+    let string_response = server.response(&string_id);
+    assert!(
+        string_response.error.is_none(),
+        "string overload prepare failed: {string_response:?}"
+    );
+    let string_item = string_response.result.expect("string overload")[0].clone();
+    assert_ne!(int_item["selectionRange"], string_item["selectionRange"]);
+    assert_ne!(int_item["data"], string_item["data"]);
+
+    for (name, item, call_line) in [("integer", int_item, 12), ("string", string_item, 13)] {
+        let id = RequestId::from(format!("{name}-overload-incoming"));
+        server.send_request(
+            id.clone(),
+            "callHierarchy/incomingCalls",
+            json!({"item": item}),
+        );
+        let incoming = server.response(&id);
+        assert!(
+            incoming.error.is_none(),
+            "{name} overload query failed: {incoming:?}"
+        );
+        let incoming = incoming.result.expect("incoming");
+        assert_eq!(incoming.as_array().expect("incoming array").len(), 1);
+        assert_eq!(incoming[0]["fromRanges"][0]["start"]["line"], call_line);
+    }
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_exceeds_call_cap_without_partial_success() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("ManyCalls.pas");
+    let mut source = String::from(
+        "unit ManyCalls;\ninterface\nprocedure Caller;\nimplementation\nprocedure Caller;\nbegin\n",
+    );
+    for _ in 0..4_097 {
+        source.push_str("  MissingCall();\n");
+    }
+    source.push_str("end;\nend.\n");
+    write_file(&path, &source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("many-calls-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(&source, "Caller", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "caller prepare failed: {prepare:?}"
+    );
+    let item = prepare.result.expect("caller item")[0].clone();
+    let outgoing_id = RequestId::from("many-calls-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(
+        outgoing.result.is_none(),
+        "overflow must not return partial edges: {outgoing:?}"
+    );
+    let message = outgoing.error.expect("cap error").message;
+    assert!(
+        message.contains("limit"),
+        "expected work/call cap error, got: {message}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn document_links_target_only_active_proven_include_paths() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");

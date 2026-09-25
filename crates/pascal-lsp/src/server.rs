@@ -928,6 +928,9 @@ impl AnalysisPriority {
             | AnalysisRequest::Navigation { .. }
             | AnalysisRequest::TypeDefinitions { .. }
             | AnalysisRequest::Prepare { .. }
+            | AnalysisRequest::PrepareCallHierarchy { .. }
+            | AnalysisRequest::IncomingCalls { .. }
+            | AnalysisRequest::OutgoingCalls { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
             | AnalysisRequest::ResolveCompletion(_)
@@ -2066,6 +2069,16 @@ enum AnalysisRequest {
         uri: Url,
         range: lsp_types::Range,
     },
+    PrepareCallHierarchy {
+        uri: Url,
+        position: Position,
+    },
+    IncomingCalls {
+        item: lsp_types::CallHierarchyItem,
+    },
+    OutgoingCalls {
+        item: lsp_types::CallHierarchyItem,
+    },
 }
 
 fn progress_title(request: &AnalysisRequest) -> &'static str {
@@ -2083,6 +2096,9 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
         AnalysisRequest::SemanticTokens { .. } => "Computing semantic tokens",
         AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
         AnalysisRequest::InlayHints { .. } => "Computing inlay hints",
+        AnalysisRequest::PrepareCallHierarchy { .. } => "Preparing call hierarchy",
+        AnalysisRequest::IncomingCalls { .. } => "Searching incoming calls",
+        AnalysisRequest::OutgoingCalls { .. } => "Searching outgoing calls",
         AnalysisRequest::Hover { .. }
         | AnalysisRequest::Completion { .. }
         | AnalysisRequest::SignatureHelp { .. }
@@ -2127,6 +2143,9 @@ enum AnalysisResultValue {
     SemanticTokens(Result<lsp_types::SemanticTokens, String>),
     FoldingRanges(Result<Vec<lsp_types::FoldingRange>, String>),
     InlayHints(Result<Vec<lsp_types::InlayHint>, String>),
+    PrepareCallHierarchy(Result<Option<Vec<lsp_types::CallHierarchyItem>>, String>),
+    IncomingCalls(Result<Vec<lsp_types::CallHierarchyIncomingCall>, String>),
+    OutgoingCalls(Result<Vec<lsp_types::CallHierarchyOutgoingCall>, String>),
 }
 
 #[derive(Clone)]
@@ -4502,6 +4521,7 @@ enum ObservationMethod {
     Navigation(NavigationObservationTarget),
     TypeDefinitions,
     Prepare,
+    PrepareCallHierarchy,
     DocumentSymbols {
         hierarchical: bool,
     },
@@ -4637,6 +4657,16 @@ impl ObservationKey {
                 None,
                 None,
             ),
+            AnalysisRequest::PrepareCallHierarchy { uri, position } => (
+                ObservationMethod::PrepareCallHierarchy,
+                Some(uri.clone()),
+                Some(ObservationPosition {
+                    line: position.line,
+                    character: position.character,
+                }),
+                None,
+                None,
+            ),
             AnalysisRequest::DocumentSymbols { uri, hierarchical } => (
                 ObservationMethod::DocumentSymbols {
                     hierarchical: *hierarchical,
@@ -4743,7 +4773,9 @@ impl ObservationKey {
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
             | AnalysisRequest::ResolveCompletion(_)
-            | AnalysisRequest::DocumentLinks { .. } => return None,
+            | AnalysisRequest::DocumentLinks { .. }
+            | AnalysisRequest::IncomingCalls { .. }
+            | AnalysisRequest::OutgoingCalls { .. } => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
@@ -5114,6 +5146,17 @@ impl AnalysisJobs {
                 "analysis worker failed without changing workspace state".to_string(),
             )),
             AnalysisRequest::InlayHints { .. } => AnalysisResultValue::InlayHints(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::PrepareCallHierarchy { .. } => {
+                AnalysisResultValue::PrepareCallHierarchy(Err(
+                    "analysis worker failed without changing workspace state".to_string(),
+                ))
+            }
+            AnalysisRequest::IncomingCalls { .. } => AnalysisResultValue::IncomingCalls(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::OutgoingCalls { .. } => AnalysisResultValue::OutgoingCalls(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
         };
@@ -5893,6 +5936,49 @@ impl AnalysisJobs {
                                 value: AnalysisResultValue::InlayHints(computed.value),
                             }
                         }
+                        AnalysisRequest::PrepareCallHierarchy { uri, position } => {
+                            let computed = queries::prepare_call_hierarchy_from_input(
+                                input,
+                                &uri,
+                                position,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::PrepareCallHierarchy(computed.value),
+                            }
+                        }
+                        AnalysisRequest::IncomingCalls { item } => {
+                            let computed = queries::incoming_calls_from_input(
+                                input,
+                                &item,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::IncomingCalls(computed.value),
+                            }
+                        }
+                        AnalysisRequest::OutgoingCalls { item } => {
+                            let computed = queries::outgoing_calls_from_input(
+                                input,
+                                &item,
+                                &worker_cancellation,
+                            );
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::OutgoingCalls(computed.value),
+                            }
+                        }
                     }));
                 let mut result = result.unwrap_or_else(|_| AnalysisResult {
                     id: panic_id,
@@ -5904,7 +5990,10 @@ impl AnalysisJobs {
                 #[cfg(feature = "test-support")]
                 if matches!(
                     result.value,
-                    AnalysisResultValue::DocumentLinks(_) | AnalysisResultValue::InlayHints(_)
+                    AnalysisResultValue::DocumentLinks(_)
+                        | AnalysisResultValue::InlayHints(_)
+                        | AnalysisResultValue::IncomingCalls(_)
+                        | AnalysisResultValue::OutgoingCalls(_)
                 ) {
                     if let Err(error) = wait_at_test_barrier(
                         TestBarrier::PartialValidation,
@@ -7673,6 +7762,9 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::SemanticTokens(_)
                 | AnalysisResultValue::FoldingRanges(_)
                 | AnalysisResultValue::InlayHints(_)
+                | AnalysisResultValue::PrepareCallHierarchy(_)
+                | AnalysisResultValue::IncomingCalls(_)
+                | AnalysisResultValue::OutgoingCalls(_)
         )
 }
 
@@ -8036,6 +8128,24 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
+        AnalysisResultValue::PrepareCallHierarchy(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::IncomingCalls(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::OutgoingCalls(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
     }
 }
 
@@ -8347,6 +8457,9 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         AnalysisResultValue::SemanticTokens(value) => *value = Err(error),
         AnalysisResultValue::FoldingRanges(value) => *value = Err(error),
         AnalysisResultValue::InlayHints(value) => *value = Err(error),
+        AnalysisResultValue::PrepareCallHierarchy(value) => *value = Err(error),
+        AnalysisResultValue::IncomingCalls(value) => *value = Err(error),
+        AnalysisResultValue::OutgoingCalls(value) => *value = Err(error),
     }
 }
 
@@ -10666,6 +10779,68 @@ fn handle_request(
                 work_done_token.clone(),
             )?;
         }
+        "textDocument/prepareCallHierarchy" => {
+            let id = request.id.clone();
+            let params: lsp_types::CallHierarchyPrepareParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::PrepareCallHierarchy {
+                    uri: canonical_file_uri(
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    position: params.text_document_position_params.position,
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "callHierarchy/incomingCalls" => {
+            let id = request.id.clone();
+            let params: lsp_types::CallHierarchyIncomingCallsParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::IncomingCalls { item: params.item },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "callHierarchy/outgoingCalls" => {
+            let id = request.id.clone();
+            let params: lsp_types::CallHierarchyOutgoingCallsParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::OutgoingCalls { item: params.item },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
         "textDocument/prepareRename" => {
             let id = request.id.clone();
             let params: PositionRequestParams = match parse_params(&request) {
@@ -12230,6 +12405,7 @@ fn server_capabilities(
         "selectionRangeProvider": {"workDoneProgress": true},
         "foldingRangeProvider": {"workDoneProgress": true},
         "inlayHintProvider": {"resolveProvider": false, "workDoneProgress": true},
+        "callHierarchyProvider": true,
         "semanticTokensProvider": {
             "legend": crate::NavigationIndex::semantic_tokens_legend(),
             "range": true,

@@ -49,6 +49,7 @@ use walkdir::WalkDir;
 use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTarget, SourceKind};
 
 pub(crate) mod codeactions;
+pub(crate) mod extract;
 pub(crate) mod projects;
 pub(crate) mod queries;
 pub(crate) mod rename;

@@ -46407,6 +46407,261 @@ fn source_action_deduplication_preserves_binding_before_and_after_apply() {
 }
 
 #[test]
+fn extract_local_integer_assignment_preserves_value_and_single_output() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Sample.pas");
+    let source = "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\nbegin\n  Target := 42;\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize_with_action_support(root, Value::Null);
+
+    for (id, start, end, only, kind, expected) in [
+        (
+            "extract-variable",
+            12,
+            14,
+            "refactor.extract.variable",
+            "refactor.extract.variable",
+            "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\n  ExtractedValue: Integer;\nbegin\n  ExtractedValue := 42;\n  Target := ExtractedValue;\nend;\nend.\n",
+        ),
+        (
+            "extract-routine",
+            2,
+            15,
+            "refactor.extract.function",
+            "refactor.extract.function",
+            "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\nprocedure ExtractedRoutine(var Target: Integer);\nbegin\n  Target := 42;\nend;\nbegin\n  ExtractedRoutine(Target);\nend;\nend.\n",
+        ),
+    ] {
+        let request_id = RequestId::from(id.to_string());
+        server.send_request(
+            request_id.clone(),
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri(&main)},
+                "range": {"start": {"line": 6, "character": start}, "end": {"line": 6, "character": end}},
+                "context": {"diagnostics": [], "only": [only]}
+            }),
+        );
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_none(),
+            "extract code action failed: {response:?}"
+        );
+        let actions = response.result.expect("extract actions");
+        let actions = actions.as_array().expect("action array");
+        assert_eq!(
+            actions.len(),
+            1,
+            "unexpected extraction candidates: {actions:?}"
+        );
+        assert_eq!(actions[0]["kind"], kind);
+        assert_eq!(
+            apply_workspace_edit_to_source(source, &actions[0]["edit"], &uri(&main)),
+            expected
+        );
+    }
+
+    let quickfix_id = RequestId::from("extract-quickfix-only".to_string());
+    server.send_request(
+        quickfix_id.clone(),
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 6, "character": 12}, "end": {"line": 6, "character": 14}}, "context": {"diagnostics": [], "only": ["quickfix"]}}),
+    );
+    let quickfix = server.response(&quickfix_id);
+    assert!(
+        quickfix.error.is_none(),
+        "quickfix request failed: {quickfix:?}"
+    );
+    assert!(
+        quickfix
+            .result
+            .expect("quickfix actions")
+            .as_array()
+            .is_some_and(|actions| {
+                actions.iter().all(|action| {
+                    !action["kind"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("refactor.extract"))
+                })
+            }),
+        "extract action leaked into quickfix request"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn extract_refactoring_withholds_unsupported_or_excluded_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Sample.pas");
+    let source = "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\nbegin\n  Target := 42;\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let request = |id: &str, server: &mut TestServer| {
+        let id = RequestId::from(id.to_string());
+        server.send_request(
+            id.clone(),
+            "textDocument/codeAction",
+            json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 6, "character": 12}, "end": {"line": 6, "character": 14}}, "context": {"diagnostics": [], "only": ["refactor.extract"]}}),
+        );
+        server.response(&id)
+    };
+    let positive = request("extract-default-client", &mut server);
+    assert!(
+        positive.error.is_none(),
+        "default client extraction failed: {positive:?}"
+    );
+    assert_eq!(
+        positive
+            .result
+            .expect("actions")
+            .as_array()
+            .expect("array")
+            .len(),
+        1
+    );
+
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 2}, "contentChanges": [{"text": source.replace("42", "Compute()") }]}),
+    );
+    let unsupported = request("extract-unsupported-call", &mut server);
+    assert!(
+        unsupported.error.is_none(),
+        "unsupported request failed: {unsupported:?}"
+    );
+    assert_eq!(
+        unsupported
+            .result
+            .expect("actions")
+            .as_array()
+            .expect("array")
+            .len(),
+        0
+    );
+    server.shutdown();
+
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[lint4d]\nexclude = [\"Sample.pas\"]\n",
+    );
+    let mut excluded_server = TestServer::launch();
+    excluded_server.initialize(root, Value::Null);
+    let excluded = request("extract-excluded", &mut excluded_server);
+    assert!(
+        excluded.error.is_none(),
+        "excluded request failed: {excluded:?}"
+    );
+    assert_eq!(
+        excluded
+            .result
+            .expect("actions")
+            .as_array()
+            .expect("array")
+            .len(),
+        0
+    );
+    excluded_server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn extract_queued_source_change_cannot_publish_old_edit() {
+    let environment = tempfile::tempdir().expect("server environment");
+    let root = environment.path().join("workspace");
+    let main = root.join("Sample.pas");
+    let source = "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\nbegin\n  Target := 42;\nend;\nend.\n";
+    write_file(&main, source);
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    for number in 0..2 {
+        let blocker = root.join(format!("Blocker{number}.pas"));
+        write_file(
+            &blocker,
+            &format!("unit Blocker{number};\ninterface\nimplementation\nend.\n"),
+        );
+        server.send_request(
+            RequestId::from(format!("extract-blocker-{number}")),
+            "textDocument/definition",
+            json!({"textDocument": {"uri": uri(&blocker)}, "position": {"line": 0, "character": 5}}),
+        );
+    }
+    barrier.wait_for_entries(2);
+    let extraction_id = RequestId::from("queued-extract-variable".to_string());
+    server.send_request(
+        extraction_id.clone(),
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 6, "character": 12}, "end": {"line": 6, "character": 14}}, "context": {"diagnostics": [], "only": ["refactor.extract.variable"]}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 2}, "contentChanges": [{"text": source.replace("42", "Compute()") }]}),
+    );
+    let fence_id = RequestId::from("extract-queued-overlay-fence".to_string());
+    server.send_request(
+        fence_id.clone(),
+        "workspace/willCreateFiles",
+        json!({"files": []}),
+    );
+    assert!(server.response(&fence_id).error.is_none());
+    barrier.release();
+    let response = server.response(&extraction_id);
+    assert!(
+        response.error.is_some()
+            || response
+                .result
+                .as_ref()
+                .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty)),
+        "stale extraction published an edit: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_read_only_file_never_offers_workspace_edits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Sample.pas");
+    write_file(
+        &main,
+        "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\nbegin\n  Target := 42;\nend;\nend.\n",
+    );
+    fs::set_permissions(&main, fs::Permissions::from_mode(0o444)).expect("read-only source");
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let request_id = RequestId::from("extract-read-only".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri(&main)}, "range": {"start": {"line": 6, "character": 12}, "end": {"line": 6, "character": 14}}, "context": {"diagnostics": [], "only": ["refactor.extract.variable"]}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_some()
+            || response
+                .result
+                .as_ref()
+                .is_some_and(|result| result.as_array().is_some_and(Vec::is_empty)),
+        "read-only source offered an edit: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn source_action_organize_imports_resolves_a_frozen_safe_ordering_proof() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

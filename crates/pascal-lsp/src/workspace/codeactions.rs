@@ -1,5 +1,6 @@
 //! Naming quick-fix planning for the workspace snapshot.
 
+use super::extract;
 use super::rename::{
     CANCELLATION_MESSAGE, Computed, OverlayInput, RenameSnapshot, SnapshotMode, SnapshotSeed,
     SourceRecord, WorkspaceInput, build_snapshot, check_includes, identifier_at_position,
@@ -596,10 +597,12 @@ pub(crate) fn code_actions_from_input(
     let requests_quickfix = requests_quickfix(&params.context);
     let requests_interface_method = requests_interface_method(&params.context);
     let requests_organize_imports = requests_organize_imports(&params.context);
+    let requests_extraction = requests_extraction(&params.context);
     let fix_all_scopes = requested_fix_all_scopes(&params.context);
     if !requests_quickfix
         && !requests_interface_method
         && !requests_organize_imports
+        && !requests_extraction
         && fix_all_scopes.is_empty()
     {
         return Computed {
@@ -637,6 +640,72 @@ pub(crate) fn code_actions_from_input(
             source_generation,
             configuration_generation,
             value: Ok(Vec::new()),
+            records,
+        };
+    }
+    let extraction_actions = if requests_extraction && input_source_is_writable(&input, &uri) {
+        let mut actions = Vec::new();
+        let extractions = match extract::plan(&source, params.range, cancel) {
+            Ok(extractions) => extractions,
+            Err(error) if is_cancelled(cancel) => {
+                return failed(source_generation, configuration_generation, error);
+            }
+            Err(_) => Vec::new(),
+        };
+        for extraction in extractions {
+            if !params.context.only.as_ref().is_none_or(|kinds| {
+                kinds
+                    .iter()
+                    .any(|filter| code_action_kind_contains(filter, &extraction.kind))
+            }) {
+                continue;
+            }
+            let title = if extraction.kind.as_str() == "refactor.extract.variable" {
+                "Extract variable"
+            } else {
+                "Extract routine"
+            };
+            let edit = workspace_edit(
+                HashMap::from([(uri.clone(), extraction.edits)]),
+                &HashMap::from([(uri.clone(), target_record.clone())]),
+                features.document_changes,
+            );
+            if let Ok(edit) = edit {
+                let action = CodeActionOrCommand::CodeAction(CodeAction {
+                    title: title.to_string(),
+                    kind: Some(extraction.kind),
+                    diagnostics: None,
+                    edit: Some(edit),
+                    command: None,
+                    is_preferred: Some(false),
+                    disabled: None,
+                    data: None,
+                });
+                match push_bounded_code_action(&mut actions, action) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        return failed(source_generation, configuration_generation, error);
+                    }
+                }
+            }
+        }
+        actions
+    } else {
+        Vec::new()
+    };
+    if requests_extraction
+        && !requests_quickfix
+        && !requests_interface_method
+        && !requests_organize_imports
+        && fix_all_scopes.is_empty()
+    {
+        let mut records = vec![target_record];
+        append_records(&mut records, configuration_records);
+        return Computed {
+            source_generation,
+            configuration_generation,
+            value: Ok(extraction_actions),
             records,
         };
     }
@@ -791,7 +860,7 @@ pub(crate) fn code_actions_from_input(
         (plans, records)
     };
     if features.resolve {
-        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        let mut actions: Vec<CodeActionOrCommand> = extraction_actions.clone();
         for candidate in &candidates {
             let action = CodeActionOrCommand::CodeAction({
                 let data =
@@ -993,7 +1062,7 @@ pub(crate) fn code_actions_from_input(
             format!("code-action document is outside configured workspace roots: {uri}"),
         );
     }
-    let mut actions = Vec::new();
+    let mut actions = extraction_actions;
     for candidate in candidates {
         if is_cancelled(cancel) {
             return cancelled(source_generation, configuration_generation);
@@ -5273,6 +5342,18 @@ fn requests_organize_imports(context: &CodeActionContext) -> bool {
         kinds
             .iter()
             .any(|kind| code_action_kind_contains(kind, &ORGANIZE_IMPORTS_CODE_ACTION_KIND))
+    })
+}
+
+fn requests_extraction(context: &CodeActionContext) -> bool {
+    context.only.as_ref().is_none_or(|kinds| {
+        kinds.iter().any(|kind| {
+            code_action_kind_contains(kind, &CodeActionKind::new("refactor.extract.variable"))
+                || code_action_kind_contains(
+                    kind,
+                    &CodeActionKind::new("refactor.extract.function"),
+                )
+        })
     })
 }
 

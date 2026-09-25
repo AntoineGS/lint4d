@@ -3,6 +3,7 @@
 use self::rename::CANCELLATION_MESSAGE;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use crate::include_expansion::{ExpandedSource, ExpansionLimits};
+use crate::navigation::compiled_dcu::{discover_compiled_units, virtual_unit_identity};
 use crate::navigation::{SemanticDiagnostic, SemanticDiagnosticKind};
 use crate::{NavigationIndex, NavigationTarget, text};
 use globset::{GlobSet, GlobSetBuilder};
@@ -2138,8 +2139,17 @@ pub(crate) struct NavigationState {
     document_contexts: HashMap<Url, ContextKey>,
     open_document_contexts: HashMap<Url, ContextKey>,
     document_owners: HashMap<Url, KnownDocumentOwner>,
+    compiled_provider_bindings: Vec<CompiledProviderBinding>,
     owner_last_used: HashMap<Url, u64>,
     use_clock: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledProviderBinding {
+    importer: Url,
+    provider: Url,
+    importer_source_hash: u64,
+    context_fingerprint: u64,
 }
 
 struct NotificationRecoveryPlan {
@@ -2476,6 +2486,7 @@ pub struct Workspace {
     document_contexts: HashMap<Url, ContextKey>,
     open_document_contexts: HashMap<Url, ContextKey>,
     document_owners: HashMap<Url, KnownDocumentOwner>,
+    compiled_provider_bindings: Vec<CompiledProviderBinding>,
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
@@ -2526,6 +2537,122 @@ struct SharedLintResult {
 }
 
 impl Workspace {
+    /// Read a generated compiled-unit view only from a currently retained
+    /// project context whose fingerprint matches the canonical provider URI.
+    /// The URI is never interpreted as a filesystem path.
+    pub fn compiled_virtual_document_content(&self, uri: &Url) -> Result<Option<String>, String> {
+        let Some((fingerprint, _content_fingerprint, unit_name)) = virtual_unit_identity(uri)
+        else {
+            return Ok(None);
+        };
+        if self.document_contexts.len() > self.options.limits.max_files {
+            return Err("compiled virtual-document importer limit exceeded".to_string());
+        }
+        let active_importers = self
+            .document_contexts
+            .iter()
+            .filter_map(|(importer, context_key)| {
+                self.contexts
+                    .get(context_key)
+                    .filter(|state| {
+                        crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
+                            == fingerprint
+                            && context_state_is_fresh_with_cancel(state, None, None)
+                                .is_ok_and(|fresh| fresh)
+                    })
+                    .map(|_| importer.clone())
+            })
+            .collect::<HashSet<_>>();
+        let transferred_binding = self.compiled_provider_bindings.iter().any(|binding| {
+            binding.provider == *uri
+                && active_importers.contains(&binding.importer)
+                && self
+                    .document_contexts
+                    .get(&binding.importer)
+                    .is_some_and(|key| {
+                        self.contexts.get(key).is_some_and(|state| {
+                            crate::navigation::compiled_dcu::project_context_fingerprint(
+                                &state.context,
+                            ) == binding.context_fingerprint
+                        })
+                    })
+                && self
+                    .current_importer_source_hash(&binding.importer)
+                    .is_some_and(|hash| hash == binding.importer_source_hash)
+        });
+        if !transferred_binding
+            && !self
+                .index
+                .is_bound_compiled_unit_provider(uri, &active_importers)
+        {
+            return Ok(None);
+        }
+        let mut visits = 0usize;
+        let mut seen = HashSet::new();
+        let cancel = AtomicBool::new(false);
+        for state in self.contexts.values() {
+            visits = visits.saturating_add(1);
+            if visits > 64 {
+                return Err("compiled virtual-document context limit exceeded".to_string());
+            }
+            if !state.context.discovery_complete
+                || crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
+                    != fingerprint
+                || !context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+                || !seen.insert(fingerprint)
+            {
+                continue;
+            }
+            let Some(unit) =
+                discover_compiled_units(&state.context, std::slice::from_ref(&unit_name), &cancel)?
+                    .into_iter()
+                    .find(|unit| {
+                        unit.document.uri() == uri && unit.is_current(&state.context.read_policy)
+                    })
+            else {
+                continue;
+            };
+            return Ok(Some(unit.document.text().to_owned()));
+        }
+        Ok(None)
+    }
+
+    fn current_importer_source_hash(&self, importer: &Url) -> Option<u64> {
+        if let Some(open) = self.open_documents.get(importer) {
+            return open
+                .text
+                .as_ref()
+                .map(|text| content_hash_bytes(text.as_bytes()));
+        }
+        let path = importer.to_file_path().ok()?;
+        let context_key = self.document_contexts.get(importer)?;
+        let context = self.contexts.get(context_key)?;
+        let entry = context.context.read_policy.entry_for_path(&path)?;
+        let bytes = context
+            .context
+            .read_policy
+            .read_payload_bytes(&entry, 8 * 1024 * 1024)
+            .ok()?;
+        let text = resolver::decode_source_bytes(&bytes);
+        Some(content_hash_bytes(text.as_bytes()))
+    }
+
+    fn validate_compiled_navigation_locations(&self, locations: &[Location]) -> Result<(), String> {
+        for location in locations {
+            if location.uri.scheme() == "lint4d-dcu"
+                && self
+                    .compiled_virtual_document_content(&location.uri)?
+                    .is_none()
+            {
+                return Err(format!(
+                    "compiled unit changed or is no longer authorized at {}; retry navigation",
+                    location.uri
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn bounded_rejected_open_uri(uri: &Url) -> Option<Url> {
         (uri.as_str().len() <= MAX_REJECTED_OPEN_FENCE_URI_BYTES).then(|| uri.clone())
     }
@@ -2749,11 +2876,30 @@ impl Workspace {
     }
 
     pub(crate) fn navigation_state(&self) -> NavigationState {
+        let compiled_provider_bindings = self
+            .index
+            .compiled_unit_provider_bindings()
+            .into_iter()
+            .filter_map(|(importer, provider, importer_source_hash)| {
+                let key = self.document_contexts.get(&importer)?;
+                let context = self.contexts.get(key)?;
+                Some(CompiledProviderBinding {
+                    importer,
+                    provider,
+                    importer_source_hash,
+                    context_fingerprint:
+                        crate::navigation::compiled_dcu::project_context_fingerprint(
+                            &context.context,
+                        ),
+                })
+            })
+            .collect();
         NavigationState {
             contexts: self.contexts.clone(),
             document_contexts: self.document_contexts.clone(),
             open_document_contexts: self.open_document_contexts.clone(),
             document_owners: self.document_owners.clone(),
+            compiled_provider_bindings,
             owner_last_used: self.owner_last_used.clone(),
             use_clock: self.use_clock,
         }
@@ -2783,6 +2929,7 @@ impl Workspace {
                 self.document_owners.insert(uri, incoming);
             }
         }
+        self.compiled_provider_bindings = state.compiled_provider_bindings;
         self.owner_last_used.extend(state.owner_last_used);
         self.use_clock = self.use_clock.max(state.use_clock);
         self.trim_document_owners();
@@ -5911,6 +6058,7 @@ impl Workspace {
             check_workspace_cancel(cancel)?;
             let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
             if !locations.is_empty() {
+                self.validate_compiled_navigation_locations(&locations)?;
                 return Ok(locations);
             }
             if frontier.is_empty() || work >= MAX_DEPENDENCY_WORK {
@@ -5950,7 +6098,9 @@ impl Workspace {
         }
 
         check_workspace_cancel(cancel)?;
-        self.resolve_virtual_navigation(uri, position, target, cancel)
+        let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
+        self.validate_compiled_navigation_locations(&locations)?;
+        Ok(locations)
     }
 
     fn resolve_virtual_navigation(
@@ -6192,6 +6342,62 @@ impl Workspace {
         self.merge_resolution_report(&effective_context_key, &report);
         if let Some(reason) = rejected_dependency {
             return Err(format!("required dependency was rejected: {reason}"));
+        }
+
+        // Source providers resolved above always win. Only unresolved imports
+        // are eligible for the selected-context compiled provider, which itself
+        // rejects source shadows and ambiguous DCUs.
+        let unresolved_units = sites
+            .iter()
+            .map(|site| site.requested_name.as_str())
+            .filter(|name| {
+                !bindings
+                    .keys()
+                    .any(|bound| bound.eq_ignore_ascii_case(name))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !unresolved_units.is_empty() {
+            let no_cancel = AtomicBool::new(false);
+            let provider_cancel = cancel.unwrap_or(&no_cancel);
+            let compiled = discover_compiled_units(&context, &unresolved_units, provider_cancel)?;
+            for unit in compiled {
+                check_workspace_cancel(cancel)?;
+                let Some((_, _, unit_name)) = virtual_unit_identity(unit.document.uri()) else {
+                    continue;
+                };
+                let requested_name = unresolved_units
+                    .iter()
+                    .find(|name| name.eq_ignore_ascii_case(&unit_name))
+                    .cloned();
+                let Some(requested_name) = requested_name else {
+                    continue;
+                };
+                if bindings
+                    .keys()
+                    .any(|bound| bound.eq_ignore_ascii_case(&requested_name))
+                {
+                    continue;
+                }
+                self.index
+                    .update_compiled_unit_document(&unit.document)
+                    .map_err(|error| format!("could not index compiled unit: {error}"))?;
+                bindings.insert(requested_name, unit.document.uri().clone());
+                let (path, path_entry, content_hash) = unit.observation();
+                if let Some(record) = rename::path_record_at(
+                    path.to_path_buf(),
+                    path_stamp(path),
+                    Some(content_hash),
+                    None,
+                    None,
+                    Some(context.read_policy.clone()),
+                    Some(path_entry.clone()),
+                    false,
+                ) {
+                    let records = self.analysis_records.get_or_insert_with(HashMap::new);
+                    resolver::merge_source_record(records, record);
+                }
+            }
         }
         self.index.bind_imports(uri, bindings);
         Ok(dependencies)
@@ -14654,6 +14860,339 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    #[test]
+    fn compiled_virtual_content_is_bound_to_a_live_authorized_context() {
+        let temp = tempfile::tempdir().expect("temporary authorized path");
+        let fixture_root = temp.path().join("dcu");
+        fs::create_dir(&fixture_root).expect("create fixture search path");
+        let fixture_source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug")
+            .join("Lint4dFixture.Classes.dcu");
+        let fixture_path = fixture_root.join("Lint4dFixture.Classes.dcu");
+        fs::copy(&fixture_source, &fixture_path).expect("copy fixture into authorized path");
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![fixture_root.clone()],
+            search_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
+            read_policy: ReadPolicy::new(
+                std::slice::from_ref(&fixture_root),
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(fixture_root.clone()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace = test_workspace(vec![fixture_root.clone()], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context: context.clone(),
+                ..ContextState::default()
+            },
+        );
+        let unit = super::discover_compiled_units(
+            &context,
+            &["Lint4dFixture.Classes".to_string()],
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .pop()
+        .expect("supported compiled type unit");
+        let uri = unit.document.uri().clone();
+        assert_eq!(
+            workspace.compiled_virtual_document_content(&uri).unwrap(),
+            None,
+            "an unbound virtual URI must not trigger content disclosure"
+        );
+        workspace
+            .index
+            .update_compiled_unit_document(&unit.document)
+            .expect("index authorized generated unit");
+        let consumer_uri = Url::parse("file:///workspace/Consumer.pas").unwrap();
+        workspace
+            .index
+            .update(
+                consumer_uri.clone(),
+                "unit Consumer; interface uses Lint4dFixture.Classes; implementation end."
+                    .to_string(),
+            )
+            .expect("index consumer source");
+        workspace.index.bind_imports(
+            &consumer_uri,
+            [("Lint4dFixture.Classes".to_string(), uri.clone())],
+        );
+        workspace
+            .document_contexts
+            .insert(consumer_uri.clone(), key.clone());
+        assert_eq!(
+            workspace.compiled_virtual_document_content(&uri).unwrap(),
+            Some(unit.document.text().to_owned())
+        );
+        let mut switched_context_key = key.clone();
+        switched_context_key.workspace_root = Some(temp.path().join("other-project"));
+        workspace
+            .document_contexts
+            .insert(consumer_uri.clone(), switched_context_key);
+        assert_eq!(
+            workspace.compiled_virtual_document_content(&uri).unwrap(),
+            None
+        );
+        workspace
+            .document_contexts
+            .insert(consumer_uri, key.clone());
+
+        let mut replacement = fs::read(&fixture_path).expect("read copied fixture");
+        let last_byte = replacement.len() - 1;
+        replacement[last_byte] ^= 1;
+        fs::write(&fixture_path, replacement).expect("replace fixture contents");
+        assert_eq!(
+            workspace.compiled_virtual_document_content(&uri).unwrap(),
+            None
+        );
+        assert!(
+            workspace
+                .validate_compiled_navigation_locations(&[super::Location {
+                    uri: uri.clone(),
+                    range: Range::default(),
+                }])
+                .is_err()
+        );
+
+        let forged =
+            Url::parse("lint4d-dcu://d13-win64/0000000000000000/0000000000000000/Other.pas")
+                .expect("well-formed forged virtual URI");
+        assert_eq!(
+            workspace
+                .compiled_virtual_document_content(&forged)
+                .unwrap(),
+            None
+        );
+        workspace.contexts.clear();
+        assert_eq!(
+            workspace.compiled_virtual_document_content(&uri).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_project_source_import_binds_fixture_dcu_for_navigation() {
+        let temp = tempfile::tempdir().expect("temporary project root");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug")
+            .canonicalize()
+            .expect("fixture directory exists");
+        let source_path = temp.path().join("Consumer.pas");
+        let source = "unit Consumer; interface uses Lint4dFixture.Classes; type TAlias = TSimpleClass; implementation end.";
+        fs::write(&source_path, source).expect("write project source");
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![fixture_root.clone()],
+            search_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
+            read_policy: ReadPolicy::new(
+                &[temp.path().to_path_buf(), fixture_root.clone()],
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let expected_dcu_uri = super::discover_compiled_units(
+            &context,
+            &["Lint4dFixture.Classes".to_string()],
+            &AtomicBool::new(false),
+        )
+        .expect("selected-project DCU discovery")
+        .into_iter()
+        .next()
+        .expect("fixture DCU discovered")
+        .document
+        .uri()
+        .clone();
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(temp.path().to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context,
+                ..ContextState::default()
+            },
+        );
+        workspace
+            .index
+            .update(source_uri.clone(), source.to_string())
+            .expect("index selected project source");
+        workspace
+            .document_contexts
+            .insert(source_uri.clone(), key.clone());
+        let imports = workspace.index.imports(&source_uri);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].name, "lint4dfixture.classes");
+        workspace
+            .load_imports_with_cancel(
+                &source_uri,
+                &key,
+                &mut HashSet::new(),
+                Some(&AtomicBool::new(false)),
+            )
+            .expect("resolve importer dependencies");
+        assert!(
+            workspace
+                .index
+                .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
+                .is_some(),
+            "selected project should bind the discovered compiled unit"
+        );
+
+        let target = Position::new(0, source.find("TSimpleClass").expect("type use") as u32 + 1);
+        let locations = workspace
+            .resolve_navigation_once_with_cancel(
+                &source_uri,
+                target,
+                NavigationTarget::Definition,
+                &key,
+                &mut HashSet::from([source_uri.clone()]),
+                Some(&AtomicBool::new(false)),
+            )
+            .expect("resolve selected project's import");
+        assert_eq!(
+            workspace.index.unit_name(&expected_dcu_uri).as_deref(),
+            Some("lint4dfixture.classes")
+        );
+        assert!(
+            workspace
+                .index
+                .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
+                .is_some(),
+            "selected project should retain the DCU import binding"
+        );
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri.scheme(), "lint4d-dcu");
+        assert!(workspace.index.contains(&locations[0].uri));
+    }
+
+    #[test]
+    fn selected_project_pascal_source_precedes_same_named_dcu() {
+        let temp = tempfile::tempdir().expect("temporary project root");
+        let source_dir = temp.path().join("source");
+        let dcu_dir = temp.path().join("dcu");
+        fs::create_dir_all(&source_dir).expect("source directory");
+        fs::create_dir_all(&dcu_dir).expect("DCU directory");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+        fs::copy(fixture, dcu_dir.join("Lint4dFixture.Classes.dcu")).expect("copy fixture DCU");
+        let provider_path = source_dir.join("Lint4dFixture.Classes.pas");
+        fs::write(
+            &provider_path,
+            "unit Lint4dFixture.Classes; interface type TSourceOnly = class end; implementation end.",
+        )
+        .expect("write source provider");
+        let importer_path = temp.path().join("Consumer.pas");
+        let importer_text = "unit Consumer; interface uses Lint4dFixture.Classes; type TAlias = TSourceOnly; implementation end.";
+        fs::write(&importer_path, importer_text).expect("write importer");
+        let importer_uri = Url::from_file_path(&importer_path).expect("importer URI");
+        let provider_uri = Url::from_file_path(&provider_path).expect("provider URI");
+
+        let search_paths = [&source_dir, &dcu_dir]
+            .into_iter()
+            .map(|path| path.to_path_buf())
+            .collect::<Vec<_>>();
+        let search_path_entries = search_paths
+            .iter()
+            .cloned()
+            .map(ProjectPathEntry::legacy)
+            .collect();
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths,
+            search_path_entries,
+            read_policy: ReadPolicy::new(
+                &[
+                    temp.path().to_path_buf(),
+                    source_dir.clone(),
+                    dcu_dir.clone(),
+                ],
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let key = ContextKey {
+            project_file: None,
+            workspace_root: Some(temp.path().to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context: context.clone(),
+                ..ContextState::default()
+            },
+        );
+        workspace
+            .index
+            .update(importer_uri.clone(), importer_text.to_string())
+            .expect("index importer");
+        workspace
+            .document_contexts
+            .insert(importer_uri.clone(), key.clone());
+        workspace
+            .load_imports_with_cancel(
+                &importer_uri,
+                &key,
+                &mut HashSet::new(),
+                Some(&AtomicBool::new(false)),
+            )
+            .expect("resolve source import first");
+        assert_eq!(
+            workspace
+                .index
+                .import_provider_uri(&importer_uri, "Lint4dFixture.Classes"),
+            Some(&provider_uri)
+        );
+        assert!(
+            super::discover_compiled_units(
+                &context,
+                &["Lint4dFixture.Classes".to_string()],
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

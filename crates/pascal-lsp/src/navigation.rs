@@ -20,6 +20,7 @@ use tree_sitter::{Node, Tree};
 
 mod assistance;
 mod call_hierarchy;
+pub mod compiled_dcu;
 mod documentation;
 mod folding;
 mod inlay;
@@ -423,6 +424,8 @@ pub struct NavigationIndex {
     units: HashMap<String, Vec<Url>>,
     auto_import_discovery_complete: Option<bool>,
     auto_import_unit_providers: HashMap<String, Vec<Url>>,
+    compiled_unit_uris: HashSet<Url>,
+    compiled_unit_bytes: usize,
 }
 
 /// A byte span in a parsed Pascal source document.
@@ -728,6 +731,73 @@ impl NavigationIndex {
         self.update_with_defines(uri, source, &[])
     }
 
+    pub(crate) fn update_compiled_unit_document(
+        &mut self,
+        document: &compiled_dcu::CompiledUnitDocument,
+    ) -> Result<(), String> {
+        let uri = document.uri().clone();
+        if compiled_dcu::virtual_unit_identity(&uri).is_none() {
+            return Err("compiled-unit URI is not canonical".to_string());
+        }
+        let size = document.text().len();
+        if size > compiled_dcu::CompiledUnitDocument::MAX_TEXT_BYTES {
+            return Err("compiled-unit virtual text exceeds its byte limit".to_string());
+        }
+        let existing_size = self
+            .documents
+            .get(&uri)
+            .map_or(0, |existing| existing.source.len());
+        let document_count =
+            self.compiled_unit_uris.len() + usize::from(!self.compiled_unit_uris.contains(&uri));
+        let retained_bytes = self
+            .compiled_unit_bytes
+            .saturating_sub(existing_size)
+            .saturating_add(size);
+        if document_count > 128 || retained_bytes > 4 * 1024 * 1024 {
+            return Err("compiled-unit virtual index limit exceeded".to_string());
+        }
+        self.update(uri.clone(), document.text().to_owned())?;
+        self.compiled_unit_uris.insert(uri);
+        self.compiled_unit_bytes = retained_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn is_bound_compiled_unit_provider(
+        &self,
+        uri: &Url,
+        importers: &HashSet<Url>,
+    ) -> bool {
+        self.compiled_unit_uris.contains(uri)
+            && importers.iter().any(|importer| {
+                self.documents
+                    .get(importer)
+                    .and_then(|document| document.import_bindings.as_ref())
+                    .is_some_and(|bindings| bindings.values().any(|provider| provider == uri))
+            })
+    }
+
+    /// Snapshot the bounded authorization facts that let a selected-context
+    /// navigation result authorize a later virtual-document read. The source
+    /// hash is checked again by the owning workspace before serving content.
+    pub(crate) fn compiled_unit_provider_bindings(&self) -> Vec<(Url, Url, u64)> {
+        let mut bindings = Vec::new();
+        for (importer, document) in &self.documents {
+            let Some(imports) = &document.import_bindings else {
+                continue;
+            };
+            let source_hash = pascal_project::content_hash_bytes(document.source.as_bytes());
+            for provider in imports.values() {
+                if self.compiled_unit_uris.contains(provider) {
+                    bindings.push((importer.clone(), provider.clone(), source_hash));
+                    if bindings.len() >= 4096 {
+                        return bindings;
+                    }
+                }
+            }
+        }
+        bindings
+    }
+
     /// Parse and replace one document using the selected project's positive
     /// conditional-compilation facts.
     pub(crate) fn update_with_defines(
@@ -866,6 +936,8 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?,
+            compiled_unit_uris: self.compiled_unit_uris.clone(),
+            compiled_unit_bytes: self.compiled_unit_bytes,
         };
         for (document_uri, document) in documents {
             check_navigation_cancel(cancel)?;
@@ -931,6 +1003,13 @@ impl NavigationIndex {
 
     /// Remove a document and all symbols contributed by it.
     pub fn remove(&mut self, uri: &Url) {
+        if self.compiled_unit_uris.remove(uri) {
+            if let Some(document) = self.documents.get(uri) {
+                self.compiled_unit_bytes = self
+                    .compiled_unit_bytes
+                    .saturating_sub(document.source.len());
+            }
+        }
         if let Some(document) = self.documents.remove(uri) {
             self.remove_uri_from_unit(&document.unit_name, uri);
         }

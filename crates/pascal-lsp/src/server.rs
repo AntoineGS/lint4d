@@ -10330,6 +10330,62 @@ fn handle_request(
         )?;
         return Ok(());
     }
+    if request.method == "textDocument/content" {
+        let uri = request
+            .params
+            .get("textDocument")
+            .and_then(|document| document.get("uri"))
+            .and_then(Value::as_str)
+            .and_then(|value| Url::parse(value).ok());
+        let Some(uri) = uri else {
+            send_error(
+                connection,
+                request.id,
+                ErrorCode::InvalidParams,
+                "textDocument/content requires a valid textDocument URI",
+            )?;
+            return Ok(());
+        };
+        match workspace.compiled_virtual_document_content(&uri) {
+            Ok(Some(text)) => connection.send_result(Message::Response(Response::new_ok(
+                request.id,
+                serde_json::json!({ "text": text }),
+            )))?,
+            Ok(None) => send_error(
+                connection,
+                request.id,
+                ErrorCode::RequestFailed,
+                "compiled virtual document is not current or authorized",
+            )?,
+            Err(error) => send_error(connection, request.id, ErrorCode::RequestFailed, error)?,
+        }
+        return Ok(());
+    }
+    let edit_request = matches!(
+        request.method.as_str(),
+        "textDocument/rename"
+            | "textDocument/codeAction"
+            | "textDocument/formatting"
+            | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
+            | "textDocument/willSaveWaitUntil"
+    );
+    let compiled_uri_target = request
+        .params
+        .get("textDocument")
+        .and_then(|document| document.get("uri"))
+        .and_then(Value::as_str)
+        .and_then(|value| Url::parse(value).ok())
+        .is_some_and(|uri| uri.scheme() == "lint4d-dcu");
+    if edit_request && compiled_uri_target {
+        send_error(
+            connection,
+            request.id,
+            ErrorCode::RequestFailed,
+            "compiled virtual documents are read-only",
+        )?;
+        return Ok(());
+    }
     let work_done_token = match request_work_done_token(&request) {
         Ok(token) => token,
         Err(error) => {
@@ -12631,7 +12687,15 @@ fn server_capabilities(
             "workDoneProgress": true
         },
         "experimental": {
-            "projectSelection": true
+            "projectSelection": true,
+            "compiledDcuVirtualDocuments": {
+                "uriScheme": "lint4d-dcu",
+                "contentMethod": "textDocument/content",
+                "readOnly": true,
+                "version": "D13",
+                "platform": "Win64",
+                "typesOnly": true
+            }
         }
     });
     if supports_workspace_folders(client) {
@@ -12937,7 +13001,7 @@ mod tests {
         MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, OutputError,
         PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload,
         PendingAnalysis, PriorityQueue, ProtocolSender, TestBarrierConfig, deliver_analysis_result,
-        event_loop_receive_timeout, invalidate_analysis_result,
+        event_loop_receive_timeout, handle_request, invalidate_analysis_result,
         pump_pending_diagnostic_publications, supports_diagnostic_refresh,
         supports_workspace_diagnostic_reports,
     };
@@ -12945,7 +13009,7 @@ mod tests {
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
     use crate::workspace::{Workspace, WorkspaceOptions};
     use crossbeam_channel::{RecvTimeoutError, bounded};
-    use lsp_server::{Connection, Message, Notification, RequestId, Response};
+    use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
     use lsp_types::{
         ClientCapabilities, CompletionItem, CompletionList, Diagnostic, DiagnosticSeverity,
         Location, MarkupKind, Position, PrepareRenameResponse, Range, SymbolInformation,
@@ -14657,6 +14721,44 @@ mod tests {
     }
 
     #[test]
+    fn compiled_virtual_document_edit_requests_are_rejected_by_protocol() {
+        let sender = BackpressureOnceSender {
+            should_block: AtomicBool::new(false),
+            accepted: Mutex::new(Vec::new()),
+        };
+        let mut workspace = test_workspace(Vec::new(), WorkspaceOptions::default());
+        let mut jobs = AnalysisJobs::new();
+        let uri = "lint4d-dcu://d13-win64/0000000000000000/0000000000000000/unit.pas";
+        let request = Request::new(
+            RequestId::from(1),
+            "textDocument/rename".to_string(),
+            serde_json::json!({
+                "textDocument": {"uri": uri},
+                "position": {"line": 0, "character": 1},
+                "newName": "Renamed"
+            }),
+        );
+        handle_request(
+            &sender,
+            &mut workspace,
+            request,
+            symbol_client_features(),
+            false,
+            false,
+            &mut jobs,
+        )
+        .expect("return the read-only protocol error");
+
+        let accepted = sender.accepted.lock().expect("sender messages");
+        let Some(Message::Response(response)) = accepted.first() else {
+            panic!("expected an LSP response");
+        };
+        let error = response.error.as_ref().expect("read-only request error");
+        assert_eq!(error.code, -32803);
+        assert!(error.message.contains("read-only"));
+    }
+
+    #[test]
     fn documentation_formats_are_negotiated_independently() {
         let capabilities: ClientCapabilities = serde_json::from_value(serde_json::json!({
             "textDocument": {
@@ -14685,6 +14787,13 @@ mod tests {
     #[test]
     fn server_advertises_workspace_file_operations() {
         let capabilities = super::server_capabilities(&ClientCapabilities::default(), false);
+        let compiled = &capabilities["experimental"]["compiledDcuVirtualDocuments"];
+        assert_eq!(compiled["uriScheme"], "lint4d-dcu");
+        assert_eq!(compiled["contentMethod"], "textDocument/content");
+        assert_eq!(compiled["readOnly"], true);
+        assert_eq!(compiled["version"], "D13");
+        assert_eq!(compiled["platform"], "Win64");
+        assert_eq!(compiled["typesOnly"], true);
         let file_operations = &capabilities["workspace"]["fileOperations"];
         for operation in [
             "willCreate",

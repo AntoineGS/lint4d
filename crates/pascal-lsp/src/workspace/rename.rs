@@ -2038,7 +2038,7 @@ fn unsupported_source_encoding(bytes: &[u8]) -> Option<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn path_record_at(
+pub(super) fn path_record_at(
     path: PathBuf,
     stamp: Option<PathStamp>,
     content_hash: Option<u64>,

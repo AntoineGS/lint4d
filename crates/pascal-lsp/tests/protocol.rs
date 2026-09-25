@@ -2445,6 +2445,159 @@ fn diagnostics_suppress_unqualified_global_absence_without_a_system_catalogue() 
 }
 
 #[test]
+fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let root = temp.path();
+    let lib = root.join("lib");
+    fs::create_dir_all(&lib).expect("library directory");
+    let dcu = lib.join("Lint4dFixture.Classes.dcu");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+    fs::copy(&fixture, &dcu).expect("real D13 Win64 fixture");
+    let main = root.join("Consumer.pas");
+    let source = "unit Consumer;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let id = RequestId::from("compiled-unit-definition".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)}, "position": {"line": 3, "character": 16}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "definition failed: {response:?}");
+    let locations = response.result.expect("definition locations");
+    let locations = locations.as_array().expect("locations");
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one proven compiled type: {locations:?}"
+    );
+    let virtual_uri = locations[0]["uri"].as_str().expect("virtual target URI");
+    assert!(
+        virtual_uri.starts_with("lint4d-dcu://d13-win64/"),
+        "{virtual_uri}"
+    );
+    let content_id = RequestId::from("compiled-unit-content".to_string());
+    server.send_request(
+        content_id.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    let content = server.response(&content_id);
+    assert!(
+        content.error.is_none(),
+        "virtual content failed: {content:?}"
+    );
+    let text = content.result.expect("virtual content")["text"]
+        .as_str()
+        .expect("text")
+        .to_owned();
+    assert!(text.contains("TSimpleClass = class end;"), "{text}");
+    assert!(
+        !text.contains("Create;"),
+        "unproven members must be omitted: {text}"
+    );
+
+    let mut forged = Url::parse(virtual_uri).expect("canonical virtual URI");
+    let mut segments = forged
+        .path_segments()
+        .expect("virtual URI path segments")
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(segments.len(), 3);
+    let replacement = if segments[1].starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    segments[1].replace_range(0..1, replacement);
+    forged.set_path(&segments.join("/"));
+    let forged_id = RequestId::from("forged-compiled-unit-content".to_string());
+    server.send_request(
+        forged_id.clone(),
+        "textDocument/content",
+        json!({
+            "textDocument": {"uri": forged.as_str()}
+        }),
+    );
+    assert!(
+        server.response(&forged_id).error.is_some(),
+        "forged provider must not be authorized"
+    );
+
+    let original_dcu = fs::read(&dcu).expect("compiled fixture bytes");
+    let original_metadata = fs::metadata(&dcu).expect("compiled fixture metadata");
+    let mut replacement = original_dcu.clone();
+    let last = replacement.last_mut().expect("nonempty DCU fixture");
+    *last ^= 1;
+    fs::write(&dcu, &replacement).expect("same-length DCU replacement");
+    restore_mtime(&dcu, &original_metadata);
+    let stale_dcu_id = RequestId::from("stale-compiled-unit-content".to_string());
+    server.send_request(
+        stale_dcu_id.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    assert!(
+        server.response(&stale_dcu_id).error.is_some(),
+        "a same-size DCU rewrite with restored mtime must invalidate virtual content"
+    );
+    fs::write(&dcu, &original_dcu).expect("restore compiled fixture");
+
+    fs::write(&main, "unit Consumer;\ninterface\nimplementation\nend.\n")
+        .expect("change importer on disk after navigation");
+    let stale_id = RequestId::from("stale-importer-content".to_string());
+    server.send_request(
+        stale_id.clone(),
+        "textDocument/content",
+        json!({
+            "textDocument": {"uri": virtual_uri}
+        }),
+    );
+    assert!(
+        server.response(&stale_id).error.is_some(),
+        "stale importer binding must not authorize content"
+    );
+    fs::write(&main, source).expect("restore importer after stale-source test");
+
+    fs::write(
+        root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>elsewhere</DCC_UnitSearchPath></PropertyGroup></Project>",
+    )
+    .expect("change selected project after navigation");
+    let stale_project_id = RequestId::from("stale-project-content".to_string());
+    server.send_request(
+        stale_project_id.clone(),
+        "textDocument/content",
+        json!({
+            "textDocument": {"uri": virtual_uri}
+        }),
+    );
+    assert!(
+        server.response(&stale_project_id).error.is_some(),
+        "stale selected project must not authorize content"
+    );
+
+    let edit_id = RequestId::from("compiled-unit-readonly".to_string());
+    server.send_request(edit_id.clone(), "textDocument/rename", json!({
+        "textDocument": {"uri": virtual_uri}, "position": {"line": 4, "character": 3}, "newName": "Unsafe"
+    }));
+    assert!(
+        server.response(&edit_id).error.is_some(),
+        "compiled virtual text is read-only"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn call_hierarchy_prepare_returns_only_bound_routine_items() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let source_path = temp.path().join("CallHierarchy.pas");

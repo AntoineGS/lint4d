@@ -699,14 +699,36 @@ init_options = {
 ```
 
 `sourcePaths` adds to the workspace root; relative paths resolve against each
-workspace folder. Libraries must be available as source files on Linux for
-source navigation. `projectFile`, `buildConfig`, and `platform` select the
+workspace folder. Source libraries provide full navigation; the limited DCU
+provider described below can navigate selected compiled type names. `projectFile`, `buildConfig`, and `platform` select the
 project metadata context used for navigation. The server reads `.dproj`,
 `.dpr`/`.dpk`, imported `.optset` files, `DCC_UnitSearchPath`, `DCCReference`,
 `DCC_UsePackage`, `DCC_Namespace`, `DCC_UnitAlias`, and explicit unit paths in a
 project main source. It does not launch a compiler, read the Windows registry,
-execute Delphi/MSBuild targets, or resolve compiled-only DCUs. Only use library
-sources you are entitled to access.
+execute Delphi/MSBuild targets, or decode arbitrary compiled-library members.
+
+### Compiled-library type views
+
+When a selected project imports a unit with no resolvable Pascal source, the
+server checks authorized unit search paths for a unique matching DCU. The
+current provider accepts only **Delphi 13 Win64** DCUs with a valid unit header
+and unambiguous class type declarations. It produces read-only `lint4d-dcu:`
+declaration views containing type shells (`TName = class end;`), omitting
+methods, fields, signatures, generics and other symbols whose visibility or
+identity the DCU parser cannot prove. Source files always take priority over
+DCUs. Navigation, completion and hover can use a proven compiled type; the
+virtual view is served via `textDocument/content` and never accepted as an edit
+target. A URI is valid only for its selected project, bound source importer and
+unchanged DCU bytes; stale or forged URIs are refused.
+
+Discovery is bounded to 128 imported names, 128 search directories, 4,096
+entries per directory and 16,384 total entries, 16 MiB per DCU, 32 MiB total
+DCU bytes, 4 MiB generated text across units, and 1 MiB per generated view.
+The two-second elapsed-work check runs between filesystem operations and cannot
+interrupt a blocked system call. Malformed or unsupported DCUs, duplicate
+candidates, unauthorized paths, symlinks and uncertain type names yield no
+authoritative compiled result. Full compiler-grade DCU resolution is not
+provided.
 
 ### Delphi path overrides (LSP only)
 

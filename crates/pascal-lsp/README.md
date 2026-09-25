@@ -1207,23 +1207,25 @@ are based on the declaration rather than display name alone.
 
 Edges are limited to explicit, uniquely resolved direct superclass links and
 interface-to-interface inheritance links that the existing type-ancestry
-resolver can prove. The resolver's URI-qualified symbol identity is used in
-both directions, so homonyms in unrelated units are not joined by spelling.
-Cross-unit edges are included only when both declarations belong to the
-selected project snapshot. Implicit compiler ancestors such as `TObject`,
-implemented interfaces on classes, aliases, generic specializations, ambiguous
-or missing parent references, conditional-unknown declarations, and parser
-recovery regions are not synthesized as edges. If ancestry resolution for a
-prepared type is incomplete, its supertypes request returns no result rather
-than a partial list; unproven subtype candidates are omitted.
+resolver can prove. Direct edges are bound independently of transitive
+ancestry: an unresolved grandparent suppresses that grandparent's own edge, but
+does not hide a separately proven immediate parent. The resolver's URI-qualified
+symbol identity is used in both directions, so homonyms in unrelated units are
+not joined by spelling. Cross-unit edges are included only when both
+declarations belong to the selected project snapshot. Implicit compiler
+ancestors such as `TObject`, implemented interfaces on classes, aliases, generic
+specializations, ambiguous or missing direct parent references,
+conditional-unknown parent references/declarations, and parser-recovery regions
+are not synthesized as edges. An uncertain direct parent prevents the complete
+direct-parent result; unproven subtype candidates are omitted.
 
 Traversal reuses the navigation resolver's 100,000-work/8 MiB budget, examines
-at most 4,096 candidates, returns at most 2,048 items, and reserves a 2 MiB
-result-construction budget. Cancellation, work/output exhaustion, forged or
-stale identity, and changed source/project read sets fail closed without
-publishing partial results. This deliberately conservative subset is not a
-complete model of Delphi inheritance, generic specialization, visibility, or
-conditional compilation.
+at most 4,096 subtype candidates and 256 ancestry entries per request, returns
+at most 2,048 items, and reserves a 2 MiB result-construction budget.
+Cancellation, work/output exhaustion, forged or stale identity, and changed
+source/project read sets fail closed without publishing partial results. This
+deliberately conservative subset is not a complete model of Delphi inheritance,
+generic specialization, visibility, or conditional compilation.
 
 ### Document outlines
 

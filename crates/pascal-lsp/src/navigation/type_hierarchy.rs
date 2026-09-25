@@ -68,7 +68,7 @@ pub(super) fn supertypes(
     }
     let mut budget = hierarchy_budget();
     let mut state = AncestryResolutionState::new();
-    let ancestry = index.resolve_type_ancestry_with_budget(
+    let ancestry = index.resolve_direct_type_ancestry_with_budget(
         &uri,
         &canonical(&symbol.name),
         &mut state,
@@ -158,7 +158,7 @@ pub(super) fn subtypes(
             if has_generic_ancestry(index, uri, symbol) {
                 continue;
             }
-            let ancestry = index.resolve_type_ancestry_with_budget(
+            let ancestry = index.resolve_direct_type_ancestry_with_budget(
                 uri,
                 &canonical(&symbol.name),
                 &mut state,

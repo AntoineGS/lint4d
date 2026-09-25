@@ -2809,6 +2809,125 @@ fn type_hierarchy_resolves_local_and_cross_unit_parent_child_edges() {
 }
 
 #[test]
+fn type_hierarchy_keeps_proven_direct_edges_when_grandparent_is_unresolved() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let provider_source = "unit Provider; interface type TBase = class(TMissing) end; TLocalChild = class(TBase) end; implementation end.";
+    let consumer_source = "unit Consumer; interface uses Provider; type TCrossChild = class(TBase) end; implementation end.";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+
+    let prepare =
+        |server: &mut TestServer, id: &str, path: &std::path::Path, source: &str, name: &str| {
+            let request = RequestId::from(id.to_string());
+            server.send_request(
+                request.clone(),
+                "textDocument/prepareTypeHierarchy",
+                json!({
+                    "textDocument": {"uri": uri(path)}, "position": position_of(source, name, 0)
+                }),
+            );
+            let response = server.response(&request);
+            assert!(response.error.is_none(), "prepare failed: {response:?}");
+            response.result.expect("prepared item")[0].clone()
+        };
+    let base = prepare(
+        &mut server,
+        "incomplete-base",
+        &provider,
+        provider_source,
+        "TBase",
+    );
+    let local = prepare(
+        &mut server,
+        "incomplete-local-child",
+        &provider,
+        provider_source,
+        "TLocalChild",
+    );
+    let cross = prepare(
+        &mut server,
+        "incomplete-cross-child",
+        &consumer,
+        consumer_source,
+        "TCrossChild",
+    );
+
+    for (id, child) in [
+        ("incomplete-local-parent", local.clone()),
+        ("incomplete-cross-parent", cross),
+    ] {
+        let request = RequestId::from(id.to_string());
+        server.send_request(
+            request.clone(),
+            "typeHierarchy/supertypes",
+            json!({"item": child}),
+        );
+        let response = server.response(&request);
+        let parents = response.result.expect("proven direct parent");
+        assert_eq!(parents[0]["name"], "TBase");
+        assert_eq!(parents[0]["uri"], uri(&provider).to_string());
+    }
+
+    let request = RequestId::from("incomplete-grandparent-subtypes".to_string());
+    server.send_request(
+        request.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": base}),
+    );
+    let response = server.response(&request);
+    let result = response.result.expect("proven direct children");
+    let children = result.as_array().expect("child item array");
+    assert!(children.iter().any(|item| {
+        item["uri"] == uri(&provider).to_string() && item["name"] == "TLocalChild"
+    }));
+    assert!(children.iter().any(|item| {
+        item["uri"] == uri(&consumer).to_string() && item["name"] == "TCrossChild"
+    }));
+    server.shutdown();
+}
+
+#[test]
+fn type_hierarchy_refuses_conditionally_unknown_direct_parent_reference() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("ConditionalParent.pas");
+    let source = "unit ConditionalParent;\ninterface\ntype\n{$IF UNKNOWN_PARENT}\n  TBase = class end;\n{$ENDIF}\n  TChild = class(TBase) end;\nimplementation\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare = RequestId::from("conditional-parent-prepare".to_string());
+    server.send_request(
+        prepare.clone(),
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "TChild", 0)
+        }),
+    );
+    let response = server.response(&prepare);
+    assert!(response.error.is_none(), "prepare failed: {response:?}");
+    let result = response.result.expect("child item response");
+    assert!(!result.is_null(), "prepare returned null");
+    let item = result[0].clone();
+    let query = RequestId::from("conditional-parent-supertypes".to_string());
+    server.send_request(
+        query.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": item}),
+    );
+    let response = server.response(&query);
+    assert!(
+        response.error.is_some()
+            || response.result.is_none()
+            || response.result.as_ref().is_some_and(Value::is_null),
+        "conditional parent uncertainty must fail closed: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn type_hierarchy_candidate_cap_refuses_partial_subtypes() {
     let root = tempfile::tempdir().expect("workspace");
     let path = root.path().join("ManyTypes.pas");

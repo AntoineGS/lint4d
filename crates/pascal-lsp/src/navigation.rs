@@ -12760,7 +12760,7 @@ impl NavigationIndex {
                     | (TypeKind::Interface, ParentRelation::InterfaceParent)
             )
         }) {
-            if parent.path.is_empty() {
+            if parent.path.is_empty() || document.conditionals.is_unknown_at(parent.span.start) {
                 return unknown_ancestry();
             }
             let candidates = dedup_candidates(self.type_parent_candidates(
@@ -12861,6 +12861,50 @@ impl NavigationIndex {
                 })
                 .collect(),
         )
+    }
+
+    fn resolve_direct_type_ancestry_with_budget(
+        &self,
+        type_uri: &Url,
+        type_key: &str,
+        state: &mut AncestryResolutionState,
+        cancel: &AtomicBool,
+        budget: &mut AssistanceBudget,
+    ) -> Result<TypeAncestryResolution, String> {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        budget.require_bytes(
+            type_uri.as_str().len().saturating_add(type_key.len()),
+            cancel,
+        )?;
+        budget.require_owned_bytes(
+            std::mem::size_of::<(Url, String)>()
+                .saturating_add(type_uri.as_str().len())
+                .saturating_add(type_key.len()),
+            cancel,
+        )?;
+        let Some(document) = self.documents.get(type_uri) else {
+            return Ok(unknown_ancestry());
+        };
+        let Some(entries) = document.type_ancestry.get(type_key) else {
+            return Ok(unknown_ancestry());
+        };
+        if !state.take_work() {
+            return Err("type hierarchy ancestry work limit exceeded".into());
+        }
+        if entries.len() != 1 {
+            return Ok(unknown_ancestry());
+        }
+        let result = self.resolve_type_ancestry_entry_with_budget(
+            type_uri,
+            type_key,
+            &entries[0],
+            document,
+            cancel,
+            budget,
+        )?;
+        budget.require_owned_bytes(ancestry_resolution_owned_bytes(&result), cancel)?;
+        Ok(result)
     }
 
     fn resolve_type_ancestry_with_budget(
@@ -13011,7 +13055,7 @@ impl NavigationIndex {
         }) {
             check_navigation_cancel(cancel)?;
             budget.require_work(1, cancel)?;
-            if parent.path.is_empty() {
+            if parent.path.is_empty() || document.conditionals.is_unknown_at(parent.span.start) {
                 return Ok(unknown_ancestry());
             }
             let candidates = dedup_candidates(self.type_parent_candidates_with_budget(
@@ -14493,6 +14537,7 @@ struct ParentType {
     path: Vec<String>,
     type_ref: Option<TypeRef>,
     relation: ParentRelation,
+    span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17816,6 +17861,7 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                     path,
                     type_ref,
                     relation,
+                    span,
                 });
             }
         }

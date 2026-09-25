@@ -110,6 +110,25 @@ pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     let (version, platform) = parse_magic(data)?;
     let mut reader = DcuReader::new(data, version);
 
+    parse_unit_header_with_reader(version, platform, &mut reader)
+}
+
+pub(crate) fn parse_unit_header_for_provider(
+    data: &[u8],
+    max_records: usize,
+    max_decoded_bytes: usize,
+) -> Result<(UnitHeader, DcuReader<'_>), DcuError> {
+    let (version, platform) = parse_magic(data)?;
+    let mut reader = DcuReader::new_for_provider(data, version, max_records, max_decoded_bytes);
+    let header = parse_unit_header_with_reader(version, platform, &mut reader)?;
+    Ok((header, reader))
+}
+
+fn parse_unit_header_with_reader(
+    version: DcuVersion,
+    platform: DcuPlatform,
+    reader: &mut DcuReader<'_>,
+) -> Result<UnitHeader, DcuError> {
     // Skip magic (4 bytes already parsed by parse_magic).
     reader.skip(4)?;
 
@@ -120,6 +139,7 @@ pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     reader.skip(10)?;
 
     // Read namespace prefix (D2005+; always present for D2010+).
+    reader.charge_decoded_record()?;
     let _namespace = reader.read_name()?;
 
     // D2009+ intermediate fields (always present for D2010+).
@@ -141,6 +161,7 @@ pub fn parse_unit_header(data: &[u8]) -> Result<UnitHeader, DcuError> {
     }
 
     // Read the source filename (e.g. "Lint4dFixture.Classes.pas").
+    reader.charge_decoded_record()?;
     let source_file = reader.read_name()?;
 
     // Derive the unit name: strip directory prefix (D2010 stores full relative

@@ -47,31 +47,48 @@ pub(crate) fn read_namef_fields(
 ///   TNameFDecl: F, F1, F4, [Inf], [B2]
 ///   hDef (ReadUIndex)
 pub(crate) fn read_type_decl(reader: &mut DcuReader) -> Result<Option<TypeInfo>, DcuError> {
+    read_type_decl_with_handle(reader).map(|decoded| decoded.map(|(ty, _)| ty))
+}
+
+pub(crate) fn read_type_decl_with_handle(
+    reader: &mut DcuReader,
+) -> Result<Option<(TypeInfo, u32)>, DcuError> {
+    reader.charge_decoded_record()?;
     let name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
-    let _h_def = reader.read_uindex()?;
+    let h_def = reader.read_uindex()?;
 
     if name.starts_with('.') || name.starts_with(':') || name.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(TypeInfo {
-        name,
-        kind: TypeKind::Other,
-        parent: None,
-        fields: Vec::new(),
-        methods: Vec::new(),
-        interface_guid: None,
-    }))
+    Ok(Some((
+        TypeInfo {
+            name,
+            kind: TypeKind::Other,
+            parent: None,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            interface_guid: None,
+        },
+        h_def,
+    )))
 }
 
 /// Read a drTypeP (VMT pointer type) declaration.
 /// In D13, TTypePDecl has an extra ReadUIndex field after hDef
 /// that is not present in the DCU32 reference code.
 pub(crate) fn read_type_p_decl(reader: &mut DcuReader) -> Result<Option<TypeInfo>, DcuError> {
+    read_type_p_decl_with_handle(reader).map(|decoded| decoded.map(|(ty, _)| ty))
+}
+
+pub(crate) fn read_type_p_decl_with_handle(
+    reader: &mut DcuReader,
+) -> Result<Option<(TypeInfo, u32)>, DcuError> {
+    reader.charge_decoded_record()?;
     let name = reader.read_name()?;
     let _nf = read_namef_fields(reader, false)?;
-    let _h_def = reader.read_uindex()?;
+    let h_def = reader.read_uindex()?;
     // D13 extra field: observed in binary but not documented in DCU32.
     let _extra = reader.read_uindex()?;
 
@@ -79,14 +96,17 @@ pub(crate) fn read_type_p_decl(reader: &mut DcuReader) -> Result<Option<TypeInfo
         return Ok(None);
     }
 
-    Ok(Some(TypeInfo {
-        name,
-        kind: TypeKind::Other,
-        parent: None,
-        fields: Vec::new(),
-        methods: Vec::new(),
-        interface_guid: None,
-    }))
+    Ok(Some((
+        TypeInfo {
+            name,
+            kind: TypeKind::Other,
+            parent: None,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            interface_guid: None,
+        },
+        h_def,
+    )))
 }
 
 /// Skip a TLocalDecl record (AR_VAL, AR_VAR, AR_RESULT, AR_FLD, AR_ABS_LOC_VAR, AR_LABEL).
@@ -361,6 +381,7 @@ pub(crate) fn parse_class_def(
             AR_FLD => match read_field_decl(reader) {
                 Ok((name, h_dt)) => {
                     if !name.is_empty() && !name.starts_with('.') {
+                        reader.charge_decoded_record()?;
                         fields.push(FieldInfo {
                             name,
                             type_ref: TypeRef::Unresolved(h_dt),
@@ -373,6 +394,7 @@ pub(crate) fn parse_class_def(
             AR_METHOD | AR_CONSTR | AR_DESTR => match read_method_info(reader, fixed) {
                 Ok((name, kind)) => {
                     if !name.is_empty() {
+                        reader.charge_decoded_record()?;
                         methods.push(MethodInfo {
                             name,
                             kind,

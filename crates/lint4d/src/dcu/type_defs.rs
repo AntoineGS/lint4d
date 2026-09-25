@@ -134,6 +134,16 @@ pub(crate) fn skip_obj_vmt_def(reader: &mut DcuReader) -> Result<(), DcuError> {
     Ok(())
 }
 
+/// Decode the object type handle carried by a D13 object VMT definition.
+/// This handle is the link from a root `drType.hDef` to the following class
+/// definition record; adjacency alone is not sufficient evidence.
+pub(crate) fn read_obj_vmt_handle(reader: &mut DcuReader) -> Result<u32, DcuError> {
+    read_type_def_header(reader)?;
+    let h_obj_dt = reader.read_uindex()?;
+    let _vmt_sz = reader.read_uindex()?;
+    Ok(h_obj_dt)
+}
+
 /// Skip an object definition (DR_OBJ_DEF).
 /// DCU32 reference: TObjDef.Create — inherits from TRecDef.
 pub(crate) fn skip_obj_def(reader: &mut DcuReader) -> Result<(), DcuError> {

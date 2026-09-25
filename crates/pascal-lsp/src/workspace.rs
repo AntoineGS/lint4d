@@ -2081,6 +2081,15 @@ pub(crate) struct ContextState {
 }
 
 impl ContextState {
+    fn retained_payload_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        let _ = self.visit_recovery_payload(&mut |payload_bytes| {
+            bytes = bytes.saturating_add(payload_bytes);
+            Ok(())
+        });
+        bytes
+    }
+
     fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -2165,6 +2174,20 @@ pub(crate) struct CompiledContentSnapshot {
     context: ContextState,
     open_source: Option<String>,
     unit: AuthorizedCompiledUnit,
+}
+
+impl CompiledContentSnapshot {
+    /// Conservative byte estimate for the owned payload retained by a queued
+    /// or running content request. Includes cloned project observations, open
+    /// importer text, generated unit text, and URI strings.
+    pub(crate) fn retained_payload_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.context.retained_payload_bytes())
+            .saturating_add(self.open_source.as_ref().map_or(0, String::len))
+            .saturating_add(self.unit.retained_payload_bytes())
+            .saturating_add(self.uri.as_str().len())
+            .saturating_add(self.importer.as_str().len())
+    }
 }
 
 struct NotificationRecoveryPlan {
@@ -3053,6 +3076,24 @@ impl Workspace {
         }
         let mut compiled_provider_bindings = std::mem::take(&mut self.compiled_provider_bindings);
         compiled_provider_bindings.extend(state.compiled_provider_bindings);
+        // Validate freshness before pair deduplication. Otherwise an older
+        // `(importer, provider)` entry can shadow a fresh binding with the same
+        // pair; the old hash is then rejected and the current authorization is
+        // lost as well.
+        compiled_provider_bindings.retain(|binding| {
+            self.document_contexts
+                .get(&binding.importer)
+                .and_then(|key| self.contexts.get(key))
+                .is_some_and(|state| {
+                    crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
+                        == binding.context_fingerprint
+                        && context_state_is_fresh_with_cancel(state, None, None)
+                            .is_ok_and(|fresh| fresh)
+                })
+                && self
+                    .current_importer_source_hash(&binding.importer)
+                    .is_some_and(|hash| hash == binding.importer_source_hash)
+        });
         compiled_provider_bindings.sort_by(|left, right| {
             left.importer
                 .as_str()
@@ -3064,21 +3105,6 @@ impl Workspace {
         });
         if compiled_provider_bindings.len() > MAX_COMPILED_PROVIDER_BINDINGS {
             compiled_provider_bindings.clear();
-        } else {
-            compiled_provider_bindings.retain(|binding| {
-                self.document_contexts
-                    .get(&binding.importer)
-                    .and_then(|key| self.contexts.get(key))
-                    .is_some_and(|state| {
-                        crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
-                            == binding.context_fingerprint
-                            && context_state_is_fresh_with_cancel(state, None, None)
-                                .is_ok_and(|fresh| fresh)
-                    })
-                    && self
-                        .current_importer_source_hash(&binding.importer)
-                        .is_some_and(|hash| hash == binding.importer_source_hash)
-            });
         }
         self.compiled_provider_bindings = compiled_provider_bindings;
         let retained_compiled_bytes = self

@@ -1,11 +1,12 @@
 use crate::dcu::class_parser::{
-    parse_class_def, read_namef_fields, read_type_decl, read_type_p_decl, skip_local_decl,
-    skip_method_decl, skip_property_decl,
+    parse_class_def, read_namef_fields, read_type_decl, read_type_decl_with_handle,
+    read_type_p_decl, read_type_p_decl_with_handle, skip_local_decl, skip_method_decl,
+    skip_property_decl,
 };
 use crate::dcu::const_add_info::skip_decl_const_add_info;
 use crate::dcu::reader::DcuReader;
 use crate::dcu::tags::*;
-use crate::dcu::type_defs::try_skip_type_def;
+use crate::dcu::type_defs::{read_obj_vmt_handle, try_skip_type_def};
 use crate::dcu::types::fix_tag;
 use crate::dcu::{DcuVersion, MethodInfo, MethodKind, TypeInfo, TypeKind};
 
@@ -32,7 +33,7 @@ pub(crate) fn read_decl_list_into(
     types: &mut Vec<TypeInfo>,
     in_args: bool,
 ) -> Result<(), DcuError> {
-    read_decl_list_inner(reader, tag, types, in_args, false, None)
+    read_decl_list_inner(reader, tag, types, in_args, false, None, None)
 }
 
 /// Walk a unit-root declaration list and retain the parser-proven indices of
@@ -45,7 +46,36 @@ pub(crate) fn read_decl_list_into_with_exports(
     types: &mut Vec<TypeInfo>,
     exported_type_indices: &mut Vec<usize>,
 ) -> Result<(), DcuError> {
-    read_decl_list_inner(reader, tag, types, false, true, Some(exported_type_indices))
+    read_decl_list_inner(
+        reader,
+        tag,
+        types,
+        false,
+        true,
+        Some(exported_type_indices),
+        None,
+    )
+}
+
+/// Strict provider path. Root exports and class-definition evidence are
+/// separate: procedure-name association may enrich the tolerant lint view but
+/// never establishes a compiled class shell.
+pub(crate) fn read_decl_list_into_for_provider(
+    reader: &mut DcuReader,
+    tag: &mut u8,
+    types: &mut Vec<TypeInfo>,
+    exported_type_indices: &mut Vec<usize>,
+    class_definition_type_indices: &mut Vec<usize>,
+) -> Result<(), DcuError> {
+    read_decl_list_inner(
+        reader,
+        tag,
+        types,
+        false,
+        true,
+        Some(exported_type_indices),
+        Some(class_definition_type_indices),
+    )
 }
 
 fn read_decl_list_inner(
@@ -55,19 +85,33 @@ fn read_decl_list_inner(
     in_args: bool,
     unit_root: bool,
     mut exported_type_indices: Option<&mut Vec<usize>>,
+    mut class_definition_type_indices: Option<&mut Vec<usize>>,
 ) -> Result<(), DcuError> {
     let mut last_type_index = None;
+    let mut root_type_handles = Vec::<(u32, usize)>::new();
+    let mut pending_obj_vmt_handle = None;
     loop {
         let fixed = fix_tag(*tag);
+        if reader.is_provider_reader() && fixed != DR_CLASS_DEF && fixed != DR_OBJ_VMT_DEF {
+            pending_obj_vmt_handle = None;
+        }
         match fixed {
             // Type declaration: extract name.
             DR_TYPE => {
                 last_type_index = None;
-                if let Some(ti) = read_type_decl(reader)? {
+                let decoded_type = if reader.is_provider_reader() {
+                    read_type_decl_with_handle(reader)?
+                } else {
+                    read_type_decl(reader)?.map(|ty| (ty, 0))
+                };
+                if let Some((ti, handle)) = decoded_type {
                     let type_index = types.len();
                     types.push(ti);
                     last_type_index = Some(type_index);
                     if unit_root {
+                        if reader.is_provider_reader() {
+                            root_type_handles.push((handle, type_index));
+                        }
                         if let Some(indices) = exported_type_indices.as_deref_mut() {
                             indices.push(type_index);
                         }
@@ -78,11 +122,19 @@ fn read_decl_list_inner(
             // In D13 this has an extra ReadUIndex field after hDef.
             DR_TYPE_P => {
                 last_type_index = None;
-                if let Some(ti) = read_type_p_decl(reader)? {
+                let decoded_type = if reader.is_provider_reader() {
+                    read_type_p_decl_with_handle(reader)?
+                } else {
+                    read_type_p_decl(reader)?.map(|ty| (ty, 0))
+                };
+                if let Some((ti, handle)) = decoded_type {
                     let type_index = types.len();
                     types.push(ti);
                     last_type_index = Some(type_index);
                     if unit_root {
+                        if reader.is_provider_reader() {
+                            root_type_handles.push((handle, type_index));
+                        }
                         if let Some(indices) = exported_type_indices.as_deref_mut() {
                             indices.push(type_index);
                         }
@@ -171,7 +223,9 @@ fn read_decl_list_inner(
                 let save_pos = reader.position();
                 match skip_proc_decl(reader, types) {
                     Ok(proc_name) => {
-                        associate_proc_with_class(&proc_name, types);
+                        if !reader.is_provider_reader() {
+                            associate_proc_with_class(&proc_name, types);
+                        }
                     }
                     Err(_e) => {
                         reader.set_position(save_pos);
@@ -220,15 +274,44 @@ fn read_decl_list_inner(
             }
             // Class definition: parse and associate with the last type declaration.
             DR_CLASS_DEF => {
+                reader.charge_decoded_record()?;
                 let members = parse_class_def(reader)?;
-                // Associate within this declaration scope. Shared vectors may
-                // contain nested routine-local types that are not the current
-                // scope's declaration.
-                if let Some(last_type) = last_type_index.and_then(|index| types.get_mut(index)) {
-                    last_type.kind = TypeKind::Class;
-                    last_type.fields = members.0;
-                    last_type.methods = members.1;
+                if reader.is_provider_reader() {
+                    if let Some(handle) = pending_obj_vmt_handle.take() {
+                        let mut matches = root_type_handles
+                            .iter()
+                            .filter(|(root_handle, _)| *root_handle == handle)
+                            .map(|(_, type_index)| *type_index);
+                        if let (Some(type_index), None) = (matches.next(), matches.next()) {
+                            if let Some(indices) = class_definition_type_indices.as_deref_mut() {
+                                indices.push(type_index);
+                            }
+                        }
+                    }
+                    // Provider shells intentionally discard decoded members:
+                    // member absence is opaque, not semantic proof.
+                } else {
+                    // Associate within this declaration scope. Shared vectors may
+                    // contain nested routine-local types that are not the current
+                    // scope's declaration.
+                    if let Some(type_index) = last_type_index {
+                        if unit_root {
+                            if let Some(indices) = class_definition_type_indices.as_deref_mut() {
+                                indices.push(type_index);
+                            }
+                        }
+                    }
+                    if let Some(last_type) = last_type_index.and_then(|index| types.get_mut(index))
+                    {
+                        last_type.kind = TypeKind::Class;
+                        last_type.fields = members.0;
+                        last_type.methods = members.1;
+                    }
                 }
+            }
+            DR_OBJ_VMT_DEF if reader.is_provider_reader() => {
+                reader.charge_decoded_record()?;
+                pending_obj_vmt_handle = Some(read_obj_vmt_handle(reader)?);
             }
             // Try shared type-def handler for all other type definition tags.
             _ if try_skip_type_def(fixed, reader)? => {}
@@ -249,6 +332,12 @@ fn read_decl_list_inner(
             }
             // Unknown or unhandled tag: stop gracefully.
             _ => {
+                if reader.is_provider_reader() {
+                    return Err(DcuError::UnknownTag {
+                        tag: fixed,
+                        offset: reader.position().saturating_sub(1),
+                    });
+                }
                 break;
             }
         }
@@ -430,12 +519,14 @@ pub(crate) fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo])
 
 #[cfg(test)]
 mod export_scope_tests {
-    use super::read_decl_list_into_with_exports;
+    use super::{read_decl_list_into_for_provider, read_decl_list_into_with_exports};
     use crate::dcu::DcuVersion;
     use crate::dcu::reader::DcuReader;
     use crate::dcu::tags::{
-        DR_CLASS_DEF, DR_EMBEDDED_PROC_END, DR_EMBEDDED_PROC_START, DR_STOP, DR_STOP1, DR_TYPE,
+        DR_CLASS_DEF, DR_EMBEDDED_PROC_END, DR_EMBEDDED_PROC_START, DR_PROC, DR_STOP, DR_STOP1,
+        DR_TYPE,
     };
+    use crate::dcu::{DcuError, TypeInfo};
 
     fn append_type(bytes: &mut Vec<u8>, name: &str) {
         bytes.push(DR_TYPE);
@@ -477,5 +568,71 @@ mod export_scope_tests {
         assert_eq!(types[0].kind, crate::dcu::TypeKind::Class);
         assert_eq!(types[1].kind, crate::dcu::TypeKind::Class);
         assert_eq!(exported, [0], "nested scope is not exported by the unit");
+    }
+
+    fn append_root_class(bytes: &mut Vec<u8>, name: &str) {
+        append_type(bytes, name);
+        append_empty_class_def(bytes);
+    }
+
+    type StrictParseOutput = (Vec<TypeInfo>, Vec<usize>, Vec<usize>);
+
+    fn strict_parse(
+        bytes: &[u8],
+        max_records: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<StrictParseOutput, DcuError> {
+        let mut reader =
+            DcuReader::new_for_provider(bytes, DcuVersion::D13, max_records, max_decoded_bytes);
+        let mut tag = reader.read_byte()?;
+        let mut types = Vec::new();
+        let mut exported = Vec::new();
+        let mut class_defs = Vec::new();
+        read_decl_list_into_for_provider(
+            &mut reader,
+            &mut tag,
+            &mut types,
+            &mut exported,
+            &mut class_defs,
+        )?;
+        Ok((types, exported, class_defs))
+    }
+
+    #[test]
+    fn provider_parse_rejects_eof_or_unknown_tag_after_a_valid_class_prefix() {
+        let mut prefix_then_eof = Vec::new();
+        append_root_class(&mut prefix_then_eof, "TExported");
+        assert!(strict_parse(&prefix_then_eof, 16, 1024).is_err());
+
+        let mut prefix_then_unknown = prefix_then_eof;
+        prefix_then_unknown.push(0xFF);
+        assert!(strict_parse(&prefix_then_unknown, 16, 1024).is_err());
+    }
+
+    #[test]
+    fn provider_class_evidence_requires_dr_class_def_not_dotted_procedure_name() {
+        let mut bytes = Vec::new();
+        append_type(&mut bytes, "TRecord");
+        bytes.push(DR_PROC);
+        bytes.push("TRecord.Method".len() as u8);
+        bytes.extend_from_slice(b"TRecord.Method");
+        bytes.extend_from_slice(&[0; 9]); // flags, size, D13 extra, proc/ref indices
+        bytes.push(DR_STOP1);
+        bytes.push(DR_STOP);
+
+        let (types, exported, class_defs) = strict_parse(&bytes, 16, 1024).unwrap();
+        assert_eq!(exported, [0]);
+        assert!(class_defs.is_empty());
+        assert_eq!(types[0].kind, crate::dcu::TypeKind::Other);
+        assert!(types[0].methods.is_empty());
+    }
+
+    #[test]
+    fn provider_parse_caps_decoded_records_and_name_bytes_during_decode() {
+        let mut bytes = Vec::new();
+        append_root_class(&mut bytes, "TExported");
+        bytes.push(DR_STOP);
+        assert!(strict_parse(&bytes, 0, 1024).is_err());
+        assert!(strict_parse(&bytes, 16, 4).is_err());
     }
 }

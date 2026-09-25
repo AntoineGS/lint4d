@@ -62,6 +62,7 @@ const MAX_ANALYSIS_JOBS: usize = 2;
 /// `WorkspaceInput`. This keeps source snapshot memory bounded by the number
 /// of running workers rather than by the queue length.
 const MAX_ANALYSIS_QUEUE: usize = 32;
+const MAX_COMPILED_CONTENT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 // Keep one queue slot available for diagnostics while client work is busy.
 const MAX_CLIENT_ANALYSIS_QUEUE: usize = MAX_ANALYSIS_QUEUE.saturating_sub(1);
 /// Maximum number of client request recipients retained across running and
@@ -5006,12 +5007,49 @@ struct AnalysisJobs {
     request_to_job: HashMap<RequestId, AnalysisComputationId>,
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
     diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
+    compiled_content_payload_budget: CompiledContentPayloadBudget,
     completion_resolutions: CompletionResolutionStore,
     diagnostic_results: DiagnosticPullStore,
     progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
     shutting_down: bool,
+}
+
+#[derive(Debug)]
+struct CompiledContentPayloadBudget {
+    max_bytes: usize,
+    retained_bytes: usize,
+    reservations: HashMap<AnalysisComputationId, usize>,
+}
+
+impl CompiledContentPayloadBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            retained_bytes: 0,
+            reservations: HashMap::new(),
+        }
+    }
+
+    fn try_reserve(&mut self, id: AnalysisComputationId, bytes: usize) -> Result<(), String> {
+        let next = self.retained_bytes.saturating_add(bytes);
+        if bytes == 0 || next > self.max_bytes {
+            return Err("compiled content retained-payload limit exceeded".to_string());
+        }
+        if self.reservations.contains_key(&id) {
+            return Err("compiled content reservation already exists".to_string());
+        }
+        self.reservations.insert(id, bytes);
+        self.retained_bytes = next;
+        Ok(())
+    }
+
+    fn release(&mut self, id: &AnalysisComputationId) {
+        if let Some(bytes) = self.reservations.remove(id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+        }
+    }
 }
 
 impl AnalysisJobs {
@@ -5037,6 +5075,9 @@ impl AnalysisJobs {
             request_to_job: HashMap::new(),
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
+            compiled_content_payload_budget: CompiledContentPayloadBudget::new(
+                MAX_COMPILED_CONTENT_RETAINED_BYTES,
+            ),
             completion_resolutions: CompletionResolutionStore::new(),
             diagnostic_results: DiagnosticPullStore::new(),
             progress: ProgressTracker::new(server_progress_supported),
@@ -6405,6 +6446,10 @@ impl AnalysisJobs {
         }
 
         let primary_id = self.next_computation_id()?;
+        if let AnalysisRequest::CompiledContent { snapshot } = &request {
+            self.compiled_content_payload_budget
+                .try_reserve(primary_id, snapshot.retained_payload_bytes())?;
+        }
         self.request_to_job.insert(id.clone(), primary_id);
         let recipient = ClientRecipient {
             id,
@@ -6541,6 +6586,7 @@ impl AnalysisJobs {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
         ) {
+            self.compiled_content_payload_budget.release(primary_id);
             self.remove_observation(job.key.as_ref(), primary_id);
             let request_ids = job
                 .recipients
@@ -6645,6 +6691,7 @@ impl AnalysisJobs {
                 if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
                     |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
                 ) {
+                    self.compiled_content_payload_budget.release(&primary_id);
                     self.remove_observation(job.key.as_ref(), &primary_id);
                 }
             }
@@ -6873,6 +6920,7 @@ impl AnalysisJobs {
             while let Some(queued) = self.queue.pop() {
                 match queued {
                     QueuedAnalysis::Client(job) => {
+                        self.compiled_content_payload_budget.release(&job.id);
                         self.remove_observation(job.key.as_ref(), &job.id);
                         for recipient in &job.recipients {
                             self.remove_client_mapping(&recipient.id, &job.id);
@@ -6925,6 +6973,7 @@ impl AnalysisJobs {
                             }
                         }
                         Err(message) => {
+                            self.compiled_content_payload_budget.release(&primary_id);
                             self.remove_observation(job.key.as_ref(), &primary_id);
                             for recipient in &job.recipients {
                                 self.remove_client_mapping(&recipient.id, &primary_id);
@@ -7646,6 +7695,7 @@ impl AnalysisJobs {
                     let Some(job) = self.pending.remove(&primary_id) else {
                         continue;
                     };
+                    self.compiled_content_payload_budget.release(&primary_id);
                     let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
                     let recipients = job.recipients;
                     let key = job.key;
@@ -7746,6 +7796,7 @@ impl AnalysisJobs {
         let mut queued = std::mem::take(&mut self.queue);
         while let Some(job) = queued.pop() {
             if let QueuedAnalysis::Client(job) = job {
+                self.compiled_content_payload_budget.release(&job.id);
                 let request_ids = job
                     .recipients
                     .iter()
@@ -7865,6 +7916,8 @@ impl AnalysisJobs {
             }
             thread::sleep(ANALYSIS_POLL_INTERVAL);
         }
+        self.compiled_content_payload_budget.reservations.clear();
+        self.compiled_content_payload_budget.retained_bytes = 0;
         Ok(())
     }
 }
@@ -13086,21 +13139,21 @@ mod tests {
     use super::{
         ANALYSIS_QUEUE_FULL_MESSAGE, ANALYSIS_SUPERSEDED_MESSAGE, AnalysisComputationId,
         AnalysisJobId, AnalysisJobs, AnalysisPriority, AnalysisProgressTokens, AnalysisRequest,
-        AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures, CompletionAnalysis,
-        CompletionResolutionSeed, CompletionResolutionStore, CompletionResult,
-        ConfigurationCoordinator, DiagnosticPublicationDiscardScan,
-        DiagnosticPublicationTurnBudget, DiagnosticPullStore, DocumentationFormat,
-        FileWatcherRegistration, MAX_ANALYSIS_QUEUE, MAX_CLIENT_ANALYSIS_RECIPIENTS,
-        MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES, MAX_COMPLETION_RESOLUTION_DATA_BYTES,
-        MAX_COMPLETION_RESOLUTION_RECORDS, MAX_CONFIGURATION_WATCH_PATHS,
-        MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
-        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
-        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, OutputError,
-        PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload,
-        PendingAnalysis, PriorityQueue, ProtocolSender, TestBarrierConfig, deliver_analysis_result,
-        event_loop_receive_timeout, handle_request, invalidate_analysis_result,
-        pump_pending_diagnostic_publications, supports_diagnostic_refresh,
-        supports_workspace_diagnostic_reports,
+        AnalysisResult, AnalysisResultValue, BoundedReader, ClientFeatures,
+        CompiledContentPayloadBudget, CompletionAnalysis, CompletionResolutionSeed,
+        CompletionResolutionStore, CompletionResult, ConfigurationCoordinator,
+        DiagnosticPublicationDiscardScan, DiagnosticPublicationTurnBudget, DiagnosticPullStore,
+        DocumentationFormat, FileWatcherRegistration, MAX_ANALYSIS_QUEUE,
+        MAX_CLIENT_ANALYSIS_RECIPIENTS, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
+        MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
+        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
+        MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass,
+        OutboundQueue, OutputError, PartialDelivery, PartialDeliveryRecipient,
+        PartialDeliveryValidation, PartialResultPayload, PendingAnalysis, PriorityQueue,
+        ProtocolSender, TestBarrierConfig, deliver_analysis_result, event_loop_receive_timeout,
+        handle_request, invalidate_analysis_result, pump_pending_diagnostic_publications,
+        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
     };
     use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -15656,6 +15709,31 @@ mod tests {
             !result.records.is_empty(),
             "the computed type-definition result must carry its source read set"
         );
+    }
+
+    #[test]
+    fn compiled_content_payload_budget_caps_repeated_large_snapshots_and_releases_reservations() {
+        let first = AnalysisComputationId(1);
+        let second = AnalysisComputationId(2);
+        let third = AnalysisComputationId(3);
+        let mut budget = CompiledContentPayloadBudget::new(100);
+
+        budget
+            .try_reserve(first, 60)
+            .expect("first payload admitted");
+        assert_eq!(budget.retained_bytes, 60);
+        assert!(budget.try_reserve(second, 50).is_err());
+        assert_eq!(budget.retained_bytes, 60, "rejection retains no bytes");
+
+        budget.release(&first); // completion or cancellation releases admission
+        assert_eq!(budget.retained_bytes, 0);
+        budget
+            .try_reserve(third, 50)
+            .expect("capacity becomes available after release");
+        assert_eq!(budget.retained_bytes, 50);
+        budget.release(&third);
+        assert!(budget.reservations.is_empty());
+        assert_eq!(budget.retained_bytes, 0);
     }
 
     #[test]

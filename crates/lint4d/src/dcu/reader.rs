@@ -5,11 +5,79 @@ pub struct DcuReader<'a> {
     data: &'a [u8],
     pos: usize,
     pub ver: DcuVersion,
+    provider_decode: Option<ProviderDecodeBudget>,
+}
+
+struct ProviderDecodeBudget {
+    max_records: usize,
+    max_decoded_bytes: usize,
+    records: usize,
+    decoded_bytes: usize,
 }
 
 impl<'a> DcuReader<'a> {
     pub fn new(data: &'a [u8], ver: DcuVersion) -> Self {
-        Self { data, pos: 0, ver }
+        Self {
+            data,
+            pos: 0,
+            ver,
+            provider_decode: None,
+        }
+    }
+
+    pub(crate) fn new_for_provider(
+        data: &'a [u8],
+        ver: DcuVersion,
+        max_records: usize,
+        max_decoded_bytes: usize,
+    ) -> Self {
+        Self {
+            data,
+            pos: 0,
+            ver,
+            provider_decode: Some(ProviderDecodeBudget {
+                max_records,
+                max_decoded_bytes,
+                records: 0,
+                decoded_bytes: 0,
+            }),
+        }
+    }
+
+    pub(crate) fn is_provider_reader(&self) -> bool {
+        self.provider_decode.is_some()
+    }
+
+    pub(crate) fn charge_decoded_record(&mut self) -> Result<(), DcuError> {
+        if let Some(budget) = &mut self.provider_decode {
+            let next = budget.records.saturating_add(1);
+            if next > budget.max_records {
+                return Err(DcuError::DecodeLimitExceeded {
+                    resource: "decoded-record",
+                });
+            }
+            budget.records = next;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn provider_decode_usage(&self) -> (usize, usize) {
+        self.provider_decode
+            .as_ref()
+            .map_or((0, 0), |budget| (budget.records, budget.decoded_bytes))
+    }
+
+    fn charge_decoded_bytes(&mut self, bytes: usize) -> Result<(), DcuError> {
+        if let Some(budget) = &mut self.provider_decode {
+            let next = budget.decoded_bytes.saturating_add(bytes);
+            if next > budget.max_decoded_bytes {
+                return Err(DcuError::DecodeLimitExceeded {
+                    resource: "decoded-byte",
+                });
+            }
+            budget.decoded_bytes = next;
+        }
+        Ok(())
     }
 
     pub fn position(&self) -> usize {
@@ -154,6 +222,15 @@ impl<'a> DcuReader<'a> {
             });
         }
         let bytes = &self.data[self.pos..self.pos + len];
+        let decoded_bytes = if self.provider_decode.is_some() {
+            bytes
+                .iter()
+                .map(|byte| if *byte < 0x80 { 1 } else { 2 })
+                .sum()
+        } else {
+            0
+        };
+        self.charge_decoded_bytes(decoded_bytes)?;
         self.pos += len;
         // ANSI bytes — treat as Latin-1 (superset of ASCII)
         let s: String = bytes.iter().map(|&b| b as char).collect();

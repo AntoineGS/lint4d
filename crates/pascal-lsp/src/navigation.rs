@@ -776,6 +776,10 @@ impl NavigationIndex {
             })
     }
 
+    fn compiled_shell_members_are_opaque(&self, uri: &Url) -> bool {
+        self.compiled_unit_uris.contains(uri)
+    }
+
     /// Snapshot the bounded authorization facts that let a selected-context
     /// navigation result authorize a later virtual-document read. The source
     /// hash is checked again by the owning workspace before serving content.
@@ -12508,6 +12512,9 @@ impl NavigationIndex {
                 member_key,
                 allow_implementation,
             );
+            if self.compiled_shell_members_are_opaque(type_uri) {
+                return MemberLookup::unknown(direct);
+            }
             let implicit_root_member_known =
                 self.implicit_root_member_known(type_uri, type_key, member_key);
             let ancestry = if self.type_requires_ancestry(type_uri, type_key) {
@@ -12589,6 +12596,9 @@ impl NavigationIndex {
                 cancel,
                 budget,
             )?;
+            if self.compiled_shell_members_are_opaque(type_uri) {
+                return Ok(MemberLookup::unknown(direct));
+            }
             let implicit_root_member_known =
                 self.implicit_root_member_known(type_uri, type_key, member_key);
             let ancestry = if self.type_requires_ancestry(type_uri, type_key) {

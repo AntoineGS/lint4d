@@ -2455,7 +2455,7 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
         .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
     fs::copy(&fixture, &dcu).expect("real D13 Win64 fixture");
     let main = root.join("Consumer.pas");
-    let source = "unit Consumer;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nend.\n";
+    let source = "unit Consumer;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nprocedure Check(Value: TSimpleClass);\nbegin\n  Value.GetName;\nend;\nend.\n";
     write_file(&main, source);
     write_file(
         &root.join("App.dproj"),
@@ -2463,6 +2463,27 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     );
     let mut server = TestServer::launch();
     server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&main),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let diagnostics = diagnostics_for_uri(&mut server, &uri(&main));
+    let diagnostics = diagnostics["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["message"] == "missing member 'GetName'"),
+        "an omitted real compiled method is opaque, not proven absent: {diagnostics:?}"
+    );
     // Assistance snapshots must discover/index selected-context DCUs on their
     // own; these queries deliberately precede navigation and provider binding.
     let completion_id = RequestId::from("compiled-unit-completion".to_string());
@@ -2684,6 +2705,78 @@ fn compiled_dcu_source_navigation_serves_read_only_virtual_type() {
     assert!(
         server.response(&edit_id).error.is_some(),
         "compiled virtual text is read-only"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn compiled_provider_rebind_after_same_importer_edit_keeps_fresh_binding() {
+    let temp = tempfile::tempdir().expect("isolated workspace");
+    let root = temp.path();
+    let lib = root.join("lib");
+    fs::create_dir_all(&lib).expect("library directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+    fs::copy(&fixture, lib.join("Lint4dFixture.Classes.dcu")).expect("real D13 fixture");
+    let main = root.join("Consumer.pas");
+    let source_a = "unit Consumer;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nend.\n";
+    let source_b = format!("{source_a}// edit of the same importer\n");
+    write_file(&main, source_a);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let definition_id = RequestId::from("initial-compiled-provider-binding".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 3, "character": 16}
+        }),
+    );
+    let definition = server.response(&definition_id);
+    assert!(
+        definition.error.is_none(),
+        "initial definition failed: {definition:?}"
+    );
+    let virtual_uri = definition.result.expect("definition result")[0]["uri"]
+        .as_str()
+        .expect("compiled provider URI")
+        .to_owned();
+
+    fs::write(&main, &source_b).expect("persist edited importer");
+    let rebound_id = RequestId::from("rebound-compiled-provider-binding".to_string());
+    server.send_request(
+        rebound_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": {"line": 3, "character": 16}
+        }),
+    );
+    let rebound = server.response(&rebound_id);
+    assert!(
+        rebound.error.is_none(),
+        "rebound definition failed: {rebound:?}"
+    );
+    assert_eq!(
+        rebound.result.as_ref().expect("rebound result")[0]["uri"],
+        virtual_uri
+    );
+
+    let content_id = RequestId::from("content-after-same-importer-rebind".to_string());
+    server.send_request(
+        content_id.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    let content = server.response(&content_id);
+    assert!(
+        content.error.is_none(),
+        "stale same-importer binding shadowed the fresh source hash: {content:?}"
     );
     server.shutdown();
 }

@@ -5,7 +5,7 @@
 //! caller may index [`CompiledUnitDocument::text`] at its stable URI, but must
 //! retain this object (or equivalent trusted state) to serve virtual text.
 
-use lint4d::dcu::{DcuPlatform, DcuVersion, TypeKind};
+use lint4d::dcu::{DcuPlatform, DcuVersion};
 use lsp_types::Url;
 use pascal_project::{ProjectContext, ProjectPathEntry, ReadPolicy, content_hash_bytes};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +22,8 @@ const MAX_DCU_IMPORTS: usize = 128;
 const MAX_DCU_SEARCH_PATHS: usize = 128;
 const MAX_DCU_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_DCU_TOTAL_DIRECTORY_ENTRIES: usize = 16384;
+const MAX_DCU_DECODED_RECORDS: usize = 32_768;
+const MAX_DCU_DECODED_BYTES: usize = 4 * 1024 * 1024;
 // A best-effort elapsed-time bound checked between synchronous filesystem
 // operations. It cannot preempt a kernel call, but it refuses results as soon
 // as a slow read/enumeration returns.
@@ -50,10 +52,23 @@ impl CompiledUnitDocument {
         if bytes.is_empty() || bytes.len() > MAX_DCU_BYTES {
             return Err("compiled unit exceeds the DCU byte limit".to_string());
         }
-        let (unit, exported_type_indices) =
-            lint4d::dcu::types::parse_dcu_with_exported_type_indices(bytes)
-                .map_err(|error| error.to_string())?;
-        let exported_type_indices = exported_type_indices.into_iter().collect::<HashSet<_>>();
+        let parsed = lint4d::dcu::types::parse_dcu_for_provider(
+            bytes,
+            lint4d::dcu::types::ProviderParseLimits {
+                max_records: MAX_DCU_DECODED_RECORDS,
+                max_decoded_bytes: MAX_DCU_DECODED_BYTES,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let unit = parsed.unit;
+        let exported_type_indices = parsed
+            .exported_type_indices
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let class_definition_type_indices = parsed
+            .class_definition_type_indices
+            .into_iter()
+            .collect::<HashSet<_>>();
         if unit.version != DcuVersion::D13 || unit.platform != DcuPlatform::Win64 {
             return Err(
                 "compiled unit version/platform is not supported for navigation".to_string(),
@@ -66,7 +81,7 @@ impl CompiledUnitDocument {
         let mut type_name_counts = HashMap::<String, usize>::new();
         for (type_index, ty) in unit.types.iter().enumerate() {
             if exported_type_indices.contains(&type_index)
-                && ty.kind == TypeKind::Class
+                && class_definition_type_indices.contains(&type_index)
                 && safe_identifier(&ty.name)
             {
                 *type_name_counts
@@ -83,8 +98,8 @@ impl CompiledUnitDocument {
             // does not prove the class member signatures/visibility. Emit a
             // type shell only, and refuse case-insensitively ambiguous names.
             let canonical_name = ty.name.to_ascii_lowercase();
-            if ty.kind != TypeKind::Class
-                || !exported_type_indices.contains(&type_index)
+            if !exported_type_indices.contains(&type_index)
+                || !class_definition_type_indices.contains(&type_index)
                 || !safe_identifier(&ty.name)
                 || type_name_counts.get(&canonical_name) != Some(&1)
                 || !emitted_names.insert(canonical_name)
@@ -177,6 +192,21 @@ pub struct AuthorizedCompiledUnit {
 }
 
 impl AuthorizedCompiledUnit {
+    pub(crate) fn retained_payload_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(self.document.text.len())
+            .saturating_add(self.document.unit_name.len())
+            .saturating_add(self.document.uri.as_str().len())
+            .saturating_add(self.path.as_os_str().len());
+        let _ = self
+            .path_entry
+            .visit_recovery_payload(&mut |payload_bytes| {
+                bytes = bytes.saturating_add(payload_bytes);
+                Ok(())
+            });
+        bytes
+    }
+
     pub fn is_current(&self, policy: &ReadPolicy) -> bool {
         policy
             .read_payload_bytes(&self.path_entry, MAX_DCU_BYTES as u64)

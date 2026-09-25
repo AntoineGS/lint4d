@@ -12,6 +12,9 @@ pub enum DcuError {
         tag: u8,
         offset: usize,
     },
+    DecodeLimitExceeded {
+        resource: &'static str,
+    },
     UnresolvedTypeRef {
         index: u32,
     },
@@ -32,6 +35,9 @@ impl fmt::Display for DcuError {
             }
             Self::UnknownTag { tag, offset } => {
                 write!(f, "unknown tag 0x{tag:02X} at offset {offset}")
+            }
+            Self::DecodeLimitExceeded { resource } => {
+                write!(f, "compiled-unit {resource} limit exceeded")
             }
             Self::UnresolvedTypeRef { index } => {
                 write!(f, "unresolved type reference: index {index}")

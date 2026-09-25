@@ -1,5 +1,5 @@
 use lint4d::dcu::header::parse_unit_header;
-use lint4d::dcu::types::parse_dcu;
+use lint4d::dcu::types::{ProviderParseLimits, parse_dcu, parse_dcu_for_provider};
 use lint4d::dcu::{DcuPlatform, DcuVersion, MethodKind, TypeKind};
 use std::fs;
 use std::path::PathBuf;
@@ -80,6 +80,34 @@ fn parse_dcu_classes_unit() {
         "Expected at least 4 imports, got: {:?}",
         unit.imported_units
     );
+}
+
+#[test]
+fn strict_provider_parser_accepts_complete_d13_class_fixture_with_explicit_class_proof() {
+    let data = fs::read(fixture_path("Lint4dFixture.Classes.dcu")).unwrap();
+    let parsed = parse_dcu_for_provider(
+        &data,
+        ProviderParseLimits {
+            max_records: 32_768,
+            max_decoded_bytes: 4 * 1024 * 1024,
+        },
+    )
+    .expect("checked-in D13 fixture has a complete provider declaration list");
+    assert_eq!(parsed.unit.version, DcuVersion::D13);
+    assert_eq!(parsed.unit.platform, DcuPlatform::Win64);
+    assert!(parsed.decoded_records > 0);
+    assert!(parsed.decoded_bytes > 0);
+    let simple = parsed
+        .unit
+        .types
+        .iter()
+        .position(|ty| ty.name == "TSimpleClass")
+        .expect("fixture class record");
+    assert!(parsed.exported_type_indices.contains(&simple));
+    assert!(parsed.class_definition_type_indices.contains(&simple));
+
+    let tolerant = parse_dcu(&data).expect("legacy parser API remains available");
+    assert_eq!(tolerant.name, parsed.unit.name);
 }
 
 #[test]

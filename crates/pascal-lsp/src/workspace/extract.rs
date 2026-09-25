@@ -78,10 +78,11 @@ pub(crate) fn plan(
         return Ok(Vec::new());
     };
     let name = &source[header_name.start_byte()..header_name.end_byte()];
+    let args = header.child_by_field_name("args");
+    let args_source = args.map_or("", |node| &source[node.start_byte()..node.end_byte()]);
     if header.kind() != "declProc"
-        || header.child_by_field_name("args").is_some()
         || !source[header.start_byte()..header.end_byte()]
-            .eq_ignore_ascii_case(&format!("procedure {name};"))
+            .eq_ignore_ascii_case(&format!("procedure {name}{args_source};"))
     {
         return Ok(Vec::new());
     }
@@ -108,6 +109,26 @@ pub(crate) fn plan(
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         return Ok(Vec::new());
+    }
+    if let Some(args) = args {
+        let mut args_cursor = args.walk();
+        for arg in args.named_children(&mut args_cursor) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            if arg.kind() != "declArg" {
+                return Ok(Vec::new());
+            }
+            let mut name_cursor = arg.walk();
+            for parameter in arg.children_by_field_name("name", &mut name_cursor) {
+                let parameter = &source[parameter.start_byte()..parameter.end_byte()];
+                if parameter.eq_ignore_ascii_case(target)
+                    || parameter.eq_ignore_ascii_case("Integer")
+                {
+                    return Ok(Vec::new());
+                }
+            }
+        }
     }
     let literal = &source[rhs.start_byte()..rhs.end_byte()];
     if !literal.bytes().all(|byte| byte.is_ascii_digit())
@@ -318,6 +339,20 @@ mod tests {
             edit.new_text
                 .contains("procedure ExtractedRoutine(var Target: Integer);")
         }));
+    }
+
+    #[test]
+    fn unused_outer_parameter_does_not_become_an_extraction_input() {
+        let cancel = AtomicBool::new(false);
+        let source = SOURCE.replace("procedure Run;", "procedure Run(const Seed: Integer);");
+        assert_eq!(plan(&source, selection(12, 14), &cancel).unwrap().len(), 1);
+        assert_eq!(plan(&source, selection(2, 15), &cancel).unwrap().len(), 1);
+        let shadowed = SOURCE.replace("procedure Run;", "procedure Run(const Target: Integer);");
+        assert!(
+            plan(&shadowed, selection(12, 14), &cancel)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

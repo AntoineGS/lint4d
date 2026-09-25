@@ -12879,6 +12879,8 @@ fn server_capabilities(
             "codeActionKinds": [
                 "quickfix",
                 "quickfix.implement-interface-method",
+                "refactor.extract.variable",
+                "refactor.extract.function",
                 "source.fixAll",
                 "source.fixAll.constant-naming",
                 "source.fixAll.local-variable-naming",

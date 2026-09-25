@@ -46414,7 +46414,12 @@ fn extract_local_integer_assignment_preserves_value_and_single_output() {
     let source = "unit Sample;\ninterface\nimplementation\nprocedure Run;\nvar Target: Integer;\nbegin\n  Target := 42;\nend;\nend.\n";
     write_file(&main, source);
     let mut server = TestServer::launch();
-    server.initialize_with_action_support(root, Value::Null);
+    let initialized = server.initialize_with_action_support(root, Value::Null);
+    let kinds = initialized["capabilities"]["codeActionProvider"]["codeActionKinds"]
+        .as_array()
+        .expect("advertised code action kinds");
+    assert!(kinds.iter().any(|kind| kind == "refactor.extract.variable"));
+    assert!(kinds.iter().any(|kind| kind == "refactor.extract.function"));
 
     for (id, start, end, only, kind, expected) in [
         (

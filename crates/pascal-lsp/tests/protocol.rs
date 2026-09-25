@@ -2831,7 +2831,7 @@ fn compiled_provider_rebind_after_same_importer_edit_keeps_fresh_binding() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn queued_compiled_content_and_symbols_reject_changed_importer_overlay() {
+fn queued_compiled_content_and_symbols_reject_changed_importer_and_project() {
     let environment = tempfile::tempdir().expect("server environment");
     let root = environment.path().join("workspace");
     let lib = root.join("lib");
@@ -2846,8 +2846,7 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_overlay() {
         &root.join("App.dproj"),
         "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
     );
-    let (mut server, barrier, dispatch) =
-        TestServer::launch_with_navigation_barrier_and_dispatch_log(environment);
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
     server.initialize(&root, Value::Null);
     server.send_notification(
         "textDocument/didOpen",
@@ -2906,10 +2905,16 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_overlay() {
             "contentChanges": [{"text": "unit Consumer;\ninterface\nimplementation\nend.\n"}]
         }),
     );
-    // Keep both worker slots occupied until the request and overlay change
-    // have been admitted in protocol order.
-    thread::sleep(Duration::from_millis(50));
-    let _ = dispatch.wait_for_entries(3);
+    // This inline response fences the preceding notification in the protocol
+    // stream while both analysis workers remain blocked.
+    let fence_id = RequestId::from("compiled-queue-overlay-fence".to_string());
+    server.send_request(
+        fence_id.clone(),
+        "workspace/willCreateFiles",
+        json!({"files": []}),
+    );
+    let fence = server.response(&fence_id);
+    assert!(fence.error.is_none(), "overlay fence failed: {fence:?}");
     barrier.release();
 
     for request_id in [queued_content, queued_symbols] {
@@ -2917,6 +2922,80 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_overlay() {
         assert!(
             response.error.is_some(),
             "stale queued virtual result: {response:?}"
+        );
+    }
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&main), "version": 3}, "contentChanges": [{"text": source}]}),
+    );
+    let rebound_id = RequestId::from("rebind-after-compiled-overlay-change".to_string());
+    server.send_request(
+        rebound_id.clone(),
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri(&main)}, "position": {"line": 3, "character": 16}}),
+    );
+    let rebound = server.response(&rebound_id);
+    assert!(rebound.error.is_none(), "rebind failed: {rebound:?}");
+    assert_eq!(
+        rebound.result.expect("rebound location")[0]["uri"],
+        virtual_uri
+    );
+    fs::remove_file(&barrier.release).expect("re-arm project-change barrier");
+    fs::remove_file(&barrier.entered).expect("reset project-change barrier count");
+    for number in 2..4 {
+        let other = root.join(format!("Blocker{number}.pas"));
+        write_file(
+            &other,
+            &format!(
+                "unit Blocker{number};\ninterface\ntype TLocal = Integer;\nimplementation\nend.\n"
+            ),
+        );
+        server.send_request(
+            RequestId::from(format!("project-queue-blocker-{number}")),
+            "textDocument/definition",
+            json!({"textDocument": {"uri": uri(&other)}, "position": {"line": 2, "character": 7}}),
+        );
+    }
+    barrier.wait_for_entries(2);
+    let queued_project_content = RequestId::from("queued-project-compiled-content".to_string());
+    let queued_project_symbols = RequestId::from("queued-project-compiled-symbols".to_string());
+    server.send_request(
+        queued_project_content.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    server.send_request(
+        queued_project_symbols.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    let project = root.join("App.dproj");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>elsewhere</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&project), "type": 2}]}),
+    );
+    let project_fence_id = RequestId::from("compiled-queue-project-fence".to_string());
+    server.send_request(
+        project_fence_id.clone(),
+        "workspace/willCreateFiles",
+        json!({"files": []}),
+    );
+    let project_fence = server.response(&project_fence_id);
+    assert!(
+        project_fence.error.is_none(),
+        "project fence failed: {project_fence:?}"
+    );
+    barrier.release();
+    for request_id in [queued_project_content, queued_project_symbols] {
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_some(),
+            "stale queued project result: {response:?}"
         );
     }
     server.shutdown();

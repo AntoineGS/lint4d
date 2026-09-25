@@ -9085,6 +9085,39 @@ fn cancel_and_join_workspace_file_worker(
         .map_or(Ok(()), |mut worker| worker.cancel_and_join())
 }
 
+#[cfg(feature = "test-support")]
+fn wait_at_workspace_file_worker_test_barrier(budget: &ReconciliationBudget) -> Result<(), String> {
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_WORKSPACE_FILE_WORKER_BARRIER") else {
+        return Ok(());
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return Ok(());
+    };
+    let mut marker = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+        .map_err(|error| format!("could not enter workspace file worker test barrier: {error}"))?;
+    marker
+        .write_all(b"x")
+        .map_err(|error| format!("could not record workspace file worker barrier: {error}"))?;
+    drop(marker);
+    while !std::path::Path::new(release).exists() {
+        if budget.is_cancelled() {
+            return Err(rename::CANCELLATION_MESSAGE.to_string());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+fn wait_at_workspace_file_worker_test_barrier(
+    _budget: &ReconciliationBudget,
+) -> Result<(), String> {
+    Ok(())
+}
+
 fn spawn_workspace_file_notification(
     workspace: &mut Workspace,
     notification: Notification,
@@ -9102,18 +9135,20 @@ fn spawn_workspace_file_notification(
         .spawn(move || {
             let mut workspace = owned_workspace;
             let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
-            let mut result = handle_notification_with_control(
-                &UnusedProtocolSender,
-                &mut workspace,
-                notification,
-                workspace_folders_supported,
-                push_diagnostics_supported,
-                NotificationWorkControl {
-                    cancel: Some(&worker_cancellation),
-                    budget: Some(&budget),
-                    defer_push_clears: false,
-                },
-            );
+            let mut result = wait_at_workspace_file_worker_test_barrier(&budget).and_then(|()| {
+                handle_notification_with_control(
+                    &UnusedProtocolSender,
+                    &mut workspace,
+                    notification,
+                    workspace_folders_supported,
+                    push_diagnostics_supported,
+                    NotificationWorkControl {
+                        cancel: Some(&worker_cancellation),
+                        budget: Some(&budget),
+                        defer_push_clears: false,
+                    },
+                )
+            });
             if budget.is_exhausted() && !budget.is_cancelled() {
                 workspace.invalidate_for_reconciliation_budget(&budget);
                 let mut effect = DiagnosticNotificationEffect::default();

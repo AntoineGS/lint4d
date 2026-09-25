@@ -1586,9 +1586,21 @@ fn load_local_project_config(
         }
         let candidate = directory.join(".delphilsp.json");
         tracker.record_metadata_path(candidate.clone());
-        if !is_deleted_path(&candidate, tracker.deleted_paths)
-            && fs::symlink_metadata(&candidate).is_ok()
-        {
+        let candidate_exists = if is_deleted_path(&candidate, tracker.deleted_paths) {
+            false
+        } else {
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(format!(
+                        "could not inspect .delphilsp.json candidate {}: {error}",
+                        candidate.display()
+                    ));
+                }
+            }
+        };
+        if candidate_exists {
             let entry = ProjectPathEntry {
                 path: candidate.clone(),
                 provenance: ProjectPathProvenance::Configured,
@@ -1673,6 +1685,15 @@ fn discover_context_with_selections(
     let file_path = discovery_file_path(&absolute_file, &mut warnings);
     let roots = normalize_workspace_roots(workspace_roots, &mut warnings)?;
     let relevant_root = relevant_workspace_root(&file_path, &roots);
+    let local_config_overrides = overrides
+        .effective_for(relevant_root.as_deref(), file_path.parent())
+        .unwrap_or_default();
+    let original_read_policy = ReadPolicy::new(
+        &roots,
+        &options.source_paths,
+        exclusions,
+        &local_config_overrides,
+    );
     let config_path = load_local_project_config(
         &file_path,
         relevant_root.as_deref(),
@@ -1685,23 +1706,47 @@ fn discover_context_with_selections(
     )?;
     let mut options = options.clone();
     if let Some((config_file, config)) = config_path {
-        if options.project_file.is_none() && selections.is_empty() {
-            if let Some(project) = config.project.as_deref() {
-                validate_local_config_path(project)?;
-                let project_directory = config_file.parent().unwrap_or_else(|| Path::new("."));
-                options.project_file = Some(project_directory.join(project));
+        let config_directory = config_file.parent().unwrap_or_else(|| Path::new("."));
+        let configured_project = if let Some(project) = config.project.as_deref() {
+            validate_local_config_path(project)?;
+            let project_path = absolute_lexical(&config_directory.join(project))?;
+            let project_entry = ProjectPathEntry {
+                path: project_path.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            };
+            if !original_read_policy.allows_location(&project_entry) {
+                return Err(format!(
+                    ".delphilsp.json project path escapes its original authorized roots or uses a symlink: {}",
+                    project_path.display()
+                ));
+            }
+            Some(project_path)
+        } else {
+            None
+        };
+        let requester_has_project_selection = selections
+            .keys()
+            .any(|scope| project_path_starts_with(&file_path, scope));
+        if options.project_file.is_none() && !requester_has_project_selection {
+            if let Some(project) = configured_project {
+                options.project_file = Some(project);
             }
         }
         for source_path in config.source_paths {
             validate_local_config_path(&source_path)?;
-            let config_directory = config_file.parent().unwrap_or_else(|| Path::new("."));
             let source_path = absolute_lexical(&config_directory.join(source_path))?;
-            if !project_path_starts_with(
-                &source_path,
-                relevant_root.as_deref().unwrap_or(config_directory),
-            ) {
+            let source_entry = ProjectPathEntry {
+                path: source_path.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            };
+            if !original_read_policy.allows_location(&source_entry)
+                || !project_path_starts_with(
+                    &source_path,
+                    relevant_root.as_deref().unwrap_or(config_directory),
+                )
+            {
                 return Err(format!(
-                    ".delphilsp.json source path escapes its authorized root: {}",
+                    ".delphilsp.json source path escapes its original authorized roots or uses a symlink: {}",
                     source_path.display()
                 ));
             }
@@ -5965,6 +6010,8 @@ impl ProjectBuilder {
             return;
         };
         if !self.active_imports.insert(path.clone()) {
+            self.incomplete = true;
+            self.taint_unknown_import();
             self.warnings.push(format!(
                 "project import cycle ignored at {}",
                 path.display()

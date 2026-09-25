@@ -254,6 +254,104 @@ fn public_api_applies_versioned_local_configuration_without_overriding_explicit_
 }
 
 #[test]
+fn local_project_selection_is_scoped_to_the_current_requester() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path().join("workspace");
+    let project_a = root.join("A");
+    let project_b = root.join("B");
+    let source_a = project_a.join("Main.pas");
+    let source_b = project_b.join("Main.pas");
+    for (folder, source) in [(&project_a, &source_a), (&project_b, &source_b)] {
+        fs::create_dir_all(folder).expect("project directory");
+        write(source, "unit Main; interface implementation end.");
+        write(
+            &folder.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    let selected_a = project_a.join("App.dproj");
+    write(
+        &project_b.join("Configured.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    let configured_b = project_b.join("Configured.dproj");
+    write(
+        &project_b.join(".delphilsp.json"),
+        r#"{"version":1,"project":"Configured.dproj"}"#,
+    );
+
+    let mut selections = ProjectSelections::new();
+    selections.insert(project_a.clone(), selected_a.clone());
+    let overrides = OverrideSession::new(None);
+    let selected = discover_with_selections_and_observations_with_cancel_and_overrides(
+        &source_a,
+        &[root.clone()],
+        &ProjectOptions::default(),
+        &selections,
+        &overrides,
+        &[],
+        &AtomicBool::new(false),
+    )
+    .expect("requester A discovery");
+    assert_eq!(selected.context.project_file, Some(selected_a));
+
+    let independent = discover_with_selections_and_observations_with_cancel_and_overrides(
+        &source_b,
+        &[root],
+        &ProjectOptions::default(),
+        &selections,
+        &overrides,
+        &[],
+        &AtomicBool::new(false),
+    )
+    .expect("requester B discovery");
+    assert_eq!(independent.context.project_file, Some(configured_b));
+}
+
+#[test]
+fn local_project_path_is_validated_even_when_another_requester_has_selection() {
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path().join("workspace");
+    let project_a = root.join("A");
+    let project_b = root.join("B");
+    let source_a = project_a.join("Main.pas");
+    let source_b = project_b.join("Main.pas");
+    for (folder, source) in [(&project_a, &source_a), (&project_b, &source_b)] {
+        fs::create_dir_all(folder).expect("project directory");
+        write(source, "unit Main; interface implementation end.");
+        write(
+            &folder.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    let selected_a = project_a.join("App.dproj");
+    let invalid_traversal_target = project_b.join("Configured.dproj");
+    write(
+        &invalid_traversal_target,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        &project_b.join(".delphilsp.json"),
+        r#"{"version":1,"project":"../B/Configured.dproj","defines":["MUST_NOT_APPLY"]}"#,
+    );
+
+    let mut selections = ProjectSelections::new();
+    selections.insert(project_a.clone(), selected_a);
+    let discovery = discover_with_selections_and_observations_with_cancel_and_overrides(
+        &source_b,
+        &[root],
+        &ProjectOptions::default(),
+        &selections,
+        &OverrideSession::new(None),
+        &[],
+        &AtomicBool::new(false),
+    );
+    let error =
+        discovery.expect_err("invalid config project paths fail even under other selections");
+    assert!(error.contains("traversal"), "unexpected error: {error}");
+}
+
+#[test]
 fn public_api_rejects_malformed_unknown_and_traversing_local_configuration() {
     let directory = tempdir().expect("temporary workspace");
     let root = directory.path();
@@ -303,6 +401,133 @@ fn public_api_rejects_a_symlinked_local_configuration() {
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect_err("symlinked config must not be followed");
     assert!(error.contains("symlink"), "unexpected error: {error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn public_api_rejects_local_source_paths_that_symlink_outside_the_original_root() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path().join("workspace");
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let outside = directory.path().join("outside");
+    fs::create_dir_all(&project_dir).expect("project directory");
+    fs::create_dir_all(&outside).expect("outside directory");
+    write(&source, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    symlink(&outside, project_dir.join("linked")).expect("outside directory symlink");
+    write(
+        &project_dir.join(".delphilsp.json"),
+        r#"{"version":1,"sourcePaths":["linked"]}"#,
+    );
+
+    let error = ProjectContext::discover(&source, &[root], &ProjectOptions::default())
+        .expect_err("a config-added root must not authorize its own symlink escape");
+    assert!(
+        error.contains(".delphilsp.json"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn public_api_rejects_local_project_paths_that_symlink_outside_the_original_root() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path().join("workspace");
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let outside_project = directory.path().join("outside.dproj");
+    fs::create_dir_all(&project_dir).expect("project directory");
+    write(&source, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        &outside_project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    symlink(&outside_project, project_dir.join("Linked.dproj")).expect("project symlink");
+    write(
+        &project_dir.join(".delphilsp.json"),
+        r#"{"version":1,"project":"Linked.dproj"}"#,
+    );
+
+    let error = ProjectContext::discover(&source, &[root], &ProjectOptions::default())
+        .expect_err("a local config must not select a project through an external symlink");
+    assert!(
+        error.contains(".delphilsp.json"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_project_selection_does_not_bypass_local_project_symlink_validation() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path().join("workspace");
+    let project_dir = root.join("App");
+    let source = project_dir.join("App.dpr");
+    let selected = project_dir.join("Selected.dproj");
+    let outside_project = directory.path().join("outside.dproj");
+    fs::create_dir_all(&project_dir).expect("project directory");
+    write(&source, "program App; begin end.");
+    for project in [&selected, &outside_project] {
+        write(
+            project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+    }
+    symlink(&outside_project, project_dir.join("Linked.dproj")).expect("project symlink");
+    write(
+        &project_dir.join(".delphilsp.json"),
+        r#"{"version":1,"project":"Linked.dproj","defines":["MUST_NOT_APPLY"]}"#,
+    );
+    let mut selections = ProjectSelections::new();
+    selections.insert(root.clone(), selected);
+
+    let discovery = discover_with_selections_and_observations_with_cancel_and_overrides(
+        &source,
+        &[root],
+        &ProjectOptions::default(),
+        &selections,
+        &OverrideSession::new(None),
+        &[],
+        &AtomicBool::new(false),
+    );
+    let error = discovery.expect_err("runtime selection must not bypass config path validation");
+    assert!(
+        error.contains(".delphilsp.json"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn public_api_fails_closed_when_local_config_candidate_stat_has_non_not_found_error() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().expect("temporary workspace");
+    let root = directory.path().join("workspace");
+    fs::create_dir_all(&root).expect("workspace root");
+    symlink("loop", root.join("loop")).expect("self-referential symlink");
+    let source = root.join("loop/Main.pas");
+
+    let error = ProjectContext::discover(&source, &[root], &ProjectOptions::default())
+        .expect_err("an uninspectable candidate must not be treated as absent");
+    assert!(
+        error.contains(".delphilsp.json"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -411,12 +636,19 @@ fn public_api_refuses_missing_unknown_and_cyclic_property_imports_conservatively
         ProjectContext::discover(&source, &[root.to_path_buf()], &ProjectOptions::default())
             .expect("cycle is handled conservatively");
     assert!(
+        !cyclic.discovery_complete,
+        "a cyclic import must not advertise prior partial properties as complete"
+    );
+    assert!(
         cyclic
             .warnings
             .iter()
             .any(|warning| warning.contains("project import cycle"))
     );
-    assert!(cyclic.defines.contains(&"SECOND".to_string()));
+    assert!(
+        !cyclic.defines.contains(&"SECOND".to_string()),
+        "properties read before the cycle must not be exposed as authoritative"
+    );
 }
 
 #[test]

@@ -36147,6 +36147,170 @@ fn uri_byte_overflow_delete_fences_closed_provider_before_unlink_for_push_and_pu
 
 #[test]
 #[cfg(feature = "test-support")]
+fn queued_local_project_config_events_refresh_unopened_cross_project_owners() {
+    for event in ["create", "change", "delete"] {
+        let root = tempfile::tempdir().expect("workspace");
+        let project_a = root.path().join("A");
+        let project_b = root.path().join("B");
+        fs::create_dir_all(&project_a).expect("project A directory");
+        fs::create_dir_all(&project_b).expect("project B directory");
+        let source_a = project_a.join("Main.pas");
+        let source_b = project_b.join("Main.pas");
+        write_file(&source_a, "unit Main; interface implementation end.\n");
+        write_file(&source_b, "unit Main; interface implementation end.\n");
+        for (directory, names) in [
+            (&project_a, ["AOne.dproj", "ATwo.dproj"]),
+            (&project_b, ["BOne.dproj", "BTwo.dproj"]),
+        ] {
+            for name in names {
+                write_file(
+                    &directory.join(name),
+                    "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+                );
+            }
+        }
+        let config = project_b.join(".delphilsp.json");
+        if event != "create" {
+            write_file(&config, r#"{"version":1,"project":"BOne.dproj"}"#);
+        }
+
+        let barrier_directory = root.path().join(format!("{event}-file-discovery-barrier"));
+        fs::create_dir_all(&barrier_directory).expect("barrier directory");
+        let barrier = TestBarrier {
+            entered: barrier_directory.join("entered"),
+            release: barrier_directory.join("release"),
+        };
+        let barrier_value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = TestServer::launch_test_server_with_environment_path_and_variable(
+            root.path(),
+            Some("PASCAL_LSP_TEST_WORKSPACE_FILE_WORKER_BARRIER"),
+            Some(&barrier_value),
+        );
+        server.initialize(root.path(), Value::Null);
+
+        let select_a_id = RequestId::from(format!("{event}-select-a"));
+        server.send_request(
+            select_a_id.clone(),
+            "pascal/selectProject",
+            json!({
+                "textDocument": {"uri": uri(&source_a)},
+                "projectUri": uri(&project_a.join("AOne.dproj"))
+            }),
+        );
+        assert!(
+            server.response(&select_a_id).error.is_none(),
+            "project A selection failed for {event}"
+        );
+        let initial_id = RequestId::from(format!("{event}-initial-b-context"));
+        server.send_request(
+            initial_id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&source_b)}}),
+        );
+        let initial = server.response(&initial_id);
+        assert!(
+            initial.error.is_none(),
+            "initial B context failed: {initial:?}"
+        );
+        if event == "create" {
+            assert!(initial.result.as_ref().unwrap()["selectedProjectUri"].is_null());
+        } else {
+            assert_eq!(
+                initial.result.as_ref().unwrap()["selectedProjectUri"],
+                uri(&project_b.join("BOne.dproj")).to_string(),
+                "selection in project A must not suppress project B local config"
+            );
+        }
+
+        let event_type = match event {
+            "create" => {
+                write_file(&config, r#"{"version":1,"project":"BOne.dproj"}"#);
+                1
+            }
+            "change" => {
+                let original_modified = fs::metadata(&config)
+                    .expect("config metadata")
+                    .modified()
+                    .expect("config modified time");
+                write_file(&config, r#"{"version":1,"project":"BTwo.dproj"}"#);
+                fs::File::options()
+                    .write(true)
+                    .open(&config)
+                    .expect("open config timestamp")
+                    .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+                    .expect("restore config timestamp");
+                2
+            }
+            "delete" => {
+                fs::remove_file(&config).expect("delete local config");
+                3
+            }
+            _ => unreachable!(),
+        };
+        server.send_notification(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes": [{"uri": uri(&config), "type": event_type}]}),
+        );
+        barrier.wait_until_entered();
+
+        let queued_id = RequestId::from(format!("{event}-queued-context"));
+        server.send_request(
+            queued_id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&source_b)}}),
+        );
+        assert!(
+            server
+                .response_with_timeout(&queued_id, Duration::from_millis(100))
+                .is_none(),
+            "project context must wait for the queued {event} worker"
+        );
+        barrier.release();
+        let refreshed = server.response(&queued_id);
+        assert!(
+            refreshed.error.is_none(),
+            "refreshed context failed after {event}: {refreshed:?}"
+        );
+        let context = refreshed.result.unwrap();
+        match event {
+            "create" => assert_eq!(
+                context["selectedProjectUri"],
+                uri(&project_b.join("BOne.dproj")).to_string()
+            ),
+            "change" => assert_eq!(
+                context["selectedProjectUri"],
+                uri(&project_b.join("BTwo.dproj")).to_string(),
+                "same-stamp config bytes must refresh the unopened owner"
+            ),
+            "delete" => assert!(
+                context["selectedProjectUri"].is_null(),
+                "deleting local config must remove its owner"
+            ),
+            _ => unreachable!(),
+        }
+
+        let still_selected_a_id = RequestId::from(format!("{event}-still-selected-a"));
+        server.send_request(
+            still_selected_a_id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&source_a)}}),
+        );
+        let still_selected_a = server.response(&still_selected_a_id);
+        assert_eq!(
+            still_selected_a.result.unwrap()["selectedProjectUri"],
+            uri(&project_a.join("AOne.dproj")).to_string(),
+            "B metadata event must not steal A's explicit owner"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn blocked_file_discovery_does_not_block_cancel_or_unrelated_protocol_messages() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

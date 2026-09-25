@@ -1162,8 +1162,12 @@ fn imported_optset_cycles_are_bounded_and_reported() {
     );
 
     let context = discover(&main, root, &options());
-    assert!(context.defines.contains(&"ONE".to_string()));
-    assert!(context.defines.contains(&"TWO".to_string()));
+    assert!(
+        !context.discovery_complete,
+        "a cyclic import must not expose a partial context as complete"
+    );
+    assert!(!context.defines.contains(&"ONE".to_string()));
+    assert!(!context.defines.contains(&"TWO".to_string()));
     assert!(
         context
             .warnings

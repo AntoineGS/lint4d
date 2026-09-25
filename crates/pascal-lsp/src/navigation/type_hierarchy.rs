@@ -3,6 +3,7 @@ use super::{
 };
 use crate::text;
 use lsp_types::{Position, Range, TypeHierarchyItem, Url};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 
@@ -68,14 +69,13 @@ pub(super) fn supertypes(
     }
     let mut budget = hierarchy_budget();
     let mut state = AncestryResolutionState::new();
-    let ancestry = index.resolve_direct_type_ancestry_with_budget(
-        &uri,
-        &canonical(&symbol.name),
-        &mut state,
-        cancel,
-        &mut budget,
-    )?;
+    let key = canonical(&symbol.name);
+    let mut cycle_check = TypeHierarchyCycleCheck::new(index, cancel, &mut state, &mut budget);
+    let ancestry = cycle_check.direct_ancestry(&uri, &key)?;
     if ancestry.status != super::AncestryStatus::Complete {
+        return Ok(None);
+    }
+    if !cycle_check.has_acyclic_known_ancestry(&uri, &key)? {
         return Ok(None);
     }
     if ancestry.parents.iter().any(|(parent_uri, parent_key)| {
@@ -138,6 +138,10 @@ pub(super) fn subtypes(
     let mut candidates = 0usize;
     let mut state = AncestryResolutionState::new();
     let mut budget = hierarchy_budget();
+    let mut cycle_check = TypeHierarchyCycleCheck::new(index, cancel, &mut state, &mut budget);
+    if !cycle_check.has_acyclic_known_ancestry(&target_uri, &target_key)? {
+        return Ok(None);
+    }
     for (uri, document) in &index.documents {
         for symbol in document.symbols.iter().filter(|symbol| {
             symbol.kind == SymbolKind::Type
@@ -158,14 +162,12 @@ pub(super) fn subtypes(
             if has_generic_ancestry(index, uri, symbol) {
                 continue;
             }
-            let ancestry = index.resolve_direct_type_ancestry_with_budget(
-                uri,
-                &canonical(&symbol.name),
-                &mut state,
-                cancel,
-                &mut budget,
-            )?;
+            let key = canonical(&symbol.name);
+            let ancestry = cycle_check.direct_ancestry(uri, &key)?;
             if ancestry.status != super::AncestryStatus::Complete {
+                continue;
+            }
+            if !cycle_check.has_acyclic_known_ancestry(uri, &key)? {
                 continue;
             }
             if ancestry.parents.iter().any(|(parent_uri, parent_key)| {
@@ -202,6 +204,81 @@ pub(super) fn subtypes(
     });
     output.dedup_by(|a, b| a.uri == b.uri && a.selection_range == b.selection_range);
     Ok(Some(output))
+}
+
+struct TypeHierarchyCycleCheck<'a> {
+    index: &'a NavigationIndex,
+    cancel: &'a AtomicBool,
+    state: &'a mut AncestryResolutionState,
+    budget: &'a mut AssistanceBudget,
+    active: HashSet<(Url, String)>,
+    known_acyclic: HashSet<(Url, String)>,
+}
+
+impl<'a> TypeHierarchyCycleCheck<'a> {
+    fn new(
+        index: &'a NavigationIndex,
+        cancel: &'a AtomicBool,
+        state: &'a mut AncestryResolutionState,
+        budget: &'a mut AssistanceBudget,
+    ) -> Self {
+        Self {
+            index,
+            cancel,
+            state,
+            budget,
+            active: HashSet::new(),
+            known_acyclic: HashSet::new(),
+        }
+    }
+
+    fn direct_ancestry(
+        &mut self,
+        uri: &Url,
+        key: &str,
+    ) -> Result<super::TypeAncestryResolution, String> {
+        self.index.resolve_direct_type_ancestry_with_budget(
+            uri,
+            key,
+            self.state,
+            self.cancel,
+            self.budget,
+        )
+    }
+
+    fn has_acyclic_known_ancestry(&mut self, uri: &Url, key: &str) -> Result<bool, String> {
+        check_cancel(self.cancel)?;
+        let identity_bytes = std::mem::size_of::<(Url, String)>()
+            .saturating_add(uri.as_str().len())
+            .saturating_add(key.len());
+        self.budget
+            .require_owned_bytes(identity_bytes, self.cancel)?;
+        let identity = (uri.clone(), key.to_owned());
+        if self.active.contains(&identity) {
+            return Ok(false);
+        }
+        if self.known_acyclic.contains(&identity) {
+            return Ok(true);
+        }
+        self.budget
+            .require_owned_bytes(identity_bytes, self.cancel)?;
+        self.active.insert(identity.clone());
+        let result = self.direct_ancestry(uri, key)?;
+        let mut acyclic = true;
+        if result.status == super::AncestryStatus::Complete {
+            for (parent_uri, parent_key) in result.parents {
+                if !self.has_acyclic_known_ancestry(&parent_uri, &parent_key)? {
+                    acyclic = false;
+                    break;
+                }
+            }
+        }
+        self.active.remove(&identity);
+        if acyclic {
+            self.known_acyclic.insert(identity);
+        }
+        Ok(acyclic)
+    }
 }
 
 fn hierarchy_budget() -> AssistanceBudget {

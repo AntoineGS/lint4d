@@ -2891,6 +2891,111 @@ fn type_hierarchy_keeps_proven_direct_edges_when_grandparent_is_unresolved() {
 }
 
 #[test]
+fn type_hierarchy_refuses_cycles_but_keeps_edges_before_unknown_grandparents() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("CycleTypes.pas");
+    let source = "unit CycleTypes; interface type TNode = class(TNode) end; TAlpha = class(TBeta) end; TBeta = class(TAlpha) end; TBase = class(TMissing) end; TChild = class(TBase) end; implementation end.";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare = |server: &mut TestServer, name: &str| {
+        let request = RequestId::from(format!("cycle-prepare-{name}"));
+        server.send_request(
+            request.clone(),
+            "textDocument/prepareTypeHierarchy",
+            json!({
+                "textDocument": {"uri": uri(&path)},
+                "position": position_of(source, name, usize::from(name == "TBeta"))
+            }),
+        );
+        let response = server.response(&request);
+        assert!(
+            response.error.is_none(),
+            "prepare {name} failed: {response:?}"
+        );
+        response
+            .result
+            .clone()
+            .unwrap_or_else(|| panic!("prepare {name} returned no result: {response:?}"))[0]
+            .clone()
+    };
+    let node = prepare(&mut server, "TNode");
+    let alpha = prepare(&mut server, "TAlpha");
+    let beta = prepare(&mut server, "TBeta");
+    let base = prepare(&mut server, "TBase");
+    let child = prepare(&mut server, "TChild");
+
+    for (name, item) in [("self", node), ("alpha", alpha), ("beta", beta)] {
+        let supers = RequestId::from(format!("cycle-super-{name}"));
+        server.send_request(
+            supers.clone(),
+            "typeHierarchy/supertypes",
+            json!({"item": item}),
+        );
+        let response = server.response(&supers);
+        assert!(
+            response.error.is_none(),
+            "supertype query failed: {response:?}"
+        );
+        assert!(
+            response.result.is_none() || response.result.as_ref().is_some_and(Value::is_null),
+            "cyclic source ancestry must not produce a supertype edge: {response:?}"
+        );
+
+        let item = prepare(
+            &mut server,
+            match name {
+                "self" => "TNode",
+                "alpha" => "TAlpha",
+                _ => "TBeta",
+            },
+        );
+        let subs = RequestId::from(format!("cycle-sub-{name}"));
+        server.send_request(
+            subs.clone(),
+            "typeHierarchy/subtypes",
+            json!({"item": item}),
+        );
+        let response = server.response(&subs);
+        assert!(
+            response.error.is_none(),
+            "subtype query failed: {response:?}"
+        );
+        assert!(
+            response.result.is_none() || response.result.as_ref().is_some_and(Value::is_null),
+            "cyclic source ancestry must not produce subtype edges: {response:?}"
+        );
+    }
+
+    let supers = RequestId::from("cycle-control-super".to_string());
+    server.send_request(
+        supers.clone(),
+        "typeHierarchy/supertypes",
+        json!({"item": child}),
+    );
+    let parents = server
+        .response(&supers)
+        .result
+        .expect("proven direct parent");
+    assert_eq!(parents[0]["name"], "TBase");
+    assert_eq!(parents[0]["uri"], uri(&path).to_string());
+
+    let subs = RequestId::from("cycle-control-sub".to_string());
+    server.send_request(
+        subs.clone(),
+        "typeHierarchy/subtypes",
+        json!({"item": base}),
+    );
+    let result = server
+        .response(&subs)
+        .result
+        .expect("proven direct child list");
+    let children = result.as_array().expect("subtype item array");
+    assert!(children.iter().any(|item| item["name"] == "TChild"));
+    server.shutdown();
+}
+
+#[test]
 fn type_hierarchy_refuses_conditionally_unknown_direct_parent_reference() {
     let root = tempfile::tempdir().expect("workspace");
     let path = root.path().join("ConditionalParent.pas");

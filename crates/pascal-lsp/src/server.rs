@@ -6,6 +6,7 @@ use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FOLDING_KIND_COMMENT,
     FOLDING_KIND_IMPORTS, FOLDING_KIND_REGION, FoldingRangeOptions, InlayHintOptions,
 };
+use crate::workspace::code_lenses;
 use crate::workspace::codeactions::{self, ClientActionFeatures};
 use crate::workspace::queries;
 use crate::workspace::rename::{self, SourceRecord};
@@ -939,9 +940,12 @@ impl AnalysisPriority {
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
             | AnalysisRequest::ResolveCompletion(_)
+            | AnalysisRequest::ResolveCodeLens(_)
             | AnalysisRequest::DocumentHighlights { .. }
             | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
-            AnalysisRequest::DocumentLinks { .. } => Self::Bulk,
+            AnalysisRequest::DocumentLinks { .. } | AnalysisRequest::CodeLenses { .. } => {
+                Self::Bulk
+            }
             AnalysisRequest::Diagnostics { .. }
             | AnalysisRequest::DocumentDiagnostics { .. }
             | AnalysisRequest::WorkspaceDiagnostics { .. } => Self::Diagnostics,
@@ -2019,6 +2023,10 @@ enum AnalysisRequest {
     DocumentLinks {
         uri: Url,
     },
+    CodeLenses {
+        uri: Url,
+    },
+    ResolveCodeLens(lsp_types::CodeLens),
     Diagnostics {
         uri: Url,
     },
@@ -2112,6 +2120,8 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
         AnalysisRequest::CodeActions(_) | AnalysisRequest::Resolve(_) => "Preparing code actions",
         AnalysisRequest::Formatting { .. } => "Formatting document",
         AnalysisRequest::DocumentLinks { .. } => "Resolving document links",
+        AnalysisRequest::CodeLenses { .. } => "Discovering code lenses",
+        AnalysisRequest::ResolveCodeLens(_) => "Resolving code lens",
         AnalysisRequest::DocumentSymbols { .. } => "Indexing document symbols",
         AnalysisRequest::SemanticTokens { .. } => "Computing semantic tokens",
         AnalysisRequest::FoldingRanges { .. } => "Computing folding ranges",
@@ -2144,6 +2154,8 @@ enum AnalysisResultValue {
     Navigation(NavigationAnalysis),
     Formatting(Result<Vec<lsp_types::TextEdit>, String>),
     DocumentLinks(Result<Vec<lsp_types::DocumentLink>, String>),
+    CodeLenses(Result<Vec<lsp_types::CodeLens>, String>),
+    ResolveCodeLens(Result<lsp_types::CodeLens, String>),
     Diagnostics(DiagnosticsAnalysis),
     DocumentDiagnostics(Result<DocumentDiagnosticsAnalysis, String>),
     WorkspaceDiagnostics(Result<WorkspaceDiagnosticsAnalysis, String>),
@@ -4813,6 +4825,8 @@ impl ObservationKey {
             | AnalysisRequest::Resolve(_)
             | AnalysisRequest::ResolveCompletion(_)
             | AnalysisRequest::DocumentLinks { .. }
+            | AnalysisRequest::CodeLenses { .. }
+            | AnalysisRequest::ResolveCodeLens(_)
             | AnalysisRequest::IncomingCalls { .. }
             | AnalysisRequest::OutgoingCalls { .. }
             | AnalysisRequest::TypeHierarchySupertypes { .. }
@@ -5217,6 +5231,12 @@ impl AnalysisJobs {
             AnalysisRequest::DocumentLinks { .. } => AnalysisResultValue::DocumentLinks(Err(
                 "analysis worker failed without changing workspace state".to_string(),
             )),
+            AnalysisRequest::CodeLenses { .. } => AnalysisResultValue::CodeLenses(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
+            AnalysisRequest::ResolveCodeLens(_) => AnalysisResultValue::ResolveCodeLens(Err(
+                "analysis worker failed without changing workspace state".to_string(),
+            )),
             AnalysisRequest::Diagnostics { uri } => {
                 AnalysisResultValue::Diagnostics(DiagnosticsAnalysis {
                     uri: uri.clone(),
@@ -5514,6 +5534,26 @@ impl AnalysisJobs {
                                 configuration_generation: computed.configuration_generation,
                                 records: computed.records,
                                 value: AnalysisResultValue::DocumentLinks(computed.value),
+                            }
+                        }
+                        AnalysisRequest::CodeLenses { uri } => {
+                            let computed = code_lenses::discover(input, &uri, &worker_cancellation);
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::CodeLenses(computed.value),
+                            }
+                        }
+                        AnalysisRequest::ResolveCodeLens(lens) => {
+                            let computed = code_lenses::resolve(input, lens, &worker_cancellation);
+                            AnalysisResult {
+                                id: worker_id,
+                                source_generation: computed.source_generation,
+                                configuration_generation: computed.configuration_generation,
+                                records: computed.records,
+                                value: AnalysisResultValue::ResolveCodeLens(computed.value),
                             }
                         }
                         AnalysisRequest::Diagnostics { uri } => {
@@ -6210,6 +6250,8 @@ impl AnalysisJobs {
                     AnalysisResultValue::Navigation(_)
                         | AnalysisResultValue::CompiledContent(_)
                         | AnalysisResultValue::DocumentLinks(_)
+                        | AnalysisResultValue::CodeLenses(_)
+                        | AnalysisResultValue::ResolveCodeLens(_)
                         | AnalysisResultValue::InlayHints(_)
                         | AnalysisResultValue::IncomingCalls(_)
                         | AnalysisResultValue::OutgoingCalls(_)
@@ -7983,6 +8025,8 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
                 | AnalysisResultValue::Navigation(_)
                 | AnalysisResultValue::Formatting(_)
                 | AnalysisResultValue::DocumentLinks(_)
+                | AnalysisResultValue::CodeLenses(_)
+                | AnalysisResultValue::ResolveCodeLens(_)
                 | AnalysisResultValue::Diagnostics(_)
                 | AnalysisResultValue::DocumentDiagnostics(_)
                 | AnalysisResultValue::WorkspaceDiagnostics(_)
@@ -8203,6 +8247,18 @@ fn deliver_analysis_result_with_store(
             ),
         },
         AnalysisResultValue::DocumentLinks(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::CodeLenses(value) => match value {
+            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::ResolveCodeLens(value) => match value {
             Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
@@ -8696,6 +8752,8 @@ fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
         }
         AnalysisResultValue::Formatting(value) => *value = Err(error),
         AnalysisResultValue::DocumentLinks(value) => *value = Err(error),
+        AnalysisResultValue::CodeLenses(value) => *value = Err(error),
+        AnalysisResultValue::ResolveCodeLens(value) => *value = Err(error),
         AnalysisResultValue::Diagnostics(diagnostics) => {
             diagnostics.value = Err(error);
             diagnostics.discard = true;
@@ -11459,6 +11517,46 @@ fn handle_request(
                 work_done_token.clone(),
             )?;
         }
+        "textDocument/codeLens" => {
+            let id = request.id.clone();
+            let params: lsp_types::CodeLensParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::CodeLenses {
+                    uri: canonical_file_uri(&params.text_document.uri),
+                },
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
+        "codeLens/resolve" => {
+            let id = request.id.clone();
+            let lens: lsp_types::CodeLens = match parse_params(&request) {
+                Ok(lens) => lens,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                request.id,
+                AnalysisRequest::ResolveCodeLens(lens),
+                client_features,
+                work_done_token.clone(),
+            )?;
+        }
         "textDocument/rangeFormatting" => {
             let id = request.id.clone();
             let params: lsp_types::DocumentRangeFormattingParams = match parse_params(&request) {
@@ -12874,6 +12972,7 @@ fn server_capabilities(
         "documentRangeFormattingProvider": {"workDoneProgress": true},
         "documentOnTypeFormattingProvider": {"firstTriggerCharacter": ";"},
         "documentLinkProvider": {"resolveProvider": false},
+        "codeLensProvider": {"resolveProvider": true},
         "renameProvider": {"prepareProvider": true, "workDoneProgress": true},
         "codeActionProvider": {
             "codeActionKinds": [

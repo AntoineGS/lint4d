@@ -46407,6 +46407,329 @@ fn source_action_deduplication_preserves_binding_before_and_after_apply() {
 }
 
 #[test]
+fn code_lens_resolves_bound_references_and_implementation_lazily() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n",
+    );
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n",
+    );
+    let mut server = TestServer::launch();
+    let initialized = server.initialize(root, Value::Null);
+    assert_eq!(
+        initialized["capabilities"]["codeLensProvider"]["resolveProvider"],
+        true
+    );
+    let id = RequestId::from("code-lens-discover".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/codeLens",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "code lens discovery failed: {response:?}"
+    );
+    let lenses = response.result.expect("discovered lenses");
+    let lenses = lenses.as_array().expect("lens array");
+    assert_eq!(
+        lenses.len(),
+        2,
+        "expected reference and implementation lenses: {lenses:?}"
+    );
+    for (index, expected_uri, expected_line) in [(0, uri(&main), 6), (1, uri(&provider), 4)] {
+        let lens = &lenses[index];
+        assert!(
+            lens.get("command").is_none(),
+            "discovery performed eager search: {lens:?}"
+        );
+        assert!(lens["data"].is_object(), "missing lazy token: {lens:?}");
+        let resolve_id = RequestId::from(format!("code-lens-resolve-{index}"));
+        server.send_request(resolve_id.clone(), "codeLens/resolve", lens.clone());
+        let resolved = server.response(&resolve_id);
+        assert!(
+            resolved.error.is_none(),
+            "code lens resolve failed: {resolved:?}"
+        );
+        let resolved = resolved.result.expect("resolved lens");
+        assert_eq!(
+            resolved["command"]["command"],
+            "editor.action.showReferences"
+        );
+        assert!(
+            resolved["command"]["arguments"][2]
+                .as_array()
+                .is_some_and(|locations| {
+                    locations.iter().any(|location| {
+                        location["uri"] == json!(expected_uri)
+                            && location["range"]["start"]["line"] == expected_line
+                    })
+                }),
+            "resolved lens missed bound target: {resolved:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn code_lens_without_bound_references_has_no_executable_command() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let provider = root.join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    let discover_id = RequestId::from("code-lens-zero-discovery".to_string());
+    server.send_request(
+        discover_id.clone(),
+        "textDocument/codeLens",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    let lens = server
+        .response(&discover_id)
+        .result
+        .expect("lenses")
+        .as_array()
+        .expect("lens array")[0]
+        .clone();
+    let resolve_id = RequestId::from("code-lens-zero-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeLens/resolve", lens);
+    let response = server.response(&resolve_id);
+    assert!(
+        response.error.is_none(),
+        "zero-reference resolve failed: {response:?}"
+    );
+    let result = response.result.expect("zero-reference lens");
+    assert!(
+        result.get("command").is_none(),
+        "zero-reference lens offered an executable command: {result:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_lens_resolve_refuses_stale_or_forged_discovery_token() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let provider = root.join("Provider.pas");
+    let source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    write_file(&provider, source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&provider), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    let discover_id = RequestId::from("code-lens-token-discovery".to_string());
+    server.send_request(
+        discover_id.clone(),
+        "textDocument/codeLens",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    let response = server.response(&discover_id);
+    assert!(
+        response.error.is_none(),
+        "lens discovery failed: {response:?}"
+    );
+    let lens = response
+        .result
+        .expect("lenses")
+        .as_array()
+        .expect("lens array")[0]
+        .clone();
+    let mut forged = lens.clone();
+    forged["range"]["start"]["character"] = json!(0);
+    let forged_id = RequestId::from("code-lens-forged-range".to_string());
+    server.send_request(forged_id.clone(), "codeLens/resolve", forged);
+    assert!(
+        server.response(&forged_id).error.is_some(),
+        "forged range was accepted"
+    );
+
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&provider), "version": 2}, "contentChanges": [{"text": source.replace("PublicRoutine", "ChangedRoutine")}]}),
+    );
+    let stale_id = RequestId::from("code-lens-stale-source".to_string());
+    server.send_request(stale_id.clone(), "codeLens/resolve", lens);
+    let stale = server.response(&stale_id);
+    assert!(
+        stale.error.is_some(),
+        "stale source resolved an old lens: {stale:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn code_lens_invalid_selected_project_withholds_discovery_even_for_open_source() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let provider = root.join("Provider.pas");
+    let selected = root.join("A.dproj");
+    let remaining = root.join("B.dproj");
+    let source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    write_file(&provider, source);
+    for project in [&selected, &remaining] {
+        write_file(
+            project,
+            "<Project><PropertyGroup><MainSource>Provider.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&provider), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    let select_id = RequestId::from("code-lens-select-project".to_string());
+    server.send_request(
+        select_id.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&provider)}, "projectUri": uri(&selected)}),
+    );
+    assert!(server.response(&select_id).error.is_none());
+    fs::remove_file(&selected).expect("remove selected project");
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&selected), "type": 3}]}),
+    );
+    let context_id = RequestId::from("code-lens-invalid-context".to_string());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    assert_eq!(
+        server
+            .response(&context_id)
+            .result
+            .expect("project context")["selectionMode"],
+        "invalid"
+    );
+    let lenses_id = RequestId::from("code-lens-invalid-owner".to_string());
+    server.send_request(
+        lenses_id.clone(),
+        "textDocument/codeLens",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    let response = server.response(&lenses_id);
+    assert!(
+        response.error.is_some()
+            || response
+                .result
+                .as_ref()
+                .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty)),
+        "invalid owner produced lenses: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn code_lens_queued_resolution_cancellation_returns_no_locations() {
+    let environment = tempfile::tempdir().expect("server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n",
+    );
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    let discover_id = RequestId::from("code-lens-cancel-discovery".to_string());
+    server.send_request(
+        discover_id.clone(),
+        "textDocument/codeLens",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    let response = server.response(&discover_id);
+    let lens = response
+        .result
+        .expect("discovered lenses")
+        .as_array()
+        .expect("lens array")[0]
+        .clone();
+    for number in 0..2 {
+        let blocker = root.join(format!("Blocker{number}.pas"));
+        write_file(
+            &blocker,
+            &format!("unit Blocker{number};\ninterface\nimplementation\nend.\n"),
+        );
+        server.send_request(
+            RequestId::from(format!("code-lens-blocker-{number}")),
+            "textDocument/definition",
+            json!({"textDocument": {"uri": uri(&blocker)}, "position": {"line": 0, "character": 5}}),
+        );
+    }
+    barrier.wait_for_entries(2);
+    let resolve_id = RequestId::from("code-lens-cancel-resolve".to_string());
+    server.send_request(resolve_id.clone(), "codeLens/resolve", lens);
+    server.send_notification("$/cancelRequest", json!({"id": resolve_id}));
+    let cancelled = server.response(&resolve_id);
+    assert_eq!(
+        cancelled.error.expect("queued resolve cancellation").code,
+        -32800
+    );
+    barrier.release();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn code_lens_computed_discovery_rejects_late_overlay() {
+    let environment = tempfile::tempdir().expect("server environment");
+    let root = environment.path().join("workspace");
+    let provider = root.join("Provider.pas");
+    let source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    write_file(&provider, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&provider), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    let id = RequestId::from("code-lens-queued-discovery".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/codeLens",
+        json!({"textDocument": {"uri": uri(&provider)}}),
+    );
+    barrier.wait_for_entries(1);
+    server.send_notification(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri(&provider), "version": 2}, "contentChanges": [{"text": source.replace("PublicRoutine", "ChangedRoutine") }]}),
+    );
+    let fence_id = RequestId::from("code-lens-queued-overlay-fence".to_string());
+    server.send_request(
+        fence_id.clone(),
+        "workspace/willCreateFiles",
+        json!({"files": []}),
+    );
+    assert!(server.response(&fence_id).error.is_none());
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some()
+            || response
+                .result
+                .as_ref()
+                .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty)),
+        "old source lenses escaped delivery freshness: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn change_signature_swaps_all_proven_nested_calls_and_literal_defaults() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();

@@ -48,6 +48,7 @@ use walkdir::WalkDir;
 
 use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTarget, SourceKind};
 
+pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod extract;
 pub(crate) mod projects;

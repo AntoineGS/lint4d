@@ -46414,7 +46414,7 @@ fn code_lens_resolves_bound_references_and_implementation_lazily() {
     let main = root.join("Main.pas");
     write_file(
         &provider,
-        "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n",
+        "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\n{ Implementation comment }\nbegin\nend;\nend.\n",
     );
     write_file(
         &main,
@@ -46555,6 +46555,21 @@ fn code_lens_resolve_refuses_stale_or_forged_discovery_token() {
         server.response(&forged_id).error.is_some(),
         "forged range was accepted"
     );
+    for (index, field, forged_value) in [
+        (0, "sourceHash", json!("0")),
+        (1, "sourceGeneration", json!("999999")),
+        (2, "configurationGeneration", json!("999999")),
+        (3, "uri", json!("file:///workspace/Other.pas")),
+    ] {
+        let mut forged = lens.clone();
+        forged["data"][field] = forged_value;
+        let id = RequestId::from(format!("code-lens-forged-data-{index}"));
+        server.send_request(id.clone(), "codeLens/resolve", forged);
+        assert!(
+            server.response(&id).error.is_some(),
+            "forged {field} was accepted"
+        );
+    }
 
     server.send_notification(
         "textDocument/didChange",

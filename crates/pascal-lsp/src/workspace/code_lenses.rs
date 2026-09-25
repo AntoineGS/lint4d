@@ -149,17 +149,15 @@ fn lenses_for_source(
         let Some(header) = definition.child_by_field_name("header") else {
             continue;
         };
-        let Some(body) = definition
+        if definition
             .child_by_field_name("body")
             .filter(|body| body.kind() == "block")
-        else {
+            .is_none()
+        {
             continue;
-        };
+        }
         if !simple_procedure_name(header, source)
             .is_some_and(|other| other.eq_ignore_ascii_case(name))
-            || !source[header.end_byte()..body.start_byte()]
-                .chars()
-                .all(char::is_whitespace)
         {
             continue;
         }
@@ -430,6 +428,16 @@ mod tests {
         let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
         let spaced = SOURCE.replace("procedure PublicRoutine;", "procedure   PublicRoutine ;");
         assert_eq!(lenses_for_source(&uri, &spaced, 7, 3).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn comment_between_header_and_body_preserves_implementation_lens() {
+        let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
+        let commented = SOURCE.replace(
+            "procedure PublicRoutine;\nbegin",
+            "procedure PublicRoutine;\n{ This is the implementation. }\nbegin",
+        );
+        assert_eq!(lenses_for_source(&uri, &commented, 7, 3).unwrap().len(), 2);
     }
 
     #[test]

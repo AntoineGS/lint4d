@@ -91,6 +91,7 @@ pub(super) fn incoming(
         super::MAX_NAVIGATION_OVERLOAD_BYTES,
         "call hierarchy incoming binding",
     );
+    let mut result_budget = ResultBudget::default();
     for (uri, document) in &index.documents {
         let root = document.tree.root_node();
         scan_calls(root, &mut budget, cancel, &mut |call| {
@@ -111,20 +112,15 @@ pub(super) fn incoming(
             else {
                 return Ok(());
             };
+            if has_dynamic_dispatch(callee) {
+                return Ok(());
+            }
             if callee_uri != target_uri
                 || callee.selection_span != target_symbol.selection_span
                 || callee.routine_signature != target_symbol.routine_signature
             {
                 return Ok(());
             }
-            if caller.routine_directives.dynamic
-                || caller.routine_directives.virtual_
-                || caller.routine_directives.override_
-            {
-                return Ok(());
-            }
-            let caller_item = item_for_symbol(uri, document, caller)
-                .ok_or_else(|| "could not form caller identity".to_string())?;
             let entity = call
                 .child_by_field_name("entity")
                 .ok_or_else(|| "call has no entity".to_string())?;
@@ -132,16 +128,25 @@ pub(super) fn incoming(
             else {
                 return Ok(());
             };
+            result_budget.charge(
+                uri.as_str()
+                    .len()
+                    .saturating_add(3 * std::mem::size_of::<usize>()),
+            )?;
             let key = (uri.to_string(), caller_index, caller.selection_span.start);
-            grouped
-                .entry(key)
-                .or_insert_with(|| (caller_item, Vec::new()))
-                .1
-                .push(range);
+            if let Some((_, ranges)) = grouped.get_mut(&key) {
+                result_budget.charge_range()?;
+                ranges.push(range);
+            } else {
+                result_budget.charge_item(uri, caller)?;
+                result_budget.charge_range()?;
+                let caller_item = item_for_symbol(uri, document, caller)
+                    .ok_or_else(|| "could not form caller identity".to_string())?;
+                grouped.insert(key, (caller_item, vec![range]));
+            }
             Ok(())
         })?;
     }
-    ensure_result_budget(&grouped)?;
     grouped
         .into_values()
         .map(|(from, mut from_ranges)| {
@@ -178,6 +183,7 @@ pub(super) fn outgoing(
         super::MAX_NAVIGATION_OVERLOAD_BYTES,
         "call hierarchy outgoing binding",
     );
+    let mut result_budget = ResultBudget::default();
     scan_calls(
         document.tree.root_node(),
         &mut budget,
@@ -202,18 +208,13 @@ pub(super) fn outgoing(
             else {
                 return Ok(());
             };
-            if callee.routine_directives.dynamic
-                || callee.routine_directives.virtual_
-                || callee.routine_directives.override_
-            {
+            if has_dynamic_dispatch(callee) {
                 return Ok(());
             }
             let callee_document = index
                 .documents
                 .get(&callee_uri)
                 .ok_or_else(|| "resolved call target source is unavailable".to_string())?;
-            let callee_item = item_for_symbol(&callee_uri, callee_document, callee)
-                .ok_or_else(|| "could not form callee identity".to_string())?;
             let entity = call
                 .child_by_field_name("entity")
                 .ok_or_else(|| "call has no entity".to_string())?;
@@ -221,20 +222,30 @@ pub(super) fn outgoing(
             else {
                 return Ok(());
             };
+            result_budget.charge(
+                callee_uri
+                    .as_str()
+                    .len()
+                    .saturating_add(3 * std::mem::size_of::<usize>()),
+            )?;
             let key = (
                 callee_uri.to_string(),
                 callee.selection_span.start,
                 callee.selection_span.end,
             );
-            grouped
-                .entry(key)
-                .or_insert_with(|| (callee_item, Vec::new()))
-                .1
-                .push(range);
+            if let Some((_, ranges)) = grouped.get_mut(&key) {
+                result_budget.charge_range()?;
+                ranges.push(range);
+            } else {
+                result_budget.charge_item(&callee_uri, callee)?;
+                result_budget.charge_range()?;
+                let callee_item = item_for_symbol(&callee_uri, callee_document, callee)
+                    .ok_or_else(|| "could not form callee identity".to_string())?;
+                grouped.insert(key, (callee_item, vec![range]));
+            }
             Ok(())
         },
     )?;
-    ensure_result_budget(&grouped)?;
     grouped
         .into_values()
         .map(|(to, mut from_ranges)| {
@@ -347,6 +358,9 @@ fn resolve_call<'a>(
     let Some(entity) = call.child_by_field_name("entity") else {
         return Ok(None);
     };
+    if !is_direct_callee_entity(entity) {
+        return Ok(None);
+    }
     let identifier = super::callable_lookup_identifier(entity);
     let Some(position) = text::offset_to_position(&document.source, identifier.start_byte()) else {
         return Ok(None);
@@ -449,29 +463,70 @@ fn byte_range(source: &str, start: usize, end: usize) -> Option<Range> {
     })
 }
 
-fn ensure_result_budget(
-    grouped: &BTreeMap<(String, usize, usize), (CallHierarchyItem, Vec<Range>)>,
-) -> Result<(), String> {
-    let retained = grouped
-        .iter()
-        .try_fold(0usize, |total, ((uri, _, _), (item, ranges))| {
-            let bytes = uri
-                .len()
-                .saturating_add(item.name.len())
-                .saturating_add(item.detail.as_ref().map_or(0, String::len))
-                .saturating_add(
-                    item.data
-                        .as_ref()
-                        .and_then(|data| serde_json::to_vec(data).ok())
-                        .map_or(0, |data| data.len()),
-                )
-                .saturating_add(ranges.len().saturating_mul(std::mem::size_of::<Range>()));
-            let next = total.saturating_add(bytes);
-            (next <= MAX_RESULT_BYTES).then_some(next)
-        });
-    retained
-        .map(|_| ())
-        .ok_or_else(|| "call hierarchy result byte limit exceeded".to_string())
+#[derive(Default)]
+struct ResultBudget {
+    bytes: usize,
+}
+
+impl ResultBudget {
+    fn charge_item(&mut self, uri: &Url, symbol: &Symbol) -> Result<(), String> {
+        // Reserve conservatively for the map node/key, CallHierarchyItem,
+        // serialized identity data (which repeats URI/name), and cloned detail
+        // before constructing or inserting any of those allocations.
+        let bytes = uri
+            .as_str()
+            .len()
+            .saturating_mul(3)
+            .saturating_add(symbol.name.len().saturating_mul(3))
+            .saturating_add(symbol.routine_signature.as_ref().map_or(0, String::len))
+            .saturating_add(1_024);
+        self.charge(bytes)
+    }
+
+    fn charge_range(&mut self) -> Result<(), String> {
+        // Includes the range plus amortized Vec capacity and map bookkeeping.
+        self.charge(
+            std::mem::size_of::<Range>()
+                .saturating_mul(2)
+                .saturating_add(64),
+        )
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.bytes.saturating_add(bytes);
+        if next > MAX_RESULT_BYTES {
+            return Err("call hierarchy result byte limit exceeded".to_string());
+        }
+        self.bytes = next;
+        Ok(())
+    }
+}
+
+fn has_dynamic_dispatch(symbol: &Symbol) -> bool {
+    symbol.routine_directives.dynamic
+        || symbol.routine_directives.virtual_
+        || symbol.routine_directives.override_
+}
+
+fn is_direct_callee_entity(entity: Node<'_>) -> bool {
+    if !matches!(
+        entity.kind(),
+        "identifier" | "exprDot" | "genericDot" | "typerefDot" | "exprTpl"
+    ) {
+        return false;
+    }
+    let mut stack = vec![entity];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "exprCall" {
+            return false;
+        }
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    true
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {

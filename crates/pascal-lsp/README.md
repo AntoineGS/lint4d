@@ -1186,12 +1186,13 @@ Bare procedure statements without an `exprCall` node, indirect/function-value
 calls, dynamic dispatch, and other unsupported call forms are not counted.
 
 AST scanning is bounded to 200,000 visited nodes and 4,096 call expressions
-per request, and retained result data is bounded to 2 MiB. Exceeding a bound or
-observing cancellation/freshness failure returns an error rather than a partial
-call graph. Edges are read-only and ordered/deduplicated by source identity and
-location. Candidate binding shares the navigation resolver's 100,000-work and
-8 MiB budget across the request. These limits and the subset are implementation
-policy, not a claim of complete Pascal call-graph semantics.
+per request, and a conservative 2 MiB result-construction budget is reserved
+before item/range allocations. Exceeding a bound or observing cancellation/
+freshness failure returns an error rather than a partial call graph. Edges are
+read-only and ordered/deduplicated by source identity and location. Candidate
+binding shares the navigation resolver's 100,000-work and 8 MiB budget across
+the request. These limits and the subset are implementation policy, not a claim
+of complete Pascal call-graph semantics.
 
 ### Document outlines
 

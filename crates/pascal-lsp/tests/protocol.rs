@@ -2718,6 +2718,123 @@ fn call_hierarchy_cancellation_discards_completed_edges() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn call_hierarchy_result_is_rejected_after_queued_disk_content_change() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("DiskFreshCalls.pas");
+    let source = "unit DiskFreshCalls;\ninterface\nfunction Target: Integer;\nfunction Caller: Integer;\nimplementation\nfunction Target: Integer;\nbegin Result := 1; end;\nfunction Caller: Integer;\nbegin Result := Target(); end;\nend.\n";
+    write_file(&path, source);
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(path.parent().expect("workspace root"), json!({}));
+    let prepare_id = RequestId::from("disk-fresh-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(prepare.error.is_none(), "prepare failed: {prepare:?}");
+    let item = prepare.result.expect("caller item")[0].clone();
+    let id = RequestId::from("disk-fresh-outgoing".to_string());
+    server.send_request(
+        id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": item}),
+    );
+    barrier.wait_until_entered();
+    write_file(&path, &source.replace("Target()", "Target(1)"));
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.result.is_none(),
+        "stale disk edges must not publish: {response:?}"
+    );
+    let error = response
+        .error
+        .expect("disk freshness failure should be reported");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error.message.contains("closed source changed")
+            && error.message.contains("retry the request"),
+        "expected disk read-set invalidation, got: {error:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn call_hierarchy_result_is_rejected_after_queued_project_owner_change() {
+    let root = tempfile::tempdir().expect("workspace");
+    let project = root.path().join("App.dproj");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    let other = root.path().join("Other.pas");
+    let owner_source = "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_Define>ONE</DCC_Define></PropertyGroup></Project>";
+    write_file(&project, owner_source);
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\nfunction Target: Integer;\nimplementation\nfunction Target: Integer;\nbegin Result := 1; end;\nend.\n",
+    );
+    write_file(
+        &main,
+        "program Main;\nuses Provider;\nfunction Caller: Integer;\nbegin Result := Target(); end;\nbegin end.\n",
+    );
+    let (mut server, barrier) = TestServer::launch_with_partial_validation_barrier(root);
+    server.initialize(
+        project.parent().expect("project root"),
+        json!({"projectFile": "App.dproj"}),
+    );
+    let prepare_id = RequestId::from("owner-target-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&provider)}, "position": {"line": 2, "character": 10}
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "project target prepare failed: {prepare:?}"
+    );
+    let item = prepare.result.expect("target item")[0].clone();
+    let id = RequestId::from("owner-incoming".to_string());
+    server.send_request(
+        id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": item}),
+    );
+    barrier.wait_until_entered();
+    write_file(
+        &project,
+        &owner_source
+            .replace("Main.pas", "Other.pas")
+            .replace("ONE", "TWO"),
+    );
+    write_file(&other, "program Other; begin end.\n");
+    barrier.release();
+    let response = server.response(&id);
+    assert!(
+        response.result.is_none(),
+        "old project-owner edges must not publish: {response:?}"
+    );
+    let error = response
+        .error
+        .expect("project ownership freshness failure should be reported");
+    assert_eq!(error.code, -32803);
+    assert!(
+        error
+            .message
+            .contains("workspace metadata or membership changed")
+            && error.message.contains("retry the request"),
+        "expected project read-set invalidation, got: {error:?}"
+    );
+    server.shutdown();
+}
+
 #[test]
 fn call_hierarchy_omits_named_references_and_ambiguous_overloads() {
     let root = tempfile::tempdir().expect("workspace");
@@ -2810,6 +2927,134 @@ fn call_hierarchy_keeps_uniquely_selected_overloads_as_distinct_items() {
         assert_eq!(incoming.as_array().expect("incoming array").len(), 1);
         assert_eq!(incoming[0]["fromRanges"][0]["start"]["line"], call_line);
     }
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_does_not_report_incoming_calls_for_virtual_targets() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("VirtualCalls.pas");
+    let source = "unit VirtualCalls;\ninterface\ntype TBase = class\n  procedure Ping; virtual;\nend;\nprocedure Use;\nimplementation\nprocedure TBase.Ping;\nbegin end;\nprocedure Use;\nvar Obj: TBase;\nbegin\n  Obj.Ping();\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("virtual-ping-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Ping", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "virtual target prepare failed: {prepare:?}"
+    );
+    let item = prepare.result.expect("virtual target item")[0].clone();
+    let incoming_id = RequestId::from("virtual-ping-incoming".to_string());
+    server.send_request(
+        incoming_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": item}),
+    );
+    let incoming = server.response(&incoming_id);
+    assert!(
+        incoming.error.is_none(),
+        "incoming query failed: {incoming:?}"
+    );
+    assert_eq!(incoming.result.expect("incoming edges"), json!([]));
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_attributes_only_the_direct_inner_call_in_nested_invocation() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("NestedCalls.pas");
+    let source = "unit NestedCalls;\ninterface\nfunction MakeCallback: Integer;\nfunction Caller: Integer;\nimplementation\nfunction MakeCallback: Integer;\nbegin Result := 1; end;\nfunction Caller: Integer;\nbegin Result := MakeCallback()(); end;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let prepare_id = RequestId::from("nested-caller-prepare".to_string());
+    server.send_request(
+        prepare_id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(source, "Caller", 0)
+        }),
+    );
+    let prepare = server.response(&prepare_id);
+    assert!(
+        prepare.error.is_none(),
+        "caller prepare failed: {prepare:?}"
+    );
+    let caller = prepare.result.expect("caller item")[0].clone();
+    let outgoing_id = RequestId::from("nested-outgoing".to_string());
+    server.send_request(
+        outgoing_id.clone(),
+        "callHierarchy/outgoingCalls",
+        json!({"item": caller}),
+    );
+    let outgoing = server.response(&outgoing_id);
+    assert!(
+        outgoing.error.is_none(),
+        "outgoing query failed: {outgoing:?}"
+    );
+    let edges = outgoing.result.expect("outgoing edges");
+    let edges = edges.as_array().expect("outgoing array");
+    assert_eq!(
+        edges.len(),
+        1,
+        "outer indirect call must not be attributed to inner function: {edges:?}"
+    );
+    assert_eq!(edges[0]["to"]["name"], "MakeCallback");
+    assert_eq!(edges[0]["fromRanges"].as_array().expect("ranges").len(), 1);
+    assert_eq!(edges[0]["fromRanges"][0]["start"]["character"], 16);
+    assert_eq!(edges[0]["fromRanges"][0]["end"]["character"], 28);
+    server.shutdown();
+}
+
+#[test]
+fn call_hierarchy_rejects_results_over_retained_byte_budget() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("LargeCallHierarchy.pas");
+    let long_type = "T".repeat(2 * 1024 * 1024 - 150);
+    let source = format!(
+        "unit LargeCallHierarchy;\ninterface\nprocedure Target;\nimplementation\nprocedure Target; begin end;\nprocedure Caller(Param: {long_type}); begin Target(); end;\nend.\n"
+    );
+    write_file(&path, &source);
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), json!({}));
+    let id = RequestId::from("large-call-hierarchy-target".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": {"uri": uri(&path)}, "position": position_of(&source, "Target", 0)
+        }),
+    );
+    let prepare = server.response(&id);
+    assert!(
+        prepare.error.is_none(),
+        "target prepare failed: {prepare:?}"
+    );
+    let target = prepare.result.expect("target item")[0].clone();
+    let incoming_id = RequestId::from("large-call-hierarchy-incoming".to_string());
+    server.send_request(
+        incoming_id.clone(),
+        "callHierarchy/incomingCalls",
+        json!({"item": target}),
+    );
+    let incoming = server.response(&incoming_id);
+    assert!(
+        incoming.result.is_none(),
+        "over-budget result must not be partial: {incoming:?}"
+    );
+    let message = incoming.error.expect("byte limit error").message;
+    assert!(
+        message.contains("byte limit"),
+        "expected byte-cap refusal, got {message}"
+    );
     server.shutdown();
 }
 

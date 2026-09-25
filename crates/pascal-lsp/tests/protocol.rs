@@ -2831,6 +2831,99 @@ fn compiled_provider_rebind_after_same_importer_edit_keeps_fresh_binding() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn queued_compiled_content_and_symbols_reject_changed_importer_overlay() {
+    let environment = tempfile::tempdir().expect("server environment");
+    let root = environment.path().join("workspace");
+    let lib = root.join("lib");
+    fs::create_dir_all(&lib).expect("library directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+    fs::copy(fixture, lib.join("Lint4dFixture.Classes.dcu")).expect("D13 fixture");
+    let main = root.join("Consumer.pas");
+    let source = "unit Consumer;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Consumer.pas</MainSource><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let (mut server, barrier, dispatch) =
+        TestServer::launch_with_navigation_barrier_and_dispatch_log(environment);
+    server.initialize(&root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
+    );
+    barrier.release();
+    let definition_id = RequestId::from("establish-compiled-binding".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri(&main)}, "position": {"line": 3, "character": 16}}),
+    );
+    let definition = server.response(&definition_id);
+    assert!(
+        definition.error.is_none(),
+        "initial binding failed: {definition:?}"
+    );
+    let virtual_uri = definition.result.expect("definition")[0]["uri"]
+        .as_str()
+        .expect("virtual URI")
+        .to_owned();
+    fs::remove_file(&barrier.release).expect("re-arm navigation barrier");
+    fs::remove_file(&barrier.entered).expect("reset navigation entry count");
+
+    for number in 0..2 {
+        let other = root.join(format!("Blocker{number}.pas"));
+        write_file(
+            &other,
+            &format!(
+                "unit Blocker{number};\ninterface\ntype TLocal = Integer;\nimplementation\nend.\n"
+            ),
+        );
+        server.send_request(
+            RequestId::from(format!("compiled-queue-blocker-{number}")),
+            "textDocument/definition",
+            json!({"textDocument": {"uri": uri(&other)}, "position": {"line": 2, "character": 7}}),
+        );
+    }
+    barrier.wait_for_entries(2);
+    let queued_content = RequestId::from("queued-compiled-content".to_string());
+    let queued_symbols = RequestId::from("queued-compiled-symbols".to_string());
+    server.send_request(
+        queued_content.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    server.send_request(
+        queued_symbols.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": virtual_uri}}),
+    );
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": "unit Consumer;\ninterface\nimplementation\nend.\n"}]
+        }),
+    );
+    // Keep both worker slots occupied until the request and overlay change
+    // have been admitted in protocol order.
+    thread::sleep(Duration::from_millis(50));
+    let _ = dispatch.wait_for_entries(3);
+    barrier.release();
+
+    for request_id in [queued_content, queued_symbols] {
+        let response = server.response(&request_id);
+        assert!(
+            response.error.is_some(),
+            "stale queued virtual result: {response:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn queued_compiled_navigation_rejects_same_size_restored_mtime_dcu_change() {
     let temp = tempfile::tempdir().expect("isolated workspace");
     let root = temp.path();

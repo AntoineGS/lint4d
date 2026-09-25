@@ -2168,6 +2168,8 @@ struct CompiledProviderBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledContentSnapshot {
     uri: Url,
+    source_generation: u64,
+    configuration_generation: u64,
     importer: Url,
     importer_source_hash: u64,
     context_fingerprint: u64,
@@ -2177,6 +2179,10 @@ pub(crate) struct CompiledContentSnapshot {
 }
 
 impl CompiledContentSnapshot {
+    pub(crate) fn generations(&self) -> (u64, u64) {
+        (self.source_generation, self.configuration_generation)
+    }
+
     /// Conservative byte estimate for the owned payload retained by a queued
     /// or running content request. Includes cloned project observations, open
     /// importer text, generated unit text, and URI strings.
@@ -2576,10 +2582,6 @@ struct SharedLintResult {
 }
 
 impl Workspace {
-    pub(crate) fn analysis_generations(&self) -> (u64, u64) {
-        (self.source_generation, self.configuration_generation)
-    }
-
     /// Capture only the bounded, already-authorized immutable data needed by a
     /// content worker. This path performs no filesystem access; URI and binding
     /// authorization are still required before a snapshot is created.
@@ -2612,6 +2614,8 @@ impl Workspace {
         let unit = self.compiled_units.get(uri)?.clone();
         (unit.document.uri() == uri).then(|| CompiledContentSnapshot {
             uri: uri.clone(),
+            source_generation: self.source_generation,
+            configuration_generation: self.configuration_generation,
             importer: binding.importer.clone(),
             importer_source_hash: binding.importer_source_hash,
             context_fingerprint: binding.context_fingerprint,

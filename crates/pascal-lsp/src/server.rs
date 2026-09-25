@@ -5096,7 +5096,9 @@ impl AnalysisJobs {
         features: ClientFeatures,
     ) -> Result<PendingAnalysis, String> {
         if let AnalysisRequest::CompiledContent { snapshot, symbols } = request {
-            let (source_generation, configuration_generation) = workspace.analysis_generations();
+            // Keep the admission-time generations. A queued request must not
+            // adopt the post-edit generations when it finally gets a worker.
+            let (source_generation, configuration_generation) = snapshot.generations();
             let cancellation = Arc::new(AtomicBool::new(false));
             let worker_cancellation = Arc::clone(&cancellation);
             let sender = self.sender.clone();

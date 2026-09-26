@@ -301,6 +301,16 @@ fn neovim_installation_selection() {
         "<Project><PropertyGroup><MainSource>../../src/App.dpr</MainSource></PropertyGroup></Project>",
     )
     .unwrap();
+    fs::write(
+        root.join("projects/App/Alternative.dproj"),
+        "<Project><PropertyGroup><MainSource>../../src/App.dpr</MainSource></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("projects/App/Chooser.pas"),
+        "unit Chooser;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
     fs::write(root.join("src/App.dpr"), "program App; begin end.\n").unwrap();
     fs::write(
         root.join("projects/Loose/Loose.dproj"),

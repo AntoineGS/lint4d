@@ -5729,7 +5729,8 @@ impl ProjectBuilder {
         tracker: &mut ProjectReadTracker<'_>,
         provenance: &ProjectPathProvenance,
     ) -> Result<(), String> {
-        let operations = parse_xml_operations(contents, path)?;
+        let operations = parse_xml_operations(contents, path)
+            .map_err(|error| format!("malformed installation XML: {error}"))?;
         let previous_mode = std::mem::replace(&mut self.installation_data_mode, true);
         let result = self.process_operations(operations, path, tracker, provenance);
         self.installation_data_mode = previous_mode;
@@ -6043,6 +6044,23 @@ impl ProjectBuilder {
         }
     }
 
+    fn unknown_installation_import(
+        &mut self,
+        source_file: &Path,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.incomplete = true;
+        self.taint_unknown_import();
+        if self.installation_data_mode {
+            Err(format!(
+                "unknown installation-data import in {}: {reason}",
+                source_file.display()
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn mark_property_unknown(
         &mut self,
         name: &str,
@@ -6073,6 +6091,37 @@ impl ProjectBuilder {
         tracker: &mut ProjectReadTracker<'_>,
         source_provenance: &ProjectPathProvenance,
     ) -> Result<(), String> {
+        let condition = condition_matches(
+            import.condition.as_deref(),
+            ConditionEnvironment {
+                properties: &self.properties,
+                unknown_properties: &self.unknown_properties,
+                unknown_import_taint: self.unknown_import_taint,
+                overrides: &self.overrides,
+                read_policy: &self.read_policy,
+            },
+            base,
+            &mut self.metadata_files,
+            &mut self.warnings,
+            source_file,
+        );
+        match condition {
+            TruthValue::True => {}
+            TruthValue::False => return Ok(()),
+            TruthValue::Unknown => {
+                self.incomplete = true;
+                self.taint_unknown_import();
+                return if self.installation_data_mode {
+                    Err(format!(
+                        "unknown installation-data import condition in {}: {}",
+                        source_file.display(),
+                        import.project
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+        }
         if !import_may_be_evaluated(&import.project) {
             let message = format!(
                 "unsupported MSBuild import in {} (targets are not executed): {}",
@@ -6103,9 +6152,7 @@ impl ProjectBuilder {
             source_provenance,
         );
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            return Ok(());
+            return self.unknown_installation_import(source_file, "unresolved import path");
         }
         let Some(resolved) = project_path_candidate(
             &expanded.value,
@@ -6114,9 +6161,7 @@ impl ProjectBuilder {
             &mut self.warnings,
             "project import",
         ) else {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            return Ok(());
+            return self.unknown_installation_import(source_file, "unresolvable import path");
         };
         let candidate = lexical_normalize(&resolved.path);
         if !is_supported_project_import(&candidate) {
@@ -6146,9 +6191,8 @@ impl ProjectBuilder {
             ExistingPathStatus::Found(path) => path,
             ExistingPathStatus::Missing => &candidate,
             ExistingPathStatus::Unresolvable => {
-                self.incomplete = true;
-                self.taint_unknown_import();
-                return Ok(());
+                return self
+                    .unknown_installation_import(source_file, "unresolvable import location");
             }
         };
         let entry = inherit_path_provenance(
@@ -6158,13 +6202,14 @@ impl ProjectBuilder {
         if matches!(path_status, ExistingPathStatus::Found(_))
             && !self.read_policy.allows_entry(&entry)
         {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(format!(
                 "ignored project import outside authorized read roots: {}",
                 path.display()
             ));
-            return Ok(());
+            return self.unknown_installation_import(
+                source_file,
+                "import is outside authorized read roots",
+            );
         }
         if !add_metadata_file(
             &mut self.metadata_files,
@@ -6173,61 +6218,30 @@ impl ProjectBuilder {
             source_file,
             "project import",
         ) {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            return Ok(());
-        }
-        let condition = condition_matches(
-            import.condition.as_deref(),
-            ConditionEnvironment {
-                properties: &self.properties,
-                unknown_properties: &self.unknown_properties,
-                unknown_import_taint: self.unknown_import_taint,
-                overrides: &self.overrides,
-                read_policy: &self.read_policy,
-            },
-            base,
-            &mut self.metadata_files,
-            &mut self.warnings,
-            source_file,
-        );
-        match condition {
-            TruthValue::True => {}
-            TruthValue::False => return Ok(()),
-            TruthValue::Unknown => {
-                self.incomplete = true;
-                self.taint_unknown_import();
-                return Ok(());
-            }
+            return self.unknown_installation_import(source_file, "metadata import limit reached");
         }
         if self.import_count >= MAX_IMPORT_COUNT {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(format!(
                 "project import limit ({MAX_IMPORT_COUNT}) reached while reading {}",
                 source_file.display()
             ));
-            return Ok(());
+            return self.unknown_installation_import(source_file, "project import limit reached");
         }
         let ExistingPathStatus::Found(path) = path_status else {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(missing_path_warning(
                 "project import",
                 &expanded.value,
                 &candidate,
                 &resolved,
             ));
-            return Ok(());
+            return self.unknown_installation_import(source_file, "import file is missing");
         };
         if !self.active_imports.insert(path.clone()) {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(format!(
                 "project import cycle ignored at {}",
                 path.display()
             ));
-            return Ok(());
+            return self.unknown_installation_import(source_file, "project import cycle");
         }
         self.import_count += 1;
         let result =
@@ -6250,7 +6264,11 @@ impl ProjectBuilder {
                     "could not read project import {}: {error}",
                     path.display()
                 ));
-                if transient { Err(error) } else { Ok(()) }
+                if transient || self.installation_data_mode {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
             }
         };
         self.active_imports.remove(&path);

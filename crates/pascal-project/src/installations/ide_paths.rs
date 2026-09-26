@@ -506,6 +506,133 @@ mod tests {
             "request cancelled"
         );
     }
+
+    #[test]
+    fn unsupported_environment_import_fails_closed_instead_of_using_partial_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        write(
+            &ide.join("environment.proj"),
+            r#"<Project><Import Project="unsupported.targets"/><PropertyGroup><BDSLIB>C:\Original\lib</BDSLIB></PropertyGroup></Project>"#,
+        );
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let error =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap_err();
+        assert!(error.contains("unsupported MSBuild import"));
+    }
+
+    #[test]
+    fn nested_environment_import_cancellation_is_propagated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CancelAtNestedImport(AtomicUsize);
+        impl ProjectWorkBudget for CancelAtNestedImport {
+            fn check_cancelled(&self) -> Result<(), String> {
+                if self.0.load(Ordering::SeqCst) >= 5 {
+                    Err("request cancelled".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+            fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+                self.0.fetch_add(amount, Ordering::SeqCst);
+                Ok(())
+            }
+            fn ensure_file_read_fits(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn charge_file_bytes(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_transient_error(&self, error: &str) -> bool {
+                error == "request cancelled"
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        write(&ide.join("settings.props"), "<Project/>");
+        write(
+            &ide.join("environment.proj"),
+            r#"<Project><Import Project="settings.props"/><PropertyGroup><BDSLIB>C:\Original\lib</BDSLIB></PropertyGroup></Project>"#,
+        );
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let budget = CancelAtNestedImport(AtomicUsize::new(0));
+        let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+        assert_eq!(
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap_err(),
+            "request cancelled"
+        );
+    }
+
+    #[test]
+    fn inactive_unsupported_platform_import_does_not_fail_selected_platform() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        write(
+            &ide.join("EnvOptions.proj"),
+            r#"<Project><Import Project="win32.targets" Condition="'$(Platform)'=='Win32'"/><PropertyGroup Condition="'$(Platform)'=='Linux64'"><DelphiLibraryPath>$(BDS)\lib</DelphiLibraryPath></PropertyGroup></Project>"#,
+        );
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk.clone(), ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let environment =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap();
+        let paths = evaluate_ide_paths(
+            &environment,
+            &profile,
+            "Debug",
+            "Linux64",
+            &mut tracker,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(paths.library[0].path, sdk.join("lib"));
+    }
 }
 use super::{
     InstallationEnvironment, PropertyMap, relocate_environment, resolve_path_with_inferred,
@@ -619,6 +746,13 @@ pub(crate) fn load_installation(
                     warnings = builder.warnings;
                 }
                 Err(error) => {
+                    if tracker
+                        .work_budget
+                        .is_some_and(|budget| budget.is_transient_error(&error))
+                        || !error.starts_with("malformed installation XML:")
+                    {
+                        return Err(error);
+                    }
                     warnings.push(format!(
                         "malformed environment settings {}: {error}",
                         path.display()

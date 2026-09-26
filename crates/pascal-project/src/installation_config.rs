@@ -9,7 +9,7 @@ use crate::delphi_overrides::{EffectiveOverrides, OverrideLayer, RawPathMapping,
 pub(crate) struct ConfigurationLayer {
     pub(crate) shared: OverrideLayer,
     pub(crate) installations: BTreeMap<String, OverrideLayer>,
-    projects: HashMap<String, String>,
+    projects: HashMap<PathBuf, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +64,12 @@ impl ConfigurationLayer {
 
         let mut projects = HashMap::new();
         for (selector, project) in raw.projects {
+            if project.installation.trim().is_empty() {
+                return Err(config_error(
+                    config_file,
+                    format_args!("project selector `{selector}` has an empty installation ID"),
+                ));
+            }
             let key = normalize_selector(config_file, &selector)?;
             if projects.insert(key, project.installation).is_some() {
                 return Err(config_error(
@@ -87,7 +93,7 @@ impl ConfigurationLayer {
 #[derive(Debug, Clone)]
 pub struct ProjectConfiguration {
     layers: Vec<ConfigurationLayer>,
-    selectors: HashMap<String, String>,
+    selectors: HashMap<PathBuf, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +194,7 @@ impl crate::delphi_overrides::OverrideSession {
     }
 }
 
-fn normalize_selector(config_file: &Path, selector: &str) -> Result<String, String> {
+fn normalize_selector(config_file: &Path, selector: &str) -> Result<PathBuf, String> {
     if selector.trim().is_empty() {
         return Err(config_error(
             config_file,
@@ -227,14 +233,43 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-fn canonical_path(path: &Path) -> String {
-    let value = path.to_string_lossy().replace('\\', "/");
+fn canonical_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        value.to_ascii_lowercase()
+        let mut canonical = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => canonical.push(fold_windows_ascii(prefix.as_os_str())),
+                Component::RootDir => canonical.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    canonical.pop();
+                }
+                Component::Normal(part) => canonical.push(fold_windows_ascii(part)),
+            }
+        }
+        canonical
     }
     #[cfg(not(windows))]
     {
-        value
+        path.to_path_buf()
     }
+}
+
+#[cfg(windows)]
+fn fold_windows_ascii(value: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    std::ffi::OsString::from_wide(
+        &value
+            .encode_wide()
+            .map(|unit| {
+                if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                    unit + (b'a' - b'A') as u16
+                } else {
+                    unit
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
 }

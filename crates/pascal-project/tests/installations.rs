@@ -117,6 +117,71 @@ fn project_installation_selectors_are_exact_and_later_layers_replace_them() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn project_selectors_keep_unix_backslash_filenames_distinct_from_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("config.toml");
+    write(
+        &user,
+        "[projects.\"app\\\\One.dproj\"]\ninstallation = 'literal-backslash'\n\
+         [projects.\"app/One.dproj\"]\ninstallation = 'directory'\n",
+    );
+    let literal_backslash = temp.path().join("app\\One.dproj");
+    let directory = temp.path().join("app/One.dproj");
+
+    let config = OverrideSession::new(Some(user))
+        .configuration_for(None, None)
+        .unwrap();
+    assert_eq!(
+        config.configured_installation_for(&literal_backslash),
+        Some("literal-backslash")
+    );
+    assert_eq!(
+        config.configured_installation_for(&directory),
+        Some("directory")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_selector_lookup_does_not_alias_invalid_utf8_to_replacement_character() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("config.toml");
+    write(
+        &user,
+        "[projects.\"App�.dproj\"]\ninstallation = 'valid-unicode'\n",
+    );
+    let invalid_utf8 = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"App\xff.dproj".to_vec()));
+    let valid_unicode = temp.path().join("App�.dproj");
+
+    let config = OverrideSession::new(Some(user))
+        .configuration_for(None, None)
+        .unwrap();
+    assert_eq!(
+        config.configured_installation_for(&valid_unicode),
+        Some("valid-unicode")
+    );
+    assert_eq!(config.configured_installation_for(&invalid_utf8), None);
+}
+
+#[test]
+fn project_selector_rejects_empty_installation_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("config.toml");
+    write(&user, "[projects.\"App.dproj\"]\ninstallation = '  '\n");
+
+    let error = OverrideSession::new(Some(user.clone()))
+        .configuration_for(None, None)
+        .expect_err("empty installation IDs must be rejected");
+    assert!(error.contains(&user.display().to_string()));
+    assert!(error.contains("installation"));
+}
+
 #[test]
 fn invalid_installation_configuration_is_rejected() {
     let temp = tempfile::tempdir().unwrap();

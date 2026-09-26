@@ -3,6 +3,7 @@
 use super::{Workspace, absolute_path, check_workspace_cancel, path_starts_with_native};
 use lsp_types::Url;
 use serde::Serialize;
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -77,7 +78,9 @@ impl Workspace {
             })?;
 
         let started = Instant::now();
-        let mut visited = 0usize;
+        let visited = Cell::new(0usize);
+        let filter_cancelled = Cell::new(false);
+        let filter_stop = Cell::new(None);
         let mut bytes = 0usize;
         let mut projects = Vec::new();
         let mut warnings = Vec::new();
@@ -86,6 +89,20 @@ impl Workspace {
             .follow_links(false)
             .into_iter()
             .filter_entry(|entry| {
+                visited.set(visited.get().saturating_add(1));
+                if check_workspace_cancel(Some(cancel)).is_err() {
+                    filter_cancelled.set(true);
+                    // Let `next` return so the outer loop can stop immediately.
+                    return true;
+                }
+                if started.elapsed() >= time_limit {
+                    filter_stop.set(Some("time"));
+                    return true;
+                }
+                if visited.get() > visit_limit {
+                    filter_stop.set(Some("entry"));
+                    return true;
+                }
                 if entry.depth() == 0 {
                     return true;
                 }
@@ -104,15 +121,34 @@ impl Workspace {
             let Some(entry) = walker.next() else {
                 break;
             };
-            visited = visited.saturating_add(1);
-            if visited > visit_limit {
+            if filter_cancelled.get() {
+                return Err("project catalogue request cancelled".to_owned());
+            }
+            if let Some(reason) = filter_stop.replace(None) {
                 complete = false;
-                warnings.push("project catalogue entry limit reached".to_owned());
+                warnings.push(match reason {
+                    "time" => "project catalogue time limit reached".to_owned(),
+                    _ => "project catalogue entry limit reached".to_owned(),
+                });
                 break;
             }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
+                    visited.set(visited.get().saturating_add(1));
+                    if check_workspace_cancel(Some(cancel)).is_err() {
+                        return Err("project catalogue request cancelled".to_owned());
+                    }
+                    if started.elapsed() >= time_limit {
+                        complete = false;
+                        warnings.push("project catalogue time limit reached".to_owned());
+                        break;
+                    }
+                    if visited.get() > visit_limit {
+                        complete = false;
+                        warnings.push("project catalogue entry limit reached".to_owned());
+                        break;
+                    }
                     complete = false;
                     if warnings.is_empty() {
                         warnings.push("project catalogue could not visit some entries".to_owned());
@@ -266,6 +302,83 @@ mod tests {
             vec!["apps/One/App.dproj", "apps/Two/App.dproj"]
         );
         assert!(catalogue.complete);
+    }
+
+    #[test]
+    fn excluded_siblings_are_charged_before_filtering_can_hide_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let ignored = root.join("ignored");
+        fs::create_dir_all(&ignored).unwrap();
+        for index in 0..10_100 {
+            fs::write(ignored.join(format!("entry-{index:05}.skip")), b"").unwrap();
+        }
+        write(&root.join("App.dproj"));
+        let workspace = Workspace::new(
+            vec![root.to_path_buf()],
+            WorkspaceOptions {
+                exclude: vec!["ignored/*.skip".to_owned()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        let catalogue = workspace
+            .list_projects_with_limits(
+                &Url::from_file_path(root).unwrap(),
+                &AtomicBool::new(false),
+                32,
+                1024,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(
+            !catalogue.complete,
+            "filtered entries still consume the visit budget"
+        );
+        assert!(
+            catalogue.projects.len() <= 1,
+            "retain only visited projects"
+        );
+        assert!(
+            catalogue
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("entry limit"))
+        );
+    }
+
+    #[test]
+    fn cancellation_is_checked_while_filtering_excluded_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let ignored = root.join("ignored");
+        fs::create_dir_all(&ignored).unwrap();
+        for index in 0..20_000 {
+            fs::write(ignored.join(format!("entry-{index:05}.skip")), b"").unwrap();
+        }
+        let workspace = Workspace::new(
+            vec![root.to_path_buf()],
+            WorkspaceOptions {
+                exclude: vec!["ignored/*.skip".to_owned()],
+                ..WorkspaceOptions::default()
+            },
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_after_delay = Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1));
+            cancel_after_delay.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = workspace.list_projects_with_limits(
+            &Url::from_file_path(root).unwrap(),
+            &cancel,
+            100_000,
+            1024,
+            Duration::from_secs(10),
+        );
+        canceller.join().unwrap();
+        assert!(result.unwrap_err().contains("cancel"));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

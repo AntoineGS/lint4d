@@ -4,7 +4,7 @@ local BUSY_RETRY_DELAY = 50
 
 local function run()
   vim.cmd('filetype on')
-  vim.opt.hidden = true
+  vim.opt.hidden = false
 
   local pickers = {}
   local notifications = {}
@@ -385,13 +385,30 @@ local function run()
   local picker_other_directory = open_project_picker(main)
   local catalogue_other_directory = browse_picker_from(picker_other_directory, main)
   local other_alpha = repo_item(catalogue_other_directory, 'other/Alpha.dproj')
+  local original_browse_request = client.request
+  local browse_selection_completed = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == other_alpha.projectUri then
+      return original_browse_request(self, method, params, function(err, response)
+        callback(err, response)
+        browse_selection_completed = true
+      end, request_bufnr)
+    end
+    return original_browse_request(self, method, params, callback, request_bufnr)
+  end
   choose(catalogue_other_directory, other_alpha)
   local other_main_path = root .. '/other/Alpha.pas'
   assert(
     vim.wait(REQUEST_TIMEOUT, function()
-      return vim.api.nvim_buf_get_name(0) == other_main_path
+      return browse_selection_completed
     end),
-    'repository browsing did not navigate to the selected main source'
+    'repository browse selection callback did not complete'
+  )
+  client.request = original_browse_request
+  assert(
+    vim.api.nvim_buf_get_name(0) == other_main_path,
+    'repository browsing did not navigate to the selected main source: '
+      .. vim.inspect({ current = vim.api.nvim_buf_get_name(0), notifications = notifications })
   )
   local other_main = vim.api.nvim_get_current_buf()
   assert(vim.bo[main].modified, 'browsing another project discarded the unsaved source buffer')
@@ -413,22 +430,45 @@ local function run()
 
   -- Changing focus after opening the catalogue must not steal it back when the
   -- project-selection response arrives. The unrelated scratch buffer stays dirty.
+  vim.bo[other_main].bufhidden = 'hide'
   local focus_picker = open_project_picker(other_main)
   local focus_catalogue = browse_picker_from(focus_picker, other_main)
+  local original_request = client.request
+  local deliver_focus_response
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == beta_project_uri then
+      return original_request(self, method, params, function(err, response)
+        deliver_focus_response = function()
+          callback(err, response)
+        end
+      end, request_bufnr)
+    end
+    return original_request(self, method, params, callback, request_bufnr)
+  end
   local unrelated = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(unrelated, root .. '/Unrelated.txt')
+  vim.bo[unrelated].bufhidden = 'hide'
   vim.api.nvim_buf_set_lines(unrelated, 0, -1, false, { 'unsaved unrelated content' })
   vim.api.nvim_set_current_buf(unrelated)
   local unrelated_lines = vim.api.nvim_buf_get_lines(unrelated, 0, -1, false)
   assert(vim.bo[unrelated].modified, 'unrelated buffer should be modified')
   choose(focus_catalogue, repo_item(focus_catalogue, 'ambiguous/Beta.dproj'))
-  wait_for_project(client, other_main, probe_uri, beta_project_uri)
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return deliver_focus_response ~= nil
+    end),
+    'server did not return the browse selection response'
+  )
+  vim.api.nvim_set_current_buf(unrelated)
+  deliver_focus_response()
+  client.request = original_request
   assert(vim.api.nvim_get_current_buf() == unrelated, 'late browse response stole focus')
   assert(vim.bo[unrelated].modified, 'late browse response cleared unrelated modifications')
   assert(
     vim.deep_equal(vim.api.nvim_buf_get_lines(unrelated, 0, -1, false), unrelated_lines),
     'late browse response changed unrelated buffer content'
   )
+  wait_for_project(client, other_main, probe_uri, beta_project_uri)
   local restored_project = project_context(client, other_main, main_uri)
   assert(restored_project.selectedProjectUri == alpha_project_uri, vim.inspect(restored_project))
   assert(
@@ -440,7 +480,6 @@ local function run()
   vim.api.nvim_set_current_buf(other_main)
   local deleted_picker = open_project_picker(other_main)
   local deleted_catalogue = browse_picker_from(deleted_picker, other_main)
-  local original_request = client.request
   local delayed_response
   client.request = function(self, method, params, callback, request_bufnr)
     if method == 'pascal/selectProject' then

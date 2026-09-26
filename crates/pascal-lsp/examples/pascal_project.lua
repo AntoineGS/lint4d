@@ -295,7 +295,12 @@ function M.attach(client, bufnr)
                 vim.notify('Selected project has no usable main source; opening the project file.', vim.log.levels.WARN)
               end
               local destination = vim.uri_to_fname(destination_uri)
-              local ok, switch_error = pcall(vim.cmd.edit, vim.fn.fnameescape(destination))
+              local ok, switch_error = pcall(vim.api.nvim_cmd, {
+                cmd = 'edit',
+                args = { destination },
+                mods = { hide = true },
+                magic = { file = false, bar = false },
+              }, {})
               if not ok then
                 vim.notify(
                   'Could not open selected Delphi project source: ' .. tostring(switch_error),

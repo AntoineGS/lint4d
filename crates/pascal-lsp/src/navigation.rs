@@ -24601,6 +24601,44 @@ mod tests {
     }
 
     #[test]
+    fn locally_shadowed_builtin_in_lambda_does_not_emit_a_proven_mismatch() {
+        let uri = Url::parse("file:///tmp/LambdaShadowDiagnostic.pas").unwrap();
+        let source = "unit LambdaShadowDiagnostic;\ninterface\ntype TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TBoolHandler);\nimplementation\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\ntype Integer = Boolean;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("shadowed lambda fixture parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("shadowed lambda diagnostics");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("incompatible argument")),
+            "shadowed type was classified by spelling: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_function_result_mismatch_describes_the_actual_result_type() {
+        let uri = Url::parse("file:///tmp/LambdaResultMismatch.pas").unwrap();
+        let source = "unit LambdaResultMismatch;\ninterface\ntype TBoolResult = reference to function(Value: Integer): Boolean;\nprocedure Choose(Handler: TBoolResult);\nimplementation\nprocedure Choose(Handler: TBoolResult); begin end;\nprocedure Run;\nbegin\n  Choose(function(Value: Integer): Integer begin Result := Value; end);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("function-result fixture parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("function-result diagnostics");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("found 'anonymous function(Integer): Integer'")),
+            "callable result mismatch omitted the actual result type: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn semantic_diagnostics_report_an_incompatible_bound_argument() {
         let uri =
             Url::parse("file:///tmp/semantic-diagnostics-type-argument.pas").expect("argument URI");

@@ -49,6 +49,25 @@ struct SimpleCallableSignature {
     result: Option<SimpleCallableType>,
 }
 
+impl SimpleCallableType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Integer => "Integer",
+            Self::Boolean => "Boolean",
+        }
+    }
+}
+
+impl SimpleCallableSignature {
+    fn label(self) -> String {
+        let argument = self.parameter.map_or("", SimpleCallableType::label);
+        match self.result {
+            Some(result) => format!("anonymous function({argument}): {}", result.label()),
+            None => format!("anonymous procedure({argument})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Writability {
     Writable,
@@ -771,19 +790,7 @@ fn score_group_detailed(
                     Some(_) if !uncertain => mismatches.push(ArgumentTypeMismatch {
                         span: argument.span,
                         expected: type_identity_label(expected),
-                        actual: format!(
-                            "anonymous {}({})",
-                            if actual_callable.result.is_some() {
-                                "function"
-                            } else {
-                                "procedure"
-                            },
-                            match actual_callable.parameter {
-                                Some(SimpleCallableType::Integer) => "Integer",
-                                Some(SimpleCallableType::Boolean) => "Boolean",
-                                None => "",
-                            }
-                        ),
+                        actual: actual_callable.label(),
                     }),
                     Some(_) | None => uncertain = true,
                 },
@@ -1660,6 +1667,19 @@ fn infer_argument(
     if kind == "lambda" {
         budget.require_work(1 + node.named_child_count(), cancel)?;
         let callable = simple_callable_signature(node, &current_document.source);
+        let callable = if callable.is_some()
+            && callable_types_bind_to_builtins(
+                index,
+                current_uri,
+                current_document,
+                node,
+                cancel,
+                budget,
+            )? {
+            callable
+        } else {
+            None
+        };
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: None,
@@ -2127,7 +2147,82 @@ fn direct_callable_signature(
     let Some(callable) = type_node.named_child(0) else {
         return Ok(None);
     };
-    Ok(simple_callable_signature(callable, &document.source))
+    let signature = simple_callable_signature(callable, &document.source);
+    if signature.is_some()
+        && callable_types_bind_to_builtins(index, uri, document, callable, cancel, budget)?
+    {
+        Ok(signature)
+    } else {
+        Ok(None)
+    }
+}
+
+fn callable_types_bind_to_builtins(
+    index: &NavigationIndex,
+    uri: &Url,
+    document: &Document,
+    callable: Node<'_>,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<bool, String> {
+    if !document.unknown_imports.is_empty() {
+        return Ok(false);
+    }
+    let mut type_nodes = Vec::with_capacity(2);
+    if let Some(args) = callable.child_by_field_name("args") {
+        if let Some(parameter) = args.named_child(0) {
+            let Some(ty) = parameter.child_by_field_name("type") else {
+                return Ok(false);
+            };
+            type_nodes.push(ty);
+        }
+    }
+    if let Some(result) = callable.child_by_field_name("type") {
+        type_nodes.push(result);
+    }
+    for ty in type_nodes {
+        check_navigation_cancel(cancel)?;
+        budget.require_work(1, cancel)?;
+        let mut identifier = ty;
+        while matches!(identifier.kind(), "type" | "typeref") {
+            let Some(child) = identifier.named_child(0) else {
+                return Ok(false);
+            };
+            identifier = child;
+        }
+        if identifier.kind() != "identifier"
+            || document.conditionals.is_unknown_at(identifier.start_byte())
+        {
+            return Ok(false);
+        }
+        let Some(name) = document
+            .source
+            .get(identifier.start_byte()..identifier.end_byte())
+        else {
+            return Ok(false);
+        };
+        let mut binding = ResolutionState::new();
+        let candidates = index.unqualified_references_with_budget_at_scope_and_state(
+            uri,
+            document,
+            identifier.start_byte(),
+            name,
+            identifier,
+            document.scope_at(identifier.start_byte()),
+            &mut binding,
+            cancel,
+            budget,
+        )?;
+        if !candidates.is_empty()
+            || binding.receiver_uncertain
+            || binding.member_lookup_incomplete
+            || binding.inaccessible_candidate
+            || binding.ambiguous
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

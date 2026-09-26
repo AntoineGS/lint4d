@@ -3855,6 +3855,46 @@ fn nested_anonymous_parameters_inherit_only_their_ancestors() {
 }
 
 #[test]
+fn anonymous_parameter_shadows_the_outer_variable_only_in_its_body() {
+    let source = "unit LambdaShadowValue;\ninterface\nimplementation\nprocedure Run;\nvar Value: Boolean;\nbegin\n  (procedure(Value: Integer) begin Val; end);\n  Val;\nend;\nend.\n";
+    let source_uri = uri("LambdaShadowValue");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("shadowing lambda fixture parses");
+    let inside = index
+        .completion(&source_uri, position_after(source, "Val;", 0))
+        .expect("lambda completion");
+    let inside_value = inside
+        .items
+        .iter()
+        .find(|item| item.label == "Value")
+        .expect("lambda parameter");
+    assert!(
+        inside_value
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Integer")),
+        "outer variable replaced lambda parameter: {inside_value:?}"
+    );
+    let outside = index
+        .completion(&source_uri, position_after(source, "Val;", 1))
+        .expect("outer completion");
+    let outside_value = outside
+        .items
+        .iter()
+        .find(|item| item.label == "Value")
+        .expect("outer variable");
+    assert!(
+        outside_value
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Boolean")),
+        "lambda parameter escaped or hid the outer variable: {outside_value:?}"
+    );
+}
+
+#[test]
 fn anonymous_callable_signature_selects_the_matching_direct_reference_overload() {
     let source = "unit LambdaSelect;\ninterface\ntype\n  TIntHandler = reference to procedure(Value: Integer);\n  TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
     let source_uri = uri("LambdaSelect");
@@ -3926,6 +3966,46 @@ fn empty_parenthesized_callable_parameters_match_zero_argument_reference() {
         &selected[0],
         &source_uri,
         position_of(source, "Choose(Handler: TZero)", 0),
+    );
+}
+
+#[test]
+fn shadowed_integer_in_lambda_does_not_select_builtin_integer_callable() {
+    let source = "unit LambdaShadow;\ninterface\ntype\n  TIntHandler = reference to procedure(Value: Integer);\n  TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\ntype Integer = Boolean;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaShadow");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("shadowed callable fixture parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_ne!(
+        selected.len(),
+        1,
+        "shadowed Integer falsely selected one builtin callable alias: {selected:?}"
+    );
+}
+
+#[test]
+fn shadowed_boolean_in_declared_reference_does_not_prove_builtin_mismatch() {
+    let source = "unit ShadowedAlias;\ninterface\ntype Boolean = Integer;\n     TNamed = reference to procedure(Value: Boolean);\n     TInteger = reference to procedure(Value: Integer);\nprocedure Choose(Handler: TNamed); overload;\nprocedure Choose(Handler: TInteger); overload;\nimplementation\nprocedure Choose(Handler: TNamed); begin end;\nprocedure Choose(Handler: TInteger); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("ShadowedAlias");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("shadowed alias fixture parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_ne!(
+        selected.len(),
+        1,
+        "an unproven homonymous direct alias was treated as a builtin: {selected:?}"
     );
 }
 

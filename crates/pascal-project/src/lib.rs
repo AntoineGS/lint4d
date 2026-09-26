@@ -5386,7 +5386,7 @@ fn parse_dproj_package_metadata(
         read_policy.clone(),
     );
     let operations = parse_xml_operations(contents, path)?;
-    builder.process_operations(operations, path, tracker, &entry.provenance);
+    builder.process_operations(operations, path, tracker, &entry.provenance)?;
 
     let Some(main_source) = builder.property("mainsource") else {
         return Err(format!(
@@ -5558,6 +5558,7 @@ struct ProjectBuilder {
     overrides: EffectiveOverrides,
     unknown_properties: HashSet<String>,
     unknown_import_taint: bool,
+    installation_data_mode: bool,
     references: Vec<DccReference>,
     path_issues: Vec<ProjectPathIssue>,
     warnings: Vec<String>,
@@ -5678,6 +5679,7 @@ impl ProjectBuilder {
             overrides: overrides.clone(),
             unknown_properties: HashSet::new(),
             unknown_import_taint: false,
+            installation_data_mode: false,
             references: Vec::new(),
             path_issues: Vec::new(),
             warnings,
@@ -5728,23 +5730,10 @@ impl ProjectBuilder {
         provenance: &ProjectPathProvenance,
     ) -> Result<(), String> {
         let operations = parse_xml_operations(contents, path)?;
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        for operation in operations {
-            match operation {
-                XmlOperation::PropertyGroup(group) => {
-                    self.process_property_group(group, path, base, provenance);
-                }
-                XmlOperation::Import(import) => {
-                    self.process_import(import, path, base, tracker, provenance);
-                }
-                XmlOperation::DccReference(_) => self.warnings.push(format!(
-                    "ignored project references in installation data file {}",
-                    path.display()
-                )),
-                XmlOperation::Unsupported(message) => self.warnings.push(message),
-            }
-        }
-        Ok(())
+        let previous_mode = std::mem::replace(&mut self.installation_data_mode, true);
+        let result = self.process_operations(operations, path, tracker, provenance);
+        self.installation_data_mode = previous_mode;
+        result
     }
 
     fn property(&self, name: &str) -> Option<String> {
@@ -5819,7 +5808,7 @@ impl ProjectBuilder {
                 .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
         self.record_payload_observation(observation);
         let operations = parse_xml_operations(&contents, path)?;
-        self.process_operations(operations, path, tracker, &entry.provenance);
+        self.process_operations(operations, path, tracker, &entry.provenance)?;
         Ok(())
     }
 
@@ -5829,7 +5818,7 @@ impl ProjectBuilder {
         source_file: &Path,
         tracker: &mut ProjectReadTracker<'_>,
         source_provenance: &ProjectPathProvenance,
-    ) {
+    ) -> Result<(), String> {
         let base = source_file.parent().unwrap_or_else(|| Path::new("."));
         for operation in operations {
             match operation {
@@ -5866,11 +5855,12 @@ impl ProjectBuilder {
                     }
                 }
                 XmlOperation::Import(import) => {
-                    self.process_import(import, source_file, base, tracker, source_provenance);
+                    self.process_import(import, source_file, base, tracker, source_provenance)?;
                 }
                 XmlOperation::Unsupported(message) => self.warnings.push(message),
             }
         }
+        Ok(())
     }
 
     fn process_property_group(
@@ -6082,14 +6072,22 @@ impl ProjectBuilder {
         base: &Path,
         tracker: &mut ProjectReadTracker<'_>,
         source_provenance: &ProjectPathProvenance,
-    ) {
+    ) -> Result<(), String> {
         if !import_may_be_evaluated(&import.project) {
+            let message = format!(
+                "unsupported MSBuild import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            );
+            if self.installation_data_mode {
+                return Err(message);
+            }
             self.warnings.push(format!(
                 "ignored unsupported MSBuild import in {} (targets are not executed): {}",
                 source_file.display(),
                 import.project
             ));
-            return;
+            return Ok(());
         }
         let expanded = expand_value(
             &import.project,
@@ -6107,7 +6105,7 @@ impl ProjectBuilder {
         if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
             self.incomplete = true;
             self.taint_unknown_import();
-            return;
+            return Ok(());
         }
         let Some(resolved) = project_path_candidate(
             &expanded.value,
@@ -6118,16 +6116,24 @@ impl ProjectBuilder {
         ) else {
             self.incomplete = true;
             self.taint_unknown_import();
-            return;
+            return Ok(());
         };
         let candidate = lexical_normalize(&resolved.path);
         if !is_supported_project_import(&candidate) {
+            let message = format!(
+                "unsupported MSBuild import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            );
+            if self.installation_data_mode {
+                return Err(message);
+            }
             self.warnings.push(format!(
                 "ignored unsupported MSBuild import in {} (targets are not executed): {}",
                 source_file.display(),
                 import.project
             ));
-            return;
+            return Ok(());
         }
         let path_status = resolve_existing_path_status_with_provenance(
             &candidate,
@@ -6142,7 +6148,7 @@ impl ProjectBuilder {
             ExistingPathStatus::Unresolvable => {
                 self.incomplete = true;
                 self.taint_unknown_import();
-                return;
+                return Ok(());
             }
         };
         let entry = inherit_path_provenance(
@@ -6158,7 +6164,7 @@ impl ProjectBuilder {
                 "ignored project import outside authorized read roots: {}",
                 path.display()
             ));
-            return;
+            return Ok(());
         }
         if !add_metadata_file(
             &mut self.metadata_files,
@@ -6169,7 +6175,7 @@ impl ProjectBuilder {
         ) {
             self.incomplete = true;
             self.taint_unknown_import();
-            return;
+            return Ok(());
         }
         let condition = condition_matches(
             import.condition.as_deref(),
@@ -6187,11 +6193,11 @@ impl ProjectBuilder {
         );
         match condition {
             TruthValue::True => {}
-            TruthValue::False => return,
+            TruthValue::False => return Ok(()),
             TruthValue::Unknown => {
                 self.incomplete = true;
                 self.taint_unknown_import();
-                return;
+                return Ok(());
             }
         }
         if self.import_count >= MAX_IMPORT_COUNT {
@@ -6201,7 +6207,7 @@ impl ProjectBuilder {
                 "project import limit ({MAX_IMPORT_COUNT}) reached while reading {}",
                 source_file.display()
             ));
-            return;
+            return Ok(());
         }
         let ExistingPathStatus::Found(path) = path_status else {
             self.incomplete = true;
@@ -6212,7 +6218,7 @@ impl ProjectBuilder {
                 &candidate,
                 &resolved,
             ));
-            return;
+            return Ok(());
         };
         if !self.active_imports.insert(path.clone()) {
             self.incomplete = true;
@@ -6221,7 +6227,7 @@ impl ProjectBuilder {
                 "project import cycle ignored at {}",
                 path.display()
             ));
-            return;
+            return Ok(());
         }
         self.import_count += 1;
         let result =
@@ -6230,20 +6236,25 @@ impl ProjectBuilder {
                     self.record_payload_observation(observation);
                     parse_xml_operations(&contents, &path)
                 });
-        match result {
+        let result = match result {
             Ok(operations) => {
                 self.process_operations(operations, &path, tracker, &entry.provenance)
             }
             Err(error) => {
+                let transient = tracker
+                    .work_budget
+                    .is_some_and(|budget| budget.is_transient_error(&error));
                 self.incomplete = true;
                 self.taint_unknown_import();
                 self.warnings.push(format!(
                     "could not read project import {}: {error}",
                     path.display()
                 ));
+                if transient { Err(error) } else { Ok(()) }
             }
-        }
+        };
         self.active_imports.remove(&path);
+        result
     }
 }
 

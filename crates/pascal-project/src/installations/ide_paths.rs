@@ -69,6 +69,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [sdk.join("addon"), sdk.join("lib/base")]
         );
+        assert!(paths.library.iter().all(|entry| {
+            matches!(&entry.provenance, crate::ProjectPathProvenance::Configured)
+        }));
         assert_eq!(
             paths
                 .browsing
@@ -142,6 +145,10 @@ mod tests {
         )
         .unwrap();
         assert!(other_platform.library.is_empty());
+
+        let unknown_platform =
+            evaluate_ide_paths(&environment, &profile, "Debug", "", &mut tracker, &policy).unwrap();
+        assert!(unknown_platform.library.is_empty());
     }
 
     #[test]
@@ -234,6 +241,271 @@ mod tests {
             "request cancelled"
         );
     }
+
+    #[test]
+    fn unsupported_import_makes_dependent_ide_paths_uncertain() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        write(
+            &ide.join("EnvOptions.proj"),
+            r#"<Project><Import Project="unsupported.targets"/><PropertyGroup Condition="'$(Platform)'=='Linux64'"><DelphiLibraryPath>$(BDS)\lib</DelphiLibraryPath></PropertyGroup></Project>"#,
+        );
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let environment =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap();
+        let error = evaluate_ide_paths(
+            &environment,
+            &profile,
+            "Debug",
+            "Linux64",
+            &mut tracker,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported MSBuild import"));
+    }
+
+    #[test]
+    fn imported_absolute_ide_paths_cannot_authorize_external_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        let external = temp.path().join("unconfigured/external-lib");
+        write(
+            &ide.join("environment.proj"),
+            &format!(
+                "<Project><PropertyGroup><DelphiLibraryPath>{}</DelphiLibraryPath></PropertyGroup></Project>",
+                external.display()
+            ),
+        );
+        write(&ide.join("EnvOptions.proj"), "<Project/>");
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let environment =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap();
+        let paths = evaluate_ide_paths(
+            &environment,
+            &profile,
+            "Debug",
+            "Linux64",
+            &mut tracker,
+            &policy,
+        )
+        .unwrap();
+        assert!(
+            paths.library.is_empty(),
+            "unconfigured imported path escaped its read roots"
+        );
+    }
+
+    #[test]
+    fn explicit_bdslib_override_preserves_original_environment_root_for_relocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        let local_lib = temp.path().join("custom lib");
+        write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\r\n");
+        write(
+            &ide.join("environment.proj"),
+            "<Project><PropertyGroup><BDSLIB>C:\\Original\\lib</BDSLIB><BDSINCLUDE>C:\\Original\\lib\\include</BDSINCLUDE></PropertyGroup></Project>",
+        );
+        write(&ide.join("EnvOptions.proj"), "<Project/>");
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                    (
+                        "bdslib".to_owned(),
+                        local_lib.to_string_lossy().into_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let environment =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap();
+        assert_eq!(
+            environment.properties["bdslib"],
+            local_lib.to_string_lossy()
+        );
+        assert_eq!(
+            environment.properties["bdsinclude"],
+            local_lib.join("include").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_environment_locator_does_not_fall_back_to_appdata() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        write(
+            &ide.join("environment.proj"),
+            "<Project><PropertyGroup><Marker>default-was-read</Marker></PropertyGroup></Project>",
+        );
+        write(&ide.join("EnvOptions.proj"), "<Project/>");
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                    (
+                        "environmentsettings".to_owned(),
+                        "C:\\unmapped\\environment.proj".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let error =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap_err();
+        assert!(error.contains("invalid configured environmentsettings locator"));
+
+        let mut invalid_options_profile = profile.clone();
+        invalid_options_profile
+            .overrides
+            .properties
+            .remove("environmentsettings");
+        invalid_options_profile.overrides.properties.insert(
+            "envoptions".to_owned(),
+            "C:\\unmapped\\EnvOptions.proj".to_owned(),
+        );
+        let mut tracker = ProjectReadTracker::default();
+        let environment = load_installation(
+            &invalid_options_profile,
+            "Debug",
+            "Linux64",
+            &mut tracker,
+            &policy,
+        )
+        .unwrap();
+        assert!(
+            evaluate_ide_paths(
+                &environment,
+                &invalid_options_profile,
+                "Debug",
+                "Linux64",
+                &mut tracker,
+                &policy,
+            )
+            .unwrap_err()
+            .contains("invalid configured envoptions locator")
+        );
+    }
+
+    #[test]
+    fn nested_import_cancellation_is_returned_to_the_caller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CancelOnNestedRead(AtomicUsize);
+        impl ProjectWorkBudget for CancelOnNestedRead {
+            fn check_cancelled(&self) -> Result<(), String> {
+                if self.0.load(Ordering::SeqCst) >= 4 {
+                    Err("request cancelled".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+            fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+                self.0.fetch_add(amount, Ordering::SeqCst);
+                Ok(())
+            }
+            fn ensure_file_read_fits(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn charge_file_bytes(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_transient_error(&self, error: &str) -> bool {
+                error == "request cancelled"
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        write(&ide.join("settings.props"), "<Project/>");
+        write(
+            &ide.join("EnvOptions.proj"),
+            r#"<Project><Import Project="settings.props"/><PropertyGroup><DelphiLibraryPath>$(BDS)\lib</DelphiLibraryPath></PropertyGroup></Project>"#,
+        );
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let environment =
+            load_installation(&profile, "Debug", "Linux64", &mut tracker, &policy).unwrap();
+        let budget = CancelOnNestedRead(AtomicUsize::new(0));
+        let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+        assert_eq!(
+            evaluate_ide_paths(
+                &environment,
+                &profile,
+                "Debug",
+                "Linux64",
+                &mut tracker,
+                &policy,
+            )
+            .unwrap_err(),
+            "request cancelled"
+        );
+    }
 }
 use super::{
     InstallationEnvironment, PropertyMap, relocate_environment, resolve_path_with_inferred,
@@ -308,7 +580,7 @@ pub(crate) fn load_installation(
         "environmentsettings",
         appdata.as_deref(),
         "environment.proj",
-    ) {
+    )? {
         if let Some(contents) = read_installation_file(
             &path,
             true,
@@ -319,8 +591,15 @@ pub(crate) fn load_installation(
             &mut metadata_files,
             &mut warnings,
         )? {
-            let mut builder =
-                installation_builder(profile, config, platform, policy, &path, warnings.clone());
+            let environment_profile = environment_input_profile(profile);
+            let mut builder = installation_builder(
+                &environment_profile,
+                config,
+                platform,
+                policy,
+                &path,
+                warnings.clone(),
+            );
             builder.seed_installation_properties(&imported);
             match builder.process_installation_file(
                 &contents,
@@ -390,7 +669,8 @@ pub(crate) fn evaluate_ide_paths(
         "envoptions",
         appdata.as_deref(),
         "EnvOptions.proj",
-    ) else {
+    )?
+    else {
         return Ok(IdePaths::default());
     };
     let mut observations = Vec::new();
@@ -448,9 +728,30 @@ pub(crate) fn evaluate_ide_paths(
         )
     };
     Ok(IdePaths {
-        library: property_paths(&builder, library_key, profile, environment, &mut warnings),
-        browsing: property_paths(&builder, browsing_key, profile, environment, &mut warnings),
-        debug_dcu: property_paths(&builder, debug_key, profile, environment, &mut warnings),
+        library: property_paths(
+            &builder,
+            library_key,
+            profile,
+            environment,
+            policy,
+            &mut warnings,
+        ),
+        browsing: property_paths(
+            &builder,
+            browsing_key,
+            profile,
+            environment,
+            policy,
+            &mut warnings,
+        ),
+        debug_dcu: property_paths(
+            &builder,
+            debug_key,
+            profile,
+            environment,
+            policy,
+            &mut warnings,
+        ),
         namespaces: builder
             .property_list_with_provenance("delphinamespacesearchpath")
             .into_iter()
@@ -497,17 +798,23 @@ fn locator_path(
     name: &str,
     appdata: Option<&Path>,
     filename: &str,
-) -> Option<PathBuf> {
-    overrides
-        .properties
-        .get(name)
-        .and_then(|value| {
-            overrides
-                .resolve_path(value, Path::new("/"))
-                .ok()
-                .map(|path| path.path)
-        })
-        .or_else(|| appdata.map(|root| root.join(filename)))
+) -> Result<Option<PathBuf>, String> {
+    if let Some(value) = overrides.properties.get(name) {
+        return overrides
+            .resolve_path(value, Path::new("/"))
+            .map(|resolved| Some(resolved.path))
+            .map_err(|error| format!("invalid configured {name} locator `{value}`: {error}"));
+    }
+    Ok(appdata.map(|root| root.join(filename)))
+}
+
+fn environment_input_profile(profile: &ResolvedInstallation) -> ResolvedInstallation {
+    let mut profile = profile.clone();
+    // Preserve the imported BDSLIB value as relocation evidence while still
+    // applying the configured local BDSLIB as the final authoritative value.
+    profile.overrides.properties.remove("bdslib");
+    profile.overrides.property_origins.remove("bdslib");
+    profile
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -602,10 +909,11 @@ fn property_paths(
     key: &str,
     profile: &ResolvedInstallation,
     environment: &InstallationEnvironment,
+    policy: &ReadPolicy,
     warnings: &mut Vec<String>,
 ) -> Vec<ProjectPathEntry> {
     let mut entries = Vec::new();
-    for (raw, provenance) in builder.property_list_with_provenance(key) {
+    for (raw, _provenance) in builder.property_list_with_provenance(key) {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
@@ -624,11 +932,23 @@ fn property_paths(
             Path::new("/"),
         ) {
             Ok(resolved) => {
-                let entry = ProjectPathEntry::resolved(
-                    resolved.path.clone(),
-                    &resolved,
-                    provenance == ProjectPathProvenance::Configured,
-                );
+                if !environment
+                    .read_roots
+                    .iter()
+                    .any(|root| crate::project_path_starts_with(&resolved.path, root))
+                {
+                    warnings.push(format!(
+                        "ignored IDE {key} entry outside selected installation read roots: {raw}"
+                    ));
+                    continue;
+                }
+                let entry = ProjectPathEntry::resolved(resolved.path.clone(), &resolved, true);
+                if !policy.allows_location(&entry) {
+                    warnings.push(format!(
+                        "ignored IDE {key} entry not authorized by the read policy: {raw}"
+                    ));
+                    continue;
+                }
                 if entries
                     .iter()
                     .all(|existing: &ProjectPathEntry| existing.path != entry.path)

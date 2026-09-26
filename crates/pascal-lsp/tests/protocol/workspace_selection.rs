@@ -1,5 +1,66 @@
 use super::*;
 
+#[test]
+fn automatic_project_ambiguity_asks_the_client_to_choose_a_project() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write_file(
+        &root.join("a/App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&root.join("a/App.dpr"), "program App; begin end.");
+    write_file(
+        &root.join("b/App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(&root.join("b/App.dpr"), "program App; begin end.");
+    write_file(
+        &root.join("src/Unit.pas"),
+        "unit Unit; interface implementation end.",
+    );
+
+    // Both projects are equally near by putting a project in the unit's directory.
+    let project_a = root.join("src/A.dproj");
+    let project_b = root.join("src/B.dproj");
+    write_file(
+        &project_a,
+        "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &project_b,
+        "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(&root.join("src/Unit.pas")), "languageId": "pascal", "version": 1, "text": "unit Unit; interface implementation end."}}),
+    );
+    let request = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("project ambiguity prompt");
+    assert_eq!(request.params["type"], 3);
+    let actions = request.params["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 2);
+    let chosen = actions[0].clone();
+    server.send(Message::Response(Response::new_ok(request.id, chosen)));
+
+    let context_id = RequestId::from("automatic-project-prompt-context".to_owned());
+    server.send_request(
+        context_id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&root.join("src/Unit.pas"))}}),
+    );
+    let context = server.response(&context_id);
+    assert!(context.error.is_none(), "{context:?}");
+    assert_eq!(
+        context.result.unwrap()["selectedProjectUri"],
+        uri(&project_a).as_str()
+    );
+    server.shutdown();
+}
+
 struct SelectionFixture {
     directory: tempfile::TempDir,
     project_a: std::path::PathBuf,

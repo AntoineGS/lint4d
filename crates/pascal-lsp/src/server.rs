@@ -1,5 +1,9 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
+#[path = "server/project_prompts.rs"]
+#[allow(dead_code)]
+mod project_prompts;
+
 #[cfg(test)]
 use crate::navigation::CompletionResolutionSeed;
 use crate::navigation::{

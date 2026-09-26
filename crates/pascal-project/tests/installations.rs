@@ -611,6 +611,52 @@ fn import_may_set_config_so_empty_config_identity_condition_is_unknown() {
 }
 
 #[test]
+fn false_conditional_import_does_not_make_later_empty_config_condition_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        "[installations.\"10.0\".properties]\nBDS = '/sdk/10'\n\
+         [installations.\"23.0\".properties]\nBDS = '/sdk/23'\n",
+    );
+    let source = temp.path().join("App.dpr");
+    let project = temp.path().join("App.dproj");
+    write(&source, "begin end.\n");
+    write(
+        &project,
+        r#"<Project>
+          <Import Project="Config.props" Condition="'$(Platform)' == 'Win32'" />
+          <PropertyGroup Condition="'$(Config)' == ''">
+            <CompilerVersion>24.0</CompilerVersion><MainSource>App.dpr</MainSource>
+          </PropertyGroup>
+        </Project>"#,
+    );
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            platform: Some("Win64".into()),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    assert_eq!(
+        context.installation_evidence.compiler_version,
+        Some(pascal_project::CompilerVersion::new(24, 0))
+    );
+    assert!(!context.installation_evidence.conflicting);
+    assert_eq!(
+        context.installation_selection,
+        Some(InstallationSelection::Selected {
+            id: "10.0".into(),
+            origin: InstallationOrigin::Metadata,
+        })
+    );
+}
+
+#[test]
 fn direct_compiler_fact_survives_unrelated_imported_config_uncertainty() {
     let temp = tempfile::tempdir().unwrap();
     let configuration = temp.path().join("config.toml");

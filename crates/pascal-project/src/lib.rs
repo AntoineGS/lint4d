@@ -4392,7 +4392,24 @@ fn parse_project_bootstrap(
         options.platform.is_some() || overrides.properties.contains_key("platform");
     for operation in operations {
         let group = match operation {
-            XmlOperation::Import(_) => {
+            XmlOperation::Import(import) => {
+                let import_truth = condition_matches(
+                    import.condition.as_deref(),
+                    ConditionEnvironment {
+                        properties: &properties,
+                        unknown_properties: &unknown_properties,
+                        unknown_import_taint,
+                        overrides,
+                        read_policy,
+                    },
+                    base,
+                    &mut metadata_files,
+                    &mut warnings,
+                    source_file,
+                );
+                if import_truth == TruthValue::False {
+                    continue;
+                }
                 unknown_import_taint = true;
                 if !config_is_fixed {
                     unknown_properties.insert("config".to_owned());

@@ -4,7 +4,7 @@ use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
 use pascal_project::installations::InstallationEvidence;
 use pascal_project::{
     InstallationOrigin, InstallationSelection, ProjectContext, ProjectOptions, ProjectPathEntry,
-    ProjectPathProvenance, ReadPolicy,
+    ProjectPathProvenance, ProjectSelections, ReadPolicy, discover_with_selections,
 };
 
 fn write(path: &Path, text: &str) {
@@ -384,6 +384,57 @@ fn explicit_external_environmentsettings_locator_authorizes_only_that_file() {
         path: sibling,
         provenance: ProjectPathProvenance::Configured,
     }));
+}
+
+#[test]
+fn explicit_external_locators_respect_directory_and_filename_exclusions() {
+    for (relative_locator, exclusion) in [
+        ("private/settings.proj", "private/**"),
+        ("public/settings.proj", "settings.proj"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let external_dir = tempfile::tempdir().unwrap();
+        let external = external_dir.path().join(relative_locator);
+        let project = root.join("App.dproj");
+        write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+        write(&external, "<Project/>");
+        write(&root.join("App.dpr"), "program App; begin end.");
+        write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{}'\nEnvironmentSettings='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+                sdk.display(),
+                external.display()
+            ),
+        );
+
+        let context = discover_with_selections(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project),
+                ..ProjectOptions::default()
+            },
+            &ProjectSelections::default(),
+            &OverrideSession::new(None),
+            &[exclusion.to_owned()],
+        )
+        .unwrap();
+
+        assert!(
+            !context.read_policy.allows_location(&ProjectPathEntry {
+                path: external,
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            "exclusion {exclusion:?} should block explicit locator {relative_locator:?}"
+        );
+    }
 }
 
 #[test]

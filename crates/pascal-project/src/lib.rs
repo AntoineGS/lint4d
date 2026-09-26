@@ -616,10 +616,26 @@ impl ReadPolicy {
     }
 
     fn is_excluded_authorized_file(&self, path: &Path) -> bool {
-        path.components().any(is_default_excluded_component)
-            || path
-                .file_name()
-                .is_some_and(|name| self.matches_exclusion_patterns_for_relative(Path::new(name)))
+        if self.is_excluded(path) {
+            return true;
+        }
+
+        // A locator may be outside every configured read root, so no
+        // root-relative path is available for the ordinary exclusion check.
+        // Try each component-relative suffix instead: this preserves patterns
+        // such as `private/**` for `/external/private/settings.proj`, without
+        // treating the absolute filesystem prefix as part of the pattern.
+        let components = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(component) => Some(component),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (0..components.len()).any(|start| {
+            let relative = components[start..].iter().collect::<PathBuf>();
+            self.matches_exclusion_patterns_for_relative(&relative)
+        })
     }
 
     fn allows_location_under_root(&self, path: &Path, root: &Path) -> bool {

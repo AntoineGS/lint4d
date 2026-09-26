@@ -24542,6 +24542,115 @@ mod tests {
     }
 
     #[test]
+    fn recovered_callable_alias_context_does_not_prove_overloads_or_mismatches() {
+        assert_incomplete_callable_context("alias context", "uses ;\n", "", true);
+    }
+
+    #[test]
+    fn recovered_callable_caller_context_does_not_prove_overloads_or_mismatches() {
+        assert_incomplete_callable_context("caller context", "", "uses ;\n", true);
+    }
+
+    #[test]
+    fn conditionally_incomplete_callable_context_does_not_prove_overloads_or_mismatches() {
+        assert_incomplete_callable_context(
+            "unknown conditional context",
+            "{$IF CompilerVersion >= 24}\nconst ConditionalValue = 1;\n{$ENDIF}\n",
+            "",
+            false,
+        );
+    }
+
+    fn assert_incomplete_callable_context(
+        context: &str,
+        interface_gap: &str,
+        implementation_gap: &str,
+        expect_recovery: bool,
+    ) {
+        let uri = Url::parse("file:///tmp/RecoveredCallable.pas").unwrap();
+        let source = format!(
+            "unit RecoveredCallable;\ninterface\n{interface_gap}\
+                 type TInt = reference to procedure(Value: Integer);\n\
+                      TBool = reference to procedure(Value: Boolean);\n\
+                 procedure Choose(Handler: TInt); overload;\n\
+                 procedure Choose(Handler: TBool); overload;\n\
+                 procedure Reject(Handler: TBool);\n\
+                 implementation\n{implementation_gap}\
+                 procedure Choose(Handler: TInt); begin end;\n\
+                 procedure Choose(Handler: TBool); begin end;\n\
+                 procedure Reject(Handler: TBool); begin end;\n\
+                 procedure Run;\nbegin\n\
+                   Choose(procedure(Value: Integer) begin end);\n\
+                   Reject(procedure(Value: Integer) begin end);\n\
+                 end;\nend.\n"
+        );
+        let mut index = NavigationIndex::new();
+        index.update(uri.clone(), source.clone()).unwrap();
+        let document = &index.documents[&uri];
+        assert_eq!(
+            !document.parser_recovery_spans.is_empty(),
+            expect_recovery,
+            "{context}: fixture recovery precondition"
+        );
+        assert_eq!(
+            document.conditionals.unknown_spans.is_empty(),
+            expect_recovery,
+            "{context}: fixture conditional precondition"
+        );
+        assert!(
+            document.imports.is_empty(),
+            "{context} must lose the incomplete import"
+        );
+        let position =
+            text::offset_to_position(&source, source.find("Choose(procedure").unwrap()).unwrap();
+        let selected = index.navigate(&uri, position, NavigationTarget::Declaration);
+        assert_eq!(
+            selected.len(),
+            2,
+            "{context}: recovery must retain both overloads: {selected:?}"
+        );
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .unwrap();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::IncompatibleArgument),
+            "{context}: recovery proved a mismatch: {diagnostics:?}"
+        );
+
+        // The same indexed document must regain useful inference after repair.
+        let repaired = source
+            .replace(interface_gap, "")
+            .replace(implementation_gap, "");
+        index.update(uri.clone(), repaired.clone()).unwrap();
+        assert!(index.documents[&uri].parser_recovery_spans.is_empty());
+        let position =
+            text::offset_to_position(&repaired, repaired.find("Choose(procedure").unwrap())
+                .unwrap();
+        let selected = index.navigate(&uri, position, NavigationTarget::Declaration);
+        assert_eq!(
+            selected.len(),
+            1,
+            "{context}: repair must restore selection"
+        );
+        assert_eq!(
+            selected[0].range.start,
+            text::offset_to_position(&repaired, repaired.find("Choose(Handler: TInt)").unwrap())
+                .unwrap()
+        );
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .unwrap();
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.kind
+                == SemanticDiagnosticKind::IncompatibleArgument
+                && diagnostic.span.start == repaired.rfind("procedure(Value: Integer)").unwrap()),
+            "{context}: repair must restore the proven mismatch: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn anonymous_callable_signature_mismatch_reports_a_bound_argument() {
         let uri = Url::parse("file:///tmp/LambdaMismatch.pas").unwrap();
         let source = "unit LambdaMismatch;\ninterface\ntype TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TBoolHandler);\nimplementation\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";

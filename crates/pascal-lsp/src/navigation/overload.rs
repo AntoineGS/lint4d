@@ -2165,6 +2165,16 @@ fn callable_types_bind_to_builtins(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
+    budget.require_work(1, cancel)?;
+    // An empty lookup is evidence of a builtin only in a complete context.
+    // Recovery can omit a uses/type declaration outside the signature itself;
+    // unknown conditional branches can also hide declarations. Apply this to
+    // the signature owner as well as its imported providers below. This shared
+    // gate covers both the lambda and the expected callable's declaration site.
+    if !document.parser_recovery_spans.is_empty() || !document.conditionals.unknown_spans.is_empty()
+    {
+        return Ok(false);
+    }
     // The normal no-System-source case uses the compiler's builtin fallback.
     // An indexed but ambiguous, recovered, or conditionally unknown System
     // provider is different: its absent candidates are not negative evidence.

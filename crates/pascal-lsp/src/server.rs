@@ -5116,6 +5116,7 @@ struct AnalysisJobs {
     automatic_apply_requests: HashMap<RequestId, Url>,
     automatic_answer_requests: HashMap<RequestId, AutomaticPromptAnswer>,
     next_automatic_discovery: u64,
+    selection_intent_generation: u64,
     progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
@@ -5126,6 +5127,7 @@ struct AnalysisJobs {
 struct AutomaticPromptAnswer {
     key: project_prompts::PromptKey,
     source_uri: Url,
+    selection_intent_generation: u64,
 }
 
 #[derive(Debug)]
@@ -5260,6 +5262,7 @@ impl AnalysisJobs {
             automatic_apply_requests: HashMap::new(),
             automatic_answer_requests: HashMap::new(),
             next_automatic_discovery: 0,
+            selection_intent_generation: 0,
             progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
             next_computation_id: 0,
@@ -8163,7 +8166,12 @@ impl AnalysisJobs {
                     let automatic_answer =
                         primary_request_id.and_then(|id| self.automatic_answer_requests.remove(id));
                     let stale_automatic_answer = automatic_answer.as_ref().is_some_and(|answer| {
-                        !automatic_prompt_answer_is_current(workspace, &result, answer)
+                        !automatic_prompt_answer_is_current(
+                            workspace,
+                            &result,
+                            answer,
+                            self.selection_intent_generation,
+                        )
                     });
                     let key = job.key;
                     let _ = job.handle.join();
@@ -8306,15 +8314,15 @@ impl AnalysisJobs {
             && info.selected_project_uri.is_none()
             && info.candidates.len() > 1
         {
+            let titles = project_prompts::project_prompt_titles(
+                &info.candidates,
+                info.scope_uri.as_ref().unwrap_or(&source_uri),
+            );
             let choices = info
                 .candidates
                 .iter()
-                .map(|uri| {
-                    (
-                        project_prompt_title(uri),
-                        project_prompts::PromptChoice::Project(uri.clone()),
-                    )
-                })
+                .zip(titles)
+                .map(|(uri, title)| (title, project_prompts::PromptChoice::Project(uri.clone())))
                 .collect::<Vec<_>>();
             (
                 None,
@@ -8322,7 +8330,8 @@ impl AnalysisJobs {
                 choices,
                 "Choose the Delphi project to load",
             )
-        } else if info.selected_project_uri.is_some()
+        } else if prepared.needs_installation_choice()
+            && info.selected_project_uri.is_some()
             && info.selected_installation_id.is_none()
             && !info.installation_candidates.is_empty()
         {
@@ -8360,6 +8369,8 @@ impl AnalysisJobs {
         let Some(request) = self.project_prompts.begin(key, choices) else {
             return Ok(());
         };
+        self.project_prompts
+            .retain_live_sources(&mut self.prompt_sources);
         self.prompt_sources.insert(request.id.clone(), source_uri);
         let mut request = request;
         request.params["message"] = serde_json::json!(message);
@@ -10854,11 +10865,14 @@ fn event_loop(
                             ));
                             jobs.next_automatic_discovery =
                                 jobs.next_automatic_discovery.wrapping_add(1);
+                            jobs.selection_intent_generation =
+                                jobs.selection_intent_generation.wrapping_add(1);
                             jobs.automatic_answer_requests.insert(
                                 id.clone(),
                                 AutomaticPromptAnswer {
                                     key: key.clone(),
                                     source_uri: source_uri.clone(),
+                                    selection_intent_generation: jobs.selection_intent_generation,
                                 },
                             );
                             if method == "pascal/selectProject" {
@@ -11633,6 +11647,9 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            if !jobs.automatic_answer_requests.contains_key(&request.id) {
+                jobs.selection_intent_generation = jobs.selection_intent_generation.wrapping_add(1);
+            }
             jobs.invalidate_project_prompts_for_project(&params.project_uri);
             let project_path = params.project_uri.to_file_path().ok();
             let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
@@ -11659,6 +11676,9 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            if !jobs.automatic_answer_requests.contains_key(&request.id) {
+                jobs.selection_intent_generation = jobs.selection_intent_generation.wrapping_add(1);
+            }
             jobs.invalidate_project_prompts_for_source(&params.text_document.uri);
             let project = if params.project_uri.is_null() {
                 None
@@ -13777,14 +13797,6 @@ fn server_capabilities(
     capabilities
 }
 
-fn project_prompt_title(uri: &Url) -> String {
-    let path = uri.path();
-    let mut components = path.rsplit('/').filter(|component| !component.is_empty());
-    let name = components.next().unwrap_or(path);
-    let parent = components.next();
-    parent.map_or_else(|| name.to_owned(), |parent| format!("{parent}/{name}"))
-}
-
 fn uri_is_within_scope(uri: &Url, scope: &Url) -> bool {
     match (uri.to_file_path(), scope.to_file_path()) {
         (Ok(uri), Ok(scope)) => uri.starts_with(scope),
@@ -13803,8 +13815,10 @@ fn automatic_prompt_answer_is_current(
     workspace: &Workspace,
     result: &AnalysisResult,
     answer: &AutomaticPromptAnswer,
+    selection_intent_generation: u64,
 ) -> bool {
     if answer.key.generation != project_prompt_generation(workspace)
+        || answer.selection_intent_generation != selection_intent_generation
         || workspace.document_identity(&answer.source_uri).1.is_none()
     {
         return false;

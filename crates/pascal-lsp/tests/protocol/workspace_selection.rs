@@ -273,6 +273,89 @@ fn arbitrary_prompt_title_is_not_interpreted_as_a_project_path() {
 }
 
 #[test]
+fn invalid_installation_selection_does_not_trigger_automatic_install_prompt() {
+    let fixture = selection_fixture();
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("installation='7.0'", "installation='99.0'");
+    write_file(&config_path, &config);
+
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &fixture.main_a);
+    assert!(
+        server
+            .request_with_timeout("window/showMessageRequest", Duration::from_millis(250))
+            .is_none(),
+        "an invalid persisted selection must not be offered as NeedsChoice"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn manual_project_choice_supersedes_automatic_worker_before_commit() {
+    let (directory, unit, project_a, project_b) = ambiguous_projects();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_project_operation_prepared_barrier(environment);
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    wait_for_path(&barrier.entered);
+    fs::write(&barrier.release, b"release discovery").unwrap();
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project prompt");
+    fs::remove_file(&barrier.release).unwrap();
+
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        prompt.params["actions"][0].clone(),
+    )));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) < 2
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fs::read(&barrier.entered).unwrap().len() >= 2,
+        "automatic selection worker should be held before commit"
+    );
+
+    let manual = RequestId::from("manual-choice-fences-held-automatic-choice".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&unit)}, "projectUri": uri(&project_b)}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) < 3
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fs::read(&barrier.entered).unwrap().len() >= 3,
+        "manual selection worker should also be held before commit"
+    );
+    fs::write(&barrier.release, b"release both prepared workers").unwrap();
+    let manual_response = server.response(&manual);
+    assert!(manual_response.error.is_none(), "{manual_response:?}");
+
+    let mut context = Value::Null;
+    for attempt in 0..10 {
+        context = project_context(&mut server, &unit, &format!("barrier-{attempt}"));
+        if context["selectedProjectUri"] == uri(&project_b).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(context["selectedProjectUri"], uri(&project_b).as_str());
+    assert_ne!(context["selectedProjectUri"], uri(&project_a).as_str());
+    server.shutdown();
+}
+
+#[test]
 fn project_prompt_finishes_before_installation_prompt_starts() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();

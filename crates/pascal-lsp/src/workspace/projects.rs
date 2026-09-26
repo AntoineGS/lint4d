@@ -102,6 +102,15 @@ pub(crate) struct ProjectContextPreparation {
     pub(crate) info: ProjectContextInfo,
 }
 
+impl ProjectContextPreparation {
+    pub(crate) fn needs_installation_choice(&self) -> bool {
+        matches!(
+            self.state.context.installation_selection.as_ref(),
+            Some(InstallationSelection::NeedsChoice { .. })
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ProjectSelectionPreparation {
     pub(crate) context: ProjectContextPreparation,

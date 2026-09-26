@@ -41,6 +41,10 @@ pub(super) struct PromptState {
 }
 
 impl PromptState {
+    pub fn retain_live_sources(&self, sources: &mut HashMap<RequestId, Url>) {
+        sources.retain(|id, _| self.pending.contains_key(id));
+    }
+
     pub fn is_request_id(&self, id: &RequestId) -> bool {
         serde_json::to_value(id)
             .ok()
@@ -181,6 +185,61 @@ impl PromptState {
     }
 }
 
+pub(super) fn project_prompt_titles(candidates: &[Url], scope: &Url) -> Vec<String> {
+    let scope_path = scope.to_file_path().ok();
+    let paths = candidates
+        .iter()
+        .map(|uri| {
+            let Some(path) = uri.to_file_path().ok() else {
+                return vec![uri.as_str().to_owned()];
+            };
+            let relative = scope_path
+                .as_ref()
+                .and_then(|scope| path.strip_prefix(scope).ok())
+                .unwrap_or(&path);
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut depths = vec![1usize; paths.len()];
+    loop {
+        let titles = paths
+            .iter()
+            .zip(&depths)
+            .map(|(parts, depth)| {
+                parts[parts.len().saturating_sub(*depth).min(parts.len())..].join("/")
+            })
+            .collect::<Vec<_>>();
+        let duplicates = titles
+            .iter()
+            .enumerate()
+            .filter(|(index, title)| {
+                titles[..*index].contains(title) || titles[index + 1..].contains(title)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if duplicates.is_empty() {
+            return titles;
+        }
+        let mut advanced = false;
+        for index in duplicates {
+            if depths[index] < paths[index].len() {
+                depths[index] += 1;
+                advanced = true;
+            }
+        }
+        if !advanced {
+            return titles
+                .into_iter()
+                .enumerate()
+                .map(|(index, title)| format!("{title} ({})", index + 1))
+                .collect();
+        }
+    }
+}
+
 fn prompt_key_bytes(key: &PromptKey) -> usize {
     key.candidates.iter().fold(
         key.scope_uri
@@ -295,5 +354,38 @@ mod tests {
         changed.generation += 1;
         let stale = Response::new_ok(stale_request.id, json!({"title": "a.dproj"}));
         assert!(state.answer(&stale, &changed).is_none());
+    }
+
+    #[test]
+    fn source_tracking_can_be_reconciled_after_prompt_eviction() {
+        let mut state = PromptState::default();
+        let mut sources = HashMap::new();
+        let choices = vec![(
+            "project.dproj".to_owned(),
+            PromptChoice::Project(Url::parse("file:///workspace/project.dproj").unwrap()),
+        )];
+        for generation in 0..100 {
+            let mut prompt_key = key(&["file:///workspace/project.dproj"]);
+            prompt_key.generation = generation;
+            let request = state.begin(prompt_key, choices.clone()).unwrap();
+            sources.insert(
+                request.id,
+                Url::parse("file:///workspace/Unit.pas").unwrap(),
+            );
+            state.retain_live_sources(&mut sources);
+        }
+        assert_eq!(sources.len(), MAX_OUTSTANDING);
+        assert!(sources.keys().all(|id| state.key_for_id(id).is_some()));
+    }
+
+    #[test]
+    fn project_prompt_titles_expand_duplicate_suffixes_from_the_scope() {
+        let scope = Url::parse("file:///workspace").unwrap();
+        let candidates = [
+            Url::parse("file:///workspace/first/src/App.dproj").unwrap(),
+            Url::parse("file:///workspace/second/src/App.dproj").unwrap(),
+        ];
+        let titles = project_prompt_titles(&candidates, &scope);
+        assert_eq!(titles, ["first/src/App.dproj", "second/src/App.dproj"]);
     }
 }

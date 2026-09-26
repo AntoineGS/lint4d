@@ -8263,10 +8263,9 @@ impl Workspace {
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
                 && !owner.follow_current_project_file
-                && (rediscover_open_context
-                    || self.known_owner_selection_is_current_with_cancel_and_budget(
-                        &path, &owner, cancel, budget,
-                    )?)
+                && self.known_owner_selection_is_current_with_cancel_and_budget(
+                    &path, &owner, cancel, budget,
+                )?
             {
                 return self
                     .restore_known_owner(
@@ -9581,51 +9580,53 @@ impl Workspace {
         Ok(())
     }
 
-    fn selection_context_keys_for_scope(&self, selection_scope: &Path) -> HashSet<ContextKey> {
-        let mut affected = self
-            .contexts
-            .keys()
-            .filter(|key| {
-                key.selection_scope
-                    .as_ref()
-                    .is_some_and(|candidate| paths_equal_ci(candidate, selection_scope))
-                    || key
-                        .project_scope
-                        .as_ref()
-                        .is_some_and(|candidate| paths_equal_ci(candidate, selection_scope))
-            })
-            .cloned()
-            .collect::<HashSet<_>>();
-
-        // A file opened before a nearer project appeared can retain an
-        // ancestor owner. It is still a prospective dependent of a selection
-        // scoped below that ancestor, so include owners by their document path
-        // as well as by the scopes retained in their old keys.
-        for (uri, key) in self
-            .document_contexts
-            .iter()
-            .chain(self.open_document_contexts.iter())
-        {
-            if uri
-                .to_file_path()
-                .ok()
-                .map(absolute_path)
-                .is_some_and(|document| path_starts_with_native(&document, selection_scope))
+    fn invalidate_project_selection_uris(
+        &mut self,
+        uris: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let mut diagnostic_uris = Vec::new();
+        diagnostic_uris
+            .try_reserve(uris.len())
+            .map_err(|error| format!("could not reserve project-switch diagnostics: {error}"))?;
+        for uri in uris {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if let Some(owner) = self.document_owners.get_mut(uri) {
+                owner.legacy_route = None;
+                owner.needs_revalidation = true;
+            }
+            self.open_document_contexts.remove(uri);
+            self.remove_indexed_with_control(uri, cancel, budget, false)?;
+            mark_dependency_change(
+                &mut self.source_change_generations,
+                uri,
+                self.source_generation,
+                false,
+            );
+            mark_dependency_change(
+                &mut self.configuration_change_generations,
+                uri,
+                self.configuration_generation,
+                false,
+            );
+            if self
+                .open_documents
+                .get(uri)
+                .is_some_and(|document| document.text.is_some())
             {
-                affected.insert(key.clone());
+                diagnostic_uris.push(uri.clone());
             }
         }
-        for (uri, owner) in &self.document_owners {
-            if uri
-                .to_file_path()
-                .ok()
-                .map(absolute_path)
-                .is_some_and(|document| path_starts_with_native(&document, selection_scope))
-            {
-                affected.insert(owner.key.clone());
-            }
+        self.prune_unused_contexts_with_control(cancel, budget)?;
+        for uri in diagnostic_uris {
+            check_workspace_cancel(cancel)?;
+            self.schedule_diagnostics(uri);
         }
-        affected
+        Ok(())
     }
 
     fn invalidate_metadata_for_uri(
@@ -15523,8 +15524,8 @@ BDS = '/fake/37'
         );
         assert!(
             workspace
-                .selection_context_keys_for_scope(&scope)
-                .contains(&old_key),
+                .selection_uris_for_scope(&scope, &source_uri)
+                .contains(&source_uri),
             "a source under the prospective selection scope must invalidate its inherited owner"
         );
 
@@ -15568,6 +15569,95 @@ BDS = '/fake/37'
                 .unwrap()
                 .selected_project_uri,
             Some(Url::from_file_path(&prospective_project).unwrap())
+        );
+    }
+
+    #[test]
+    fn project_switch_moves_only_the_target_uri_from_a_shared_context_key() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let scope = root.join("nested");
+        let other = root.join("other");
+        fs::create_dir_all(&scope).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let shared = scope.join("Shared.pas");
+        let sibling = other.join("Other.pas");
+        let ancestor_project = root.join("Root.dproj");
+        let prospective_project = scope.join("Nested.dproj");
+        fs::write(&shared, "unit Shared; interface implementation end.").unwrap();
+        fs::write(&sibling, "unit Other; interface implementation end.").unwrap();
+        fs::write(
+            &ancestor_project,
+            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
+        let shared_uri = Url::from_file_path(&shared).unwrap();
+        let sibling_uri = Url::from_file_path(&sibling).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        for (uri, path) in [(&shared_uri, &shared), (&sibling_uri, &sibling)] {
+            workspace
+                .open_document(uri.clone(), fs::read_to_string(path).unwrap(), 1)
+                .unwrap();
+            workspace.project_context(uri).unwrap();
+        }
+        let shared_key = workspace.document_contexts[&shared_uri].clone();
+        let sibling_key = workspace.document_contexts[&sibling_uri].clone();
+        assert_eq!(
+            shared_key, sibling_key,
+            "fixture must share the ancestor context key"
+        );
+        workspace.indexed_files.insert(sibling_uri.clone());
+        assert!(!workspace.document_owners[&sibling_uri].needs_revalidation);
+
+        fs::write(
+            &prospective_project,
+            "<Project><PropertyGroup><MainSource>Nested.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(scope.join("Nested.dpr"), "program Nested; begin end.").unwrap();
+        workspace
+            .select_project(
+                &shared_uri,
+                Some(&Url::from_file_path(&prospective_project).unwrap()),
+            )
+            .unwrap();
+
+        let switched_key = workspace.document_contexts.get(&shared_uri).unwrap();
+        assert_ne!(switched_key, &shared_key);
+        assert_eq!(
+            switched_key.project_file.as_deref(),
+            Some(prospective_project.as_path())
+        );
+        assert_eq!(
+            workspace.open_document_contexts.get(&shared_uri),
+            Some(switched_key)
+        );
+        assert!(
+            workspace.open_documents[&shared_uri].text.is_some(),
+            "switch must preserve the unsaved overlay"
+        );
+        assert_eq!(
+            workspace.document_contexts.get(&sibling_uri),
+            Some(&sibling_key)
+        );
+        assert_eq!(
+            workspace.open_document_contexts.get(&sibling_uri),
+            Some(&sibling_key)
+        );
+        assert!(workspace.contexts.contains_key(&sibling_key));
+        assert!(workspace.indexed_files.contains(&sibling_uri));
+        assert!(!workspace.document_owners[&sibling_uri].needs_revalidation);
+        assert_eq!(workspace.document_owners[&shared_uri].key, *switched_key);
+        assert!(
+            !workspace
+                .source_change_generations
+                .contains_key(&Url::from_file_path(root.join("Root.dpr")).unwrap())
+        );
+        assert!(
+            !workspace
+                .configuration_change_generations
+                .contains_key(&Url::from_file_path(&ancestor_project).unwrap())
         );
     }
 

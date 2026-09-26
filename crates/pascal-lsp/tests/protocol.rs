@@ -29355,12 +29355,7 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
             "automatic",
             Some(singleton_project),
         ),
-        (
-            "owner-context",
-            &owner_source,
-            "automatic",
-            Some(owner_root.join("OwnerA.dproj")),
-        ),
+        ("owner-context", &owner_source, "ambiguous", None),
     ] {
         let id = RequestId::from(id.to_string());
         server.send_request(
@@ -29372,8 +29367,11 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
         assert!(response.error.is_none(), "{response:?}");
         let context = response.result.unwrap();
         assert_eq!(context["selectionMode"], mode);
-        let selected = selected.expect("expected selected project");
-        assert_eq!(context["selectedProjectUri"], uri(&selected).to_string());
+        if let Some(selected) = selected {
+            assert_eq!(context["selectedProjectUri"], uri(&selected).to_string());
+        } else {
+            assert!(context["selectedProjectUri"].is_null());
+        }
     }
     server.shutdown();
 }

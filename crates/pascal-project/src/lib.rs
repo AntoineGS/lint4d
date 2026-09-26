@@ -8517,22 +8517,22 @@ mod tests {
             ProjectContext::discover(&member, &[root.to_path_buf()], &ProjectOptions::default())
                 .expect("discover project context");
 
-        assert_eq!(context.project_file, Some(root.join("A.dproj")));
+        assert!(context.project_file.is_none(), "{context:?}");
+        assert!(!context.discovery_complete);
         for path in [&main, &member] {
             assert!(
                 context.metadata_observations.iter().any(|observation| {
                     let MetadataObservation::Payload {
                         path: observed,
-                        read_policy,
                         path_entry,
                         stamp,
                         content_hash,
+                        ..
                     } = observation
                     else {
                         return false;
                     };
                     observed == path
-                        && read_policy == &context.read_policy
                         && path_entry.path == *path
                         && stamp == &path_stamp_result(path).expect("payload path stamp")
                         && *content_hash

@@ -40,6 +40,41 @@ pub struct InstallationContextInfo {
 }
 
 impl Workspace {
+    pub(super) fn selection_uris_for_scope(&self, scope: &Path, requester: &Url) -> HashSet<Url> {
+        let mut affected = HashSet::from([requester.clone()]);
+        let belongs = |uri: &Url, key: &ContextKey| {
+            let is_under_scope = uri
+                .to_file_path()
+                .ok()
+                .map(absolute_path)
+                .is_some_and(|path| crate::workspace::path_starts_with_native(&path, scope));
+            is_under_scope
+                || key
+                    .selection_scope
+                    .as_deref()
+                    .is_some_and(|candidate| project_paths_equal(candidate, scope))
+                || key
+                    .project_scope
+                    .as_deref()
+                    .is_some_and(|candidate| project_paths_equal(candidate, scope))
+        };
+        for (uri, key) in self
+            .document_contexts
+            .iter()
+            .chain(self.open_document_contexts.iter())
+        {
+            if belongs(uri, key) {
+                affected.insert(uri.clone());
+            }
+        }
+        for (uri, owner) in &self.document_owners {
+            if belongs(uri, &owner.key) {
+                affected.insert(uri.clone());
+            }
+        }
+        affected
+    }
+
     pub fn project_context(&mut self, uri: &Url) -> Result<ProjectContextInfo, String> {
         let uri = canonical_file_uri(uri);
         let path = document_path(&uri)?;
@@ -329,14 +364,11 @@ impl Workspace {
             &self.options.exclude,
         )?;
 
-        let selection_scope = scope.clone();
-        let affected_keys = self.selection_context_keys_for_scope(&selection_scope);
+        let affected_uris = self.selection_uris_for_scope(&scope, &uri);
         self.project_selections = tentative;
-        self.document_owners.remove(&uri);
-        self.owner_last_used.remove(&uri);
         self.bump_source_generation();
         self.bump_configuration_generation();
-        self.invalidate_selection_contexts(&affected_keys, None, None)?;
+        self.invalidate_project_selection_uris(&affected_uris, None, None)?;
         self.project_context(&uri)
     }
 

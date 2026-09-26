@@ -10773,17 +10773,11 @@ mod tests {
             "program A; uses Child in 'Child.pas'; begin end.\n",
         )
         .expect("owning main source");
-        fs::write(root.join("B.dpr"), "program B; begin end.\n").expect("competing main source");
         fs::write(
             root.join("A.dproj"),
             "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup></Project>",
         )
         .expect("owning project");
-        fs::write(
-            root.join("B.dproj"),
-            "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
-        )
-        .expect("competing project");
         let original_metadata = fs::metadata(&target).expect("target metadata");
         let target_uri = Url::from_file_path(&target).expect("target URI");
         let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());

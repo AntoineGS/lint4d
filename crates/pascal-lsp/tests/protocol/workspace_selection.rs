@@ -37,8 +37,9 @@ fn selection_fixture() -> SelectionFixture {
             ),
         );
         config.push_str(&format!(
-            "[installations.\"{version}\".properties]\nBDS='{}'\nAPPDATA='{}'\n",
+            "[installations.\"{version}\".properties]\nBDS='{}'\nAPPDATA='{}'\nEnvironmentSettings='{}/EnvOptions.proj'\n",
             sdk.display(),
+            ide.display(),
             ide.display(),
         ));
     }
@@ -201,7 +202,18 @@ fn installation_context_and_project_context_report_additive_fields() {
     assert_eq!(context["selectedInstallationId"], "7.0");
     assert_eq!(context["installationCandidates"], json!(["37.0", "7.0"]));
     assert!(context["mainSourceUri"].is_string());
-    assert!(context["installationConfigUris"].is_array());
+    let installation_config_uris = context["installationConfigUris"]
+        .as_array()
+        .expect("installation config URI array");
+    assert!(
+        installation_config_uris
+            .iter()
+            .any(|uri| { uri.as_str().is_some_and(|uri| uri.ends_with("/rsvars.bat")) })
+    );
+    assert!(installation_config_uris.iter().any(|uri| {
+        uri.as_str()
+            .is_some_and(|uri| uri.ends_with("/EnvOptions.proj"))
+    }));
     assert!(context["pathIssues"].is_array());
     server.shutdown();
 }
@@ -220,5 +232,196 @@ fn installation_methods_reject_non_file_uris() {
         }),
     );
     assert!(server.response(&id).error.is_some());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn held_project_operation_worker_does_not_block_ordinary_requests() {
+    let fixture = selection_fixture();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) = TestServer::launch_with_project_operation_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let select = RequestId::from("held-project-operation".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    wait_for_path(&barrier.entered);
+
+    let ordinary = RequestId::from("ordinary-request-during-project-worker".to_owned());
+    server.send_request(
+        ordinary.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    let ordinary_response = server.response(&ordinary);
+    assert!(ordinary_response.error.is_none(), "{ordinary_response:?}");
+
+    fs::write(&barrier.release, b"release").expect("release project worker");
+    let selected = server.response(&select);
+    assert!(selected.error.is_none(), "{selected:?}");
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn queued_project_selection_cancelled_before_worker_start_is_not_committed() {
+    let fixture = selection_fixture();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) = TestServer::launch_with_project_operation_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let request_id = |name: &str| RequestId::from(name.to_owned());
+    for (name, profile) in [("project-worker-a", "37.0"), ("project-worker-b", "37.0")] {
+        server.send_request(
+            request_id(name),
+            "pascal/selectInstallation",
+            json!({"projectUri": uri(&fixture.project_a), "installationId": profile}),
+        );
+    }
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while Instant::now() < deadline && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) < 2
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) >= 2,
+        "both project operation workers should occupy bounded worker slots"
+    );
+
+    let queued = request_id("project-worker-queued-cancel");
+    server.send_request(
+        queued.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_b), "installationId": "7.0"}),
+    );
+    server.send_notification("$/cancelRequest", json!({"id": queued}));
+    assert_eq!(server.response(&queued).error.unwrap().code, -32800);
+
+    fs::write(&barrier.release, b"release").expect("release project workers");
+    for name in ["project-worker-a", "project-worker-b"] {
+        let _ = server.response(&request_id(name));
+    }
+    let context = RequestId::from("queued-cancel-project-b-context".to_owned());
+    server.send_request(
+        context.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_b)}),
+    );
+    assert_eq!(
+        server.response(&context).result.unwrap()["selectedInstallationId"],
+        "37.0",
+        "the canceled queued selection must not change project B"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn selection_worker_result_is_rejected_after_installation_profile_change() {
+    let fixture = selection_fixture();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) = TestServer::launch_with_project_operation_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let select = RequestId::from("selection-stale-after-profile-change".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    wait_for_path(&barrier.entered);
+
+    let local_config = fixture.directory.path().join(".delphi-tools.local.toml");
+    let config = fs::read_to_string(&local_config)
+        .expect("read local config")
+        .replace("installations.\"37.0\"", "installations.\"38.0\"");
+    write_file(&local_config, &config);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&local_config), "type": 2}]}),
+    );
+
+    let ordinary = RequestId::from("profile-change-ordering-fence".to_owned());
+    server.send_request(
+        ordinary.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    let ordinary_response = server.response(&ordinary);
+    assert!(ordinary_response.error.is_none(), "{ordinary_response:?}");
+
+    fs::write(&barrier.release, b"release").expect("release project worker");
+    let stale = server.response(&select);
+    assert!(
+        stale.error.is_some(),
+        "a selection prepared against the prior profile generation must not commit: {stale:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn compiled_view_response_is_stale_after_installation_switch() {
+    let fixture = selection_fixture();
+    let root = fixture.directory.path();
+    let library = root.join("a/lib");
+    fs::create_dir_all(&library).expect("create compiled library directory");
+    let dcu = library.join("Lint4dFixture.Classes.dcu");
+    let dcu_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug/Lint4dFixture.Classes.dcu");
+    fs::copy(&dcu_fixture, &dcu).expect("copy real D13 DCU fixture");
+    let source = "unit Main;\ninterface\nuses Lint4dFixture.Classes;\ntype TAlias = TSimpleClass;\nimplementation\nprocedure Check(Value: TSimpleClass);\nbegin\n  Value.GetName;\nend;\nend.\n";
+    write_file(&fixture.main_a, source);
+    write_file(
+        &fixture.project_a,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Platform>Win32</Platform><DCC_UnitSearchPath>lib</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) = TestServer::launch_with_compiled_content_barrier(environment);
+    server.initialize(root, Value::Null);
+
+    let definition = RequestId::from("compiled-view-definition-before-switch".to_owned());
+    server.send_request(
+        definition.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&fixture.main_a)},
+            "position": {"line": 3, "character": 16}
+        }),
+    );
+    let definition = server.response(&definition);
+    assert!(definition.error.is_none(), "{definition:?}");
+    let compiled_uri = definition.result.unwrap()[0]["uri"]
+        .as_str()
+        .expect("compiled URI")
+        .to_owned();
+    assert!(compiled_uri.starts_with("lint4d-dcu://"), "{compiled_uri}");
+
+    let content = RequestId::from("compiled-view-content-before-switch".to_owned());
+    server.send_request(
+        content.clone(),
+        "textDocument/content",
+        json!({"textDocument": {"uri": compiled_uri}}),
+    );
+    wait_for_path(&barrier.entered);
+
+    let select = RequestId::from("compiled-view-installation-switch".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    let selected = server.response(&select);
+    assert!(selected.error.is_none(), "{selected:?}");
+
+    fs::write(&barrier.release, b"release").expect("release compiled-content worker");
+    assert!(
+        server.response(&content).error.is_some(),
+        "compiled content captured before an installation switch must be rejected"
+    );
     server.shutdown();
 }

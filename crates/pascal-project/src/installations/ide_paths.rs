@@ -783,6 +783,7 @@ pub(crate) fn load_installation(
         properties,
         read_roots,
         inferred_mappings: relocated.inferred_mappings,
+        installation_config_files: metadata_files.clone(),
         metadata_files,
         metadata_observations: observations,
         path_issues: Vec::new(),

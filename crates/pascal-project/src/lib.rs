@@ -824,6 +824,9 @@ pub struct ProjectContext {
     /// candidate files used to build the context. Consumers can revalidate
     /// these paths without rediscovering or reparsing unrelated source files.
     pub metadata_files: Vec<PathBuf>,
+    /// Exact selected installation environment and imported IDE XML files
+    /// consumed while constructing this context.
+    pub installation_config_files: Vec<PathBuf>,
     /// The authorization provenance for each metadata observation. A path in
     /// `metadata_files` without a payload observation is stat-only.
     pub metadata_observations: Vec<MetadataObservation>,
@@ -3874,6 +3877,7 @@ fn build_project_context(
             .map(|(_, id)| id.as_str()),
     ));
     let mut installation_environment = None;
+    let mut installation_config_files = Vec::new();
     let mut ide_paths = IdePaths::default();
     let mut installation_warnings = Vec::new();
     let mut ide_path_warnings = Vec::new();
@@ -3929,6 +3933,7 @@ fn build_project_context(
                     &read_policy,
                 ) {
                     Ok(environment) => {
+                        installation_config_files = environment.installation_config_files.clone();
                         if let (Some(config), Some(platform)) = (
                             evaluation_options.build_config.as_deref(),
                             evaluation_options.platform.as_deref(),
@@ -4298,6 +4303,7 @@ fn build_project_context(
         read_policy,
         packages: package_list(&builder),
         metadata_files,
+        installation_config_files,
         metadata_observations,
         warnings: builder.warnings,
         override_error: None,
@@ -4386,6 +4392,7 @@ fn build_standalone_context(
         read_policy,
         packages: Vec::new(),
         metadata_files,
+        installation_config_files: Vec::new(),
         metadata_observations,
         warnings,
         override_error: None,

@@ -924,6 +924,9 @@ impl AnalysisPriority {
     fn for_request(request: &AnalysisRequest) -> Self {
         match request {
             AnalysisRequest::Hover { .. }
+            | AnalysisRequest::ProjectContext { .. }
+            | AnalysisRequest::InstallationContext { .. }
+            | AnalysisRequest::SelectInstallation { .. }
             | AnalysisRequest::CompiledContent { .. }
             | AnalysisRequest::Completion { .. }
             | AnalysisRequest::SignatureHelp { .. }
@@ -1093,6 +1096,8 @@ enum TestBarrier {
     WorkspaceSymbols,
     References,
     PartialValidation,
+    ProjectOperation,
+    CompiledContent,
 }
 
 #[cfg(feature = "test-support")]
@@ -1106,6 +1111,8 @@ pub struct TestBarrierConfig {
     workspace_symbols: Option<TestBarrierPaths>,
     references: Option<TestBarrierPaths>,
     partial_validation: Option<TestBarrierPaths>,
+    project_operation: Option<TestBarrierPaths>,
+    compiled_content: Option<TestBarrierPaths>,
     outbound_writer: Option<OutboundWriterBarrierPaths>,
     outbound_control_limit: Option<usize>,
     workspace_fifo_probe: Option<WorkspaceFifoProbePaths>,
@@ -1153,6 +1160,8 @@ impl TestBarrierConfig {
             workspace_symbols: None,
             references: None,
             partial_validation: None,
+            project_operation: None,
+            compiled_content: None,
             outbound_writer: None,
             outbound_control_limit: None,
             workspace_fifo_probe: None,
@@ -1269,6 +1278,18 @@ impl TestBarrierConfig {
         self
     }
 
+    pub fn with_project_operation(mut self, project_operation: Option<(PathBuf, PathBuf)>) -> Self {
+        self.project_operation =
+            project_operation.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    pub fn with_compiled_content(mut self, compiled_content: Option<(PathBuf, PathBuf)>) -> Self {
+        self.compiled_content =
+            compiled_content.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
     pub fn with_dispatch(mut self, path: Option<PathBuf>) -> Self {
         self.dispatch = path;
         self
@@ -1305,6 +1326,8 @@ impl TestBarrierConfig {
             TestBarrier::WorkspaceSymbols => self.workspace_symbols.as_ref(),
             TestBarrier::References => self.references.as_ref(),
             TestBarrier::PartialValidation => self.partial_validation.as_ref(),
+            TestBarrier::ProjectOperation => self.project_operation.as_ref(),
+            TestBarrier::CompiledContent => self.compiled_content.as_ref(),
         }
     }
 }
@@ -1995,6 +2018,19 @@ struct SelectInstallationRequestParams {
 
 #[derive(Debug)]
 enum AnalysisRequest {
+    ProjectContext {
+        uri: Url,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
+    InstallationContext {
+        project_uri: Url,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
+    SelectInstallation {
+        project_uri: Url,
+        installation_id: Option<String>,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
     CompiledContent {
         snapshot: crate::workspace::CompiledContentSnapshot,
         symbols: Option<(Url, bool)>,
@@ -2115,6 +2151,9 @@ enum AnalysisRequest {
 
 fn progress_title(request: &AnalysisRequest) -> &'static str {
     match request {
+        AnalysisRequest::ProjectContext { .. }
+        | AnalysisRequest::InstallationContext { .. }
+        | AnalysisRequest::SelectInstallation { .. } => "Resolving Delphi project context",
         AnalysisRequest::CompiledContent { .. } => "Reading compiled virtual document",
         AnalysisRequest::Diagnostics { .. } => "Indexing workspace",
         AnalysisRequest::DocumentDiagnostics { .. } => "Indexing document diagnostics",
@@ -2149,6 +2188,7 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
 
 #[derive(Clone)]
 enum AnalysisResultValue {
+    ProjectOperation(Result<ProjectOperationResponse, String>),
     CompiledContent(Result<Option<String>, String>),
     Hover(Result<Option<lsp_types::Hover>, String>),
     Completion(CompletionAnalysis),
@@ -2186,6 +2226,21 @@ enum AnalysisResultValue {
     PrepareTypeHierarchy(Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String>),
     TypeHierarchySupertypes(Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String>),
     TypeHierarchySubtypes(Result<Option<Vec<lsp_types::TypeHierarchyItem>>, String>),
+}
+
+#[derive(Clone)]
+enum ProjectOperationResponse {
+    ProjectContext {
+        value: Value,
+        prepared: crate::workspace::projects::ProjectContextPreparation,
+    },
+    InstallationContext(Value),
+    SelectInstallation {
+        value: Value,
+        project_path: PathBuf,
+        installation_id: Option<String>,
+        expected_installation: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -4829,7 +4884,10 @@ impl ObservationKey {
             | AnalysisRequest::IncomingCalls { .. }
             | AnalysisRequest::OutgoingCalls { .. }
             | AnalysisRequest::TypeHierarchySupertypes { .. }
-            | AnalysisRequest::TypeHierarchySubtypes { .. } => return None,
+            | AnalysisRequest::TypeHierarchySubtypes { .. }
+            | AnalysisRequest::ProjectContext { .. }
+            | AnalysisRequest::InstallationContext { .. }
+            | AnalysisRequest::SelectInstallation { .. } => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
@@ -5028,6 +5086,7 @@ struct AnalysisJobs {
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
     shutting_down: bool,
+    configuration_watch_sync_pending: bool,
 }
 
 #[derive(Debug)]
@@ -5098,6 +5157,7 @@ impl AnalysisJobs {
             test_barriers,
             next_computation_id: 0,
             shutting_down: false,
+            configuration_watch_sync_pending: false,
         }
     }
 
@@ -5108,6 +5168,14 @@ impl AnalysisJobs {
         workspace: &Workspace,
         features: ClientFeatures,
     ) -> Result<PendingAnalysis, String> {
+        if matches!(
+            &request,
+            AnalysisRequest::ProjectContext { .. }
+                | AnalysisRequest::InstallationContext { .. }
+                | AnalysisRequest::SelectInstallation { .. }
+        ) {
+            return self.spawn_project_operation(id, request);
+        }
         if let AnalysisRequest::CompiledContent { snapshot, symbols } = request {
             // Keep the admission-time generations. A queued request must not
             // adopt the post-edit generations when it finally gets a worker.
@@ -5115,16 +5183,24 @@ impl AnalysisJobs {
             let cancellation = Arc::new(AtomicBool::new(false));
             let worker_cancellation = Arc::clone(&cancellation);
             let sender = self.sender.clone();
+            let test_barriers = self.test_barriers.clone();
             let worker_id = id;
             let panic_symbols = symbols.clone();
             let handle = thread::Builder::new()
                 .name("PascalLspCompiledContent".to_string())
                 .spawn(move || {
                     let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let result = Workspace::read_compiled_virtual_document_snapshot(
-                            snapshot,
+                        let result = wait_at_test_barrier(
+                            TestBarrier::CompiledContent,
+                            &test_barriers,
                             &worker_cancellation,
-                        );
+                        )
+                        .and_then(|()| {
+                            Workspace::read_compiled_virtual_document_snapshot(
+                                snapshot,
+                                &worker_cancellation,
+                            )
+                        });
                         match symbols {
                             Some((uri, hierarchical)) => {
                                 let value = result.and_then(|text| {
@@ -5191,6 +5267,11 @@ impl AnalysisJobs {
         let worker_id = id;
         let panic_id = id;
         let panic_value = match &request {
+            AnalysisRequest::ProjectContext { .. }
+            | AnalysisRequest::InstallationContext { .. }
+            | AnalysisRequest::SelectInstallation { .. } => AnalysisResultValue::ProjectOperation(
+                Err("project operation worker panicked".to_string()),
+            ),
             AnalysisRequest::CompiledContent { .. } => AnalysisResultValue::CompiledContent(Err(
                 "compiled virtual-document worker panicked".to_string(),
             )),
@@ -5341,6 +5422,11 @@ impl AnalysisJobs {
                 let validation_input = input.clone();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
+                        AnalysisRequest::ProjectContext { .. }
+                        | AnalysisRequest::InstallationContext { .. }
+                        | AnalysisRequest::SelectInstallation { .. } => unreachable!(
+                            "project operations use their dedicated worker admission path"
+                        ),
                         AnalysisRequest::Hover {
                             uri,
                             position,
@@ -6247,6 +6333,109 @@ impl AnalysisJobs {
                 let _ = sender.send(result);
             })
             .map_err(|error| format!("could not start analysis worker: {error}"))?;
+        Ok(PendingAnalysis {
+            cancellation,
+            handle,
+            recipients: Vec::new(),
+            key: None,
+        })
+    }
+
+    fn spawn_project_operation(
+        &self,
+        id: AnalysisJobId,
+        request: AnalysisRequest,
+    ) -> Result<PendingAnalysis, String> {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let test_barriers = self.test_barriers.clone();
+        let sender = self.sender.clone();
+        let worker_id = id;
+        let (source_generation, configuration_generation) = match &request {
+            AnalysisRequest::ProjectContext { snapshot, .. }
+            | AnalysisRequest::InstallationContext { snapshot, .. }
+            | AnalysisRequest::SelectInstallation { snapshot, .. } => snapshot.generations(),
+            _ => unreachable!("only project protocol requests use this worker"),
+        };
+        let handle = thread::Builder::new()
+            .name("PascalLspProjectOperation".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    wait_at_test_barrier(
+                        TestBarrier::ProjectOperation,
+                        &test_barriers,
+                        &worker_cancellation,
+                    )?;
+                    if worker_cancellation.load(Ordering::Acquire) {
+                        return Err(rename::CANCELLATION_MESSAGE.to_string());
+                    }
+                    match request {
+                        AnalysisRequest::ProjectContext { uri, mut snapshot } => {
+                            let prepared = snapshot
+                                .workspace_mut()
+                                .prepare_project_context_with_cancel(
+                                    &uri,
+                                    Some(&worker_cancellation),
+                                )?;
+                            let value = serde_json::to_value(&prepared.info)
+                                .map_err(|error| error.to_string())?;
+                            Ok(ProjectOperationResponse::ProjectContext { value, prepared })
+                        }
+                        AnalysisRequest::InstallationContext {
+                            project_uri,
+                            mut snapshot,
+                        } => {
+                            let value = snapshot
+                                .workspace_mut()
+                                .installation_context(&project_uri)
+                                .and_then(|context| {
+                                    serde_json::to_value(context).map_err(|error| error.to_string())
+                                })?;
+                            Ok(ProjectOperationResponse::InstallationContext(value))
+                        }
+                        AnalysisRequest::SelectInstallation {
+                            project_uri,
+                            installation_id,
+                            mut snapshot,
+                        } => {
+                            let expected_installation =
+                                snapshot.expected_installation().map(str::to_string);
+                            let project_path = project_uri.to_file_path().map_err(|_| {
+                                format!("project URI must be a file URI: {project_uri}")
+                            })?;
+                            let context =
+                                snapshot.workspace_mut().select_installation_with_cancel(
+                                    &project_uri,
+                                    installation_id.as_deref(),
+                                    &worker_cancellation,
+                                )?;
+                            let value =
+                                serde_json::to_value(context).map_err(|error| error.to_string())?;
+                            Ok(ProjectOperationResponse::SelectInstallation {
+                                value,
+                                project_path,
+                                installation_id,
+                                expected_installation,
+                            })
+                        }
+                        _ => unreachable!("only project protocol requests use this worker"),
+                    }
+                }))
+                .unwrap_or_else(|_| {
+                    Err(
+                        "project operation worker panicked without changing live workspace state"
+                            .to_string(),
+                    )
+                });
+                let _ = sender.send(AnalysisResult {
+                    id: worker_id,
+                    source_generation,
+                    configuration_generation,
+                    records: Vec::new(),
+                    value: AnalysisResultValue::ProjectOperation(result),
+                });
+            })
+            .map_err(|error| format!("could not start project operation worker: {error}"))?;
         Ok(PendingAnalysis {
             cancellation,
             handle,
@@ -7735,6 +7924,12 @@ impl AnalysisJobs {
                     }
                 }
                 AnalysisJobId::Client(primary_id) => {
+                    let project_context_result = matches!(
+                        &result.value,
+                        AnalysisResultValue::ProjectOperation(Ok(
+                            ProjectOperationResponse::ProjectContext { .. }
+                        ))
+                    );
                     let Some(job) = self.pending.remove(&primary_id) else {
                         continue;
                     };
@@ -7800,6 +7995,9 @@ impl AnalysisJobs {
                                         error.into()
                                     })?;
                             }
+                            if project_context_result {
+                                self.configuration_watch_sync_pending = true;
+                            }
                         }
                     }
                 }
@@ -7809,6 +8007,10 @@ impl AnalysisJobs {
         self.handle_dispatch_failures(failures, Some(connection))
             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         Ok(())
+    }
+
+    fn take_configuration_watch_sync_pending(&mut self) -> bool {
+        std::mem::take(&mut self.configuration_watch_sync_pending)
     }
 
     fn is_empty(&self) -> bool {
@@ -8120,6 +8322,54 @@ fn deliver_analysis_result_with_store(
         }
     }
     match result.value {
+        AnalysisResultValue::ProjectOperation(Err(error)) => send_analysis_error(
+            connection,
+            client_id.clone().expect("project operation client result"),
+            error,
+        ),
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::ProjectContext {
+            value,
+            prepared,
+        })) => {
+            workspace.apply_project_context_preparation(prepared);
+            send_ok(
+                connection,
+                client_id.clone().expect("project operation client result"),
+                value,
+            )
+        }
+        AnalysisResultValue::ProjectOperation(Ok(
+            ProjectOperationResponse::InstallationContext(value),
+        )) => send_ok(
+            connection,
+            client_id.clone().expect("project operation client result"),
+            value,
+        ),
+        AnalysisResultValue::ProjectOperation(Ok(
+            ProjectOperationResponse::SelectInstallation {
+                value,
+                project_path,
+                installation_id,
+                expected_installation,
+            },
+        )) => {
+            match workspace.commit_prepared_installation_selection(
+                &project_path,
+                installation_id.as_deref(),
+                expected_installation.as_deref(),
+            ) {
+                Ok(()) => send_ok(
+                    connection,
+                    client_id.clone().expect("project operation client result"),
+                    value,
+                ),
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("project operation client result"),
+                    error,
+                ),
+            }
+        }
         AnalysisResultValue::CompiledContent(value) => match value {
             Ok(Some(text)) => send_ok(
                 connection,
@@ -8698,6 +8948,9 @@ fn workspace_diagnostic_items(
 
 fn invalidate_analysis_result(result: &mut AnalysisResult, error: String) {
     match &mut result.value {
+        AnalysisResultValue::ProjectOperation(value) => {
+            *value = Err(error);
+        }
         AnalysisResultValue::CompiledContent(value) => *value = Err(error),
         AnalysisResultValue::Hover(value) => *value = Err(error),
         AnalysisResultValue::Completion(analysis) => analysis.value = Err(error),
@@ -9639,6 +9892,11 @@ fn event_loop(
                 &mut diagnostic_publication_budget,
                 pending_diagnostic_clears.is_empty(),
             )?;
+            if jobs.take_configuration_watch_sync_pending() {
+                if let Some(registration) = watcher_registration.as_mut() {
+                    sync_file_watcher(connection, workspace, registration)?;
+                }
+            }
         }
         if !pull_diagnostics_supported
             && !diagnostic_clears_were_pending
@@ -10823,10 +11081,19 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            match workspace.project_context(&params.text_document.uri) {
-                Ok(context) => send_ok(connection, id, context)?,
-                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
-            }
+            let snapshot = workspace.project_operation_snapshot(None);
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::ProjectContext {
+                    uri: params.text_document.uri,
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
         }
         "pascal/installationContext" => {
             let id = request.id.clone();
@@ -10837,10 +11104,20 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            match workspace.installation_context(&params.project_uri) {
-                Ok(context) => send_ok(connection, id, context)?,
-                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
-            }
+            let project_path = params.project_uri.to_file_path().ok();
+            let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::InstallationContext {
+                    project_uri: params.project_uri,
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
         }
         "pascal/selectInstallation" => {
             let id = request.id.clone();
@@ -10860,12 +11137,21 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            match workspace
-                .select_installation(&params.project_uri, params.installation_id.as_deref())
-            {
-                Ok(context) => send_ok(connection, id, context)?,
-                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
-            }
+            let project_path = params.project_uri.to_file_path().ok();
+            let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::SelectInstallation {
+                    project_uri: params.project_uri,
+                    installation_id: params.installation_id,
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
         }
         "pascal/selectProject" => {
             let id = request.id.clone();

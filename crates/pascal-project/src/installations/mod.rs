@@ -19,6 +19,9 @@ pub(crate) struct InstallationEnvironment {
     pub read_roots: Vec<PathBuf>,
     pub inferred_mappings: Vec<PathMapping>,
     pub metadata_files: Vec<PathBuf>,
+    /// Exact rsvars / IDE environment XML inputs consumed while loading the
+    /// selected installation, including imported XML files.
+    pub installation_config_files: Vec<PathBuf>,
     pub metadata_observations: Vec<MetadataObservation>,
     pub path_issues: Vec<ProjectPathIssue>,
     pub warnings: Vec<String>,

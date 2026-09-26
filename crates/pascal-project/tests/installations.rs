@@ -562,3 +562,161 @@ fn imported_compiler_metadata_does_not_supply_bootstrap_installation_identity() 
         })
     );
 }
+
+#[test]
+fn import_may_set_config_so_empty_config_identity_condition_is_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        "[installations.\"10.0\".properties]\nBDS = '/sdk/10'\n\
+         [installations.\"23.0\".properties]\nBDS = '/sdk/23'\n",
+    );
+    let source = temp.path().join("App.dpr");
+    let project = temp.path().join("App.dproj");
+    write(&source, "begin end.\n");
+    write(
+        &temp.path().join("Config.props"),
+        "<Project><PropertyGroup><Config>Release</Config></PropertyGroup></Project>",
+    );
+    write(
+        &project,
+        r#"<Project>
+          <Import Project="Config.props" />
+          <PropertyGroup Condition="'$(Config)' == ''">
+            <CompilerVersion>24.0</CompilerVersion>
+          </PropertyGroup>
+          <PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+        </Project>"#,
+    );
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    assert_eq!(context.config.as_deref(), Some("Release"));
+    assert_eq!(context.installation_evidence.compiler_version, None);
+    assert!(context.installation_evidence.conflicting);
+    assert_eq!(
+        context.installation_selection,
+        Some(InstallationSelection::NeedsChoice {
+            candidates: vec!["10.0".into(), "23.0".into()]
+        })
+    );
+}
+
+#[test]
+fn direct_compiler_fact_survives_unrelated_imported_config_uncertainty() {
+    let temp = tempfile::tempdir().unwrap();
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        "[installations.\"10.0\".properties]\nBDS = '/sdk/10'\n\
+         [installations.\"23.0\".properties]\nBDS = '/sdk/23'\n",
+    );
+    let source = temp.path().join("App.dpr");
+    let project = temp.path().join("App.dproj");
+    write(&source, "begin end.\n");
+    write(
+        &temp.path().join("Config.props"),
+        "<Project><PropertyGroup><Config>Release</Config></PropertyGroup></Project>",
+    );
+    write(
+        &project,
+        r#"<Project>
+          <Import Project="Config.props" />
+          <PropertyGroup><CompilerVersion>24.0</CompilerVersion><MainSource>App.dpr</MainSource></PropertyGroup>
+          <PropertyGroup Condition="'$(Config)' == ''"><Platform>Win32</Platform></PropertyGroup>
+        </Project>"#,
+    );
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    assert_eq!(
+        context.installation_evidence.compiler_version,
+        Some(pascal_project::CompilerVersion::new(24, 0))
+    );
+    assert_eq!(
+        context.installation_selection,
+        Some(InstallationSelection::Selected {
+            id: "10.0".into(),
+            origin: InstallationOrigin::Metadata,
+        })
+    );
+}
+
+#[test]
+fn explicit_compiler_resolves_compiler_conflicts_but_not_bds_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        "[installations.\"10.0\".properties]\nBDS = '/sdk/10'\n\
+         [installations.\"23.0\".properties]\nBDS = '/sdk/23'\n",
+    );
+    let source = temp.path().join("App.dpr");
+    let project = temp.path().join("App.dproj");
+    write(&source, "begin end.\n");
+    write(
+        &project,
+        "<Project><PropertyGroup><CompilerVersion>24.0</CompilerVersion>\
+         <DCC_CompilerVersion>36.0</DCC_CompilerVersion><MainSource>App.dpr</MainSource>\
+         </PropertyGroup></Project>",
+    );
+    let explicit_version = pascal_project::CompilerVersion::new(36, 0);
+    let options = ProjectOptions {
+        project_file: Some(project.clone()),
+        conditional_context: pascal_project::ConditionalContext {
+            compiler_version: Some(explicit_version),
+            ..Default::default()
+        },
+        ..ProjectOptions::default()
+    };
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &options,
+        &OverrideSession::new(Some(configuration.clone())),
+    )
+    .unwrap();
+    assert!(context.installation_evidence.conflicting);
+    assert_eq!(
+        context.installation_selection,
+        Some(InstallationSelection::Selected {
+            id: "23.0".into(),
+            origin: InstallationOrigin::Metadata,
+        })
+    );
+
+    write(
+        &project,
+        "<Project><PropertyGroup><CompilerVersion>24.0</CompilerVersion>\
+         <DCC_CompilerVersion>36.0</DCC_CompilerVersion><BDS>/sdk/not-configured</BDS>\
+         <MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    let independent_conflict = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &options,
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    assert_eq!(
+        independent_conflict.installation_selection,
+        Some(InstallationSelection::NeedsChoice {
+            candidates: vec!["10.0".into(), "23.0".into()]
+        })
+    );
+}

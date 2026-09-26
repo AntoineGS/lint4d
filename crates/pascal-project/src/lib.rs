@@ -3730,7 +3730,10 @@ fn build_project_context(
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
+    let caller_compiler_version = options.conditional_context.compiler_version;
     let mut installation_evidence = InstallationEvidence::default();
+    let mut compiler_identity_conflicting = false;
+    let mut other_identity_conflicting = false;
     if extension_is(&project_file, "dproj") {
         let bootstrap_entry = ProjectPathEntry::legacy(project_file.clone());
         let (bootstrap, observation) = read_policy
@@ -3749,6 +3752,8 @@ fn build_project_context(
             tracker.record_metadata_path(path.clone());
         }
         installation_evidence = bootstrap.evidence;
+        compiler_identity_conflicting = bootstrap.compiler_conflicting;
+        other_identity_conflicting = bootstrap.other_conflicting;
         if evaluation_options.build_config.is_none() {
             evaluation_options.build_config = bootstrap.config;
         }
@@ -3765,7 +3770,12 @@ fn build_project_context(
         }
     }
     let mut selection_evidence = installation_evidence.clone();
-    if let Some(compiler_version) = evaluation_options.conditional_context.compiler_version {
+    if let Some(compiler_version) = caller_compiler_version {
+        selection_evidence.compiler_version = Some(compiler_version);
+        if compiler_identity_conflicting {
+            selection_evidence.conflicting = other_identity_conflicting;
+        }
+    } else if let Some(compiler_version) = installation_evidence.compiler_version {
         selection_evidence.compiler_version = Some(compiler_version);
     }
     let installation_selection = Some(select_installation(
@@ -4326,6 +4336,8 @@ fn parse_conditional_fact(value: &str) -> Option<ConditionalFact> {
 #[derive(Default)]
 struct ProjectBootstrap {
     evidence: InstallationEvidence,
+    compiler_conflicting: bool,
+    other_conflicting: bool,
     config: Option<String>,
     platform: Option<String>,
     metadata_files: Vec<PathBuf>,
@@ -4350,12 +4362,13 @@ fn parse_project_bootstrap(
                     conflicting: true,
                     ..InstallationEvidence::default()
                 },
+                other_conflicting: true,
                 ..ProjectBootstrap::default()
             };
         }
     };
     let mut properties = HashMap::new();
-    let unknown_properties = HashSet::new();
+    let mut unknown_properties = HashSet::new();
     for (key, option_value) in [
         ("config", options.build_config.as_ref()),
         ("platform", options.platform.as_ref()),
@@ -4367,7 +4380,9 @@ fn parse_project_bootstrap(
         }
     }
     let mut values = BTreeMap::<String, Vec<String>>::new();
-    let mut uncertain_identity = false;
+    let mut compiler_uncertain = false;
+    let mut other_identity_uncertain = false;
+    let mut unknown_import_taint = false;
     let mut warnings = Vec::new();
     let mut metadata_files = Vec::new();
     let base = source_file.parent().unwrap_or_else(|| Path::new("."));
@@ -4376,15 +4391,26 @@ fn parse_project_bootstrap(
     let platform_is_fixed =
         options.platform.is_some() || overrides.properties.contains_key("platform");
     for operation in operations {
-        let XmlOperation::PropertyGroup(group) = operation else {
-            continue;
+        let group = match operation {
+            XmlOperation::Import(_) => {
+                unknown_import_taint = true;
+                if !config_is_fixed {
+                    unknown_properties.insert("config".to_owned());
+                }
+                if !platform_is_fixed {
+                    unknown_properties.insert("platform".to_owned());
+                }
+                continue;
+            }
+            XmlOperation::PropertyGroup(group) => group,
+            XmlOperation::DccReference(_) | XmlOperation::Unsupported(_) => continue,
         };
         let group_truth = condition_matches(
             group.condition.as_deref(),
             ConditionEnvironment {
                 properties: &properties,
                 unknown_properties: &unknown_properties,
-                unknown_import_taint: false,
+                unknown_import_taint,
                 overrides,
                 read_policy,
             },
@@ -4406,7 +4432,7 @@ fn parse_project_bootstrap(
                 ConditionEnvironment {
                     properties: &properties,
                     unknown_properties: &unknown_properties,
-                    unknown_import_taint: false,
+                    unknown_import_taint,
                     overrides,
                     read_policy,
                 },
@@ -4428,12 +4454,18 @@ fn parse_project_bootstrap(
                         if (key == "config" && !config_is_fixed)
                             || (key == "platform" && !platform_is_fixed)
                         {
+                            unknown_properties.remove(&key);
                             properties.insert(key, value.to_owned());
                         }
                     }
                 }
                 TruthValue::False => {}
-                TruthValue::Unknown if identity_property => uncertain_identity = true,
+                TruthValue::Unknown if identity_property => {
+                    match entry.name.to_ascii_lowercase().as_str() {
+                        "compilerversion" | "dcc_compilerversion" => compiler_uncertain = true,
+                        _ => other_identity_uncertain = true,
+                    }
+                }
                 TruthValue::Unknown => {}
             }
         }
@@ -4462,32 +4494,37 @@ fn parse_project_bootstrap(
     };
     let project_version = unique_value("projectversion");
     let bds_root = unique_value("bds");
-    let conflicting = uncertain_identity
-        || [
-            "projectversion",
-            "compilerversion",
-            "dcc_compilerversion",
-            "bds",
-        ]
-        .into_iter()
-        .any(|key| {
+    let compiler_conflicting = compiler_uncertain
+        || ["compilerversion", "dcc_compilerversion"]
+            .into_iter()
+            .any(|key| {
+                values.get(key).is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| !item.eq_ignore_ascii_case(&items[0]))
+                })
+            })
+        || compiler_raw.len() > 1
+            && compiler_raw
+                .iter()
+                .any(|value| CompilerVersion::parse(value) != compiler_version);
+    let other_conflicting = other_identity_uncertain
+        || ["projectversion", "bds"].into_iter().any(|key| {
             values.get(key).is_some_and(|items| {
                 items
                     .iter()
                     .any(|item| !item.eq_ignore_ascii_case(&items[0]))
             })
-        })
-        || compiler_raw.len() > 1
-            && compiler_raw
-                .iter()
-                .any(|value| CompilerVersion::parse(value) != compiler_version);
+        });
     ProjectBootstrap {
         evidence: InstallationEvidence {
             compiler_version,
             project_version,
             bds_root,
-            conflicting,
+            conflicting: compiler_conflicting || other_conflicting,
         },
+        compiler_conflicting,
+        other_conflicting,
         config: unique_value("config"),
         platform: unique_value("platform"),
         metadata_files,

@@ -28,7 +28,10 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
     );
     write(
         &app,
-        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform></PropertyGroup><ItemGroup><DCCReference Include=\"Reserved.pas\" /></ItemGroup></Project>",
+        &format!(
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform><DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"Reserved.pas\" /></ItemGroup></Project>",
+            sdk.join("lib").display()
+        ),
     );
     write(&root.join("App.dpr"), "program App; begin end.");
     write(
@@ -78,6 +81,23 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
             .iter()
             .any(|entry| entry.path == sdk.join("lib"))
     );
+    assert_eq!(
+        context
+            .search_path_entries
+            .iter()
+            .filter(|entry| entry.path == sdk.join("lib"))
+            .count(),
+        1,
+        "the earliest project path entry must deduplicate the SDK copy"
+    );
+    assert!(matches!(
+        context
+            .search_path_entries
+            .iter()
+            .find(|entry| entry.path == sdk.join("lib"))
+            .map(|entry| &entry.provenance),
+        Some(ProjectPathProvenance::LegacyNative)
+    ));
     assert!(
         context
             .browsing_path_entries

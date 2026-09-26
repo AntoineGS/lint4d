@@ -39,6 +39,48 @@ fn installation_read_roots_authorize_only_the_selected_local_tree() {
 }
 
 #[test]
+fn invalid_selected_ide_path_is_reported_and_keeps_context_incomplete() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let ide = root.join("ide");
+    let project = root.join("App.dproj");
+    write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+    write(
+        &ide.join("EnvOptions.proj"),
+        "<Project><PropertyGroup><DelphiLibraryPath>/definitely/outside</DelphiLibraryPath></PropertyGroup></Project>",
+    );
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+            sdk.display(),
+            ide.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("outside selected installation read roots"))
+    );
+    assert!(!context.discovery_complete);
+}
+
+#[test]
 fn project_shared_properties_override_user_profile_properties() {
     let temp = tempfile::tempdir().unwrap();
     let user = temp.path().join("config.toml");

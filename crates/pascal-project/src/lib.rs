@@ -3822,6 +3822,7 @@ fn build_project_context(
     let mut installation_environment = None;
     let mut ide_paths = IdePaths::default();
     let mut installation_warnings = Vec::new();
+    let mut ide_path_warnings = Vec::new();
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
             Ok(profile) => {
@@ -3861,7 +3862,10 @@ fn build_project_context(
                                 tracker,
                                 &read_policy,
                             ) {
-                                Ok(paths) => ide_paths = paths,
+                                Ok(paths) => {
+                                    ide_path_warnings = paths.warnings.clone();
+                                    ide_paths = paths;
+                                }
                                 Err(error) => installation_warnings.push(error),
                             }
                         } else {
@@ -3909,6 +3913,7 @@ fn build_project_context(
         builder.path_issues.extend(environment.path_issues.clone());
     }
     builder.warnings.extend(installation_warnings);
+    builder.warnings.extend(ide_path_warnings.iter().cloned());
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
         builder.process_root_dproj(&project_file, tracker)?;
@@ -3998,7 +4003,12 @@ fn build_project_context(
         );
     }
     for entry in &ide_paths.library {
-        add_unique_project_path_entry(&mut search_path_entries, entry.clone());
+        if !search_path_entries
+            .iter()
+            .any(|existing| project_paths_equal(&existing.path, &entry.path))
+        {
+            search_path_entries.push(entry.clone());
+        }
     }
     let search_paths = paths_from_entries(&search_path_entries);
 
@@ -4172,6 +4182,7 @@ fn build_project_context(
 
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
+            && ide_path_warnings.is_empty()
             && !project_context_warnings_incomplete(&builder.warnings, explicit),
         binding_metadata_complete: !builder.incomplete
             && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),

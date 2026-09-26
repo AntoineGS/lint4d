@@ -655,6 +655,7 @@ pub(crate) struct IdePaths {
     pub browsing: Vec<ProjectPathEntry>,
     pub debug_dcu: Vec<ProjectPathEntry>,
     pub namespaces: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 pub(crate) fn load_installation(
@@ -797,6 +798,7 @@ pub(crate) fn evaluate_ide_paths(
     tracker: &mut ProjectReadTracker<'_>,
     policy: &ReadPolicy,
 ) -> Result<IdePaths, String> {
+    let mut warnings = Vec::new();
     let appdata = property_path(&profile.overrides, "appdata", Path::new("/"));
     let Some(path) = locator_path(
         &profile.overrides,
@@ -805,11 +807,13 @@ pub(crate) fn evaluate_ide_paths(
         "EnvOptions.proj",
     )?
     else {
-        return Ok(IdePaths::default());
+        return Ok(IdePaths {
+            warnings,
+            ..IdePaths::default()
+        });
     };
     let mut observations = Vec::new();
     let mut files = Vec::new();
-    let mut warnings = Vec::new();
     let Some(contents) = read_installation_file(
         &path,
         false,
@@ -821,7 +825,10 @@ pub(crate) fn evaluate_ide_paths(
         &mut warnings,
     )?
     else {
-        return Ok(IdePaths::default());
+        return Ok(IdePaths {
+            warnings,
+            ..IdePaths::default()
+        });
     };
 
     let options = ProjectOptions {
@@ -861,37 +868,42 @@ pub(crate) fn evaluate_ide_paths(
             "delphidebugdcupath",
         )
     };
+    let library = property_paths(
+        &builder,
+        library_key,
+        profile,
+        environment,
+        policy,
+        &mut warnings,
+    );
+    let browsing = property_paths(
+        &builder,
+        browsing_key,
+        profile,
+        environment,
+        policy,
+        &mut warnings,
+    );
+    let debug_dcu = property_paths(
+        &builder,
+        debug_key,
+        profile,
+        environment,
+        policy,
+        &mut warnings,
+    );
+    let namespaces = builder
+        .property_list_with_provenance("delphinamespacesearchpath")
+        .into_iter()
+        .map(|(value, _)| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect();
     Ok(IdePaths {
-        library: property_paths(
-            &builder,
-            library_key,
-            profile,
-            environment,
-            policy,
-            &mut warnings,
-        ),
-        browsing: property_paths(
-            &builder,
-            browsing_key,
-            profile,
-            environment,
-            policy,
-            &mut warnings,
-        ),
-        debug_dcu: property_paths(
-            &builder,
-            debug_key,
-            profile,
-            environment,
-            policy,
-            &mut warnings,
-        ),
-        namespaces: builder
-            .property_list_with_provenance("delphinamespacesearchpath")
-            .into_iter()
-            .map(|(value, _)| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .collect(),
+        library,
+        browsing,
+        debug_dcu,
+        namespaces,
+        warnings,
     })
 }
 
@@ -1083,10 +1095,9 @@ fn property_paths(
                     ));
                     continue;
                 }
-                if entries
-                    .iter()
-                    .all(|existing: &ProjectPathEntry| existing.path != entry.path)
-                {
+                if entries.iter().all(|existing: &ProjectPathEntry| {
+                    !crate::project_paths_equal(&existing.path, &entry.path)
+                }) {
                     entries.push(entry);
                 }
             }

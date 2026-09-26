@@ -212,7 +212,7 @@ fn local_delphi_installations_resolve_configured_roots() {
             issue
                 .path
                 .as_ref()
-                .is_some_and(|path| path.starts_with(&delphi.join("Dependencies")))
+                .is_some_and(|path| path.starts_with(delphi.join("Dependencies")))
         })
         .collect::<Vec<_>>();
     eprintln!(

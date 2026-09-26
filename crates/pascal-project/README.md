@@ -128,8 +128,11 @@ missing explicit unit remains reserved instead of silently rebinding to a
 same-named unit elsewhere.
 
 Real copied-install checks are opt-in: set `PASCAL_TEST_DELPHI_ROOT` to the
-parent containing the expected `RAD Studio`/`Studio` and `AppData` directories,
-then run `cargo test -p pascal-project --test local_installations`. Do not
+parent containing `RAD Studio/7.0`, `RAD Studio/10.0`, `Studio/37.0`, and their
+`AppData` IDE folders; set `PASCAL_TEST_PROJECT_ROOT` to the repository
+containing `Projects/ChainDriveAPI/ChainDriveAPI.dproj`. Then run
+`cargo test -p pascal-project --test local_installations -- --ignored` (and set
+both variables in the command environment). Do not
 interpret this as a green real-RTL-resolution guarantee: versions 7.0, 10.0,
 and 37.0 can return `Incomplete` because earlier IDE/environment path metadata
 is unknown. Version 23.0 is partial and supplies only partial evidence.

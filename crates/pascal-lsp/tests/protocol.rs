@@ -46407,6 +46407,94 @@ fn source_action_deduplication_preserves_binding_before_and_after_apply() {
 }
 
 #[test]
+fn anonymous_callable_parameter_completion_stays_in_lambda_scope() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let path = temp.path().join("LambdaScope.pas");
+    let source = "unit LambdaScope;\ninterface\nimplementation\nprocedure Run;\nbegin\n  (procedure(LambdaOnly: Integer) begin LambdaO; end);\n  LambdaO;\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    for (occurrence, expected) in [(1, true), (2, false)] {
+        let id = RequestId::from(format!("lambda-scope-{occurrence}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/completion",
+            json!({"textDocument": {"uri": uri(&path)}, "position": position_after(source, "LambdaO", occurrence)}),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "lambda completion failed: {response:?}"
+        );
+        let result = response.result.expect("completion");
+        assert_eq!(
+            result["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .any(|item| item["label"] == "LambdaOnly"),
+            expected,
+            "lambda parameter visibility at occurrence {occurrence}: {result:?}"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
+fn anonymous_callable_overload_and_argument_diagnostic_use_direct_reference_signatures() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let path = temp.path().join("LambdaWire.pas");
+    let source = "unit LambdaWire;\ninterface\ntype\n  TIntHandler = reference to procedure(Value: Integer);\n  TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nprocedure Reject(Handler: TBoolHandler);\nimplementation\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Reject(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\n  Reject(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    write_file(&path, source);
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+    server.send_notification("textDocument/didOpen", json!({"textDocument": {"uri": uri(&path), "languageId": "pascal", "version": 1, "text": source}}));
+    let publication = diagnostics_for_uri(&mut server, &uri(&path));
+    let diagnostics = publication["diagnostics"].as_array().expect("diagnostics");
+    assert!(
+        diagnostics.iter().any(
+            |diagnostic| diagnostic["code"] == "pascal-incompatible-argument"
+                && diagnostic["range"]["start"]
+                    == json!(position_of(
+                        source,
+                        "procedure(Value: Integer) begin end",
+                        1
+                    ))
+        ),
+        "known callable mismatch not reported at argument: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics.iter().any(
+            |diagnostic| diagnostic["code"] == "pascal-incompatible-argument"
+                && diagnostic["range"]["start"]
+                    == json!(position_of(
+                        source,
+                        "procedure(Value: Integer) begin end",
+                        0
+                    ))
+        ),
+        "matching overload falsely rejected: {diagnostics:?}"
+    );
+    let id = RequestId::from("lambda-wire-overload".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/declaration",
+        navigation_params(&path, source, "Choose(procedure", 0),
+    );
+    let locations = result_locations(server.response(&id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "callable overload did not bind uniquely: {locations:?}"
+    );
+    assert_eq!(
+        locations[0]["range"]["start"],
+        json!(position_of(source, "Choose(Handler: TIntHandler)", 0))
+    );
+    server.shutdown();
+}
+
+#[test]
 fn code_lens_resolves_bound_references_and_implementation_lazily() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();

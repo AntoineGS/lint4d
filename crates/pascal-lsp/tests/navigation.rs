@@ -3802,6 +3802,134 @@ fn signature_help_rejects_an_oversized_overload_selection() {
 }
 
 #[test]
+fn anonymous_callable_parameter_completion_is_lexically_scoped() {
+    let source = "unit LambdaScope;\ninterface\nimplementation\nprocedure Run;\nbegin\n  (procedure(LambdaOnly: Integer) begin LambdaO; end);\n  LambdaO;\nend;\nend.\n";
+    let source_uri = uri("LambdaScope");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("lambda fixture parses");
+    let inside = index
+        .completion(&source_uri, position_after(source, "LambdaO", 1))
+        .expect("lambda completion");
+    assert!(
+        inside.items.iter().any(|item| item.label == "LambdaOnly"),
+        "lambda parameter missing inside its body: {inside:?}"
+    );
+    let outside = index
+        .completion(&source_uri, position_after(source, "LambdaO", 2))
+        .expect("enclosing completion");
+    assert!(
+        !outside.items.iter().any(|item| item.label == "LambdaOnly"),
+        "lambda parameter escaped into enclosing scope: {outside:?}"
+    );
+}
+
+#[test]
+fn nested_anonymous_parameters_inherit_only_their_ancestors() {
+    let source = "unit NestedLambdaScope;\ninterface\nimplementation\nprocedure Run;\nvar OuterOnly: Integer;\nbegin\n  (procedure(LambdaOnly: Integer) begin\n    (procedure(InnerOnly: Boolean) begin InnerO; LambdaO; OuterO; end);\n    InnerO; LambdaO;\n  end);\n  LambdaO; OuterO;\nend;\nend.\n";
+    let source_uri = uri("NestedLambdaScope");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("nested lambda parses");
+    for (needle, occurrence, expected, absent) in [
+        ("InnerO", 1, "InnerOnly", "Missing"),
+        ("LambdaO", 2, "LambdaOnly", "Missing"),
+        ("OuterO", 1, "OuterOnly", "Missing"),
+        ("InnerO", 2, "Missing", "InnerOnly"),
+        ("LambdaO", 3, "Missing", "LambdaOnly"),
+    ] {
+        let completion = index
+            .completion(&source_uri, position_after(source, needle, occurrence))
+            .expect("nested completion");
+        assert!(
+            expected == "Missing" || completion.items.iter().any(|item| item.label == expected),
+            "{expected} missing at {needle} occurrence {occurrence}: {completion:?}"
+        );
+        assert!(
+            !completion.items.iter().any(|item| item.label == absent),
+            "{absent} escaped into {needle} occurrence {occurrence}: {completion:?}"
+        );
+    }
+}
+
+#[test]
+fn anonymous_callable_signature_selects_the_matching_direct_reference_overload() {
+    let source = "unit LambdaSelect;\ninterface\ntype\n  TIntHandler = reference to procedure(Value: Integer);\n  TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaSelect");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("callable overload fixture parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        selected.len(),
+        1,
+        "anonymous signature did not select exactly one overload: {selected:?}"
+    );
+    assert_location_start(
+        &selected[0],
+        &source_uri,
+        position_of(source, "Choose(Handler: TIntHandler)", 0),
+    );
+}
+
+#[test]
+fn anonymous_function_result_type_selects_matching_direct_callable_overload() {
+    let source = "unit LambdaResult;\ninterface\ntype\n  TIntResult = reference to function(Value: Integer): Integer;\n  TBoolResult = reference to function(Value: Integer): Boolean;\nprocedure Choose(Handler: TIntResult); overload;\nprocedure Choose(Handler: TBoolResult); overload;\nimplementation\nprocedure Choose(Handler: TIntResult); begin end;\nprocedure Choose(Handler: TBoolResult); begin end;\nprocedure Run;\nbegin\n  Choose(function(Value: Integer): Integer begin Result := Value; end);\nend;\nend.\n";
+    let source_uri = uri("LambdaResult");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("function overload fixture parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(function", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        selected.len(),
+        1,
+        "function result did not select one overload: {selected:?}"
+    );
+    assert_location_start(
+        &selected[0],
+        &source_uri,
+        position_of(source, "Choose(Handler: TIntResult)", 0),
+    );
+}
+
+#[test]
+fn empty_parenthesized_callable_parameters_match_zero_argument_reference() {
+    let source = "unit LambdaZero;\ninterface\ntype TZero = reference to procedure();\n     TOne = reference to procedure(Value: Integer);\nprocedure Choose(Handler: TZero); overload;\nprocedure Choose(Handler: TOne); overload;\nimplementation\nprocedure Choose(Handler: TZero); begin end;\nprocedure Choose(Handler: TOne); begin end;\nprocedure Run;\nbegin\n  Choose(procedure() begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaZero");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("empty callable fixture parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        selected.len(),
+        1,
+        "zero-arg signature did not select one overload: {selected:?}"
+    );
+    assert_location_start(
+        &selected[0],
+        &source_uri,
+        position_of(source, "Choose(Handler: TZero)", 0),
+    );
+}
+
+#[test]
 fn completion_projection_is_scope_aware_and_uses_plain_identifier_edits() {
     let mut index = NavigationIndex::new();
     let main_uri = uri("AssistanceMain");

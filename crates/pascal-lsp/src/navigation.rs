@@ -18665,6 +18665,7 @@ fn build_scopes(
     source: &str,
 ) -> (Vec<Scope>, HashMap<Span, usize>) {
     let mut scope_nodes = definitions.to_vec();
+    scope_nodes.extend(collect_nodes_matching(root, "lambda"));
     scope_nodes.extend(collect_nodes_matching(root, "block"));
     let mut seeds: Vec<(Span, Option<String>)> = scope_nodes
         .iter()
@@ -24537,6 +24538,65 @@ mod tests {
                         }
             }),
             "known assignment mismatch must be reported at the actual expression: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_callable_signature_mismatch_reports_a_bound_argument() {
+        let uri = Url::parse("file:///tmp/LambdaMismatch.pas").unwrap();
+        let source = "unit LambdaMismatch;\ninterface\ntype TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TBoolHandler);\nimplementation\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("callable mismatch fixture parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("callable diagnostics");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("incompatible argument")
+                && diagnostic.span.start
+                    == source.find("procedure(Value: Integer) begin end").unwrap()),
+            "mismatched anonymous signature lacked an argument diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_byref_callable_type_does_not_claim_a_signature_mismatch() {
+        let uri = Url::parse("file:///tmp/LambdaUnknown.pas").unwrap();
+        let source = "unit LambdaUnknown;\ninterface\ntype TByRef = reference to procedure(var Value: Integer);\nprocedure Choose(Handler: TByRef);\nimplementation\nprocedure Choose(Handler: TByRef); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("unsupported callable fixture parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("callable diagnostics");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("incompatible argument")),
+            "unsupported byref signature produced a false mismatch: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn aliased_callable_type_does_not_claim_a_signature_mismatch() {
+        let uri = Url::parse("file:///tmp/LambdaAlias.pas").unwrap();
+        let source = "unit LambdaAlias;\ninterface\ntype TDirect = reference to procedure(Value: Boolean);\n     TAlias = TDirect;\nprocedure Choose(Handler: TAlias);\nimplementation\nprocedure Choose(Handler: TAlias); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("aliased callable fixture parses");
+        let diagnostics = index
+            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("alias diagnostics");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("incompatible argument")),
+            "indirect type alias led to a false mismatch: {diagnostics:?}"
         );
     }
 

@@ -31,9 +31,22 @@ pub(super) struct Selection {
 struct ArgumentInfo {
     span: Span,
     ty: Option<TypeIdentity>,
+    callable: Option<SimpleCallableSignature>,
     writability: Writability,
     storage: StorageProvenance,
     nil_literal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleCallableType {
+    Integer,
+    Boolean,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SimpleCallableSignature {
+    parameter: Option<SimpleCallableType>,
+    result: Option<SimpleCallableType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,6 +762,34 @@ fn score_group_detailed(
                     continue;
                 }
             }
+        }
+        if let Some(actual_callable) = argument.callable {
+            match expected.as_ref() {
+                Some(expected) => match direct_callable_signature(index, expected, cancel, budget)?
+                {
+                    Some(expected_callable) if expected_callable == actual_callable => {}
+                    Some(_) if !uncertain => mismatches.push(ArgumentTypeMismatch {
+                        span: argument.span,
+                        expected: type_identity_label(expected),
+                        actual: format!(
+                            "anonymous {}({})",
+                            if actual_callable.result.is_some() {
+                                "function"
+                            } else {
+                                "procedure"
+                            },
+                            match actual_callable.parameter {
+                                Some(SimpleCallableType::Integer) => "Integer",
+                                Some(SimpleCallableType::Boolean) => "Boolean",
+                                None => "",
+                            }
+                        ),
+                    }),
+                    Some(_) | None => uncertain = true,
+                },
+                None => uncertain = true,
+            }
+            continue;
         }
         if argument.nil_literal {
             let Some(expected) = expected.as_ref() else {
@@ -1616,12 +1657,25 @@ fn infer_argument(
         break;
     }
     let kind = node.kind();
+    if kind == "lambda" {
+        budget.require_work(1 + node.named_child_count(), cancel)?;
+        let callable = simple_callable_signature(node, &current_document.source);
+        return Ok(ArgumentInfo {
+            span: argument_span,
+            ty: None,
+            callable,
+            writability: Writability::NonWritable,
+            storage: StorageProvenance::Value,
+            nil_literal: false,
+        });
+    }
     if matches!(kind, "literalNumber") {
         let text = node_text(index, current_document, node, cancel, budget)?;
         let ty = infer_numeric_literal(&text);
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: Some(ty),
+            callable: None,
             writability: Writability::NonWritable,
             storage: StorageProvenance::Value,
             nil_literal: false,
@@ -1646,6 +1700,7 @@ fn infer_argument(
                     BuiltinType::String
                 },
             )),
+            callable: None,
             writability: Writability::NonWritable,
             storage: StorageProvenance::Value,
             nil_literal: false,
@@ -1655,6 +1710,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: Some(TypeIdentity::Builtin(BuiltinType::Boolean)),
+            callable: None,
             writability: Writability::NonWritable,
             storage: StorageProvenance::Value,
             nil_literal: false,
@@ -1664,6 +1720,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: None,
+            callable: None,
             writability: Writability::NonWritable,
             storage: StorageProvenance::Value,
             nil_literal: true,
@@ -1710,6 +1767,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty,
+            callable: None,
             writability: if storage == StorageProvenance::Addressed {
                 Writability::Writable
             } else {
@@ -1761,6 +1819,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty,
+            callable: None,
             writability,
             storage,
             nil_literal: false,
@@ -1792,6 +1851,7 @@ fn infer_argument(
                 StorageProvenance::Unknown
             },
             ty,
+            callable: None,
             nil_literal: false,
         });
     }
@@ -1816,6 +1876,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: None,
+            callable: None,
             writability: Writability::Unknown,
             storage: StorageProvenance::Unknown,
             nil_literal: false,
@@ -1825,6 +1886,7 @@ fn infer_argument(
         return Ok(ArgumentInfo {
             span: argument_span,
             ty: None,
+            callable: None,
             writability: Writability::Unknown,
             storage: StorageProvenance::Unknown,
             nil_literal: false,
@@ -1922,6 +1984,7 @@ fn infer_argument(
         } else {
             None
         },
+        callable: None,
         writability,
         storage,
         nil_literal: false,
@@ -1932,10 +1995,139 @@ fn unknown_argument(span: Span) -> ArgumentInfo {
     ArgumentInfo {
         span,
         ty: None,
+        callable: None,
         writability: Writability::Unknown,
         storage: StorageProvenance::Unknown,
         nil_literal: false,
     }
+}
+
+fn simple_callable_type(node: Node<'_>, source: &str) -> Option<SimpleCallableType> {
+    let source = source.get(node.start_byte()..node.end_byte())?;
+    if source.eq_ignore_ascii_case("Integer") {
+        Some(SimpleCallableType::Integer)
+    } else if source.eq_ignore_ascii_case("Boolean") {
+        Some(SimpleCallableType::Boolean)
+    } else {
+        None
+    }
+}
+
+/// Only compare explicit, non-generic, plain value parameters of direct
+/// `reference to` types. A signature is not proof that a lambda body is valid.
+fn simple_callable_signature(node: Node<'_>, source: &str) -> Option<SimpleCallableSignature> {
+    if node.has_error() || !matches!(node.kind(), "lambda" | "declProcRef") {
+        return None;
+    }
+    if node.kind() == "lambda" && node.child_by_field_name("body")?.kind() != "block" {
+        return None;
+    }
+    if node.kind() == "declProcRef" {
+        let children = (0..node.named_child_count())
+            .filter_map(|index| node.named_child(index))
+            .collect::<Vec<_>>();
+        if !children.iter().any(|child| child.kind() == "kReference")
+            || !children.iter().any(|child| child.kind() == "kTo")
+            || children.iter().any(|child| {
+                !matches!(
+                    child.kind(),
+                    "kReference" | "kTo" | "kProcedure" | "kFunction" | "declArgs" | "typeref"
+                )
+            })
+        {
+            return None;
+        }
+    }
+    let is_function = match node
+        .named_child(if node.kind() == "declProcRef" { 2 } else { 0 })?
+        .kind()
+    {
+        "kProcedure" => false,
+        "kFunction" => true,
+        _ => return None,
+    };
+    let parameter = match node.child_by_field_name("args") {
+        Some(args) if args.named_child_count() == 0 => None,
+        Some(args) if args.named_child_count() == 1 => {
+            let parameter = args.named_child(0)?;
+            if parameter.kind() != "declArg" || parameter.named_child_count() != 2 {
+                return None;
+            }
+            let name = parameter.child_by_field_name("name")?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            Some(simple_callable_type(
+                parameter.child_by_field_name("type")?,
+                source,
+            )?)
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    let result = if is_function {
+        Some(simple_callable_type(
+            node.child_by_field_name("type")?,
+            source,
+        )?)
+    } else {
+        if node.child_by_field_name("type").is_some() {
+            return None;
+        }
+        None
+    };
+    Some(SimpleCallableSignature { parameter, result })
+}
+
+fn direct_callable_signature(
+    index: &NavigationIndex,
+    expected: &TypeIdentity,
+    cancel: &AtomicBool,
+    budget: &mut AssistanceBudget,
+) -> Result<Option<SimpleCallableSignature>, String> {
+    check_navigation_cancel(cancel)?;
+    budget.require_work(1, cancel)?;
+    let TypeIdentity::Named {
+        uri,
+        key,
+        kind: TypeKind::Callable,
+        args,
+    } = expected
+    else {
+        return Ok(None);
+    };
+    if !args.is_empty() {
+        return Ok(None);
+    }
+    let Some(document) = index.documents.get(uri) else {
+        return Ok(None);
+    };
+    let Some([symbol_index]) = document.type_symbol_indices.get(key).map(Vec::as_slice) else {
+        return Ok(None);
+    };
+    let Some(symbol) = document
+        .symbols
+        .get(*symbol_index)
+        .filter(|symbol| symbol.kind == SymbolKind::Type && symbol.generic_parameters.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(declaration) = document.tree.root_node().named_descendant_for_byte_range(
+        symbol.declaration_span.start,
+        symbol.declaration_span.end,
+    ) else {
+        return Ok(None);
+    };
+    if declaration.kind() != "declType" || Span::from_node(declaration) != symbol.declaration_span {
+        return Ok(None);
+    }
+    let Some(type_node) = declaration.child_by_field_name("type") else {
+        return Ok(None);
+    };
+    let Some(callable) = type_node.named_child(0) else {
+        return Ok(None);
+    };
+    Ok(simple_callable_signature(callable, &document.source))
 }
 
 #[allow(clippy::too_many_arguments)]

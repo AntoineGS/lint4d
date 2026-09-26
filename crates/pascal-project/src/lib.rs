@@ -183,6 +183,7 @@ struct AuthorizedReadRoot {
 pub struct ReadPolicy {
     configured_roots: Vec<AuthorizedReadRoot>,
     mapped_roots: Vec<AuthorizedReadRoot>,
+    authorized_files: Arc<Vec<PathBuf>>,
     exclusions: Vec<String>,
     exclusion_bases: Vec<PathBuf>,
     compiled_exclusions: Arc<Option<globset::GlobSet>>,
@@ -192,6 +193,7 @@ impl PartialEq for ReadPolicy {
     fn eq(&self, other: &Self) -> bool {
         self.configured_roots == other.configured_roots
             && self.mapped_roots == other.mapped_roots
+            && self.authorized_files == other.authorized_files
             && self.exclusions == other.exclusions
             && self.exclusion_bases == other.exclusion_bases
     }
@@ -209,6 +211,9 @@ impl ReadPolicy {
             for base in &root.pattern_exclusion_bases {
                 visit(base.as_os_str().len())?;
             }
+        }
+        for path in self.authorized_files.iter() {
+            visit(path.as_os_str().len())?;
         }
         for pattern in &self.exclusions {
             visit(pattern.len())?;
@@ -229,6 +234,7 @@ impl Hash for ReadPolicy {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.configured_roots.hash(state);
         self.mapped_roots.hash(state);
+        self.authorized_files.hash(state);
         self.exclusions.hash(state);
         self.exclusion_bases.hash(state);
     }
@@ -307,10 +313,23 @@ impl ReadPolicy {
         Self {
             configured_roots,
             mapped_roots,
+            authorized_files: Arc::new(Vec::new()),
             exclusions: exclusions.to_vec(),
             exclusion_bases: unique_exclusion_bases,
             compiled_exclusions: Arc::new(compile_exclude_patterns(exclusions)),
         }
+    }
+
+    /// Add exact metadata files explicitly named by the selected installation.
+    /// Unlike a root, each path authorizes no siblings or descendants.
+    pub(crate) fn with_authorized_files(mut self, files: &[PathBuf]) -> Self {
+        for path in files {
+            let path = absolute_lexical(path).unwrap_or_else(|_| path.clone());
+            if !self.authorized_files.contains(&path) {
+                Arc::make_mut(&mut self.authorized_files).push(path);
+            }
+        }
+        self
     }
 
     pub fn allows_entry(&self, entry: &ProjectPathEntry) -> bool {
@@ -318,14 +337,16 @@ impl ReadPolicy {
             ProjectPathProvenance::LegacyNative => {
                 safe_regular_file(&entry.path) && !self.is_excluded(&entry.path)
             }
-            ProjectPathProvenance::Configured => self
-                .configured_roots
-                .iter()
-                .chain(self.mapped_roots.iter())
-                .any(|root| {
-                    self.allows_regular_file_under_root(&entry.path, &root.path)
-                        && !self.is_excluded_for_root(&entry.path, root)
-                }),
+            ProjectPathProvenance::Configured => {
+                self.configured_roots
+                    .iter()
+                    .chain(self.mapped_roots.iter())
+                    .any(|root| {
+                        self.allows_regular_file_under_root(&entry.path, &root.path)
+                            && !self.is_excluded_for_root(&entry.path, root)
+                    })
+                    || self.allows_authorized_file(&entry.path, true)
+            }
             ProjectPathProvenance::Mapped { root } => {
                 !self.is_excluded_for_mapped_root(&entry.path, root)
                     && self.allows_regular_file_under_root(&entry.path, root)
@@ -359,6 +380,7 @@ impl ReadPolicy {
 
         let configured = self.configured_roots.iter().map(root_bytes).sum::<usize>();
         let mapped = self.mapped_roots.iter().map(root_bytes).sum::<usize>();
+        let authorized_files = self.authorized_files.iter().map(path_bytes).sum::<usize>();
         let exclusions = self
             .exclusions
             .iter()
@@ -376,6 +398,7 @@ impl ReadPolicy {
         std::mem::size_of::<Self>()
             .saturating_add(configured)
             .saturating_add(mapped)
+            .saturating_add(authorized_files)
             .saturating_add(exclusions)
             .saturating_add(exclusion_bases)
             .saturating_add(compiled_patterns)
@@ -386,14 +409,16 @@ impl ReadPolicy {
             ProjectPathProvenance::LegacyNative => {
                 path_has_no_symlink_component(&entry.path) && !self.is_excluded(&entry.path)
             }
-            ProjectPathProvenance::Configured => self
-                .configured_roots
-                .iter()
-                .chain(self.mapped_roots.iter())
-                .any(|root| {
-                    self.allows_location_under_root(&entry.path, &root.path)
-                        && !self.is_excluded_for_root(&entry.path, root)
-                }),
+            ProjectPathProvenance::Configured => {
+                self.configured_roots
+                    .iter()
+                    .chain(self.mapped_roots.iter())
+                    .any(|root| {
+                        self.allows_location_under_root(&entry.path, &root.path)
+                            && !self.is_excluded_for_root(&entry.path, root)
+                    })
+                    || self.allows_authorized_file(&entry.path, false)
+            }
             ProjectPathProvenance::Mapped { root } => {
                 !self.is_excluded_for_mapped_root(&entry.path, root)
                     && self.allows_location_under_root(&entry.path, root)
@@ -413,6 +438,12 @@ impl ReadPolicy {
                 },
             })
             .or_else(|| {
+                if self.authorizes_exact_file(path) {
+                    return Some(ProjectPathEntry {
+                        path: path.to_path_buf(),
+                        provenance: ProjectPathProvenance::Configured,
+                    });
+                }
                 self.configured_roots
                     .iter()
                     .filter(|root| project_path_starts_with(path, &root.path))
@@ -444,14 +475,16 @@ impl ReadPolicy {
     ) -> bool {
         match provenance {
             ProjectPathProvenance::LegacyNative => !self.is_excluded(path),
-            ProjectPathProvenance::Configured => self
-                .configured_roots
-                .iter()
-                .chain(self.mapped_roots.iter())
-                .any(|root| {
-                    project_path_starts_with(path, &root.path)
-                        && !self.is_excluded_for_root(path, root)
-                }),
+            ProjectPathProvenance::Configured => {
+                self.configured_roots
+                    .iter()
+                    .chain(self.mapped_roots.iter())
+                    .any(|root| {
+                        project_path_starts_with(path, &root.path)
+                            && !self.is_excluded_for_root(path, root)
+                    })
+                    || self.authorizes_exact_file(path) && !self.is_excluded_authorized_file(path)
+            }
             ProjectPathProvenance::Mapped { root } => {
                 project_path_starts_with(path, root)
                     && !self.is_excluded_for_mapped_root(path, root)
@@ -566,6 +599,27 @@ impl ReadPolicy {
 
     fn allows_regular_file_under_root(&self, path: &Path, root: &Path) -> bool {
         self.allows_location_under_root(path, root) && safe_regular_file(path)
+    }
+
+    fn authorizes_exact_file(&self, path: &Path) -> bool {
+        let path = absolute_lexical(path).unwrap_or_else(|_| path.to_path_buf());
+        self.authorized_files
+            .iter()
+            .any(|authorized| authorized == &path)
+    }
+
+    fn allows_authorized_file(&self, path: &Path, require_regular_file: bool) -> bool {
+        self.authorizes_exact_file(path)
+            && path_has_no_symlink_component(path)
+            && (!require_regular_file || safe_regular_file(path))
+            && !self.is_excluded_authorized_file(path)
+    }
+
+    fn is_excluded_authorized_file(&self, path: &Path) -> bool {
+        path.components().any(is_default_excluded_component)
+            || path
+                .file_name()
+                .is_some_and(|name| self.matches_exclusion_patterns_for_relative(Path::new(name)))
     }
 
     fn allows_location_under_root(&self, path: &Path, root: &Path) -> bool {
@@ -3910,10 +3964,21 @@ fn build_project_context(
                         .cloned()
                         .or_else(|| bootstrap_platform.clone());
                 }
-                let installation_roots = ["bds", "appdata"]
+                let installation_roots = ["bds", "appdata", "bdslib", "bdscommondir"]
                     .into_iter()
                     .filter_map(|name| effective_profile.overrides.properties.get(name))
                     .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                let explicit_locator_files = ["environmentsettings", "envoptions"]
+                    .into_iter()
+                    .filter_map(|name| effective_profile.overrides.properties.get(name))
+                    .filter_map(|value| {
+                        effective_profile
+                            .overrides
+                            .resolve_path(value, Path::new("/"))
+                            .ok()
+                            .map(|resolved| resolved.path)
+                    })
                     .collect::<Vec<_>>();
                 read_policy = ReadPolicy::new_with_installation_roots(
                     roots,
@@ -3921,7 +3986,8 @@ fn build_project_context(
                     exclusions,
                     &overrides,
                     &installation_roots,
-                );
+                )
+                .with_authorized_files(&explicit_locator_files);
                 match load_installation(
                     &effective_profile,
                     evaluation_options

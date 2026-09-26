@@ -3818,6 +3818,8 @@ fn build_project_context(
     let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
     let caller_compiler_version = options.conditional_context.compiler_version;
+    let mut bootstrap_config = None;
+    let mut bootstrap_platform = None;
     let mut installation_evidence = InstallationEvidence::default();
     let mut compiler_identity_conflicting = false;
     let mut other_identity_conflicting = false;
@@ -3841,12 +3843,8 @@ fn build_project_context(
         installation_evidence = bootstrap.evidence;
         compiler_identity_conflicting = bootstrap.compiler_conflicting;
         other_identity_conflicting = bootstrap.other_conflicting;
-        if evaluation_options.build_config.is_none() {
-            evaluation_options.build_config = bootstrap.config;
-        }
-        if evaluation_options.platform.is_none() {
-            evaluation_options.platform = bootstrap.platform;
-        }
+        bootstrap_config = bootstrap.config;
+        bootstrap_platform = bootstrap.platform;
         if evaluation_options
             .conditional_context
             .compiler_version
@@ -3882,15 +3880,35 @@ fn build_project_context(
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
             Ok(profile) => {
-                overrides = merge_effective_overrides(
-                    profile.overrides.clone(),
-                    &overrides,
-                    relevant_override_workspace_root(&project_dir, roots).as_deref(),
-                    &project_dir,
-                );
+                let effective_profile = crate::installation_config::ResolvedInstallation {
+                    id: profile.id.clone(),
+                    overrides: merge_effective_overrides(
+                        profile.overrides,
+                        &overrides,
+                        relevant_override_workspace_root(&project_dir, roots).as_deref(),
+                        &project_dir,
+                    ),
+                };
+                overrides = effective_profile.overrides.clone();
+                if evaluation_options.build_config.is_none() {
+                    evaluation_options.build_config = effective_profile
+                        .overrides
+                        .properties
+                        .get("config")
+                        .cloned()
+                        .or_else(|| bootstrap_config.clone());
+                }
+                if evaluation_options.platform.is_none() {
+                    evaluation_options.platform = effective_profile
+                        .overrides
+                        .properties
+                        .get("platform")
+                        .cloned()
+                        .or_else(|| bootstrap_platform.clone());
+                }
                 let installation_roots = ["bds", "appdata"]
                     .into_iter()
-                    .filter_map(|name| profile.overrides.properties.get(name))
+                    .filter_map(|name| effective_profile.overrides.properties.get(name))
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
                 read_policy = ReadPolicy::new_with_installation_roots(
@@ -3901,7 +3919,7 @@ fn build_project_context(
                     &installation_roots,
                 );
                 match load_installation(
-                    &profile,
+                    &effective_profile,
                     evaluation_options
                         .build_config
                         .as_deref()
@@ -3917,7 +3935,7 @@ fn build_project_context(
                         ) {
                             match evaluate_ide_paths(
                                 &environment,
-                                &profile,
+                                &effective_profile,
                                 config,
                                 platform,
                                 tracker,
@@ -3954,6 +3972,12 @@ fn build_project_context(
                 installation_warnings.push(error);
             }
         }
+    }
+    if evaluation_options.build_config.is_none() {
+        evaluation_options.build_config = bootstrap_config;
+    }
+    if evaluation_options.platform.is_none() {
+        evaluation_options.platform = bootstrap_platform;
     }
     let mut builder = ProjectBuilder::new(
         &evaluation_options,

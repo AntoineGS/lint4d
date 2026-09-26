@@ -81,6 +81,152 @@ fn invalid_selected_ide_path_is_reported_and_keeps_context_incomplete() {
 }
 
 #[test]
+fn selected_profile_config_and_platform_precede_project_xml_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("App.dproj");
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        "[installations.\"37.0\".properties]\nConfig='Release'\nPlatform='Win64'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+    );
+
+    let discover = |build_config: Option<&str>, platform: Option<&str>| {
+        ProjectContext::discover_with_overrides(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project.clone()),
+                build_config: build_config.map(str::to_owned),
+                platform: platform.map(str::to_owned),
+                ..ProjectOptions::default()
+            },
+            &OverrideSession::new(None),
+        )
+        .unwrap()
+    };
+
+    let profile_context = discover(None, None);
+    assert!(matches!(
+        profile_context.installation_selection,
+        Some(InstallationSelection::Selected { ref id, .. }) if id == "37.0"
+    ));
+    assert_eq!(profile_context.config.as_deref(), Some("Release"));
+    assert_eq!(profile_context.platform.as_deref(), Some("Win64"));
+
+    let client_context = discover(Some("Client"), Some("Linux64"));
+    assert_eq!(client_context.config.as_deref(), Some("Client"));
+    assert_eq!(client_context.platform.as_deref(), Some("Linux64"));
+}
+
+#[test]
+fn project_bds_override_selects_its_installation_root_and_ide_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("projects/App.dproj");
+    let profile_sdk = tempfile::tempdir().unwrap();
+    let project_sdk = tempfile::tempdir().unwrap();
+    let appdata = tempfile::tempdir().unwrap();
+    write(&root.join("projects/App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win64</Platform><DCC_Namespace>$(LocalSdkMarker);$(ProfileSdkMarker)</DCC_Namespace></PropertyGroup></Project>",
+    );
+    write(
+        &profile_sdk.path().join("bin/rsvars.bat"),
+        &format!(
+            "SET BDS={}\nSET ProfileSdkMarker=PROFILE_SDK\n",
+            profile_sdk.path().display()
+        ),
+    );
+    write(
+        &project_sdk.path().join("bin/rsvars.bat"),
+        &format!(
+            "SET BDS={}\nSET LocalSdkMarker=LOCAL_SDK\n",
+            project_sdk.path().display()
+        ),
+    );
+    fs::create_dir_all(project_sdk.path().join("source")).unwrap();
+    fs::create_dir_all(profile_sdk.path().join("source")).unwrap();
+    write(
+        &appdata.path().join("EnvOptions.proj"),
+        "<Project><PropertyGroup><DelphiLibraryPath>$(BDS)/source</DelphiLibraryPath></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n[projects.\"projects/App.dproj\"]\ninstallation='37.0'\n",
+            profile_sdk.path().display(),
+            appdata.path().display()
+        ),
+    );
+    write(
+        &root.join("projects/.delphi-tools.local.toml"),
+        &format!("[properties]\nBDS='{}'\n", project_sdk.path().display()),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("projects/App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+
+    assert_eq!(
+        context.overrides.properties.get("bds"),
+        Some(&project_sdk.path().display().to_string())
+    );
+    assert!(
+        context
+            .unit_namespaces
+            .iter()
+            .any(|name| name == "LOCAL_SDK")
+    );
+    assert!(
+        !context
+            .unit_namespaces
+            .iter()
+            .any(|name| name == "PROFILE_SDK")
+    );
+    assert!(
+        context
+            .metadata_files
+            .contains(&project_sdk.path().join("bin/rsvars.bat"))
+    );
+    assert!(
+        !context
+            .metadata_files
+            .contains(&profile_sdk.path().join("bin/rsvars.bat"))
+    );
+    assert!(
+        context
+            .search_paths
+            .contains(&project_sdk.path().join("source"))
+    );
+    assert!(
+        !context
+            .search_paths
+            .contains(&profile_sdk.path().join("source"))
+    );
+    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+        path: project_sdk.path().join("source"),
+        provenance: ProjectPathProvenance::Configured,
+    }));
+    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+        path: profile_sdk.path().join("source"),
+        provenance: ProjectPathProvenance::Configured,
+    }));
+}
+
+#[test]
 fn project_shared_properties_override_user_profile_properties() {
     let temp = tempfile::tempdir().unwrap();
     let user = temp.path().join("config.toml");

@@ -27,7 +27,8 @@ pub use installations::{InstallationOrigin, InstallationSelection};
 pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
-    EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
+    EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping, ResolvedPath,
+    user_config_path,
 };
 use crate::installations::{
     IdePaths, InstallationEvidence, evaluate_ide_paths, load_installation, select_installation,
@@ -3659,6 +3660,58 @@ fn effective_overrides_for_project(
     session.effective_for(workspace_root.as_deref(), project_directory)
 }
 
+fn merge_effective_overrides(
+    mut profile: EffectiveOverrides,
+    project: &EffectiveOverrides,
+    workspace_root: Option<&Path>,
+    project_dir: &Path,
+) -> EffectiveOverrides {
+    let origin_rank = |path: &Path| {
+        if project_paths_equal(path, &project_dir.join(LOCAL_CONFIG_NAME)) {
+            2
+        } else if workspace_root
+            .is_some_and(|root| project_paths_equal(path, &root.join(LOCAL_CONFIG_NAME)))
+        {
+            1
+        } else {
+            0
+        }
+    };
+    for (name, value) in &project.properties {
+        let project_origin = project.property_origins.get(name);
+        let profile_origin = profile.property_origins.get(name);
+        let project_is_more_local = profile_origin.is_none_or(|profile_origin| {
+            project_origin.is_some_and(|project_origin| {
+                origin_rank(project_origin) > origin_rank(profile_origin)
+            })
+        });
+        if project_is_more_local {
+            profile.properties.insert(name.clone(), value.clone());
+            if let Some(origin) = project_origin {
+                profile
+                    .property_origins
+                    .insert(name.clone(), origin.clone());
+            }
+        }
+    }
+
+    let mut path_mappings = profile
+        .path_mappings
+        .into_iter()
+        .map(|mapping| (mapping.from.clone(), mapping))
+        .collect::<BTreeMap<_, _>>();
+    for mapping in &project.path_mappings {
+        let project_is_more_local = path_mappings.get(&mapping.from).is_none_or(|profile| {
+            origin_rank(&mapping.config_file) > origin_rank(&profile.config_file)
+        });
+        if project_is_more_local {
+            path_mappings.insert(mapping.from.clone(), mapping.clone());
+        }
+    }
+    profile.path_mappings = path_mappings.into_values().collect();
+    profile
+}
+
 fn relevant_override_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     roots
         .iter()
@@ -3829,10 +3882,15 @@ fn build_project_context(
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
             Ok(profile) => {
-                overrides = profile.overrides.clone();
+                overrides = merge_effective_overrides(
+                    profile.overrides.clone(),
+                    &overrides,
+                    relevant_override_workspace_root(&project_dir, roots).as_deref(),
+                    &project_dir,
+                );
                 let installation_roots = ["bds", "appdata"]
                     .into_iter()
-                    .filter_map(|name| overrides.properties.get(name))
+                    .filter_map(|name| profile.overrides.properties.get(name))
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
                 read_policy = ReadPolicy::new_with_installation_roots(
@@ -4680,8 +4738,16 @@ fn parse_project_bootstrap(
         },
         compiler_conflicting,
         other_conflicting,
-        config: unique_value("config"),
-        platform: unique_value("platform"),
+        config: if config_is_fixed {
+            properties.get("config").cloned()
+        } else {
+            unique_value("config")
+        },
+        platform: if platform_is_fixed {
+            properties.get("platform").cloned()
+        } else {
+            unique_value("platform")
+        },
         metadata_files,
     }
 }

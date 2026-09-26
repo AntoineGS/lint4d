@@ -399,8 +399,8 @@ fn delphi_overrides_are_immutable_project_properties() {
         &session,
     )
     .unwrap();
-    assert_eq!(context.config.as_deref(), Some("Debug"));
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(context.config.as_deref(), Some("Debug"), "{context:?}");
+    assert_eq!(context.platform.as_deref(), Some("Win32"), "{context:?}");
     assert!(
         context
             .unit_namespaces
@@ -552,6 +552,105 @@ fn immutable_globals_skip_unresolved_xml_rhs_expansion() {
             .any(|warning| warning.contains("MissingConfig") || warning.contains("MissingPlatform")),
         "immutable file globals expanded their XML RHS: {:?}",
         file_context.warnings
+    );
+}
+
+#[test]
+fn selected_installation_keeps_project_local_properties_and_profile_roots() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let project_dir = root.join("projects/app");
+    let sdk_root = tempfile::tempdir().unwrap();
+    let sdk = sdk_root.path().to_path_buf();
+    let main = project_dir.join("App.dpr");
+    write(&main, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>$(MissingConfig)</Config><Platform>$(MissingPlatform)</Platform><DCC_UnitSearchPath>$(BDS)/source</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write(
+        &sdk.join("source/ProfileUnit.pas"),
+        "unit ProfileUnit; interface implementation end.",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nSharedVsProfile='shared'\n[installations.\"37.0\".properties]\nBDS='{}'\nProfileRoot='{}'\nConfig='Release'\nPlatform='Win64'\nSharedVsProfile='profile'\n[projects.\"projects/app/App.dproj\"]\ninstallation='37.0'\n",
+            sdk.display(),
+            sdk.display()
+        ),
+    );
+    write(
+        &project_dir.join(".delphi-tools.local.toml"),
+        "[properties]\nConfig='Debug'\nPlatform='Win32'\nProjectOnly='kept'\n",
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &main,
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project_dir.join("App.dproj")),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .expect("discover project using the selected installation");
+
+    assert!(matches!(
+        context.installation_selection,
+        Some(pascal_project::InstallationSelection::Selected { ref id, .. }) if id == "37.0"
+    ));
+    assert_eq!(context.config.as_deref(), Some("Debug"));
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(
+        context
+            .overrides
+            .properties
+            .get("config")
+            .map(String::as_str),
+        Some("Debug")
+    );
+    assert_eq!(
+        context
+            .overrides
+            .properties
+            .get("projectonly")
+            .map(String::as_str),
+        Some("kept")
+    );
+    assert_eq!(
+        context
+            .overrides
+            .properties
+            .get("sharedvsprofile")
+            .map(String::as_str),
+        Some("profile")
+    );
+    assert_eq!(
+        context.overrides.properties.get("bds"),
+        Some(&sdk.display().to_string())
+    );
+    assert_eq!(
+        context.overrides.properties.get("profileroot"),
+        Some(&sdk.display().to_string())
+    );
+    assert!(context.search_paths.contains(&sdk.join("source")));
+    assert!(
+        context
+            .read_policy
+            .allows_location(&pascal_project::ProjectPathEntry {
+                path: sdk.join("source"),
+                provenance: pascal_project::ProjectPathProvenance::Configured,
+            })
+    );
+    let unrelated_root = tempfile::tempdir().unwrap();
+    assert!(
+        !context
+            .read_policy
+            .allows_location(&pascal_project::ProjectPathEntry {
+                path: unrelated_root.path().to_path_buf(),
+                provenance: pascal_project::ProjectPathProvenance::Configured,
+            })
     );
 }
 
@@ -2177,9 +2276,11 @@ fn metadata_limit_prevents_automatic_exclusion() {
     );
     let mut imports = String::new();
     for index in 0..64 {
-        imports.push_str(&format!(
-            "<Import Project=\"unused{index}.optset\" Condition=\"'a'=='b'\"/>"
-        ));
+        write(
+            root.join(format!("unused{index}.optset")).as_path(),
+            "<Project />",
+        );
+        imports.push_str(&format!("<Import Project=\"unused{index}.optset\"/>"));
     }
     imports.push_str("<Import Project=\"owner.optset\"/>");
     write(

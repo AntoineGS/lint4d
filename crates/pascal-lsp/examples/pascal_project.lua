@@ -51,6 +51,7 @@ function M.attach(client, bufnr)
     project_intents = {
       sequence = 0,
       scopes = {},
+      directory_intents = {},
       attachments = {},
       project_selection_queues = {},
     }
@@ -168,6 +169,16 @@ function M.attach(client, bufnr)
     project_intents.sequence = project_intents.sequence + 1
     project_intents.scopes[scope] = project_intents.sequence
     return project_intents.sequence
+  end
+
+  local function begin_directory_intent(directory)
+    project_intents.sequence = project_intents.sequence + 1
+    project_intents.directory_intents[directory] = project_intents.sequence
+    return project_intents.sequence
+  end
+
+  local function has_current_directory_intent(directory, intent)
+    return (project_intents.directory_intents[directory] or 0) == intent
   end
 
   local function notify_newer_project_intent()
@@ -331,6 +342,7 @@ function M.attach(client, bufnr)
       )
       return
     end
+    begin_directory_intent(directory)
 
     enqueue_project_selection(project_intents, directory, function(complete)
       if not still_attached() then
@@ -467,6 +479,11 @@ function M.attach(client, bufnr)
             vim.notify('Could not determine the browsed project directory; no selection was sent.', vim.log.levels.WARN)
             return
           end
+          local target_intent = begin_directory_intent(target_scope)
+          local function browse_intent_is_current()
+            return has_current_intent(intent_scope, selection_intent)
+              and has_current_directory_intent(target_scope, target_intent)
+          end
           enqueue_project_selection(project_intents, target_scope, function(complete)
             if not still_attached() or not has_current_intent(intent_scope, selection_intent) then
               if still_attached() then
@@ -510,7 +527,7 @@ function M.attach(client, bufnr)
                   if not still_attached() then
                     return
                   end
-                  if not has_current_intent(intent_scope, selection_intent) then
+                  if not browse_intent_is_current() then
                     notify_newer_project_intent()
                     return
                   end
@@ -532,7 +549,7 @@ function M.attach(client, bufnr)
                     return
                   end
                   local function open_destination(destination_uri)
-                    if not can_navigate() then
+                    if not can_navigate() or not browse_intent_is_current() then
                       return
                     end
                     local destination = vim.uri_to_fname(destination_uri)
@@ -551,6 +568,9 @@ function M.attach(client, bufnr)
                   end
 
                   local function open_project_anchor(reason)
+                    if not browse_intent_is_current() then
+                      return
+                    end
                     vim.notify(reason, vim.log.levels.WARN)
                     open_destination(target_uri)
                   end
@@ -569,7 +589,7 @@ function M.attach(client, bufnr)
                       if not still_attached() or not can_navigate() then
                         return
                       end
-                      if not has_current_intent(intent_scope, selection_intent) then
+                      if not browse_intent_is_current() then
                         notify_newer_project_intent()
                         return
                       end
@@ -594,7 +614,7 @@ function M.attach(client, bufnr)
                           if not still_attached() or not can_navigate() then
                             return
                           end
-                          if not has_current_intent(intent_scope, selection_intent) then
+                          if not browse_intent_is_current() then
                             notify_newer_project_intent()
                             return
                           end
@@ -630,11 +650,7 @@ function M.attach(client, bufnr)
                       end
                     end
                   )
-                  if
-                    not ownership_accepted
-                    and can_navigate()
-                    and has_current_intent(intent_scope, selection_intent)
-                  then
+                  if not ownership_accepted and can_navigate() and browse_intent_is_current() then
                     open_project_anchor('Could not request main source ownership; opening the project file instead.')
                   end
                 end)

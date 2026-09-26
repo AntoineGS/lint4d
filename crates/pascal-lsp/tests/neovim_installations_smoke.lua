@@ -790,13 +790,25 @@ local function run()
   assert(chooser_client.id == client.id, 'opening the target-scope chooser started a second LSP client')
   local browse_target_picker = open_project_picker(other_main)
   local browse_target_catalogue = browse_picker_from(browse_target_picker, other_main)
+  local browse_source_owner_context = project_context(client, other_main, app_source_uri)
+  assert(
+    browse_source_owner_context.selectedProjectUri == alpha_project_uri,
+    'Browse navigation regression requires its independent source scope to remain owned by Alpha'
+  )
   local original_browse_queue_request = client.request
   local release_browse_target_request
   local alternative_request_sent = false
+  local browse_selection_callback_completed = false
   client.request = function(self, method, params, callback, request_bufnr)
-    if method == 'pascal/selectProject' and params.projectUri == app_project_uri then
+    if method == 'pascal/projectContext' and params.textDocument.uri == app_source_uri then
+      callback(nil, browse_source_owner_context)
+      return true
+    elseif method == 'pascal/selectProject' and params.projectUri == app_project_uri then
       release_browse_target_request = function()
-        local accepted = original_browse_queue_request(self, method, params, callback, request_bufnr)
+        local accepted = original_browse_queue_request(self, method, params, function(err, response)
+          callback(err, response)
+          browse_selection_callback_completed = true
+        end, request_bufnr)
         assert(accepted, 'held Browse target request was not accepted after release')
       end
       return true
@@ -825,6 +837,16 @@ local function run()
   assert(vim.api.nvim_buf_is_valid(chooser), 'target-scope chooser was deleted before the Browse queue drained')
   assert(vim.lsp.buf_is_attached(chooser, client.id), 'target-scope chooser detached before the Browse queue drained')
   release_browse_target_request()
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return browse_selection_callback_completed
+    end),
+    'Browse selection callback did not complete after releasing its held response'
+  )
+  assert(
+    vim.api.nvim_get_current_buf() == other_main,
+    'older Browse navigated after a newer choice was queued for its target directory'
+  )
   assert(
     vim.wait(REQUEST_TIMEOUT, function()
       return alternative_request_sent

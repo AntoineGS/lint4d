@@ -1105,6 +1105,7 @@ enum TestBarrier {
     ProjectOperationPrepared,
     ProjectContextPrepared,
     AutomaticSelectionPrepared,
+    ManualSelectionPrepared,
     CompiledContent,
 }
 
@@ -1123,6 +1124,7 @@ pub struct TestBarrierConfig {
     project_operation_prepared: Option<TestBarrierPaths>,
     project_context_prepared: Option<TestBarrierPaths>,
     automatic_selection_prepared: Option<TestBarrierPaths>,
+    manual_selection_prepared: Option<TestBarrierPaths>,
     compiled_content: Option<TestBarrierPaths>,
     outbound_writer: Option<OutboundWriterBarrierPaths>,
     outbound_control_limit: Option<usize>,
@@ -1175,6 +1177,7 @@ impl TestBarrierConfig {
             project_operation_prepared: None,
             project_context_prepared: None,
             automatic_selection_prepared: None,
+            manual_selection_prepared: None,
             compiled_content: None,
             outbound_writer: None,
             outbound_control_limit: None,
@@ -1323,6 +1326,13 @@ impl TestBarrierConfig {
         self
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn with_manual_selection_prepared(mut self, barrier: Option<(PathBuf, PathBuf)>) -> Self {
+        self.manual_selection_prepared =
+            barrier.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
     pub fn with_compiled_content(mut self, compiled_content: Option<(PathBuf, PathBuf)>) -> Self {
         self.compiled_content =
             compiled_content.map(|(entered, release)| TestBarrierPaths { entered, release });
@@ -1369,6 +1379,7 @@ impl TestBarrierConfig {
             TestBarrier::ProjectOperationPrepared => self.project_operation_prepared.as_ref(),
             TestBarrier::ProjectContextPrepared => self.project_context_prepared.as_ref(),
             TestBarrier::AutomaticSelectionPrepared => self.automatic_selection_prepared.as_ref(),
+            TestBarrier::ManualSelectionPrepared => self.manual_selection_prepared.as_ref(),
             TestBarrier::CompiledContent => self.compiled_content.as_ref(),
         }
     }
@@ -5143,6 +5154,7 @@ struct AnalysisJobs {
     automatic_apply_requests: HashMap<RequestId, Url>,
     automatic_answer_requests: HashMap<RequestId, AutomaticPromptAnswer>,
     deferred_automatic_answers: HashMap<RequestId, AutomaticPromptAnswer>,
+    deferred_answers_to_resume: VecDeque<AutomaticPromptAnswer>,
     manual_selection_requests: HashMap<RequestId, ManualSelectionIntent>,
     next_automatic_discovery: u64,
     progress: ProgressTracker,
@@ -5321,6 +5333,7 @@ impl AnalysisJobs {
             automatic_apply_requests: HashMap::new(),
             automatic_answer_requests: HashMap::new(),
             deferred_automatic_answers: HashMap::new(),
+            deferred_answers_to_resume: VecDeque::new(),
             manual_selection_requests: HashMap::new(),
             next_automatic_discovery: 0,
             progress: ProgressTracker::new(server_progress_supported),
@@ -6649,6 +6662,12 @@ impl AnalysisJobs {
                                     &test_barriers,
                                     &worker_cancellation,
                                 )?;
+                            } else {
+                                wait_at_test_barrier(
+                                    TestBarrier::ManualSelectionPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
                             }
                             Ok((
                                 ProjectOperationResponse::SelectInstallation {
@@ -6682,6 +6701,12 @@ impl AnalysisJobs {
                             if automatic {
                                 wait_at_test_barrier(
                                     TestBarrier::AutomaticSelectionPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                            } else {
+                                wait_at_test_barrier(
+                                    TestBarrier::ManualSelectionPrepared,
                                     &test_barriers,
                                     &worker_cancellation,
                                 )?;
@@ -7072,7 +7097,18 @@ impl AnalysisJobs {
         {
             self.request_to_job.remove(id);
         }
-        self.manual_selection_requests.remove(id);
+        let removed_manual = self.manual_selection_requests.remove(id).is_some();
+        if removed_manual && self.manual_selection_requests.is_empty() {
+            for (_, mut answer) in std::mem::take(&mut self.deferred_automatic_answers) {
+                let next_attempt = match answer.stage {
+                    AutomaticAnswerStage::Deferred { next_attempt } => next_attempt,
+                    AutomaticAnswerStage::Validate { next_attempt } => next_attempt,
+                    AutomaticAnswerStage::Apply { attempt } => attempt,
+                };
+                answer.stage = AutomaticAnswerStage::Validate { next_attempt };
+                self.deferred_answers_to_resume.push_back(answer);
+            }
+        }
     }
 
     fn remove_observation(
@@ -8495,6 +8531,30 @@ impl AnalysisJobs {
                         }
                     }
                 }
+            }
+        }
+        if !self.manual_selection_is_pending() {
+            while let Some(answer) = self.deferred_answers_to_resume.pop_front() {
+                if self.shutting_down
+                    || answer.fenced_by_manual_selection
+                    || workspace.document_identity(&answer.source_uri).1
+                        != Some(answer.source_identity_generation)
+                {
+                    continue;
+                }
+                let next_attempt = match answer.stage {
+                    AutomaticAnswerStage::Validate { next_attempt } => next_attempt,
+                    _ => continue,
+                };
+                queue_automatic_answer_stage(
+                    connection,
+                    workspace,
+                    self,
+                    answer,
+                    AutomaticAnswerStage::Validate { next_attempt },
+                    false,
+                    false,
+                )?;
             }
         }
         let failures = self.pump(workspace, Some(connection));
@@ -11079,6 +11139,7 @@ fn event_loop(
                         {
                             if jobs.automatic_answer_requests.len()
                                 + jobs.deferred_automatic_answers.len()
+                                + jobs.deferred_answers_to_resume.len()
                                 >= MAX_AUTOMATIC_PROMPT_ANSWERS
                             {
                                 continue;
@@ -14133,7 +14194,11 @@ fn queue_automatic_answer_stage(
     pull_diagnostics_supported: bool,
     pull_related_diagnostics_supported: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if jobs.automatic_answer_requests.len() >= MAX_AUTOMATIC_PROMPT_ANSWERS {
+    if jobs.automatic_answer_requests.len()
+        + jobs.deferred_automatic_answers.len()
+        + jobs.deferred_answers_to_resume.len()
+        >= MAX_AUTOMATIC_PROMPT_ANSWERS
+    {
         return Ok(());
     }
     answer.stage = stage;

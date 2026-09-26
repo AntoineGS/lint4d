@@ -387,6 +387,28 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_manual_selection_prepared_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let directory = environment.path().join("manual-selection-prepared-barrier");
+        fs::create_dir_all(&directory).expect("manual selection barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_MANUAL_SELECTION_PREPARED_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_compiled_content_barrier(environment: TempDir) -> (Self, TestBarrier) {
         let directory = environment.path().join("compiled-content-barrier");
         fs::create_dir_all(&directory).expect("compiled content barrier directory");

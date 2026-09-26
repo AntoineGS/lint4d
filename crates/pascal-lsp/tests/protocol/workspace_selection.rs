@@ -727,6 +727,60 @@ fn unrelated_commit_during_automatic_validation_retries_validation_once() {
     server.shutdown();
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn cancelling_pending_manual_selection_resumes_deferred_automatic_answer() {
+    let (directory, unit, project_a, project_b) = ambiguous_projects();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_manual_selection_prepared_barrier(environment);
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project choice prompt");
+
+    let manual = RequestId::from("cancel-pending-same-scope-manual-selection".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&unit)}, "projectUri": uri(&project_b)}),
+    );
+    wait_for_path(&barrier.entered);
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        prompt.params["actions"][0].clone(),
+    )));
+
+    // Let the automatic answer's fresh-context worker complete while the manual
+    // operation remains held; this is the state that must not be stranded.
+    thread::sleep(Duration::from_millis(100));
+
+    server.send_notification("$/cancelRequest", json!({"id": manual}));
+    let cancelled = server.response(&manual);
+    assert_eq!(cancelled.error.unwrap().code, -32800);
+
+    let mut context = Value::Null;
+    for attempt in 0..20 {
+        context = project_context_retry_stale(
+            &mut server,
+            &unit,
+            &format!("after-manual-cancel-{attempt}"),
+        );
+        if context["selectedProjectUri"] == uri(&project_a).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        context["selectedProjectUri"],
+        uri(&project_a).as_str(),
+        "canceling the last manual intent must resume a fresh automatic validation"
+    );
+    fs::write(&barrier.release, b"release canceled worker cleanup").unwrap();
+    server.shutdown();
+}
+
 #[test]
 fn child_with_own_project_scope_does_not_fence_parent_prompt() {
     let (directory, parent_unit, parent_a, _, child_unit, _) = nested_scope_projects(true);

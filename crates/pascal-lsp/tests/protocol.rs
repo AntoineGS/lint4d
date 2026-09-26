@@ -27462,6 +27462,13 @@ fn malformed_delphi_override_scopes_report_provenance_fail_closed_and_preserve_v
             }),
             "malformed {scope} provenance was not returned: {warnings:?}"
         );
+        assert_eq!(bad_context["installationSelectionMode"], "automatic");
+        assert!(
+            bad_context["installationCandidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         let bad_navigation_id = RequestId::from(format!("{scope}-malformed-navigation"));
         server.send_request(

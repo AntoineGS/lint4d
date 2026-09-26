@@ -430,12 +430,24 @@ impl Workspace {
 
         let (installation_candidates, installation_selection_mode) =
             if let Some(project_file) = context.project_file.as_deref() {
-                let (_, candidates, selection) =
-                    self.installation_selection_snapshot(project_file, cancel, budget)?;
-                (
-                    candidates,
-                    installation_selection_mode(&selection).to_string(),
-                )
+                match self.installation_selection_snapshot(project_file, cancel, budget) {
+                    Ok((_, candidates, selection)) => (
+                        candidates,
+                        installation_selection_mode(&selection).to_string(),
+                    ),
+                    Err(error) if context.override_error.as_deref() == Some(error.as_str()) => {
+                        // Project discovery already recorded this exact
+                        // malformed-override diagnostic in the context. Keep
+                        // the inspection request usable, but do not convert a
+                        // cancellation or budget exhaustion into a warning.
+                        check_project_operation_cancel(cancel)?;
+                        if let Some(budget) = budget {
+                            budget.charge_path_visits(0)?;
+                        }
+                        (Vec::new(), "automatic".to_string())
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 (Vec::new(), "automatic".to_string())
             };
@@ -1187,6 +1199,67 @@ fn installation_selection_mode(selection: &InstallationSelection) -> &'static st
     }
 }
 
+fn document_path(uri: &Url) -> Result<PathBuf, String> {
+    let path = uri
+        .to_file_path()
+        .map_err(|_| format!("project context requires a file URI: {uri}"))?;
+    let path = absolute_path(path);
+    let is_project_anchor = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"));
+    if !is_analyzable_source_path(&path) && !is_project_anchor {
+        return Err(format!(
+            "unsupported project context anchor: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn project_path(uri: &Url) -> Result<PathBuf, String> {
+    let path = uri
+        .to_file_path()
+        .map_err(|_| format!("project URI must be a file URI: {uri}"))?;
+    let path = absolute_path(path);
+    if !path.is_file()
+        || !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"))
+    {
+        return Err(format!(
+            "project is not a current .dproj file: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn check_project_operation_cancel(
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+        Err("request cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn file_uri(path: &Path) -> Option<Url> {
+    Url::from_file_path(path).ok()
+}
+
+fn project_paths_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 #[cfg(test)]
 mod installation_selection_mode_tests {
     use super::{InstallationSelection, Workspace, installation_selection_mode};
@@ -1273,66 +1346,5 @@ mod installation_selection_mode_tests {
             .installation_selection_snapshot(&project, None, Some(&budget))
             .expect_err("discovery must be charged after the configuration snapshot");
         assert!(error.contains("work budget exceeded"), "{error}");
-    }
-}
-
-fn document_path(uri: &Url) -> Result<PathBuf, String> {
-    let path = uri
-        .to_file_path()
-        .map_err(|_| format!("project context requires a file URI: {uri}"))?;
-    let path = absolute_path(path);
-    let is_project_anchor = path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"));
-    if !is_analyzable_source_path(&path) && !is_project_anchor {
-        return Err(format!(
-            "unsupported project context anchor: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
-fn project_path(uri: &Url) -> Result<PathBuf, String> {
-    let path = uri
-        .to_file_path()
-        .map_err(|_| format!("project URI must be a file URI: {uri}"))?;
-    let path = absolute_path(path);
-    if !path.is_file()
-        || !path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"))
-    {
-        return Err(format!(
-            "project is not a current .dproj file: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
-fn check_project_operation_cancel(
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<(), String> {
-    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
-        Err("request cancelled".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-fn file_uri(path: &Path) -> Option<Url> {
-    Url::from_file_path(path).ok()
-}
-
-fn project_paths_equal(left: &Path, right: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
     }
 }

@@ -13,6 +13,10 @@ const TEST_PARTIAL_VALIDATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_PARTIAL_VALID
 const TEST_PROJECT_OPERATION_BARRIER_ENV: &str = "PASCAL_LSP_TEST_PROJECT_OPERATION_BARRIER";
 const TEST_PROJECT_OPERATION_PREPARED_BARRIER_ENV: &str =
     "PASCAL_LSP_TEST_PROJECT_OPERATION_PREPARED_BARRIER";
+const TEST_PROJECT_CONTEXT_PREPARED_BARRIER_ENV: &str =
+    "PASCAL_LSP_TEST_PROJECT_CONTEXT_PREPARED_BARRIER";
+const TEST_AUTOMATIC_SELECTION_PREPARED_BARRIER_ENV: &str =
+    "PASCAL_LSP_TEST_AUTOMATIC_SELECTION_PREPARED_BARRIER";
 const TEST_COMPILED_CONTENT_BARRIER_ENV: &str = "PASCAL_LSP_TEST_COMPILED_CONTENT_BARRIER";
 const TEST_OUTBOUND_WRITER_BARRIER_ENV: &str = "PASCAL_LSP_TEST_OUTBOUND_WRITER_BARRIER";
 const TEST_DISPATCH_LOG_ENV: &str = "PASCAL_LSP_TEST_DISPATCH_LOG";
@@ -100,6 +104,12 @@ fn test_barrier_config() -> Result<TestBarrierConfig, String> {
     )?)
     .with_project_operation_prepared(barrier_from_environment(
         TEST_PROJECT_OPERATION_PREPARED_BARRIER_ENV,
+    )?)
+    .with_project_context_prepared(barrier_from_environment(
+        TEST_PROJECT_CONTEXT_PREPARED_BARRIER_ENV,
+    )?)
+    .with_automatic_selection_prepared(barrier_from_environment(
+        TEST_AUTOMATIC_SELECTION_PREPARED_BARRIER_ENV,
     )?)
     .with_compiled_content(barrier_from_environment(TEST_COMPILED_CONTENT_BARRIER_ENV)?)
     .with_outbound_writer(outbound_writer_barrier_from_environment(

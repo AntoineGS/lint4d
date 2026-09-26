@@ -37,13 +37,52 @@ fn two_scope_ambiguous_projects() -> (
         write_file(&unit, "unit Unit; interface implementation end.");
         let project =
             "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>";
-        write_file(&first_project, &project);
-        write_file(&second_project, &project);
+        write_file(&first_project, project);
+        write_file(&second_project, project);
         values.push((unit, first_project));
     }
     let (unit_a, project_a) = values.remove(0);
     let (unit_b, project_b) = values.remove(0);
     (directory, unit_a, project_a, unit_b, project_b)
+}
+
+fn nested_scope_projects(
+    child_has_candidates: bool,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let parent_unit = root.join("Unit.pas");
+    write_file(&parent_unit, "unit Unit; interface implementation end.");
+    let parent_project_a = root.join("ParentA.dproj");
+    let parent_project_b = root.join("ParentB.dproj");
+    let project =
+        "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>";
+    write_file(&parent_project_a, project);
+    write_file(&parent_project_b, project);
+    let child_root = root.join("child");
+    let child_unit = child_root.join("Unit.pas");
+    write_file(&child_unit, "unit Unit; interface implementation end.");
+    if child_has_candidates {
+        let child_project =
+            "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>";
+        write_file(&child_root.join("ChildA.dproj"), child_project);
+        write_file(&child_root.join("ChildB.dproj"), child_project);
+    }
+    (
+        directory,
+        parent_unit,
+        parent_project_a,
+        parent_project_b,
+        child_unit,
+        child_root,
+    )
 }
 
 fn open_automatic_unit(server: &mut TestServer, unit: &std::path::Path) {
@@ -66,6 +105,32 @@ fn project_context(server: &mut TestServer, unit: &std::path::Path, suffix: &str
     let response = server.response(&id);
     assert!(response.error.is_none(), "{response:?}");
     response.result.unwrap()
+}
+
+fn project_context_retry_stale(
+    server: &mut TestServer,
+    unit: &std::path::Path,
+    suffix: &str,
+) -> Value {
+    for attempt in 0..5 {
+        let id = RequestId::from(format!("project-prompt-context-{suffix}-{attempt}"));
+        server.send_request(
+            id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(unit)}}),
+        );
+        let response = server.response(&id);
+        if response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == -32803)
+        {
+            continue;
+        }
+        assert!(response.error.is_none(), "{response:?}");
+        return response.result.unwrap();
+    }
+    panic!("project context stayed stale after bounded retries for {suffix}");
 }
 
 #[test]
@@ -261,6 +326,38 @@ fn changed_candidate_set_rejects_old_project_prompt_answer() {
 }
 
 #[test]
+fn close_and_reopen_rejects_the_old_prompt_document_identity() {
+    let (directory, unit, _, _) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let old_prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("initial automatic project prompt");
+    server.send_notification(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri(&unit)}}),
+    );
+    open_automatic_unit(&mut server, &unit);
+    let replacement_prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("new document identity should be prompted independently");
+
+    server.send(Message::Response(Response::new_ok(
+        old_prompt.id,
+        old_prompt.params["actions"][0].clone(),
+    )));
+    let context = project_context_retry_stale(&mut server, &unit, "reopened-old-reply");
+    assert_eq!(context["selectedProjectUri"], Value::Null);
+
+    server.send(Message::Response(Response::new_ok(
+        replacement_prompt.id,
+        Value::Null,
+    )));
+    server.shutdown();
+}
+
+#[test]
 fn dismissing_prompt_allows_new_document_generation_to_prompt_again() {
     let (directory, unit, _, _) = ambiguous_projects();
     let second_unit = directory.path().join("src/Second.pas");
@@ -411,8 +508,6 @@ fn unrelated_scope_manual_selection_does_not_fence_automatic_answer() {
     } else {
         (&unit_b, &project_b, &unit_a, &project_a)
     };
-    let _ = project_context(&mut server, manual_unit, "prepare-unrelated-manual-scope");
-    fs::remove_file(&barrier.release).unwrap();
     let selected_action = actions
         .iter()
         .find(|action| {
@@ -425,42 +520,30 @@ fn unrelated_scope_manual_selection_does_not_fence_automatic_answer() {
         })
         .unwrap()
         .clone();
-    let entered_before_answers = fs::read(&barrier.entered).unwrap().len();
-    server.send(Message::Response(Response::new_ok(
-        prompt.id,
-        selected_action,
-    )));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) <= entered_before_answers
-    {
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(fs::read(&barrier.entered).unwrap().len() > entered_before_answers);
-    let automatic_worker_entered = fs::read(&barrier.entered).unwrap().len();
     let manual = RequestId::from("unrelated-scope-manual-selection".to_owned());
     server.send_request(
         manual.clone(),
         "pascal/selectProject",
         json!({"textDocument": {"uri": uri(manual_unit)}, "projectUri": uri(manual_project)}),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) <= automatic_worker_entered
-    {
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert!(fs::read(&barrier.entered).unwrap().len() > automatic_worker_entered);
-    fs::write(&barrier.release, b"release selection workers").unwrap();
-
     let manual_response = server.response(&manual);
-    // The global workspace generation may reject the competing request as
-    // stale; this regression specifically verifies it cannot invalidate the
-    // automatic answer for the other independent scope.
-    let _ = manual_response;
+    assert!(manual_response.error.is_none(), "{manual_response:?}");
+    let manual_context = project_context(&mut server, manual_unit, "manual-scope-committed");
+    assert_eq!(
+        manual_context["selectedProjectUri"],
+        uri(manual_project).as_str()
+    );
+
+    // The prompt remains unanswered while the unrelated scope commits. Its
+    // old global PromptKey generation must not discard this still-current
+    // scope/candidate choice.
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        selected_action,
+    )));
     let mut automatic_context = Value::Null;
     for attempt in 0..10 {
-        automatic_context = project_context(
+        automatic_context = project_context_retry_stale(
             &mut server,
             automatic_unit,
             &format!("automatic-scope-{attempt}"),
@@ -474,6 +557,271 @@ fn unrelated_scope_manual_selection_does_not_fence_automatic_answer() {
         automatic_context["selectedProjectUri"],
         uri(automatic_project).as_str(),
         "an unrelated scope's manual choice must not invalidate this automatic answer"
+    );
+    fs::remove_file(&barrier.release).unwrap();
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_manual_commit_retries_a_held_automatic_answer_once() {
+    let (directory, unit_a, project_a, unit_b, project_b) = two_scope_ambiguous_projects();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_automatic_selection_prepared_barrier(environment);
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit_a);
+    open_automatic_unit(&mut server, &unit_b);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project choice prompt");
+    let actions = prompt.params["actions"].as_array().unwrap();
+    let automatic_is_a = actions.iter().any(|action| action["title"] == "A1.dproj");
+    let (automatic_unit, automatic_project, manual_unit, manual_project, action_title) =
+        if automatic_is_a {
+            (&unit_a, &project_a, &unit_b, &project_b, "A1.dproj")
+        } else {
+            (&unit_b, &project_b, &unit_a, &project_a, "B1.dproj")
+        };
+    let action = actions
+        .iter()
+        .find(|action| action["title"] == action_title)
+        .unwrap()
+        .clone();
+    server.send(Message::Response(Response::new_ok(prompt.id, action)));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !barrier.entered.exists() {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        barrier.entered.exists(),
+        "automatic selection should be prepared and held"
+    );
+
+    let manual = RequestId::from("commit-other-scope-before-automatic-retry".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(manual_unit)}, "projectUri": uri(manual_project)}),
+    );
+    let response = server.response(&manual);
+    assert!(response.error.is_none(), "{response:?}");
+    let manual_context = project_context(&mut server, manual_unit, "other-scope-committed-first");
+    assert_eq!(
+        manual_context["selectedProjectUri"],
+        uri(manual_project).as_str()
+    );
+
+    fs::write(&barrier.release, b"release stale automatic snapshot").unwrap();
+    let mut automatic_context = Value::Null;
+    for attempt in 0..10 {
+        automatic_context = project_context_retry_stale(
+            &mut server,
+            automatic_unit,
+            &format!("automatic-retry-{attempt}"),
+        );
+        if automatic_context["selectedProjectUri"] == uri(automatic_project).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        automatic_context["selectedProjectUri"],
+        uri(automatic_project).as_str(),
+        "the stale first snapshot should be revalidated and retried once"
+    );
+    assert_eq!(
+        fs::read(&barrier.entered).unwrap().len(),
+        2,
+        "automatic selection should use one initial attempt and at most one retry"
+    );
+    let manual_context =
+        project_context_retry_stale(&mut server, manual_unit, "manual-still-selected");
+    assert_eq!(
+        manual_context["selectedProjectUri"],
+        uri(manual_project).as_str()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_commit_during_automatic_validation_retries_validation_once() {
+    let (directory, unit_a, project_a, unit_b, project_b) = two_scope_ambiguous_projects();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_project_context_prepared_barrier(environment);
+    // Let automatic discovery pass; arm the barrier only for answer validation.
+    fs::write(&barrier.release, b"initial discovery may pass").unwrap();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit_a);
+    open_automatic_unit(&mut server, &unit_b);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project choice prompt");
+    let actions = prompt.params["actions"].as_array().unwrap();
+    let automatic_is_a = actions.iter().any(|action| action["title"] == "A1.dproj");
+    let (automatic_unit, automatic_project, manual_unit, manual_project, title) = if automatic_is_a
+    {
+        (&unit_a, &project_a, &unit_b, &project_b, "A1.dproj")
+    } else {
+        (&unit_b, &project_b, &unit_a, &project_a, "B1.dproj")
+    };
+    let action = actions
+        .iter()
+        .find(|action| action["title"] == title)
+        .unwrap()
+        .clone();
+    fs::remove_file(&barrier.release).unwrap();
+    server.send(Message::Response(Response::new_ok(prompt.id, action)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) < 3
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fs::read(&barrier.entered).unwrap().len() >= 3,
+        "automatic answer validation should be held after the discovery workers"
+    );
+    let held_validation_count = fs::read(&barrier.entered).unwrap().len();
+
+    let manual = RequestId::from("commit-other-scope-during-validation".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(manual_unit)}, "projectUri": uri(manual_project)}),
+    );
+    let response = server.response(&manual);
+    assert!(response.error.is_none(), "{response:?}");
+    fs::write(&barrier.release, b"release validation worker").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) < held_validation_count + 1
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        fs::read(&barrier.entered).unwrap().len(),
+        held_validation_count + 1,
+        "only the single bounded validation retry should follow the held attempt"
+    );
+
+    let mut context = Value::Null;
+    for attempt in 0..10 {
+        context = project_context_retry_stale(
+            &mut server,
+            automatic_unit,
+            &format!("validation-retry-{attempt}"),
+        );
+        if context["selectedProjectUri"] == uri(automatic_project).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        context["selectedProjectUri"],
+        uri(automatic_project).as_str()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn child_with_own_project_scope_does_not_fence_parent_prompt() {
+    let (directory, parent_unit, parent_a, _, child_unit, _) = nested_scope_projects(true);
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &parent_unit);
+    let parent_prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("parent ambiguity prompt");
+    open_automatic_unit(&mut server, &child_unit);
+
+    let manual = RequestId::from("select-child-own-scope".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&child_unit)}, "projectUri": uri(&directory.path().join("child/ChildB.dproj"))}),
+    );
+    let response = server.response(&manual);
+    assert!(response.error.is_none(), "{response:?}");
+    let child_context = project_context_retry_stale(&mut server, &child_unit, "child-own-scope");
+    assert_eq!(
+        child_context["selectedProjectUri"],
+        uri(&directory.path().join("child/ChildB.dproj")).as_str()
+    );
+
+    let parent_action = parent_prompt.params["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["title"] == "ParentA.dproj")
+        .unwrap()
+        .clone();
+    server.send(Message::Response(Response::new_ok(
+        parent_prompt.id,
+        parent_action,
+    )));
+    let mut parent_context = Value::Null;
+    for attempt in 0..10 {
+        parent_context = project_context_retry_stale(
+            &mut server,
+            &parent_unit,
+            &format!("parent-after-child-own-{attempt}"),
+        );
+        if parent_context["selectedProjectUri"] == uri(&parent_a).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        parent_context["selectedProjectUri"],
+        uri(&parent_a).as_str()
+    );
+    server.shutdown();
+}
+
+#[test]
+fn child_inheriting_parent_scope_is_fenced_by_parent_manual_choice() {
+    let (directory, parent_unit, parent_a, parent_b, child_unit, _) = nested_scope_projects(false);
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &parent_unit);
+    let parent_prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("parent ambiguity prompt");
+    open_automatic_unit(&mut server, &child_unit);
+
+    let manual = RequestId::from("select-inherited-parent-scope".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&child_unit)}, "projectUri": uri(&parent_b)}),
+    );
+    let response = server.response(&manual);
+    assert!(response.error.is_none(), "{response:?}");
+    let parent_action = parent_prompt.params["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["title"] == "ParentA.dproj")
+        .unwrap()
+        .clone();
+    server.send(Message::Response(Response::new_ok(
+        parent_prompt.id,
+        parent_action,
+    )));
+
+    let parent_context =
+        project_context_retry_stale(&mut server, &parent_unit, "inherited-parent-wins");
+    assert_eq!(
+        parent_context["selectedProjectUri"],
+        uri(&parent_b).as_str()
+    );
+    assert_ne!(
+        parent_context["selectedProjectUri"],
+        uri(&parent_a).as_str()
     );
     server.shutdown();
 }

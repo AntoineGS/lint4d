@@ -1103,6 +1103,8 @@ enum TestBarrier {
     PartialValidation,
     ProjectOperation,
     ProjectOperationPrepared,
+    ProjectContextPrepared,
+    AutomaticSelectionPrepared,
     CompiledContent,
 }
 
@@ -1119,6 +1121,8 @@ pub struct TestBarrierConfig {
     partial_validation: Option<TestBarrierPaths>,
     project_operation: Option<TestBarrierPaths>,
     project_operation_prepared: Option<TestBarrierPaths>,
+    project_context_prepared: Option<TestBarrierPaths>,
+    automatic_selection_prepared: Option<TestBarrierPaths>,
     compiled_content: Option<TestBarrierPaths>,
     outbound_writer: Option<OutboundWriterBarrierPaths>,
     outbound_control_limit: Option<usize>,
@@ -1169,6 +1173,8 @@ impl TestBarrierConfig {
             partial_validation: None,
             project_operation: None,
             project_operation_prepared: None,
+            project_context_prepared: None,
+            automatic_selection_prepared: None,
             compiled_content: None,
             outbound_writer: None,
             outbound_control_limit: None,
@@ -1301,6 +1307,22 @@ impl TestBarrierConfig {
         self
     }
 
+    pub fn with_project_context_prepared(mut self, barrier: Option<(PathBuf, PathBuf)>) -> Self {
+        self.project_context_prepared =
+            barrier.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn with_automatic_selection_prepared(
+        mut self,
+        barrier: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.automatic_selection_prepared =
+            barrier.map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
     pub fn with_compiled_content(mut self, compiled_content: Option<(PathBuf, PathBuf)>) -> Self {
         self.compiled_content =
             compiled_content.map(|(entered, release)| TestBarrierPaths { entered, release });
@@ -1345,6 +1367,8 @@ impl TestBarrierConfig {
             TestBarrier::PartialValidation => self.partial_validation.as_ref(),
             TestBarrier::ProjectOperation => self.project_operation.as_ref(),
             TestBarrier::ProjectOperationPrepared => self.project_operation_prepared.as_ref(),
+            TestBarrier::ProjectContextPrepared => self.project_context_prepared.as_ref(),
+            TestBarrier::AutomaticSelectionPrepared => self.automatic_selection_prepared.as_ref(),
             TestBarrier::CompiledContent => self.compiled_content.as_ref(),
         }
     }
@@ -2047,11 +2071,13 @@ enum AnalysisRequest {
     SelectInstallation {
         project_uri: Url,
         installation_id: Option<String>,
+        automatic: bool,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
     },
     SelectProject {
         uri: Url,
         project_uri: Option<Url>,
+        automatic: bool,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
     },
     CompiledContent {
@@ -5112,9 +5138,12 @@ struct AnalysisJobs {
     diagnostic_results: DiagnosticPullStore,
     project_prompts: project_prompts::PromptState,
     prompt_sources: HashMap<RequestId, Url>,
+    prompt_source_identities: HashMap<RequestId, u64>,
     automatic_discovery_requests: HashMap<RequestId, Url>,
     automatic_apply_requests: HashMap<RequestId, Url>,
     automatic_answer_requests: HashMap<RequestId, AutomaticPromptAnswer>,
+    deferred_automatic_answers: HashMap<RequestId, AutomaticPromptAnswer>,
+    manual_selection_requests: HashMap<RequestId, ManualSelectionIntent>,
     next_automatic_discovery: u64,
     progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
@@ -5123,10 +5152,26 @@ struct AnalysisJobs {
     configuration_watch_sync_pending: bool,
 }
 
+#[derive(Clone)]
 struct AutomaticPromptAnswer {
     key: project_prompts::PromptKey,
     source_uri: Url,
+    source_identity_generation: u64,
+    choice: project_prompts::PromptChoice,
     fenced_by_manual_selection: bool,
+    stage: AutomaticAnswerStage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutomaticAnswerStage {
+    Validate { next_attempt: u8 },
+    Apply { attempt: u8 },
+    Deferred { next_attempt: u8 },
+}
+
+enum ManualSelectionIntent {
+    Project,
+    Installation { project_uri: Url },
 }
 
 #[derive(Debug)]
@@ -5166,12 +5211,15 @@ impl CompiledContentPayloadBudget {
 }
 
 impl AnalysisJobs {
-    fn fence_automatic_answers_for_source(&mut self, source_uri: &Url) {
+    fn fence_automatic_answers_for_scope(&mut self, scope_uri: &Url) {
         for answer in self.automatic_answer_requests.values_mut() {
-            if uri_is_within_scope(source_uri, &answer.key.scope_uri) {
+            if &answer.key.scope_uri == scope_uri {
                 answer.fenced_by_manual_selection = true;
             }
         }
+        self.deferred_automatic_answers
+            .retain(|_, answer| &answer.key.scope_uri != scope_uri);
+        self.invalidate_project_prompts_for_scope(scope_uri);
     }
 
     fn fence_automatic_answers_for_project(&mut self, project_uri: &Url) {
@@ -5180,6 +5228,13 @@ impl AnalysisJobs {
                 answer.fenced_by_manual_selection = true;
             }
         }
+        self.deferred_automatic_answers
+            .retain(|_, answer| answer.key.project_uri.as_ref() != Some(project_uri));
+        self.invalidate_project_prompts_for_project(project_uri);
+    }
+
+    fn manual_selection_is_pending(&self) -> bool {
+        !self.manual_selection_requests.is_empty()
     }
 
     fn invalidate_project_prompts_for_scope(&mut self, scope: &Url) {
@@ -5195,25 +5250,13 @@ impl AnalysisJobs {
             .collect::<Vec<_>>();
         for id in stale {
             self.prompt_sources.remove(&id);
+            self.prompt_source_identities.remove(&id);
         }
         self.project_prompts.invalidate_scope(scope);
         self.prompt_sources
             .retain(|id, _| self.project_prompts.key_for_id(id).is_some());
-    }
-
-    fn invalidate_project_prompts_for_source(&mut self, source_uri: &Url) {
-        let scopes = self
-            .prompt_sources
-            .iter()
-            .filter_map(|(id, source)| {
-                let key = self.project_prompts.key_for_id(id)?;
-                (source == source_uri || uri_is_within_scope(source_uri, &key.scope_uri))
-                    .then(|| key.scope_uri.clone())
-            })
-            .collect::<HashSet<_>>();
-        for scope in scopes {
-            self.invalidate_project_prompts_for_scope(&scope);
-        }
+        self.prompt_source_identities
+            .retain(|id, _| self.project_prompts.key_for_id(id).is_some());
     }
 
     fn invalidate_project_prompts_for_project(&mut self, project_uri: &Url) {
@@ -5273,9 +5316,12 @@ impl AnalysisJobs {
             diagnostic_results: DiagnosticPullStore::new(),
             project_prompts: project_prompts::PromptState::default(),
             prompt_sources: HashMap::new(),
+            prompt_source_identities: HashMap::new(),
             automatic_discovery_requests: HashMap::new(),
             automatic_apply_requests: HashMap::new(),
             automatic_answer_requests: HashMap::new(),
+            deferred_automatic_answers: HashMap::new(),
+            manual_selection_requests: HashMap::new(),
             next_automatic_discovery: 0,
             progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
@@ -6541,6 +6587,11 @@ impl AnalysisJobs {
                             let value = serde_json::to_value(&prepared.info)
                                 .map_err(|error| error.to_string())?;
                             wait_at_test_barrier(
+                                TestBarrier::ProjectContextPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            wait_at_test_barrier(
                                 TestBarrier::ProjectOperationPrepared,
                                 &test_barriers,
                                 &worker_cancellation,
@@ -6570,6 +6621,7 @@ impl AnalysisJobs {
                         AnalysisRequest::SelectInstallation {
                             project_uri,
                             installation_id,
+                            automatic,
                             mut snapshot,
                         } => {
                             let expected_installation =
@@ -6591,6 +6643,13 @@ impl AnalysisJobs {
                                 &test_barriers,
                                 &worker_cancellation,
                             )?;
+                            if automatic {
+                                wait_at_test_barrier(
+                                    TestBarrier::AutomaticSelectionPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                            }
                             Ok((
                                 ProjectOperationResponse::SelectInstallation {
                                     value,
@@ -6604,6 +6663,7 @@ impl AnalysisJobs {
                         AnalysisRequest::SelectProject {
                             uri,
                             project_uri,
+                            automatic,
                             mut snapshot,
                         } => {
                             let prepared = snapshot
@@ -6619,6 +6679,13 @@ impl AnalysisJobs {
                                 &test_barriers,
                                 &worker_cancellation,
                             )?;
+                            if automatic {
+                                wait_at_test_barrier(
+                                    TestBarrier::AutomaticSelectionPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                            }
                             Ok((ProjectOperationResponse::SelectProject { prepared }, snapshot))
                         }
                         _ => unreachable!("only project protocol requests use this worker"),
@@ -7005,6 +7072,7 @@ impl AnalysisJobs {
         {
             self.request_to_job.remove(id);
         }
+        self.manual_selection_requests.remove(id);
     }
 
     fn remove_observation(
@@ -8179,9 +8247,9 @@ impl AnalysisJobs {
                         primary_request_id.and_then(|id| self.automatic_apply_requests.remove(id));
                     let automatic_answer =
                         primary_request_id.and_then(|id| self.automatic_answer_requests.remove(id));
-                    let stale_automatic_answer = automatic_answer.as_ref().is_some_and(|answer| {
-                        !automatic_prompt_answer_is_current(workspace, &result, answer)
-                    });
+                    let manual_intent =
+                        primary_request_id.and_then(|id| self.manual_selection_requests.remove(id));
+                    let manual_selection_completed = manual_intent.is_some();
                     let key = job.key;
                     let _ = job.handle.join();
                     self.remove_observation(key.as_ref(), &primary_id);
@@ -8227,7 +8295,95 @@ impl AnalysisJobs {
                                     error.into()
                                 })?;
                         }
-                    } else if stale_automatic_answer {
+                    } else if let Some(mut answer) = automatic_answer {
+                        let recipient_id = recipients.first().map(|recipient| recipient.id.clone());
+                        let mut followup = None;
+                        if !answer.fenced_by_manual_selection
+                            && workspace.document_identity(&answer.source_uri).1
+                                == Some(answer.source_identity_generation)
+                        {
+                            match answer.stage {
+                                AutomaticAnswerStage::Validate { next_attempt } => {
+                                    let globally_current =
+                                        !analysis_result_is_stale(workspace, &result);
+                                    let scope_current = automatic_prompt_context_is_current(
+                                        workspace, &result, &answer,
+                                    );
+                                    if globally_current && scope_current {
+                                        if self.manual_selection_is_pending() {
+                                            answer.stage =
+                                                AutomaticAnswerStage::Deferred { next_attempt };
+                                            if let Some(id) = recipient_id.clone() {
+                                                self.deferred_automatic_answers.insert(id, answer);
+                                            }
+                                        } else {
+                                            followup = Some((
+                                                answer,
+                                                AutomaticAnswerStage::Apply {
+                                                    attempt: next_attempt,
+                                                },
+                                            ));
+                                        }
+                                    } else if !globally_current
+                                        && scope_current
+                                        && next_attempt == 0
+                                        && !workspace.analysis_admission_fenced()
+                                    {
+                                        // An unrelated commit can make the validation
+                                        // result globally stale even though the answer's
+                                        // scope and read set remain current. Refresh once.
+                                        followup = Some((
+                                            answer,
+                                            AutomaticAnswerStage::Validate { next_attempt: 1 },
+                                        ));
+                                    }
+                                }
+                                AutomaticAnswerStage::Apply { attempt } => {
+                                    if self.manual_selection_is_pending() {
+                                        answer.stage = AutomaticAnswerStage::Deferred {
+                                            next_attempt: attempt,
+                                        };
+                                        if let Some(id) = recipient_id.clone() {
+                                            self.deferred_automatic_answers.insert(id, answer);
+                                        }
+                                    } else if analysis_result_is_stale(workspace, &result) {
+                                        if !workspace.analysis_admission_fenced()
+                                            && attempt == 0
+                                            && project_selection_result_succeeded(&result)
+                                        {
+                                            followup = Some((
+                                                answer,
+                                                AutomaticAnswerStage::Validate { next_attempt: 1 },
+                                            ));
+                                        }
+                                    } else if project_selection_result_succeeded(&result) {
+                                        match commit_automatic_selection(
+                                            workspace,
+                                            &result,
+                                            &answer.source_uri,
+                                        ) {
+                                            Ok(selected_project) => {
+                                                if let Some(uri) = selected_project {
+                                                    queue_automatic_project_discovery(
+                                                        connection, workspace, self, uri, false,
+                                                        false,
+                                                    )?;
+                                                }
+                                            }
+                                            Err(error) => eprintln!(
+                                                "pascal-lsp: automatic project choice was not committed: {error}"
+                                            ),
+                                        }
+                                    }
+                                }
+                                AutomaticAnswerStage::Deferred { .. } => {}
+                            }
+                        }
+                        if let Some((answer, stage)) = followup {
+                            queue_automatic_answer_stage(
+                                connection, workspace, self, answer, stage, false, false,
+                            )?;
+                        }
                         for recipient in &recipients {
                             self.remove_client_mapping(&recipient.id, &primary_id);
                             self.release_partial_token(recipient);
@@ -8236,7 +8392,7 @@ impl AnalysisJobs {
                                     Some(connection),
                                     AnalysisJobId::Client(primary_id),
                                     &recipient.id,
-                                    Some("Stale project choice"),
+                                    None,
                                 )
                                 .map_err(|error| -> Box<dyn Error + Send + Sync> {
                                     error.into()
@@ -8253,7 +8409,7 @@ impl AnalysisJobs {
                             )?;
                         } else {
                             for recipient in &recipients {
-                                deliver_analysis_result_with_store(
+                                let selection_committed = deliver_analysis_result_with_store(
                                     connection,
                                     workspace,
                                     &mut self.completion_resolutions,
@@ -8261,6 +8417,33 @@ impl AnalysisJobs {
                                     result.clone(),
                                     Some(recipient.id.clone()),
                                 )?;
+                                if selection_committed {
+                                    if let Some(intent) = &manual_intent {
+                                        match intent {
+                                            ManualSelectionIntent::Project => {
+                                                if let AnalysisResultValue::ProjectOperation(Ok(
+                                                    ProjectOperationResponse::SelectProject {
+                                                        prepared,
+                                                    },
+                                                )) = &result.value
+                                                {
+                                                    if let Some(scope) =
+                                                        prepared.context.info.scope_uri.as_ref()
+                                                    {
+                                                        self.fence_automatic_answers_for_scope(
+                                                            scope,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            ManualSelectionIntent::Installation { project_uri } => {
+                                                self.fence_automatic_answers_for_project(
+                                                    project_uri,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 self.remove_client_mapping(&recipient.id, &primary_id);
                                 self.release_partial_token(recipient);
                                 self.progress
@@ -8284,6 +8467,31 @@ impl AnalysisJobs {
                                     )?;
                                 }
                             }
+                        }
+                    }
+                    if manual_selection_completed && !self.manual_selection_is_pending() {
+                        let deferred = std::mem::take(&mut self.deferred_automatic_answers);
+                        for (_, mut answer) in deferred {
+                            if answer.fenced_by_manual_selection
+                                || workspace.document_identity(&answer.source_uri).1
+                                    != Some(answer.source_identity_generation)
+                            {
+                                continue;
+                            }
+                            let next_attempt = match answer.stage {
+                                AutomaticAnswerStage::Deferred { next_attempt } => next_attempt,
+                                _ => continue,
+                            };
+                            answer.stage = AutomaticAnswerStage::Validate { next_attempt };
+                            queue_automatic_answer_stage(
+                                connection,
+                                workspace,
+                                self,
+                                answer,
+                                AutomaticAnswerStage::Validate { next_attempt },
+                                false,
+                                false,
+                            )?;
                         }
                     }
                 }
@@ -8380,7 +8588,14 @@ impl AnalysisJobs {
         };
         self.project_prompts
             .retain_live_sources(&mut self.prompt_sources);
+        self.prompt_source_identities
+            .retain(|id, _| self.project_prompts.key_for_id(id).is_some());
+        let Some(identity_generation) = workspace.document_identity(&source_uri).1 else {
+            return Ok(());
+        };
         self.prompt_sources.insert(request.id.clone(), source_uri);
+        self.prompt_source_identities
+            .insert(request.id.clone(), identity_generation);
         let mut request = request;
         request.params["message"] = serde_json::json!(message);
         connection.send_control(Message::Request(request))?;
@@ -8639,6 +8854,7 @@ fn deliver_analysis_result(
         result,
         client_id,
     )
+    .map(|_| ())
 }
 
 fn deliver_analysis_result_with_store(
@@ -8648,34 +8864,36 @@ fn deliver_analysis_result_with_store(
     diagnostic_results: &mut DiagnosticPullStore,
     result: AnalysisResult,
     client_id: Option<RequestId>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let stale = analysis_result_is_stale(workspace, &result);
     if stale {
         match &result.value {
             AnalysisResultValue::Diagnostics(diagnostics) => {
                 workspace.reschedule_diagnostics(diagnostics.uri.clone());
-                return Ok(());
+                return Ok(false);
             }
             AnalysisResultValue::DocumentDiagnostics(_)
             | AnalysisResultValue::WorkspaceDiagnostics(_) => {
-                return send_diagnostic_server_cancelled(
+                send_diagnostic_server_cancelled(
                     connection,
                     client_id
                         .clone()
                         .expect("stale diagnostic pull has a client result"),
                     "analysis result became stale; retry the request",
-                );
+                )?;
+                return Ok(false);
             }
             _ => {}
         }
-        return send_error(
+        send_error(
             connection,
             client_id
                 .clone()
                 .expect("non-diagnostic stale analysis result"),
             ErrorCode::RequestFailed,
             "analysis result became stale; retry the request",
-        );
+        )?;
+        return Ok(false);
     }
     let mut result = result;
     if let AnalysisResultValue::Diagnostics(diagnostics) = &result.value {
@@ -8683,7 +8901,7 @@ fn deliver_analysis_result_with_store(
             || workspace.document_version(&diagnostics.uri) != diagnostics.version
         {
             workspace.reschedule_diagnostics(diagnostics.uri.clone());
-            return Ok(());
+            return Ok(false);
         }
         workspace.record_diagnostic_dependencies(diagnostics.uri.clone(), result.records.clone());
     }
@@ -8695,6 +8913,7 @@ fn deliver_analysis_result_with_store(
             workspace.apply_navigation_state(state);
         }
     }
+    let mut selection_committed = false;
     match result.value {
         AnalysisResultValue::ProjectOperation(Err(error)) => send_analysis_error(
             connection,
@@ -8734,11 +8953,14 @@ fn deliver_analysis_result_with_store(
                 expected_installation.as_deref(),
                 &budget,
             ) {
-                Ok(()) => send_ok(
-                    connection,
-                    client_id.clone().expect("project operation client result"),
-                    value,
-                ),
+                Ok(()) => {
+                    selection_committed = true;
+                    send_ok(
+                        connection,
+                        client_id.clone().expect("project operation client result"),
+                        value,
+                    )
+                }
                 Err(error) => send_analysis_error(
                     connection,
                     client_id.clone().expect("project operation client result"),
@@ -8751,11 +8973,14 @@ fn deliver_analysis_result_with_store(
         })) => {
             let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
             match workspace.commit_prepared_project_selection(prepared, &budget) {
-                Ok(context) => send_ok(
-                    connection,
-                    client_id.clone().expect("project operation client result"),
-                    context,
-                ),
+                Ok(context) => {
+                    selection_committed = true;
+                    send_ok(
+                        connection,
+                        client_id.clone().expect("project operation client result"),
+                        context,
+                    )
+                }
                 Err(error) => send_analysis_error(
                     connection,
                     client_id.clone().expect("project operation client result"),
@@ -8942,11 +9167,12 @@ fn deliver_analysis_result_with_store(
                 if let Some((old_uri, new_uri)) = unit_file_move {
                     if let Err(error) = workspace.stage_unit_file_rename(&old_uri, &new_uri, &value)
                     {
-                        return send_analysis_error(
+                        send_analysis_error(
                             connection,
                             client_id.clone().expect("client result"),
                             error,
-                        );
+                        )?;
+                        return Ok(false);
                     }
                     let response =
                         send_ok(connection, client_id.clone().expect("client result"), value);
@@ -9059,7 +9285,8 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-    }
+    }?;
+    Ok(selection_committed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10837,67 +11064,46 @@ fn event_loop(
                 if jobs.project_prompts.is_request_id(&response.id) {
                     if let Some(key) = jobs.project_prompts.key_for_response(&response).cloned() {
                         let source_uri = jobs.prompt_sources.remove(&response.id);
-                        let source_is_live = source_uri
-                            .as_ref()
-                            .is_some_and(|uri| workspace.document_identity(uri).1.is_some());
-                        let current_generation = project_prompt_generation(workspace);
-                        let choice = if source_is_live && key.generation == current_generation {
+                        let source_identity = jobs.prompt_source_identities.remove(&response.id);
+                        let source_is_live = source_uri.as_ref().zip(source_identity).is_some_and(
+                            |(uri, identity)| workspace.document_identity(uri).1 == Some(identity),
+                        );
+                        let choice = if source_is_live {
                             jobs.project_prompts.answer(&response, &key)
                         } else {
                             jobs.invalidate_project_prompts_for_scope(&key.scope_uri);
                             None
                         };
-                        if let (Some(source_uri), Some(choice)) = (source_uri, choice) {
-                            if jobs.automatic_answer_requests.len() >= MAX_AUTOMATIC_PROMPT_ANSWERS
+                        if let (Some(source_uri), Some(source_identity_generation), Some(choice)) =
+                            (source_uri, source_identity, choice)
+                        {
+                            if jobs.automatic_answer_requests.len()
+                                + jobs.deferred_automatic_answers.len()
+                                >= MAX_AUTOMATIC_PROMPT_ANSWERS
                             {
                                 continue;
                             }
-                            let (method, params) = match choice {
-                                project_prompts::PromptChoice::Project(project_uri) => (
-                                    "pascal/selectProject",
-                                    serde_json::json!({
-                                        "textDocument": {"uri": source_uri},
-                                        "projectUri": project_uri,
-                                    }),
-                                ),
-                                project_prompts::PromptChoice::Installation(installation_id) => (
-                                    "pascal/selectInstallation",
-                                    serde_json::json!({
-                                        "projectUri": key.project_uri,
-                                        "installationId": installation_id,
-                                    }),
-                                ),
+                            let answer = AutomaticPromptAnswer {
+                                key,
+                                source_uri,
+                                source_identity_generation,
+                                choice,
+                                fenced_by_manual_selection: false,
+                                stage: AutomaticAnswerStage::Validate { next_attempt: 0 },
                             };
-                            let id = RequestId::from(format!(
-                                "pascal-project-answer-{}",
-                                jobs.next_automatic_discovery
-                            ));
-                            jobs.next_automatic_discovery =
-                                jobs.next_automatic_discovery.wrapping_add(1);
-                            jobs.automatic_answer_requests.insert(
-                                id.clone(),
-                                AutomaticPromptAnswer {
-                                    key: key.clone(),
-                                    source_uri: source_uri.clone(),
-                                    fenced_by_manual_selection: false,
-                                },
-                            );
-                            if method == "pascal/selectProject" {
-                                jobs.automatic_apply_requests
-                                    .insert(id.clone(), source_uri.clone());
-                            }
-                            handle_request(
-                                connection,
-                                workspace,
-                                Request::new(id.clone(), method.to_owned(), params),
-                                project_operation_client_features(),
-                                pull_diagnostics_supported,
-                                pull_related_diagnostics_supported,
-                                &mut jobs,
-                            )?;
-                            if !jobs.request_to_job.contains_key(&id) {
-                                jobs.automatic_answer_requests.remove(&id);
-                                jobs.automatic_apply_requests.remove(&id);
+                            if jobs.manual_selection_is_pending() {
+                                jobs.deferred_automatic_answers
+                                    .insert(response.id.clone(), answer);
+                            } else {
+                                queue_automatic_answer_stage(
+                                    connection,
+                                    workspace,
+                                    &mut jobs,
+                                    answer,
+                                    AutomaticAnswerStage::Validate { next_attempt: 0 },
+                                    pull_diagnostics_supported,
+                                    pull_related_diagnostics_supported,
+                                )?;
                             }
                         }
                     }
@@ -11654,10 +11860,13 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            if !jobs.automatic_answer_requests.contains_key(&request.id) {
-                jobs.fence_automatic_answers_for_project(&params.project_uri);
-            }
-            jobs.invalidate_project_prompts_for_project(&params.project_uri);
+            let manual_intent =
+                (!jobs.automatic_answer_requests.contains_key(&request.id)).then(|| {
+                    ManualSelectionIntent::Installation {
+                        project_uri: params.project_uri.clone(),
+                    }
+                });
+            let request_id = request.id.clone();
             let project_path = params.project_uri.to_file_path().ok();
             let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
             start_analysis(
@@ -11668,11 +11877,17 @@ fn handle_request(
                 AnalysisRequest::SelectInstallation {
                     project_uri: params.project_uri,
                     installation_id: params.installation_id,
+                    automatic: jobs.automatic_answer_requests.contains_key(&request.id),
                     snapshot,
                 },
                 client_features,
                 None,
             )?;
+            if jobs.request_to_job.contains_key(&request_id) {
+                if let Some(intent) = manual_intent {
+                    jobs.manual_selection_requests.insert(request_id, intent);
+                }
+            }
         }
         "pascal/selectProject" => {
             let id = request.id.clone();
@@ -11683,10 +11898,6 @@ fn handle_request(
                     return Ok(());
                 }
             };
-            if !jobs.automatic_answer_requests.contains_key(&request.id) {
-                jobs.fence_automatic_answers_for_source(&params.text_document.uri);
-            }
-            jobs.invalidate_project_prompts_for_source(&params.text_document.uri);
             let project = if params.project_uri.is_null() {
                 None
             } else {
@@ -11703,6 +11914,9 @@ fn handle_request(
                     }
                 }
             };
+            let manual_intent = (!jobs.automatic_answer_requests.contains_key(&request.id))
+                .then_some(ManualSelectionIntent::Project);
+            let request_id = request.id.clone();
             let snapshot = workspace.project_operation_snapshot(None);
             start_analysis(
                 connection,
@@ -11712,11 +11926,17 @@ fn handle_request(
                 AnalysisRequest::SelectProject {
                     uri: params.text_document.uri,
                     project_uri: project,
+                    automatic: jobs.automatic_answer_requests.contains_key(&request.id),
                     snapshot,
                 },
                 client_features,
                 None,
             )?;
+            if jobs.request_to_job.contains_key(&request_id) {
+                if let Some(intent) = manual_intent {
+                    jobs.manual_selection_requests.insert(request_id, intent);
+                }
+            }
         }
         "textDocument/hover" => {
             let id = request.id.clone();
@@ -13804,13 +14024,6 @@ fn server_capabilities(
     capabilities
 }
 
-fn uri_is_within_scope(uri: &Url, scope: &Url) -> bool {
-    match (uri.to_file_path(), scope.to_file_path()) {
-        (Ok(uri), Ok(scope)) => uri.starts_with(scope),
-        _ => false,
-    }
-}
-
 fn project_prompt_generation(workspace: &Workspace) -> u64 {
     workspace
         .source_generation()
@@ -13818,49 +14031,166 @@ fn project_prompt_generation(workspace: &Workspace) -> u64 {
         .wrapping_add(workspace.configuration_generation())
 }
 
-fn automatic_prompt_answer_is_current(
+fn automatic_prompt_context_is_current(
     workspace: &Workspace,
     result: &AnalysisResult,
     answer: &AutomaticPromptAnswer,
 ) -> bool {
-    if answer.key.generation != project_prompt_generation(workspace)
-        || answer.fenced_by_manual_selection
-        || workspace.document_identity(&answer.source_uri).1.is_none()
+    if answer.fenced_by_manual_selection
+        || workspace.document_identity(&answer.source_uri).1
+            != Some(answer.source_identity_generation)
     {
         return false;
     }
     match &result.value {
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::ProjectContext {
+            prepared,
+            ..
+        })) => {
+            if prepared.info.scope_uri.as_ref() != Some(&answer.key.scope_uri) {
+                return false;
+            }
+            match &answer.choice {
+                project_prompts::PromptChoice::Project(project_uri) => {
+                    let candidates = prepared
+                        .info
+                        .candidates
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    answer.key.project_uri.is_none()
+                        && prepared.info.selection_mode == "ambiguous"
+                        && prepared.info.selected_project_uri.is_none()
+                        && candidates == answer.key.candidates
+                        && candidates
+                            .iter()
+                            .any(|candidate| candidate == project_uri.as_str())
+                }
+                project_prompts::PromptChoice::Installation(installation_id) => {
+                    answer.key.project_uri.as_ref() == prepared.info.selected_project_uri.as_ref()
+                        && prepared.needs_installation_choice()
+                        && prepared.info.installation_candidates == answer.key.candidates
+                        && prepared
+                            .info
+                            .installation_candidates
+                            .contains(installation_id)
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
+fn project_selection_result_succeeded(result: &AnalysisResult) -> bool {
+    matches!(
+        result.value,
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::SelectProject { .. }
+            | ProjectOperationResponse::SelectInstallation { .. }))
+    )
+}
+
+fn commit_automatic_selection(
+    workspace: &mut Workspace,
+    result: &AnalysisResult,
+    source_uri: &Url,
+) -> Result<Option<Url>, String> {
+    match &result.value {
         AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::SelectProject {
             prepared,
         })) => {
-            let candidates = prepared
-                .context
-                .info
-                .candidates
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            let selected = prepared
-                .context
-                .info
-                .selected_project_uri
-                .as_ref()
-                .map(ToString::to_string);
-            candidates == answer.key.candidates
-                && selected.is_some_and(|selected| candidates.contains(&selected))
+            let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+            workspace.commit_prepared_project_selection(prepared.clone(), &budget)?;
+            Ok(Some(source_uri.clone()))
         }
         AnalysisResultValue::ProjectOperation(Ok(
-            ProjectOperationResponse::SelectInstallation { value, .. },
-        )) => value["candidates"].as_array().is_some_and(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-                == answer.key.candidates
-        }),
-        _ => false,
+            ProjectOperationResponse::SelectInstallation {
+                project_path,
+                installation_id,
+                expected_installation,
+                ..
+            },
+        )) => {
+            let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+            workspace.commit_prepared_installation_selection(
+                project_path,
+                installation_id.as_deref(),
+                expected_installation.as_deref(),
+                &budget,
+            )?;
+            Ok(None)
+        }
+        AnalysisResultValue::ProjectOperation(Err(error)) => Err(error.clone()),
+        _ => Err("automatic selection worker returned an unexpected result".to_owned()),
     }
+}
+
+fn queue_automatic_answer_stage(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    jobs: &mut AnalysisJobs,
+    mut answer: AutomaticPromptAnswer,
+    stage: AutomaticAnswerStage,
+    pull_diagnostics_supported: bool,
+    pull_related_diagnostics_supported: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if jobs.automatic_answer_requests.len() >= MAX_AUTOMATIC_PROMPT_ANSWERS {
+        return Ok(());
+    }
+    answer.stage = stage;
+    let id = RequestId::from(format!(
+        "pascal-project-answer-{}",
+        jobs.next_automatic_discovery
+    ));
+    jobs.next_automatic_discovery = jobs.next_automatic_discovery.wrapping_add(1);
+    let (method, params) = match stage {
+        AutomaticAnswerStage::Validate { .. } => (
+            "pascal/projectContext",
+            serde_json::json!({"textDocument": {"uri": answer.source_uri.clone()}}),
+        ),
+        AutomaticAnswerStage::Apply { .. } => match &answer.choice {
+            project_prompts::PromptChoice::Project(project_uri) => (
+                "pascal/selectProject",
+                serde_json::json!({
+                    "textDocument": {"uri": answer.source_uri.clone()},
+                    "projectUri": project_uri.clone(),
+                }),
+            ),
+            project_prompts::PromptChoice::Installation(installation_id) => (
+                "pascal/selectInstallation",
+                serde_json::json!({
+                    "projectUri": answer.key.project_uri.clone(),
+                    "installationId": installation_id.clone(),
+                }),
+            ),
+        },
+        AutomaticAnswerStage::Deferred { .. } => return Ok(()),
+    };
+    jobs.automatic_answer_requests
+        .insert(id.clone(), answer.clone());
+    if matches!(
+        (&stage, &answer.choice),
+        (
+            AutomaticAnswerStage::Apply { .. },
+            project_prompts::PromptChoice::Project(_)
+        )
+    ) {
+        jobs.automatic_apply_requests
+            .insert(id.clone(), answer.source_uri.clone());
+    }
+    handle_request(
+        connection,
+        workspace,
+        Request::new(id.clone(), method.to_owned(), params),
+        project_operation_client_features(),
+        pull_diagnostics_supported,
+        pull_related_diagnostics_supported,
+        jobs,
+    )?;
+    if !jobs.request_to_job.contains_key(&id) {
+        jobs.automatic_answer_requests.remove(&id);
+        jobs.automatic_apply_requests.remove(&id);
+    }
+    Ok(())
 }
 
 fn project_operation_client_features() -> ClientFeatures {

@@ -84,7 +84,6 @@ impl Workspace {
         let mut complete = true;
         let walker = WalkDir::new(&root_path)
             .follow_links(false)
-            .sort_by_file_name()
             .into_iter()
             .filter_entry(|entry| {
                 if entry.depth() == 0 {
@@ -210,7 +209,21 @@ fn label_component(component: &std::ffi::OsStr) -> String {
     output
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn label_component(component: &std::ffi::OsStr) -> String {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide = component.encode_wide().collect::<Vec<_>>();
+    if let Some(text) = component.to_str() {
+        return text.replace('%', "%25");
+    }
+    wide.iter().map(|unit| format!("%u{unit:04X}")).collect()
+}
+
+// Targets other than Unix and Windows do not expose a lossless OsStr encoding
+// suitable for a portable label. Keep a readable fallback; collision-free
+// labels on those targets are deferred until their native encoding is handled.
+#[cfg(not(any(unix, windows)))]
 fn label_component(component: &std::ffi::OsStr) -> String {
     component.to_string_lossy().replace('%', "%25")
 }
@@ -221,7 +234,8 @@ mod tests {
     use crate::workspace::WorkspaceOptions;
     use std::fs;
     use std::path::Path;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn write(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -404,5 +418,64 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("entry limit"))
         );
+    }
+
+    #[test]
+    fn huge_single_directory_observes_time_limit_without_sorting_every_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..50_000 {
+            fs::write(root.join(format!("entry-{index:05}.txt")), b"").unwrap();
+        }
+        let workspace = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let started = Instant::now();
+        let catalogue = workspace
+            .list_projects_with_limits(
+                &Url::from_file_path(root).unwrap(),
+                &AtomicBool::new(false),
+                8,
+                1024,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(!catalogue.complete);
+        assert!(catalogue.projects.len() <= 8);
+        assert!(
+            catalogue.warnings.iter().any(|warning| {
+                warning.contains("time limit") || warning.contains("entry limit")
+            })
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "bounded catalogue traversal took {:?} despite its 1ms work deadline",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn cancellation_interrupts_traversal_of_a_large_single_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..20_000 {
+            fs::write(root.join(format!("entry-{index:05}.txt")), b"").unwrap();
+        }
+        let workspace = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_after_delay = Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            cancel_after_delay.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = workspace.list_projects_with_limits(
+            &Url::from_file_path(root).unwrap(),
+            &cancel,
+            100_000,
+            1024,
+            Duration::from_secs(10),
+        );
+        canceller.join().unwrap();
+        assert!(result.unwrap_err().contains("cancel"));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

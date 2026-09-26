@@ -164,6 +164,50 @@ fn installation_selection_supports_reset_and_rejects_invalid_requests() {
 }
 
 #[test]
+fn reset_installation_response_does_not_reuse_cached_prior_profile() {
+    let fixture = selection_fixture();
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    let config = fs::read_to_string(&config_path)
+        .expect("read fixture configuration")
+        .replace("[projects.\"a/App.dproj\"]\ninstallation='7.0'\n", "")
+        .replace("[projects.\"b/App.dproj\"]\ninstallation='37.0'\n", "");
+    write_file(&config_path, &config);
+
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+    let selected = RequestId::from("cached-profile-seed".to_owned());
+    server.send_request(
+        selected.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    assert!(server.response(&selected).error.is_none());
+
+    let project_context = RequestId::from("cache-selected-profile-context".to_owned());
+    server.send_request(
+        project_context.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    assert!(server.response(&project_context).error.is_none());
+
+    let reset = RequestId::from("clear-session-profile".to_owned());
+    server.send_request(
+        reset.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": null}),
+    );
+    let reset = server.response(&reset);
+    assert!(reset.error.is_none(), "{reset:?}");
+    assert_ne!(
+        reset.result.unwrap()["selectedInstallationId"],
+        "37.0",
+        "reset response must describe post-reset automatic selection, not cached session data"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn installation_context_and_project_context_report_additive_fields() {
     let fixture = selection_fixture();
     let mut server = TestServer::launch();
@@ -268,6 +312,56 @@ fn held_project_operation_worker_does_not_block_ordinary_requests() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn select_project_runs_on_the_bounded_project_worker() {
+    let fixture = selection_fixture();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) = TestServer::launch_with_project_operation_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let select = RequestId::from("select-project-worker-route".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&fixture.main_a)},
+            "projectUri": uri(&fixture.project_a)
+        }),
+    );
+    wait_for_path(&barrier.entered);
+
+    let ordinary = RequestId::from("ordinary-request-during-select-project".to_owned());
+    server.send_request(
+        ordinary.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    let ordinary_response = server.response(&ordinary);
+    assert!(ordinary_response.error.is_none(), "{ordinary_response:?}");
+
+    fs::write(&barrier.release, b"release").expect("release project operation worker");
+    let selected = server.response(&select);
+    assert!(selected.error.is_none(), "{selected:?}");
+    assert_eq!(
+        selected.result.unwrap()["selectedProjectUri"],
+        uri(&fixture.project_a).as_str()
+    );
+    let context = RequestId::from("project-context-after-worker-selection".to_owned());
+    server.send_request(
+        context.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    let context = server.response(&context);
+    assert!(context.error.is_none(), "{context:?}");
+    assert_eq!(
+        context.result.unwrap()["selectedProjectUri"],
+        uri(&fixture.project_a).as_str()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn queued_project_selection_cancelled_before_worker_start_is_not_committed() {
     let fixture = selection_fixture();
     let environment = tempfile::tempdir().unwrap();
@@ -359,6 +453,53 @@ fn selection_worker_result_is_rejected_after_installation_profile_change() {
     assert!(
         stale.error.is_some(),
         "a selection prepared against the prior profile generation must not commit: {stale:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn selection_result_is_rejected_for_disk_profile_change_without_notification() {
+    let fixture = selection_fixture();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_project_operation_prepared_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let selection = RequestId::from("selection-unnotified-profile-change".to_owned());
+    server.send_request(
+        selection.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    wait_for_path(&barrier.entered);
+
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    let original = fs::read_to_string(&config_path).expect("read captured profile config");
+    let replacement = original.replace(
+        &fixture
+            .directory
+            .path()
+            .join("sdk/37.0")
+            .display()
+            .to_string(),
+        &fixture
+            .directory
+            .path()
+            .join("sdk/7.0")
+            .display()
+            .to_string(),
+    );
+    assert_ne!(original, replacement, "fixture profile must be changed");
+    write_file(&config_path, &replacement);
+    // Deliberately do not send didChangeWatchedFiles: delivery must verify the
+    // worker's captured on-disk read set rather than trusting generations only.
+    fs::write(&barrier.release, b"release").expect("release prepared worker");
+
+    let response = server.response(&selection);
+    assert!(
+        response.error.is_some(),
+        "profile/config changed after preparation without an LSP notification: {response:?}"
     );
     server.shutdown();
 }

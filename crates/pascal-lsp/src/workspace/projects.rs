@@ -1,14 +1,15 @@
 //! Runtime Delphi project selection and project-context protocol data.
 
 use super::{
-    ContextKey, OwnerOrigin, Workspace, absolute_path, canonical_file_uri,
+    ContextKey, OwnerOrigin, ReconciliationBudget, Workspace, absolute_path, canonical_file_uri,
     is_analyzable_source_path, path_stamp,
 };
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use lsp_types::Url;
+use pascal_project::installation_config::ConfigurationSourceStamp;
 use pascal_project::{
-    InstallationSelection, discover_with_selections, project_candidates, runtime_project_selection,
-    selected_project_is_current,
+    InstallationSelection, discover_with_selections, project_candidates,
+    project_candidates_with_work_budget, runtime_project_selection, selected_project_is_current,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -69,7 +70,17 @@ pub(crate) struct ProjectContextPreparation {
     key: ContextKey,
     state: super::ContextState,
     owner: Option<super::KnownDocumentOwner>,
+    pub(crate) project_file: Option<PathBuf>,
     pub(crate) info: ProjectContextInfo,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProjectSelectionPreparation {
+    pub(crate) context: ProjectContextPreparation,
+    scope: Option<PathBuf>,
+    selected: Option<PathBuf>,
+    expected_selected: Option<PathBuf>,
+    affected_uris: HashSet<Url>,
 }
 
 impl ProjectOperationSnapshot {
@@ -87,6 +98,33 @@ impl ProjectOperationSnapshot {
 }
 
 impl Workspace {
+    pub(crate) fn project_operation_configuration(
+        &self,
+        project_path: &Path,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Vec<ConfigurationSourceStamp>, String> {
+        let roots = self.workspace_root_paths();
+        let root = roots
+            .iter()
+            .find(|root| crate::workspace::path_starts_with_native(project_path, root));
+        self.overrides.configuration_source_stamps_for(
+            root.map(PathBuf::as_path),
+            Some(project_path),
+            budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
+        )
+    }
+
+    pub(crate) fn project_operation_configuration_is_current(
+        &self,
+        configuration: &[ConfigurationSourceStamp],
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<bool, String> {
+        self.overrides.configuration_source_stamps_are_current(
+            configuration,
+            budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
+        )
+    }
+
     pub(crate) fn project_operation_snapshot(
         &self,
         project_path: Option<&Path>,
@@ -169,25 +207,31 @@ impl Workspace {
         uri: &Url,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<ProjectContextInfo, String> {
-        self.prepare_project_context_with_cancel(uri, cancel)
+        self.prepare_project_context_with_control(uri, cancel, None)
             .map(|prepared| prepared.info)
     }
 
-    pub(crate) fn prepare_project_context_with_cancel(
+    pub(crate) fn prepare_project_context_with_control(
         &mut self,
         uri: &Url,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<ProjectContextPreparation, String> {
         let uri = canonical_file_uri(uri);
         let path = document_path(&uri)?;
-        let context_key = self.context_for_uri_with_cancel_and_budget(&uri, cancel, None)?;
+        let context_key = self.context_for_uri_with_cancel_and_budget(&uri, cancel, budget)?;
         let context = self
             .contexts
             .get(&context_key)
             .map(|state| state.context.clone())
             .ok_or_else(|| format!("project context was not retained for {uri}"))?;
         let roots = self.workspace_root_paths();
-        let candidates = project_candidates(&path, &roots)?;
+        let candidates = project_candidates_with_work_budget(
+            &path,
+            &roots,
+            cancel,
+            budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
+        )?;
         let runtime_selection =
             runtime_project_selection(&path, &candidates, &self.project_selections);
         let retained_selection = context_key
@@ -226,7 +270,7 @@ impl Workspace {
 
         let (installation_candidates, installation_selection_mode) =
             if let Some(project_file) = context.project_file.as_deref() {
-                self.installation_selection_snapshot(project_file)
+                self.installation_selection_snapshot(project_file, budget)
                     .map(|(_, candidates, _)| {
                         let mode = if self.installation_selections.contains_key(project_file) {
                             "session"
@@ -301,6 +345,7 @@ impl Workspace {
             key: context_key,
             state,
             owner,
+            project_file: context.project_file.clone(),
             info,
         })
     }
@@ -314,6 +359,7 @@ impl Workspace {
             key,
             state,
             owner,
+            project_file: _,
             info: _,
         } = prepared;
         let watched_paths = state.watched_paths.keys().cloned().collect::<Vec<_>>();
@@ -330,10 +376,18 @@ impl Workspace {
         &mut self,
         project_uri: &Url,
     ) -> Result<InstallationContextInfo, String> {
+        self.installation_context_with_budget(project_uri, None)
+    }
+
+    pub(crate) fn installation_context_with_budget(
+        &mut self,
+        project_uri: &Url,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<InstallationContextInfo, String> {
         let project_path = project_path(project_uri)?;
         self.validate_project_scope(&project_path)?;
         let (project, candidates, selected) =
-            self.installation_selection_snapshot(&project_path)?;
+            self.installation_selection_snapshot(&project_path, budget)?;
         let selection_is_valid = selected.as_ref().is_none_or(|id| {
             candidates
                 .iter()
@@ -369,16 +423,17 @@ impl Workspace {
         project_uri: &Url,
         installation_id: Option<&str>,
     ) -> Result<InstallationContextInfo, String> {
-        self.select_installation_inner(project_uri, installation_id, None)
+        self.select_installation_inner(project_uri, installation_id, None, None)
     }
 
-    pub(crate) fn select_installation_with_cancel(
+    pub(crate) fn select_installation_with_control(
         &mut self,
         project_uri: &Url,
         installation_id: Option<&str>,
         cancel: &std::sync::atomic::AtomicBool,
+        budget: &ReconciliationBudget,
     ) -> Result<InstallationContextInfo, String> {
-        self.select_installation_inner(project_uri, installation_id, Some(cancel))
+        self.select_installation_inner(project_uri, installation_id, Some(cancel), Some(budget))
     }
 
     fn select_installation_inner(
@@ -386,11 +441,13 @@ impl Workspace {
         project_uri: &Url,
         installation_id: Option<&str>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<InstallationContextInfo, String> {
         let project_path = project_path(project_uri)?;
         self.validate_project_scope(&project_path)?;
         check_project_operation_cancel(cancel)?;
-        let (config, candidates, _) = self.installation_selection_snapshot(&project_path)?;
+        let (config, candidates, _) =
+            self.installation_selection_snapshot(&project_path, budget)?;
         if let Some(id) = installation_id {
             config.profile(id)?;
             if !candidates
@@ -412,7 +469,7 @@ impl Workspace {
         let options = self.project_options_with_installations(selections.clone());
         let validation = match cancel {
             Some(cancel) => {
-                pascal_project::discover_with_selections_and_observations_with_cancel_and_overrides(
+                pascal_project::discover_with_selections_and_observations_with_work_budget(
                     &project_path,
                     &roots,
                     &options,
@@ -420,6 +477,7 @@ impl Workspace {
                     &self.overrides,
                     &self.options.exclude,
                     cancel,
+                    budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
                 )?
                 .context
             }
@@ -443,7 +501,6 @@ impl Workspace {
             ));
         }
 
-        self.installation_selections = selections;
         let keys = self
             .contexts
             .keys()
@@ -454,11 +511,30 @@ impl Workspace {
             })
             .cloned()
             .collect::<HashSet<_>>();
+        let selected_after_change = match validation.installation_selection.as_ref() {
+            Some(InstallationSelection::Selected { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        self.invalidate_selection_contexts(&keys, cancel, budget)?;
+        // No fallible operation follows this point: context invalidation has
+        // been fully preflighted and applied, so the session map and generation
+        // changes become one infallible commit.
+        self.installation_selections = selections;
         self.bump_source_generation();
         self.bump_configuration_generation();
-        self.invalidate_selection_contexts(&keys, None, None)?;
-        check_project_operation_cancel(cancel)?;
-        self.installation_context(project_uri)
+        Ok(InstallationContextInfo {
+            project_uri: canonical_file_uri(project_uri),
+            candidates,
+            selected_installation_id: selected_after_change,
+            selection_mode: if installation_id.is_some() {
+                "session".to_string()
+            } else if config.configured_installation_for(&project_path).is_some() {
+                "configured".to_string()
+            } else {
+                "automatic".to_string()
+            },
+            warnings: Vec::new(),
+        })
     }
 
     /// Commit a worker-validated installation choice. No configuration or
@@ -484,15 +560,6 @@ impl Workspace {
         {
             return Err("project is no longer in the configured workspace scope".to_string());
         }
-        match installation_id {
-            Some(id) => {
-                self.installation_selections
-                    .insert(project_path.to_path_buf(), id.to_string());
-            }
-            None => {
-                self.installation_selections.remove(project_path);
-            }
-        }
         let keys = self
             .contexts
             .keys()
@@ -503,14 +570,25 @@ impl Workspace {
             })
             .cloned()
             .collect::<HashSet<_>>();
+        self.invalidate_selection_contexts(&keys, None, None)?;
+        match installation_id {
+            Some(id) => {
+                self.installation_selections
+                    .insert(project_path.to_path_buf(), id.to_string());
+            }
+            None => {
+                self.installation_selections.remove(project_path);
+            }
+        }
         self.bump_source_generation();
         self.bump_configuration_generation();
-        self.invalidate_selection_contexts(&keys, None, None)
+        Ok(())
     }
 
     fn installation_selection_snapshot(
         &self,
         project_path: &Path,
+        budget: Option<&ReconciliationBudget>,
     ) -> Result<
         (
             pascal_project::installation_config::ProjectConfiguration,
@@ -520,12 +598,13 @@ impl Workspace {
         String,
     > {
         let roots = self.workspace_root_paths();
-        let configuration = self.overrides.configuration_for(
+        let configuration = self.overrides.configuration_for_with_work_budget(
             roots
                 .iter()
                 .find(|root| project_path.starts_with(root))
                 .map(PathBuf::as_path),
             Some(project_path),
+            budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
         )?;
         let mut candidates = configuration.installation_ids();
         candidates.sort_by_key(|id| id.to_ascii_lowercase());
@@ -645,6 +724,170 @@ impl Workspace {
         self.bump_configuration_generation();
         self.invalidate_project_selection_uris(&affected_uris, None, None)?;
         self.project_context(&uri)
+    }
+
+    pub(crate) fn prepare_select_project_with_control(
+        &mut self,
+        uri: &Url,
+        project: Option<&Url>,
+        cancel: &std::sync::atomic::AtomicBool,
+        budget: &ReconciliationBudget,
+    ) -> Result<ProjectSelectionPreparation, String> {
+        let uri = canonical_file_uri(uri);
+        let path = document_path(&uri)?;
+        let roots = self.workspace_root_paths();
+        let candidates = project_candidates_with_work_budget(
+            &path,
+            &roots,
+            Some(cancel),
+            Some(budget as &dyn pascal_project::ProjectWorkBudget),
+        )?;
+        let current_selection =
+            runtime_project_selection(&path, &candidates, &self.project_selections);
+        let candidate_scope = candidates.directory.clone();
+        let retained_owner_scope = self
+            .document_owners
+            .get(&uri)
+            .filter(|owner| owner.origin == OwnerOrigin::Inherited)
+            .and_then(|owner| owner.key.selection_scope.clone());
+        let reset_scope = current_selection
+            .as_ref()
+            .map(|(scope, _)| scope.clone())
+            .or_else(|| candidate_scope.clone())
+            .or(retained_owner_scope);
+
+        let selected = match project {
+            Some(project_uri) => {
+                let project_path = project_uri
+                    .to_file_path()
+                    .map_err(|_| format!("project selection must use a file URI: {project_uri}"))?;
+                let project_path = absolute_path(project_path);
+                let Some(scope) = candidate_scope else {
+                    return Err(format!(
+                        "project selection is unavailable because no .dproj candidates were found for {uri}"
+                    ));
+                };
+                let Some(candidate) = candidates
+                    .files
+                    .iter()
+                    .find(|candidate| project_paths_equal(candidate, &project_path))
+                    .cloned()
+                else {
+                    return Err(format!(
+                        "project selection is not a current candidate: {project_uri}"
+                    ));
+                };
+                Some((scope, candidate))
+            }
+            None => reset_scope.map(|scope| (scope, PathBuf::new())),
+        };
+
+        let Some((scope, selected)) = selected else {
+            let context =
+                self.prepare_project_context_with_control(&uri, Some(cancel), Some(budget))?;
+            return Ok(ProjectSelectionPreparation {
+                context,
+                scope: None,
+                selected: None,
+                expected_selected: None,
+                affected_uris: HashSet::new(),
+            });
+        };
+
+        let expected_selected = self.project_selections.get(&scope).cloned();
+        let mut tentative = self.project_selections.clone();
+        if project.is_some() {
+            tentative.insert(scope.clone(), selected.clone());
+        } else {
+            tentative.remove(&scope);
+        }
+
+        let deleted_paths = self.deleted_path_snapshot_with_control(Some(cancel), Some(budget))?;
+        let validation = pascal_project::discover_with_selections_and_observations_with_work_budget_and_deleted_paths(
+            &path,
+            &roots,
+            &self.project_options_with_installations(self.installation_selections.clone()),
+            &tentative,
+            &self.overrides,
+            &self.options.exclude,
+            cancel,
+            Some(budget as &dyn pascal_project::ProjectWorkBudget),
+            &deleted_paths,
+        )?;
+        if validation
+            .context
+            .project_file
+            .as_deref()
+            .is_none_or(|found| !project_paths_equal(found, &selected))
+            && project.is_some()
+        {
+            return Err(format!(
+                "selected project is no longer valid: {}",
+                selected.display()
+            ));
+        }
+
+        let affected_uris = self.selection_uris_for_scope(&scope, &uri);
+        // Force discovery against the tentative selection rather than reusing
+        // a context prepared for the previously configured project. This is a
+        // disposable worker snapshot, so partial invalidation on failure is
+        // never published to the coordinator.
+        self.invalidate_project_selection_uris(&affected_uris, Some(cancel), Some(budget))?;
+        // Don't restore an old owner from before the selection change; it may
+        // retain a configured project from a different candidate directory.
+        for affected_uri in &affected_uris {
+            self.document_owners.remove(affected_uri);
+        }
+        self.project_selections = tentative;
+        let context =
+            self.prepare_project_context_with_control(&uri, Some(cancel), Some(budget))?;
+        Ok(ProjectSelectionPreparation {
+            context,
+            scope: Some(scope),
+            selected: project.is_some().then_some(selected),
+            expected_selected,
+            affected_uris,
+        })
+    }
+
+    pub(crate) fn commit_prepared_project_selection(
+        &mut self,
+        prepared: ProjectSelectionPreparation,
+        budget: &ReconciliationBudget,
+    ) -> Result<ProjectContextInfo, String> {
+        let ProjectSelectionPreparation {
+            context,
+            scope,
+            selected,
+            expected_selected,
+            affected_uris,
+        } = prepared;
+        if let Some(scope) = scope {
+            if self.project_selections.get(&scope).cloned() != expected_selected {
+                return Err("project selection changed while the request was running".to_string());
+            }
+            if !self
+                .workspace_root_paths()
+                .iter()
+                .any(|root| crate::workspace::path_starts_with_native(&scope, root))
+            {
+                return Err("project selection scope is no longer configured".to_string());
+            }
+            self.invalidate_project_selection_uris(&affected_uris, None, Some(budget))?;
+            match selected {
+                Some(selected) => {
+                    self.project_selections.insert(scope, selected);
+                }
+                None => {
+                    self.project_selections.remove(&scope);
+                }
+            }
+            self.bump_source_generation();
+            self.bump_configuration_generation();
+        }
+        let info = context.info.clone();
+        self.apply_project_context_preparation(context);
+        Ok(info)
     }
 
     fn resolve_configuration(

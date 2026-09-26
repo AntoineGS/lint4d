@@ -927,6 +927,7 @@ impl AnalysisPriority {
             | AnalysisRequest::ProjectContext { .. }
             | AnalysisRequest::InstallationContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
+            | AnalysisRequest::SelectProject { .. }
             | AnalysisRequest::CompiledContent { .. }
             | AnalysisRequest::Completion { .. }
             | AnalysisRequest::SignatureHelp { .. }
@@ -1097,6 +1098,7 @@ enum TestBarrier {
     References,
     PartialValidation,
     ProjectOperation,
+    ProjectOperationPrepared,
     CompiledContent,
 }
 
@@ -1112,6 +1114,7 @@ pub struct TestBarrierConfig {
     references: Option<TestBarrierPaths>,
     partial_validation: Option<TestBarrierPaths>,
     project_operation: Option<TestBarrierPaths>,
+    project_operation_prepared: Option<TestBarrierPaths>,
     compiled_content: Option<TestBarrierPaths>,
     outbound_writer: Option<OutboundWriterBarrierPaths>,
     outbound_control_limit: Option<usize>,
@@ -1161,6 +1164,7 @@ impl TestBarrierConfig {
             references: None,
             partial_validation: None,
             project_operation: None,
+            project_operation_prepared: None,
             compiled_content: None,
             outbound_writer: None,
             outbound_control_limit: None,
@@ -1284,6 +1288,15 @@ impl TestBarrierConfig {
         self
     }
 
+    pub fn with_project_operation_prepared(
+        mut self,
+        project_operation_prepared: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        self.project_operation_prepared = project_operation_prepared
+            .map(|(entered, release)| TestBarrierPaths { entered, release });
+        self
+    }
+
     pub fn with_compiled_content(mut self, compiled_content: Option<(PathBuf, PathBuf)>) -> Self {
         self.compiled_content =
             compiled_content.map(|(entered, release)| TestBarrierPaths { entered, release });
@@ -1327,6 +1340,7 @@ impl TestBarrierConfig {
             TestBarrier::References => self.references.as_ref(),
             TestBarrier::PartialValidation => self.partial_validation.as_ref(),
             TestBarrier::ProjectOperation => self.project_operation.as_ref(),
+            TestBarrier::ProjectOperationPrepared => self.project_operation_prepared.as_ref(),
             TestBarrier::CompiledContent => self.compiled_content.as_ref(),
         }
     }
@@ -2031,6 +2045,11 @@ enum AnalysisRequest {
         installation_id: Option<String>,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
     },
+    SelectProject {
+        uri: Url,
+        project_uri: Option<Url>,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
     CompiledContent {
         snapshot: crate::workspace::CompiledContentSnapshot,
         symbols: Option<(Url, bool)>,
@@ -2153,7 +2172,8 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
     match request {
         AnalysisRequest::ProjectContext { .. }
         | AnalysisRequest::InstallationContext { .. }
-        | AnalysisRequest::SelectInstallation { .. } => "Resolving Delphi project context",
+        | AnalysisRequest::SelectInstallation { .. }
+        | AnalysisRequest::SelectProject { .. } => "Resolving Delphi project context",
         AnalysisRequest::CompiledContent { .. } => "Reading compiled virtual document",
         AnalysisRequest::Diagnostics { .. } => "Indexing workspace",
         AnalysisRequest::DocumentDiagnostics { .. } => "Indexing document diagnostics",
@@ -2240,6 +2260,9 @@ enum ProjectOperationResponse {
         project_path: PathBuf,
         installation_id: Option<String>,
         expected_installation: Option<String>,
+    },
+    SelectProject {
+        prepared: crate::workspace::projects::ProjectSelectionPreparation,
     },
 }
 
@@ -4887,7 +4910,8 @@ impl ObservationKey {
             | AnalysisRequest::TypeHierarchySubtypes { .. }
             | AnalysisRequest::ProjectContext { .. }
             | AnalysisRequest::InstallationContext { .. }
-            | AnalysisRequest::SelectInstallation { .. } => return None,
+            | AnalysisRequest::SelectInstallation { .. }
+            | AnalysisRequest::SelectProject { .. } => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
         Some(Self {
@@ -5173,6 +5197,7 @@ impl AnalysisJobs {
             AnalysisRequest::ProjectContext { .. }
                 | AnalysisRequest::InstallationContext { .. }
                 | AnalysisRequest::SelectInstallation { .. }
+                | AnalysisRequest::SelectProject { .. }
         ) {
             return self.spawn_project_operation(id, request);
         }
@@ -5269,9 +5294,10 @@ impl AnalysisJobs {
         let panic_value = match &request {
             AnalysisRequest::ProjectContext { .. }
             | AnalysisRequest::InstallationContext { .. }
-            | AnalysisRequest::SelectInstallation { .. } => AnalysisResultValue::ProjectOperation(
-                Err("project operation worker panicked".to_string()),
-            ),
+            | AnalysisRequest::SelectInstallation { .. }
+            | AnalysisRequest::SelectProject { .. } => AnalysisResultValue::ProjectOperation(Err(
+                "project operation worker panicked".to_string(),
+            )),
             AnalysisRequest::CompiledContent { .. } => AnalysisResultValue::CompiledContent(Err(
                 "compiled virtual-document worker panicked".to_string(),
             )),
@@ -5424,7 +5450,8 @@ impl AnalysisJobs {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
                         AnalysisRequest::ProjectContext { .. }
                         | AnalysisRequest::InstallationContext { .. }
-                        | AnalysisRequest::SelectInstallation { .. } => unreachable!(
+                        | AnalysisRequest::SelectInstallation { .. }
+                        | AnalysisRequest::SelectProject { .. } => unreachable!(
                             "project operations use their dedicated worker admission path"
                         ),
                         AnalysisRequest::Hover {
@@ -6354,7 +6381,8 @@ impl AnalysisJobs {
         let (source_generation, configuration_generation) = match &request {
             AnalysisRequest::ProjectContext { snapshot, .. }
             | AnalysisRequest::InstallationContext { snapshot, .. }
-            | AnalysisRequest::SelectInstallation { snapshot, .. } => snapshot.generations(),
+            | AnalysisRequest::SelectInstallation { snapshot, .. }
+            | AnalysisRequest::SelectProject { snapshot, .. } => snapshot.generations(),
             _ => unreachable!("only project protocol requests use this worker"),
         };
         let handle = thread::Builder::new()
@@ -6369,28 +6397,69 @@ impl AnalysisJobs {
                     if worker_cancellation.load(Ordering::Acquire) {
                         return Err(rename::CANCELLATION_MESSAGE.to_string());
                     }
+                    let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
                     match request {
                         AnalysisRequest::ProjectContext { uri, mut snapshot } => {
                             let prepared = snapshot
                                 .workspace_mut()
-                                .prepare_project_context_with_cancel(
+                                .prepare_project_context_with_control(
                                     &uri,
                                     Some(&worker_cancellation),
+                                    Some(&budget),
                                 )?;
                             let value = serde_json::to_value(&prepared.info)
                                 .map_err(|error| error.to_string())?;
+                            if let Some(project_path) = prepared.project_file.as_deref() {
+                                let configuration = snapshot
+                                    .workspace_mut()
+                                    .project_operation_configuration(project_path, Some(&budget))?;
+                                wait_at_test_barrier(
+                                    TestBarrier::ProjectOperationPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                                if !snapshot
+                                    .workspace_mut()
+                                    .project_operation_configuration_is_current(
+                                        &configuration,
+                                        Some(&budget),
+                                    )?
+                                {
+                                    return Err("project configuration changed while resolving context; retry the request".to_string());
+                                }
+                            }
                             Ok(ProjectOperationResponse::ProjectContext { value, prepared })
                         }
                         AnalysisRequest::InstallationContext {
                             project_uri,
                             mut snapshot,
                         } => {
+                            let project_path = project_uri.to_file_path().map_err(|_| {
+                                format!("project URI must be a file URI: {project_uri}")
+                            })?;
+                            let configuration = snapshot
+                                .workspace_mut()
+                                .project_operation_configuration(&project_path, Some(&budget))?;
                             let value = snapshot
                                 .workspace_mut()
-                                .installation_context(&project_uri)
+                                .installation_context_with_budget(&project_uri, Some(&budget))
                                 .and_then(|context| {
                                     serde_json::to_value(context).map_err(|error| error.to_string())
                                 })?;
+                            wait_at_test_barrier(
+                                TestBarrier::ProjectOperationPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            if !snapshot
+                                .workspace_mut()
+                                .project_operation_configuration_is_current(
+                                    &configuration,
+                                    Some(&budget),
+                                )?
+                            {
+                                return Err("project configuration changed while resolving installation context; retry the request".to_string());
+                            }
                             Ok(ProjectOperationResponse::InstallationContext(value))
                         }
                         AnalysisRequest::SelectInstallation {
@@ -6403,20 +6472,72 @@ impl AnalysisJobs {
                             let project_path = project_uri.to_file_path().map_err(|_| {
                                 format!("project URI must be a file URI: {project_uri}")
                             })?;
+                            let configuration = snapshot
+                                .workspace_mut()
+                                .project_operation_configuration(&project_path, Some(&budget))?;
                             let context =
-                                snapshot.workspace_mut().select_installation_with_cancel(
+                                snapshot.workspace_mut().select_installation_with_control(
                                     &project_uri,
                                     installation_id.as_deref(),
                                     &worker_cancellation,
+                                    &budget,
                                 )?;
                             let value =
                                 serde_json::to_value(context).map_err(|error| error.to_string())?;
+                            wait_at_test_barrier(
+                                TestBarrier::ProjectOperationPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            if !snapshot
+                                .workspace_mut()
+                                .project_operation_configuration_is_current(
+                                    &configuration,
+                                    Some(&budget),
+                                )?
+                            {
+                                return Err("project configuration changed while selecting installation; retry the request".to_string());
+                            }
                             Ok(ProjectOperationResponse::SelectInstallation {
                                 value,
                                 project_path,
                                 installation_id,
                                 expected_installation,
                             })
+                        }
+                        AnalysisRequest::SelectProject {
+                            uri,
+                            project_uri,
+                            mut snapshot,
+                        } => {
+                            let prepared = snapshot
+                                .workspace_mut()
+                                .prepare_select_project_with_control(
+                                    &uri,
+                                    project_uri.as_ref(),
+                                    &worker_cancellation,
+                                    &budget,
+                                )?;
+                            if let Some(project_path) = prepared.context.project_file.as_deref() {
+                                let configuration = snapshot
+                                    .workspace_mut()
+                                    .project_operation_configuration(project_path, Some(&budget))?;
+                                wait_at_test_barrier(
+                                    TestBarrier::ProjectOperationPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                                if !snapshot
+                                    .workspace_mut()
+                                    .project_operation_configuration_is_current(
+                                        &configuration,
+                                        Some(&budget),
+                                    )?
+                                {
+                                    return Err("project configuration changed while selecting project; retry the request".to_string());
+                                }
+                            }
+                            Ok(ProjectOperationResponse::SelectProject { prepared })
                         }
                         _ => unreachable!("only project protocol requests use this worker"),
                     }
@@ -7928,6 +8049,7 @@ impl AnalysisJobs {
                         &result.value,
                         AnalysisResultValue::ProjectOperation(Ok(
                             ProjectOperationResponse::ProjectContext { .. }
+                                | ProjectOperationResponse::SelectProject { .. }
                         ))
                     );
                     let Some(job) = self.pending.remove(&primary_id) else {
@@ -8362,6 +8484,23 @@ fn deliver_analysis_result_with_store(
                     connection,
                     client_id.clone().expect("project operation client result"),
                     value,
+                ),
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("project operation client result"),
+                    error,
+                ),
+            }
+        }
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::SelectProject {
+            prepared,
+        })) => {
+            let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+            match workspace.commit_prepared_project_selection(prepared, &budget) {
+                Ok(context) => send_ok(
+                    connection,
+                    client_id.clone().expect("project operation client result"),
+                    context,
                 ),
                 Err(error) => send_analysis_error(
                     connection,
@@ -11178,10 +11317,20 @@ fn handle_request(
                     }
                 }
             };
-            match workspace.select_project(&params.text_document.uri, project.as_ref()) {
-                Ok(context) => send_ok(connection, id, context)?,
-                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
-            }
+            let snapshot = workspace.project_operation_snapshot(None);
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::SelectProject {
+                    uri: params.text_document.uri,
+                    project_uri: project,
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
         }
         "textDocument/hover" => {
             let id = request.id.clone();

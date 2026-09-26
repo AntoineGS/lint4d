@@ -9517,12 +9517,19 @@ impl Workspace {
     ) -> Result<(), String> {
         let mut context_sources = Vec::new();
         let mut context_metadata = Vec::new();
+        let mut retained_keys = Vec::new();
+        let mut stale_owners = Vec::new();
+        let mut affected = HashSet::new();
         for key in keys {
             check_workspace_cancel(cancel)?;
             if let Some(budget) = budget {
                 budget.charge_path_visits(1)?;
             }
             if let Some(state) = self.contexts.get(key) {
+                retained_keys
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve invalidated contexts: {error}"))?;
+                retained_keys.push(key.clone());
                 if let Some(main_source) = state.context.main_source.as_ref() {
                     context_sources.try_reserve(1).map_err(|error| {
                         format!("could not reserve changed project sources: {error}")
@@ -9541,13 +9548,181 @@ impl Workspace {
                 }
             }
         }
-        let affected = self.invalidate_contexts_with_control(keys, cancel, budget)?;
+        for (uri, owner) in &self.document_owners {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(&owner.key) {
+                stale_owners
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve stale project owners: {error}"))?;
+                stale_owners.push(uri.clone());
+            }
+        }
+        for (uri, context_key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(context_key)
+                && (self.index.contains(uri)
+                    || self
+                        .open_documents
+                        .get(uri)
+                        .is_some_and(|document| document.text.is_some()))
+            {
+                affected.try_reserve(1).map_err(|error| {
+                    format!("could not reserve affected project documents: {error}")
+                })?;
+                affected.insert(uri.clone());
+            }
+        }
+        for (uri, context_key) in &self.open_document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(context_key)
+                && self
+                    .open_documents
+                    .get(uri)
+                    .is_some_and(|document| document.text.is_some())
+            {
+                affected.try_reserve(1).map_err(|error| {
+                    format!("could not reserve affected open documents: {error}")
+                })?;
+                affected.insert(uri.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(
+                retained_keys
+                    .len()
+                    .saturating_add(stale_owners.len())
+                    .saturating_add(affected.len()),
+            )?;
+        }
+
+        // Preflight every fallible/cancellable operation that would otherwise
+        // occur while removing contexts and indexes. The apply phase below is
+        // deliberately infallible so a budget/cancellation error cannot leave
+        // a half-invalidated selection behind.
+        for uri in &affected {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+                if let Some(expansion) = self.expansions.get(uri) {
+                    let dependency_count = expansion.dependencies.len();
+                    for _ in &expansion.dependencies {
+                        check_workspace_cancel(cancel)?;
+                        budget.charge_path_visits(1)?;
+                    }
+                    budget.charge_path_visits(dependency_count.saturating_add(1))?;
+                }
+            }
+        }
+        let mut used_contexts = HashSet::new();
+        used_contexts
+            .try_reserve(
+                self.document_contexts
+                    .len()
+                    .saturating_add(self.open_document_contexts.len()),
+            )
+            .map_err(|error| format!("could not reserve selection context owners: {error}"))?;
+        for (uri, key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !affected.contains(uri) {
+                used_contexts.insert(key.clone());
+            }
+        }
+        for key in self.open_document_contexts.values() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            used_contexts.insert(key.clone());
+        }
+        let mut pruned_keys = Vec::new();
+        pruned_keys
+            .try_reserve(self.contexts.len())
+            .map_err(|error| format!("could not reserve pruned selection contexts: {error}"))?;
+        for key in self.contexts.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !used_contexts.contains(key) {
+                pruned_keys.push(key.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(pruned_keys.len())?;
+        }
+        let mut diagnostic_uris = Vec::new();
+        diagnostic_uris
+            .try_reserve(affected.len())
+            .map_err(|error| format!("could not reserve selection diagnostics: {error}"))?;
+        for uri in &affected {
+            check_workspace_cancel(cancel)?;
+            if self
+                .open_documents
+                .get(uri)
+                .is_some_and(|document| document.text.is_some())
+            {
+                diagnostic_uris.push(uri.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(diagnostic_uris.len()))?;
+            budget.check_cancelled()?;
+        }
+        check_workspace_cancel(cancel)?;
+        diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        check_workspace_cancel(cancel)?;
+
+        for key in retained_keys {
+            self.contexts.remove(&key);
+        }
+        for uri in stale_owners {
+            if let Some(owner) = self.document_owners.get_mut(&uri) {
+                owner.legacy_route = None;
+                owner.needs_revalidation = true;
+            }
+        }
+        for uri in &affected {
+            if let Some(expansion) = self.expansions.remove(uri) {
+                for dependency in expansion.dependencies {
+                    if let Some(parents) = self.include_parents.get_mut(&dependency) {
+                        parents.remove(uri);
+                        if parents.is_empty() {
+                            self.include_parents.remove(&dependency);
+                        }
+                    }
+                }
+            }
+            self.index.remove(uri);
+            self.indexed_files.remove(uri);
+            self.last_used.remove(uri);
+            self.document_contexts.remove(uri);
+            self.index.clear_import_bindings(uri);
+            self.disk_stamps.remove(uri);
+            if let Some(size) = self.indexed_sizes.remove(uri) {
+                self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
+            }
+        }
+        for key in pruned_keys {
+            self.contexts.remove(&key);
+        }
         for path in context_sources {
             if let Ok(uri) = Url::from_file_path(path) {
                 mark_dependency_change(
                     &mut self.source_change_generations,
                     &uri,
-                    self.source_generation,
+                    self.source_generation.wrapping_add(1),
                     false,
                 );
             }
@@ -9557,7 +9732,7 @@ impl Workspace {
                 mark_dependency_change(
                     &mut self.configuration_change_generations,
                     &uri,
-                    self.configuration_generation,
+                    self.configuration_generation.wrapping_add(1),
                     false,
                 );
             }
@@ -9566,13 +9741,13 @@ impl Workspace {
             mark_dependency_change(
                 &mut self.source_change_generations,
                 &uri,
-                self.source_generation,
+                self.source_generation.wrapping_add(1),
                 false,
             );
             mark_dependency_change(
                 &mut self.configuration_change_generations,
                 &uri,
-                self.configuration_generation,
+                self.configuration_generation.wrapping_add(1),
                 false,
             );
             self.schedule_diagnostics(uri);
@@ -15383,6 +15558,117 @@ BDS = '/fake/37'
         assert_eq!(stale.selected_installation_id, None);
         assert_eq!(stale.selection_mode, "invalid");
         assert!(!stale.warnings.is_empty());
+    }
+
+    #[test]
+    fn failed_selection_invalidation_preserves_the_workspace_snapshot() {
+        fn populated_workspace() -> (tempfile::TempDir, Workspace, HashSet<ContextKey>) {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            let source = root.join("Main.pas");
+            let project = root.join("App.dproj");
+            fs::write(&source, "unit Main; interface implementation end.").unwrap();
+            fs::write(
+                &project,
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+            )
+            .unwrap();
+            let mut workspace =
+                test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+            let uri = Url::from_file_path(&source).unwrap();
+            workspace
+                .open_document(uri.clone(), fs::read_to_string(&source).unwrap(), 1)
+                .unwrap();
+            workspace.project_context(&uri).unwrap();
+            let key = workspace.document_contexts.get(&uri).unwrap().clone();
+            let keys = HashSet::from([key]);
+            (directory, workspace, keys)
+        }
+
+        let (_success_dir, mut success_workspace, success_keys) = populated_workspace();
+        let success_budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        success_workspace
+            .invalidate_selection_contexts(&success_keys, None, Some(&success_budget))
+            .expect("unconstrained invalidation succeeds");
+        let invalidation_visits = success_budget.used.get().filesystem_path_visits;
+        assert!(invalidation_visits > 0);
+
+        let (_failure_dir, mut workspace, keys) = populated_workspace();
+        let source_generation = workspace.source_generation;
+        let configuration_generation = workspace.configuration_generation;
+        let contexts_before = workspace.contexts.clone();
+        let document_contexts_before = workspace.document_contexts.clone();
+        let open_contexts_before = workspace.open_document_contexts.clone();
+        let owners_before = workspace.document_owners.clone();
+        let indexed_files_before = workspace.indexed_files.clone();
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        // Trigger cancellation at the final charged invalidation step. The
+        // current implementation has already removed contexts/index state by
+        // this point, exposing the non-transactional mutation order.
+        budget.cancel_after_path_visits(invalidation_visits.saturating_sub(1));
+        let result = workspace.invalidate_selection_contexts(&keys, None, Some(&budget));
+        let error = result.expect_err("invalidation must observe the forced cancellation");
+        assert_eq!(error, super::CANCELLATION_MESSAGE);
+        assert_eq!(workspace.contexts.len(), contexts_before.len());
+        assert_eq!(workspace.document_contexts, document_contexts_before);
+        assert_eq!(workspace.open_document_contexts, open_contexts_before);
+        assert_eq!(workspace.document_owners.len(), owners_before.len());
+        assert_eq!(workspace.indexed_files, indexed_files_before);
+        assert_eq!(workspace.source_generation, source_generation);
+        assert_eq!(workspace.configuration_generation, configuration_generation);
+    }
+
+    #[test]
+    fn reset_installation_context_ignores_a_cached_pre_reset_selection() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let source = root.join("Main.pas");
+        fs::write(&source, "unit Main; interface implementation end.").unwrap();
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(
+            root.join(LOCAL_CONFIG_NAME),
+            r#"
+[installations."7.0".properties]
+BDS = '/fake/7'
+[installations."37.0".properties]
+BDS = '/fake/37'
+[projects."App.dproj"]
+installation = '7.0'
+"#,
+        )
+        .unwrap();
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let project_uri = Url::from_file_path(&project).unwrap();
+        let source_uri = Url::from_file_path(&source).unwrap();
+        workspace
+            .select_installation(&project_uri, Some("37.0"))
+            .unwrap();
+        workspace.project_context(&source_uri).unwrap();
+        assert_eq!(
+            workspace
+                .installation_context(&project_uri)
+                .unwrap()
+                .selected_installation_id,
+            Some("37.0".to_string())
+        );
+
+        // Simulate the post-reset session map before context invalidation; the
+        // response must be based on automatic/configured selection, not the
+        // stale context fallback.
+        let project_path = project.canonicalize().unwrap();
+        workspace.installation_selections.remove(&project_path);
+        let reset_context = workspace.installation_context(&project_uri).unwrap();
+        assert_eq!(
+            reset_context.selected_installation_id.as_deref(),
+            Some("7.0"),
+            "reset response must reflect configured post-reset selection, not cached session selection"
+        );
     }
 
     #[test]

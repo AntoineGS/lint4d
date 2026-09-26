@@ -1287,11 +1287,7 @@ pub fn is_option_directive(body: &str) -> bool {
     if switch_list_members(body).is_some() {
         return true;
     }
-    if body.contains(',')
-        && body
-            .split(',')
-            .any(|member| short_switch_name(member).is_some())
-    {
+    if switch_list_candidates(body).is_some() {
         return true;
     }
     let Some(keyword) = directive_keyword(body) else {
@@ -1350,9 +1346,9 @@ fn apply_option_directive(
         }
         return true;
     }
-    if body.contains(',') {
+    if let Some(members) = switch_list_candidates(body) {
         let mut found = false;
-        for member in body.split(',') {
+        for member in members {
             let Some(name) = short_switch_name(member) else {
                 continue;
             };
@@ -1443,12 +1439,24 @@ fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
     valid.then_some(members)
 }
 
+fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
+    if !body.contains(',') {
+        return None;
+    }
+    let members = body.split(',').map(str::trim);
+    members.clone().next().and_then(short_switch_name)?;
+    Some(members)
+}
+
 fn short_switch_name(member: &str) -> Option<&str> {
     let member = member.trim();
     let bytes = member.as_bytes();
-    (bytes.len() == 1 && bytes[0].is_ascii_alphabetic()
-        || bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-'))
-    .then(|| &member[..1])
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let suffix_len = usize::from(matches!(bytes.get(1), Some(b'+' | b'-')));
+    let token_end = 1 + suffix_len;
+    (token_end == bytes.len() || bytes[token_end].is_ascii_whitespace()).then(|| &member[..1])
 }
 
 fn observe_source_constants(

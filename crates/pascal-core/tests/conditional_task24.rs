@@ -246,6 +246,91 @@ fn system_pascal_switch_list_accepts_untracked_boolean_options() {
 }
 
 #[test]
+fn comma_recovery_does_not_treat_message_payload_as_switches() {
+    let context = ConditionalContext::default().with_option("R", Truth::True);
+    let source = concat!(
+        "{$MESSAGE WARN 'a,R+,b'}",
+        "{$IFOPT R+}{$DEFINE MESSAGE_LEFT_R_ON}{$ENDIF}",
+    );
+
+    assert_eq!(
+        directive_activity(source, "DEFINE MESSAGE_LEFT_R_ON", &context),
+        Truth::True
+    );
+}
+
+#[test]
+fn malformed_switch_members_invalidate_all_candidate_options() {
+    let context = ConditionalContext::default()
+        .with_option("R", Truth::True)
+        .with_option("Q", Truth::True);
+    let source = concat!(
+        "{$R+ junk,Q-}",
+        "{$IFOPT R+}{$DEFINE MALFORMED_R_ON}{$ENDIF}",
+        "{$IFOPT R-}{$DEFINE MALFORMED_R_OFF}{$ENDIF}",
+        "{$IFOPT Q+}{$DEFINE MALFORMED_Q_ON}{$ENDIF}",
+        "{$IFOPT Q-}{$DEFINE MALFORMED_Q_OFF}{$ENDIF}",
+    );
+
+    for name in [
+        "DEFINE MALFORMED_R_ON",
+        "DEFINE MALFORMED_R_OFF",
+        "DEFINE MALFORMED_Q_ON",
+        "DEFINE MALFORMED_Q_OFF",
+    ] {
+        assert_eq!(
+            directive_activity(source, name, &context),
+            Truth::Unknown,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn switch_lists_respect_inactive_and_unknown_branch_activity() {
+    let mut inactive_context = ConditionalContext::default()
+        .with_option("R", Truth::True)
+        .with_option("Q", Truth::True);
+    inactive_context.set_define("DISABLED", Truth::False);
+    let inactive = concat!(
+        "{$IFDEF DISABLED}{$R-,Q-}{$ENDIF}",
+        "{$IFOPT R+}{$DEFINE INACTIVE_PRESERVED_R}{$ENDIF}",
+        "{$IFOPT Q+}{$DEFINE INACTIVE_PRESERVED_Q}{$ENDIF}",
+    );
+    assert_eq!(
+        directive_activity(inactive, "DEFINE INACTIVE_PRESERVED_R", &inactive_context),
+        Truth::True
+    );
+    assert_eq!(
+        directive_activity(inactive, "DEFINE INACTIVE_PRESERVED_Q", &inactive_context),
+        Truth::True
+    );
+
+    let unknown = concat!(
+        "{$IF UNKNOWN}{$R-,Q-}{$ELSE}{$R+,Q+}{$ENDIF}",
+        "{$IFOPT R+}{$DEFINE UNKNOWN_R_ON}{$ENDIF}",
+        "{$IFOPT R-}{$DEFINE UNKNOWN_R_OFF}{$ENDIF}",
+        "{$IFOPT Q+}{$DEFINE UNKNOWN_Q_ON}{$ENDIF}",
+        "{$IFOPT Q-}{$DEFINE UNKNOWN_Q_OFF}{$ENDIF}",
+    );
+    let unknown_context = ConditionalContext::default()
+        .with_option("R", Truth::True)
+        .with_option("Q", Truth::True);
+    for name in [
+        "DEFINE UNKNOWN_R_ON",
+        "DEFINE UNKNOWN_R_OFF",
+        "DEFINE UNKNOWN_Q_ON",
+        "DEFINE UNKNOWN_Q_OFF",
+    ] {
+        assert_eq!(
+            directive_activity(unknown, name, &unknown_context),
+            Truth::Unknown,
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn typed_constants_support_checked_arithmetic_and_reject_unsafe_values() {
     let context =
         ConditionalContext::default().with_constant("Threshold", ConstantValue::Integer(3));

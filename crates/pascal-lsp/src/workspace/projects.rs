@@ -430,13 +430,11 @@ impl Workspace {
         let (installation_candidates, installation_selection_mode) =
             if let Some(project_file) = context.project_file.as_deref() {
                 self.installation_selection_snapshot(project_file, budget)
-                    .map(|(_, candidates, _)| {
-                        let mode = if self.installation_selections.contains_key(project_file) {
-                            "session"
-                        } else {
-                            "configured"
-                        };
-                        (candidates, mode.to_string())
+                    .map(|(_, candidates, selection)| {
+                        (
+                            candidates,
+                            installation_selection_mode(&selection).to_string(),
+                        )
                     })
                     .unwrap_or_else(|_| (Vec::new(), "automatic".to_string()))
             } else {
@@ -543,21 +541,24 @@ impl Workspace {
     ) -> Result<InstallationContextInfo, String> {
         let project_path = project_path(project_uri)?;
         self.validate_project_scope(&project_path)?;
-        let (project, candidates, selected) =
+        let (_, candidates, selection) =
             self.installation_selection_snapshot(&project_path, budget)?;
-        let selection_is_valid = selected.as_ref().is_none_or(|id| {
-            candidates
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(id))
-        });
+        let selected = match &selection {
+            InstallationSelection::Selected { id, .. } | InstallationSelection::Invalid { id } => {
+                Some(id.clone())
+            }
+            InstallationSelection::Legacy | InstallationSelection::NeedsChoice { .. } => None,
+        };
+        let selection_is_valid = !matches!(selection, InstallationSelection::Invalid { .. })
+            && selected.as_ref().is_none_or(|id| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(id))
+            });
         let selection_mode = if !selection_is_valid {
             "invalid"
-        } else if self.installation_selections.contains_key(&project_path) {
-            "session"
-        } else if project.configured_installation_for(&project_path).is_some() {
-            "configured"
         } else {
-            "automatic"
+            installation_selection_mode(&selection)
         };
         Ok(InstallationContextInfo {
             project_uri: canonical_file_uri(project_uri),
@@ -796,7 +797,7 @@ impl Workspace {
         (
             pascal_project::installation_config::ProjectConfiguration,
             Vec<String>,
-            Option<String>,
+            InstallationSelection,
         ),
         String,
     > {
@@ -811,28 +812,23 @@ impl Workspace {
         )?;
         let mut candidates = configuration.installation_ids();
         candidates.sort_by_key(|id| id.to_ascii_lowercase());
-        let selected = self
-            .installation_selections
-            .get(project_path)
-            .cloned()
-            .or_else(|| {
-                configuration
-                    .configured_installation_for(project_path)
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                self.contexts.iter().find_map(|(key, state)| {
-                    key.project_file
-                        .as_deref()
-                        .filter(|path| project_paths_equal(path, project_path))
-                        .and(state.context.installation_selection.as_ref())
-                        .and_then(|selection| match selection {
-                            InstallationSelection::Selected { id, .. } => Some(id.clone()),
-                            _ => None,
-                        })
-                })
-            });
-        Ok((configuration, candidates, selected))
+        // Resolve the selection on this project-operation worker using the
+        // same discovery path that prepares ProjectContext. A cached context
+        // cannot be the authority here: selection changes intentionally evict
+        // it, and metadata-inferred selections survive an automatic reset.
+        let options = self.project_options_with_installations(self.installation_selections.clone());
+        let discovery = discover_with_selections(
+            project_path,
+            &roots,
+            &options,
+            &self.project_selections,
+            &self.overrides,
+            &self.options.exclude,
+        )?;
+        let selection = discovery
+            .installation_selection
+            .unwrap_or(InstallationSelection::Legacy);
+        Ok((configuration, candidates, selection))
     }
 
     fn validate_project_scope(&self, project_path: &Path) -> Result<(), String> {
@@ -1163,6 +1159,67 @@ impl Workspace {
                 .watched_paths
                 .entry(path.clone())
                 .or_insert_with(|| path_stamp(&path));
+        }
+    }
+}
+
+fn installation_selection_mode(selection: &InstallationSelection) -> &'static str {
+    match selection {
+        InstallationSelection::Selected { origin, .. } => match origin {
+            pascal_project::InstallationOrigin::Session => "session",
+            pascal_project::InstallationOrigin::Configured => "configured",
+            pascal_project::InstallationOrigin::Metadata => "metadata",
+        },
+        InstallationSelection::NeedsChoice { .. } => "needsChoice",
+        InstallationSelection::Invalid { .. } => "invalid",
+        InstallationSelection::Legacy => "automatic",
+    }
+}
+
+#[cfg(test)]
+mod installation_selection_mode_tests {
+    use super::{InstallationSelection, installation_selection_mode};
+    use pascal_project::InstallationOrigin;
+
+    #[test]
+    fn selection_modes_preserve_origin_and_non_selected_states() {
+        for (selection, expected) in [
+            (
+                InstallationSelection::Selected {
+                    id: "37.0".to_string(),
+                    origin: InstallationOrigin::Session,
+                },
+                "session",
+            ),
+            (
+                InstallationSelection::Selected {
+                    id: "37.0".to_string(),
+                    origin: InstallationOrigin::Configured,
+                },
+                "configured",
+            ),
+            (
+                InstallationSelection::Selected {
+                    id: "37.0".to_string(),
+                    origin: InstallationOrigin::Metadata,
+                },
+                "metadata",
+            ),
+            (
+                InstallationSelection::NeedsChoice {
+                    candidates: vec!["7.0".to_string(), "37.0".to_string()],
+                },
+                "needsChoice",
+            ),
+            (
+                InstallationSelection::Invalid {
+                    id: "99.0".to_string(),
+                },
+                "invalid",
+            ),
+            (InstallationSelection::Legacy, "automatic"),
+        ] {
+            assert_eq!(installation_selection_mode(&selection), expected);
         }
     }
 }

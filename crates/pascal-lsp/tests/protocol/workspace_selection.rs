@@ -1661,6 +1661,61 @@ fn reset_installation_response_does_not_reuse_cached_prior_profile() {
 }
 
 #[test]
+fn reset_installation_reports_metadata_selection_consistently() {
+    let fixture = selection_fixture();
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    let config = fs::read_to_string(&config_path)
+        .expect("read fixture configuration")
+        .replace("[projects.\"a/App.dproj\"]\ninstallation='7.0'\n", "")
+        .replace("[projects.\"b/App.dproj\"]\ninstallation='37.0'\n", "");
+    write_file(&config_path, &config);
+    write_file(
+        &fixture.project_a,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Platform>Win32</Platform><CompilerVersion>37.0</CompilerVersion></PropertyGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+    let session = RequestId::from("metadata-reset-session-choice".to_owned());
+    server.send_request(
+        session.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "7.0"}),
+    );
+    assert!(server.response(&session).error.is_none());
+
+    let reset = RequestId::from("metadata-reset-to-automatic".to_owned());
+    server.send_request(
+        reset.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": null}),
+    );
+    let reset = server.response(&reset);
+    assert!(reset.error.is_none(), "{reset:?}");
+    assert_eq!(
+        reset.result.as_ref().unwrap()["selectedInstallationId"],
+        "37.0"
+    );
+
+    let installation = RequestId::from("metadata-installation-context".to_owned());
+    server.send_request(
+        installation.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_a)}),
+    );
+    let installation = server.response(&installation);
+    assert!(installation.error.is_none(), "{installation:?}");
+    let installation = installation.result.unwrap();
+    assert_eq!(installation["selectedInstallationId"], "37.0");
+    assert_eq!(installation["selectionMode"], "metadata");
+
+    let context = project_context(&mut server, &fixture.main_a, "metadata-reset");
+    assert_eq!(context["selectedInstallationId"], "37.0");
+    assert_eq!(context["installationSelectionMode"], "metadata");
+    server.shutdown();
+}
+
+#[test]
 fn installation_context_and_project_context_report_additive_fields() {
     let fixture = selection_fixture();
     let mut server = TestServer::launch();

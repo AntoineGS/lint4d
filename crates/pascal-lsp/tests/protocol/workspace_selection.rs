@@ -19,6 +19,33 @@ fn ambiguous_projects() -> (
     (directory, unit, project_a, project_b)
 }
 
+#[cfg(feature = "test-support")]
+fn two_scope_ambiguous_projects() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut values = Vec::new();
+    for (scope, first, second) in [("scope-a", "A1", "A2"), ("scope-b", "B1", "B2")] {
+        let root = directory.path().join(scope);
+        let unit = root.join("src/Unit.pas");
+        let first_project = root.join("src").join(format!("{first}.dproj"));
+        let second_project = root.join("src").join(format!("{second}.dproj"));
+        write_file(&unit, "unit Unit; interface implementation end.");
+        let project =
+            "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>";
+        write_file(&first_project, &project);
+        write_file(&second_project, &project);
+        values.push((unit, first_project));
+    }
+    let (unit_a, project_a) = values.remove(0);
+    let (unit_b, project_b) = values.remove(0);
+    (directory, unit_a, project_a, unit_b, project_b)
+}
+
 fn open_automatic_unit(server: &mut TestServer, unit: &std::path::Path) {
     server.send_notification(
         "textDocument/didOpen",
@@ -352,6 +379,102 @@ fn manual_project_choice_supersedes_automatic_worker_before_commit() {
     }
     assert_eq!(context["selectedProjectUri"], uri(&project_b).as_str());
     assert_ne!(context["selectedProjectUri"], uri(&project_a).as_str());
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn unrelated_scope_manual_selection_does_not_fence_automatic_answer() {
+    let (directory, unit_a, project_a, unit_b, project_b) = two_scope_ambiguous_projects();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_project_operation_prepared_barrier(environment);
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit_a);
+    open_automatic_unit(&mut server, &unit_b);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) < 2
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fs::read(&barrier.entered).unwrap().len() >= 2);
+    fs::write(&barrier.release, b"release discovery workers").unwrap();
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("scope prompt");
+
+    let actions = prompt.params["actions"].as_array().unwrap();
+    let automatic_is_a = actions.iter().any(|action| action["title"] == "A1.dproj");
+    let (automatic_unit, automatic_project, manual_unit, manual_project) = if automatic_is_a {
+        (&unit_a, &project_a, &unit_b, &project_b)
+    } else {
+        (&unit_b, &project_b, &unit_a, &project_a)
+    };
+    let _ = project_context(&mut server, manual_unit, "prepare-unrelated-manual-scope");
+    fs::remove_file(&barrier.release).unwrap();
+    let selected_action = actions
+        .iter()
+        .find(|action| {
+            action["title"]
+                == if automatic_is_a {
+                    "A1.dproj"
+                } else {
+                    "B1.dproj"
+                }
+        })
+        .unwrap()
+        .clone();
+    let entered_before_answers = fs::read(&barrier.entered).unwrap().len();
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        selected_action,
+    )));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) <= entered_before_answers
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fs::read(&barrier.entered).unwrap().len() > entered_before_answers);
+    let automatic_worker_entered = fs::read(&barrier.entered).unwrap().len();
+    let manual = RequestId::from("unrelated-scope-manual-selection".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(manual_unit)}, "projectUri": uri(manual_project)}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && fs::read(&barrier.entered).map_or(0, |bytes| bytes.len()) <= automatic_worker_entered
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fs::read(&barrier.entered).unwrap().len() > automatic_worker_entered);
+    fs::write(&barrier.release, b"release selection workers").unwrap();
+
+    let manual_response = server.response(&manual);
+    // The global workspace generation may reject the competing request as
+    // stale; this regression specifically verifies it cannot invalidate the
+    // automatic answer for the other independent scope.
+    let _ = manual_response;
+    let mut automatic_context = Value::Null;
+    for attempt in 0..10 {
+        automatic_context = project_context(
+            &mut server,
+            automatic_unit,
+            &format!("automatic-scope-{attempt}"),
+        );
+        if automatic_context["selectedProjectUri"] == uri(automatic_project).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        automatic_context["selectedProjectUri"],
+        uri(automatic_project).as_str(),
+        "an unrelated scope's manual choice must not invalidate this automatic answer"
+    );
     server.shutdown();
 }
 

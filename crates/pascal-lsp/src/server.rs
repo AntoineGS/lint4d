@@ -5116,7 +5116,6 @@ struct AnalysisJobs {
     automatic_apply_requests: HashMap<RequestId, Url>,
     automatic_answer_requests: HashMap<RequestId, AutomaticPromptAnswer>,
     next_automatic_discovery: u64,
-    selection_intent_generation: u64,
     progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
@@ -5127,7 +5126,7 @@ struct AnalysisJobs {
 struct AutomaticPromptAnswer {
     key: project_prompts::PromptKey,
     source_uri: Url,
-    selection_intent_generation: u64,
+    fenced_by_manual_selection: bool,
 }
 
 #[derive(Debug)]
@@ -5167,6 +5166,22 @@ impl CompiledContentPayloadBudget {
 }
 
 impl AnalysisJobs {
+    fn fence_automatic_answers_for_source(&mut self, source_uri: &Url) {
+        for answer in self.automatic_answer_requests.values_mut() {
+            if uri_is_within_scope(source_uri, &answer.key.scope_uri) {
+                answer.fenced_by_manual_selection = true;
+            }
+        }
+    }
+
+    fn fence_automatic_answers_for_project(&mut self, project_uri: &Url) {
+        for answer in self.automatic_answer_requests.values_mut() {
+            if answer.key.project_uri.as_ref() == Some(project_uri) {
+                answer.fenced_by_manual_selection = true;
+            }
+        }
+    }
+
     fn invalidate_project_prompts_for_scope(&mut self, scope: &Url) {
         let stale = self
             .prompt_sources
@@ -5262,7 +5277,6 @@ impl AnalysisJobs {
             automatic_apply_requests: HashMap::new(),
             automatic_answer_requests: HashMap::new(),
             next_automatic_discovery: 0,
-            selection_intent_generation: 0,
             progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
             next_computation_id: 0,
@@ -8166,12 +8180,7 @@ impl AnalysisJobs {
                     let automatic_answer =
                         primary_request_id.and_then(|id| self.automatic_answer_requests.remove(id));
                     let stale_automatic_answer = automatic_answer.as_ref().is_some_and(|answer| {
-                        !automatic_prompt_answer_is_current(
-                            workspace,
-                            &result,
-                            answer,
-                            self.selection_intent_generation,
-                        )
+                        !automatic_prompt_answer_is_current(workspace, &result, answer)
                     });
                     let key = job.key;
                     let _ = job.handle.join();
@@ -10865,14 +10874,12 @@ fn event_loop(
                             ));
                             jobs.next_automatic_discovery =
                                 jobs.next_automatic_discovery.wrapping_add(1);
-                            jobs.selection_intent_generation =
-                                jobs.selection_intent_generation.wrapping_add(1);
                             jobs.automatic_answer_requests.insert(
                                 id.clone(),
                                 AutomaticPromptAnswer {
                                     key: key.clone(),
                                     source_uri: source_uri.clone(),
-                                    selection_intent_generation: jobs.selection_intent_generation,
+                                    fenced_by_manual_selection: false,
                                 },
                             );
                             if method == "pascal/selectProject" {
@@ -11648,7 +11655,7 @@ fn handle_request(
                 }
             };
             if !jobs.automatic_answer_requests.contains_key(&request.id) {
-                jobs.selection_intent_generation = jobs.selection_intent_generation.wrapping_add(1);
+                jobs.fence_automatic_answers_for_project(&params.project_uri);
             }
             jobs.invalidate_project_prompts_for_project(&params.project_uri);
             let project_path = params.project_uri.to_file_path().ok();
@@ -11677,7 +11684,7 @@ fn handle_request(
                 }
             };
             if !jobs.automatic_answer_requests.contains_key(&request.id) {
-                jobs.selection_intent_generation = jobs.selection_intent_generation.wrapping_add(1);
+                jobs.fence_automatic_answers_for_source(&params.text_document.uri);
             }
             jobs.invalidate_project_prompts_for_source(&params.text_document.uri);
             let project = if params.project_uri.is_null() {
@@ -13815,10 +13822,9 @@ fn automatic_prompt_answer_is_current(
     workspace: &Workspace,
     result: &AnalysisResult,
     answer: &AutomaticPromptAnswer,
-    selection_intent_generation: u64,
 ) -> bool {
     if answer.key.generation != project_prompt_generation(workspace)
-        || answer.selection_intent_generation != selection_intent_generation
+        || answer.fenced_by_manual_selection
         || workspace.document_identity(&answer.source_uri).1.is_none()
     {
         return false;

@@ -260,6 +260,25 @@ fn comma_recovery_does_not_treat_message_payload_as_switches() {
 }
 
 #[test]
+fn comma_bearing_resource_argument_does_not_poison_other_option_facts() {
+    let context = ConditionalContext::default().with_option("Q", Truth::True);
+    let source = concat!(
+        "{$R foo,Q-}",
+        "{$IFOPT Q+}{$DEFINE RESOURCE_PRESERVED_Q_ON}{$ENDIF}",
+        "{$IFOPT Q-}{$DEFINE RESOURCE_PRESERVED_Q_OFF}{$ENDIF}",
+    );
+
+    assert_eq!(
+        directive_activity(source, "DEFINE RESOURCE_PRESERVED_Q_ON", &context),
+        Truth::True
+    );
+    assert_eq!(
+        directive_activity(source, "DEFINE RESOURCE_PRESERVED_Q_OFF", &context),
+        Truth::False
+    );
+}
+
+#[test]
 fn malformed_switch_members_invalidate_all_candidate_options() {
     let context = ConditionalContext::default()
         .with_option("R", Truth::True)

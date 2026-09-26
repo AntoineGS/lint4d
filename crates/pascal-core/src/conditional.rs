@@ -1444,8 +1444,16 @@ fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
         return None;
     }
     let members = body.split(',').map(str::trim);
-    members.clone().next().and_then(short_switch_name)?;
+    members
+        .clone()
+        .next()
+        .filter(|member| has_explicit_short_switch_suffix(member))?;
     Some(members)
+}
+
+fn has_explicit_short_switch_suffix(member: &str) -> bool {
+    let bytes = member.trim().as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-')
 }
 
 fn short_switch_name(member: &str) -> Option<&str> {

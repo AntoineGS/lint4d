@@ -255,7 +255,11 @@ fn neovim_installation_selection() {
     let root = directory.path();
     fs::write(root.join(".lint4d.toml"), "").unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("projects/App")).unwrap();
+    fs::create_dir_all(root.join("projects/Loose")).unwrap();
     fs::create_dir_all(root.join("other")).unwrap();
+    fs::create_dir_all(root.join("empty")).unwrap();
+    fs::create_dir_all(root.join("loose/src")).unwrap();
     fs::create_dir_all(root.join("ambiguous")).unwrap();
     fs::write(
         root.join("src/Alpha.dproj"),
@@ -290,6 +294,27 @@ fn neovim_installation_selection() {
     fs::write(
         root.join("other/Alpha.pas"),
         "unit Alpha;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("projects/App/App.dproj"),
+        "<Project><PropertyGroup><MainSource>../../src/App.dpr</MainSource></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(root.join("src/App.dpr"), "program App; begin end.\n").unwrap();
+    fs::write(
+        root.join("projects/Loose/Loose.dproj"),
+        "<Project><PropertyGroup><MainSource>../../loose/src/Loose.dpr</MainSource></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("loose/src/Loose.dpr"),
+        "program Loose; begin end.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("empty/Empty.dproj"),
+        "<Project><PropertyGroup><Config>Debug</Config></PropertyGroup></Project>",
     )
     .unwrap();
 

@@ -73,9 +73,22 @@ function M.attach(client, bufnr)
 
   local function same_project_context(current, expected)
     return current
+      and current.scopeUri == expected.scopeUri
       and current.selectedProjectUri == expected.selectedProjectUri
       and current.selectionMode == expected.selectionMode
       and vim.deep_equal(current.candidates or {}, expected.candidates or {})
+  end
+
+  local function is_current_project_candidate(context, project_uri)
+    if project_uri == vim.NIL then
+      return true
+    end
+    for _, candidate in ipairs(context.candidates or {}) do
+      if candidate == project_uri then
+        return true
+      end
+    end
+    return false
   end
 
   local function parent_directory(project_uri)
@@ -194,23 +207,33 @@ function M.attach(client, bufnr)
     end)
   end
 
-  local function select_project(project_uri)
+  local function select_project(project_uri, expected_context)
     if not still_attached() then
       return
     end
-    request('pascal/selectProject', {
-      textDocument = { uri = uri },
-      projectUri = project_uri,
-    }, function(err, selected)
-      if not still_attached() then
+    request_project_context(function(current_context)
+      if
+        not same_project_context(current_context, expected_context)
+        or not is_current_project_candidate(current_context, project_uri)
+      then
+        vim.notify('Project context changed while the picker was open; reopen it.', vim.log.levels.WARN)
         return
       end
-      if err then
-        vim.notify(err.message, vim.log.levels.ERROR)
-      elseif selected then
-        notify_warnings(selected.warnings)
-        vim.notify('Pascal project selection: ' .. selected.selectionMode)
-      end
+
+      request('pascal/selectProject', {
+        textDocument = { uri = uri },
+        projectUri = project_uri,
+      }, function(err, selected)
+        if not still_attached() then
+          return
+        end
+        if err then
+          vim.notify(err.message, vim.log.levels.ERROR)
+        elseif selected then
+          notify_warnings(selected.warnings)
+          vim.notify('Pascal project selection: ' .. selected.selectionMode)
+        end
+      end)
     end)
   end
 
@@ -290,22 +313,63 @@ function M.attach(client, bufnr)
               if previous_directory == parent_directory(target_uri) or not can_navigate() then
                 return
               end
-              local destination_uri = type(selected.mainSourceUri) == 'string' and selected.mainSourceUri or target_uri
-              if type(selected.mainSourceUri) ~= 'string' then
-                vim.notify('Selected project has no usable main source; opening the project file.', vim.log.levels.WARN)
+              local function open_destination(destination_uri)
+                if not can_navigate() then
+                  return
+                end
+                local destination = vim.uri_to_fname(destination_uri)
+                local ok, switch_error = pcall(vim.api.nvim_cmd, {
+                  cmd = 'edit',
+                  args = { destination },
+                  mods = { hide = true },
+                  magic = { file = false, bar = false },
+                }, {})
+                if not ok then
+                  vim.notify(
+                    'Could not open selected Delphi project source: ' .. tostring(switch_error),
+                    vim.log.levels.WARN
+                  )
+                end
               end
-              local destination = vim.uri_to_fname(destination_uri)
-              local ok, switch_error = pcall(vim.api.nvim_cmd, {
-                cmd = 'edit',
-                args = { destination },
-                mods = { hide = true },
-                magic = { file = false, bar = false },
-              }, {})
-              if not ok then
-                vim.notify(
-                  'Could not open selected Delphi project source: ' .. tostring(switch_error),
-                  vim.log.levels.WARN
-                )
+
+              local function open_project_anchor(reason)
+                vim.notify(reason, vim.log.levels.WARN)
+                open_destination(target_uri)
+              end
+
+              local destination_uri = selected.mainSourceUri
+              if type(destination_uri) ~= 'string' then
+                open_project_anchor('Selected project has no usable main source; opening the project file.')
+                return
+              end
+
+              local accepted = request(
+                'pascal/projectContext',
+                { textDocument = { uri = destination_uri } },
+                function(context_err, source_context)
+                  if not still_attached() or not can_navigate() then
+                    return
+                  end
+                  if context_err or not source_context then
+                    open_project_anchor(
+                      'Could not confirm main source ownership; opening the project file instead.'
+                        .. (context_err and ' ' .. context_err.message or '')
+                    )
+                    return
+                  end
+                  notify_warnings(source_context.warnings)
+                  if source_context.selectedProjectUri == target_uri then
+                    open_destination(destination_uri)
+                  else
+                    open_project_anchor(
+                      'Main source does not resolve to the browsed project in its document context; '
+                        .. 'opening the project file instead.'
+                    )
+                  end
+                end
+              )
+              if not accepted and can_navigate() then
+                open_project_anchor('Could not request main source ownership; opening the project file instead.')
               end
             end)
           end)
@@ -354,8 +418,8 @@ function M.attach(client, bufnr)
           browse_repository(context)
         elseif choice.kind == 'installation' then
           select_installation()
-        else
-          select_project(choice.projectUri)
+        elseif choice.kind == 'project' then
+          select_project(choice.projectUri, context)
         end
       end)
     end)

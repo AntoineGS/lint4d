@@ -593,6 +593,54 @@ fn installation_context_reconciles_cached_config_before_request_baseline() {
     server.shutdown();
 }
 
+#[test]
+fn installation_context_reconciles_repaired_cached_config_before_baseline() {
+    let fixture = selection_fixture();
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    write_file(&config_path, "[projects\n");
+
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+    let malformed_request = RequestId::from("observe-malformed-cached-config".to_owned());
+    server.send_request(
+        malformed_request.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_a)}),
+    );
+    let malformed_response = server.response(&malformed_request);
+    assert!(
+        malformed_response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("failed to parse")),
+        "malformed configuration should retain its existing parse diagnostic: {malformed_response:?}"
+    );
+    // Initialization captures the malformed file as an error. Repair it
+    // without a file notification before this request's fresh disk baseline.
+    write_file(
+        &config_path,
+        "[installations.\"37.0\".properties]\nBDS='/fake/37'\n[projects.\"a/App.dproj\"]\ninstallation='37.0'\n",
+    );
+
+    let request = RequestId::from("repaired-config-after-silent-edit".to_owned());
+    server.send_request(
+        request.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_a)}),
+    );
+    let response = server.response(&request);
+    let result = response.result.as_ref().cloned().unwrap_or(Value::Null);
+    assert!(
+        result["selectedInstallationId"] == "37.0"
+            || response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("retry the request")),
+        "operation consumed a cached parse error after the config was repaired: {response:?}"
+    );
+    server.shutdown();
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn explicit_project_configuration_is_revalidated_after_preparation() {

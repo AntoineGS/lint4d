@@ -929,6 +929,7 @@ impl AnalysisPriority {
         match request {
             AnalysisRequest::Hover { .. }
             | AnalysisRequest::ProjectContext { .. }
+            | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
             | AnalysisRequest::SelectProject { .. }
@@ -2075,6 +2076,10 @@ enum AnalysisRequest {
         uri: Url,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
     },
+    ListProjects {
+        uri: Url,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
     InstallationContext {
         project_uri: Url,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
@@ -2212,6 +2217,7 @@ enum AnalysisRequest {
 fn progress_title(request: &AnalysisRequest) -> &'static str {
     match request {
         AnalysisRequest::ProjectContext { .. }
+        | AnalysisRequest::ListProjects { .. }
         | AnalysisRequest::InstallationContext { .. }
         | AnalysisRequest::SelectInstallation { .. }
         | AnalysisRequest::SelectProject { .. } => "Resolving Delphi project context",
@@ -2305,6 +2311,7 @@ enum ProjectOperationResponse {
     SelectProject {
         prepared: crate::workspace::projects::ProjectSelectionPreparation,
     },
+    ListProjects(Value),
 }
 
 #[derive(Clone)]
@@ -4950,6 +4957,7 @@ impl ObservationKey {
             | AnalysisRequest::TypeHierarchySupertypes { .. }
             | AnalysisRequest::TypeHierarchySubtypes { .. }
             | AnalysisRequest::ProjectContext { .. }
+            | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
             | AnalysisRequest::SelectProject { .. } => return None,
@@ -5354,6 +5362,7 @@ impl AnalysisJobs {
         if matches!(
             &request,
             AnalysisRequest::ProjectContext { .. }
+                | AnalysisRequest::ListProjects { .. }
                 | AnalysisRequest::InstallationContext { .. }
                 | AnalysisRequest::SelectInstallation { .. }
                 | AnalysisRequest::SelectProject { .. }
@@ -5452,6 +5461,7 @@ impl AnalysisJobs {
         let panic_id = id;
         let panic_value = match &request {
             AnalysisRequest::ProjectContext { .. }
+            | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
             | AnalysisRequest::SelectProject { .. } => AnalysisResultValue::ProjectOperation(Err(
@@ -5608,6 +5618,7 @@ impl AnalysisJobs {
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
                         AnalysisRequest::ProjectContext { .. }
+                        | AnalysisRequest::ListProjects { .. }
                         | AnalysisRequest::InstallationContext { .. }
                         | AnalysisRequest::SelectInstallation { .. }
                         | AnalysisRequest::SelectProject { .. } => unreachable!(
@@ -6539,6 +6550,7 @@ impl AnalysisJobs {
         let worker_id = id;
         let (source_generation, configuration_generation) = match &request {
             AnalysisRequest::ProjectContext { snapshot, .. }
+            | AnalysisRequest::ListProjects { snapshot, .. }
             | AnalysisRequest::InstallationContext { snapshot, .. }
             | AnalysisRequest::SelectInstallation { snapshot, .. }
             | AnalysisRequest::SelectProject { snapshot, .. } => snapshot.generations(),
@@ -6552,6 +6564,7 @@ impl AnalysisJobs {
                 let capture = (|| {
                     let (path, snapshot) = match &mut request {
                         AnalysisRequest::ProjectContext { uri, snapshot }
+                        | AnalysisRequest::ListProjects { uri, snapshot }
                         | AnalysisRequest::SelectProject { uri, snapshot, .. } => (
                             uri.to_file_path()
                                 .map_err(|_| format!("document URI must be a file URI: {uri}"))?,
@@ -6613,6 +6626,15 @@ impl AnalysisJobs {
                                 ProjectOperationResponse::ProjectContext { value, prepared },
                                 snapshot,
                             ))
+                        }
+                        AnalysisRequest::ListProjects { uri, mut snapshot } => {
+                            let catalogue = snapshot
+                                .workspace_mut()
+                                .list_projects(&uri, &worker_cancellation)
+                                .and_then(|catalogue| {
+                                    serde_json::to_value(catalogue).map_err(|error| error.to_string())
+                                })?;
+                            Ok((ProjectOperationResponse::ListProjects(catalogue), snapshot))
                         }
                         AnalysisRequest::InstallationContext {
                             project_uri,
@@ -8994,6 +9016,13 @@ fn deliver_analysis_result_with_store(
         AnalysisResultValue::ProjectOperation(Ok(
             ProjectOperationResponse::InstallationContext(value),
         )) => send_ok(
+            connection,
+            client_id.clone().expect("project operation client result"),
+            value,
+        ),
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::ListProjects(
+            value,
+        ))) => send_ok(
             connection,
             client_id.clone().expect("project operation client result"),
             value,
@@ -11879,6 +11908,29 @@ fn handle_request(
                 None,
             )?;
         }
+        "pascal/listProjects" => {
+            let id = request.id.clone();
+            let params: ProjectContextRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let snapshot = workspace.project_operation_snapshot(None);
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::ListProjects {
+                    uri: params.text_document.uri,
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
+        }
         "pascal/installationContext" => {
             let id = request.id.clone();
             let params: InstallationContextRequestParams = match parse_params(&request) {
@@ -14047,6 +14099,7 @@ fn server_capabilities(
         },
         "experimental": {
             "projectSelection": true,
+            "projectCatalogue": true,
             "installationSelection": true,
             "compiledDcuVirtualDocuments": {
                 "uriScheme": "lint4d-dcu",

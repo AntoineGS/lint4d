@@ -1139,9 +1139,12 @@ fn document_path(uri: &Url) -> Result<PathBuf, String> {
         .to_file_path()
         .map_err(|_| format!("project context requires a file URI: {uri}"))?;
     let path = absolute_path(path);
-    if !is_analyzable_source_path(&path) {
+    let is_project_anchor = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"));
+    if !is_analyzable_source_path(&path) && !is_project_anchor {
         return Err(format!(
-            "unsupported Pascal document path: {}",
+            "unsupported project context anchor: {}",
             path.display()
         ));
     }

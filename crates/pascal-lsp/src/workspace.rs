@@ -50,6 +50,7 @@ use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTa
 
 pub(crate) mod codeactions;
 pub(crate) mod extract;
+pub mod project_catalogue;
 pub mod projects;
 pub(crate) mod queries;
 pub(crate) mod rename;
@@ -8213,7 +8214,10 @@ impl Workspace {
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("project context requires a file URI: {uri}"))?;
-        if !is_analyzable_source_path(&path) {
+        let is_project_protocol_anchor = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"));
+        if !is_analyzable_source_path(&path) && !is_project_protocol_anchor {
             return Err(format!(
                 "unsupported Pascal document path: {}",
                 path.display()

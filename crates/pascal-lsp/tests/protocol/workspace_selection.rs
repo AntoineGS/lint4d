@@ -1,5 +1,126 @@
 use super::*;
 
+#[test]
+fn list_projects_is_on_demand_and_advertised() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let first = root.join("apps/One/App.dproj");
+    let second = root.join("apps/Two/App.dproj");
+    write_file(&first, "not parsed");
+    write_file(&second, "not parsed");
+    let mut server = TestServer::launch();
+    let capabilities = server.initialize(root, Value::Null);
+    assert_eq!(
+        capabilities["capabilities"]["experimental"]["projectCatalogue"],
+        true
+    );
+    let id = RequestId::from("list-projects".to_owned());
+    let mut result = Value::Null;
+    #[cfg(target_os = "linux")]
+    let opened = observed_open(&first, || {
+        server.send_request(
+            id.clone(),
+            "pascal/listProjects",
+            json!({"textDocument": {"uri": uri(&root.join("README.md"))}}),
+        );
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "{response:?}");
+        result = response.result.unwrap();
+    });
+    #[cfg(not(target_os = "linux"))]
+    {
+        server.send_request(
+            id.clone(),
+            "pascal/listProjects",
+            json!({"textDocument": {"uri": uri(&root.join("README.md"))}}),
+        );
+        let response = server.response(&id);
+        assert!(response.error.is_none(), "{response:?}");
+        result = response.result.unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    assert!(!opened, "enumeration must not open .dproj contents");
+    assert_eq!(result["complete"], true);
+    assert_eq!(result["projects"][0]["label"], "apps/One/App.dproj");
+    assert_eq!(result["projects"][1]["label"], "apps/Two/App.dproj");
+    server.shutdown();
+}
+
+#[test]
+fn project_file_is_a_protocol_only_project_anchor() {
+    let (directory, unit, project_a, project_b) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    let id = RequestId::from("select-project-file-anchor".to_owned());
+    server.send_request(
+        id.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&project_a)}, "projectUri": uri(&project_a)}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()["selectedProjectUri"],
+        uri(&project_a).as_str()
+    );
+    assert_eq!(
+        project_context(&mut server, &unit, "dproj-anchor")["selectedProjectUri"],
+        uri(&project_a).as_str()
+    );
+    server.shutdown();
+    let _ = project_b;
+}
+
+#[test]
+fn deleted_catalogue_choice_does_not_replace_live_selection() {
+    let (directory, unit, project_a, project_b) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    let select = RequestId::from("select-live-a".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&unit)}, "projectUri": uri(&project_a)}),
+    );
+    assert!(server.response(&select).error.is_none());
+    fs::remove_file(&project_b).unwrap();
+    let stale = RequestId::from("select-deleted-candidate".to_owned());
+    server.send_request(
+        stale.clone(),
+        "pascal/selectProject",
+        json!({"textDocument": {"uri": uri(&unit)}, "projectUri": uri(&project_b)}),
+    );
+    assert!(server.response(&stale).error.is_some());
+    let context = project_context(&mut server, &unit, "stale-project");
+    assert_eq!(context["selectedProjectUri"], uri(&project_a).as_str());
+    server.shutdown();
+}
+
+#[test]
+fn project_context_without_main_source_remains_inspectable() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("App.dproj");
+    write_file(
+        &project,
+        "<Project><PropertyGroup><ProjectVersion>37.0</ProjectVersion></PropertyGroup></Project>",
+    );
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    let id = RequestId::from("context-without-main-source".to_owned());
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&project)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.unwrap();
+    assert_eq!(result["selectedProjectUri"], uri(&project).as_str());
+    assert!(result["mainSourceUri"].is_null());
+    assert!(result["warnings"].as_array().is_some());
+    server.shutdown();
+}
+
 fn ambiguous_projects() -> (
     tempfile::TempDir,
     std::path::PathBuf,

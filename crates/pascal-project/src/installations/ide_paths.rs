@@ -96,6 +96,7 @@ mod tests {
     fn legacy_keys_and_explicit_envoptions_locator_are_scoped_to_win32() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("local sdk");
+        fs::create_dir_all(&sdk).unwrap();
         let options = temp.path().join("external IDE options.proj");
         write(
             &options,
@@ -600,6 +601,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
         let ide = temp.path().join("ide");
+        fs::create_dir_all(&sdk).unwrap();
         write(
             &ide.join("EnvOptions.proj"),
             r#"<Project><Import Project="win32.targets" Condition="'$(Platform)'=='Win32'"/><PropertyGroup Condition="'$(Platform)'=='Linux64'"><DelphiLibraryPath>$(BDS)\lib</DelphiLibraryPath></PropertyGroup></Project>"#,
@@ -633,6 +635,161 @@ mod tests {
         .unwrap();
         assert_eq!(paths.library[0].path, sdk.join("lib"));
     }
+
+    #[test]
+    fn copied_envoptions_source_path_resolves_case_insensitively_on_linux() {
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let ide = temp.path().join("ide");
+        let physical = sdk.join("source/Win32/rtl/sys");
+        fs::create_dir_all(&physical).unwrap();
+        write(
+            &ide.join("EnvOptions.proj"),
+            r#"<Project><PropertyGroup Condition="'$(Platform)'=='Win32'"><DelphiLibraryPath>$(BDS)\SOURCE\Win32\rtl\sys</DelphiLibraryPath></PropertyGroup></Project>"#,
+        );
+        let profile = ResolvedInstallation {
+            id: "37.0".to_owned(),
+            overrides: EffectiveOverrides {
+                properties: [
+                    ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
+                    ("appdata".to_owned(), ide.to_string_lossy().into_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                ..EffectiveOverrides::default()
+            },
+        };
+        let roots = [sdk, ide];
+        let policy =
+            ReadPolicy::new_with_installation_roots(&[], &[], &[], &profile.overrides, &roots);
+        let mut tracker = ProjectReadTracker::default();
+        let environment =
+            load_installation(&profile, "Debug", "Win32", &mut tracker, &policy).unwrap();
+        let paths = evaluate_ide_paths(
+            &environment,
+            &profile,
+            "Debug",
+            "Win32",
+            &mut tracker,
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(paths.library.len(), 1);
+        assert_eq!(paths.library[0].path, physical);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_rejects_symlink_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("source")).unwrap();
+        let mut warnings = Vec::new();
+
+        let result = super::reconcile_ide_path(
+            &root.join("SOURCE/unit"),
+            std::slice::from_ref(&root),
+            &mut ProjectReadTracker::default(),
+            &mut warnings,
+            "delphilibrarypath",
+            "$(BDS)\\SOURCE\\unit",
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("physical directory"))
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_ambiguous_case_insensitive_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        fs::create_dir_all(root.join("source/unit")).unwrap();
+        fs::create_dir_all(root.join("SOURCE/unit")).unwrap();
+        let mut warnings = Vec::new();
+
+        let result = super::reconcile_ide_path(
+            &root.join("SoUrCe/unit"),
+            std::slice::from_ref(&root),
+            &mut ProjectReadTracker::default(),
+            &mut warnings,
+            "delphilibrarypath",
+            "$(BDS)\\SoUrCe\\unit",
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous case-insensitive"))
+        );
+    }
+
+    #[test]
+    fn reconciliation_enforces_a_fixed_directory_scan_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..300 {
+            fs::create_dir(root.join(format!("entry-{index}"))).unwrap();
+        }
+        let error = super::reconcile_ide_path(
+            &root.join("missing"),
+            std::slice::from_ref(&root),
+            &mut ProjectReadTracker::default(),
+            &mut Vec::new(),
+            "delphilibrarypath",
+            "$(BDS)\\missing",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("fixed work limit"));
+    }
+
+    #[test]
+    fn reconciliation_propagates_cancellation() {
+        struct Cancelled;
+        impl ProjectWorkBudget for Cancelled {
+            fn check_cancelled(&self) -> Result<(), String> {
+                Err("request cancelled".to_owned())
+            }
+            fn charge_path_visits(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn ensure_file_read_fits(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn charge_file_bytes(&self, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        fs::create_dir_all(&root).unwrap();
+        let budget = Cancelled;
+        let mut tracker = ProjectReadTracker::with_budget(Some(&budget), &[]);
+        let error = super::reconcile_ide_path(
+            &root.join("source/unit"),
+            std::slice::from_ref(&root),
+            &mut tracker,
+            &mut Vec::new(),
+            "delphilibrarypath",
+            "$(BDS)\\source\\unit",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "request cancelled");
+    }
 }
 use super::{
     InstallationEnvironment, PropertyMap, relocate_environment, resolve_path_with_inferred,
@@ -648,6 +805,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_INSTALLATION_XML_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RS_VARS_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_IDE_PATH_RECONCILIATION_VISITS: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IdePaths {
@@ -875,24 +1033,27 @@ pub(crate) fn evaluate_ide_paths(
         profile,
         environment,
         policy,
+        tracker,
         &mut warnings,
-    );
+    )?;
     let browsing = property_paths(
         &builder,
         browsing_key,
         profile,
         environment,
         policy,
+        tracker,
         &mut warnings,
-    );
+    )?;
     let debug_dcu = property_paths(
         &builder,
         debug_key,
         profile,
         environment,
         policy,
+        tracker,
         &mut warnings,
-    );
+    )?;
     let namespaces = builder
         .property_list_with_provenance("delphinamespacesearchpath")
         .into_iter()
@@ -1057,8 +1218,9 @@ fn property_paths(
     profile: &ResolvedInstallation,
     environment: &InstallationEnvironment,
     policy: &ReadPolicy,
+    tracker: &mut ProjectReadTracker<'_>,
     warnings: &mut Vec<String>,
-) -> Vec<ProjectPathEntry> {
+) -> Result<Vec<ProjectPathEntry>, String> {
     let mut entries = Vec::new();
     for (raw, _provenance) in builder.property_list_with_provenance(key) {
         let raw = raw.trim();
@@ -1089,7 +1251,31 @@ fn property_paths(
                     ));
                     continue;
                 }
-                let entry = ProjectPathEntry::resolved(resolved.path.clone(), &resolved, true);
+                let provisional =
+                    ProjectPathEntry::resolved(resolved.path.clone(), &resolved, true);
+                if !policy.allows_location(&provisional) {
+                    warnings.push(format!(
+                        "ignored IDE {key} entry not authorized by the read policy: {raw}"
+                    ));
+                    continue;
+                }
+                let physical_path = match reconcile_ide_path(
+                    &resolved.path,
+                    &environment.read_roots,
+                    tracker,
+                    warnings,
+                    key,
+                    raw,
+                ) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue,
+                    Err(error) if error.contains("fixed work limit") => {
+                        warnings.push(format!("IDE {key} entry `{raw}` is uncertain: {error}"));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let entry = ProjectPathEntry::resolved(physical_path, &resolved, true);
                 if !policy.allows_location(&entry) {
                     warnings.push(format!(
                         "ignored IDE {key} entry not authorized by the read policy: {raw}"
@@ -1105,7 +1291,173 @@ fn property_paths(
             Err(error) => warnings.push(format!("could not resolve {key} entry `{raw}`: {error}")),
         }
     }
-    entries
+    Ok(entries)
+}
+
+fn reconcile_ide_path(
+    candidate: &Path,
+    roots: &[PathBuf],
+    tracker: &mut ProjectReadTracker<'_>,
+    warnings: &mut Vec<String>,
+    key: &str,
+    raw: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(root) = roots
+        .iter()
+        .filter(|root| crate::project_path_starts_with(candidate, root))
+        .max_by_key(|root| root.components().count())
+    else {
+        warnings.push(format!(
+            "ignored IDE {key} entry outside selected installation read roots: {raw}"
+        ));
+        return Ok(None);
+    };
+
+    let mut visits = 0usize;
+    let mut current = PathBuf::new();
+    for component in root.components() {
+        current.push(component.as_os_str());
+        let metadata = match checked_symlink_metadata(&current, tracker, &mut visits)? {
+            Some(metadata) => metadata,
+            None => {
+                warnings.push(format!(
+                    "IDE {key} entry `{raw}` is uncertain: selected installation root is absent ({})",
+                    root.display()
+                ));
+                return Ok(None);
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            warnings.push(format!(
+                "IDE {key} entry `{raw}` is uncertain: selected installation root is not a physical directory ({})",
+                current.display()
+            ));
+            return Ok(None);
+        }
+    }
+
+    let Ok(relative) = candidate.strip_prefix(root) else {
+        warnings.push(format!(
+            "ignored IDE {key} entry outside selected installation read roots: {raw}"
+        ));
+        return Ok(None);
+    };
+    let mut components = relative.components().peekable();
+    while let Some(wanted) = components.next() {
+        use std::path::Component;
+        let Component::Normal(wanted) = wanted else {
+            warnings.push(format!(
+                "IDE {key} entry `{raw}` is uncertain: invalid path component"
+            ));
+            return Ok(None);
+        };
+        let exact = current.join(wanted);
+        let selected = match checked_symlink_metadata(&exact, tracker, &mut visits)? {
+            Some(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    warnings.push(format!(
+                        "IDE {key} entry `{raw}` is uncertain: path component is not a physical directory ({})",
+                        exact.display()
+                    ));
+                    return Ok(None);
+                }
+                exact
+            }
+            None => {
+                let directory = match fs::read_dir(&current) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "IDE {key} entry `{raw}` is uncertain: could not inspect {}: {error}",
+                            current.display()
+                        ));
+                        return Ok(None);
+                    }
+                };
+                let wanted_text = wanted.to_string_lossy();
+                let mut matches = Vec::new();
+                for entry in directory {
+                    check_reconciliation_budget(tracker, &mut visits)?;
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "IDE {key} entry `{raw}` is uncertain: directory scan failed under {}: {error}",
+                                current.display()
+                            ));
+                            return Ok(None);
+                        }
+                    };
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&wanted_text)
+                    {
+                        matches.push(entry.path());
+                    }
+                }
+                if matches.len() > 1 {
+                    warnings.push(format!(
+                        "IDE {key} entry `{raw}` is uncertain: ambiguous case-insensitive component {wanted_text:?} under {}",
+                        current.display()
+                    ));
+                    return Ok(None);
+                }
+                let Some(path) = matches.pop() else {
+                    // IDE library roots are often generated later (for example,
+                    // add-on output folders). Keep the safely rooted lexical
+                    // path when no physical component exists to disambiguate.
+                    current.push(wanted);
+                    for remaining in components {
+                        current.push(remaining.as_os_str());
+                    }
+                    return Ok(Some(current));
+                };
+                let metadata = match checked_symlink_metadata(&path, tracker, &mut visits)? {
+                    Some(metadata) => metadata,
+                    None => return Ok(None),
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    warnings.push(format!(
+                        "IDE {key} entry `{raw}` is uncertain: path component is not a physical directory ({})",
+                        path.display()
+                    ));
+                    return Ok(None);
+                }
+                path
+            }
+        };
+        current = selected;
+    }
+    Ok(Some(current))
+}
+
+fn checked_symlink_metadata(
+    path: &Path,
+    tracker: &mut ProjectReadTracker<'_>,
+    visits: &mut usize,
+) -> Result<Option<fs::Metadata>, String> {
+    check_reconciliation_budget(tracker, visits)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Ok(None),
+    }
+}
+
+fn check_reconciliation_budget(
+    tracker: &mut ProjectReadTracker<'_>,
+    visits: &mut usize,
+) -> Result<(), String> {
+    *visits += 1;
+    if *visits > MAX_IDE_PATH_RECONCILIATION_VISITS {
+        return Err("IDE path reconciliation exceeded its fixed work limit".to_owned());
+    }
+    if let Some(budget) = tracker.work_budget {
+        budget.check_cancelled()?;
+        budget.charge_path_visits(1)?;
+    }
+    Ok(())
 }
 
 fn is_windows_absolute(raw: &str) -> bool {

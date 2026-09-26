@@ -3738,7 +3738,16 @@ fn build_project_context(
             .map_err(|error| format!("could not read project bootstrap metadata: {error}"))?;
         tracker.record_metadata_path(project_file.clone());
         tracker.record_metadata_observation(observation);
-        let bootstrap = parse_project_bootstrap(&bootstrap);
+        let bootstrap = parse_project_bootstrap(
+            &bootstrap,
+            &project_file,
+            &evaluation_options,
+            &overrides,
+            &read_policy,
+        );
+        for path in &bootstrap.metadata_files {
+            tracker.record_metadata_path(path.clone());
+        }
         installation_evidence = bootstrap.evidence;
         if evaluation_options.build_config.is_none() {
             evaluation_options.build_config = bootstrap.config;
@@ -3755,6 +3764,20 @@ fn build_project_context(
                 installation_evidence.compiler_version;
         }
     }
+    let mut selection_evidence = installation_evidence.clone();
+    if let Some(compiler_version) = evaluation_options.conditional_context.compiler_version {
+        selection_evidence.compiler_version = Some(compiler_version);
+    }
+    let installation_selection = Some(select_installation(
+        &installation_config,
+        &project_file,
+        &selection_evidence,
+        evaluation_options
+            .installation_selections
+            .iter()
+            .find(|(path, _)| project_paths_equal(path, &project_file))
+            .map(|(_, id)| id.as_str()),
+    ));
     let mut builder = ProjectBuilder::new(
         &evaluation_options,
         &overrides,
@@ -4028,16 +4051,7 @@ fn build_project_context(
         path_issues: builder.path_issues.clone(),
         project_file: Some(project_file.clone()),
         installation_evidence: installation_evidence.clone(),
-        installation_selection: Some(select_installation(
-            &installation_config,
-            &project_file,
-            &installation_evidence,
-            options
-                .installation_selections
-                .iter()
-                .find(|(path, _)| project_paths_equal(path, &project_file))
-                .map(|(_, id)| id.as_str()),
-        )),
+        installation_selection,
         main_source,
         search_paths,
         search_path_entries,
@@ -4314,61 +4328,114 @@ struct ProjectBootstrap {
     evidence: InstallationEvidence,
     config: Option<String>,
     platform: Option<String>,
+    metadata_files: Vec<PathBuf>,
 }
 
 /// Extract only properties physically declared in the root project's direct
-/// PropertyGroups. Imports, target-time properties, package names, and
-/// reference paths are intentionally outside this bootstrap evidence set.
-fn parse_project_bootstrap(xml: &str) -> ProjectBootstrap {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut depth = 0usize;
-    let mut group_depth = None;
-    let mut property: Option<String> = None;
-    let mut property_depth = None;
-    let mut value = String::new();
+/// PropertyGroups. Group/property conditions are evaluated against only known
+/// caller and local configuration facts; unknown-conditional identity values
+/// remain ambiguous. Imports and target-time properties are never inspected.
+fn parse_project_bootstrap(
+    xml: &str,
+    source_file: &Path,
+    options: &ProjectOptions,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+) -> ProjectBootstrap {
+    let operations = match parse_xml_operations(xml, source_file) {
+        Ok(operations) => operations,
+        Err(_) => {
+            return ProjectBootstrap {
+                evidence: InstallationEvidence {
+                    conflicting: true,
+                    ..InstallationEvidence::default()
+                },
+                ..ProjectBootstrap::default()
+            };
+        }
+    };
+    let mut properties = HashMap::new();
+    let unknown_properties = HashSet::new();
+    for (key, option_value) in [
+        ("config", options.build_config.as_ref()),
+        ("platform", options.platform.as_ref()),
+    ] {
+        if let Some(value) = option_value {
+            properties.insert(key.to_owned(), value.clone());
+        } else if let Some(value) = overrides.properties.get(key) {
+            properties.insert(key.to_owned(), value.clone());
+        }
+    }
     let mut values = BTreeMap::<String, Vec<String>>::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                depth += 1;
-                let name =
-                    String::from_utf8_lossy(element.local_name().as_ref()).to_ascii_lowercase();
-                if name == "propertygroup" && depth == 2 {
-                    group_depth = Some(depth);
-                } else if group_depth == Some(depth - 1) {
-                    property = Some(name);
-                    property_depth = Some(depth);
-                    value.clear();
-                }
+    let mut uncertain_identity = false;
+    let mut warnings = Vec::new();
+    let mut metadata_files = Vec::new();
+    let base = source_file.parent().unwrap_or_else(|| Path::new("."));
+    let config_is_fixed =
+        options.build_config.is_some() || overrides.properties.contains_key("config");
+    let platform_is_fixed =
+        options.platform.is_some() || overrides.properties.contains_key("platform");
+    for operation in operations {
+        let XmlOperation::PropertyGroup(group) = operation else {
+            continue;
+        };
+        let group_truth = condition_matches(
+            group.condition.as_deref(),
+            ConditionEnvironment {
+                properties: &properties,
+                unknown_properties: &unknown_properties,
+                unknown_import_taint: false,
+                overrides,
+                read_policy,
+            },
+            base,
+            &mut metadata_files,
+            &mut warnings,
+            source_file,
+        );
+        for entry in group.properties {
+            let identity_property = matches!(
+                entry.name.to_ascii_lowercase().as_str(),
+                "projectversion" | "compilerversion" | "dcc_compilerversion" | "bds"
+            );
+            if group_truth == TruthValue::False {
+                continue;
             }
-            Ok(Event::Text(text)) if property.is_some() => {
-                if let Ok(decoded) = text.unescape() {
-                    value.push_str(&decoded);
-                }
-            }
-            Ok(Event::CData(text)) if property.is_some() => {
-                value.push_str(&String::from_utf8_lossy(text.as_ref()));
-            }
-            Ok(Event::End(element)) => {
-                let name =
-                    String::from_utf8_lossy(element.local_name().as_ref()).to_ascii_lowercase();
-                if property_depth == Some(depth) {
-                    if let Some(property) = property.take() {
-                        let value = value.trim();
-                        if !value.is_empty() {
-                            values.entry(property).or_default().push(value.to_owned());
+            let entry_truth = condition_matches(
+                entry.condition.as_deref(),
+                ConditionEnvironment {
+                    properties: &properties,
+                    unknown_properties: &unknown_properties,
+                    unknown_import_taint: false,
+                    overrides,
+                    read_policy,
+                },
+                base,
+                &mut metadata_files,
+                &mut warnings,
+                source_file,
+            );
+            let truth = group_truth.and(entry_truth);
+            match truth {
+                TruthValue::True => {
+                    let key = entry.name.to_ascii_lowercase();
+                    let value = entry.value.trim();
+                    if !value.is_empty() {
+                        values
+                            .entry(key.clone())
+                            .or_default()
+                            .push(value.to_owned());
+                        if (key == "config" && !config_is_fixed)
+                            || (key == "platform" && !platform_is_fixed)
+                        {
+                            properties.insert(key, value.to_owned());
                         }
                     }
-                    property_depth = None;
                 }
-                if name == "propertygroup" && group_depth == Some(depth) {
-                    group_depth = None;
-                }
-                depth = depth.saturating_sub(1);
+                TruthValue::False => {}
+                TruthValue::Unknown if identity_property => uncertain_identity = true,
+                TruthValue::Unknown => {}
             }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
         }
     }
     let unique_value = |name: &str| -> Option<String> {
@@ -4395,23 +4462,25 @@ fn parse_project_bootstrap(xml: &str) -> ProjectBootstrap {
     };
     let project_version = unique_value("projectversion");
     let bds_root = unique_value("bds");
-    let conflicting = [
-        "projectversion",
-        "compilerversion",
-        "dcc_compilerversion",
-        "bds",
-    ]
-    .into_iter()
-    .any(|key| {
-        values.get(key).is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| !item.eq_ignore_ascii_case(&items[0]))
+    let conflicting = uncertain_identity
+        || [
+            "projectversion",
+            "compilerversion",
+            "dcc_compilerversion",
+            "bds",
+        ]
+        .into_iter()
+        .any(|key| {
+            values.get(key).is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| !item.eq_ignore_ascii_case(&items[0]))
+            })
         })
-    }) || compiler_raw.len() > 1
-        && compiler_raw
-            .iter()
-            .any(|value| CompilerVersion::parse(value) != compiler_version);
+        || compiler_raw.len() > 1
+            && compiler_raw
+                .iter()
+                .any(|value| CompilerVersion::parse(value) != compiler_version);
     ProjectBootstrap {
         evidence: InstallationEvidence {
             compiler_version,
@@ -4421,6 +4490,7 @@ fn parse_project_bootstrap(xml: &str) -> ProjectBootstrap {
         },
         config: unique_value("config"),
         platform: unique_value("platform"),
+        metadata_files,
     }
 }
 

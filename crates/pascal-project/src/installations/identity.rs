@@ -56,14 +56,14 @@ pub fn select_installation(
     session: Option<&str>,
 ) -> InstallationSelection {
     let ids = config.installation_ids();
-    if ids.is_empty() {
-        return InstallationSelection::Legacy;
-    }
     if let Some(id) = session {
         return choose_explicit(config, id, InstallationOrigin::Session);
     }
     if let Some(id) = config.configured_installation_for(project) {
         return choose_explicit(config, id, InstallationOrigin::Configured);
+    }
+    if ids.is_empty() {
+        return InstallationSelection::Legacy;
     }
 
     if evidence.conflicting {
@@ -77,9 +77,7 @@ pub fn select_installation(
             .filter(|id| compiler_version_for_installation(id).as_ref() == Some(&version))
             .cloned()
             .collect::<Vec<_>>();
-        if !matches.is_empty() {
-            constraints.push(matches);
-        }
+        constraints.push(matches);
     }
     if let Some(root) = evidence.bds_root.as_deref() {
         let matches = ids
@@ -95,9 +93,7 @@ pub fn select_installation(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if !matches.is_empty() {
-            constraints.push(matches);
-        }
+        constraints.push(matches);
     }
 
     if constraints.is_empty() {
@@ -302,6 +298,45 @@ mod tests {
             ),
             InstallationSelection::NeedsChoice {
                 candidates: vec!["37.0".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn asserted_bds_root_without_a_profile_prevents_compiler_only_selection() {
+        let (_directory, config) = config_with_profiles(
+            "[installations.\"10.0\".properties]\nBDS = '/sdk/10'\n\
+             [installations.\"23.0\".properties]\nBDS = '/sdk/23'\n",
+        );
+        assert_eq!(
+            select_installation(
+                &config,
+                Path::new("/tmp/App.dproj"),
+                &InstallationEvidence {
+                    compiler_version: Some(CompilerVersion::new(24, 0)),
+                    bds_root: Some("/sdk/removed".into()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            InstallationSelection::NeedsChoice {
+                candidates: vec!["10.0".into(), "23.0".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn removed_explicit_choice_is_invalid_even_without_profiles() {
+        let (_directory, config) = config_with_profiles("");
+        assert_eq!(
+            select_installation(
+                &config,
+                Path::new("/tmp/App.dproj"),
+                &InstallationEvidence::default(),
+                Some("removed"),
+            ),
+            InstallationSelection::Invalid {
+                id: "removed".into()
             }
         );
     }

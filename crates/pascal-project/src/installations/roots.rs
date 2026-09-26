@@ -1,9 +1,15 @@
 use super::{PropertyMap, RelocatedEnvironment};
 use crate::delphi_overrides::{EffectiveOverrides, PathMapping, ResolvedPath};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const INDEPENDENT_ROOTS: &[&str] = &["bds", "bdslib", "bdsinclude", "bdsbin"];
+const INDEPENDENT_ROOTS: &[&str] = &[
+    "bds",
+    "bdslib",
+    "bdsinclude",
+    "bdsbin",
+    "bdscommondir",
+    "bdsuserdir",
+];
 
 pub(crate) fn relocate_environment(
     imported: &PropertyMap,
@@ -11,7 +17,7 @@ pub(crate) fn relocate_environment(
 ) -> Result<RelocatedEnvironment, String> {
     // APPDATA in this configuration points at the per-version IDE directory,
     // not the roaming Windows APPDATA root, so it is never an inferred root.
-    let mut inferred_by_source = BTreeMap::<String, PathMapping>::new();
+    let mut inferred_mappings = Vec::<PathMapping>::new();
     for name in INDEPENDENT_ROOTS {
         let (Some(local), Some(original)) = (configured.properties.get(*name), imported.get(*name))
         else {
@@ -29,8 +35,10 @@ pub(crate) fn relocate_environment(
                 .cloned()
                 .unwrap_or_default(),
         };
-        let canonical = canonical_root(&mapping.from);
-        if let Some(previous) = inferred_by_source.get(&canonical) {
+        if let Some(previous) = inferred_mappings
+            .iter()
+            .find(|previous| same_root_with_resolver(&previous.from, &mapping.from))
+        {
             if previous.to != mapping.to {
                 return Err(format!(
                     "conflicting inferred translations for original root `{}`",
@@ -38,11 +46,9 @@ pub(crate) fn relocate_environment(
                 ));
             }
         } else {
-            inferred_by_source.insert(canonical, mapping);
+            inferred_mappings.push(mapping);
         }
     }
-    let mut inferred_mappings = inferred_by_source.into_values().collect::<Vec<_>>();
-    inferred_mappings.sort_by_key(|mapping| std::cmp::Reverse(component_count(&mapping.from)));
 
     let mut properties = imported.clone();
     for (name, value) in imported {
@@ -50,7 +56,9 @@ pub(crate) fn relocate_environment(
             continue;
         }
         if is_windows_absolute(value) {
-            if let Ok(resolved) = resolve_from_tier(&inferred_mappings, value) {
+            if let Ok(resolved) =
+                resolve_path_with_inferred(configured, &inferred_mappings, value, Path::new("/"))
+            {
                 if !resolved.path.as_os_str().is_empty() {
                     properties.insert(name.clone(), resolved.path.to_string_lossy().into_owned());
                 }
@@ -122,22 +130,43 @@ fn is_root_property(name: &str) -> bool {
 
 fn is_windows_absolute(raw: &str) -> bool {
     let bytes = raw.as_bytes();
-    bytes.len() >= 3
+    let drive_absolute = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
+        && matches!(bytes[2], b'/' | b'\\');
+    if drive_absolute {
+        return true;
+    }
+    let leading = bytes
+        .iter()
+        .take_while(|byte| matches!(byte, b'/' | b'\\'))
+        .count();
+    if leading < 2 {
+        return false;
+    }
+    // The resolver performs full component validation when matching the path.
+    // This recognizes only a minimally complete UNC server/share root here.
+    let mut components = raw[leading..]
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty());
+    matches!(components.next(), Some(server) if server != "." && server != "..")
+        && matches!(components.next(), Some(share) if share != "." && share != "..")
 }
 
-fn canonical_root(root: &str) -> String {
-    root.trim_end_matches(['/', '\\'])
-        .replace('\\', "/")
-        .to_ascii_lowercase()
-}
-
-fn component_count(root: &str) -> usize {
-    root.split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .count()
+fn same_root_with_resolver(known_root: &str, candidate: &str) -> bool {
+    let marker_root = PathBuf::from("/");
+    let mapping = PathMapping {
+        from: known_root.to_owned(),
+        to: marker_root.clone(),
+        config_file: PathBuf::new(),
+    };
+    let resolver = EffectiveOverrides {
+        path_mappings: vec![mapping],
+        ..EffectiveOverrides::default()
+    };
+    resolver
+        .resolve_path(candidate, Path::new("/"))
+        .is_ok_and(|resolved| resolved.path == marker_root)
 }
 
 #[cfg(test)]
@@ -286,5 +315,63 @@ mod tests {
         ]);
         let relocated = relocate_environment(&imported, &configured).unwrap();
         assert_eq!(relocated.read_roots, vec![PathBuf::from("/local/sdk")]);
+    }
+
+    #[test]
+    fn common_and_user_roots_infer_their_configured_descendants() {
+        let configured = configured(
+            "[properties]\nBDSCOMMONDIR = '/local/common'\nBDSUSERDIR = '/local/user'\n",
+        );
+        let imported = PropertyMap::from([
+            ("bdscommondir".into(), r"D:\Shared\Common".into()),
+            ("bdsuserdir".into(), r"C:\Users\me\BDS".into()),
+            ("commonpackages".into(), r"D:\Shared\Common\Packages".into()),
+            ("userpackages".into(), r"C:\Users\me\BDS\Packages".into()),
+        ]);
+        let relocated = relocate_environment(&imported, &configured).unwrap();
+        assert_eq!(
+            relocated.properties["commonpackages"],
+            "/local/common/Packages"
+        );
+        assert_eq!(relocated.properties["userpackages"], "/local/user/Packages");
+    }
+
+    #[test]
+    fn explicit_mapping_precedes_inferred_mapping_when_relocating_values() {
+        let configured = configured(
+            "[properties]\nBDS = '/local/sdk'\n[[path_mappings]]\nfrom = 'C:/Old/SDK/lib'\nto = '/mapped/lib'\n",
+        );
+        let imported = PropertyMap::from([
+            ("bds".into(), r"C:\Old\SDK".into()),
+            ("libpath".into(), r"C:\Old\SDK\lib\Windows".into()),
+        ]);
+        let relocated = relocate_environment(&imported, &configured).unwrap();
+        assert_eq!(relocated.properties["libpath"], "/mapped/lib/Windows");
+    }
+
+    #[test]
+    fn unc_installation_roots_relocate_descendants() {
+        let configured = configured("[properties]\nBDS = '/local/sdk'\n");
+        let imported = PropertyMap::from([
+            ("bds".into(), r"\\server\share\SDK".into()),
+            ("bdslib".into(), r"\\server\share\SDK\lib".into()),
+        ]);
+        let relocated = relocate_environment(&imported, &configured).unwrap();
+        assert_eq!(relocated.properties["bdslib"], "/local/sdk/lib");
+    }
+
+    #[test]
+    fn conflicting_original_roots_normalize_dot_and_repeated_separators() {
+        let configured =
+            configured("[properties]\nBDS = '/local/sdk'\nBDSLIB = '/different/lib'\n");
+        let imported = PropertyMap::from([
+            ("bds".into(), r"C:\Old\SDK\.\".into()),
+            ("bdslib".into(), r"c:/old//sdk".into()),
+        ]);
+        assert!(
+            relocate_environment(&imported, &configured)
+                .unwrap_err()
+                .contains("conflicting inferred translations")
+        );
     }
 }

@@ -9,12 +9,17 @@ pub(crate) fn parse_rsvars(text: &str, initial: &PropertyMap) -> Result<Property
         return Err("rsvars input exceeds 4 MiB".to_owned());
     }
     let mut properties = PropertyMap::new();
+    let mut total_property_bytes = 0;
     for (name, value) in initial {
         let name = name.to_ascii_lowercase();
         validate_name(&name)?;
-        properties.insert(name, value.clone());
+        insert_bounded(
+            &mut properties,
+            name,
+            value.clone(),
+            &mut total_property_bytes,
+        )?;
     }
-    check_total(&properties)?;
 
     for line in text.lines() {
         let mut line = line.trim();
@@ -42,8 +47,7 @@ pub(crate) fn parse_rsvars(text: &str, initial: &PropertyMap) -> Result<Property
         let key = name.trim().to_ascii_lowercase();
         validate_name(&key)?;
         let expanded = expand_once(value, &properties)?;
-        properties.insert(key, expanded);
-        check_total(&properties)?;
+        insert_bounded(&mut properties, key, expanded, &mut total_property_bytes)?;
     }
     Ok(properties)
 }
@@ -89,16 +93,31 @@ fn expand_once(value: &str, properties: &PropertyMap) -> Result<String, String> 
     Ok(result)
 }
 
-fn check_total(properties: &PropertyMap) -> Result<(), String> {
-    let bytes = properties.iter().try_fold(0usize, |total, (name, value)| {
-        total.checked_add(name.len())?.checked_add(value.len())
-    });
-    if match bytes {
-        Some(bytes) => bytes > MAX_TOTAL_PROPERTY_BYTES,
-        None => true,
-    } {
+fn insert_bounded(
+    properties: &mut PropertyMap,
+    name: String,
+    value: String,
+    total: &mut usize,
+) -> Result<(), String> {
+    let replaced = match properties.get(&name) {
+        Some(previous) => name
+            .len()
+            .checked_add(previous.len())
+            .ok_or_else(|| "rsvars properties exceed 16 MiB".to_owned())?,
+        None => 0,
+    };
+    let Some(updated_total) = total
+        .checked_sub(replaced)
+        .and_then(|bytes| bytes.checked_add(name.len()))
+        .and_then(|bytes| bytes.checked_add(value.len()))
+    else {
+        return Err("rsvars properties exceed 16 MiB".to_owned());
+    };
+    if updated_total > MAX_TOTAL_PROPERTY_BYTES {
         return Err("rsvars properties exceed 16 MiB".to_owned());
     }
+    *total = updated_total;
+    properties.insert(name, value);
     Ok(())
 }
 

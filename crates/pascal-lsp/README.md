@@ -990,9 +990,10 @@ exclude potential consumers.
 Excludes from that sidecar suppress lint diagnostics for matching files; they do
 not apply to source discovery. The initialization `exclude` option controls
 source discovery. `.fmt4d.toml` controls formatter style. Document formatting
-returns an edit to the client and never writes files. Range formatting also
-honors the request's standard `tabSize` and `insertSpaces` options for that
-request, overriding only indentation in the project formatter configuration.
+returns an edit to the client and never writes files. Document, range, and
+on-type formatting honor the request's standard `tabSize` and `insertSpaces`
+options for that request, overriding only indentation in the project formatter
+configuration.
 Range formatting currently accepts a single complete statement line (expanded
 to that whole line) and emits edits only within it. It maps the statement using
 the globally ordered source/output token stream and stable syntax-parent/token
@@ -1237,8 +1238,10 @@ explicit argument parentheses), resolves each call through existing
 definition/overload navigation, and groups edges by exact source routine
 identity. From-ranges cover only the callee designator and use LSP UTF-16
 positions. The selected-project workspace snapshot permits proven cross-unit
-calls. Ambiguous/unresolved calls, unknown callers, parser-recovery/unknown
-conditional sites, and routines marked virtual/dynamic/override are omitted.
+calls. Calls inside a nested local routine belong to that routine, not its
+enclosing routine. Ambiguous/unresolved calls, unknown callers,
+parser-recovery/unknown conditional sites, and routines marked
+virtual/dynamic/override are omitted.
 Bare procedure statements without an `exprCall` node, indirect/function-value
 calls, dynamic dispatch, and other unsupported call forms are not counted.
 

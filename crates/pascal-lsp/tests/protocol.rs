@@ -27969,8 +27969,14 @@ fn project_sidecar_configuration_applies_to_shared_source() {
         "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
     );
     write_file(&app.join("App.dpr"), "program App; begin end.\n");
-    write_file(&root.join(".fmt4d.toml"), "[format]\nindent_size = 2\n");
-    write_file(&app.join(".fmt4d.toml"), "[format]\nindent_size = 4\n");
+    write_file(
+        &root.join(".fmt4d.toml"),
+        "[format]\nindent_size = 2\nend_of_line = \"lf\"\n",
+    );
+    write_file(
+        &app.join(".fmt4d.toml"),
+        "[format]\nindent_size = 4\nend_of_line = \"crlf\"\n",
+    );
     write_file(
         &root.join(".lint4d.toml"),
         "[rules.naming]\nconstant_style = \"PascalCase\"\n",
@@ -28015,7 +28021,11 @@ fn project_sidecar_configuration_applies_to_shared_source() {
     let response = server.response(&format_id);
     assert!(response.error.is_none(), "{:?}", response.error);
     let edits = response.result.unwrap();
-    assert!(edits[0]["newText"].as_str().unwrap().contains("\n    Log"));
+    let formatted = edits[0]["newText"].as_str().unwrap();
+    assert!(
+        formatted.contains("\r\n  Log"),
+        "the selected app sidecar must provide CRLF while client tabSize=2 controls indentation: {formatted:?}"
+    );
 
     let start = position_of(source, "GoodConst", 0);
     let end = Position::new(start.line, start.character + 9);
@@ -28867,7 +28877,10 @@ fn project_sidecar_malformed_lint_is_a_server_diagnostic_and_does_not_block_fmt(
     );
     write_file(&app.join("App.dpr"), "program App; begin end.\n");
     write_file(&app.join(".lint4d.toml"), "[rules\n");
-    write_file(&root.join(".fmt4d.toml"), "[format]\nindent_size = 4\n");
+    write_file(
+        &root.join(".fmt4d.toml"),
+        "[format]\nindent_size = 4\nend_of_line = \"crlf\"\n",
+    );
 
     let mut server = TestServer::launch();
     server.initialize(root, json!({"projectFile": "app/App.dproj"}));
@@ -28936,7 +28949,11 @@ fn project_sidecar_malformed_lint_is_a_server_diagnostic_and_does_not_block_fmt(
     assert!(format_response.error.is_none(), "{format_response:?}");
     let edits = format_response.result.unwrap();
     assert_eq!(edits.as_array().unwrap().len(), 1);
-    assert!(edits[0]["newText"].as_str().unwrap().contains("\n    Log"));
+    let formatted = edits[0]["newText"].as_str().unwrap();
+    assert!(
+        formatted.contains("\r\n  Log"),
+        "valid fmt config must remain active despite malformed lint config, while client tabSize=2 controls indentation: {formatted:?}"
+    );
     server.shutdown();
 }
 
@@ -33492,6 +33509,86 @@ fn range_formatting_formats_selected_lines_without_replacing_unrelated_text() {
     assert_eq!(
         tabs.result.expect("tab edits")[0]["newText"],
         "\tX := 1 + 2;"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn document_formatting_honors_client_indent_options_over_project_config() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path();
+    let main = root.join("Main.pas");
+    let source =
+        "unit Main;\ninterface\nimplementation\nprocedure Run;\nbegin\nX:= 1+2;\nend;\nend.\n";
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let spaces_id = RequestId::from("document-format-client-spaces".to_string());
+    server.send_request(
+        spaces_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 8, "insertSpaces": true}
+        }),
+    );
+    let spaces = server.response(&spaces_id);
+    assert!(spaces.error.is_none(), "formatting failed: {spaces:?}");
+    let spaces_result = spaces.result.expect("full-document edits");
+    let spaces_text = spaces_result[0]["newText"]
+        .as_str()
+        .expect("replacement text");
+    assert!(
+        spaces_text.contains("\n        X := 1 + 2;\n"),
+        "whole-document formatting must use requested eight-space indentation: {spaces_text:?}"
+    );
+
+    write_file(
+        &root.join(".fmt4d.toml"),
+        "[format]\nindent_size = 4\nindent_style = \"space\"\n",
+    );
+    let tabs_id = RequestId::from("document-format-client-tabs".to_string());
+    server.send_request(
+        tabs_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 3, "insertSpaces": false}
+        }),
+    );
+    let tabs = server.response(&tabs_id);
+    assert!(tabs.error.is_none(), "tab formatting failed: {tabs:?}");
+    let tabs_result = tabs.result.expect("full-document tab edits");
+    let tabs_text = tabs_result[0]["newText"]
+        .as_str()
+        .expect("replacement text");
+    assert!(
+        tabs_text.contains("\n\tX := 1 + 2;\n"),
+        "client tab options must override conflicting project formatter config: {tabs_text:?}"
+    );
+
+    let invalid_id = RequestId::from("document-format-invalid-tab-size".to_string());
+    server.send_request(
+        invalid_id.clone(),
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "options": {"tabSize": 0, "insertSpaces": true}
+        }),
+    );
+    let invalid = server.response(&invalid_id);
+    let invalid_error = invalid.error.expect("zero tab size must be rejected");
+    assert_eq!(
+        invalid_error.code, -32602,
+        "invalid tab size is InvalidParams"
+    );
+    assert!(
+        invalid_error
+            .message
+            .contains("formatting tabSize must be between 1 and 16"),
+        "unexpected tab-size validation error: {}",
+        invalid_error.message
     );
     server.shutdown();
 }

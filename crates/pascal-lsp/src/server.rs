@@ -5798,6 +5798,8 @@ impl AnalysisJobs {
                                     let computed = queries::formatting_from_input(
                                         input,
                                         &uri,
+                                        tab_size,
+                                        insert_spaces,
                                         &worker_cancellation,
                                     );
                                     rename::Computed {
@@ -10432,6 +10434,30 @@ fn queue_workspace_message(
     Ok(())
 }
 
+fn select_workspace_event_message(
+    priority_message: Option<Message>,
+    workspace_busy: bool,
+    deferred_workspace_messages: &mut VecDeque<(Message, usize)>,
+    deferred_workspace_message_bytes: &mut usize,
+    deferred_workspace_overflow: &mut Option<Message>,
+) -> Option<Message> {
+    if let Some(priority_message) = priority_message {
+        return Some(priority_message);
+    }
+    if workspace_busy {
+        None
+    } else {
+        deferred_workspace_messages
+            .pop_front()
+            .map(|(message, bytes)| {
+                *deferred_workspace_message_bytes =
+                    deferred_workspace_message_bytes.saturating_sub(bytes);
+                message
+            })
+            .or_else(|| deferred_workspace_overflow.take())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn event_loop(
     connection: &ProtocolConnection,
@@ -10697,21 +10723,14 @@ fn event_loop(
             configuration.is_preparing() || workspace_busy,
         );
         let priority_message = connection.try_recv_priority();
-        let deferred_workspace_message = if workspace_busy {
-            None
-        } else {
-            deferred_workspace_messages
-                .pop_front()
-                .map(|(message, bytes)| {
-                    deferred_workspace_message_bytes =
-                        deferred_workspace_message_bytes.saturating_sub(bytes);
-                    message
-                })
-                .or_else(|| deferred_workspace_overflow.take())
-        };
-        let message = if let Some(message) = priority_message {
-            message
-        } else if let Some(message) = deferred_workspace_message {
+        let selected_workspace_message = select_workspace_event_message(
+            priority_message,
+            workspace_busy,
+            &mut deferred_workspace_messages,
+            &mut deferred_workspace_message_bytes,
+            &mut deferred_workspace_overflow,
+        );
+        let message = if let Some(message) = selected_workspace_message {
             message
         } else if workspace_busy && deferred_workspace_overflow.is_some() {
             thread::sleep(timeout);
@@ -14230,12 +14249,12 @@ fn server_capabilities(
         });
     }
     capabilities["workspace"]["fileOperations"] = serde_json::json!({
-        "willCreate": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
-        "willRename": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
-        "willDelete": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
-        "didCreate": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
-        "didRename": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}],
-        "didDelete": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]
+        "willCreate": {"filters": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]},
+        "willRename": {"filters": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]},
+        "willDelete": {"filters": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]},
+        "didCreate": {"filters": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]},
+        "didRename": {"filters": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]},
+        "didDelete": {"filters": [{"scheme": "file", "pattern": {"glob": "**/*.{pas,pp,pascal}", "matches": "file"}}]}
     });
     if supports_pull_diagnostics(client) {
         capabilities["diagnosticProvider"] = serde_json::json!({
@@ -14719,7 +14738,8 @@ mod tests {
         PartialDeliveryValidation, PartialResultPayload, PendingAnalysis, PriorityQueue,
         ProtocolSender, TestBarrierConfig, deliver_analysis_result, event_loop_receive_timeout,
         handle_request, invalidate_analysis_result, pump_pending_diagnostic_publications,
-        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
+        select_workspace_event_message, supports_diagnostic_refresh,
+        supports_workspace_diagnostic_reports,
     };
     use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -16510,20 +16530,35 @@ mod tests {
         assert_eq!(compiled["version"], "D13");
         assert_eq!(compiled["platform"], "Win64");
         assert_eq!(compiled["typesOnly"], true);
-        let file_operations = &capabilities["workspace"]["fileOperations"];
-        for operation in [
-            "willCreate",
-            "willRename",
-            "willDelete",
-            "didCreate",
-            "didRename",
-            "didDelete",
+        let initialize: lsp_types::InitializeResult = serde_json::from_value(serde_json::json!({
+            "capabilities": capabilities,
+        }))
+        .expect("server capabilities must follow the LSP InitializeResult schema");
+        let file_operations = initialize
+            .capabilities
+            .workspace
+            .expect("workspace capabilities")
+            .file_operations
+            .expect("workspace file operations");
+        for registration in [
+            file_operations.will_create,
+            file_operations.will_rename,
+            file_operations.will_delete,
+            file_operations.did_create,
+            file_operations.did_rename,
+            file_operations.did_delete,
         ] {
-            assert!(file_operations[operation].is_array(), "missing {operation}");
-            assert_eq!(file_operations[operation][0]["pattern"]["matches"], "file");
+            let filter = registration
+                .expect("all six workspace file operations are advertised")
+                .filters
+                .into_iter()
+                .next()
+                .expect("operation filter");
+            assert_eq!(filter.scheme.as_deref(), Some("file"));
+            assert_eq!(filter.pattern.glob, "**/*.{pas,pp,pascal}");
             assert_eq!(
-                file_operations[operation][0]["pattern"]["glob"],
-                "**/*.{pas,pp,pascal}"
+                filter.pattern.matches,
+                Some(lsp_types::FileOperationPatternKind::File)
             );
         }
         assert!(super::notification_requires_configuration_ordering(
@@ -16532,6 +16567,168 @@ mod tests {
         assert!(super::notification_may_change_document(
             "workspace/didRenameFiles"
         ));
+    }
+
+    #[test]
+    fn priority_messages_do_not_consume_deferred_workspace_messages_or_overflow() {
+        let deferred_change = Message::Notification(Notification::new(
+            "textDocument/didChange".to_string(),
+            serde_json::json!({"textDocument": {"uri": "file:///Main.pas"}}),
+        ));
+        let deferred_request = Message::Request(Request::new(
+            RequestId::from("deferred".to_string()),
+            "textDocument/hover".to_string(),
+            serde_json::json!({}),
+        ));
+        let overflow_change = Message::Notification(Notification::new(
+            "textDocument/didChange".to_string(),
+            serde_json::json!({"textDocument": {"uri": "file:///Overflow.pas"}}),
+        ));
+        let priority = Message::Request(Request::new(
+            RequestId::from("priority".to_string()),
+            "shutdown".to_string(),
+            serde_json::json!({}),
+        ));
+        let mut deferred = std::collections::VecDeque::from([
+            (deferred_change.clone(), 4),
+            (deferred_request.clone(), 5),
+        ]);
+        let mut deferred_bytes = 9;
+        let mut overflow = Some(overflow_change.clone());
+
+        assert!(
+            select_workspace_event_message(
+                None,
+                true,
+                &mut deferred,
+                &mut deferred_bytes,
+                &mut overflow,
+            )
+            .is_none()
+        );
+        assert_eq!(deferred.len(), 2, "busy workspace retains FIFO queue");
+        assert_eq!(deferred_bytes, 9, "busy workspace retains byte accounting");
+        assert!(overflow.is_some(), "busy workspace retains overflow");
+
+        let selected = select_workspace_event_message(
+            Some(priority.clone()),
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Request(request)) if request.method == "shutdown")
+        );
+        assert_eq!(
+            deferred.len(),
+            2,
+            "priority selection must retain FIFO queue"
+        );
+        assert_eq!(
+            deferred_bytes, 9,
+            "priority selection must retain byte accounting"
+        );
+        assert!(
+            overflow.is_some(),
+            "priority selection must retain overflow"
+        );
+
+        let selected = select_workspace_event_message(
+            None,
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Notification(notification)) if notification.method == "textDocument/didChange")
+        );
+        let selected = select_workspace_event_message(
+            None,
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Request(request)) if request.id == RequestId::from("deferred".to_string()))
+        );
+        assert_eq!(deferred_bytes, 0);
+
+        let priority_with_overflow = Message::Request(Request::new(
+            RequestId::from("priority-with-overflow".to_string()),
+            "shutdown".to_string(),
+            serde_json::json!({}),
+        ));
+        let selected = select_workspace_event_message(
+            Some(priority_with_overflow),
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Request(request)) if request.method == "shutdown")
+        );
+        assert!(
+            overflow.is_some(),
+            "priority must not take the overflow slot"
+        );
+
+        let selected = select_workspace_event_message(
+            None,
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Notification(notification)) if notification.params["textDocument"]["uri"] == "file:///Overflow.pas")
+        );
+        assert!(overflow.is_none());
+    }
+
+    #[test]
+    fn priority_messages_do_not_consume_overflow_when_fifo_is_empty() {
+        let priority = Message::Request(Request::new(
+            RequestId::from("priority".to_string()),
+            "shutdown".to_string(),
+            serde_json::json!({}),
+        ));
+        let overflow_change = Message::Notification(Notification::new(
+            "textDocument/didChange".to_string(),
+            serde_json::json!({"textDocument": {"uri": "file:///Overflow.pas"}}),
+        ));
+        let mut deferred = std::collections::VecDeque::new();
+        let mut deferred_bytes = 0;
+        let mut overflow = Some(overflow_change);
+
+        let selected = select_workspace_event_message(
+            Some(priority),
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Request(request)) if request.method == "shutdown")
+        );
+        assert!(
+            overflow.is_some(),
+            "priority must not take the overflow slot"
+        );
+        let selected = select_workspace_event_message(
+            None,
+            false,
+            &mut deferred,
+            &mut deferred_bytes,
+            &mut overflow,
+        );
+        assert!(
+            matches!(selected, Some(Message::Notification(notification)) if notification.params["textDocument"]["uri"] == "file:///Overflow.pas")
+        );
+        assert!(overflow.is_none());
     }
 
     #[test]
@@ -19226,8 +19423,13 @@ mod tests {
         let workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
-        let computed =
-            crate::workspace::queries::formatting_from_input(input.clone(), &source_uri, &cancel);
+        let computed = crate::workspace::queries::formatting_from_input(
+            input.clone(),
+            &source_uri,
+            4,
+            true,
+            &cancel,
+        );
         assert!(computed.value.is_ok(), "formatting worker must complete");
         assert!(
             computed
@@ -19261,8 +19463,13 @@ mod tests {
         let workspace = test_workspace(vec![root], Default::default());
         let input = workspace.analysis_input();
         let cancel = AtomicBool::new(false);
-        let computed =
-            crate::workspace::queries::formatting_from_input(input.clone(), &source_uri, &cancel);
+        let computed = crate::workspace::queries::formatting_from_input(
+            input.clone(),
+            &source_uri,
+            4,
+            true,
+            &cancel,
+        );
         assert!(computed.value.is_ok(), "formatting worker must complete");
         assert!(
             computed.records.iter().any(|record| {

@@ -197,6 +197,12 @@ pub(super) fn outgoing(
             {
                 return Ok(());
             }
+            let Some((containing_caller_index, _)) = containing_caller(document, span) else {
+                return Ok(());
+            };
+            if containing_caller_index != caller_index {
+                return Ok(());
+            }
             let Some((callee_uri, callee)) = resolve_call(
                 index,
                 &caller_uri,
@@ -534,5 +540,97 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
         Err("request cancelled".to_string())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::navigation::NavigationIndex;
+    use lsp_types::Position;
+
+    const SOURCE: &str = "unit NestedCalls;\ninterface\nprocedure Target;\nprocedure Other;\nprocedure Outer;\nimplementation\nprocedure Target;\nbegin\nend;\nprocedure Other;\nbegin\nend;\nprocedure Outer;\nprocedure Inner;\nbegin\n  Target();\nend;\nbegin\n  Other();\nend;\nend.\n";
+
+    fn item_at(index: &NavigationIndex, line: u32, character: u32) -> CallHierarchyItem {
+        let uri = Url::parse("file:///nested-calls.pas").unwrap();
+        index
+            .prepare_call_hierarchy_with_cancel(
+                &uri,
+                Position { line, character },
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .unwrap()
+            .remove(0)
+    }
+
+    fn source_index() -> NavigationIndex {
+        let mut index = NavigationIndex::new();
+        index
+            .update(
+                Url::parse("file:///nested-calls.pas").unwrap(),
+                SOURCE.to_owned(),
+            )
+            .unwrap();
+        index
+    }
+
+    fn one_range(line: u32, start: u32, end: u32) -> Range {
+        Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        }
+    }
+
+    #[test]
+    fn outgoing_outer_keeps_its_direct_call_but_excludes_nested_routine_call() {
+        let index = source_index();
+        let outer = item_at(&index, 12, 10);
+        let inner = item_at(&index, 13, 10);
+        let target = item_at(&index, 6, 10);
+
+        let outer_calls = index
+            .outgoing_calls_with_cancel(&outer, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(outer_calls.len(), 1);
+        assert_eq!(outer_calls[0].to.name, "Other");
+        assert_eq!(outer_calls[0].from_ranges, vec![one_range(18, 2, 7)]);
+
+        let inner_calls = index
+            .outgoing_calls_with_cancel(&inner, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(inner_calls.len(), 1);
+        assert_eq!(inner_calls[0].to.name, "Target");
+        assert_eq!(inner_calls[0].from_ranges, vec![one_range(15, 2, 8)]);
+
+        let target_callers = index
+            .incoming_calls_with_cancel(&target, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(target_callers.len(), 1);
+        assert_eq!(target_callers[0].from.name, "Inner");
+        assert_eq!(target_callers[0].from_ranges, vec![one_range(15, 2, 8)]);
+    }
+
+    #[test]
+    fn outgoing_outer_without_direct_calls_excludes_nested_routine_calls() {
+        let source = SOURCE.replace("  Other();\n", "");
+        let mut index = NavigationIndex::new();
+        index
+            .update(Url::parse("file:///nested-calls.pas").unwrap(), source)
+            .unwrap();
+        let outer = item_at(&index, 12, 10);
+
+        assert!(
+            index
+                .outgoing_calls_with_cancel(&outer, &AtomicBool::new(false))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

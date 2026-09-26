@@ -1509,6 +1509,8 @@ pub(crate) fn navigation_from_input(
 pub(crate) fn formatting_from_input(
     input: WorkspaceInput,
     uri: &Url,
+    tab_size: u32,
+    insert_spaces: bool,
     cancel: &AtomicBool,
 ) -> super::rename::Computed<Option<lsp_types::TextEdit>> {
     let source_generation = input.source_generation;
@@ -1519,7 +1521,7 @@ pub(crate) fn formatting_from_input(
     }
 
     let mut workspace = super::Workspace::from_analysis_input(&input);
-    let value = match workspace.formatting_edit_with_cancel(&uri, cancel) {
+    let value = match workspace.formatting_edit_with_cancel(&uri, tab_size, insert_spaces, cancel) {
         Ok(edit) => Ok(edit),
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);

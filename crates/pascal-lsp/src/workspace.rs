@@ -5816,9 +5816,12 @@ impl Workspace {
     pub(crate) fn formatting_edit_with_cancel(
         &mut self,
         uri: &Url,
+        tab_size: u32,
+        insert_spaces: bool,
         cancel: &AtomicBool,
     ) -> Result<Option<TextEdit>, String> {
-        let Some((source, formatted)) = self.formatting_output_with_cancel(uri, cancel, None)?
+        let Some((source, formatted)) =
+            self.formatting_output_with_cancel(uri, cancel, Some((tab_size, insert_spaces)))?
         else {
             return Ok(None);
         };

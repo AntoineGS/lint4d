@@ -3,6 +3,9 @@
 -- For tool-neutral Delphi path/property overrides, see ../README.md's
 -- "Delphi path overrides (LSP only)" section and configure delphi-tools files;
 -- do not add mapping fields to init_options.
+-- Project choices are available with :PascalProject / <leader>wp, and the
+-- selected project's installation can be changed with :PascalDelphiVersion.
+-- Automatic ambiguity prompts use standard LSP message requests.
 vim.filetype.add({ extension = { pas = 'pascal', dpr = 'pascal', dpk = 'pascal' } })
 local example_file = assert(debug.getinfo(1, 'S').source:match('^@(.+)$'))
 local pascal_project = dofile(vim.fn.fnamemodify(example_file, ':h') .. '/pascal_project.lua')

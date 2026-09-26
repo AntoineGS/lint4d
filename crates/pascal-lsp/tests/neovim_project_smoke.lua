@@ -21,6 +21,15 @@ local function run()
   )
   local client = vim.lsp.get_clients({ bufnr = main, name = 'pascal_lsp' })[1]
   assert(client.server_capabilities.experimental.projectSelection, 'project selection capability missing')
+  local project_mapping = false
+  local leader = vim.g.mapleader or '\\'
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(main, 'n')) do
+    if mapping.lhs == leader .. 'wp' then
+      project_mapping = true
+      break
+    end
+  end
+  assert(project_mapping, '<leader>wp project picker mapping missing')
 
   local function context_for(bufnr)
     local result
@@ -98,6 +107,8 @@ local function run()
     'a configured project outside the candidate list must not become a selectable candidate'
   )
   assert(find_item(first_picker, 'A.dproj'), 'picker is missing A.dproj')
+  assert(find_item(first_picker, 'Browse repository'), 'picker is missing repository browsing')
+  assert(find_item(first_picker, 'Select Delphi installation'), 'picker is missing installation selection')
   local b_project = find_item(first_picker, 'B.dproj')
   assert(b_project, 'picker is missing B.dproj')
   first_picker.callback(b_project)

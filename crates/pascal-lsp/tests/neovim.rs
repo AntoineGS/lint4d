@@ -243,6 +243,139 @@ fn neovim_project_selection() {
 }
 
 #[test]
+fn neovim_installation_selection() {
+    if !neovim_is_available() {
+        eprintln!("Neovim installation-selection integration skipped: nvim is not installed");
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("pascal lsp neovim installation selection ")
+        .tempdir()
+        .unwrap();
+    let root = directory.path();
+    fs::write(root.join(".lint4d.toml"), "").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fs::create_dir_all(root.join("ambiguous")).unwrap();
+    fs::write(
+        root.join("src/Alpha.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ambiguous/Alpha.dproj"),
+        "<Project><PropertyGroup><MainSource>Probe.pas</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ambiguous/Beta.dproj"),
+        "<Project><PropertyGroup><MainSource>Probe.pas</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ambiguous/Probe.pas"),
+        "unit Probe;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/Main.pas"),
+        "unit Main;\ninterface\nuses SdkUnit;\nimplementation\nprocedure Run;\nvar Value: Integer;\nbegin\n  Value := SdkValue;\nend;\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("other/Alpha.dproj"),
+        "<Project><PropertyGroup><MainSource>Alpha.pas</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("other/Alpha.pas"),
+        "unit Alpha;\ninterface\nimplementation\nend.\n",
+    )
+    .unwrap();
+
+    let mut configuration = String::new();
+    for version in ["7.0", "37.0"] {
+        let sdk = root.join("sdk").join(version);
+        let ide = root.join("ide").join(version);
+        fs::create_dir_all(sdk.join("bin")).unwrap();
+        fs::create_dir_all(sdk.join("source")).unwrap();
+        fs::create_dir_all(&ide).unwrap();
+        fs::write(
+            sdk.join("bin/rsvars.bat"),
+            format!("@SET BDS=C:\\SDK\\{version}\n"),
+        )
+        .unwrap();
+        let path_property = if version == "7.0" {
+            "Win32LibraryPath"
+        } else {
+            "DelphiLibraryPath"
+        };
+        fs::write(
+            ide.join("EnvOptions.proj"),
+            format!(
+                "<Project><PropertyGroup><{path_property}>$(BDS)\\source</{path_property}></PropertyGroup></Project>"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            sdk.join("source/SdkUnit.pas"),
+            format!(
+                "unit SdkUnit;\ninterface\nconst\n  SdkValue = {};\nimplementation\nend.\n",
+                if version == "7.0" { 7 } else { 37 },
+            ),
+        )
+        .unwrap();
+        configuration.push_str(&format!(
+            "[installations.\"{version}\".properties]\nBDS='{}'\nAPPDATA='{}'\nEnvironmentSettings='{}/EnvOptions.proj'\n",
+            sdk.display(),
+            ide.display(),
+            ide.display(),
+        ));
+    }
+    fs::write(root.join(".delphi-tools.local.toml"), configuration).unwrap();
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(manifest.join("tests/neovim_installations_smoke.lua"))
+        .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
+        .env("PASCAL_LSP_SMOKE_ROOT", root)
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "Neovim installation-selection smoke timed out: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "Neovim installation-selection smoke failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NEOVIM_INSTALLATION_SELECTION_OK"));
+}
+
+#[test]
 fn neovim_delphi_overrides_navigate_to_native_source() {
     if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");

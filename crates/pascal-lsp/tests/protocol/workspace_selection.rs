@@ -1696,6 +1696,7 @@ fn reset_installation_reports_metadata_selection_consistently() {
         reset.result.as_ref().unwrap()["selectedInstallationId"],
         "37.0"
     );
+    assert_eq!(reset.result.as_ref().unwrap()["selectionMode"], "metadata");
 
     let installation = RequestId::from("metadata-installation-context".to_owned());
     server.send_request(

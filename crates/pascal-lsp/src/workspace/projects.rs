@@ -8,7 +8,8 @@ use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use lsp_types::Url;
 use pascal_project::installation_config::ConfigurationSourceStamp;
 use pascal_project::{
-    InstallationSelection, discover_with_selections, project_candidates,
+    InstallationSelection, discover_with_selections,
+    discover_with_selections_and_observations_with_work_budget, project_candidates,
     project_candidates_with_work_budget, runtime_project_selection, selected_project_is_current,
 };
 use serde::Serialize;
@@ -429,14 +430,12 @@ impl Workspace {
 
         let (installation_candidates, installation_selection_mode) =
             if let Some(project_file) = context.project_file.as_deref() {
-                self.installation_selection_snapshot(project_file, budget)
-                    .map(|(_, candidates, selection)| {
-                        (
-                            candidates,
-                            installation_selection_mode(&selection).to_string(),
-                        )
-                    })
-                    .unwrap_or_else(|_| (Vec::new(), "automatic".to_string()))
+                let (_, candidates, selection) =
+                    self.installation_selection_snapshot(project_file, cancel, budget)?;
+                (
+                    candidates,
+                    installation_selection_mode(&selection).to_string(),
+                )
             } else {
                 (Vec::new(), "automatic".to_string())
             };
@@ -542,7 +541,7 @@ impl Workspace {
         let project_path = project_path(project_uri)?;
         self.validate_project_scope(&project_path)?;
         let (_, candidates, selection) =
-            self.installation_selection_snapshot(&project_path, budget)?;
+            self.installation_selection_snapshot(&project_path, None, budget)?;
         let selected = match &selection {
             InstallationSelection::Selected { id, .. } | InstallationSelection::Invalid { id } => {
                 Some(id.clone())
@@ -605,7 +604,7 @@ impl Workspace {
         self.validate_project_scope(&project_path)?;
         check_project_operation_cancel(cancel)?;
         let (config, candidates, _) =
-            self.installation_selection_snapshot(&project_path, budget)?;
+            self.installation_selection_snapshot(&project_path, cancel, budget)?;
         if let Some(id) = installation_id {
             config.profile(id)?;
             if !candidates
@@ -689,10 +688,14 @@ impl Workspace {
             selected_installation_id: selected_after_change,
             selection_mode: if installation_id.is_some() {
                 "session".to_string()
-            } else if config.configured_installation_for(&project_path).is_some() {
-                "configured".to_string()
             } else {
-                "automatic".to_string()
+                installation_selection_mode(
+                    validation
+                        .installation_selection
+                        .as_ref()
+                        .unwrap_or(&InstallationSelection::Legacy),
+                )
+                .to_string()
             },
             warnings: Vec::new(),
         })
@@ -792,6 +795,7 @@ impl Workspace {
     fn installation_selection_snapshot(
         &self,
         project_path: &Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<
         (
@@ -817,15 +821,22 @@ impl Workspace {
         // cannot be the authority here: selection changes intentionally evict
         // it, and metadata-inferred selections survive an automatic reset.
         let options = self.project_options_with_installations(self.installation_selections.clone());
-        let discovery = discover_with_selections(
+        // Standalone callers may not have a request cancellation token, but
+        // their budget remains cancellation-aware and is charged throughout
+        // discovery. Protocol workers pass the actual request token.
+        let fallback_cancel = std::sync::atomic::AtomicBool::new(false);
+        let discovery = discover_with_selections_and_observations_with_work_budget(
             project_path,
             &roots,
             &options,
             &self.project_selections,
             &self.overrides,
             &self.options.exclude,
+            cancel.unwrap_or(&fallback_cancel),
+            budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
         )?;
         let selection = discovery
+            .context
             .installation_selection
             .unwrap_or(InstallationSelection::Legacy);
         Ok((configuration, candidates, selection))
@@ -1178,8 +1189,10 @@ fn installation_selection_mode(selection: &InstallationSelection) -> &'static st
 
 #[cfg(test)]
 mod installation_selection_mode_tests {
-    use super::{InstallationSelection, installation_selection_mode};
+    use super::{InstallationSelection, Workspace, installation_selection_mode};
+    use crate::workspace::{ReconciliationBudget, WorkspaceOptions};
     use pascal_project::InstallationOrigin;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
     fn selection_modes_preserve_origin_and_non_selected_states() {
@@ -1221,6 +1234,45 @@ mod installation_selection_mode_tests {
         ] {
             assert_eq!(installation_selection_mode(&selection), expected);
         }
+    }
+
+    #[test]
+    fn installation_selection_discovery_uses_the_supplied_work_budget() {
+        let directory = tempfile::tempdir().expect("workspace directory");
+        let root = directory.path();
+        let project = root.join("App.dproj");
+        std::fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .expect("project file");
+        std::fs::write(root.join("App.dpr"), "program App; begin end.").expect("main source");
+        std::fs::write(root.join(".delphi-tools.local.toml"), "").expect("configuration file");
+
+        let baseline = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let baseline_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+        let roots = baseline.workspace_root_paths();
+        baseline
+            .overrides
+            .configuration_for_with_work_budget(
+                roots.first().map(std::path::PathBuf::as_path),
+                Some(&project),
+                Some(&baseline_budget as &dyn pascal_project::ProjectWorkBudget),
+            )
+            .expect("configuration snapshot");
+        let configuration_visits = baseline_budget.used.get().filesystem_path_visits;
+        assert!(
+            configuration_visits > 0,
+            "fixture must charge configuration work"
+        );
+
+        let workspace = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+        budget.set_path_visit_limit(configuration_visits);
+        let error = workspace
+            .installation_selection_snapshot(&project, None, Some(&budget))
+            .expect_err("discovery must be charged after the configuration snapshot");
+        assert!(error.contains("work budget exceeded"), "{error}");
     }
 }
 

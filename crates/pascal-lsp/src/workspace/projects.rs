@@ -4,14 +4,14 @@ use super::{
     ContextKey, OwnerOrigin, Workspace, absolute_path, canonical_file_uri,
     is_analyzable_source_path, path_stamp,
 };
-use crate::NavigationIndex;
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use lsp_types::Url;
 use pascal_project::{
-    discover_with_selections, project_candidates, runtime_project_selection,
+    InstallationSelection, discover_with_selections, project_candidates, runtime_project_selection,
     selected_project_is_current,
 };
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const MAX_CONFIGURATION_BYTES: usize = 4 * 1024 * 1024;
@@ -23,9 +23,20 @@ pub struct ProjectContextInfo {
     pub(crate) candidates: Vec<Url>,
     pub(crate) selected_project_uri: Option<Url>,
     pub(crate) selection_mode: String,
+    pub(crate) selected_installation_id: Option<String>,
     pub(crate) lint_config_uri: Option<Url>,
     pub(crate) fmt_config_uri: Option<Url>,
     pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationContextInfo {
+    pub project_uri: Url,
+    pub candidates: Vec<String>,
+    pub selected_installation_id: Option<String>,
+    pub selection_mode: String,
+    pub warnings: Vec<String>,
 }
 
 impl Workspace {
@@ -92,10 +103,145 @@ impl Workspace {
                 })
                 .flatten(),
             selection_mode: selection_mode.to_string(),
+            selected_installation_id: context.installation_selection.as_ref().and_then(
+                |selection| match selection {
+                    InstallationSelection::Selected { id, .. } => Some(id.clone()),
+                    _ => None,
+                },
+            ),
             lint_config_uri,
             fmt_config_uri,
             warnings,
         })
+    }
+
+    pub fn installation_context(
+        &mut self,
+        project_uri: &Url,
+    ) -> Result<InstallationContextInfo, String> {
+        let project_path = project_path(project_uri)?;
+        let (project, candidates, selected) =
+            self.installation_selection_snapshot(&project_path)?;
+        let selection_mode = if self.installation_selections.contains_key(&project_path) {
+            "session"
+        } else if project.configured_installation_for(&project_path).is_some() {
+            "configured"
+        } else {
+            "automatic"
+        };
+        Ok(InstallationContextInfo {
+            project_uri: canonical_file_uri(project_uri),
+            candidates,
+            selected_installation_id: selected,
+            selection_mode: selection_mode.to_string(),
+            warnings: Vec::new(),
+        })
+    }
+
+    pub fn select_installation(
+        &mut self,
+        project_uri: &Url,
+        installation_id: Option<&str>,
+    ) -> Result<InstallationContextInfo, String> {
+        let project_path = project_path(project_uri)?;
+        let (config, candidates, _) = self.installation_selection_snapshot(&project_path)?;
+        if let Some(id) = installation_id {
+            config.profile(id)?;
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(id))
+            {
+                return Err(format!("unknown Delphi installation `{id}`"));
+            }
+        }
+
+        // Validate/evaluate tentatively before changing the live selection.
+        let mut selections = self.installation_selections.clone();
+        if let Some(id) = installation_id {
+            selections.insert(project_path.clone(), id.to_string());
+        } else {
+            selections.remove(&project_path);
+        }
+        let roots = self.workspace_root_paths();
+        let options = self.project_options_with_installations(selections.clone());
+        let validation = discover_with_selections(
+            &project_path,
+            &roots,
+            &options,
+            &self.project_selections,
+            &self.overrides,
+            &self.options.exclude,
+        )?;
+        if validation
+            .project_file
+            .as_deref()
+            .is_none_or(|path| !project_paths_equal(path, &project_path))
+        {
+            return Err(format!(
+                "project is no longer valid: {}",
+                project_path.display()
+            ));
+        }
+
+        self.installation_selections = selections;
+        let keys = self
+            .contexts
+            .keys()
+            .filter(|key| {
+                key.project_file
+                    .as_deref()
+                    .is_some_and(|path| project_paths_equal(path, &project_path))
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.invalidate_selection_contexts(&keys, None, None)?;
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.installation_context(project_uri)
+    }
+
+    fn installation_selection_snapshot(
+        &self,
+        project_path: &Path,
+    ) -> Result<
+        (
+            pascal_project::installation_config::ProjectConfiguration,
+            Vec<String>,
+            Option<String>,
+        ),
+        String,
+    > {
+        let roots = self.workspace_root_paths();
+        let configuration = self.overrides.configuration_for(
+            roots
+                .iter()
+                .find(|root| project_path.starts_with(root))
+                .map(PathBuf::as_path),
+            Some(project_path),
+        )?;
+        let candidates = configuration.installation_ids();
+        let selected = self
+            .installation_selections
+            .get(project_path)
+            .cloned()
+            .or_else(|| {
+                configuration
+                    .configured_installation_for(project_path)
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                self.contexts.iter().find_map(|(key, state)| {
+                    key.project_file
+                        .as_deref()
+                        .filter(|path| project_paths_equal(path, project_path))
+                        .and(state.context.installation_selection.as_ref())
+                        .and_then(|selection| match selection {
+                            InstallationSelection::Selected { id, .. } => Some(id.clone()),
+                            _ => None,
+                        })
+                })
+            });
+        Ok((configuration, candidates, selected))
     }
 
     pub fn select_project(
@@ -169,10 +315,26 @@ impl Workspace {
             &self.options.exclude,
         )?;
 
+        let selection_scope = scope.clone();
+        let affected_keys =
+            self.contexts
+                .keys()
+                .filter(|key| {
+                    key.selection_scope
+                        .as_ref()
+                        .is_some_and(|candidate| project_paths_equal(candidate, &selection_scope))
+                        || key.project_scope.as_ref().is_some_and(|candidate| {
+                            project_paths_equal(candidate, &selection_scope)
+                        })
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
         self.project_selections = tentative;
         self.document_owners.remove(&uri);
         self.owner_last_used.remove(&uri);
-        self.invalidate_project_selection();
+        self.invalidate_selection_contexts(&affected_keys, None, None)?;
+        self.bump_source_generation();
+        self.bump_configuration_generation();
         self.project_context(&uri)
     }
 
@@ -239,34 +401,6 @@ impl Workspace {
                 .or_insert_with(|| path_stamp(&path));
         }
     }
-
-    fn invalidate_project_selection(&mut self) {
-        self.bump_source_generation();
-        self.bump_configuration_generation();
-        self.mark_global_change();
-        self.index = NavigationIndex::new();
-        self.cached_documents.clear();
-        self.indexed_files.clear();
-        self.indexed_sizes.clear();
-        self.indexed_bytes = 0;
-        self.disk_stamps.clear();
-        self.last_used.clear();
-        self.contexts.clear();
-        self.document_contexts.clear();
-        self.open_document_contexts.clear();
-        self.clear_legacy_route_proofs();
-        self.file_cap_warning_sent = false;
-        self.total_cap_warning_sent = false;
-        self.pending_diagnostics.clear();
-        let open_documents = self
-            .open_documents
-            .iter()
-            .filter_map(|(uri, document)| document.text.as_ref().map(|_| uri.clone()))
-            .collect::<Vec<_>>();
-        for uri in open_documents {
-            self.schedule_diagnostics(uri);
-        }
-    }
 }
 
 fn document_path(uri: &Url) -> Result<PathBuf, String> {
@@ -277,6 +411,24 @@ fn document_path(uri: &Url) -> Result<PathBuf, String> {
     if !is_analyzable_source_path(&path) {
         return Err(format!(
             "unsupported Pascal document path: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn project_path(uri: &Url) -> Result<PathBuf, String> {
+    let path = uri
+        .to_file_path()
+        .map_err(|_| format!("project URI must be a file URI: {uri}"))?;
+    let path = absolute_path(path);
+    if !path.is_file()
+        || !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"))
+    {
+        return Err(format!(
+            "project is not a current .dproj file: {}",
             path.display()
         ));
     }

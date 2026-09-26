@@ -1039,6 +1039,42 @@ fn preserves_project_ambiguity_and_allows_explicit_project_override() {
 }
 
 #[test]
+fn nested_unique_dproj_beats_ancestor_and_same_nearest_projects_stay_ambiguous() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let nested = root.join("src/nested");
+    let source = nested.join("Unit.pas");
+    write(&source, "unit Unit; interface implementation end.");
+    write(
+        &root.join("Root.dproj"),
+        "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        &nested.join("Nested.dproj"),
+        "<Project><PropertyGroup><DCCReference Include=\"Unit.pas\" /></PropertyGroup></Project>",
+    );
+
+    let unique_nearest = discover(&source, root, &options());
+    assert_eq!(
+        unique_nearest.project_file,
+        Some(nested.join("Nested.dproj"))
+    );
+
+    write(
+        &nested.join("Other.dproj"),
+        "<Project><PropertyGroup><MainSource>Other.dpr</MainSource></PropertyGroup></Project>",
+    );
+    let ambiguous = discover(&source, root, &options());
+    assert_eq!(ambiguous.project_file, None, "{ambiguous:?}");
+    assert!(
+        ambiguous
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("multiple project files"))
+    );
+}
+
+#[test]
 fn normalizes_case_insensitive_paths_and_rejects_unknown_windows_paths() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
@@ -1752,7 +1788,7 @@ fn properties_from_unknown_prior_conditions_remain_unknown() {
 }
 
 #[test]
-fn automatic_selection_uses_the_unique_proven_source_owner() {
+fn automatic_selection_does_not_guess_from_unique_source_membership() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
     let source = root.join("src/Shared.pas");
@@ -1774,11 +1810,8 @@ fn automatic_selection_uses_the_unique_proven_source_owner() {
 
     let context = discover(&source, root, &options());
 
-    assert_eq!(context.project_file, Some(root.join("B.dproj")));
-    assert!(
-        context.discovery_complete,
-        "unique owner was not complete: {context:?}"
-    );
+    assert_eq!(context.project_file, None, "{context:?}");
+    assert!(!context.discovery_complete);
     assert!(
         context
             .metadata_files
@@ -2221,7 +2254,8 @@ fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
     );
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
-    assert_eq!(before.project_file, Some(root.join("A.dproj")));
+    assert!(before.project_file.is_none(), "{before:?}");
+    assert!(!before.discovery_complete);
     assert!(
         before
             .metadata_files
@@ -2261,7 +2295,8 @@ fn exists_dependencies_are_retained_in_the_ownership_readset() {
     );
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
-    assert_eq!(before.project_file, Some(root.join("A.dproj")));
+    assert!(before.project_file.is_none(), "{before:?}");
+    assert!(!before.discovery_complete);
     assert!(
         before
             .metadata_files

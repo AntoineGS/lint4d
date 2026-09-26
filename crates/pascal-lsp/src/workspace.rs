@@ -50,7 +50,7 @@ use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTa
 
 pub(crate) mod codeactions;
 pub(crate) mod extract;
-pub(crate) mod projects;
+pub mod projects;
 pub(crate) mod queries;
 pub(crate) mod rename;
 #[allow(dead_code)]
@@ -2014,6 +2014,7 @@ struct PreparedPackageWatch {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ContextKey {
     project_file: Option<PathBuf>,
+    installation_id: Option<String>,
     workspace_root: Option<PathBuf>,
     project_scope: Option<PathBuf>,
     selection_scope: Option<PathBuf>,
@@ -2022,6 +2023,13 @@ pub(crate) struct ContextKey {
     platform: Option<String>,
     conditional_context: ConditionalContext,
     overrides: EffectiveOverrides,
+}
+
+fn selected_installation_id(context: &ProjectContext) -> Option<String> {
+    match context.installation_selection.as_ref() {
+        Some(pascal_project::InstallationSelection::Selected { id, .. }) => Some(id.clone()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2052,6 +2060,9 @@ impl ContextKey {
         }
         if let Some(platform) = &self.platform {
             visit(platform.len())?;
+        }
+        if let Some(installation_id) = &self.installation_id {
+            visit(installation_id.len())?;
         }
         self.conditional_context.visit_recovery_payload(visit)?;
         self.overrides.visit_recovery_payload(visit)
@@ -2535,6 +2546,7 @@ pub struct Workspace {
     compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
+    installation_selections: HashMap<PathBuf, String>,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
     filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
     package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
@@ -3017,6 +3029,7 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_selections: input.project_selections.clone(),
+            installation_selections: input.installation_selections.clone(),
             analysis_records: Some(HashMap::new()),
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
@@ -3150,13 +3163,20 @@ impl Workspace {
     pub fn refresh_for_navigation(&mut self) {}
 
     fn project_options(&self) -> ProjectOptions {
+        self.project_options_with_installations(self.installation_selections.clone())
+    }
+
+    fn project_options_with_installations(
+        &self,
+        installation_selections: HashMap<PathBuf, String>,
+    ) -> ProjectOptions {
         ProjectOptions {
             project_file: self.options.project_file.clone(),
             build_config: self.options.build_config.clone(),
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
-            installation_selections: Default::default(),
+            installation_selections,
         }
     }
 
@@ -4295,6 +4315,7 @@ impl Workspace {
             count_recovery_entries!(self.expansions.len());
             count_recovery_entries!(self.include_parents.len());
             count_recovery_entries!(self.document_owners.len());
+            count_recovery_entries!(self.installation_selections.len());
             count_recovery_entries!(self.owner_last_used.len());
             count_recovery_entries!(self.pending_unit_file_renames.len());
             count_recovery_entries!(self.indexed_files.len());
@@ -4315,6 +4336,10 @@ impl Workspace {
             for (key, state) in &self.contexts {
                 key.visit_recovery_payload(&mut charge_retained_payload)?;
                 state.visit_recovery_payload(&mut charge_retained_payload)?;
+            }
+            for (project, installation_id) in &self.installation_selections {
+                charge_retained_payload(project.as_os_str().len())?;
+                charge_retained_payload(installation_id.len())?;
             }
             for (uri, key) in &self.document_contexts {
                 charge_retained_payload(uri.as_str().len())?;
@@ -5672,7 +5697,7 @@ impl Workspace {
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
-            installation_selections: Default::default(),
+            installation_selections: self.installation_selections.clone(),
         };
         let (context_key, context) =
             self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
@@ -8232,7 +8257,7 @@ impl Workspace {
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
-            installation_selections: Default::default(),
+            installation_selections: self.installation_selections.clone(),
         };
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         if let Some(owner) = self.document_owners.get(uri).cloned() {
@@ -8810,6 +8835,7 @@ impl Workspace {
         let selection = self.runtime_selection_for_path_default(path);
         ContextKey {
             project_file: context.and_then(|context| context.project_file.clone()),
+            installation_id: context.and_then(selected_installation_id),
             workspace_root: self.root_for_path(path),
             project_scope: self.project_scope_for_path(path, context),
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
@@ -8846,6 +8872,7 @@ impl Workspace {
         };
         Ok(ContextKey {
             project_file: context.and_then(|context| context.project_file.clone()),
+            installation_id: context.and_then(selected_installation_id),
             workspace_root: self.root_for_path(path),
             project_scope,
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
@@ -9481,6 +9508,19 @@ impl Workspace {
         diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         check_workspace_cancel(cancel)?;
         Ok(diagnostic_uris)
+    }
+
+    fn invalidate_selection_contexts(
+        &mut self,
+        keys: &HashSet<ContextKey>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let affected = self.invalidate_contexts_with_control(keys, cancel, budget)?;
+        for uri in affected {
+            self.schedule_diagnostics(uri);
+        }
+        Ok(())
     }
 
     fn invalidate_metadata_for_uri(
@@ -13993,6 +14033,7 @@ mod tests {
 
     fn budget_test_context_key(index: usize) -> ContextKey {
         ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(PathBuf::from(format!("/workspace-{index}"))),
             project_scope: None,
@@ -15112,6 +15153,59 @@ mod tests {
     }
 
     #[test]
+    fn installation_selection_is_project_scoped_and_invalid_choices_are_transactional() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let source_a = root.join("A/Main.pas");
+        let project_a = root.join("A/Main.dproj");
+        let project_b = root.join("B/Main.dproj");
+        fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(project_b.parent().unwrap()).unwrap();
+        fs::write(&source_a, "unit Main; interface implementation end.").unwrap();
+        fs::write(&project_a, "<Project><PropertyGroup><DCCReference Include=\"Main.pas\"/></PropertyGroup></Project>").unwrap();
+        fs::write(&project_b, "<Project><PropertyGroup/></Project>").unwrap();
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            r#"
+[installations."10.0".properties]
+BDS = '/fake/10'
+[installations."37.0".properties]
+BDS = '/fake/37'
+"#,
+        )
+        .unwrap();
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let uri_a = Url::from_file_path(&project_a).unwrap();
+        let uri_b = Url::from_file_path(&project_b).unwrap();
+        let before_b = workspace.installation_context(&uri_b).unwrap();
+        let invalid = workspace.select_installation(&uri_a, Some("99.0"));
+        assert!(invalid.is_err());
+        assert_eq!(
+            workspace
+                .installation_context(&uri_a)
+                .unwrap()
+                .selected_installation_id,
+            None
+        );
+
+        workspace.select_installation(&uri_a, Some("37.0")).unwrap();
+        let after_b = workspace.installation_context(&uri_b).unwrap();
+        assert_eq!(
+            before_b.selected_installation_id,
+            after_b.selected_installation_id
+        );
+        assert_eq!(
+            workspace
+                .installation_context(&uri_a)
+                .unwrap()
+                .selected_installation_id
+                .as_deref(),
+            Some("37.0")
+        );
+    }
+
+    #[test]
     fn compiled_virtual_content_is_bound_to_a_live_authorized_context() {
         let temp = tempfile::tempdir().expect("temporary authorized path");
         let fixture_root = temp.path().join("dcu");
@@ -15134,6 +15228,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(fixture_root.clone()),
             project_scope: None,
@@ -15273,6 +15368,7 @@ mod tests {
         .uri()
         .clone();
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
@@ -15388,6 +15484,7 @@ mod tests {
             "regression requires a validated DCU provider"
         );
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
@@ -15467,6 +15564,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: context.project_file.clone(),
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
@@ -15521,6 +15619,7 @@ mod tests {
             fs::write(&source_path, source).expect("write importer");
             let source_uri = Url::from_file_path(&source_path).expect("source URI");
             let key = ContextKey {
+                installation_id: None,
                 project_file: None,
                 workspace_root: Some(root.to_path_buf()),
                 project_scope: None,
@@ -15683,6 +15782,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
@@ -15747,6 +15847,7 @@ mod tests {
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
         let context = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: None,
             project_scope: None,
@@ -15806,6 +15907,7 @@ mod tests {
         fs::write(&second, "package Second; end.").expect("second descriptor");
         let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -15898,6 +16000,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root),
             project_scope: None,
@@ -15967,6 +16070,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -16017,6 +16121,7 @@ mod tests {
         fs::write(&package_path, "package Shared; end.").expect("package descriptor");
         let source = root.join("Main.pas");
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -16080,6 +16185,7 @@ mod tests {
         const EXISTING: usize = 1_200;
         let root = PathBuf::from("/tmp/package-watch-index");
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -16141,6 +16247,7 @@ mod tests {
             .expect("project candidate");
         }
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -16188,6 +16295,7 @@ mod tests {
             .expect("project candidate");
         }
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -17110,6 +17218,7 @@ mod tests {
             options: WorkspaceOptions::default(),
             overrides: OverrideSession::new(None),
             project_selections: HashMap::new(),
+            installation_selections: HashMap::new(),
             document_owners: HashMap::new(),
             overlays,
             cached_documents: HashMap::new(),
@@ -18155,6 +18264,7 @@ mod tests {
     fn legacy_route_proof_requires_the_exact_source_and_owner_context() {
         let source = PathBuf::from("/external/Helper.pas");
         let key = super::ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/workspace/A.dproj")),
             workspace_root: Some(PathBuf::from("/workspace")),
             project_scope: Some(PathBuf::from("/workspace")),
@@ -18189,6 +18299,7 @@ mod tests {
     fn legacy_route_proof_uses_native_case_sensitive_source_comparison() {
         let source = PathBuf::from("/external/Helper.pas");
         let key = super::ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/workspace/App.dproj")),
             workspace_root: Some(PathBuf::from("/workspace")),
             project_scope: Some(PathBuf::from("/workspace")),
@@ -18809,6 +18920,7 @@ mod tests {
 
         let mut workspace = test_workspace(vec![root.clone()], Default::default());
         let key = super::ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root),
             project_scope: None,
@@ -18871,6 +18983,7 @@ mod tests {
         symlink(&outside, mapped_a.join("escape")).expect("source escape symlink");
 
         let key_for = |mapped_root: PathBuf| super::ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: None,
             project_scope: None,
@@ -18951,6 +19064,7 @@ mod tests {
         fs::write(&custom_excluded, "package Shared; end.\n").expect("custom excluded descriptor");
 
         let key = super::ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(workspace_root.clone()),
             project_scope: None,

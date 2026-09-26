@@ -2941,6 +2941,7 @@ fn discover_project_file(
                 &directory,
                 "project files",
                 file,
+                false,
                 roots,
                 options,
                 overrides,
@@ -2975,6 +2976,7 @@ fn discover_project_file(
             &directory,
             "DPR/DPK files",
             file,
+            true,
             roots,
             options,
             overrides,
@@ -3012,6 +3014,7 @@ fn choose_project_candidate(
     directory: &Path,
     kind: &str,
     file: &Path,
+    allow_membership_selection: bool,
     roots: &[PathBuf],
     options: &ProjectOptions,
     overrides: &OverrideSession,
@@ -3114,7 +3117,7 @@ fn choose_project_candidate(
         }
     }
 
-    if owned.len() == 1 && !incomplete && !budget.exhausted {
+    if allow_membership_selection && owned.len() == 1 && !incomplete && !budget.exhausted {
         return ProjectSelection::Selected {
             path: owned.pop().expect("one owned candidate"),
             explicit: false,

@@ -377,7 +377,8 @@ impl Workspace {
     ) -> Result<ProjectContextPreparation, String> {
         let uri = canonical_file_uri(uri);
         let path = document_path(&uri)?;
-        let context_key = self.context_for_uri_with_cancel_and_budget(&uri, cancel, budget)?;
+        let context_key =
+            self.context_for_project_protocol_anchor_with_control(&uri, cancel, budget)?;
         let context = self
             .contexts
             .get(&context_key)

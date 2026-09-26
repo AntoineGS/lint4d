@@ -3,6 +3,8 @@
 use super::{Workspace, absolute_path, check_workspace_cancel, path_starts_with_native};
 use lsp_types::Url;
 use serde::Serialize;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -34,16 +36,39 @@ impl Workspace {
         anchor: &Url,
         cancel: &AtomicBool,
     ) -> Result<ProjectCatalogue, String> {
+        self.list_projects_with_limits(
+            anchor,
+            cancel,
+            MAX_CATALOGUE_VISITS,
+            MAX_CATALOGUE_BYTES,
+            MAX_CATALOGUE_TIME,
+        )
+    }
+
+    fn list_projects_with_limits(
+        &self,
+        anchor: &Url,
+        cancel: &AtomicBool,
+        visit_limit: usize,
+        byte_limit: usize,
+        time_limit: Duration,
+    ) -> Result<ProjectCatalogue, String> {
         check_workspace_cancel(Some(cancel))?;
         let anchor_path = anchor
             .to_file_path()
             .map_err(|_| format!("project catalogue requires a file URI: {anchor}"))?;
-        let anchor_path = absolute_path(anchor_path);
-        let root = self
+        let anchor_path = fs::canonicalize(absolute_path(anchor_path))
+            .map_err(|error| format!("project catalogue anchor is unavailable: {error}"))?;
+        let (root, root_path) = self
             .roots
             .iter()
-            .filter(|root| path_starts_with_native(&anchor_path, &root.path))
-            .max_by_key(|root| root.path.components().count())
+            .filter_map(|root| {
+                fs::canonicalize(&root.path)
+                    .ok()
+                    .filter(|physical_root| path_starts_with_native(&anchor_path, physical_root))
+                    .map(|physical_root| (root, physical_root))
+            })
+            .max_by_key(|(_, physical_root)| physical_root.components().count())
             .ok_or_else(|| {
                 format!(
                     "project catalogue anchor is outside configured workspace roots: {}",
@@ -57,8 +82,7 @@ impl Workspace {
         let mut projects = Vec::new();
         let mut warnings = Vec::new();
         let mut complete = true;
-        let root_path = &root.path;
-        let walker = WalkDir::new(root_path)
+        let walker = WalkDir::new(&root_path)
             .follow_links(false)
             .sort_by_file_name()
             .into_iter()
@@ -67,25 +91,26 @@ impl Workspace {
                     return true;
                 }
                 let path = entry.path();
-                !entry.file_type().is_symlink() && !root.excludes.is_excluded(path, root_path)
+                !entry.file_type().is_symlink() && !root.excludes.is_excluded(path, &root_path)
             });
 
         let mut walker = walker;
         loop {
             check_workspace_cancel(Some(cancel))?;
-            if started.elapsed() >= MAX_CATALOGUE_TIME {
+            if started.elapsed() >= time_limit {
                 complete = false;
                 warnings.push("project catalogue time limit reached".to_owned());
-                break;
-            }
-            if visited >= MAX_CATALOGUE_VISITS {
-                complete = false;
-                warnings.push("project catalogue entry limit reached".to_owned());
                 break;
             }
             let Some(entry) = walker.next() else {
                 break;
             };
+            visited = visited.saturating_add(1);
+            if visited > visit_limit {
+                complete = false;
+                warnings.push("project catalogue entry limit reached".to_owned());
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -96,8 +121,7 @@ impl Workspace {
                     continue;
                 }
             };
-            visited = visited.saturating_add(1);
-            if started.elapsed() >= MAX_CATALOGUE_TIME {
+            if started.elapsed() >= time_limit {
                 complete = false;
                 warnings.push("project catalogue time limit reached".to_owned());
                 break;
@@ -110,8 +134,11 @@ impl Workspace {
             {
                 continue;
             }
-            let relative = entry.path().strip_prefix(root_path).unwrap_or(entry.path());
-            let label = relative.to_string_lossy().replace('\\', "/");
+            let relative = entry
+                .path()
+                .strip_prefix(&root_path)
+                .unwrap_or(entry.path());
+            let label = relative_label(relative);
             let project_uri = Url::from_file_path(entry.path()).map_err(|_| {
                 format!(
                     "could not convert project path to URI: {}",
@@ -119,7 +146,7 @@ impl Workspace {
                 )
             })?;
             let retained = label.len().saturating_add(project_uri.as_str().len());
-            if bytes.saturating_add(retained) > MAX_CATALOGUE_BYTES {
+            if bytes.saturating_add(retained) > byte_limit {
                 complete = false;
                 warnings.push("project catalogue retained-byte limit reached".to_owned());
                 break;
@@ -135,6 +162,57 @@ impl Workspace {
             warnings,
         })
     }
+}
+
+fn relative_label(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(label_component(part)),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(unix)]
+fn label_component(component: &std::ffi::OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    fn escape_valid(text: &str, output: &mut String) {
+        output.push_str(&text.replace('%', "%25").replace('\\', "%5C"));
+    }
+
+    let mut remaining = component.as_bytes();
+    let mut output = String::new();
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                escape_valid(text, &mut output);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    // `valid_up_to` is guaranteed to identify a UTF-8 boundary.
+                    escape_valid(
+                        std::str::from_utf8(&remaining[..valid]).unwrap(),
+                        &mut output,
+                    );
+                }
+                let invalid = error.error_len().unwrap_or(remaining.len() - valid).max(1);
+                for byte in &remaining[valid..valid + invalid] {
+                    output.push_str(&format!("%{byte:02X}"));
+                }
+                remaining = &remaining[valid + invalid..];
+            }
+        }
+    }
+    output
+}
+
+#[cfg(not(unix))]
+fn label_component(component: &std::ffi::OsStr) -> String {
+    component.to_string_lossy().replace('%', "%25")
 }
 
 #[cfg(test)]
@@ -187,6 +265,144 @@ mod tests {
                 .list_projects(&Url::from_file_path(temp.path()).unwrap(), &cancel)
                 .unwrap_err()
                 .contains("cancel")
+        );
+    }
+
+    #[test]
+    fn dproj_is_not_an_analyzable_document_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("App.dproj");
+        write(&project);
+        let mut workspace =
+            Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        assert!(
+            workspace
+                .context_for_uri(&Url::from_file_path(project).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn anchor_must_be_existing_and_physically_inside_the_authorized_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("root-sibling");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        let missing = root.join("missing.txt");
+        assert!(
+            workspace
+                .list_projects(
+                    &Url::from_file_path(missing).unwrap(),
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+        );
+        assert!(
+            workspace
+                .list_projects(
+                    &Url::from_file_path(&outside).unwrap(),
+                    &AtomicBool::new(false)
+                )
+                .unwrap_err()
+                .contains("outside")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_anchor_cannot_escape_the_authorized_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        write(&outside.join("outside.dproj"));
+        symlink(&outside, root.join("escape")).unwrap();
+        let workspace = Workspace::new(vec![root.clone()], WorkspaceOptions::default());
+        assert!(
+            workspace
+                .list_projects(
+                    &Url::from_file_path(root.join("escape/outside.dproj")).unwrap(),
+                    &AtomicBool::new(false)
+                )
+                .unwrap_err()
+                .contains("outside")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn labels_preserve_unix_component_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(&root.join("apps/One/App.dproj"));
+        write(&root.join("apps/One\\App.dproj"));
+        write(&root.join(OsString::from_vec(b"bad\xff.dproj".to_vec())));
+        let workspace = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let catalogue = workspace
+            .list_projects(&Url::from_file_path(root).unwrap(), &AtomicBool::new(false))
+            .unwrap();
+        let labels = catalogue
+            .projects
+            .iter()
+            .map(|project| project.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(
+            labels,
+            vec!["apps/One%5CApp.dproj", "apps/One/App.dproj", "bad%FF.dproj"]
+        );
+        let uris = catalogue
+            .projects
+            .iter()
+            .map(|project| project.project_uri.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(uris.len(), 3);
+    }
+
+    #[test]
+    fn reaching_visit_limit_is_complete_only_if_iterator_is_exhausted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(&root.join("One.dproj"));
+        write(&root.join("Two.dproj"));
+        let workspace = Workspace::new(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let anchor = Url::from_file_path(root).unwrap();
+        let exact = workspace
+            .list_projects_with_limits(
+                &anchor,
+                &AtomicBool::new(false),
+                3,
+                1024,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(
+            exact.complete,
+            "root + two files exhausts exactly three entries"
+        );
+        let truncated = workspace
+            .list_projects_with_limits(
+                &anchor,
+                &AtomicBool::new(false),
+                2,
+                1024,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(!truncated.complete);
+        assert!(
+            truncated
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("entry limit"))
         );
     }
 }

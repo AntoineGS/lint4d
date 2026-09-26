@@ -8210,6 +8210,25 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, false)
+    }
+
+    pub(crate) fn context_for_project_protocol_anchor_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<ContextKey, String> {
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, true)
+    }
+
+    fn context_for_uri_with_cancel_and_budget_anchor_policy(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        allow_project_anchor: bool,
+    ) -> Result<ContextKey, String> {
         let path = uri
             .to_file_path()
             .map(absolute_path)
@@ -8217,7 +8236,8 @@ impl Workspace {
         let is_project_protocol_anchor = path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"));
-        if !is_analyzable_source_path(&path) && !is_project_protocol_anchor {
+        if !(is_analyzable_source_path(&path) || allow_project_anchor && is_project_protocol_anchor)
+        {
             return Err(format!(
                 "unsupported Pascal document path: {}",
                 path.display()

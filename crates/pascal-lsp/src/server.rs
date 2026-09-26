@@ -6562,9 +6562,14 @@ impl AnalysisJobs {
                 let mut request = request;
                 let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
                 let capture = (|| {
+                    if matches!(&request, AnalysisRequest::ListProjects { .. }) {
+                        // Repository browsing gets only the validation performed
+                        // by list_projects itself. Do not pre-scan nearest
+                        // projects or inspect project configuration here.
+                        return Ok::<_, String>((None, None));
+                    }
                     let (path, snapshot) = match &mut request {
                         AnalysisRequest::ProjectContext { uri, snapshot }
-                        | AnalysisRequest::ListProjects { uri, snapshot }
                         | AnalysisRequest::SelectProject { uri, snapshot, .. } => (
                             uri.to_file_path()
                                 .map_err(|_| format!("document URI must be a file URI: {uri}"))?,
@@ -6587,7 +6592,7 @@ impl AnalysisJobs {
                         _ => unreachable!("only project protocol requests use this worker"),
                     };
                     let read_set = snapshot.capture_read_set(&path, &budget)?;
-                    Ok::<_, String>((path, read_set))
+                    Ok::<_, String>((Some(path), Some(read_set)))
                 })();
                 let result = match capture {
                     Err(error) => Err(error),
@@ -6746,24 +6751,29 @@ impl AnalysisJobs {
                 });
                 match result {
                     Ok((response, mut snapshot)) => {
-                        let membership_current = match &response {
-                            ProjectOperationResponse::ProjectContext { prepared, .. } => read_set
-                                .candidate_membership_matches(&prepared.info.candidates, &budget),
-                            ProjectOperationResponse::SelectProject { prepared } => read_set
-                                .candidate_membership_matches(
-                                    &prepared.context.info.candidates,
-                                    &budget,
-                                ),
-                            _ => Ok(true),
-                        };
-                        match (
-                            snapshot.read_set_is_current(&input_path, &read_set, &budget),
-                            membership_current,
-                        ) {
-                            (Ok(true), Ok(true)) => Ok(response),
-                            (Ok(false), _) => Err("project configuration or candidate set changed while resolving the request; retry the request".to_string()),
-                            (Ok(true), Ok(false)) => Err("project candidate membership changed while resolving the request; retry the request".to_string()),
-                            (_, Err(error)) | (Err(error), _) => Err(error),
+                        match (input_path.as_deref(), read_set.as_ref()) {
+                            (Some(input_path), Some(read_set)) => {
+                                let membership_current = match &response {
+                                    ProjectOperationResponse::ProjectContext { prepared, .. } => read_set
+                                        .candidate_membership_matches(&prepared.info.candidates, &budget),
+                                    ProjectOperationResponse::SelectProject { prepared } => read_set
+                                        .candidate_membership_matches(
+                                            &prepared.context.info.candidates,
+                                            &budget,
+                                        ),
+                                    _ => Ok(true),
+                                };
+                                match (
+                                    snapshot.read_set_is_current(input_path, read_set, &budget),
+                                    membership_current,
+                                ) {
+                                    (Ok(true), Ok(true)) => Ok(response),
+                                    (Ok(false), _) => Err("project configuration or candidate set changed while resolving the request; retry the request".to_string()),
+                                    (Ok(true), Ok(false)) => Err("project candidate membership changed while resolving the request; retry the request".to_string()),
+                                    (_, Err(error)) | (Err(error), _) => Err(error),
+                                }
+                            }
+                            _ => Ok(response),
                         }
                     }
                     Err(error) => Err(error),

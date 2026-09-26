@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectPathIssueKind {
     MissingReference,
+    MissingMainSource,
     MissingDirectory,
     UnresolvedProperty,
     Unreadable,

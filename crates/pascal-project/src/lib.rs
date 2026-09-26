@@ -4048,6 +4048,16 @@ fn build_project_context(
     };
     let main_source = main_source_entry.as_ref().map(|entry| entry.path.clone());
     if project_is_dproj && main_source.is_none() {
+        let main_source_raw = builder.property("mainsource").unwrap_or_default();
+        builder.path_issues.push(ProjectPathIssue {
+            kind: ProjectPathIssueKind::MissingMainSource,
+            source_file: project_file.clone(),
+            property: "MainSource".to_owned(),
+            raw: main_source_raw,
+            path: None,
+            unit_name: None,
+            provenance: ProjectPathProvenance::LegacyNative,
+        });
         builder.warnings.push(format!(
             "project has no resolvable MainSource: {}",
             project_file.display()

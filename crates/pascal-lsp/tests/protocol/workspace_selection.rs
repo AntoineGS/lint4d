@@ -6,8 +6,12 @@ fn list_projects_is_on_demand_and_advertised() {
     let root = directory.path();
     let first = root.join("apps/One/App.dproj");
     let second = root.join("apps/Two/App.dproj");
+    let anchor = root.join("README.md");
     write_file(&first, "not parsed");
     write_file(&second, "not parsed");
+    write_file(&anchor, "catalogue anchor");
+    let local_config = root.join(".delphi-tools.local.toml");
+    write_file(&local_config, "[properties]\nBDS = '/sdk'\n");
     let mut server = TestServer::launch();
     let capabilities = server.initialize(root, Value::Null);
     assert_eq!(
@@ -17,16 +21,30 @@ fn list_projects_is_on_demand_and_advertised() {
     let id = RequestId::from("list-projects".to_owned());
     let mut result = Value::Null;
     #[cfg(target_os = "linux")]
-    let opened = observed_open(&first, || {
-        server.send_request(
-            id.clone(),
-            "pascal/listProjects",
-            json!({"textDocument": {"uri": uri(&root.join("README.md"))}}),
-        );
-        let response = server.response(&id);
-        assert!(response.error.is_none(), "{response:?}");
-        result = response.result.unwrap();
-    });
+    let (opened, config_opened) = {
+        let opened = observed_open(&first, || {
+            server.send_request(
+                id.clone(),
+                "pascal/listProjects",
+                json!({"textDocument": {"uri": uri(&anchor)}}),
+            );
+            let response = server.response(&id);
+            assert!(response.error.is_none(), "{response:?}");
+            result = response.result.unwrap();
+        });
+        let config_opened = observed_open(&local_config, || {
+            let id = RequestId::from("list-projects-no-config-read".to_owned());
+            server.send_request(
+                id.clone(),
+                "pascal/listProjects",
+                json!({"textDocument": {"uri": uri(&anchor)}}),
+            );
+            let response = server.response(&id);
+            assert!(response.error.is_none(), "{response:?}");
+            result = response.result.unwrap();
+        });
+        (opened, config_opened)
+    };
     #[cfg(not(target_os = "linux"))]
     {
         server.send_request(
@@ -40,9 +58,36 @@ fn list_projects_is_on_demand_and_advertised() {
     }
     #[cfg(target_os = "linux")]
     assert!(!opened, "enumeration must not open .dproj contents");
+    #[cfg(target_os = "linux")]
+    assert!(
+        !config_opened,
+        "listing admission must not read project configuration"
+    );
     assert_eq!(result["complete"], true);
     assert_eq!(result["projects"][0]["label"], "apps/One/App.dproj");
     assert_eq!(result["projects"][1]["label"], "apps/Two/App.dproj");
+    server.shutdown();
+}
+
+#[test]
+fn list_projects_rejects_an_anchor_outside_the_workspace_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let outside = directory.path().join("root-sibling");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let anchor = outside.join("README.md");
+    write_file(&anchor, "outside");
+    let mut server = TestServer::launch();
+    server.initialize(&root, Value::Null);
+    let id = RequestId::from("list-projects-outside-root".to_owned());
+    server.send_request(
+        id.clone(),
+        "pascal/listProjects",
+        json!({"textDocument": {"uri": uri(&anchor)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_some());
     server.shutdown();
 }
 
@@ -76,6 +121,20 @@ fn deleted_catalogue_choice_does_not_replace_live_selection() {
     let (directory, unit, project_a, project_b) = ambiguous_projects();
     let mut server = TestServer::launch();
     server.initialize(directory.path(), Value::Null);
+    let browse = RequestId::from("browse-before-delete".to_owned());
+    server.send_request(
+        browse.clone(),
+        "pascal/listProjects",
+        json!({"textDocument": {"uri": uri(&unit)}}),
+    );
+    let catalogue = server.response(&browse).result.unwrap();
+    let stale_project = catalogue["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["projectUri"] == uri(&project_b).as_str())
+        .unwrap()["projectUri"]
+        .clone();
     let select = RequestId::from("select-live-a".to_owned());
     server.send_request(
         select.clone(),
@@ -88,7 +147,7 @@ fn deleted_catalogue_choice_does_not_replace_live_selection() {
     server.send_request(
         stale.clone(),
         "pascal/selectProject",
-        json!({"textDocument": {"uri": uri(&unit)}, "projectUri": uri(&project_b)}),
+        json!({"textDocument": {"uri": uri(&unit)}, "projectUri": stale_project}),
     );
     assert!(server.response(&stale).error.is_some());
     let context = project_context(&mut server, &unit, "stale-project");
@@ -117,6 +176,15 @@ fn project_context_without_main_source_remains_inspectable() {
     let result = response.result.unwrap();
     assert_eq!(result["selectedProjectUri"], uri(&project).as_str());
     assert!(result["mainSourceUri"].is_null());
+    assert!(
+        result["pathIssues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| {
+                issue["kind"] == "MissingMainSource" && issue["property"] == "MainSource"
+            })
+    );
     assert!(result["warnings"].as_array().is_some());
     server.shutdown();
 }

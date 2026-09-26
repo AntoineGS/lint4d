@@ -7,6 +7,7 @@ pub(super) const REQUEST_PREFIX: &str = "pascal-project-choice-";
 const MAX_OUTSTANDING: usize = 32;
 const MAX_RETAINED_BYTES: usize = 256 * 1024;
 const MAX_DISMISSED: usize = 256;
+const MAX_DISMISSED_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct PromptKey {
@@ -36,9 +37,25 @@ pub(super) struct PromptState {
     retained_bytes: usize,
     dismissed: HashSet<PromptKey>,
     dismissed_order: VecDeque<PromptKey>,
+    dismissed_bytes: usize,
 }
 
 impl PromptState {
+    pub fn is_request_id(&self, id: &RequestId) -> bool {
+        serde_json::to_value(id)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .is_some_and(|value| value.starts_with(REQUEST_PREFIX))
+    }
+
+    pub fn key_for_response(&self, response: &Response) -> Option<&PromptKey> {
+        self.pending.get(&response.id).map(|pending| &pending.key)
+    }
+
+    pub fn key_for_id(&self, id: &RequestId) -> Option<&PromptKey> {
+        self.pending.get(id).map(|pending| &pending.key)
+    }
+
     pub fn begin(
         &mut self,
         key: PromptKey,
@@ -48,18 +65,17 @@ impl PromptState {
         {
             return None;
         }
-        let bytes = prompt_key_bytes(&key).saturating_add(
-            choices
-                .iter()
-                .map(|(title, choice)| {
-                    title.len()
-                        + match choice {
-                            PromptChoice::Project(uri) => uri.as_str().len(),
-                            PromptChoice::Installation(id) => id.len(),
-                        }
-                })
-                .sum::<usize>(),
-        );
+        let bytes = choices
+            .iter()
+            .fold(prompt_key_bytes(&key), |bytes, (title, choice)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, PromptChoice)>())
+                    .saturating_add(title.len())
+                    .saturating_add(match choice {
+                        PromptChoice::Project(uri) => uri.as_str().len(),
+                        PromptChoice::Installation(id) => id.len(),
+                    })
+            });
         if choices.is_empty() || bytes > MAX_RETAINED_BYTES {
             return None;
         }
@@ -132,16 +148,33 @@ impl PromptState {
             }
             self.pending_order.retain(|pending_id| pending_id != &id);
         }
+        let removed_dismissed = self
+            .dismissed_order
+            .iter()
+            .filter(|key| &key.scope_uri == scope)
+            .map(prompt_key_bytes)
+            .sum::<usize>();
         self.dismissed.retain(|key| &key.scope_uri != scope);
         self.dismissed_order.retain(|key| &key.scope_uri != scope);
+        self.dismissed_bytes = self.dismissed_bytes.saturating_sub(removed_dismissed);
     }
 
     fn dismiss(&mut self, key: PromptKey) {
+        let bytes = prompt_key_bytes(&key);
+        if bytes > MAX_DISMISSED_BYTES {
+            return;
+        }
         if self.dismissed.insert(key.clone()) {
+            self.dismissed_bytes = self.dismissed_bytes.saturating_add(bytes);
             self.dismissed_order.push_back(key);
         }
-        while self.dismissed_order.len() > MAX_DISMISSED {
+        while self.dismissed_order.len() > MAX_DISMISSED
+            || self.dismissed_bytes > MAX_DISMISSED_BYTES
+        {
             if let Some(oldest) = self.dismissed_order.pop_front() {
+                self.dismissed_bytes = self
+                    .dismissed_bytes
+                    .saturating_sub(prompt_key_bytes(&oldest));
                 self.dismissed.remove(&oldest);
             }
         }
@@ -149,10 +182,18 @@ impl PromptState {
 }
 
 fn prompt_key_bytes(key: &PromptKey) -> usize {
-    key.scope_uri.as_str().len()
-        + key.project_uri.as_ref().map_or(0, |uri| uri.as_str().len())
-        + key.candidates.iter().map(String::len).sum::<usize>()
-        + std::mem::size_of::<PromptKey>()
+    key.candidates.iter().fold(
+        key.scope_uri
+            .as_str()
+            .len()
+            .saturating_add(key.project_uri.as_ref().map_or(0, |uri| uri.as_str().len()))
+            .saturating_add(std::mem::size_of::<PromptKey>()),
+        |bytes, candidate| {
+            bytes
+                .saturating_add(std::mem::size_of::<String>())
+                .saturating_add(candidate.len())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -193,5 +234,66 @@ mod tests {
         let dismissal = Response::new_ok(id, serde_json::Value::Null);
         assert!(state.answer(&dismissal, &prompt_key).is_none());
         assert!(state.begin(prompt_key, choices).is_none());
+    }
+
+    #[test]
+    fn outstanding_prompts_are_bounded_and_actions_map_to_retained_choices() {
+        let mut state = PromptState::default();
+        let candidates = ["file:///workspace/a.dproj", "file:///workspace/b.dproj"];
+        let choices = vec![
+            (
+                "a.dproj".to_owned(),
+                PromptChoice::Project(Url::parse(candidates[0]).unwrap()),
+            ),
+            (
+                "b.dproj".to_owned(),
+                PromptChoice::Project(Url::parse(candidates[1]).unwrap()),
+            ),
+        ];
+        let mut first = None;
+        for generation in 0..(MAX_OUTSTANDING as u64 + 1) {
+            let mut prompt_key = key(&candidates);
+            prompt_key.generation = generation;
+            let request = state
+                .begin(prompt_key, choices.clone())
+                .expect("prompt should fit the bounded state");
+            first.get_or_insert(request.id);
+        }
+        assert_eq!(state.pending.len(), MAX_OUTSTANDING);
+        let stale = Response::new_ok(first.unwrap(), json!({"title": "a.dproj"}));
+        assert!(state.key_for_response(&stale).is_none());
+
+        let active = state
+            .pending_order
+            .back()
+            .cloned()
+            .expect("last prompt retained");
+        let response = Response::new_ok(active, json!({"title": "b.dproj"}));
+        let active_key = state.key_for_response(&response).unwrap().clone();
+        assert_eq!(
+            state.answer(&response, &active_key),
+            Some(PromptChoice::Project(Url::parse(candidates[1]).unwrap()))
+        );
+    }
+
+    #[test]
+    fn error_and_stale_responses_never_choose_a_project() {
+        let mut state = PromptState::default();
+        let current = key(&["file:///workspace/a.dproj", "file:///workspace/b.dproj"]);
+        let choices = vec![(
+            "a.dproj".to_owned(),
+            PromptChoice::Project(Url::parse("file:///workspace/a.dproj").unwrap()),
+        )];
+        let error_request = state.begin(current.clone(), choices.clone()).unwrap();
+        let error = Response::new_err(error_request.id, -32601, "unsupported".to_owned());
+        assert!(state.answer(&error, &current).is_none());
+
+        let mut newer = current.clone();
+        newer.generation += 1;
+        let stale_request = state.begin(newer.clone(), choices).unwrap();
+        let mut changed = newer;
+        changed.generation += 1;
+        let stale = Response::new_ok(stale_request.id, json!({"title": "a.dproj"}));
+        assert!(state.answer(&stale, &changed).is_none());
     }
 }

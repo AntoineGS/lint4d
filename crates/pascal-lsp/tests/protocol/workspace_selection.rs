@@ -1,5 +1,46 @@
 use super::*;
 
+fn ambiguous_projects() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let unit = root.join("src/Unit.pas");
+    let project_a = root.join("src/A.dproj");
+    let project_b = root.join("src/B.dproj");
+    write_file(&unit, "unit Unit; interface implementation end.");
+    let contents =
+        "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>";
+    write_file(&project_a, contents);
+    write_file(&project_b, contents);
+    (directory, unit, project_a, project_b)
+}
+
+fn open_automatic_unit(server: &mut TestServer, unit: &std::path::Path) {
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(unit), "languageId": "pascal", "version": 1,
+            "text": "unit Unit; interface implementation end."
+        }}),
+    );
+}
+
+fn project_context(server: &mut TestServer, unit: &std::path::Path, suffix: &str) -> Value {
+    let id = RequestId::from(format!("project-prompt-context-{suffix}"));
+    server.send_request(
+        id.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(unit)}}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    response.result.unwrap()
+}
+
 #[test]
 fn automatic_project_ambiguity_asks_the_client_to_choose_a_project() {
     let directory = tempfile::tempdir().unwrap();
@@ -44,20 +85,283 @@ fn automatic_project_ambiguity_asks_the_client_to_choose_a_project() {
     let actions = request.params["actions"].as_array().unwrap();
     assert_eq!(actions.len(), 2);
     let chosen = actions[0].clone();
-    server.send(Message::Response(Response::new_ok(request.id, chosen)));
-
-    let context_id = RequestId::from("automatic-project-prompt-context".to_owned());
+    let ordinary_id = RequestId::from("ordinary-while-project-prompt-pending".to_owned());
     server.send_request(
-        context_id.clone(),
-        "pascal/projectContext",
+        ordinary_id.clone(),
+        "textDocument/documentSymbol",
         json!({"textDocument": {"uri": uri(&root.join("src/Unit.pas"))}}),
     );
-    let context = server.response(&context_id);
-    assert!(context.error.is_none(), "{context:?}");
-    assert_eq!(
-        context.result.unwrap()["selectedProjectUri"],
-        uri(&project_a).as_str()
+    let ordinary = server.response(&ordinary_id);
+    assert!(ordinary.error.is_none(), "{ordinary:?}");
+
+    let response = Response::new_ok(request.id, chosen);
+    server.send(Message::Response(response.clone()));
+    server.send(Message::Response(response));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let expected = uri(&project_a).to_string();
+    let mut selected_uri = Value::Null;
+    let mut attempt = 0;
+    while Instant::now() < deadline && selected_uri != expected {
+        let context_id = RequestId::from(format!("automatic-project-prompt-context-{attempt}"));
+        attempt += 1;
+        server.send_request(
+            context_id.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&root.join("src/Unit.pas"))}}),
+        );
+        let context = server.response(&context_id);
+        if context.error.is_none() {
+            selected_uri = context.result.unwrap()["selectedProjectUri"].clone();
+        }
+        if selected_uri != expected {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(selected_uri, expected);
+    server.shutdown();
+}
+
+#[test]
+fn stale_automatic_answer_cannot_override_a_manual_project_choice() {
+    let (directory, unit, project_a, project_b) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project prompt");
+
+    let manual = RequestId::from("manual-project-choice-before-prompt-answer".to_owned());
+    server.send_request(
+        manual.clone(),
+        "pascal/selectProject",
+        json!({
+            "textDocument": {"uri": uri(&unit)},
+            "projectUri": uri(&project_b)
+        }),
     );
+    let actions = prompt.params["actions"].as_array().unwrap();
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        actions[0].clone(),
+    )));
+    let manual_response = server.response(&manual);
+    assert!(manual_response.error.is_none(), "{manual_response:?}");
+    let mut context = Value::Null;
+    for attempt in 0..10 {
+        context = project_context(&mut server, &unit, &attempt.to_string());
+        if context["selectedProjectUri"] == uri(&project_b).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(context["selectedProjectUri"], uri(&project_b).as_str());
+    assert_ne!(context["selectedProjectUri"], uri(&project_a).as_str());
+    server.shutdown();
+}
+
+#[test]
+fn removing_prompt_candidate_before_reply_does_not_select_it() {
+    let (directory, unit, project_a, project_b) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project prompt");
+    fs::remove_file(&project_a).unwrap();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&project_a), "type": 3}]}),
+    );
+    let fence = RequestId::from("candidate-removal-fence".to_owned());
+    server.send_request(
+        fence.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&unit)}}),
+    );
+    let _ = server.response(&fence);
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        prompt.params["actions"][0].clone(),
+    )));
+    let mut context = Value::Null;
+    for attempt in 0..10 {
+        context = project_context(&mut server, &unit, &format!("removed-{attempt}"));
+        if context["selectedProjectUri"] == uri(&project_b).as_str() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(context["selectedProjectUri"], uri(&project_b).as_str());
+    server.shutdown();
+}
+
+#[test]
+fn changed_candidate_set_rejects_old_project_prompt_answer() {
+    let (directory, unit, _, _) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project prompt");
+    let added_project = directory.path().join("src/C.dproj");
+    write_file(
+        &added_project,
+        "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&added_project), "type": 1}]}),
+    );
+    let fence = RequestId::from("candidate-addition-fence".to_owned());
+    server.send_request(
+        fence.clone(),
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri(&unit)}}),
+    );
+    let _ = server.response(&fence);
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        prompt.params["actions"][0].clone(),
+    )));
+    let context = project_context(&mut server, &unit, "changed-candidate-set");
+    assert_eq!(context["candidates"].as_array().unwrap().len(), 3);
+    assert!(context["selectedProjectUri"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn dismissing_prompt_allows_new_document_generation_to_prompt_again() {
+    let (directory, unit, _, _) = ambiguous_projects();
+    let second_unit = directory.path().join("src/Second.pas");
+    write_file(&second_unit, "unit Second; interface implementation end.");
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("first prompt");
+    server.send(Message::Response(Response::new_ok(prompt.id, Value::Null)));
+    open_automatic_unit(&mut server, &second_unit);
+    let next = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("new document generation should prompt again");
+    assert_eq!(next.params["actions"].as_array().unwrap().len(), 2);
+    server.send(Message::Response(Response::new_ok(next.id, Value::Null)));
+    server.shutdown();
+}
+
+#[test]
+fn arbitrary_prompt_title_is_not_interpreted_as_a_project_path() {
+    let (directory, unit, _, _) = ambiguous_projects();
+    let mut server = TestServer::launch();
+    server.initialize(directory.path(), Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("automatic project prompt");
+    server.send(Message::Response(Response::new_ok(
+        prompt.id,
+        json!({"title": "../../outside/Injected.dproj"}),
+    )));
+    let context = project_context(&mut server, &unit, "untrusted-title");
+    assert!(context["selectedProjectUri"].is_null());
+    server.shutdown();
+}
+
+#[test]
+fn project_prompt_finishes_before_installation_prompt_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut config = String::new();
+    for version in ["7.0", "37.0"] {
+        let sdk = root.join("sdk").join(version);
+        let ide = root.join("ide").join(version);
+        write_file(
+            &sdk.join("bin/rsvars.bat"),
+            &format!("@SET BDS=C:\\SDK\\{version}\n"),
+        );
+        write_file(
+            &ide.join("EnvOptions.proj"),
+            "<Project><PropertyGroup><Win32LibraryPath>$(BDS)\\source</Win32LibraryPath></PropertyGroup></Project>",
+        );
+        write_file(
+            &sdk.join("source/SdkUnit.pas"),
+            "unit SdkUnit; interface implementation end.",
+        );
+        config.push_str(&format!(
+            "[installations.\"{version}\".properties]\nBDS='{}'\nAPPDATA='{}'\nEnvironmentSettings='{}/EnvOptions.proj'\n",
+            sdk.display(), ide.display(), ide.display(),
+        ));
+    }
+    let unit = root.join("src/Unit.pas");
+    write_file(&unit, "unit Unit; interface implementation end.");
+    for project in ["A.dproj", "B.dproj"] {
+        write_file(
+            &root.join("src").join(project),
+            "<Project><PropertyGroup><MainSource>Unit.pas</MainSource></PropertyGroup></Project>",
+        );
+    }
+    write_file(&root.join(".delphi-tools.local.toml"), &config);
+
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+    open_automatic_unit(&mut server, &unit);
+    let project_prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("project prompt first");
+    server.send(Message::Response(Response::new_ok(
+        project_prompt.id,
+        project_prompt.params["actions"][0].clone(),
+    )));
+    let installation_prompt = server
+        .request_with_timeout("window/showMessageRequest", Duration::from_secs(5))
+        .expect("installation prompt after project selection");
+    assert_eq!(
+        installation_prompt.params["message"],
+        "Choose the Delphi installation to use"
+    );
+    assert_eq!(
+        installation_prompt.params["actions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let installation_action = installation_prompt.params["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["title"] == "37.0")
+        .unwrap()
+        .clone();
+    server.send(Message::Response(Response::new_ok(
+        installation_prompt.id,
+        installation_action,
+    )));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut installation = Value::Null;
+    let mut attempt = 0;
+    while Instant::now() < deadline && installation != "37.0" {
+        let id = RequestId::from(format!("installation-after-prompt-{attempt}"));
+        attempt += 1;
+        server.send_request(
+            id.clone(),
+            "pascal/installationContext",
+            json!({"projectUri": uri(&root.join("src/A.dproj"))}),
+        );
+        let response = server.response(&id);
+        if response.error.is_none() {
+            installation = response.result.unwrap()["selectedInstallationId"].clone();
+        }
+        if installation != "37.0" {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(installation, "37.0");
     server.shutdown();
 }
 

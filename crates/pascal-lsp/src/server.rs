@@ -1,7 +1,6 @@
 //! Synchronous stdio LSP protocol loop for the Pascal navigation workspace.
 
 #[path = "server/project_prompts.rs"]
-#[allow(dead_code)]
 mod project_prompts;
 
 #[cfg(test)]
@@ -140,6 +139,7 @@ const MAX_COALESCED_STALE_TARGET_URI_BYTES: usize = 16 * 1024 * 1024;
 /// state must not become an alternate unbounded queue.
 const MAX_PROGRESS_ENTRIES: usize = 128;
 const MAX_PROGRESS_CREATES: usize = 32;
+const MAX_AUTOMATIC_PROMPT_ANSWERS: usize = 32;
 const PROGRESS_CREATE_REQUEST_PREFIX: &str = "pascal-lsp-progress-create-";
 const PROGRESS_TOKEN_PREFIX: &str = "pascal-lsp-progress-";
 const DIAGNOSTIC_REFRESH_REQUEST_PREFIX: &str = "pascal-lsp-diagnostic-refresh-";
@@ -5110,11 +5110,22 @@ struct AnalysisJobs {
     compiled_content_payload_budget: CompiledContentPayloadBudget,
     completion_resolutions: CompletionResolutionStore,
     diagnostic_results: DiagnosticPullStore,
+    project_prompts: project_prompts::PromptState,
+    prompt_sources: HashMap<RequestId, Url>,
+    automatic_discovery_requests: HashMap<RequestId, Url>,
+    automatic_apply_requests: HashMap<RequestId, Url>,
+    automatic_answer_requests: HashMap<RequestId, AutomaticPromptAnswer>,
+    next_automatic_discovery: u64,
     progress: ProgressTracker,
     test_barriers: TestBarrierConfig,
     next_computation_id: u64,
     shutting_down: bool,
     configuration_watch_sync_pending: bool,
+}
+
+struct AutomaticPromptAnswer {
+    key: project_prompts::PromptKey,
+    source_uri: Url,
 }
 
 #[derive(Debug)]
@@ -5154,6 +5165,68 @@ impl CompiledContentPayloadBudget {
 }
 
 impl AnalysisJobs {
+    fn invalidate_project_prompts_for_scope(&mut self, scope: &Url) {
+        let stale = self
+            .prompt_sources
+            .keys()
+            .filter(|id| {
+                self.project_prompts
+                    .key_for_id(id)
+                    .is_some_and(|key| &key.scope_uri == scope)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.prompt_sources.remove(&id);
+        }
+        self.project_prompts.invalidate_scope(scope);
+        self.prompt_sources
+            .retain(|id, _| self.project_prompts.key_for_id(id).is_some());
+    }
+
+    fn invalidate_project_prompts_for_source(&mut self, source_uri: &Url) {
+        let scopes = self
+            .prompt_sources
+            .iter()
+            .filter_map(|(id, source)| {
+                let key = self.project_prompts.key_for_id(id)?;
+                (source == source_uri || uri_is_within_scope(source_uri, &key.scope_uri))
+                    .then(|| key.scope_uri.clone())
+            })
+            .collect::<HashSet<_>>();
+        for scope in scopes {
+            self.invalidate_project_prompts_for_scope(&scope);
+        }
+    }
+
+    fn invalidate_project_prompts_for_project(&mut self, project_uri: &Url) {
+        let scopes = self
+            .prompt_sources
+            .keys()
+            .filter_map(|id| {
+                let key = self.project_prompts.key_for_id(id)?;
+                (key.project_uri.as_ref() == Some(project_uri)).then(|| key.scope_uri.clone())
+            })
+            .collect::<HashSet<_>>();
+        for scope in scopes {
+            self.invalidate_project_prompts_for_scope(&scope);
+        }
+    }
+
+    fn remove_prompts_for_closed_source(&mut self, source_uri: &Url) {
+        let scopes = self
+            .prompt_sources
+            .iter()
+            .filter_map(|(id, source)| {
+                let key = self.project_prompts.key_for_id(id)?;
+                (source == source_uri).then(|| key.scope_uri.clone())
+            })
+            .collect::<HashSet<_>>();
+        for scope in scopes {
+            self.invalidate_project_prompts_for_scope(&scope);
+        }
+    }
+
     #[cfg(test)]
     fn new() -> Self {
         Self::with_test_barriers_and_progress(TestBarrierConfig::disabled(), false)
@@ -5181,6 +5254,12 @@ impl AnalysisJobs {
             ),
             completion_resolutions: CompletionResolutionStore::new(),
             diagnostic_results: DiagnosticPullStore::new(),
+            project_prompts: project_prompts::PromptState::default(),
+            prompt_sources: HashMap::new(),
+            automatic_discovery_requests: HashMap::new(),
+            automatic_apply_requests: HashMap::new(),
+            automatic_answer_requests: HashMap::new(),
+            next_automatic_discovery: 0,
             progress: ProgressTracker::new(server_progress_supported),
             test_barriers,
             next_computation_id: 0,
@@ -8057,6 +8136,12 @@ impl AnalysisJobs {
                     }
                 }
                 AnalysisJobId::Client(primary_id) => {
+                    let selected_project_successfully = matches!(
+                        &result.value,
+                        AnalysisResultValue::ProjectOperation(Ok(
+                            ProjectOperationResponse::SelectProject { .. }
+                        ))
+                    );
                     let project_context_result = matches!(
                         &result.value,
                         AnalysisResultValue::ProjectOperation(Ok(
@@ -8070,6 +8155,16 @@ impl AnalysisJobs {
                     self.compiled_content_payload_budget.release(&primary_id);
                     let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
                     let recipients = job.recipients;
+                    let primary_request_id = recipients.first().map(|recipient| &recipient.id);
+                    let automatic_discovery_uri = primary_request_id
+                        .and_then(|id| self.automatic_discovery_requests.remove(id));
+                    let automatic_apply_uri =
+                        primary_request_id.and_then(|id| self.automatic_apply_requests.remove(id));
+                    let automatic_answer =
+                        primary_request_id.and_then(|id| self.automatic_answer_requests.remove(id));
+                    let stale_automatic_answer = automatic_answer.as_ref().is_some_and(|answer| {
+                        !automatic_prompt_answer_is_current(workspace, &result, answer)
+                    });
                     let key = job.key;
                     let _ = job.handle.join();
                     self.remove_observation(key.as_ref(), &primary_id);
@@ -8092,6 +8187,39 @@ impl AnalysisJobs {
                                     AnalysisJobId::Client(primary_id),
                                     &recipient.id,
                                     Some("Cancelled"),
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
+                        }
+                    } else if let Some(source_uri) = automatic_discovery_uri {
+                        self.maybe_prompt_project_context(
+                            connection, workspace, &result, source_uri,
+                        )?;
+                        for recipient in &recipients {
+                            self.remove_client_mapping(&recipient.id, &primary_id);
+                            self.release_partial_token(recipient);
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    None,
+                                )
+                                .map_err(|error| -> Box<dyn Error + Send + Sync> {
+                                    error.into()
+                                })?;
+                        }
+                    } else if stale_automatic_answer {
+                        for recipient in &recipients {
+                            self.remove_client_mapping(&recipient.id, &primary_id);
+                            self.release_partial_token(recipient);
+                            self.progress
+                                .finish_recipient(
+                                    Some(connection),
+                                    AnalysisJobId::Client(primary_id),
+                                    &recipient.id,
+                                    Some("Stale project choice"),
                                 )
                                 .map_err(|error| -> Box<dyn Error + Send + Sync> {
                                     error.into()
@@ -8132,6 +8260,13 @@ impl AnalysisJobs {
                             if project_context_result {
                                 self.configuration_watch_sync_pending = true;
                             }
+                            if selected_project_successfully {
+                                if let Some(uri) = automatic_apply_uri {
+                                    queue_automatic_project_discovery(
+                                        connection, workspace, self, uri, false, false,
+                                    )?;
+                                }
+                            }
                         }
                     }
                 }
@@ -8145,6 +8280,91 @@ impl AnalysisJobs {
 
     fn take_configuration_watch_sync_pending(&mut self) -> bool {
         std::mem::take(&mut self.configuration_watch_sync_pending)
+    }
+
+    fn maybe_prompt_project_context(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        workspace: &Workspace,
+        result: &AnalysisResult,
+        source_uri: Url,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if analysis_result_is_stale(workspace, result)
+            || workspace.document_identity(&source_uri).1.is_none()
+        {
+            return Ok(());
+        }
+        let AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::ProjectContext {
+            prepared,
+            ..
+        })) = &result.value
+        else {
+            return Ok(());
+        };
+        let info = &prepared.info;
+        let (project_uri, candidates, choices, message) = if info.selection_mode == "ambiguous"
+            && info.selected_project_uri.is_none()
+            && info.candidates.len() > 1
+        {
+            let choices = info
+                .candidates
+                .iter()
+                .map(|uri| {
+                    (
+                        project_prompt_title(uri),
+                        project_prompts::PromptChoice::Project(uri.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                None,
+                info.candidates.iter().map(ToString::to_string).collect(),
+                choices,
+                "Choose the Delphi project to load",
+            )
+        } else if info.selected_project_uri.is_some()
+            && info.selected_installation_id.is_none()
+            && !info.installation_candidates.is_empty()
+        {
+            let Some(project_uri) = info.selected_project_uri.clone() else {
+                return Ok(());
+            };
+            let choices = info
+                .installation_candidates
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        project_prompts::PromptChoice::Installation(id.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                Some(project_uri),
+                info.installation_candidates.clone(),
+                choices,
+                "Choose the Delphi installation to use",
+            )
+        } else {
+            return Ok(());
+        };
+        let Some(scope_uri) = info.scope_uri.clone() else {
+            return Ok(());
+        };
+        let key = project_prompts::PromptKey {
+            scope_uri,
+            project_uri,
+            generation: project_prompt_generation(workspace),
+            candidates,
+        };
+        let Some(request) = self.project_prompts.begin(key, choices) else {
+            return Ok(());
+        };
+        self.prompt_sources.insert(request.id.clone(), source_uri);
+        let mut request = request;
+        request.params["message"] = serde_json::json!(message);
+        connection.send_control(Message::Request(request))?;
+        Ok(())
     }
 
     fn is_empty(&self) -> bool {
@@ -10457,6 +10677,14 @@ fn event_loop(
                     continue;
                 }
                 let notification_method = notification.method.clone();
+                let automatic_discovery_uri = (notification_method == "textDocument/didOpen")
+                    .then(|| notification.params["textDocument"]["uri"].as_str())
+                    .flatten()
+                    .and_then(|value| Url::parse(value).ok());
+                let closed_document_uri = (notification_method == "textDocument/didClose")
+                    .then(|| notification.params["textDocument"]["uri"].as_str())
+                    .flatten()
+                    .and_then(|value| Url::parse(value).ok());
                 let result = if notification_method == "initialized" {
                     configuration.on_initialized(connection)?;
                     Ok(DiagnosticNotificationEffect::default())
@@ -10497,6 +10725,9 @@ fn event_loop(
                 };
                 match result {
                     Ok(effect) => {
+                        if let Some(closed_uri) = closed_document_uri {
+                            jobs.remove_prompts_for_closed_source(&closed_uri);
+                        }
                         if !pull_diagnostics_supported {
                             if let Some(cursor) = effect.clear_publication_cursor {
                                 pending_diagnostic_clears
@@ -10551,6 +10782,16 @@ fn event_loop(
                             )
                             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         }
+                        if let Some(uri) = automatic_discovery_uri {
+                            queue_automatic_project_discovery(
+                                connection,
+                                workspace,
+                                &mut jobs,
+                                uri,
+                                pull_diagnostics_supported,
+                                pull_related_diagnostics_supported,
+                            )?;
+                        }
                     }
                     Err(error) => {
                         eprintln!("pascal-lsp: notification handling failed: {error}");
@@ -10571,6 +10812,74 @@ fn event_loop(
                         deferred_workspace_message_bytes,
                         deferred_workspace_overflow.as_ref(),
                     );
+                    continue;
+                }
+                if jobs.project_prompts.is_request_id(&response.id) {
+                    if let Some(key) = jobs.project_prompts.key_for_response(&response).cloned() {
+                        let source_uri = jobs.prompt_sources.remove(&response.id);
+                        let source_is_live = source_uri
+                            .as_ref()
+                            .is_some_and(|uri| workspace.document_identity(uri).1.is_some());
+                        let current_generation = project_prompt_generation(workspace);
+                        let choice = if source_is_live && key.generation == current_generation {
+                            jobs.project_prompts.answer(&response, &key)
+                        } else {
+                            jobs.invalidate_project_prompts_for_scope(&key.scope_uri);
+                            None
+                        };
+                        if let (Some(source_uri), Some(choice)) = (source_uri, choice) {
+                            if jobs.automatic_answer_requests.len() >= MAX_AUTOMATIC_PROMPT_ANSWERS
+                            {
+                                continue;
+                            }
+                            let (method, params) = match choice {
+                                project_prompts::PromptChoice::Project(project_uri) => (
+                                    "pascal/selectProject",
+                                    serde_json::json!({
+                                        "textDocument": {"uri": source_uri},
+                                        "projectUri": project_uri,
+                                    }),
+                                ),
+                                project_prompts::PromptChoice::Installation(installation_id) => (
+                                    "pascal/selectInstallation",
+                                    serde_json::json!({
+                                        "projectUri": key.project_uri,
+                                        "installationId": installation_id,
+                                    }),
+                                ),
+                            };
+                            let id = RequestId::from(format!(
+                                "pascal-project-answer-{}",
+                                jobs.next_automatic_discovery
+                            ));
+                            jobs.next_automatic_discovery =
+                                jobs.next_automatic_discovery.wrapping_add(1);
+                            jobs.automatic_answer_requests.insert(
+                                id.clone(),
+                                AutomaticPromptAnswer {
+                                    key: key.clone(),
+                                    source_uri: source_uri.clone(),
+                                },
+                            );
+                            if method == "pascal/selectProject" {
+                                jobs.automatic_apply_requests
+                                    .insert(id.clone(), source_uri.clone());
+                            }
+                            handle_request(
+                                connection,
+                                workspace,
+                                Request::new(id.clone(), method.to_owned(), params),
+                                project_operation_client_features(),
+                                pull_diagnostics_supported,
+                                pull_related_diagnostics_supported,
+                                &mut jobs,
+                            )?;
+                            if !jobs.request_to_job.contains_key(&id) {
+                                jobs.automatic_answer_requests.remove(&id);
+                                jobs.automatic_apply_requests.remove(&id);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if diagnostic_refresh.handle_response(connection, &response)? {
@@ -10886,6 +11195,40 @@ fn deferred_request_is_current(
             || deferred.preceding_document_notification
     });
     configuration_current && document_current
+}
+
+fn queue_automatic_project_discovery(
+    connection: &dyn ProtocolSender,
+    workspace: &mut Workspace,
+    jobs: &mut AnalysisJobs,
+    uri: Url,
+    pull_diagnostics_supported: bool,
+    pull_related_diagnostics_supported: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let id = RequestId::from(format!(
+        "pascal-project-discovery-{}",
+        jobs.next_automatic_discovery
+    ));
+    jobs.next_automatic_discovery = jobs.next_automatic_discovery.wrapping_add(1);
+    jobs.automatic_discovery_requests
+        .insert(id.clone(), uri.clone());
+    handle_request(
+        connection,
+        workspace,
+        Request::new(
+            id.clone(),
+            "pascal/projectContext".to_owned(),
+            serde_json::json!({"textDocument": {"uri": uri}}),
+        ),
+        project_operation_client_features(),
+        pull_diagnostics_supported,
+        pull_related_diagnostics_supported,
+        jobs,
+    )?;
+    if !jobs.request_to_job.contains_key(&id) {
+        jobs.automatic_discovery_requests.remove(&id);
+    }
+    Ok(())
 }
 
 fn handle_request(
@@ -11290,6 +11633,7 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            jobs.invalidate_project_prompts_for_project(&params.project_uri);
             let project_path = params.project_uri.to_file_path().ok();
             let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
             start_analysis(
@@ -11315,6 +11659,7 @@ fn handle_request(
                     return Ok(());
                 }
             };
+            jobs.invalidate_project_prompts_for_source(&params.text_document.uri);
             let project = if params.project_uri.is_null() {
                 None
             } else {
@@ -13430,6 +13775,92 @@ fn server_capabilities(
         });
     }
     capabilities
+}
+
+fn project_prompt_title(uri: &Url) -> String {
+    let path = uri.path();
+    let mut components = path.rsplit('/').filter(|component| !component.is_empty());
+    let name = components.next().unwrap_or(path);
+    let parent = components.next();
+    parent.map_or_else(|| name.to_owned(), |parent| format!("{parent}/{name}"))
+}
+
+fn uri_is_within_scope(uri: &Url, scope: &Url) -> bool {
+    match (uri.to_file_path(), scope.to_file_path()) {
+        (Ok(uri), Ok(scope)) => uri.starts_with(scope),
+        _ => false,
+    }
+}
+
+fn project_prompt_generation(workspace: &Workspace) -> u64 {
+    workspace
+        .source_generation()
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(workspace.configuration_generation())
+}
+
+fn automatic_prompt_answer_is_current(
+    workspace: &Workspace,
+    result: &AnalysisResult,
+    answer: &AutomaticPromptAnswer,
+) -> bool {
+    if answer.key.generation != project_prompt_generation(workspace)
+        || workspace.document_identity(&answer.source_uri).1.is_none()
+    {
+        return false;
+    }
+    match &result.value {
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::SelectProject {
+            prepared,
+        })) => {
+            let candidates = prepared
+                .context
+                .info
+                .candidates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let selected = prepared
+                .context
+                .info
+                .selected_project_uri
+                .as_ref()
+                .map(ToString::to_string);
+            candidates == answer.key.candidates
+                && selected.is_some_and(|selected| candidates.contains(&selected))
+        }
+        AnalysisResultValue::ProjectOperation(Ok(
+            ProjectOperationResponse::SelectInstallation { value, .. },
+        )) => value["candidates"].as_array().is_some_and(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                == answer.key.candidates
+        }),
+        _ => false,
+    }
+}
+
+fn project_operation_client_features() -> ClientFeatures {
+    ClientFeatures {
+        action_resolve: false,
+        action_disabled: false,
+        document_changes: false,
+        rename_file: false,
+        will_rename_files: false,
+        hierarchical_document_symbols: false,
+        hover_format: DocumentationFormat::PlainText,
+        completion_format: DocumentationFormat::PlainText,
+        completion_snippet_support: false,
+        completion_resolve_documentation: false,
+        completion_resolve_detail: false,
+        signature_help_format: DocumentationFormat::PlainText,
+        folding_range_limit: None,
+        line_folding_only: false,
+        folding_range_kind_value_set: None,
+    }
 }
 
 fn client_features(client: &ClientCapabilities) -> ClientFeatures {

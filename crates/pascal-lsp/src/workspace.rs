@@ -9516,11 +9516,116 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
+        let mut context_sources = Vec::new();
+        let mut context_metadata = Vec::new();
+        for key in keys {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if let Some(state) = self.contexts.get(key) {
+                if let Some(main_source) = state.context.main_source.as_ref() {
+                    context_sources.try_reserve(1).map_err(|error| {
+                        format!("could not reserve changed project sources: {error}")
+                    })?;
+                    context_sources.push(main_source.clone());
+                }
+                for path in &state.context.metadata_files {
+                    check_workspace_cancel(cancel)?;
+                    if let Some(budget) = budget {
+                        budget.charge_path_visits(1)?;
+                    }
+                    context_metadata.try_reserve(1).map_err(|error| {
+                        format!("could not reserve changed project metadata: {error}")
+                    })?;
+                    context_metadata.push(path.clone());
+                }
+            }
+        }
         let affected = self.invalidate_contexts_with_control(keys, cancel, budget)?;
+        for path in context_sources {
+            if let Ok(uri) = Url::from_file_path(path) {
+                mark_dependency_change(
+                    &mut self.source_change_generations,
+                    &uri,
+                    self.source_generation,
+                    false,
+                );
+            }
+        }
+        for path in context_metadata {
+            if let Ok(uri) = Url::from_file_path(path) {
+                mark_dependency_change(
+                    &mut self.configuration_change_generations,
+                    &uri,
+                    self.configuration_generation,
+                    false,
+                );
+            }
+        }
         for uri in affected {
+            mark_dependency_change(
+                &mut self.source_change_generations,
+                &uri,
+                self.source_generation,
+                false,
+            );
+            mark_dependency_change(
+                &mut self.configuration_change_generations,
+                &uri,
+                self.configuration_generation,
+                false,
+            );
             self.schedule_diagnostics(uri);
         }
         Ok(())
+    }
+
+    fn selection_context_keys_for_scope(&self, selection_scope: &Path) -> HashSet<ContextKey> {
+        let mut affected = self
+            .contexts
+            .keys()
+            .filter(|key| {
+                key.selection_scope
+                    .as_ref()
+                    .is_some_and(|candidate| paths_equal_ci(candidate, selection_scope))
+                    || key
+                        .project_scope
+                        .as_ref()
+                        .is_some_and(|candidate| paths_equal_ci(candidate, selection_scope))
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        // A file opened before a nearer project appeared can retain an
+        // ancestor owner. It is still a prospective dependent of a selection
+        // scoped below that ancestor, so include owners by their document path
+        // as well as by the scopes retained in their old keys.
+        for (uri, key) in self
+            .document_contexts
+            .iter()
+            .chain(self.open_document_contexts.iter())
+        {
+            if uri
+                .to_file_path()
+                .ok()
+                .map(absolute_path)
+                .is_some_and(|document| path_starts_with_native(&document, selection_scope))
+            {
+                affected.insert(key.clone());
+            }
+        }
+        for (uri, owner) in &self.document_owners {
+            if uri
+                .to_file_path()
+                .ok()
+                .map(absolute_path)
+                .is_some_and(|document| path_starts_with_native(&document, selection_scope))
+            {
+                affected.insert(owner.key.clone());
+            }
+        }
+        affected
     }
 
     fn invalidate_metadata_for_uri(
@@ -15158,12 +15263,22 @@ mod tests {
         let root = temp.path();
         let source_a = root.join("A/Main.pas");
         let project_a = root.join("A/Main.dproj");
+        let source_b = root.join("B/Main.pas");
+        let provider_b = root.join("B/Provider.pas");
+        let shared = root.join("Shared.pas");
         let project_b = root.join("B/Main.dproj");
         fs::create_dir_all(source_a.parent().unwrap()).unwrap();
         fs::create_dir_all(project_b.parent().unwrap()).unwrap();
         fs::write(&source_a, "unit Main; interface implementation end.").unwrap();
         fs::write(&project_a, "<Project><PropertyGroup><DCCReference Include=\"Main.pas\"/></PropertyGroup></Project>").unwrap();
-        fs::write(&project_b, "<Project><PropertyGroup/></Project>").unwrap();
+        fs::write(
+            &source_b,
+            "unit Main; interface uses Provider; implementation end.",
+        )
+        .unwrap();
+        fs::write(&provider_b, "unit Provider; interface implementation end.").unwrap();
+        fs::write(&shared, "unit Shared; interface implementation end.").unwrap();
+        fs::write(&project_b, "<Project><PropertyGroup><DCCReference Include=\"Main.pas\"/><DCCReference Include=\"Provider.pas\"/><DCCReference Include=\"../Shared.pas\"/></PropertyGroup></Project>").unwrap();
         fs::write(
             root.join(".delphi-tools.local.toml"),
             r#"
@@ -15178,6 +15293,38 @@ BDS = '/fake/37'
         let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
         let uri_a = Url::from_file_path(&project_a).unwrap();
         let uri_b = Url::from_file_path(&project_b).unwrap();
+        let source_b_uri = Url::from_file_path(&source_b).unwrap();
+        let source_a_uri = Url::from_file_path(&source_a).unwrap();
+        workspace
+            .open_document(
+                source_a_uri.clone(),
+                fs::read_to_string(&source_a).unwrap(),
+                1,
+            )
+            .unwrap();
+        workspace.project_context(&source_a_uri).unwrap();
+        workspace
+            .open_document(
+                source_b_uri.clone(),
+                fs::read_to_string(&source_b).unwrap(),
+                1,
+            )
+            .unwrap();
+        workspace.project_context(&source_b_uri).unwrap();
+        let b_key = workspace
+            .document_contexts
+            .get(&source_b_uri)
+            .unwrap()
+            .clone();
+        let before_b_context = workspace.contexts.get(&b_key).unwrap().context.clone();
+        assert_eq!(
+            before_b_context.explicit_units.get("provider"),
+            Some(&vec![provider_b.clone()])
+        );
+        assert_eq!(
+            before_b_context.explicit_units.get("shared"),
+            Some(&vec![shared.clone()])
+        );
         let before_b = workspace.installation_context(&uri_b).unwrap();
         let invalid = workspace.select_installation(&uri_a, Some("99.0"));
         assert!(invalid.is_err());
@@ -15190,10 +15337,35 @@ BDS = '/fake/37'
         );
 
         workspace.select_installation(&uri_a, Some("37.0")).unwrap();
+        workspace.project_context(&source_a_uri).unwrap();
+        let a_key = workspace.document_contexts.get(&source_a_uri).unwrap();
+        assert_eq!(a_key.installation_id.as_deref(), Some("37.0"));
         let after_b = workspace.installation_context(&uri_b).unwrap();
         assert_eq!(
             before_b.selected_installation_id,
             after_b.selected_installation_id
+        );
+        assert_eq!(workspace.document_contexts.get(&source_b_uri), Some(&b_key));
+        assert!(workspace.contexts.contains_key(&b_key));
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&b_key)
+                .unwrap()
+                .context
+                .explicit_units
+                .get("provider"),
+            Some(&vec![provider_b])
+        );
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&b_key)
+                .unwrap()
+                .context
+                .explicit_units
+                .get("shared"),
+            Some(&vec![shared])
         );
         assert_eq!(
             workspace
@@ -15202,6 +15374,226 @@ BDS = '/fake/37'
                 .selected_installation_id
                 .as_deref(),
             Some("37.0")
+        );
+        workspace
+            .installation_selections
+            .insert(project_a.clone(), "99.0".to_string());
+        let stale = workspace.installation_context(&uri_a).unwrap();
+        assert_eq!(stale.selected_installation_id, None);
+        assert_eq!(stale.selection_mode, "invalid");
+        assert!(!stale.warnings.is_empty());
+    }
+
+    #[test]
+    fn installation_switch_rejects_a_completed_result_using_the_old_project_context() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let source = root.join("App.pas");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><DCCReference Include=\"App.pas\"/></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&source, "unit App; interface implementation end.").unwrap();
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            r#"
+[installations."10.0".properties]
+BDS = '/fake/10'
+[installations."37.0".properties]
+BDS = '/fake/37'
+"#,
+        )
+        .unwrap();
+        let source_uri = Url::from_file_path(&source).unwrap();
+        let project_uri = Url::from_file_path(&project).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(source_uri.clone(), fs::read_to_string(&source).unwrap(), 1)
+            .unwrap();
+        workspace.project_context(&source_uri).unwrap();
+
+        let old_source_generation = workspace.source_generation;
+        let old_configuration_generation = workspace.configuration_generation;
+        let old_result = super::rename::SourceRecord {
+            uri: source_uri.clone(),
+            text: "unit App; interface implementation end.".to_string(),
+            version: None,
+            stamp: None,
+            open: false,
+            path: Some(source.clone()),
+            path_stamp: None,
+            content_hash: None,
+            parsed_text_hash: None,
+            content_bytes: None,
+            candidate_membership: None,
+            candidate_observations: Vec::new(),
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            document_link_missing_candidate: false,
+            directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
+        };
+        assert!(
+            workspace
+                .dependency_scoped_result_is_fresh(
+                    old_source_generation,
+                    old_configuration_generation,
+                    std::slice::from_ref(&old_result),
+                )
+                .is_ok()
+        );
+
+        workspace
+            .select_installation(&project_uri, Some("37.0"))
+            .unwrap();
+        assert!(
+            workspace
+                .dependency_scoped_result_is_fresh(
+                    old_source_generation,
+                    old_configuration_generation,
+                    &[old_result],
+                )
+                .is_err(),
+            "result captured against the previous installation must not be deliverable"
+        );
+    }
+
+    #[test]
+    fn project_switch_invalidates_an_inherited_owner_in_the_prospective_scope() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let scope = root.join("nested");
+        fs::create_dir_all(&scope).unwrap();
+        let source = scope.join("Shared.pas");
+        let ancestor_project = root.join("Root.dproj");
+        let prospective_project = scope.join("Nested.dproj");
+        let other_scope = root.join("other");
+        fs::create_dir_all(&other_scope).unwrap();
+        let other_source = other_scope.join("Other.pas");
+        let other_project = other_scope.join("Other.dproj");
+        fs::write(&source, "unit Shared; interface implementation end.").unwrap();
+        fs::write(
+            &ancestor_project,
+            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
+        fs::write(&other_source, "unit Other; interface implementation end.").unwrap();
+        fs::write(&other_project, "<Project><PropertyGroup><DCCReference Include=\"Other.pas\"/></PropertyGroup></Project>").unwrap();
+        let source_uri = Url::from_file_path(&source).unwrap();
+        let other_uri = Url::from_file_path(&other_source).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(source_uri.clone(), fs::read_to_string(&source).unwrap(), 1)
+            .unwrap();
+        workspace
+            .open_document(
+                other_uri.clone(),
+                fs::read_to_string(&other_source).unwrap(),
+                1,
+            )
+            .unwrap();
+        workspace.project_context(&other_uri).unwrap();
+        let other_key = workspace.document_contexts.get(&other_uri).unwrap().clone();
+        let before = workspace.project_context(&source_uri).unwrap();
+        assert_eq!(
+            before.selected_project_uri,
+            Some(Url::from_file_path(&ancestor_project).unwrap())
+        );
+        let old_key = workspace
+            .document_contexts
+            .get(&source_uri)
+            .unwrap()
+            .clone();
+        assert_ne!(
+            old_key.project_scope.as_deref(),
+            Some(scope.as_path()),
+            "test must use an inherited owner outside the prospective scope: {old_key:?}"
+        );
+        assert_ne!(
+            old_key.selection_scope.as_deref(),
+            Some(scope.as_path()),
+            "test must require prospective ownership discovery: {old_key:?}"
+        );
+        assert!(
+            workspace
+                .selection_context_keys_for_scope(&scope)
+                .contains(&old_key),
+            "a source under the prospective selection scope must invalidate its inherited owner"
+        );
+
+        fs::write(
+            &prospective_project,
+            "<Project><PropertyGroup><MainSource>Nested.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(scope.join("Nested.dpr"), "program Nested; begin end.").unwrap();
+        workspace
+            .select_project(
+                &source_uri,
+                Some(&Url::from_file_path(&prospective_project).unwrap()),
+            )
+            .unwrap();
+        assert!(
+            workspace
+                .source_change_generations
+                .contains_key(&source_uri)
+        );
+        assert!(
+            workspace
+                .configuration_change_generations
+                .contains_key(&source_uri)
+        );
+        assert!(
+            !workspace.contexts.contains_key(&old_key),
+            "inherited ancestor owner remained cached"
+        );
+        assert_eq!(
+            workspace.document_contexts.get(&other_uri),
+            Some(&other_key)
+        );
+        assert!(
+            workspace.contexts.contains_key(&other_key),
+            "unrelated project's context was invalidated"
+        );
+        assert_eq!(
+            workspace
+                .project_context(&source_uri)
+                .unwrap()
+                .selected_project_uri,
+            Some(Url::from_file_path(&prospective_project).unwrap())
+        );
+    }
+
+    #[test]
+    fn deleted_project_selection_is_rejected_without_changing_the_live_choice() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let source = root.join("Main.pas");
+        let project_a = root.join("A.dproj");
+        let project_b = root.join("B.dproj");
+        fs::write(&source, "unit Main; interface implementation end.").unwrap();
+        fs::write(&project_a, "<Project><PropertyGroup/></Project>").unwrap();
+        fs::write(&project_b, "<Project><PropertyGroup/></Project>").unwrap();
+        let uri = Url::from_file_path(&source).unwrap();
+        let a_uri = Url::from_file_path(&project_a).unwrap();
+        let b_uri = Url::from_file_path(&project_b).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        workspace.select_project(&uri, Some(&a_uri)).unwrap();
+        fs::remove_file(&project_b).unwrap();
+        assert!(workspace.select_project(&uri, Some(&b_uri)).is_err());
+        assert_eq!(
+            workspace
+                .project_context(&uri)
+                .unwrap()
+                .selected_project_uri,
+            Some(a_uri)
         );
     }
 

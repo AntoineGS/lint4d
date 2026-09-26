@@ -122,7 +122,14 @@ impl Workspace {
         let project_path = project_path(project_uri)?;
         let (project, candidates, selected) =
             self.installation_selection_snapshot(&project_path)?;
-        let selection_mode = if self.installation_selections.contains_key(&project_path) {
+        let selection_is_valid = selected.as_ref().is_none_or(|id| {
+            candidates
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(id))
+        });
+        let selection_mode = if !selection_is_valid {
+            "invalid"
+        } else if self.installation_selections.contains_key(&project_path) {
             "session"
         } else if project.configured_installation_for(&project_path).is_some() {
             "configured"
@@ -132,9 +139,16 @@ impl Workspace {
         Ok(InstallationContextInfo {
             project_uri: canonical_file_uri(project_uri),
             candidates,
-            selected_installation_id: selected,
+            selected_installation_id: selection_is_valid.then(|| selected.clone()).flatten(),
             selection_mode: selection_mode.to_string(),
-            warnings: Vec::new(),
+            warnings: if selection_is_valid {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "selected Delphi installation `{}` is not currently configured for this project",
+                    selected.as_deref().unwrap_or_default()
+                )]
+            },
         })
     }
 
@@ -194,9 +208,9 @@ impl Workspace {
             })
             .cloned()
             .collect::<HashSet<_>>();
-        self.invalidate_selection_contexts(&keys, None, None)?;
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.invalidate_selection_contexts(&keys, None, None)?;
         self.installation_context(project_uri)
     }
 
@@ -316,25 +330,13 @@ impl Workspace {
         )?;
 
         let selection_scope = scope.clone();
-        let affected_keys =
-            self.contexts
-                .keys()
-                .filter(|key| {
-                    key.selection_scope
-                        .as_ref()
-                        .is_some_and(|candidate| project_paths_equal(candidate, &selection_scope))
-                        || key.project_scope.as_ref().is_some_and(|candidate| {
-                            project_paths_equal(candidate, &selection_scope)
-                        })
-                })
-                .cloned()
-                .collect::<HashSet<_>>();
+        let affected_keys = self.selection_context_keys_for_scope(&selection_scope);
         self.project_selections = tentative;
         self.document_owners.remove(&uri);
         self.owner_last_used.remove(&uri);
-        self.invalidate_selection_contexts(&affected_keys, None, None)?;
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.invalidate_selection_contexts(&affected_keys, None, None)?;
         self.project_context(&uri)
     }
 

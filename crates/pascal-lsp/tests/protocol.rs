@@ -29330,16 +29330,34 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
     );
 
     let owner_root = temp.path().join("owner");
-    let owner_source = owner_root.join("Owned.pas");
+    let owner_source = owner_root.join("proven/Owned.pas");
     write_file(&owner_source, "unit Owned; interface implementation end.");
     write_file(
-        &owner_root.join("OwnerA.dpr"),
+        &owner_root.join("proven/Owner.dpr"),
+        "program Owner; uses Owned in 'Owned.pas'; begin end.",
+    );
+    let proven_project = owner_root.join("proven/Owner.dproj");
+    write_file(
+        &proven_project,
+        "<Project><PropertyGroup><MainSource>Owner.dpr</MainSource></PropertyGroup></Project>",
+    );
+
+    let ambiguous_source = owner_root.join("ambiguous/Owned.pas");
+    write_file(
+        &ambiguous_source,
+        "unit Owned; interface implementation end.",
+    );
+    write_file(
+        &owner_root.join("ambiguous/OwnerA.dpr"),
         "program OwnerA; uses Owned in 'Owned.pas'; begin end.",
     );
-    write_file(&owner_root.join("OwnerB.dpr"), "program OwnerB; begin end.");
+    write_file(
+        &owner_root.join("ambiguous/OwnerB.dpr"),
+        "program OwnerB; begin end.",
+    );
     for name in ["OwnerA", "OwnerB"] {
         write_file(
-            &owner_root.join(format!("{name}.dproj")),
+            &owner_root.join(format!("ambiguous/{name}.dproj")),
             &format!(
                 "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
             ),
@@ -29355,7 +29373,18 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
             "automatic",
             Some(singleton_project),
         ),
-        ("owner-context", &owner_source, "ambiguous", None),
+        (
+            "proven-owner-context",
+            &owner_source,
+            "automatic",
+            Some(proven_project),
+        ),
+        (
+            "ambiguous-owner-context",
+            &ambiguous_source,
+            "ambiguous",
+            None,
+        ),
     ] {
         let id = RequestId::from(id.to_string());
         server.send_request(

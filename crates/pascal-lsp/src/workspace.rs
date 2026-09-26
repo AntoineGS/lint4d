@@ -6601,17 +6601,22 @@ impl Workspace {
             .collect::<HashSet<_>>();
         for (unit_name, unit) in compiled_by_name {
             check_workspace_cancel(cancel)?;
-            let Some(requested_name) = active_unavailable
+            let requested_names = active_unavailable
                 .iter()
-                .find(|name| name.eq_ignore_ascii_case(&unit_name))
+                .filter(|requested| {
+                    // Core applies unit aliases before browsing suppression;
+                    // match the validated canonical DCU back to every import
+                    // spelling that resolves through that alias.
+                    let resolved_name = context
+                        .unit_aliases
+                        .iter()
+                        .find(|(alias, _)| alias.eq_ignore_ascii_case(requested))
+                        .map_or(requested.as_str(), |(_, target)| target.as_str());
+                    resolved_name.eq_ignore_ascii_case(&unit_name)
+                })
                 .cloned()
-            else {
-                continue;
-            };
-            if bindings
-                .keys()
-                .any(|bound| bound.eq_ignore_ascii_case(&requested_name))
-            {
+                .collect::<Vec<_>>();
+            if requested_names.is_empty() {
                 continue;
             }
             self.index
@@ -6619,7 +6624,14 @@ impl Workspace {
                 .map_err(|error| format!("could not index compiled unit: {error}"))?;
             self.compiled_units
                 .insert(unit.document.uri().clone(), unit.clone());
-            bindings.insert(requested_name, unit.document.uri().clone());
+            for requested_name in requested_names {
+                if !bindings
+                    .keys()
+                    .any(|bound| bound.eq_ignore_ascii_case(&requested_name))
+                {
+                    bindings.insert(requested_name, unit.document.uri().clone());
+                }
+            }
             let (path, path_entry, content_hash) = unit.observation();
             if let Some(record) = rename::path_record_at(
                 path.to_path_buf(),
@@ -15416,6 +15428,90 @@ mod tests {
             .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
             .expect("compiled provider should bind");
         assert_eq!(provider.scheme(), "lint4d-dcu");
+    }
+
+    #[test]
+    fn compiled_alias_and_canonical_import_bind_to_one_validated_dcu() {
+        let temp = tempfile::tempdir().expect("temporary project root");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug")
+            .canonicalize()
+            .expect("fixture directory exists");
+        let browsing = temp.path().join("ide-source");
+        fs::create_dir_all(&browsing).expect("browsing directory");
+        fs::write(
+            browsing.join("Lint4dFixture.Classes.pas"),
+            "unit Lint4dFixture.Classes; interface implementation end.",
+        )
+        .expect("write browsing-only provider");
+        let source_path = temp.path().join("Consumer.pas");
+        let source =
+            "unit Consumer; interface uses OldUnit, Lint4dFixture.Classes; implementation end.";
+        fs::write(&source_path, source).expect("write importer");
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+        let context = ProjectContext {
+            discovery_complete: true,
+            project_file: Some(temp.path().join("App.dproj")),
+            unit_aliases: HashMap::from([(
+                "oldunit".to_string(),
+                "Lint4dFixture.Classes".to_string(),
+            )]),
+            browsing_path_entries: vec![ProjectPathEntry::legacy(browsing)],
+            debug_dcu_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
+            read_policy: ReadPolicy::new(
+                &[temp.path().to_path_buf(), fixture_root],
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let key = ContextKey {
+            project_file: context.project_file.clone(),
+            workspace_root: Some(temp.path().to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context,
+                ..ContextState::default()
+            },
+        );
+        workspace
+            .index
+            .update(source_uri.clone(), source.to_string())
+            .expect("index importer");
+        workspace
+            .document_contexts
+            .insert(source_uri.clone(), key.clone());
+        workspace
+            .load_imports_with_cancel(
+                &source_uri,
+                &key,
+                &mut HashSet::new(),
+                Some(&AtomicBool::new(false)),
+            )
+            .expect("resolve aliased imports");
+
+        let alias_provider = workspace
+            .index
+            .import_provider_uri(&source_uri, "OldUnit")
+            .expect("alias provider should bind");
+        let canonical_provider = workspace
+            .index
+            .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
+            .expect("canonical provider should bind");
+        assert_eq!(alias_provider.scheme(), "lint4d-dcu");
+        assert_eq!(alias_provider, canonical_provider);
     }
 
     #[test]

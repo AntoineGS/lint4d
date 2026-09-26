@@ -2165,8 +2165,39 @@ fn callable_types_bind_to_builtins(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<bool, String> {
-    if !document.unknown_imports.is_empty() {
+    // The normal no-System-source case uses the compiler's builtin fallback.
+    // An indexed but ambiguous, recovered, or conditionally unknown System
+    // provider is different: its absent candidates are not negative evidence.
+    if !matches!(
+        index.implicit_system_namespace_status(),
+        super::ImplicitSystemNamespaceStatus::Unavailable
+    ) || !document.unknown_imports.is_empty()
+    {
         return Ok(false);
+    }
+    for unit in
+        document.active_uses_with_budget(super::region_for_node(callable), cancel, budget)?
+    {
+        check_navigation_cancel(cancel)?;
+        let providers = index.unit_urls_for_import_with_budget(document, unit, cancel, budget)?;
+        let [provider_uri] = providers.as_slice() else {
+            return Ok(false);
+        };
+        let Some(provider) = index.documents.get(provider_uri) else {
+            return Ok(false);
+        };
+        budget.require_work(
+            provider
+                .parser_recovery_spans
+                .len()
+                .saturating_add(provider.conditionals.unknown_spans.len()),
+            cancel,
+        )?;
+        if !provider.parser_recovery_spans.is_empty()
+            || !provider.conditionals.unknown_spans.is_empty()
+        {
+            return Ok(false);
+        }
     }
     let mut type_nodes = Vec::with_capacity(2);
     if let Some(args) = callable.child_by_field_name("args") {

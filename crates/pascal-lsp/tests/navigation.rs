@@ -4010,6 +4010,109 @@ fn shadowed_boolean_in_declared_reference_does_not_prove_builtin_mismatch() {
 }
 
 #[test]
+fn missing_import_withholds_anonymous_builtin_signature_selection() {
+    let source = "unit LambdaImport;\ninterface\ntype TIntHandler = reference to procedure(Value: Integer);\n     TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nuses MissingUnit;\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaImport");
+    let mut index = NavigationIndex::new();
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("missing import fixture parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_ne!(
+        selected.len(),
+        1,
+        "missing import allowed a unique builtin lambda overload: {selected:?}"
+    );
+}
+
+#[test]
+fn ambiguous_indexed_system_withholds_anonymous_builtin_signature_selection() {
+    let source = "unit LambdaSystem;\ninterface\ntype TIntHandler = reference to procedure(Value: Integer);\n     TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaSystem");
+    let mut index = NavigationIndex::new();
+    for path in [
+        "file:///tmp/system-a/System.pas",
+        "file:///tmp/system-b/System.pas",
+    ] {
+        index
+            .update(
+                Url::parse(path).unwrap(),
+                "unit System; interface implementation end.".to_owned(),
+            )
+            .expect("System fixture parses");
+    }
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("ambiguous System consumer parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_ne!(
+        selected.len(),
+        1,
+        "ambiguous System selected a builtin lambda overload: {selected:?}"
+    );
+}
+
+#[test]
+fn conditionally_unknown_system_withholds_anonymous_builtin_signature_selection() {
+    let source = "unit LambdaConditionalSystem;\ninterface\ntype TIntHandler = reference to procedure(Value: Integer);\n     TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaConditionalSystem");
+    let mut index = NavigationIndex::new();
+    index.update(uri("System"), "unit System; interface {$IFDEF MAYBE} type Integer = Boolean; {$ENDIF} implementation end.".to_owned()).expect("conditional System parses");
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("consumer parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_ne!(
+        selected.len(),
+        1,
+        "conditional System selected a builtin callable overload: {selected:?}"
+    );
+}
+
+#[test]
+fn proven_single_import_keeps_builtin_anonymous_signature_selection() {
+    let source = "unit LambdaKnownImport;\ninterface\ntype TIntHandler = reference to procedure(Value: Integer);\n     TBoolHandler = reference to procedure(Value: Boolean);\nprocedure Choose(Handler: TIntHandler); overload;\nprocedure Choose(Handler: TBoolHandler); overload;\nimplementation\nuses KnownUnit;\nprocedure Choose(Handler: TIntHandler); begin end;\nprocedure Choose(Handler: TBoolHandler); begin end;\nprocedure Run;\nbegin\n  Choose(procedure(Value: Integer) begin end);\nend;\nend.\n";
+    let source_uri = uri("LambdaKnownImport");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            uri("KnownUnit"),
+            "unit KnownUnit; interface implementation end.".to_owned(),
+        )
+        .expect("known import parses");
+    index
+        .update(source_uri.clone(), source.to_owned())
+        .expect("consumer parses");
+    let selected = index.navigate(
+        &source_uri,
+        position_of(source, "Choose(procedure", 0),
+        NavigationTarget::Declaration,
+    );
+    assert_eq!(
+        selected.len(),
+        1,
+        "proven unrelated import suppressed builtin callable selection: {selected:?}"
+    );
+    assert_location_start(
+        &selected[0],
+        &source_uri,
+        position_of(source, "Choose(Handler: TIntHandler)", 0),
+    );
+}
+
+#[test]
 fn completion_projection_is_scope_aware_and_uses_plain_identifier_edits() {
     let mut index = NavigationIndex::new();
     let main_uri = uri("AssistanceMain");

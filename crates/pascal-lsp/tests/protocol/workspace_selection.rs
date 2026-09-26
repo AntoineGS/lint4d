@@ -551,6 +551,96 @@ fn selection_rejects_configuration_changed_before_worker_discovery() {
     server.shutdown();
 }
 
+#[test]
+fn installation_context_reconciles_cached_config_before_request_baseline() {
+    let fixture = selection_fixture();
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    let original = fs::read_to_string(&config_path).expect("read fixture configuration");
+    let changed = original.replace(
+        "[projects.\"a/App.dproj\"]\ninstallation='7.0'",
+        "[projects.\"a/App.dproj\"]\ninstallation='37.0'",
+    );
+    assert_ne!(original, changed);
+
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+    let priming = RequestId::from("prime-cached-seven-profile".to_owned());
+    server.send_request(
+        priming.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_a)}),
+    );
+    assert_eq!(
+        server.response(&priming).result.unwrap()["selectedInstallationId"],
+        "7.0"
+    );
+    // Prime the shared OverrideSession with 7.0 before the silent edit; the
+    // next request's raw-stamp baseline will see the changed bytes.
+    write_file(&config_path, &changed);
+
+    let request = RequestId::from("fresh-installation-after-silent-edit".to_owned());
+    server.send_request(
+        request.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_a)}),
+    );
+    let response = server.response(&request);
+    let result = response.result.as_ref().cloned().unwrap_or(Value::Null);
+    assert!(
+        response.error.is_some() || result["selectedInstallationId"] == "37.0",
+        "operation used cached configuration from before its raw-stamp baseline: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn explicit_project_configuration_is_revalidated_after_preparation() {
+    let fixture = selection_fixture();
+    let explicit_directory = fixture.directory.path().join("explicit-project");
+    let explicit_project = explicit_directory.join("Configured.dproj");
+    write_file(
+        &explicit_project,
+        "<Project><PropertyGroup><MainSource>Configured.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write_file(
+        &explicit_directory.join("Configured.dpr"),
+        "program Configured; begin end.",
+    );
+    let local_config = explicit_directory.join(".delphi-tools.local.toml");
+    write_file(
+        &local_config,
+        "[installations.\"88.0\".properties]\nBDS='/fake/88'\n",
+    );
+
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) =
+        TestServer::launch_with_project_operation_prepared_barrier(environment);
+    server.initialize(
+        fixture.directory.path(),
+        json!({"pascalLsp": {"projectFile": explicit_project.display().to_string()}}),
+    );
+    let request = RequestId::from("explicit-project-config-race".to_owned());
+    server.send_request(
+        request.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    wait_for_path(&barrier.entered);
+    write_file(
+        &local_config,
+        "[installations.\"77.0\".properties]\nBDS='/fake/77'\n",
+    );
+    fs::write(&barrier.release, b"release").expect("release prepared worker");
+
+    let response = server.response(&request);
+    assert!(
+        response.error.is_some(),
+        "explicit project's untracked local configuration edit must stale the result: {response:?}"
+    );
+    server.shutdown();
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn compiled_view_response_is_stale_after_installation_switch() {

@@ -168,7 +168,7 @@ impl Workspace {
         let mut configuration: Vec<ConfigurationSourceStamp> = Vec::new();
         let mut targets = Vec::new();
         targets
-            .try_reserve(candidate_paths.len().max(1))
+            .try_reserve(candidate_paths.len().saturating_add(3).max(1))
             .map_err(|error| {
                 format!("could not reserve project configuration read set: {error}")
             })?;
@@ -176,6 +176,21 @@ impl Workspace {
             targets.push(input_path.to_path_buf());
         } else {
             targets.extend(candidate_paths.iter().cloned());
+        }
+        if let Some(explicit_project) = self.options.project_file.as_ref() {
+            targets.push(explicit_project.clone());
+        }
+        budget.charge_path_visits(candidate_paths.len())?;
+        budget.charge_path_visits(self.project_selections.len())?;
+        if let Some((_, selected_project)) = runtime_project_selection(
+            input_path,
+            &pascal_project::ProjectCandidates {
+                directory: candidates.directory.clone(),
+                files: candidate_paths.clone(),
+            },
+            &self.project_selections,
+        ) {
+            targets.push(selected_project);
         }
         for target in targets {
             budget.charge_path_visits(1)?;
@@ -195,6 +210,12 @@ impl Workspace {
                     configuration.push(stamp);
                 }
             }
+        }
+        if !self.overrides.captured_sources_match(&configuration)? {
+            return Err(
+                "captured project configuration changed before request preparation; retry the request"
+                    .to_string(),
+            );
         }
         Ok(ProjectOperationReadSet {
             candidates: candidate_paths,

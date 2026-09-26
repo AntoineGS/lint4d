@@ -339,6 +339,31 @@ impl OverrideSession {
         Ok(())
     }
 
+    /// Check whether any already captured, usable layer still matches a fresh
+    /// source-stamp baseline. Uncaptured paths remain eligible for their first
+    /// read. Cached parse/read errors are left to the established configuration
+    /// reporting path; they are not usable stale layers.
+    pub fn captured_sources_match(
+        &self,
+        expected: &[crate::installation_config::ConfigurationSourceStamp],
+    ) -> Result<bool, String> {
+        let captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
+        for stamp in expected {
+            let path = normalize_absolute_lexical(&stamp.path)?;
+            let Some(layer) = captured.get(&path) else {
+                continue;
+            };
+            match layer {
+                Ok(Some(layer)) if layer.source_stamp != *stamp => return Ok(false),
+                Ok(None) if stamp.byte_len.is_some() || stamp.content_hash.is_some() => {
+                    return Ok(false);
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => {}
+            }
+        }
+        Ok(true)
+    }
+
     pub fn effective_for(
         &self,
         workspace_root: Option<&Path>,

@@ -668,6 +668,8 @@ impl Workspace {
             })
             .cloned()
             .collect::<HashSet<_>>();
+        let project_dependency =
+            self.preflight_project_selection_dependency(&project_path, budget)?;
         let selected_after_change = match validation.installation_selection.as_ref() {
             Some(InstallationSelection::Selected { id, .. }) => Some(id.clone()),
             _ => None,
@@ -679,6 +681,7 @@ impl Workspace {
         self.installation_selections = selections;
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.mark_configuration_change(&project_dependency, false);
         Ok(InstallationContextInfo {
             project_uri: canonical_file_uri(project_uri),
             candidates,
@@ -736,6 +739,8 @@ impl Workspace {
                 keys.insert(key.clone());
             }
         }
+        let project_dependency =
+            self.preflight_project_selection_dependency(project_path, Some(budget))?;
         if installation_id.is_some() {
             self.installation_selections
                 .try_reserve(1)
@@ -753,7 +758,34 @@ impl Workspace {
         }
         self.bump_source_generation();
         self.bump_configuration_generation();
+        self.mark_configuration_change(&project_dependency, false);
         Ok(())
+    }
+
+    /// Reserve and account the project-file dependency that fences in-flight
+    /// dependency-scoped requests across a selection change. This is required
+    /// even when no project context has been cached yet: a worker can already
+    /// have read the project descriptor while paused before context creation.
+    fn preflight_project_selection_dependency(
+        &mut self,
+        project_path: &Path,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Url, String> {
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
+        let project_uri = Url::from_file_path(absolute_path(project_path.to_path_buf()))
+            .map_err(|_| "could not create a URI for the selected project file".to_string())?;
+        let project_uri = canonical_file_uri(&project_uri);
+        if let Some(budget) = budget {
+            budget.charge_project_path_key_bytes(project_uri.as_str().len())?;
+        }
+        self.configuration_change_generations
+            .try_reserve(1)
+            .map_err(|error| {
+                format!("could not reserve selected project freshness dependency: {error}")
+            })?;
+        Ok(project_uri)
     }
 
     fn installation_selection_snapshot(

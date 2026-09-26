@@ -1326,6 +1326,297 @@ fn installation_selection_supports_reset_and_rejects_invalid_requests() {
 }
 
 #[test]
+fn deleting_the_selected_profile_does_not_fall_back_to_another_profile() {
+    let fixture = selection_fixture();
+    let config = fixture.directory.path().join(".delphi-tools.local.toml");
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let select = RequestId::from("choose-profile-before-removal".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    let selected = server.response(&select);
+    assert!(selected.error.is_none(), "{selected:?}");
+    assert_eq!(selected.result.unwrap()["selectedInstallationId"], "37.0");
+
+    let before = fs::read_to_string(&config).expect("read local configuration");
+    let without_selected = before.replace(
+        "[installations.\"37.0\".properties]\nBDS=",
+        "[installations.\"retired\".properties]\nBDS=",
+    );
+    assert_ne!(before, without_selected);
+    write_file(&config, &without_selected);
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&config), "type": 2}]}),
+    );
+
+    let query = RequestId::from("query-removed-selected-profile".to_owned());
+    server.send_request(
+        query.clone(),
+        "pascal/installationContext",
+        json!({"projectUri": uri(&fixture.project_a)}),
+    );
+    let response = server.response(&query);
+    assert!(
+        response.error.is_some()
+            || response.result.as_ref().is_some_and(|result| {
+                result["selectedInstallationId"].is_null() && result["selectionMode"] == "invalid"
+            }),
+        "a removed explicit profile must stay invalid, not select the remaining/newest profile: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn changing_profile_a_preserves_profile_b_context() {
+    let fixture = selection_fixture();
+    let env_options_a = fixture.directory.path().join("ide/7.0/EnvOptions.proj");
+    let mut server = TestServer::launch();
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let query_a = RequestId::from("profile-a-before-change".to_owned());
+    server.send_request(
+        query_a.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+    );
+    let context_a = server.response(&query_a);
+    assert!(context_a.error.is_none(), "{context_a:?}");
+
+    let query_b = RequestId::from("profile-b-before-change".to_owned());
+    server.send_request(
+        query_b.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.directory.path().join("b/Main.pas"))}}),
+    );
+    let context_b = server.response(&query_b);
+    assert!(context_b.error.is_none(), "{context_b:?}");
+    let before_b = context_b.result.expect("project B context");
+    assert_eq!(before_b["selectedInstallationId"], "37.0");
+
+    write_file(
+        &env_options_a,
+        "<Project><PropertyGroup><Win32LibraryPath>$(BDS)\\replacement</Win32LibraryPath></PropertyGroup></Project>",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&env_options_a), "type": 2}]}),
+    );
+
+    let after = RequestId::from("profile-b-after-a-change".to_owned());
+    server.send_request(
+        after.clone(),
+        "pascal/projectContext",
+        json!({"textDocument": {"uri": uri(&fixture.directory.path().join("b/Main.pas"))}}),
+    );
+    let after = server.response(&after);
+    assert!(after.error.is_none(), "{after:?}");
+    let after_b = after.result.expect("project B context after A change");
+    assert_eq!(after_b["selectedInstallationId"], "37.0");
+    assert_eq!(
+        after_b["selectedProjectUri"],
+        before_b["selectedProjectUri"]
+    );
+    assert!(
+        after_b["installationConfigUris"]
+            .as_array()
+            .is_some_and(|uris| uris.iter().any(|uri| uri
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/ide/37.0/EnvOptions.proj")))),
+        "profile B must retain its captured IDE layer: {after_b:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn env_options_provider_changes_refresh_with_and_without_watcher() {
+    for send_watcher in [true, false] {
+        let fixture = selection_fixture();
+        let env_options = fixture.directory.path().join("ide/7.0/EnvOptions.proj");
+        let alternate = fixture.directory.path().join("sdk/7.0/alternate");
+        let source = "unit Main;\ninterface\nuses SdkUnit;\nimplementation\nend.\n";
+        write_file(&fixture.main_a, source);
+        write_file(
+            &fixture.project_a,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+        );
+        write_file(
+            &env_options,
+            "<Project><PropertyGroup Condition=\"'$(Config)'=='Debug' and '$(Platform)'=='Win32'\"><Win32LibraryPath>$(BDS)\\source</Win32LibraryPath></PropertyGroup></Project>",
+        );
+        write_file(
+            &alternate.join("SdkUnit.pas"),
+            "unit SdkUnit; interface const ProviderVersion = 701; implementation end.",
+        );
+
+        let mut server = TestServer::launch();
+        server.initialize(fixture.directory.path(), Value::Null);
+        let context = RequestId::from(format!("env-options-context-{send_watcher}"));
+        server.send_request(
+            context.clone(),
+            "pascal/projectContext",
+            json!({"textDocument": {"uri": uri(&fixture.main_a)}}),
+        );
+        let context = server.response(&context);
+        assert!(context.error.is_none(), "{context:?}");
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({"textDocument": {"uri": uri(&fixture.main_a), "languageId": "pascal", "version": 1, "text": source}}),
+        );
+
+        let initial = RequestId::from(format!("env-options-initial-{send_watcher}"));
+        server.send_request(
+            initial.clone(),
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": uri(&fixture.main_a)},
+                "position": position_of(source, "SdkUnit", 0)
+            }),
+        );
+        let initial = server.response(&initial);
+        assert!(initial.error.is_none(), "{initial:?}");
+        assert_eq!(
+            initial.result.as_ref().expect("initial definition")[0]["uri"],
+            uri(&fixture.directory.path().join("sdk/7.0/source/SdkUnit.pas")).to_string(),
+            "the explicit Config/Platform group must provide the baseline binding"
+        );
+
+        write_file(
+            &env_options,
+            "<Project><PropertyGroup Condition=\"'$(Config)'=='Debug' and '$(Platform)'=='Win32'\"><Win32LibraryPath>$(BDS)\\alternate</Win32LibraryPath></PropertyGroup></Project>",
+        );
+        if send_watcher {
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({"changes": [{"uri": uri(&env_options), "type": 2}]}),
+            );
+        }
+
+        let refreshed = RequestId::from(format!("env-options-refreshed-{send_watcher}"));
+        server.send_request(
+            refreshed.clone(),
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": uri(&fixture.main_a)},
+                "position": position_of(source, "SdkUnit", 0)
+            }),
+        );
+        let refreshed = server.response(&refreshed);
+        assert!(refreshed.error.is_none(), "{refreshed:?}");
+        assert_eq!(
+            refreshed.result.as_ref().expect("refreshed definition")[0]["uri"],
+            uri(&alternate.join("SdkUnit.pas")).to_string(),
+            "EnvOptions provider refresh failed (watcher={send_watcher}): {refreshed:?}"
+        );
+        server.shutdown();
+    }
+}
+
+#[test]
+fn creating_an_absent_explicit_source_recovers_on_demand() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let root = directory.path();
+    let project = root.join("App.dproj");
+    let main = root.join("Main.pas");
+    let missing = root.join("Missing.pas");
+    let source = "unit Main;\ninterface\nuses Missing;\nimplementation\nend.\n";
+    write_file(
+        &project,
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Missing.pas\" /></ItemGroup></Project>",
+    );
+    write_file(&main, source);
+    let mut server = TestServer::launch();
+    server.initialize(root, Value::Null);
+
+    let before = RequestId::from("absent-source-before-create".to_owned());
+    server.send_request(
+        before.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Missing", 0)
+        }),
+    );
+    let before = server.response(&before);
+    assert!(before.error.is_none(), "{before:?}");
+    assert!(before.result.as_ref().is_some_and(Value::is_array));
+
+    write_file(
+        &missing,
+        "unit Missing;\ninterface\nconst FreshValue = 42;\nimplementation\nend.\n",
+    );
+    // No watcher event: the retained absent-reference observation must be
+    // checked when the next navigation request is prepared.
+    let after = RequestId::from("absent-source-after-create".to_owned());
+    server.send_request(
+        after.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(source, "Missing", 0)
+        }),
+    );
+    let after = server.response(&after);
+    assert!(after.error.is_none(), "{after:?}");
+    assert!(
+        after.result.as_ref().is_some_and(|locations| {
+            locations.as_array().is_some_and(|locations| {
+                locations.len() == 1 && locations[0]["uri"] == uri(&missing).to_string()
+            })
+        }),
+        "creating an explicitly referenced source must restore its binding on demand: {after:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn navigation_response_is_rejected_after_installation_switch() {
+    let fixture = selection_fixture();
+    let main_source = "unit Main;\ninterface\nuses SdkUnit;\nimplementation\nend.\n";
+    write_file(&fixture.main_a, main_source);
+    write_file(
+        &fixture.project_a,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Platform>Win32</Platform><DCC_UnitSearchPath>../sdk/7.0/source</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    let environment = tempfile::tempdir().expect("isolated test environment");
+    let (mut server, barrier) = TestServer::launch_with_navigation_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let definition = RequestId::from("definition-before-installation-switch".to_owned());
+    server.send_request(
+        definition.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri(&fixture.main_a)},
+            "position": position_of(main_source, "SdkUnit", 0)
+        }),
+    );
+    barrier.wait_until_entered();
+
+    let select = RequestId::from("switch-during-navigation".to_owned());
+    server.send_request(
+        select.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    let selected = server.response(&select);
+    assert!(selected.error.is_none(), "{selected:?}");
+    barrier.release();
+
+    let stale = server.response(&definition);
+    assert!(
+        stale.error.is_some(),
+        "navigation captured before installation selection must be discarded: {stale:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn reset_installation_response_does_not_reuse_cached_prior_profile() {
     let fixture = selection_fixture();
     let config_path = fixture.directory.path().join(".delphi-tools.local.toml");

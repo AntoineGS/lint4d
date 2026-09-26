@@ -14,19 +14,28 @@
 pub mod conditional;
 pub mod configuration;
 pub mod delphi_overrides;
+pub mod installation_config;
+#[allow(dead_code)]
+pub mod installations;
+pub mod path_issues;
 
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
 };
 pub use configuration::{ConfigRead, config_directories, read_config};
+pub use installations::{InstallationOrigin, InstallationSelection};
+pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
     EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
 };
+use crate::installations::{
+    IdePaths, InstallationEvidence, evaluate_ide_paths, load_installation, select_installation,
+};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
@@ -60,6 +69,9 @@ pub struct ProjectOptions {
     /// An explicit `.dproj`, `.dpr`, or `.dpk` path. Relative paths are
     /// resolved against the supplied workspace roots.
     pub project_file: Option<PathBuf>,
+    /// Exact-project session installation choices. An absent entry restores
+    /// Automatic selection; project directories are never used as keys.
+    pub installation_selections: HashMap<PathBuf, String>,
     /// The selected Delphi build configuration, such as `Debug` or `Release`.
     pub build_config: Option<String>,
     /// The selected Delphi platform, such as `Win32` or `Win64`.
@@ -228,6 +240,16 @@ impl ReadPolicy {
         exclusions: &[String],
         overrides: &EffectiveOverrides,
     ) -> Self {
+        Self::new_with_installation_roots(roots, source_paths, exclusions, overrides, &[])
+    }
+
+    pub fn new_with_installation_roots(
+        roots: &[PathBuf],
+        source_paths: &[String],
+        exclusions: &[String],
+        overrides: &EffectiveOverrides,
+        installation_roots: &[PathBuf],
+    ) -> Self {
         let mut configured_roots = Vec::new();
         for root in roots {
             let root = absolute_lexical(root).unwrap_or_else(|_| root.to_path_buf());
@@ -249,6 +271,10 @@ impl ReadPolicy {
                 let source = absolute_lexical(&source).unwrap_or(source);
                 add_unique_path(&mut configured_roots, source);
             }
+        }
+        for root in installation_roots {
+            let root = absolute_lexical(root).unwrap_or_else(|_| root.to_path_buf());
+            add_unique_path(&mut configured_roots, root);
         }
 
         let mut mapped_roots = Vec::new();
@@ -746,13 +772,24 @@ pub struct ProjectContext {
     /// Whether project selection and the metadata needed for binding completed
     /// without an ambiguity or an unresolved project-selection fallback.
     pub discovery_complete: bool,
+    pub binding_metadata_complete: bool,
+    pub path_issues: Vec<ProjectPathIssue>,
     pub project_file: Option<PathBuf>,
+    /// Direct root-project identity facts used before installation-dependent
+    /// imports are evaluated.
+    pub installation_evidence: InstallationEvidence,
+    /// The project-scoped installation result, if profile selection applies.
+    pub installation_selection: Option<InstallationSelection>,
     pub main_source: Option<PathBuf>,
     /// Ordered project and caller-provided unit search paths.
     pub search_paths: Vec<PathBuf>,
     /// The same search paths tagged with their source provenance. This keeps
     /// legacy native roots distinct from configured and mapped roots.
     pub search_path_entries: Vec<ProjectPathEntry>,
+    /// Source-navigation-only fallbacks from the selected IDE installation.
+    pub browsing_path_entries: Vec<ProjectPathEntry>,
+    /// Selected IDE debug DCU locations, kept out of source lookup.
+    pub debug_dcu_path_entries: Vec<ProjectPathEntry>,
     /// MainSource and explicit references retain the provenance of the path
     /// expression that produced them so membership cannot bypass mapped-root
     /// safety checks.
@@ -794,6 +831,20 @@ pub struct ProjectContext {
 }
 
 impl ProjectContext {
+    pub fn can_resolve_units(&self) -> bool {
+        self.discovery_complete || self.binding_metadata_complete
+    }
+
+    pub fn missing_explicit_unit(&self, canonical_name: &str) -> Option<&ProjectPathIssue> {
+        self.path_issues.iter().find(|issue| {
+            issue.kind == ProjectPathIssueKind::MissingReference
+                && issue
+                    .unit_name
+                    .as_deref()
+                    .is_some_and(|unit| unit.eq_ignore_ascii_case(canonical_name))
+        })
+    }
+
     /// Visit each retained child and byte-bearing value that recovery would
     /// release. Callers provide bounded/cancellable admission at every visit.
     pub fn visit_recovery_payload(
@@ -806,10 +857,33 @@ impl ProjectContext {
         if let Some(path) = &self.main_source {
             visit(path.as_os_str().len())?;
         }
+        if let Some(version) = &self.installation_evidence.project_version {
+            visit(version.len())?;
+        }
+        if let Some(root) = &self.installation_evidence.bds_root {
+            visit(root.len())?;
+        }
+        match &self.installation_selection {
+            Some(InstallationSelection::Selected { id, .. })
+            | Some(InstallationSelection::Invalid { id }) => visit(id.len())?,
+            Some(InstallationSelection::NeedsChoice { candidates }) => {
+                for id in candidates {
+                    visit(id.len())?;
+                }
+            }
+            Some(InstallationSelection::Legacy) | None => {}
+        }
         for path in &self.search_paths {
             visit(path.as_os_str().len())?;
         }
         for entry in &self.search_path_entries {
+            entry.visit_recovery_payload(visit)?;
+        }
+        for entry in self
+            .browsing_path_entries
+            .iter()
+            .chain(&self.debug_dcu_path_entries)
+        {
             entry.visit_recovery_payload(visit)?;
         }
         if let Some(entry) = &self.main_source_entry {
@@ -860,6 +934,20 @@ impl ProjectContext {
         }
         for observation in &self.metadata_observations {
             observation.visit_recovery_payload(visit)?;
+        }
+        for issue in &self.path_issues {
+            visit(issue.source_file.as_os_str().len())?;
+            visit(issue.property.len())?;
+            visit(issue.raw.len())?;
+            if let Some(path) = &issue.path {
+                visit(path.as_os_str().len())?;
+            }
+            if let Some(unit_name) = &issue.unit_name {
+                visit(unit_name.len())?;
+            }
+            if let ProjectPathProvenance::Mapped { root } = &issue.provenance {
+                visit(root.as_os_str().len())?;
+            }
         }
         for warning in &self.warnings {
             visit(warning.len())?;
@@ -1109,6 +1197,8 @@ impl ProjectContext {
 
         self.search_path_entries
             .iter()
+            .chain(&self.browsing_path_entries)
+            .chain(&self.debug_dcu_path_entries)
             .filter(|entry| project_path_starts_with(&path, &lexical_normalize(&entry.path)))
             .max_by_key(|entry| entry.path.components().count())
             .map(|entry| ProjectPathEntry {
@@ -1897,6 +1987,18 @@ fn discover_context_with_selections(
             metadata_files,
             metadata_observations,
         } => {
+            let installation_workspace = project_file
+                .parent()
+                .and_then(|directory| relevant_override_workspace_root(directory, &roots));
+            let installation_config = match overrides
+                .configuration_for(installation_workspace.as_deref(), Some(&project_file))
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    warnings.push(error);
+                    crate::installation_config::ProjectConfiguration::from_layers(Vec::new())
+                }
+            };
             let effective_overrides =
                 match effective_overrides_for_project(&project_file, &roots, overrides) {
                     Ok(overrides) => overrides,
@@ -1907,6 +2009,7 @@ fn discover_context_with_selections(
                             &file_path,
                             &roots,
                             &options,
+                            installation_config.clone(),
                             EffectiveOverrides::default(),
                             warnings,
                             explicit,
@@ -1929,6 +2032,7 @@ fn discover_context_with_selections(
                 &file_path,
                 &roots,
                 &options,
+                installation_config,
                 effective_overrides,
                 warnings,
                 explicit,
@@ -3164,11 +3268,20 @@ fn inspect_project_candidate(
             };
         }
     };
+    let installation_workspace = project_file
+        .parent()
+        .and_then(|directory| relevant_override_workspace_root(directory, roots));
+    let installation_config = overrides
+        .configuration_for(installation_workspace.as_deref(), Some(project_file))
+        .unwrap_or_else(|_| {
+            crate::installation_config::ProjectConfiguration::from_layers(Vec::new())
+        });
     match build_project_context(
         project_file.to_path_buf(),
         file,
         roots,
         options,
+        installation_config,
         effective_overrides,
         Vec::new(),
         false,
@@ -3632,7 +3745,8 @@ fn build_project_context(
     file: &Path,
     roots: &[PathBuf],
     options: &ProjectOptions,
-    overrides: EffectiveOverrides,
+    installation_config: crate::installation_config::ProjectConfiguration,
+    mut overrides: EffectiveOverrides,
     warnings: Vec<String>,
     explicit: bool,
     consulted_metadata_files: Vec<PathBuf>,
@@ -3645,14 +3759,156 @@ fn build_project_context(
     let project_dir = project_file
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
+    let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
+    let mut evaluation_options = options.clone();
+    let caller_compiler_version = options.conditional_context.compiler_version;
+    let mut installation_evidence = InstallationEvidence::default();
+    let mut compiler_identity_conflicting = false;
+    let mut other_identity_conflicting = false;
+    if extension_is(&project_file, "dproj") {
+        let bootstrap_entry = ProjectPathEntry::legacy(project_file.clone());
+        let (bootstrap, observation) = read_policy
+            .read_payload_with_observation(&bootstrap_entry, MAX_PROJECT_BYTES)
+            .map_err(|error| format!("could not read project bootstrap metadata: {error}"))?;
+        tracker.record_metadata_path(project_file.clone());
+        tracker.record_metadata_observation(observation);
+        let bootstrap = parse_project_bootstrap(
+            &bootstrap,
+            &project_file,
+            &evaluation_options,
+            &overrides,
+            &read_policy,
+        );
+        for path in &bootstrap.metadata_files {
+            tracker.record_metadata_path(path.clone());
+        }
+        installation_evidence = bootstrap.evidence;
+        compiler_identity_conflicting = bootstrap.compiler_conflicting;
+        other_identity_conflicting = bootstrap.other_conflicting;
+        if evaluation_options.build_config.is_none() {
+            evaluation_options.build_config = bootstrap.config;
+        }
+        if evaluation_options.platform.is_none() {
+            evaluation_options.platform = bootstrap.platform;
+        }
+        if evaluation_options
+            .conditional_context
+            .compiler_version
+            .is_none()
+        {
+            evaluation_options.conditional_context.compiler_version =
+                installation_evidence.compiler_version;
+        }
+    }
+    let mut selection_evidence = installation_evidence.clone();
+    if let Some(compiler_version) = caller_compiler_version {
+        selection_evidence.compiler_version = Some(compiler_version);
+        if compiler_identity_conflicting {
+            selection_evidence.conflicting = other_identity_conflicting;
+        }
+    } else if let Some(compiler_version) = installation_evidence.compiler_version {
+        selection_evidence.compiler_version = Some(compiler_version);
+    }
+    let installation_selection = Some(select_installation(
+        &installation_config,
+        &project_file,
+        &selection_evidence,
+        evaluation_options
+            .installation_selections
+            .iter()
+            .find(|(path, _)| project_paths_equal(path, &project_file))
+            .map(|(_, id)| id.as_str()),
+    ));
+    let mut installation_environment = None;
+    let mut ide_paths = IdePaths::default();
+    let mut installation_warnings = Vec::new();
+    if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
+        match installation_config.profile(id) {
+            Ok(profile) => {
+                overrides = profile.overrides.clone();
+                let installation_roots = ["bds", "appdata"]
+                    .into_iter()
+                    .filter_map(|name| overrides.properties.get(name))
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                read_policy = ReadPolicy::new_with_installation_roots(
+                    roots,
+                    &options.source_paths,
+                    exclusions,
+                    &overrides,
+                    &installation_roots,
+                );
+                match load_installation(
+                    &profile,
+                    evaluation_options
+                        .build_config
+                        .as_deref()
+                        .unwrap_or("Debug"),
+                    evaluation_options.platform.as_deref().unwrap_or(""),
+                    tracker,
+                    &read_policy,
+                ) {
+                    Ok(environment) => {
+                        if let (Some(config), Some(platform)) = (
+                            evaluation_options.build_config.as_deref(),
+                            evaluation_options.platform.as_deref(),
+                        ) {
+                            match evaluate_ide_paths(
+                                &environment,
+                                &profile,
+                                config,
+                                platform,
+                                tracker,
+                                &read_policy,
+                            ) {
+                                Ok(paths) => ide_paths = paths,
+                                Err(error) => installation_warnings.push(error),
+                            }
+                        } else {
+                            // IDE paths are platform-conditioned; never union unknown platforms.
+                        }
+                        installation_environment = Some(environment);
+                    }
+                    Err(error) => {
+                        installation_warnings.push(error);
+                    }
+                }
+                if evaluation_options
+                    .conditional_context
+                    .compiler_version
+                    .is_none()
+                {
+                    if let Some(version) =
+                        crate::installations::compiler_version_for_installation(id)
+                    {
+                        evaluation_options.conditional_context.compiler_version = Some(version);
+                    }
+                }
+            }
+            Err(error) => {
+                installation_warnings.push(error);
+            }
+        }
+    }
     let mut builder = ProjectBuilder::new(
-        options,
+        &evaluation_options,
         &overrides,
         warnings,
         project_dir.clone(),
         read_policy.clone(),
     );
+    if let Some(environment) = &installation_environment {
+        builder.seed_installation_properties(&environment.properties);
+        builder.warnings.extend(environment.warnings.clone());
+        builder
+            .metadata_files
+            .extend(environment.metadata_files.clone());
+        builder
+            .metadata_observations
+            .extend(environment.metadata_observations.clone());
+        builder.path_issues.extend(environment.path_issues.clone());
+    }
+    builder.warnings.extend(installation_warnings);
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
         builder.process_root_dproj(&project_file, tracker)?;
@@ -3741,6 +3997,9 @@ fn build_project_context(
             ProjectPathProvenance::Configured,
         );
     }
+    for entry in &ide_paths.library {
+        add_unique_project_path_entry(&mut search_path_entries, entry.clone());
+    }
     let search_paths = paths_from_entries(&search_path_entries);
 
     let mut include_path_entries = Vec::new();
@@ -3797,19 +4056,66 @@ fn build_project_context(
         if is_compiled_reference(&expanded.value) {
             continue;
         }
-        let Some(entry) = resolve_project_path_entry(
+        let provenance = expanded_path_provenance(&expanded, &reference.source_provenance);
+        let Some(resolved) = project_path_candidate(
             &expanded.value,
             &builder.project_dir,
             &builder.overrides,
             &mut builder.warnings,
             "DCCReference",
-            true,
-            expanded.explicit_dependency,
         ) else {
             continue;
         };
-        let provenance = expanded_path_provenance(&expanded, &reference.source_provenance);
-        let entry = inherit_path_provenance(entry, &provenance);
+        let candidate = lexical_normalize(&resolved.path);
+        let entry = match resolve_existing_path_status_with_provenance(
+            &candidate,
+            &resolved,
+            &expanded.value,
+            &mut builder.warnings,
+            "DCCReference",
+        ) {
+            ExistingPathStatus::Found(path) => inherit_path_provenance(
+                ProjectPathEntry::resolved(path, &resolved, expanded.explicit_dependency),
+                &provenance,
+            ),
+            ExistingPathStatus::Missing => {
+                builder.warnings.push(missing_path_warning(
+                    "DCCReference",
+                    &expanded.value,
+                    &candidate,
+                    &resolved,
+                ));
+                let unit_name = candidate
+                    .file_stem()
+                    .map(|stem| canonical_unit_name(&stem.to_string_lossy()))
+                    .filter(|name| !name.is_empty());
+                builder.path_issues.push(ProjectPathIssue {
+                    kind: ProjectPathIssueKind::MissingReference,
+                    source_file: reference.source_file.clone(),
+                    property: "DCCReference".to_string(),
+                    raw: reference.include.clone(),
+                    path: Some(candidate.clone()),
+                    unit_name,
+                    provenance: inherit_path_provenance(
+                        ProjectPathEntry::resolved(
+                            candidate.clone(),
+                            &resolved,
+                            expanded.explicit_dependency,
+                        ),
+                        &provenance,
+                    )
+                    .provenance,
+                });
+                add_metadata_observation(
+                    &mut builder.metadata_observations,
+                    MetadataObservation::Stat {
+                        path: candidate.clone(),
+                    },
+                );
+                continue;
+            }
+            ExistingPathStatus::Unresolvable => continue,
+        };
         let Some(stem) = entry.path.file_stem() else {
             continue;
         };
@@ -3847,7 +4153,7 @@ fn build_project_context(
     let project_defines = property_list(&builder, "dcc_define");
     let mut conditional_warnings = Vec::new();
     let conditional_context = merge_project_conditional_context(
-        options,
+        &evaluation_options,
         &builder,
         &project_defines,
         &mut conditional_warnings,
@@ -3867,21 +4173,31 @@ fn build_project_context(
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
             && !project_context_warnings_incomplete(&builder.warnings, explicit),
-        project_file: Some(project_file),
+        binding_metadata_complete: !builder.incomplete
+            && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
+        path_issues: builder.path_issues.clone(),
+        project_file: Some(project_file.clone()),
+        installation_evidence: installation_evidence.clone(),
+        installation_selection,
         main_source,
         search_paths,
         search_path_entries,
+        browsing_path_entries: ide_paths.browsing,
+        debug_dcu_path_entries: ide_paths.debug_dcu,
         main_source_entry,
         explicit_unit_entries,
         include_paths,
         include_path_entries,
         explicit_units,
-        unit_namespaces: property_list(&builder, "dcc_namespace"),
+        unit_namespaces: property_list(&builder, "dcc_namespace")
+            .into_iter()
+            .chain(ide_paths.namespaces)
+            .collect(),
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
         defines,
         conditional_context,
-        config: selected_config(&builder, options),
-        platform: selected_platform(&builder, options),
+        config: selected_config(&builder, &evaluation_options),
+        platform: selected_platform(&builder, &evaluation_options),
         overrides,
         read_policy,
         packages: package_list(&builder),
@@ -3949,10 +4265,16 @@ fn build_standalone_context(
 
     Ok(ProjectContext {
         discovery_complete,
+        binding_metadata_complete: discovery_complete,
+        path_issues: Vec::new(),
         project_file: None,
+        installation_evidence: InstallationEvidence::default(),
+        installation_selection: None,
         main_source: None,
         search_paths,
         search_path_entries,
+        browsing_path_entries: Vec::new(),
+        debug_dcu_path_entries: Vec::new(),
         main_source_entry: None,
         explicit_unit_entries: HashMap::new(),
         include_paths: Vec::new(),
@@ -3998,6 +4320,37 @@ fn project_context_warnings_incomplete(warnings: &[String], explicit: bool) -> b
             || warning.contains("optset import path does not exist")
             || warning.contains("workspace root could not be resolved")
     })
+}
+
+fn binding_metadata_warnings_incomplete(warnings: &[String], explicit: bool) -> bool {
+    warnings.iter().any(|warning| {
+        let warning = warning.to_ascii_lowercase();
+        !(warning.starts_with("dccreference path does not exist and was omitted:"))
+            && warning_incomplete(&warning, explicit)
+    })
+}
+
+fn warning_incomplete(warning: &str, explicit: bool) -> bool {
+    (!explicit && warning.contains("no resolvable"))
+        || warning.contains("unresolved property")
+        || warning.contains("path does not exist and was omitted")
+        || warning.contains("could not read optset")
+        || warning.contains("could not read main source")
+        || warning.contains("metadata file limit")
+        || warning.contains("property expansion exceeds")
+        || warning.contains("could not inspect project")
+        || warning.contains("could not inspect")
+        || warning.contains("invalid xml")
+        || warning.contains("windows path")
+        || warning.contains("unavailable property path")
+        || warning.contains("unknown project condition")
+        || warning.contains("unsupported project condition")
+        || warning.contains("ambiguous case-insensitive")
+        || warning.contains("multiple main sources")
+        || warning.contains("property memory budget exceeded")
+        || warning.contains("optset import limit")
+        || warning.contains("optset import path does not exist")
+        || warning.contains("workspace root could not be resolved")
 }
 
 fn selected_config(builder: &ProjectBuilder, options: &ProjectOptions) -> Option<String> {
@@ -4101,6 +4454,221 @@ fn parse_conditional_fact(value: &str) -> Option<ConditionalFact> {
         "0" | "false" | "no" | "off" | "-" => Some(ConditionalFact::False),
         "" => None,
         _ => Some(ConditionalFact::Unknown),
+    }
+}
+
+#[derive(Default)]
+struct ProjectBootstrap {
+    evidence: InstallationEvidence,
+    compiler_conflicting: bool,
+    other_conflicting: bool,
+    config: Option<String>,
+    platform: Option<String>,
+    metadata_files: Vec<PathBuf>,
+}
+
+/// Extract only properties physically declared in the root project's direct
+/// PropertyGroups. Group/property conditions are evaluated against only known
+/// caller and local configuration facts; unknown-conditional identity values
+/// remain ambiguous. Imports and target-time properties are never inspected.
+fn parse_project_bootstrap(
+    xml: &str,
+    source_file: &Path,
+    options: &ProjectOptions,
+    overrides: &EffectiveOverrides,
+    read_policy: &ReadPolicy,
+) -> ProjectBootstrap {
+    let operations = match parse_xml_operations(xml, source_file) {
+        Ok(operations) => operations,
+        Err(_) => {
+            return ProjectBootstrap {
+                evidence: InstallationEvidence {
+                    conflicting: true,
+                    ..InstallationEvidence::default()
+                },
+                other_conflicting: true,
+                ..ProjectBootstrap::default()
+            };
+        }
+    };
+    let mut properties = HashMap::new();
+    let mut unknown_properties = HashSet::new();
+    for (key, option_value) in [
+        ("config", options.build_config.as_ref()),
+        ("platform", options.platform.as_ref()),
+    ] {
+        if let Some(value) = option_value {
+            properties.insert(key.to_owned(), value.clone());
+        } else if let Some(value) = overrides.properties.get(key) {
+            properties.insert(key.to_owned(), value.clone());
+        }
+    }
+    let mut values = BTreeMap::<String, Vec<String>>::new();
+    let mut compiler_uncertain = false;
+    let mut other_identity_uncertain = false;
+    let mut unknown_import_taint = false;
+    let mut warnings = Vec::new();
+    let mut metadata_files = Vec::new();
+    let base = source_file.parent().unwrap_or_else(|| Path::new("."));
+    let config_is_fixed =
+        options.build_config.is_some() || overrides.properties.contains_key("config");
+    let platform_is_fixed =
+        options.platform.is_some() || overrides.properties.contains_key("platform");
+    for operation in operations {
+        let group = match operation {
+            XmlOperation::Import(import) => {
+                let import_truth = condition_matches(
+                    import.condition.as_deref(),
+                    ConditionEnvironment {
+                        properties: &properties,
+                        unknown_properties: &unknown_properties,
+                        unknown_import_taint,
+                        overrides,
+                        read_policy,
+                    },
+                    base,
+                    &mut metadata_files,
+                    &mut warnings,
+                    source_file,
+                );
+                if import_truth == TruthValue::False {
+                    continue;
+                }
+                unknown_import_taint = true;
+                if !config_is_fixed {
+                    unknown_properties.insert("config".to_owned());
+                }
+                if !platform_is_fixed {
+                    unknown_properties.insert("platform".to_owned());
+                }
+                continue;
+            }
+            XmlOperation::PropertyGroup(group) => group,
+            XmlOperation::DccReference(_) | XmlOperation::Unsupported(_) => continue,
+        };
+        let group_truth = condition_matches(
+            group.condition.as_deref(),
+            ConditionEnvironment {
+                properties: &properties,
+                unknown_properties: &unknown_properties,
+                unknown_import_taint,
+                overrides,
+                read_policy,
+            },
+            base,
+            &mut metadata_files,
+            &mut warnings,
+            source_file,
+        );
+        for entry in group.properties {
+            let identity_property = matches!(
+                entry.name.to_ascii_lowercase().as_str(),
+                "projectversion" | "compilerversion" | "dcc_compilerversion" | "bds"
+            );
+            if group_truth == TruthValue::False {
+                continue;
+            }
+            let entry_truth = condition_matches(
+                entry.condition.as_deref(),
+                ConditionEnvironment {
+                    properties: &properties,
+                    unknown_properties: &unknown_properties,
+                    unknown_import_taint,
+                    overrides,
+                    read_policy,
+                },
+                base,
+                &mut metadata_files,
+                &mut warnings,
+                source_file,
+            );
+            let truth = group_truth.and(entry_truth);
+            match truth {
+                TruthValue::True => {
+                    let key = entry.name.to_ascii_lowercase();
+                    let value = entry.value.trim();
+                    if !value.is_empty() {
+                        values
+                            .entry(key.clone())
+                            .or_default()
+                            .push(value.to_owned());
+                        if (key == "config" && !config_is_fixed)
+                            || (key == "platform" && !platform_is_fixed)
+                        {
+                            unknown_properties.remove(&key);
+                            properties.insert(key, value.to_owned());
+                        }
+                    }
+                }
+                TruthValue::False => {}
+                TruthValue::Unknown if identity_property => {
+                    match entry.name.to_ascii_lowercase().as_str() {
+                        "compilerversion" | "dcc_compilerversion" => compiler_uncertain = true,
+                        _ => other_identity_uncertain = true,
+                    }
+                }
+                TruthValue::Unknown => {}
+            }
+        }
+    }
+    let unique_value = |name: &str| -> Option<String> {
+        let candidates = values.get(name)?;
+        let first = candidates.first()?;
+        candidates
+            .iter()
+            .all(|candidate| candidate.eq_ignore_ascii_case(first))
+            .then(|| first.clone())
+    };
+    let compiler_raw = ["compilerversion", "dcc_compilerversion"]
+        .into_iter()
+        .filter_map(&unique_value)
+        .collect::<Vec<_>>();
+    let compiler_version = if let Some(first) = compiler_raw.first() {
+        let parsed = CompilerVersion::parse(first);
+        compiler_raw
+            .iter()
+            .all(|value| CompilerVersion::parse(value) == parsed)
+            .then_some(parsed)
+            .flatten()
+    } else {
+        None
+    };
+    let project_version = unique_value("projectversion");
+    let bds_root = unique_value("bds");
+    let compiler_conflicting = compiler_uncertain
+        || ["compilerversion", "dcc_compilerversion"]
+            .into_iter()
+            .any(|key| {
+                values.get(key).is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| !item.eq_ignore_ascii_case(&items[0]))
+                })
+            })
+        || compiler_raw.len() > 1
+            && compiler_raw
+                .iter()
+                .any(|value| CompilerVersion::parse(value) != compiler_version);
+    let other_conflicting = other_identity_uncertain
+        || ["projectversion", "bds"].into_iter().any(|key| {
+            values.get(key).is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| !item.eq_ignore_ascii_case(&items[0]))
+            })
+        });
+    ProjectBootstrap {
+        evidence: InstallationEvidence {
+            compiler_version,
+            project_version,
+            bds_root,
+            conflicting: compiler_conflicting || other_conflicting,
+        },
+        compiler_conflicting,
+        other_conflicting,
+        config: unique_value("config"),
+        platform: unique_value("platform"),
+        metadata_files,
     }
 }
 
@@ -4748,10 +5316,30 @@ fn resolve_existing_path_status(
         };
         let wanted = component.to_string_lossy();
         let mut matches = Vec::new();
-        let Ok(entries) = fs::read_dir(&current) else {
-            return ExistingPathStatus::Missing;
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return ExistingPathStatus::Missing;
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "could not inspect {kind} path under {}: {error}",
+                    current.display()
+                ));
+                return ExistingPathStatus::Unresolvable;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(format!(
+                        "could not inspect {kind} path under {}: {error}",
+                        current.display()
+                    ));
+                    return ExistingPathStatus::Unresolvable;
+                }
+            };
             let name = entry.file_name();
             if name.to_string_lossy().eq_ignore_ascii_case(&wanted) {
                 matches.push(entry.path());
@@ -5234,7 +5822,7 @@ fn parse_dproj_package_metadata(
         read_policy.clone(),
     );
     let operations = parse_xml_operations(contents, path)?;
-    builder.process_operations(operations, path, tracker, &entry.provenance);
+    builder.process_operations(operations, path, tracker, &entry.provenance)?;
 
     let Some(main_source) = builder.property("mainsource") else {
         return Err(format!(
@@ -5406,7 +5994,9 @@ struct ProjectBuilder {
     overrides: EffectiveOverrides,
     unknown_properties: HashSet<String>,
     unknown_import_taint: bool,
+    installation_data_mode: bool,
     references: Vec<DccReference>,
+    path_issues: Vec<ProjectPathIssue>,
     warnings: Vec<String>,
     incomplete: bool,
     active_imports: HashSet<PathBuf>,
@@ -5525,7 +6115,9 @@ impl ProjectBuilder {
             overrides: overrides.clone(),
             unknown_properties: HashSet::new(),
             unknown_import_taint: false,
+            installation_data_mode: false,
             references: Vec::new(),
+            path_issues: Vec::new(),
             warnings,
             incomplete,
             active_imports: HashSet::new(),
@@ -5540,6 +6132,45 @@ impl ProjectBuilder {
 
     fn record_payload_observation(&mut self, observation: MetadataObservation) {
         add_metadata_observation(&mut self.metadata_observations, observation);
+    }
+
+    fn seed_installation_properties(&mut self, properties: &BTreeMap<String, String>) {
+        for (name, value) in properties {
+            let key = name.to_ascii_lowercase();
+            if self.global_properties.contains(&key) {
+                continue;
+            }
+            if let Some(previous) = self.properties.insert(key.clone(), value.clone()) {
+                self.property_bytes = self.property_bytes.saturating_sub(previous.len());
+            }
+            self.property_bytes = self.property_bytes.saturating_add(value.len());
+            self.configured_ranges.remove(&key);
+            self.configured_properties.remove(&key);
+            self.property_provenance_ranges.insert(
+                key.clone(),
+                vec![ProvenanceRange {
+                    range: 0..value.len(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                }],
+            );
+            self.property_default_provenances
+                .insert(key, ProjectPathProvenance::LegacyNative);
+        }
+    }
+
+    fn process_installation_file(
+        &mut self,
+        contents: &str,
+        path: &Path,
+        tracker: &mut ProjectReadTracker<'_>,
+        provenance: &ProjectPathProvenance,
+    ) -> Result<(), String> {
+        let operations = parse_xml_operations(contents, path)
+            .map_err(|error| format!("malformed installation XML: {error}"))?;
+        let previous_mode = std::mem::replace(&mut self.installation_data_mode, true);
+        let result = self.process_operations(operations, path, tracker, provenance);
+        self.installation_data_mode = previous_mode;
+        result
     }
 
     fn property(&self, name: &str) -> Option<String> {
@@ -5614,7 +6245,7 @@ impl ProjectBuilder {
                 .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
         self.record_payload_observation(observation);
         let operations = parse_xml_operations(&contents, path)?;
-        self.process_operations(operations, path, tracker, &entry.provenance);
+        self.process_operations(operations, path, tracker, &entry.provenance)?;
         Ok(())
     }
 
@@ -5624,7 +6255,7 @@ impl ProjectBuilder {
         source_file: &Path,
         tracker: &mut ProjectReadTracker<'_>,
         source_provenance: &ProjectPathProvenance,
-    ) {
+    ) -> Result<(), String> {
         let base = source_file.parent().unwrap_or_else(|| Path::new("."));
         for operation in operations {
             match operation {
@@ -5661,11 +6292,12 @@ impl ProjectBuilder {
                     }
                 }
                 XmlOperation::Import(import) => {
-                    self.process_import(import, source_file, base, tracker, source_provenance);
+                    self.process_import(import, source_file, base, tracker, source_provenance)?;
                 }
                 XmlOperation::Unsupported(message) => self.warnings.push(message),
             }
         }
+        Ok(())
     }
 
     fn process_property_group(
@@ -5848,6 +6480,23 @@ impl ProjectBuilder {
         }
     }
 
+    fn unknown_installation_import(
+        &mut self,
+        source_file: &Path,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.incomplete = true;
+        self.taint_unknown_import();
+        if self.installation_data_mode {
+            Err(format!(
+                "unknown installation-data import in {}: {reason}",
+                source_file.display()
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn mark_property_unknown(
         &mut self,
         name: &str,
@@ -5877,95 +6526,7 @@ impl ProjectBuilder {
         base: &Path,
         tracker: &mut ProjectReadTracker<'_>,
         source_provenance: &ProjectPathProvenance,
-    ) {
-        if !import_may_be_evaluated(&import.project) {
-            self.warnings.push(format!(
-                "ignored unsupported MSBuild import in {} (targets are not executed): {}",
-                source_file.display(),
-                import.project
-            ));
-            return;
-        }
-        let expanded = expand_value(
-            &import.project,
-            "",
-            &self.properties,
-            &self.configured_ranges,
-            &self.configured_properties,
-            &self.property_provenance_ranges,
-            &self.property_default_provenances,
-            &self.unknown_properties,
-            &mut self.warnings,
-            source_file,
-            source_provenance,
-        );
-        if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            return;
-        }
-        let Some(resolved) = project_path_candidate(
-            &expanded.value,
-            base,
-            &self.overrides,
-            &mut self.warnings,
-            "project import",
-        ) else {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            return;
-        };
-        let candidate = lexical_normalize(&resolved.path);
-        if !is_supported_project_import(&candidate) {
-            self.warnings.push(format!(
-                "ignored unsupported MSBuild import in {} (targets are not executed): {}",
-                source_file.display(),
-                import.project
-            ));
-            return;
-        }
-        let path_status = resolve_existing_path_status_with_provenance(
-            &candidate,
-            &resolved,
-            &expanded.value,
-            &mut self.warnings,
-            "project import",
-        );
-        let path = match &path_status {
-            ExistingPathStatus::Found(path) => path,
-            ExistingPathStatus::Missing => &candidate,
-            ExistingPathStatus::Unresolvable => {
-                self.incomplete = true;
-                self.taint_unknown_import();
-                return;
-            }
-        };
-        let entry = inherit_path_provenance(
-            ProjectPathEntry::resolved(path.clone(), &resolved, expanded.explicit_dependency),
-            &expanded_path_provenance(&expanded, source_provenance),
-        );
-        if matches!(path_status, ExistingPathStatus::Found(_))
-            && !self.read_policy.allows_entry(&entry)
-        {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            self.warnings.push(format!(
-                "ignored project import outside authorized read roots: {}",
-                path.display()
-            ));
-            return;
-        }
-        if !add_metadata_file(
-            &mut self.metadata_files,
-            path.clone(),
-            &mut self.warnings,
-            source_file,
-            "project import",
-        ) {
-            self.incomplete = true;
-            self.taint_unknown_import();
-            return;
-        }
+    ) -> Result<(), String> {
         let condition = condition_matches(
             import.condition.as_deref(),
             ConditionEnvironment {
@@ -5982,41 +6543,141 @@ impl ProjectBuilder {
         );
         match condition {
             TruthValue::True => {}
-            TruthValue::False => return,
+            TruthValue::False => return Ok(()),
             TruthValue::Unknown => {
                 self.incomplete = true;
                 self.taint_unknown_import();
-                return;
+                return if self.installation_data_mode {
+                    Err(format!(
+                        "unknown installation-data import condition in {}: {}",
+                        source_file.display(),
+                        import.project
+                    ))
+                } else {
+                    Ok(())
+                };
             }
         }
+        if !import_may_be_evaluated(&import.project) {
+            let message = format!(
+                "unsupported MSBuild import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            );
+            if self.installation_data_mode {
+                return Err(message);
+            }
+            self.warnings.push(format!(
+                "ignored unsupported MSBuild import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            ));
+            return Ok(());
+        }
+        let expanded = expand_value(
+            &import.project,
+            "",
+            &self.properties,
+            &self.configured_ranges,
+            &self.configured_properties,
+            &self.property_provenance_ranges,
+            &self.property_default_provenances,
+            &self.unknown_properties,
+            &mut self.warnings,
+            source_file,
+            source_provenance,
+        );
+        if expanded.unknown || expanded.value.contains(UNRESOLVED_MARKER) {
+            return self.unknown_installation_import(source_file, "unresolved import path");
+        }
+        let Some(resolved) = project_path_candidate(
+            &expanded.value,
+            base,
+            &self.overrides,
+            &mut self.warnings,
+            "project import",
+        ) else {
+            return self.unknown_installation_import(source_file, "unresolvable import path");
+        };
+        let candidate = lexical_normalize(&resolved.path);
+        if !is_supported_project_import(&candidate) {
+            let message = format!(
+                "unsupported MSBuild import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            );
+            if self.installation_data_mode {
+                return Err(message);
+            }
+            self.warnings.push(format!(
+                "ignored unsupported MSBuild import in {} (targets are not executed): {}",
+                source_file.display(),
+                import.project
+            ));
+            return Ok(());
+        }
+        let path_status = resolve_existing_path_status_with_provenance(
+            &candidate,
+            &resolved,
+            &expanded.value,
+            &mut self.warnings,
+            "project import",
+        );
+        let path = match &path_status {
+            ExistingPathStatus::Found(path) => path,
+            ExistingPathStatus::Missing => &candidate,
+            ExistingPathStatus::Unresolvable => {
+                return self
+                    .unknown_installation_import(source_file, "unresolvable import location");
+            }
+        };
+        let entry = inherit_path_provenance(
+            ProjectPathEntry::resolved(path.clone(), &resolved, expanded.explicit_dependency),
+            &expanded_path_provenance(&expanded, source_provenance),
+        );
+        if matches!(path_status, ExistingPathStatus::Found(_))
+            && !self.read_policy.allows_entry(&entry)
+        {
+            self.warnings.push(format!(
+                "ignored project import outside authorized read roots: {}",
+                path.display()
+            ));
+            return self.unknown_installation_import(
+                source_file,
+                "import is outside authorized read roots",
+            );
+        }
+        if !add_metadata_file(
+            &mut self.metadata_files,
+            path.clone(),
+            &mut self.warnings,
+            source_file,
+            "project import",
+        ) {
+            return self.unknown_installation_import(source_file, "metadata import limit reached");
+        }
         if self.import_count >= MAX_IMPORT_COUNT {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(format!(
                 "project import limit ({MAX_IMPORT_COUNT}) reached while reading {}",
                 source_file.display()
             ));
-            return;
+            return self.unknown_installation_import(source_file, "project import limit reached");
         }
         let ExistingPathStatus::Found(path) = path_status else {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(missing_path_warning(
                 "project import",
                 &expanded.value,
                 &candidate,
                 &resolved,
             ));
-            return;
+            return self.unknown_installation_import(source_file, "import file is missing");
         };
         if !self.active_imports.insert(path.clone()) {
-            self.incomplete = true;
-            self.taint_unknown_import();
             self.warnings.push(format!(
                 "project import cycle ignored at {}",
                 path.display()
             ));
-            return;
+            return self.unknown_installation_import(source_file, "project import cycle");
         }
         self.import_count += 1;
         let result =
@@ -6025,20 +6686,29 @@ impl ProjectBuilder {
                     self.record_payload_observation(observation);
                     parse_xml_operations(&contents, &path)
                 });
-        match result {
+        let result = match result {
             Ok(operations) => {
                 self.process_operations(operations, &path, tracker, &entry.provenance)
             }
             Err(error) => {
+                let transient = tracker
+                    .work_budget
+                    .is_some_and(|budget| budget.is_transient_error(&error));
                 self.incomplete = true;
                 self.taint_unknown_import();
                 self.warnings.push(format!(
                     "could not read project import {}: {error}",
                     path.display()
                 ));
+                if transient || self.installation_data_mode {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
             }
-        }
+        };
         self.active_imports.remove(&path);
+        result
     }
 }
 

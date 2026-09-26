@@ -4,8 +4,262 @@ use pascal_core::resolver::{
     SourceRevision, SourceStore, SourceStoreError, UnitResolveRequest, UnitResolver,
 };
 use pascal_project::{
-    ProjectContext, ProjectPathEntry, ProjectPathProvenance, ReadPolicy, content_hash_bytes,
+    ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
+    ProjectPathProvenance, ReadPolicy, content_hash_bytes, delphi_overrides::OverrideSession,
 };
+
+#[test]
+fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallback() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let ide = root.join("ide");
+    let app = root.join("App.dproj");
+    let write = |path: &Path, text: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(&sdk.join("bin/rsvars.bat"), "@SET BDS=C:\\Original\\37.0\n");
+    write(
+        &ide.join("EnvOptions.proj"),
+        "<Project><PropertyGroup Condition=\"'$(Platform)'=='Linux64'\"><DelphiLibraryPath>$(BDS)\\lib</DelphiLibraryPath><DelphiBrowsingPath>$(BDS)\\source</DelphiBrowsingPath><DelphiDebugDCUPath>$(BDS)\\debug</DelphiDebugDCUPath></PropertyGroup></Project>",
+    );
+    write(
+        &app,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform></PropertyGroup><ItemGroup><DCCReference Include=\"Reserved.pas\" /></ItemGroup></Project>",
+    );
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &root.join("Shared.pas"),
+        "unit Shared; interface const Winner = 1; implementation end.",
+    );
+    write(
+        &sdk.join("lib/Shared.pas"),
+        "unit Shared; interface const Winner = 2; implementation end.",
+    );
+    write(
+        &sdk.join("lib/SdkOnly.pas"),
+        "unit SdkOnly; interface implementation end.",
+    );
+    write(
+        &sdk.join("source/BrowseOnly.pas"),
+        "unit BrowseOnly; interface implementation end.",
+    );
+    write(
+        &sdk.join("source/Reserved.pas"),
+        "unit Reserved; interface implementation end.",
+    );
+    fs::create_dir_all(sdk.join("debug")).unwrap();
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS = '{}'\nAPPDATA = '{}'\n[projects.\"App.dproj\"]\ninstallation = '37.0'\n",
+            sdk.display(),
+            ide.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(matches!(
+        &context.installation_selection,
+        Some(pascal_project::InstallationSelection::Selected { id, .. }) if id == "37.0"
+    ));
+    assert!(
+        context
+            .search_path_entries
+            .iter()
+            .any(|entry| entry.path == sdk.join("lib"))
+    );
+    assert!(
+        context
+            .browsing_path_entries
+            .iter()
+            .any(|entry| entry.path == sdk.join("source"))
+    );
+    assert!(
+        context
+            .debug_dcu_path_entries
+            .iter()
+            .any(|entry| entry.path == sdk.join("debug"))
+    );
+    let store = FilesystemSourceStore::new();
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        store,
+        ResolverLimits::default(),
+    );
+    let resolve = |resolver: &mut UnitResolver<FilesystemSourceStore>, name| {
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: name,
+                importer_path: &root.join("App.dpr"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        )
+    };
+
+    let shared = resolve(&mut resolver, "Shared");
+    let Resolution::Found(shared) = shared.result else {
+        panic!(
+            "project provider should resolve before SDK provider: {:?}",
+            shared.result
+        );
+    };
+    assert_eq!(shared.source.path, root.join("Shared.pas"));
+    assert!(matches!(
+        resolve(&mut resolver, "SdkOnly").result,
+        Resolution::Found(_)
+    ));
+    assert!(matches!(
+        resolve(&mut resolver, "BrowseOnly").result,
+        Resolution::Found(_)
+    ));
+    assert!(matches!(
+        resolve(&mut resolver, "Reserved").result,
+        Resolution::Incomplete { .. }
+    ));
+}
+
+#[test]
+fn missing_explicit_reference_reserves_name_without_blocking_other_units() {
+    let root = PathBuf::from("/workspace");
+    let good = root.join("Good.pas");
+    let mut context = ProjectContext {
+        discovery_complete: false,
+        binding_metadata_complete: true,
+        search_paths: vec![root.clone(), root.join("later")],
+        search_path_entries: vec![
+            ProjectPathEntry::legacy(root.clone()),
+            ProjectPathEntry::legacy(root.join("later")),
+        ],
+        path_issues: vec![ProjectPathIssue {
+            kind: ProjectPathIssueKind::MissingReference,
+            source_file: root.join("App.dproj"),
+            property: "DCCReference".to_string(),
+            raw: "Missing.pas".to_string(),
+            path: Some(root.join("Missing.pas")),
+            unit_name: Some("missing".to_string()),
+            provenance: ProjectPathProvenance::LegacyNative,
+        }],
+        ..ProjectContext::default()
+    };
+    context
+        .explicit_units
+        .insert("good".to_string(), vec![good.clone()]);
+    context.explicit_unit_entries.insert(
+        "good".to_string(),
+        vec![ProjectPathEntry::legacy(good.clone())],
+    );
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/later/Missing.pas",
+        "unit Missing; interface implementation end.",
+    );
+    store.add(
+        "/workspace/Good.pas",
+        "unit Good; interface implementation end.",
+    );
+    let mut resolver = UnitResolver::new(context, vec![root], store, ResolverLimits::default());
+
+    let missing = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Missing",
+            importer_path: Path::new("/workspace/App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(matches!(missing.result, Resolution::Incomplete { .. }));
+    let found = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Good",
+            importer_path: Path::new("/workspace/App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(matches!(found.result, Resolution::Found(_)));
+    assert!(
+        !resolver.report().complete,
+        "a positive lookup must not claim whole-project completeness"
+    );
+}
+
+#[test]
+fn absent_search_directory_does_not_hide_later_provider() {
+    let root = PathBuf::from("/workspace");
+    let missing = root.join("not-installed");
+    let provider_dir = root.join("provider");
+    let context = ProjectContext {
+        discovery_complete: true,
+        search_paths: vec![missing.clone(), provider_dir.clone()],
+        search_path_entries: vec![
+            ProjectPathEntry::legacy(missing),
+            ProjectPathEntry::legacy(provider_dir),
+        ],
+        ..ProjectContext::default()
+    };
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/provider/Later.pas",
+        "unit Later; interface implementation end.",
+    );
+    let mut resolver = UnitResolver::new(context, vec![root], store, ResolverLimits::default());
+    let result = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Later",
+            importer_path: Path::new("/workspace/App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(matches!(result.result, Resolution::Found(_)));
+}
+
+#[test]
+fn unreadable_higher_priority_directory_blocks_later_provider() {
+    let root = PathBuf::from("/workspace");
+    let unavailable = root.join("restricted");
+    let provider_dir = root.join("provider");
+    let context = ProjectContext {
+        discovery_complete: true,
+        search_paths: vec![unavailable.clone(), provider_dir.clone()],
+        search_path_entries: vec![
+            ProjectPathEntry::legacy(unavailable.clone()),
+            ProjectPathEntry::legacy(provider_dir),
+        ],
+        ..ProjectContext::default()
+    };
+    let mut inner = MemoryStore::default();
+    inner.add(
+        "/workspace/provider/Later.pas",
+        "unit Later; interface implementation end.",
+    );
+    let store = FailingDirectoryStore {
+        inner,
+        failing_directory: unavailable,
+    };
+    let mut resolver = UnitResolver::new(context, vec![root], store, ResolverLimits::default());
+    let result = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Later",
+            importer_path: Path::new("/workspace/App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(matches!(result.result, Resolution::Incomplete { .. }));
+}
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -406,6 +660,52 @@ fn unsupported_active_directive_blocks_include_precision() {
         pascal_core::ResolutionTarget::Incomplete
     ));
     assert!(project.include_sources.is_empty());
+}
+
+#[test]
+fn rtl_switch_list_does_not_make_unit_resolution_unsupported() {
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/System.pas",
+        "{$H+,I-,R-,O+,W-} unit System; interface implementation end.",
+    );
+    let mut resolver = UnitResolver::new(
+        fixture_context(),
+        vec![PathBuf::from("/workspace")],
+        store,
+        Default::default(),
+    );
+
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "System",
+            importer_path: Path::new("/workspace/Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+
+    assert!(matches!(outcome.result, Resolution::Found(_)));
+    assert!(resolver.finish().complete);
+}
+
+#[test]
+fn comma_switch_effects_flow_through_resolved_includes() {
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/Main.pas",
+        "unit Main; interface {$R+,Q+}{$I options.inc}{$IFOPT Q-}{$I selected.inc}{$ENDIF} implementation end.",
+    );
+    store.add("/workspace/options.inc", "{$Q-}");
+    store.add("/workspace/selected.inc", "const Selected = 1;");
+
+    let project = resolve_memory_project(fixture_context(), store, Default::default());
+
+    assert!(project.complete);
+    assert!(project.includes.iter().any(|include| {
+        include.requested_name == "selected.inc"
+            && matches!(include.target, pascal_core::ResolutionTarget::Found(_))
+    }));
 }
 
 #[test]

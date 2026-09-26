@@ -1284,6 +1284,12 @@ fn constant_size(value: &ConstantValue) -> usize {
 /// Whether a directive is a state-changing compiler option that the bounded
 /// evaluator can track and downstream projections must replace or mask.
 pub fn is_option_directive(body: &str) -> bool {
+    if switch_list_members(body).is_some() {
+        return true;
+    }
+    if switch_list_candidates(body).is_some() {
+        return true;
+    }
     let Some(keyword) = directive_keyword(body) else {
         return false;
     };
@@ -1332,6 +1338,29 @@ fn apply_option_directive(
     activity: Truth,
     budget: &mut AnalysisBudget<'_>,
 ) -> bool {
+    if let Some(members) = switch_list_members(body) {
+        for member in members {
+            if !apply_option_directive(environment, member, activity, budget) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if let Some(members) = switch_list_candidates(body) {
+        let mut found = false;
+        for member in members {
+            let Some(name) = short_switch_name(member) else {
+                continue;
+            };
+            found = true;
+            if !apply_option_fact(environment, name, Truth::Unknown, activity, budget) {
+                return false;
+            }
+        }
+        if found {
+            return true;
+        }
+    }
     let Some(keyword) = directive_keyword(body) else {
         return false;
     };
@@ -1396,6 +1425,46 @@ fn apply_option_directive(
         }
     };
     apply_option_fact(environment, &canonical_name, value, activity, budget)
+}
+
+fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
+    if !body.contains(',') {
+        return None;
+    }
+    let members = body.split(',').map(str::trim);
+    let valid = members.clone().all(|member| {
+        let bytes = member.as_bytes();
+        bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-')
+    });
+    valid.then_some(members)
+}
+
+fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
+    if !body.contains(',') {
+        return None;
+    }
+    let members = body.split(',').map(str::trim);
+    members
+        .clone()
+        .next()
+        .filter(|member| has_explicit_short_switch_suffix(member))?;
+    Some(members)
+}
+
+fn has_explicit_short_switch_suffix(member: &str) -> bool {
+    let bytes = member.trim().as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b'+' | b'-')
+}
+
+fn short_switch_name(member: &str) -> Option<&str> {
+    let member = member.trim();
+    let bytes = member.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let suffix_len = usize::from(matches!(bytes.get(1), Some(b'+' | b'-')));
+    let token_end = 1 + suffix_len;
+    (token_end == bytes.len() || bytes[token_end].is_ascii_whitespace()).then(|| &member[..1])
 }
 
 fn observe_source_constants(
@@ -1937,6 +2006,9 @@ fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
 }
 
 fn directive_kind(body: &str) -> DirectiveKind {
+    if switch_list_members(body).is_some() {
+        return DirectiveKind::Harmless;
+    }
     let keyword = directive_keyword(body)
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();

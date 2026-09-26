@@ -52,23 +52,23 @@ pub struct ResolvedPath {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverrideLayer {
-    properties: BTreeMap<String, String>,
-    path_mappings: Vec<PathMapping>,
-    config_file: PathBuf,
+    pub(crate) properties: BTreeMap<String, String>,
+    pub(crate) path_mappings: Vec<PathMapping>,
+    pub(crate) config_file: PathBuf,
 }
 
-type CapturedLayer = Result<Option<OverrideLayer>, String>;
+type CapturedLayer = Result<Option<crate::installation_config::ConfigurationLayer>, String>;
 
 #[derive(Debug, Clone)]
 pub struct OverrideSession {
-    user_config_file: Option<PathBuf>,
+    pub(crate) user_config_file: Option<PathBuf>,
     captured: Arc<Mutex<BTreeMap<PathBuf, CapturedLayer>>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawOverrideFile {
+pub(crate) struct RawOverrideFile {
     #[serde(default)]
     properties: BTreeMap<String, String>,
     #[serde(default)]
@@ -77,9 +77,9 @@ struct RawOverrideFile {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawPathMapping {
-    from: String,
-    to: String,
+pub(crate) struct RawPathMapping {
+    pub(crate) from: String,
+    pub(crate) to: String,
 }
 
 impl OverrideLayer {
@@ -87,8 +87,16 @@ impl OverrideLayer {
         let raw: RawOverrideFile = toml::from_str(text)
             .map_err(|error| config_error(config_file, format_args!("failed to parse: {error}")))?;
 
+        Self::from_parts(raw.properties, raw.path_mappings, config_file)
+    }
+
+    pub(crate) fn from_parts(
+        raw_properties: BTreeMap<String, String>,
+        raw_mappings: Vec<RawPathMapping>,
+        config_file: &Path,
+    ) -> Result<Self, String> {
         let mut properties = BTreeMap::new();
-        for (name, value) in raw.properties {
+        for (name, value) in raw_properties {
             let canonical_name = name.to_ascii_lowercase();
             if !is_valid_property_name(&name) {
                 return Err(config_error(
@@ -119,9 +127,9 @@ impl OverrideLayer {
             }
         }
 
-        let mut path_mappings = Vec::with_capacity(raw.path_mappings.len());
+        let mut path_mappings = Vec::with_capacity(raw_mappings.len());
         let mut mapping_prefixes = BTreeSet::new();
-        for mapping in raw.path_mappings {
+        for mapping in raw_mappings {
             let from = canonical_mapping_prefix(&mapping.from, config_file)?;
             validate_mapping_destination(&mapping.to, config_file)?;
             if !mapping_prefixes.insert(from.clone()) {
@@ -352,7 +360,7 @@ impl OverrideSession {
         for path in paths {
             self.capture_path(&path)?;
             match self.captured_layer(&path)? {
-                Ok(Some(layer)) => layers.push(layer),
+                Ok(Some(layer)) => layers.push(layer.shared),
                 Ok(None) => {}
                 Err(error) => return Err(error),
             }
@@ -360,7 +368,7 @@ impl OverrideSession {
         Ok(EffectiveOverrides::merge(&layers))
     }
 
-    fn capture_path(&self, path: &Path) -> Result<(), String> {
+    pub(crate) fn capture_path(&self, path: &Path) -> Result<(), String> {
         let path = normalize_absolute_lexical(path)?;
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
         let dirty = self
@@ -386,7 +394,7 @@ impl OverrideSession {
         result.map(|_| ())
     }
 
-    fn captured_layer(&self, path: &Path) -> Result<CapturedLayer, String> {
+    pub(crate) fn captured_layer(&self, path: &Path) -> Result<CapturedLayer, String> {
         let captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
         captured
             .get(path)
@@ -471,7 +479,7 @@ fn read_override_file_with_budget(
     }
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| format!("invalid UTF-8 in {}: {error}", path.display()))?;
-    OverrideLayer::parse(text, path).map(Some)
+    crate::installation_config::ConfigurationLayer::parse(text, path).map(Some)
 }
 
 fn inspect_candidate(
@@ -573,7 +581,7 @@ fn open_candidate(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-fn normalize_absolute_lexical(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn normalize_absolute_lexical(path: &Path) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(path).map_err(|error| {
         format!(
             "could not resolve {} as an absolute path: {error}",
@@ -602,7 +610,7 @@ fn normalize_absolute_lexical(path: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+pub(crate) fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
@@ -804,7 +812,7 @@ fn matches_components(prefix: &[String], input: &[String]) -> bool {
             .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-fn config_error(config_file: &Path, message: impl Display) -> String {
+pub(crate) fn config_error(config_file: &Path, message: impl Display) -> String {
     format!("{}: {message}", config_file.display())
 }
 

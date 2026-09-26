@@ -10,6 +10,14 @@ pub(crate) struct ConfigurationLayer {
     pub(crate) shared: OverrideLayer,
     pub(crate) installations: BTreeMap<String, OverrideLayer>,
     projects: HashMap<PathBuf, String>,
+    pub(crate) source_stamp: ConfigurationSourceStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationSourceStamp {
+    pub path: PathBuf,
+    pub byte_len: Option<u64>,
+    pub content_hash: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +91,11 @@ impl ConfigurationLayer {
             shared,
             installations,
             projects,
+            source_stamp: ConfigurationSourceStamp {
+                path: config_file.to_path_buf(),
+                byte_len: Some(text.len() as u64),
+                content_hash: Some(crate::content_hash_bytes(text.as_bytes())),
+            },
         })
     }
 }
@@ -94,6 +107,7 @@ impl ConfigurationLayer {
 pub struct ProjectConfiguration {
     layers: Vec<ConfigurationLayer>,
     selectors: HashMap<PathBuf, String>,
+    source_stamps: Vec<ConfigurationSourceStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +122,28 @@ impl ProjectConfiguration {
         for layer in &layers {
             selectors.extend(layer.projects.clone());
         }
-        Self { layers, selectors }
+        let source_stamps = layers
+            .iter()
+            .map(|layer| layer.source_stamp.clone())
+            .collect();
+        Self {
+            layers,
+            selectors,
+            source_stamps,
+        }
+    }
+
+    fn from_layers_and_source_stamps(
+        layers: Vec<ConfigurationLayer>,
+        source_stamps: Vec<ConfigurationSourceStamp>,
+    ) -> Self {
+        let mut configuration = Self::from_layers(layers);
+        configuration.source_stamps = source_stamps;
+        configuration
+    }
+
+    pub fn source_stamps(&self) -> &[ConfigurationSourceStamp] {
+        &self.source_stamps
     }
 
     pub fn installation_ids(&self) -> Vec<String> {
@@ -156,10 +191,92 @@ impl ProjectConfiguration {
 }
 
 impl crate::delphi_overrides::OverrideSession {
+    pub fn configuration_source_stamps_for(
+        &self,
+        workspace_root: Option<&Path>,
+        project_file: Option<&Path>,
+        budget: Option<&dyn crate::ProjectWorkBudget>,
+    ) -> Result<Vec<ConfigurationSourceStamp>, String> {
+        let mut paths = Vec::with_capacity(3);
+        if let Some(user_config_file) = self.user_config_file.as_ref() {
+            super::delphi_overrides::push_unique_path(&mut paths, user_config_file.clone());
+        }
+        if let Some(workspace_root) = workspace_root {
+            let root = super::delphi_overrides::normalize_absolute_lexical(workspace_root)?;
+            super::delphi_overrides::push_unique_path(
+                &mut paths,
+                root.join(super::delphi_overrides::LOCAL_CONFIG_NAME),
+            );
+        }
+        if let Some(project_file) = project_file {
+            let project_file = super::delphi_overrides::normalize_absolute_lexical(project_file)?;
+            let directory = project_file.parent().unwrap_or(&project_file);
+            super::delphi_overrides::push_unique_path(
+                &mut paths,
+                directory.join(super::delphi_overrides::LOCAL_CONFIG_NAME),
+            );
+        }
+
+        let mut stamps = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+                budget.charge_path_visits(1)?;
+            }
+            match super::delphi_overrides::override_source_stamp_with_budget(&path, budget)? {
+                Some(stamp) => stamps.push(stamp),
+                None => stamps.push(ConfigurationSourceStamp {
+                    path,
+                    byte_len: None,
+                    content_hash: None,
+                }),
+            }
+        }
+        Ok(stamps)
+    }
+
+    pub fn configuration_source_stamps_are_current(
+        &self,
+        expected_stamps: &[ConfigurationSourceStamp],
+        budget: Option<&dyn crate::ProjectWorkBudget>,
+    ) -> Result<bool, String> {
+        for expected in expected_stamps {
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+                budget.charge_path_visits(1)?;
+            }
+            let current = match super::delphi_overrides::override_source_stamp_with_budget(
+                &expected.path,
+                budget,
+            ) {
+                Ok(Some(stamp)) => stamp,
+                Ok(None) => ConfigurationSourceStamp {
+                    path: expected.path.clone(),
+                    byte_len: None,
+                    content_hash: None,
+                },
+                Err(_) => return Ok(false),
+            };
+            if &current != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn configuration_for(
         &self,
         workspace_root: Option<&Path>,
         project_file: Option<&Path>,
+    ) -> Result<ProjectConfiguration, String> {
+        self.configuration_for_with_work_budget(workspace_root, project_file, None)
+    }
+
+    pub fn configuration_for_with_work_budget(
+        &self,
+        workspace_root: Option<&Path>,
+        project_file: Option<&Path>,
+        budget: Option<&dyn crate::ProjectWorkBudget>,
     ) -> Result<ProjectConfiguration, String> {
         let mut paths = Vec::with_capacity(3);
         if let Some(user_config_file) = self.user_config_file.as_ref() {
@@ -182,15 +299,59 @@ impl crate::delphi_overrides::OverrideSession {
         }
 
         let mut layers = Vec::new();
+        let mut source_stamps = Vec::with_capacity(paths.len());
         for path in paths {
-            self.capture_path(&path)?;
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+                budget.charge_path_visits(1)?;
+            }
+            self.capture_path_with_work_budget(&path, budget)?;
             match self.captured_layer(&path)? {
-                Ok(Some(layer)) => layers.push(layer),
-                Ok(None) => {}
+                Ok(Some(layer)) => {
+                    source_stamps.push(layer.source_stamp.clone());
+                    layers.push(layer);
+                }
+                Ok(None) => source_stamps.push(ConfigurationSourceStamp {
+                    path,
+                    byte_len: None,
+                    content_hash: None,
+                }),
                 Err(error) => return Err(error),
             }
         }
-        Ok(ProjectConfiguration::from_layers(layers))
+        Ok(ProjectConfiguration::from_layers_and_source_stamps(
+            layers,
+            source_stamps,
+        ))
+    }
+
+    pub fn configuration_sources_are_current(
+        &self,
+        configuration: &ProjectConfiguration,
+        budget: Option<&dyn crate::ProjectWorkBudget>,
+    ) -> Result<bool, String> {
+        for expected in configuration.source_stamps() {
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+                budget.charge_path_visits(1)?;
+            }
+            let current = match super::delphi_overrides::read_override_file_with_budget(
+                &expected.path,
+                budget,
+            ) {
+                Ok(Some(layer)) => layer.source_stamp,
+                Ok(None) => ConfigurationSourceStamp {
+                    path: expected.path.clone(),
+                    byte_len: None,
+                    content_hash: None,
+                },
+                Err(_) => return Ok(false),
+            };
+            if &current != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 

@@ -9,6 +9,123 @@ use pascal_project::{
 };
 
 #[test]
+#[ignore = "requires explicitly supplied local Delphi installations"]
+fn local_delphi_rtl_unit_resolution() {
+    use std::{env, fs, path::PathBuf};
+
+    let delphi =
+        PathBuf::from(env::var_os("PASCAL_TEST_DELPHI_ROOT").expect("PASCAL_TEST_DELPHI_ROOT"));
+    let _project_root =
+        PathBuf::from(env::var_os("PASCAL_TEST_PROJECT_ROOT").expect("PASCAL_TEST_PROJECT_ROOT"));
+    let mut failures = Vec::new();
+    for (version, compiler, install, ide, unit) in [
+        (
+            "7.0",
+            21,
+            "RAD Studio/7.0",
+            "AppData/CodeGear/BDS/7.0",
+            "SysUtils",
+        ),
+        (
+            "10.0",
+            24,
+            "RAD Studio/10.0",
+            "AppData/Embarcadero/BDS/10.0",
+            "System.SysUtils",
+        ),
+        (
+            "37.0",
+            37,
+            "Studio/37.0",
+            "AppData/Embarcadero/BDS/37.0",
+            "System.SysUtils",
+        ),
+    ] {
+        let sdk = delphi.join(install);
+        let ide_root = delphi.join(ide);
+        if !sdk.join("bin/rsvars.bat").is_file() || !ide_root.join("EnvOptions.proj").is_file() {
+            eprintln!("Delphi {version}: skipped (rsvars or EnvOptions absent)");
+            continue;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("Probe.dpr"), "program Probe; begin end.").unwrap();
+        fs::write(root.join("Probe.dproj"), "<Project><PropertyGroup><MainSource>Probe.dpr</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>").unwrap();
+        fs::write(root.join(".delphi-tools.local.toml"), format!(
+            "[installations.\"{version}\".properties]\nBDS={}\nAPPDATA={}\nENVOPTIONS={}\n[projects.\"Probe.dproj\"]\ninstallation='{version}'\n",
+            toml::Value::String(sdk.to_string_lossy().into_owned()),
+            toml::Value::String(ide_root.to_string_lossy().into_owned()),
+            toml::Value::String(ide_root.join("EnvOptions.proj").to_string_lossy().into_owned()),
+        )).unwrap();
+        let context = ProjectContext::discover_with_overrides(
+            &root.join("Probe.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .unwrap();
+        eprintln!(
+            "Delphi {version}: discovery_complete={}, search_paths={:?}, browsing_paths={:?}, path_issues={:?}, warning_count={}, first_warnings={:?}",
+            context.discovery_complete,
+            context.search_paths,
+            context
+                .browsing_path_entries
+                .iter()
+                .map(|entry| &entry.path)
+                .collect::<Vec<_>>(),
+            context.path_issues,
+            context.warnings.len(),
+            context.warnings.iter().take(5).collect::<Vec<_>>(),
+        );
+        if context.conditional_context.compiler_version
+            != Some(pascal_project::CompilerVersion::new(compiler, 0))
+        {
+            failures.push(format!(
+                "Delphi {version}: compiler version {:?}",
+                context.conditional_context.compiler_version
+            ));
+        }
+        let mut resolver = UnitResolver::new(
+            context,
+            vec![root.to_path_buf()],
+            FilesystemSourceStore::new(),
+            ResolverLimits::default(),
+        );
+        let outcome = resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: unit,
+                importer_path: &root.join("Probe.dpr"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        );
+        match outcome.result {
+            Resolution::Found(found) => {
+                if !found.source.path.starts_with(&sdk) {
+                    failures.push(format!(
+                        "Delphi {version}: resolved outside SDK: {}",
+                        found.source.path.display()
+                    ));
+                }
+                eprintln!(
+                    "Delphi {version}: {unit} -> {}",
+                    found.source.path.display()
+                );
+            }
+            other => failures.push(format!(
+                "Delphi {version}: failed to resolve {unit}: {other:?}; warnings={:?}",
+                outcome.warnings
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "real RTL resolution failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallback() {
     use std::fs;
 
@@ -28,7 +145,10 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
     );
     write(
         &app,
-        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform></PropertyGroup><ItemGroup><DCCReference Include=\"Reserved.pas\" /></ItemGroup></Project>",
+        &format!(
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform><DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"Reserved.pas\" /></ItemGroup></Project>",
+            sdk.join("lib").display()
+        ),
     );
     write(&root.join("App.dpr"), "program App; begin end.");
     write(
@@ -78,6 +198,23 @@ fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallb
             .iter()
             .any(|entry| entry.path == sdk.join("lib"))
     );
+    assert_eq!(
+        context
+            .search_path_entries
+            .iter()
+            .filter(|entry| entry.path == sdk.join("lib"))
+            .count(),
+        1,
+        "the earliest project path entry must deduplicate the SDK copy"
+    );
+    assert!(matches!(
+        context
+            .search_path_entries
+            .iter()
+            .find(|entry| entry.path == sdk.join("lib"))
+            .map(|entry| &entry.provenance),
+        Some(ProjectPathProvenance::LegacyNative)
+    ));
     assert!(
         context
             .browsing_path_entries

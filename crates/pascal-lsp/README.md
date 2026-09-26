@@ -732,11 +732,12 @@ candidates, unauthorized paths, symlinks and uncertain type names yield no
 authoritative compiled result. Full compiler-grade DCU resolution is not
 provided.
 
-### Delphi path overrides (LSP only)
+### Delphi path overrides (LSP and `lint4d --project`)
 
 When a Delphi project records Windows installation paths but the corresponding
-source is installed locally on Linux, `pascal-lsp` can translate those paths
-only when you explicitly configure a mapping. The LSP and lint4d's
+source is installed locally on Linux, selected installation profiles relocate
+known installation roots; explicit mappings remain available for other literal
+Windows paths and renamed subtrees. The LSP and lint4d's
 `--project` source-CFG path consume these files through `pascal-project`.
 `fmt4d` and lint4d runs without `--project` do not use them for source
 discovery. lint4d's `--bds-path` remains a DCU auto-discovery override, not a
@@ -766,13 +767,34 @@ from = 'C:\Program Files\Embarcadero\RAD Studio\7.0\lib\Indy10'
 to = '/home/you/sources/indy10'
 ```
 
-Properties and mapping prefixes are ASCII case-insensitive per key. A higher
-layer replaces the complete value for the same property or normalized Windows
-prefix; unrelated entries remain inherited. The resolver then chooses the
-longest matching Windows path prefix after that merge, at path-component
-boundaries, so the Indy mapping above wins for paths below `lib\Indy10`.
-There is no deletion/tombstone syntax: to change an inherited entry, override
-the same key or prefix in the higher layer.
+Properties and mapping prefixes are ASCII case-insensitive per key. Higher
+layers replace the same property or normalized Windows prefix; unrelated
+entries remain inherited. The resolver chooses the longest matching Windows
+prefix at path-component boundaries. There is no deletion/tombstone syntax.
+
+For installation-aware discovery, add profiles under
+`[installations."<id>".properties]` and
+`[[installations."<id>".path_mappings]]`; an ID such as `37.0` selects a
+Delphi version. In each configuration layer shared properties/mappings are
+defaults and that layer's selected profile overrides them. Layers still apply
+user, workspace, project order, so a project shared value can override a user
+profile value. A `[projects."App.dproj"]` table with
+`installation = "37.0"` selects an exact project path, not a glob; relative keys
+are resolved against their config file,
+and more-local selectors override the same project's earlier choice. See the
+[`pascal-project` installation-profile reference](../pascal-project/README.md#delphi-installation-profiles)
+for a validated full example.
+
+Set `BDS` to the direct local installation directory. `APPDATA` here means the
+direct version-specific IDE configuration directory containing `EnvOptions.proj`
+and optionally `environment.proj`, not roaming Windows `%APPDATA%`; do not
+append vendor/BDS/version components. Optional `EnvOptions` and
+`EnvironmentSettings` properties select those input files directly. The loader
+reads `rsvars.bat` assignments and the IDE XML as data; it does not execute
+scripts or import arbitrary build targets. Explicit configured properties
+override imported environment values. `environment.proj` is distinct from
+`.optset`: claims that all non-`.optset` imports are ignored apply to ordinary
+project imports, not these explicitly selected IDE inputs.
 
 Configured property values are literal values used while evaluating project
 metadata; configured values containing `$(` are rejected rather than recursively
@@ -780,8 +802,9 @@ expanded. Client `buildConfig` and `platform` take precedence over `[properties]
 `Config` and `Platform`; those file properties in turn take precedence over
 project and option-set defaults. Values from either higher-precedence source are
 immutable evaluator inputs: project XML and imports cannot replace or taint
-them. The server evaluates supported `.optset` imports, but still ignores
-non-`.optset` imports and does not execute targets.
+them. The project evaluator reads supported `.optset` and `.props` imports as
+data, subject to its bounded property/condition evaluator; it does not execute
+targets or treat arbitrary target imports as executable build logic.
 Consequently, an ignored import such as
 `$(BDS)\Bin\CodeGear.Delphi.Targets` remains a warning/limitation rather than a
 way to discover a Delphi installation.
@@ -798,11 +821,11 @@ An explicit formatting request for the current buffer is not newly forbidden by
 a mapping. Unmapped Windows paths on Linux remain unavailable and produce a
 diagnostic; use an explicit mapping or the existing native `sourcePaths` option.
 
-Each applicable file is captured on its first read for the LSP session: user and
-initial workspace layers are captured at startup, and a project layer when its
-candidate is first evaluated. Editing a captured override file has no effect
-until the LSP is restarted. This snapshot behavior is independent of the
-existing lint/formatter sidecar reload behavior.
+Configuration layers are captured with the project context and their source
+stamps participate in freshness validation. A changed config invalidates
+affected contexts/results and is re-read on subsequent discovery; this is not a
+session-lifetime immutable snapshot. Interactive project and installation
+choices are session-local and do not write these files.
 
 Malformed, unreadable, oversized, or invalid override files are errors for the
 scope that selects them, not a silent fallback. A bad user file affects all
@@ -844,8 +867,18 @@ safety limits also report an incomplete result instead of returning a partial
 unique match. This discovery is not compiler-install or Windows-registry
 auto-detection and does not add package exports to global unit search paths.
 
-Without `projectFile`, discovery searches ancestor directories up to the
-workspace boundary for an unambiguous `.dproj`, falling back to a `.dpr` or
+Without an explicit project selection, discovery searches ancestor directories
+up to the workspace boundary for project candidates. If multiple projects
+share the nearest directory, automatic selection is ambiguous and the LSP
+prompts rather than silently selecting one. A standard LSP client can handle
+`pascal/projectContext` and `pascal/selectProject`; the server advertises
+experimental `projectSelection`, `installationSelection`, and
+`projectCatalogue` capability flags for client UI support. The bundled Neovim
+helper exposes `:PascalProject` / `<leader>wp`, project browsing, and
+`:PascalDelphiVersion`; changing a selection does not restart the server.
+See [`examples/pascal_project.lua`](examples/pascal_project.lua).
+
+The automatic search falls back to a `.dpr` or
 `.dpk`. Multiple candidates can be narrowed to a unique proven source owner;
 shared ownership, uncertain dependencies, and incomplete candidate metadata
 still require an explicit selection. Candidate metadata is tracked for freshness,

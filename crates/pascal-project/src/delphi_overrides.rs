@@ -57,12 +57,15 @@ pub struct OverrideLayer {
     pub(crate) config_file: PathBuf,
 }
 
-type CapturedLayer = Result<Option<crate::installation_config::ConfigurationLayer>, String>;
+pub(crate) type CapturedLayer =
+    Result<Option<crate::installation_config::ConfigurationLayer>, String>;
 
 #[derive(Debug, Clone)]
 pub struct OverrideSession {
     pub(crate) user_config_file: Option<PathBuf>,
     captured: Arc<Mutex<BTreeMap<PathBuf, CapturedLayer>>>,
+    captured_error_stamps:
+        Arc<Mutex<BTreeMap<PathBuf, Option<crate::installation_config::ConfigurationSourceStamp>>>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
@@ -271,6 +274,7 @@ impl OverrideSession {
         let session = Self {
             user_config_file,
             captured: Arc::new(Mutex::new(BTreeMap::new())),
+            captured_error_stamps: Arc::new(Mutex::new(BTreeMap::new())),
             dirty: Arc::new(Mutex::new(HashSet::new())),
         };
         if let Some(user_config_file) = session.user_config_file.as_ref() {
@@ -293,11 +297,15 @@ impl OverrideSession {
         budget: &dyn crate::ProjectWorkBudget,
     ) -> Result<(), String> {
         let path = normalize_absolute_lexical(path)?;
-        let result = read_override_file_with_budget(&path, Some(budget));
+        let (result, source_stamp) = read_override_file_with_stamp_and_budget(&path, Some(budget));
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
         match result {
             Ok(layer) => {
                 captured.insert(path.clone(), Ok(layer));
+                self.captured_error_stamps
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .remove(&path);
                 self.dirty
                     .lock()
                     .map_err(|_| capture_store_poisoned())?
@@ -316,6 +324,10 @@ impl OverrideSession {
             }
             Err(error) => {
                 captured.insert(path.clone(), Err(error.clone()));
+                self.captured_error_stamps
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .insert(path.clone(), source_stamp);
                 self.dirty
                     .lock()
                     .map_err(|_| capture_store_poisoned())?
@@ -331,11 +343,46 @@ impl OverrideSession {
         let path = normalize_absolute_lexical(path)?;
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
         captured.insert(path.clone(), Ok(None));
+        self.captured_error_stamps
+            .lock()
+            .map_err(|_| capture_store_poisoned())?
+            .remove(&path);
         self.dirty
             .lock()
             .map_err(|_| capture_store_poisoned())?
             .remove(&path);
         Ok(())
+    }
+
+    /// Check whether any already captured, usable layer still matches a fresh
+    /// source-stamp baseline. Uncaptured paths remain eligible for their first
+    /// read. Cached parse errors retain their established reporting behavior
+    /// only while the error's captured raw-file stamp still matches baseline.
+    pub fn captured_sources_match(
+        &self,
+        expected: &[crate::installation_config::ConfigurationSourceStamp],
+    ) -> Result<bool, String> {
+        let captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
+        let error_stamps = self
+            .captured_error_stamps
+            .lock()
+            .map_err(|_| capture_store_poisoned())?;
+        for stamp in expected {
+            let path = normalize_absolute_lexical(&stamp.path)?;
+            let Some(layer) = captured.get(&path) else {
+                continue;
+            };
+            match layer {
+                Ok(Some(layer)) if layer.source_stamp != *stamp => return Ok(false),
+                Ok(None) if stamp.byte_len.is_some() || stamp.content_hash.is_some() => {
+                    return Ok(false);
+                }
+                Err(_) if error_stamps.get(&path) == Some(&Some(stamp.clone())) => {}
+                Err(_) => return Ok(false),
+                Ok(Some(_)) | Ok(None) => {}
+            }
+        }
+        Ok(true)
     }
 
     pub fn effective_for(
@@ -369,7 +416,19 @@ impl OverrideSession {
     }
 
     pub(crate) fn capture_path(&self, path: &Path) -> Result<(), String> {
+        self.capture_path_with_work_budget(path, None)
+    }
+
+    pub(crate) fn capture_path_with_work_budget(
+        &self,
+        path: &Path,
+        budget: Option<&dyn crate::ProjectWorkBudget>,
+    ) -> Result<(), String> {
         let path = normalize_absolute_lexical(path)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
         let mut captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
         let dirty = self
             .dirty
@@ -385,8 +444,22 @@ impl OverrideSession {
             }
         }
 
-        let result = read_override_file(&path);
+        let (result, source_stamp) = read_override_file_with_stamp_and_budget(&path, budget);
         captured.insert(path.clone(), result.clone());
+        match &result {
+            Err(_) => {
+                self.captured_error_stamps
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .insert(path.clone(), source_stamp);
+            }
+            Ok(_) => {
+                self.captured_error_stamps
+                    .lock()
+                    .map_err(|_| capture_store_poisoned())?
+                    .remove(&path);
+            }
+        }
         self.dirty
             .lock()
             .map_err(|_| capture_store_poisoned())?
@@ -409,14 +482,98 @@ impl Default for OverrideSession {
     }
 }
 
-fn read_override_file(path: &Path) -> CapturedLayer {
-    read_override_file_with_budget(path, None)
-}
-
-fn read_override_file_with_budget(
+pub(crate) fn read_override_file_with_budget(
     path: &Path,
     budget: Option<&dyn crate::ProjectWorkBudget>,
 ) -> CapturedLayer {
+    read_override_file_with_stamp_and_budget(path, budget).0
+}
+
+fn read_override_file_with_stamp_and_budget(
+    path: &Path,
+    budget: Option<&dyn crate::ProjectWorkBudget>,
+) -> (
+    CapturedLayer,
+    Option<crate::installation_config::ConfigurationSourceStamp>,
+) {
+    let mut source_stamp = None;
+    let result = (|| {
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
+        let Some(metadata) = inspect_candidate(path, budget)? else {
+            return Ok(None);
+        };
+        if metadata.len() > MAX_CONFIG_BYTES as u64 {
+            return Err(format!(
+                "{} exceeds {MAX_CONFIG_BYTES} bytes",
+                path.display()
+            ));
+        }
+
+        #[cfg(all(test, target_os = "linux"))]
+        maybe_substitute_candidate_after_inspection(path);
+
+        let file = open_candidate(path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+            budget.charge_path_visits(1)?;
+        }
+        let opened_metadata = file
+            .metadata()
+            .map_err(|error| format!("could not inspect opened {}: {error}", path.display()))?;
+        validate_regular_file(path, &opened_metadata)?;
+
+        let read_limit = metadata.len().min(MAX_CONFIG_BYTES as u64);
+        if let Some(budget) = budget {
+            let reserve = usize::try_from(read_limit)
+                .map_err(|_| "configuration size does not fit the work budget".to_string())?
+                .saturating_add(1);
+            budget.ensure_file_read_fits(reserve)?;
+            budget.check_cancelled()?;
+        }
+        let mut bytes = Vec::new();
+        let mut reader = file.take(read_limit.saturating_add(1));
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+            }
+            let read = reader
+                .read(&mut chunk)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            if let Some(budget) = budget {
+                budget.charge_file_bytes(read)?;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        if bytes.len() as u64 > read_limit {
+            return Err(format!(
+                "{} grew beyond its {read_limit} byte read limit",
+                path.display(),
+            ));
+        }
+        source_stamp = Some(crate::installation_config::ConfigurationSourceStamp {
+            path: path.to_path_buf(),
+            byte_len: Some(bytes.len() as u64),
+            content_hash: Some(crate::content_hash_bytes(&bytes)),
+        });
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| format!("invalid UTF-8 in {}: {error}", path.display()))?;
+        crate::installation_config::ConfigurationLayer::parse(text, path).map(Some)
+    })();
+    (result, source_stamp)
+}
+
+pub(crate) fn override_source_stamp_with_budget(
+    path: &Path,
+    budget: Option<&dyn crate::ProjectWorkBudget>,
+) -> Result<Option<crate::installation_config::ConfigurationSourceStamp>, String> {
     if let Some(budget) = budget {
         budget.check_cancelled()?;
         budget.charge_path_visits(1)?;
@@ -430,10 +587,8 @@ fn read_override_file_with_budget(
             path.display()
         ));
     }
-
     #[cfg(all(test, target_os = "linux"))]
     maybe_substitute_candidate_after_inspection(path);
-
     let file = open_candidate(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     if let Some(budget) = budget {
@@ -444,7 +599,6 @@ fn read_override_file_with_budget(
         .metadata()
         .map_err(|error| format!("could not inspect opened {}: {error}", path.display()))?;
     validate_regular_file(path, &opened_metadata)?;
-
     let read_limit = metadata.len().min(MAX_CONFIG_BYTES as u64);
     if let Some(budget) = budget {
         let reserve = usize::try_from(read_limit)
@@ -474,12 +628,14 @@ fn read_override_file_with_budget(
     if bytes.len() as u64 > read_limit {
         return Err(format!(
             "{} grew beyond its {read_limit} byte read limit",
-            path.display(),
+            path.display()
         ));
     }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|error| format!("invalid UTF-8 in {}: {error}", path.display()))?;
-    crate::installation_config::ConfigurationLayer::parse(text, path).map(Some)
+    Ok(Some(crate::installation_config::ConfigurationSourceStamp {
+        path: path.to_path_buf(),
+        byte_len: Some(bytes.len() as u64),
+        content_hash: Some(crate::content_hash_bytes(&bytes)),
+    }))
 }
 
 fn inspect_candidate(
@@ -826,7 +982,7 @@ fn is_valid_property_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fs, read_override_file};
+    use super::{fs, read_override_file_with_budget};
     use std::cell::Cell;
 
     struct RecordingBudget {
@@ -998,7 +1154,8 @@ mod tests {
         fs::write(&path, "[properties]\nName = 'value'\n").expect("configuration file");
         let _hook = super::install_fifo_substitution_hook(&path);
 
-        let error = read_override_file(&path).expect_err("substituted FIFO must not be read");
+        let error = read_override_file_with_budget(&path, None)
+            .expect_err("substituted FIFO must not be read");
         assert!(
             error.contains("could not open") || error.contains("not a regular file"),
             "unexpected FIFO substitution error: {error}"

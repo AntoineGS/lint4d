@@ -27,7 +27,8 @@ pub use installations::{InstallationOrigin, InstallationSelection};
 pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
-    EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
+    EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping, ResolvedPath,
+    user_config_path,
 };
 use crate::installations::{
     IdePaths, InstallationEvidence, evaluate_ide_paths, load_installation, select_installation,
@@ -182,6 +183,7 @@ struct AuthorizedReadRoot {
 pub struct ReadPolicy {
     configured_roots: Vec<AuthorizedReadRoot>,
     mapped_roots: Vec<AuthorizedReadRoot>,
+    authorized_files: Arc<Vec<PathBuf>>,
     exclusions: Vec<String>,
     exclusion_bases: Vec<PathBuf>,
     compiled_exclusions: Arc<Option<globset::GlobSet>>,
@@ -191,6 +193,7 @@ impl PartialEq for ReadPolicy {
     fn eq(&self, other: &Self) -> bool {
         self.configured_roots == other.configured_roots
             && self.mapped_roots == other.mapped_roots
+            && self.authorized_files == other.authorized_files
             && self.exclusions == other.exclusions
             && self.exclusion_bases == other.exclusion_bases
     }
@@ -208,6 +211,9 @@ impl ReadPolicy {
             for base in &root.pattern_exclusion_bases {
                 visit(base.as_os_str().len())?;
             }
+        }
+        for path in self.authorized_files.iter() {
+            visit(path.as_os_str().len())?;
         }
         for pattern in &self.exclusions {
             visit(pattern.len())?;
@@ -228,6 +234,7 @@ impl Hash for ReadPolicy {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.configured_roots.hash(state);
         self.mapped_roots.hash(state);
+        self.authorized_files.hash(state);
         self.exclusions.hash(state);
         self.exclusion_bases.hash(state);
     }
@@ -306,10 +313,23 @@ impl ReadPolicy {
         Self {
             configured_roots,
             mapped_roots,
+            authorized_files: Arc::new(Vec::new()),
             exclusions: exclusions.to_vec(),
             exclusion_bases: unique_exclusion_bases,
             compiled_exclusions: Arc::new(compile_exclude_patterns(exclusions)),
         }
+    }
+
+    /// Add exact metadata files explicitly named by the selected installation.
+    /// Unlike a root, each path authorizes no siblings or descendants.
+    pub(crate) fn with_authorized_files(mut self, files: &[PathBuf]) -> Self {
+        for path in files {
+            let path = absolute_lexical(path).unwrap_or_else(|_| path.clone());
+            if !self.authorized_files.contains(&path) {
+                Arc::make_mut(&mut self.authorized_files).push(path);
+            }
+        }
+        self
     }
 
     pub fn allows_entry(&self, entry: &ProjectPathEntry) -> bool {
@@ -317,14 +337,16 @@ impl ReadPolicy {
             ProjectPathProvenance::LegacyNative => {
                 safe_regular_file(&entry.path) && !self.is_excluded(&entry.path)
             }
-            ProjectPathProvenance::Configured => self
-                .configured_roots
-                .iter()
-                .chain(self.mapped_roots.iter())
-                .any(|root| {
-                    self.allows_regular_file_under_root(&entry.path, &root.path)
-                        && !self.is_excluded_for_root(&entry.path, root)
-                }),
+            ProjectPathProvenance::Configured => {
+                self.configured_roots
+                    .iter()
+                    .chain(self.mapped_roots.iter())
+                    .any(|root| {
+                        self.allows_regular_file_under_root(&entry.path, &root.path)
+                            && !self.is_excluded_for_root(&entry.path, root)
+                    })
+                    || self.allows_authorized_file(&entry.path, true)
+            }
             ProjectPathProvenance::Mapped { root } => {
                 !self.is_excluded_for_mapped_root(&entry.path, root)
                     && self.allows_regular_file_under_root(&entry.path, root)
@@ -358,6 +380,7 @@ impl ReadPolicy {
 
         let configured = self.configured_roots.iter().map(root_bytes).sum::<usize>();
         let mapped = self.mapped_roots.iter().map(root_bytes).sum::<usize>();
+        let authorized_files = self.authorized_files.iter().map(path_bytes).sum::<usize>();
         let exclusions = self
             .exclusions
             .iter()
@@ -375,6 +398,7 @@ impl ReadPolicy {
         std::mem::size_of::<Self>()
             .saturating_add(configured)
             .saturating_add(mapped)
+            .saturating_add(authorized_files)
             .saturating_add(exclusions)
             .saturating_add(exclusion_bases)
             .saturating_add(compiled_patterns)
@@ -385,14 +409,16 @@ impl ReadPolicy {
             ProjectPathProvenance::LegacyNative => {
                 path_has_no_symlink_component(&entry.path) && !self.is_excluded(&entry.path)
             }
-            ProjectPathProvenance::Configured => self
-                .configured_roots
-                .iter()
-                .chain(self.mapped_roots.iter())
-                .any(|root| {
-                    self.allows_location_under_root(&entry.path, &root.path)
-                        && !self.is_excluded_for_root(&entry.path, root)
-                }),
+            ProjectPathProvenance::Configured => {
+                self.configured_roots
+                    .iter()
+                    .chain(self.mapped_roots.iter())
+                    .any(|root| {
+                        self.allows_location_under_root(&entry.path, &root.path)
+                            && !self.is_excluded_for_root(&entry.path, root)
+                    })
+                    || self.allows_authorized_file(&entry.path, false)
+            }
             ProjectPathProvenance::Mapped { root } => {
                 !self.is_excluded_for_mapped_root(&entry.path, root)
                     && self.allows_location_under_root(&entry.path, root)
@@ -412,6 +438,12 @@ impl ReadPolicy {
                 },
             })
             .or_else(|| {
+                if self.authorizes_exact_file(path) {
+                    return Some(ProjectPathEntry {
+                        path: path.to_path_buf(),
+                        provenance: ProjectPathProvenance::Configured,
+                    });
+                }
                 self.configured_roots
                     .iter()
                     .filter(|root| project_path_starts_with(path, &root.path))
@@ -443,14 +475,16 @@ impl ReadPolicy {
     ) -> bool {
         match provenance {
             ProjectPathProvenance::LegacyNative => !self.is_excluded(path),
-            ProjectPathProvenance::Configured => self
-                .configured_roots
-                .iter()
-                .chain(self.mapped_roots.iter())
-                .any(|root| {
-                    project_path_starts_with(path, &root.path)
-                        && !self.is_excluded_for_root(path, root)
-                }),
+            ProjectPathProvenance::Configured => {
+                self.configured_roots
+                    .iter()
+                    .chain(self.mapped_roots.iter())
+                    .any(|root| {
+                        project_path_starts_with(path, &root.path)
+                            && !self.is_excluded_for_root(path, root)
+                    })
+                    || self.authorizes_exact_file(path) && !self.is_excluded_authorized_file(path)
+            }
             ProjectPathProvenance::Mapped { root } => {
                 project_path_starts_with(path, root)
                     && !self.is_excluded_for_mapped_root(path, root)
@@ -565,6 +599,43 @@ impl ReadPolicy {
 
     fn allows_regular_file_under_root(&self, path: &Path, root: &Path) -> bool {
         self.allows_location_under_root(path, root) && safe_regular_file(path)
+    }
+
+    fn authorizes_exact_file(&self, path: &Path) -> bool {
+        let path = absolute_lexical(path).unwrap_or_else(|_| path.to_path_buf());
+        self.authorized_files
+            .iter()
+            .any(|authorized| authorized == &path)
+    }
+
+    fn allows_authorized_file(&self, path: &Path, require_regular_file: bool) -> bool {
+        self.authorizes_exact_file(path)
+            && path_has_no_symlink_component(path)
+            && (!require_regular_file || safe_regular_file(path))
+            && !self.is_excluded_authorized_file(path)
+    }
+
+    fn is_excluded_authorized_file(&self, path: &Path) -> bool {
+        if path.components().any(is_default_excluded_component) || self.is_excluded(path) {
+            return true;
+        }
+
+        // A locator may be outside every configured read root, so no
+        // root-relative path is available for the ordinary exclusion check.
+        // Try each component-relative suffix instead: this preserves patterns
+        // such as `private/**` for `/external/private/settings.proj`, without
+        // treating the absolute filesystem prefix as part of the pattern.
+        let components = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(component) => Some(component),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (0..components.len()).any(|start| {
+            let relative = components[start..].iter().collect::<PathBuf>();
+            self.matches_exclusion_patterns_for_relative(&relative)
+        })
     }
 
     fn allows_location_under_root(&self, path: &Path, root: &Path) -> bool {
@@ -823,6 +894,9 @@ pub struct ProjectContext {
     /// candidate files used to build the context. Consumers can revalidate
     /// these paths without rediscovering or reparsing unrelated source files.
     pub metadata_files: Vec<PathBuf>,
+    /// Exact selected installation environment and imported IDE XML files
+    /// consumed while constructing this context.
+    pub installation_config_files: Vec<PathBuf>,
     /// The authorization provenance for each metadata observation. A path in
     /// `metadata_files` without a payload observation is stat-only.
     pub metadata_observations: Vec<MetadataObservation>,
@@ -2941,6 +3015,7 @@ fn discover_project_file(
                 &directory,
                 "project files",
                 file,
+                false,
                 roots,
                 options,
                 overrides,
@@ -2975,6 +3050,7 @@ fn discover_project_file(
             &directory,
             "DPR/DPK files",
             file,
+            true,
             roots,
             options,
             overrides,
@@ -3012,6 +3088,7 @@ fn choose_project_candidate(
     directory: &Path,
     kind: &str,
     file: &Path,
+    allow_membership_selection: bool,
     roots: &[PathBuf],
     options: &ProjectOptions,
     overrides: &OverrideSession,
@@ -3114,7 +3191,7 @@ fn choose_project_candidate(
         }
     }
 
-    if owned.len() == 1 && !incomplete && !budget.exhausted {
+    if allow_membership_selection && owned.len() == 1 && !incomplete && !budget.exhausted {
         return ProjectSelection::Selected {
             path: owned.pop().expect("one owned candidate"),
             explicit: false,
@@ -3656,6 +3733,58 @@ fn effective_overrides_for_project(
     session.effective_for(workspace_root.as_deref(), project_directory)
 }
 
+fn merge_effective_overrides(
+    mut profile: EffectiveOverrides,
+    project: &EffectiveOverrides,
+    workspace_root: Option<&Path>,
+    project_dir: &Path,
+) -> EffectiveOverrides {
+    let origin_rank = |path: &Path| {
+        if project_paths_equal(path, &project_dir.join(LOCAL_CONFIG_NAME)) {
+            2
+        } else if workspace_root
+            .is_some_and(|root| project_paths_equal(path, &root.join(LOCAL_CONFIG_NAME)))
+        {
+            1
+        } else {
+            0
+        }
+    };
+    for (name, value) in &project.properties {
+        let project_origin = project.property_origins.get(name);
+        let profile_origin = profile.property_origins.get(name);
+        let project_is_more_local = profile_origin.is_none_or(|profile_origin| {
+            project_origin.is_some_and(|project_origin| {
+                origin_rank(project_origin) > origin_rank(profile_origin)
+            })
+        });
+        if project_is_more_local {
+            profile.properties.insert(name.clone(), value.clone());
+            if let Some(origin) = project_origin {
+                profile
+                    .property_origins
+                    .insert(name.clone(), origin.clone());
+            }
+        }
+    }
+
+    let mut path_mappings = profile
+        .path_mappings
+        .into_iter()
+        .map(|mapping| (mapping.from.clone(), mapping))
+        .collect::<BTreeMap<_, _>>();
+    for mapping in &project.path_mappings {
+        let project_is_more_local = path_mappings.get(&mapping.from).is_none_or(|profile| {
+            origin_rank(&mapping.config_file) > origin_rank(&profile.config_file)
+        });
+        if project_is_more_local {
+            path_mappings.insert(mapping.from.clone(), mapping.clone());
+        }
+    }
+    profile.path_mappings = path_mappings.into_values().collect();
+    profile
+}
+
 fn relevant_override_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     roots
         .iter()
@@ -3762,6 +3891,8 @@ fn build_project_context(
     let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
     let caller_compiler_version = options.conditional_context.compiler_version;
+    let mut bootstrap_config = None;
+    let mut bootstrap_platform = None;
     let mut installation_evidence = InstallationEvidence::default();
     let mut compiler_identity_conflicting = false;
     let mut other_identity_conflicting = false;
@@ -3785,12 +3916,8 @@ fn build_project_context(
         installation_evidence = bootstrap.evidence;
         compiler_identity_conflicting = bootstrap.compiler_conflicting;
         other_identity_conflicting = bootstrap.other_conflicting;
-        if evaluation_options.build_config.is_none() {
-            evaluation_options.build_config = bootstrap.config;
-        }
-        if evaluation_options.platform.is_none() {
-            evaluation_options.platform = bootstrap.platform;
-        }
+        bootstrap_config = bootstrap.config;
+        bootstrap_platform = bootstrap.platform;
         if evaluation_options
             .conditional_context
             .compiler_version
@@ -3820,16 +3947,54 @@ fn build_project_context(
             .map(|(_, id)| id.as_str()),
     ));
     let mut installation_environment = None;
+    let mut installation_config_files = Vec::new();
     let mut ide_paths = IdePaths::default();
     let mut installation_warnings = Vec::new();
+    let mut ide_path_warnings = Vec::new();
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
             Ok(profile) => {
-                overrides = profile.overrides.clone();
-                let installation_roots = ["bds", "appdata"]
+                let effective_profile = crate::installation_config::ResolvedInstallation {
+                    id: profile.id.clone(),
+                    overrides: merge_effective_overrides(
+                        profile.overrides,
+                        &overrides,
+                        relevant_override_workspace_root(&project_dir, roots).as_deref(),
+                        &project_dir,
+                    ),
+                };
+                overrides = effective_profile.overrides.clone();
+                if evaluation_options.build_config.is_none() {
+                    evaluation_options.build_config = effective_profile
+                        .overrides
+                        .properties
+                        .get("config")
+                        .cloned()
+                        .or_else(|| bootstrap_config.clone());
+                }
+                if evaluation_options.platform.is_none() {
+                    evaluation_options.platform = effective_profile
+                        .overrides
+                        .properties
+                        .get("platform")
+                        .cloned()
+                        .or_else(|| bootstrap_platform.clone());
+                }
+                let installation_roots = ["bds", "appdata", "bdslib", "bdscommondir"]
                     .into_iter()
-                    .filter_map(|name| overrides.properties.get(name))
+                    .filter_map(|name| effective_profile.overrides.properties.get(name))
                     .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                let explicit_locator_files = ["environmentsettings", "envoptions"]
+                    .into_iter()
+                    .filter_map(|name| effective_profile.overrides.properties.get(name))
+                    .filter_map(|value| {
+                        effective_profile
+                            .overrides
+                            .resolve_path(value, Path::new("/"))
+                            .ok()
+                            .map(|resolved| resolved.path)
+                    })
                     .collect::<Vec<_>>();
                 read_policy = ReadPolicy::new_with_installation_roots(
                     roots,
@@ -3837,9 +4002,10 @@ fn build_project_context(
                     exclusions,
                     &overrides,
                     &installation_roots,
-                );
+                )
+                .with_authorized_files(&explicit_locator_files);
                 match load_installation(
-                    &profile,
+                    &effective_profile,
                     evaluation_options
                         .build_config
                         .as_deref()
@@ -3849,19 +4015,23 @@ fn build_project_context(
                     &read_policy,
                 ) {
                     Ok(environment) => {
+                        installation_config_files = environment.installation_config_files.clone();
                         if let (Some(config), Some(platform)) = (
                             evaluation_options.build_config.as_deref(),
                             evaluation_options.platform.as_deref(),
                         ) {
                             match evaluate_ide_paths(
                                 &environment,
-                                &profile,
+                                &effective_profile,
                                 config,
                                 platform,
                                 tracker,
                                 &read_policy,
                             ) {
-                                Ok(paths) => ide_paths = paths,
+                                Ok(paths) => {
+                                    ide_path_warnings = paths.warnings.clone();
+                                    ide_paths = paths;
+                                }
                                 Err(error) => installation_warnings.push(error),
                             }
                         } else {
@@ -3890,6 +4060,12 @@ fn build_project_context(
             }
         }
     }
+    if evaluation_options.build_config.is_none() {
+        evaluation_options.build_config = bootstrap_config;
+    }
+    if evaluation_options.platform.is_none() {
+        evaluation_options.platform = bootstrap_platform;
+    }
     let mut builder = ProjectBuilder::new(
         &evaluation_options,
         &overrides,
@@ -3909,6 +4085,7 @@ fn build_project_context(
         builder.path_issues.extend(environment.path_issues.clone());
     }
     builder.warnings.extend(installation_warnings);
+    builder.warnings.extend(ide_path_warnings.iter().cloned());
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
         builder.process_root_dproj(&project_file, tracker)?;
@@ -3953,6 +4130,16 @@ fn build_project_context(
     };
     let main_source = main_source_entry.as_ref().map(|entry| entry.path.clone());
     if project_is_dproj && main_source.is_none() {
+        let main_source_raw = builder.property("mainsource").unwrap_or_default();
+        builder.path_issues.push(ProjectPathIssue {
+            kind: ProjectPathIssueKind::MissingMainSource,
+            source_file: project_file.clone(),
+            property: "MainSource".to_owned(),
+            raw: main_source_raw,
+            path: None,
+            unit_name: None,
+            provenance: ProjectPathProvenance::LegacyNative,
+        });
         builder.warnings.push(format!(
             "project has no resolvable MainSource: {}",
             project_file.display()
@@ -3998,7 +4185,12 @@ fn build_project_context(
         );
     }
     for entry in &ide_paths.library {
-        add_unique_project_path_entry(&mut search_path_entries, entry.clone());
+        if !search_path_entries
+            .iter()
+            .any(|existing| project_paths_equal(&existing.path, &entry.path))
+        {
+            search_path_entries.push(entry.clone());
+        }
     }
     let search_paths = paths_from_entries(&search_path_entries);
 
@@ -4172,6 +4364,7 @@ fn build_project_context(
 
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
+            && ide_path_warnings.is_empty()
             && !project_context_warnings_incomplete(&builder.warnings, explicit),
         binding_metadata_complete: !builder.incomplete
             && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
@@ -4202,6 +4395,7 @@ fn build_project_context(
         read_policy,
         packages: package_list(&builder),
         metadata_files,
+        installation_config_files,
         metadata_observations,
         warnings: builder.warnings,
         override_error: None,
@@ -4290,6 +4484,7 @@ fn build_standalone_context(
         read_policy,
         packages: Vec::new(),
         metadata_files,
+        installation_config_files: Vec::new(),
         metadata_observations,
         warnings,
         override_error: None,
@@ -4666,8 +4861,16 @@ fn parse_project_bootstrap(
         },
         compiler_conflicting,
         other_conflicting,
-        config: unique_value("config"),
-        platform: unique_value("platform"),
+        config: if config_is_fixed {
+            properties.get("config").cloned()
+        } else {
+            unique_value("config")
+        },
+        platform: if platform_is_fixed {
+            properties.get("platform").cloned()
+        } else {
+            unique_value("platform")
+        },
         metadata_files,
     }
 }
@@ -8413,22 +8616,22 @@ mod tests {
             ProjectContext::discover(&member, &[root.to_path_buf()], &ProjectOptions::default())
                 .expect("discover project context");
 
-        assert_eq!(context.project_file, Some(root.join("A.dproj")));
+        assert!(context.project_file.is_none(), "{context:?}");
+        assert!(!context.discovery_complete);
         for path in [&main, &member] {
             assert!(
                 context.metadata_observations.iter().any(|observation| {
                     let MetadataObservation::Payload {
                         path: observed,
-                        read_policy,
                         path_entry,
                         stamp,
                         content_hash,
+                        ..
                     } = observation
                     else {
                         return false;
                     };
                     observed == path
-                        && read_policy == &context.read_policy
                         && path_entry.path == *path
                         && stamp == &path_stamp_result(path).expect("payload path stamp")
                         && *content_hash

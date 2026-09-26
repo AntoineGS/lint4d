@@ -293,6 +293,144 @@ impl TestServer {
     }
 
     #[cfg(feature = "test-support")]
+    fn launch_with_project_operation_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let directory = environment.path().join("project-operation-barrier");
+        fs::create_dir_all(&directory).expect("project operation barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_PROJECT_OPERATION_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_project_operation_prepared_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let directory = environment
+            .path()
+            .join("project-operation-prepared-barrier");
+        fs::create_dir_all(&directory).expect("prepared project operation barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_PROJECT_OPERATION_PREPARED_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_automatic_selection_prepared_barrier(
+        environment: TempDir,
+    ) -> (Self, TestBarrier) {
+        let directory = environment
+            .path()
+            .join("automatic-selection-prepared-barrier");
+        fs::create_dir_all(&directory).expect("automatic selection barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_AUTOMATIC_SELECTION_PREPARED_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_project_context_prepared_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let directory = environment.path().join("project-context-prepared-barrier");
+        fs::create_dir_all(&directory).expect("project context barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_PROJECT_CONTEXT_PREPARED_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_manual_selection_prepared_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let directory = environment.path().join("manual-selection-prepared-barrier");
+        fs::create_dir_all(&directory).expect("manual selection barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_MANUAL_SELECTION_PREPARED_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn launch_with_compiled_content_barrier(environment: TempDir) -> (Self, TestBarrier) {
+        let directory = environment.path().join("compiled-content-barrier");
+        fs::create_dir_all(&directory).expect("compiled content barrier directory");
+        let barrier = TestBarrier {
+            entered: directory.join("entered"),
+            release: directory.join("release"),
+        };
+        let value = format!(
+            "{}|{}",
+            barrier.entered.display(),
+            barrier.release.display()
+        );
+        let mut server = Self::launch_test_server_with_environment_path_and_variable(
+            environment.path(),
+            Some("PASCAL_LSP_TEST_COMPILED_CONTENT_BARRIER"),
+            Some(value.as_str()),
+        );
+        server._environment = Some(environment);
+        (server, barrier)
+    }
+
+    #[cfg(feature = "test-support")]
     fn launch_with_navigation_and_configuration_preparation_barriers(
         environment: TempDir,
     ) -> (Self, TestBarrier, TestBarrier) {
@@ -27324,6 +27462,13 @@ fn malformed_delphi_override_scopes_report_provenance_fail_closed_and_preserve_v
             }),
             "malformed {scope} provenance was not returned: {warnings:?}"
         );
+        assert_eq!(bad_context["installationSelectionMode"], "automatic");
+        assert!(
+            bad_context["installationCandidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         let bad_navigation_id = RequestId::from(format!("{scope}-malformed-navigation"));
         server.send_request(
@@ -29330,16 +29475,34 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
     );
 
     let owner_root = temp.path().join("owner");
-    let owner_source = owner_root.join("Owned.pas");
+    let owner_source = owner_root.join("proven/Owned.pas");
     write_file(&owner_source, "unit Owned; interface implementation end.");
     write_file(
-        &owner_root.join("OwnerA.dpr"),
+        &owner_root.join("proven/Owner.dpr"),
+        "program Owner; uses Owned in 'Owned.pas'; begin end.",
+    );
+    let proven_project = owner_root.join("proven/Owner.dproj");
+    write_file(
+        &proven_project,
+        "<Project><PropertyGroup><MainSource>Owner.dpr</MainSource></PropertyGroup></Project>",
+    );
+
+    let ambiguous_source = owner_root.join("ambiguous/Owned.pas");
+    write_file(
+        &ambiguous_source,
+        "unit Owned; interface implementation end.",
+    );
+    write_file(
+        &owner_root.join("ambiguous/OwnerA.dpr"),
         "program OwnerA; uses Owned in 'Owned.pas'; begin end.",
     );
-    write_file(&owner_root.join("OwnerB.dpr"), "program OwnerB; begin end.");
+    write_file(
+        &owner_root.join("ambiguous/OwnerB.dpr"),
+        "program OwnerB; begin end.",
+    );
     for name in ["OwnerA", "OwnerB"] {
         write_file(
-            &owner_root.join(format!("{name}.dproj")),
+            &owner_root.join(format!("ambiguous/{name}.dproj")),
             &format!(
                 "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
             ),
@@ -29356,10 +29519,16 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
             Some(singleton_project),
         ),
         (
-            "owner-context",
+            "proven-owner-context",
             &owner_source,
             "automatic",
-            Some(owner_root.join("OwnerA.dproj")),
+            Some(proven_project),
+        ),
+        (
+            "ambiguous-owner-context",
+            &ambiguous_source,
+            "ambiguous",
+            None,
         ),
     ] {
         let id = RequestId::from(id.to_string());
@@ -29372,8 +29541,11 @@ fn project_context_reports_singleton_and_proven_owner_modes() {
         assert!(response.error.is_none(), "{response:?}");
         let context = response.result.unwrap();
         assert_eq!(context["selectionMode"], mode);
-        let selected = selected.expect("expected selected project");
-        assert_eq!(context["selectedProjectUri"], uri(&selected).to_string());
+        if let Some(selected) = selected {
+            assert_eq!(context["selectedProjectUri"], uri(&selected).to_string());
+        } else {
+            assert!(context["selectedProjectUri"].is_null());
+        }
     }
     server.shutdown();
 }
@@ -59516,3 +59688,6 @@ fn runtime_configuration_processes_did_change_after_a_decreased_file_limit() {
     );
     server.shutdown();
 }
+
+#[path = "protocol/workspace_selection.rs"]
+mod workspace_selection;

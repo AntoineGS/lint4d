@@ -21,6 +21,15 @@ local function run()
   )
   local client = vim.lsp.get_clients({ bufnr = main, name = 'pascal_lsp' })[1]
   assert(client.server_capabilities.experimental.projectSelection, 'project selection capability missing')
+  local project_mapping = false
+  local leader = vim.g.mapleader or '\\'
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(main, 'n')) do
+    if mapping.lhs == leader .. 'wp' then
+      project_mapping = true
+      break
+    end
+  end
+  assert(project_mapping, '<leader>wp project picker mapping missing')
 
   local function context_for(bufnr)
     local result
@@ -98,9 +107,17 @@ local function run()
     'a configured project outside the candidate list must not become a selectable candidate'
   )
   assert(find_item(first_picker, 'A.dproj'), 'picker is missing A.dproj')
+  assert(find_item(first_picker, 'Browse repository'), 'picker is missing repository browsing')
+  assert(find_item(first_picker, 'Select Delphi installation'), 'picker is missing installation selection')
   local b_project = find_item(first_picker, 'B.dproj')
   assert(b_project, 'picker is missing B.dproj')
   first_picker.callback(b_project)
+  assert(
+    vim.wait(5000, function()
+      return #notifications > 0
+    end),
+    'project selection response timed out'
+  )
 
   local selected_context = context_for(main)
   assert(selected_context.selectionMode == 'directory', 'explicit selection must use directory mode')
@@ -120,7 +137,14 @@ local function run()
   assert(after_cancel.selectedProjectUri == before_cancel.selectedProjectUri, 'cancellation changed selection')
 
   local reset_picker = open_picker()
+  local notifications_before_reset = #notifications
   reset_picker.callback(find_item(reset_picker, 'Automatic'))
+  assert(
+    vim.wait(5000, function()
+      return #notifications > notifications_before_reset
+    end),
+    'automatic project reset response timed out'
+  )
   local reset_context = context_for(main)
   assert(reset_context.selectionMode == initial_context.selectionMode, 'Automatic did not restore configured mode')
   assert(reset_context.selectedProjectUri == initial_context.selectedProjectUri, 'Automatic did not clear selection')
@@ -135,7 +159,14 @@ local function run()
     end),
     'LSP did not attach to the second buffer'
   )
+  local notifications_before_switch = #notifications
   switch_picker.callback(find_item(switch_picker, 'B.dproj'))
+  assert(
+    vim.wait(5000, function()
+      return #notifications > notifications_before_switch
+    end),
+    'buffer-scoped project selection response timed out'
+  )
   local switched_context = context_for(main)
   assert(switched_context.selectionMode == 'directory', 'picker switched the wrong buffer scope')
   assert(switched_context.selectedProjectUri:match('/B%.dproj$'), 'buffer switch lost the selected project')

@@ -129,6 +129,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) options: WorkspaceOptions,
     pub(crate) overrides: pascal_project::delphi_overrides::OverrideSession,
     pub(crate) project_selections: ProjectSelections,
+    pub(crate) installation_selections: HashMap<PathBuf, String>,
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
@@ -1342,6 +1343,7 @@ impl Workspace {
             options: self.options.clone(),
             overrides: self.overrides.clone(),
             project_selections: self.project_selections.clone(),
+            installation_selections: self.installation_selections.clone(),
             document_owners: self.document_owners.clone(),
             overlays,
             cached_documents,
@@ -10504,6 +10506,7 @@ mod tests {
         enumeration.add_path(a_path.clone(), None);
         enumeration.sort_paths(&[]);
         let a_owner = ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/projects/A.dproj")),
             workspace_root: None,
             project_scope: None,
@@ -10515,6 +10518,7 @@ mod tests {
             overrides: EffectiveOverrides::default(),
         };
         let b_owner = ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/projects/B.dproj")),
             ..a_owner.clone()
         };
@@ -10530,6 +10534,7 @@ mod tests {
     #[test]
     fn enumeration_rejects_changed_contexts_with_the_same_key() {
         let key = ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/workspace/App.dproj")),
             workspace_root: Some(PathBuf::from("/workspace")),
             project_scope: Some(PathBuf::from("/workspace")),
@@ -10681,6 +10686,7 @@ mod tests {
             content_hash: super::super::content_hash_bytes(replacement.as_bytes()),
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: Some(metadata.clone()),
             workspace_root: Some(root.clone()),
             project_scope: Some(root.clone()),
@@ -10767,17 +10773,11 @@ mod tests {
             "program A; uses Child in 'Child.pas'; begin end.\n",
         )
         .expect("owning main source");
-        fs::write(root.join("B.dpr"), "program B; begin end.\n").expect("competing main source");
         fs::write(
             root.join("A.dproj"),
             "<Project><PropertyGroup><MainSource>A.dpr</MainSource></PropertyGroup></Project>",
         )
         .expect("owning project");
-        fs::write(
-            root.join("B.dproj"),
-            "<Project><PropertyGroup><MainSource>B.dpr</MainSource></PropertyGroup></Project>",
-        )
-        .expect("competing project");
         let original_metadata = fs::metadata(&target).expect("target metadata");
         let target_uri = Url::from_file_path(&target).expect("target URI");
         let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
@@ -11016,6 +11016,7 @@ mod tests {
         fs::create_dir_all(&external).expect("external directory");
 
         let key = ContextKey {
+            installation_id: None,
             project_file: Some(project),
             workspace_root: Some(root.clone()),
             project_scope: Some(root.clone()),
@@ -11089,6 +11090,7 @@ mod tests {
             ..Enumeration::default()
         };
         let owner = ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/projects/Owner.dproj")),
             workspace_root: None,
             project_scope: None,
@@ -11181,6 +11183,7 @@ mod tests {
         fs::create_dir(&workspace_root).expect("workspace root");
         fs::create_dir(&directory).expect("candidate directory");
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: None,
             project_scope: None,

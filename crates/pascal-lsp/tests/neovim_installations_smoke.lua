@@ -1,0 +1,1201 @@
+local REQUEST_TIMEOUT = 10000
+local BUSY_ERROR_CODE = -32803
+local BUSY_RETRY_DELAY = 50
+
+local function run()
+  vim.cmd('filetype on')
+  vim.opt.hidden = false
+
+  local pickers = {}
+  local notifications = {}
+  local original_select = vim.ui.select
+  local original_notify = vim.notify
+  vim.ui.select = function(items, options, callback)
+    pickers[#pickers + 1] = {
+      items = items,
+      options = options or {},
+      callback = callback,
+      answered = false,
+    }
+  end
+  vim.notify = function(message, level)
+    notifications[#notifications + 1] = { message = tostring(message), level = level }
+  end
+  dofile(assert(vim.env.PASCAL_LSP_CONFIG))
+
+  local root = assert(vim.env.PASCAL_LSP_SMOKE_ROOT)
+  local main_path = root .. '/src/Main.pas'
+  local probe_path = root .. '/ambiguous/Probe.pas'
+  local beta_project_path = root .. '/ambiguous/Beta.dproj'
+  local main_on_disk = vim.fn.readfile(main_path)
+
+  local function choose(picker, item)
+    assert(picker and not picker.answered, 'picker is missing or already answered')
+    picker.answered = true
+    picker.callback(item)
+  end
+
+  local function wait_picker(after, predicate, description)
+    local function matching_picker()
+      for index = #pickers, after + 1, -1 do
+        if predicate(pickers[index]) then
+          return pickers[index]
+        end
+      end
+    end
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        return matching_picker() ~= nil
+      end),
+      description
+    )
+    return matching_picker()
+  end
+
+  local function find_item(picker, predicate, description)
+    for _, item in ipairs(picker.items) do
+      if predicate(item) then
+        return item
+      end
+    end
+    error('picker is missing ' .. description .. ': ' .. vim.inspect(picker.items))
+  end
+
+  local function client_for(bufnr)
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        return #vim.lsp.get_clients({ bufnr = bufnr, name = 'pascal_lsp' }) == 1
+      end),
+      'LSP did not attach using the shipped example'
+    )
+    return vim.lsp.get_clients({ bufnr = bufnr, name = 'pascal_lsp' })[1]
+  end
+
+  local function request(client, method, params, bufnr)
+    local result
+    local response_error
+    local completed = false
+    local function attempt()
+      local accepted = client:request(method, params, function(err, response)
+        if err and err.code == BUSY_ERROR_CODE then
+          vim.defer_fn(attempt, BUSY_RETRY_DELAY)
+          return
+        end
+        response_error = err
+        result = response
+        completed = true
+      end, bufnr)
+      assert(accepted, method .. ' request was not accepted')
+    end
+    attempt()
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        return completed
+      end),
+      method .. ' request timed out'
+    )
+    assert(not response_error, method .. ' request failed: ' .. vim.inspect(response_error))
+    return result
+  end
+
+  local function wait_for_response(client, method, params, bufnr, predicate, description)
+    local result
+    local response_error
+    local completed = false
+    local function attempt()
+      local accepted = client:request(method, params, function(err, response)
+        if err and err.code == BUSY_ERROR_CODE then
+          vim.defer_fn(attempt, BUSY_RETRY_DELAY)
+          return
+        end
+        if err then
+          response_error = err
+          completed = true
+        elseif predicate(response) then
+          result = response
+          completed = true
+        else
+          vim.defer_fn(attempt, BUSY_RETRY_DELAY)
+        end
+      end, bufnr)
+      if not accepted then
+        response_error = method .. ' request was not accepted'
+        completed = true
+      end
+    end
+    attempt()
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        return completed
+      end),
+      description .. ' timed out'
+    )
+    assert(not response_error, description .. ' failed: ' .. vim.inspect(response_error))
+    return result
+  end
+
+  local function project_context(client, bufnr, document_uri)
+    return request(client, 'pascal/projectContext', {
+      textDocument = { uri = document_uri },
+    }, bufnr)
+  end
+
+  local function installation_context(client, bufnr, project_uri)
+    return request(client, 'pascal/installationContext', {
+      projectUri = project_uri,
+    }, bufnr)
+  end
+
+  local function wait_for_project(client, bufnr, document_uri, selected_uri)
+    return wait_for_response(
+      client,
+      'pascal/projectContext',
+      {
+        textDocument = { uri = document_uri },
+      },
+      bufnr,
+      function(context)
+        return context and context.selectedProjectUri == selected_uri
+      end,
+      'project selection response'
+    )
+  end
+
+  local function wait_for_installation(client, bufnr, project_uri, selected_id)
+    return wait_for_response(
+      client,
+      'pascal/installationContext',
+      {
+        projectUri = project_uri,
+      },
+      bufnr,
+      function(context)
+        return context and context.selectedInstallationId == selected_id
+      end,
+      'installation selection response'
+    )
+  end
+
+  local function open_project_picker(bufnr)
+    local before = #pickers
+    vim.api.nvim_buf_call(bufnr, function()
+      vim.cmd.PascalProject()
+    end)
+    return wait_picker(before, function(picker)
+      return picker.options.kind ~= 'lsp_message'
+        and type(picker.options.prompt) == 'string'
+        and picker.options.prompt:match('^Pascal project %(') ~= nil
+    end, 'PascalProject did not open its explicit picker')
+  end
+
+  local function browse_picker_from(project_picker, bufnr)
+    local browse = find_item(project_picker, function(item)
+      return item.kind == 'browse'
+    end, 'Browse repository action')
+    local before = #pickers
+    choose(project_picker, browse)
+    return wait_picker(before, function(picker)
+      return picker.options.kind ~= 'lsp_message'
+        and type(picker.options.prompt) == 'string'
+        and picker.options.prompt:match('^Browse Delphi projects') ~= nil
+    end, 'Browse repository did not open the catalogue picker')
+  end
+
+  local function repo_item(picker, label)
+    return find_item(picker, function(item)
+      return item.label == label
+    end, label)
+  end
+
+  local function project_item(picker, project_uri)
+    return find_item(picker, function(item)
+      return item.projectUri == project_uri
+    end, project_uri)
+  end
+
+  local function has_notification_since(after, fragment)
+    for index = after + 1, #notifications do
+      if notifications[index].message:find(fragment, 1, true) then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function wait_for_notification(after, fragment, description)
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        return has_notification_since(after, fragment)
+      end),
+      description
+    )
+  end
+
+  local function wait_for_buffer_path(path, description)
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        local current = vim.api.nvim_get_current_buf()
+        return vim.api.nvim_buf_is_valid(current) and vim.api.nvim_buf_get_name(current) == path
+      end),
+      description .. ': ' .. vim.inspect({ current = vim.api.nvim_buf_get_name(0), expected = path })
+    )
+  end
+
+  local function cancel_new_automatic_prompts(after)
+    for index = after + 1, #pickers do
+      local picker = pickers[index]
+      if picker.options.kind == 'lsp_message' and not picker.answered then
+        choose(picker, nil)
+      end
+    end
+  end
+
+  -- vim.ui.select is replaced before opening the first Pascal document. This
+  -- captures Neovim's standard handler for window/showMessageRequest, not a
+  -- second automatic-prompt implementation in the shipped helper.
+  vim.cmd.edit(vim.fn.fnameescape(probe_path))
+  local probe = vim.api.nvim_get_current_buf()
+  local client = client_for(probe)
+  local probe_uri = vim.uri_from_fname(probe_path)
+  local main_uri = vim.uri_from_fname(main_path)
+  local alpha_project_uri = vim.uri_from_fname(root .. '/src/Alpha.dproj')
+  local ambiguous_alpha_uri = vim.uri_from_fname(root .. '/ambiguous/Alpha.dproj')
+  local beta_project_uri = vim.uri_from_fname(root .. '/ambiguous/Beta.dproj')
+  local app_project_path = root .. '/projects/App/App.dproj'
+  local app_project_uri = vim.uri_from_fname(app_project_path)
+  local alternative_project_uri = vim.uri_from_fname(root .. '/projects/App/Alternative.dproj')
+  local chooser_path = root .. '/projects/App/Chooser.pas'
+  local app_source_path = root .. '/src/App.dpr'
+  local app_source_uri = vim.uri_from_fname(app_source_path)
+  local loose_project_path = root .. '/projects/Loose/Loose.dproj'
+  local loose_project_uri = vim.uri_from_fname(loose_project_path)
+  local loose_source_uri = vim.uri_from_fname(root .. '/loose/src/Loose.dpr')
+  local empty_project_path = root .. '/empty/Empty.dproj'
+  local empty_project_uri = vim.uri_from_fname(empty_project_path)
+
+  local function choose_browsed_project(bufnr, project_uri)
+    local picker = open_project_picker(bufnr)
+    local catalogue = browse_picker_from(picker, bufnr)
+    local choice = project_item(catalogue, project_uri)
+    local original_request = client.request
+    local selection_completed = false
+    client.request = function(self, method, params, callback, request_bufnr)
+      if method == 'pascal/selectProject' and params.projectUri == project_uri then
+        return original_request(self, method, params, function(err, response)
+          callback(err, response)
+          selection_completed = true
+        end, request_bufnr)
+      end
+      return original_request(self, method, params, callback, request_bufnr)
+    end
+    choose(catalogue, choice)
+    assert(
+      vim.wait(REQUEST_TIMEOUT, function()
+        return selection_completed
+      end),
+      'repository browse selection callback did not complete for ' .. project_uri
+    )
+    client.request = original_request
+  end
+
+  local initial_prompt = wait_picker(0, function(picker)
+    return picker.options.kind == 'lsp_message'
+  end, 'missing standard automatic project prompt')
+  assert(#initial_prompt.items == 2, 'automatic prompt must list the two ambiguous projects')
+  choose(initial_prompt, nil)
+  vim.wait(250)
+  local automatic_prompt_count = 0
+  for _, picker in ipairs(pickers) do
+    if picker.options.kind == 'lsp_message' then
+      automatic_prompt_count = automatic_prompt_count + 1
+    end
+  end
+  assert(automatic_prompt_count == 1, 'unchanged ambiguity must produce exactly one automatic prompt')
+
+  local before_unresolved_version = #pickers
+  vim.api.nvim_buf_call(probe, function()
+    vim.cmd.PascalDelphiVersion()
+  end)
+  vim.wait(100)
+  assert(#pickers == before_unresolved_version, 'installation picker opened for an unresolved project')
+  assert(
+    vim.tbl_contains(
+      vim.tbl_map(function(item)
+        return item.message
+      end, notifications),
+      'Project selection is unresolved; choose a project with :PascalProject first.'
+    ),
+    'unresolved installation selection did not direct the user to :PascalProject'
+  )
+
+  -- A candidate removed while its picker is open must be rejected locally,
+  -- before sending selectProject with a stale URI.
+  local candidate_picker = open_project_picker(probe)
+  local stale_beta = project_item(candidate_picker, beta_project_uri)
+  local parked_beta_path = beta_project_path .. '.parked'
+  assert(vim.fn.rename(beta_project_path, parked_beta_path) == 0, 'could not park stale project candidate')
+  local original_candidate_request = client.request
+  local stale_candidate_requests = 0
+  local stale_candidate_response_completed = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == beta_project_uri then
+      stale_candidate_requests = stale_candidate_requests + 1
+      return original_candidate_request(self, method, params, function(err, response)
+        callback(err, response)
+        stale_candidate_response_completed = true
+      end, request_bufnr)
+    end
+    return original_candidate_request(self, method, params, callback, request_bufnr)
+  end
+  local before_stale_candidate = #notifications
+  choose(candidate_picker, stale_beta)
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return has_notification_since(before_stale_candidate, 'Project context changed while the picker was open')
+        or has_notification_since(before_stale_candidate, 'Project choices changed while the selection was queued')
+        or stale_candidate_response_completed
+    end),
+    'stale candidate callback did not complete'
+  )
+  client.request = original_candidate_request
+  assert(stale_candidate_requests == 0, 'removed project candidate was sent to selectProject')
+  assert(vim.fn.rename(parked_beta_path, beta_project_path) == 0, 'could not restore stale project candidate')
+  wait_for_response(client, 'pascal/projectContext', { textDocument = { uri = probe_uri } }, probe, function(context)
+    return vim.tbl_contains(context.candidates or {}, beta_project_uri)
+  end, 'restored project candidate')
+
+  -- An Automatic choice advances the selection intent even when the resolved
+  -- project context remains identical, so older open pickers cannot override it.
+  local context_before_automatic = project_context(client, probe, probe_uri)
+  assert(
+    context_before_automatic.selectedProjectUri == vim.NIL and #context_before_automatic.candidates == 2,
+    'Automatic picker regression must start with an unresolved ambiguous scope: '
+      .. vim.inspect(context_before_automatic)
+  )
+  local older_automatic_picker = open_project_picker(probe)
+  local newer_automatic_picker = open_project_picker(probe)
+  local original_automatic_request = client.request
+  local automatic_selection_completed = false
+  local stale_automatic_project_requests = 0
+  local stale_automatic_response_completed = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == vim.NIL then
+      return original_automatic_request(self, method, params, function(err, response)
+        callback(err, response)
+        automatic_selection_completed = true
+      end, request_bufnr)
+    elseif method == 'pascal/selectProject' and params.projectUri == ambiguous_alpha_uri then
+      stale_automatic_project_requests = stale_automatic_project_requests + 1
+      return original_automatic_request(self, method, params, function(err, response)
+        callback(err, response)
+        stale_automatic_response_completed = true
+      end, request_bufnr)
+    end
+    return original_automatic_request(self, method, params, callback, request_bufnr)
+  end
+  choose(
+    newer_automatic_picker,
+    find_item(newer_automatic_picker, function(item)
+      return item.kind == 'project' and item.projectUri == vim.NIL
+    end, 'Automatic project reset')
+  )
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return automatic_selection_completed
+    end),
+    'newer Automatic project selection did not complete'
+  )
+  local context_after_automatic = project_context(client, probe, probe_uri)
+  assert(
+    context_after_automatic.scopeUri == context_before_automatic.scopeUri
+      and context_after_automatic.selectedProjectUri == context_before_automatic.selectedProjectUri
+      and context_after_automatic.selectionMode == context_before_automatic.selectionMode
+      and vim.deep_equal(context_after_automatic.candidates, context_before_automatic.candidates),
+    'Automatic project selection unexpectedly changed the context used by the stale-picker regression'
+  )
+  local before_stale_automatic = #notifications
+  choose(older_automatic_picker, project_item(older_automatic_picker, ambiguous_alpha_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return has_notification_since(before_stale_automatic, 'newer project selection')
+        or stale_automatic_response_completed
+    end),
+    'older project picker callback did not complete after Automatic selection'
+  )
+  client.request = original_automatic_request
+  assert(
+    stale_automatic_project_requests == 0,
+    'older project picker overrode a newer Automatic selection whose context was unchanged'
+  )
+  assert(
+    project_context(client, probe, probe_uri).selectedProjectUri == context_before_automatic.selectedProjectUri,
+    'older picker changed project selection after the newer Automatic intent'
+  )
+
+  -- An older project choice must not overwrite a newer selection when its
+  -- delayed picker callback is eventually delivered.
+  local stale_picker = open_project_picker(probe)
+  local stale_alpha = project_item(stale_picker, ambiguous_alpha_uri)
+  local newer_picker = open_project_picker(probe)
+  choose(newer_picker, project_item(newer_picker, beta_project_uri))
+  wait_for_project(client, probe, probe_uri, beta_project_uri)
+  local original_stale_request = client.request
+  local stale_selection_requests = 0
+  local stale_selection_response_completed = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == ambiguous_alpha_uri then
+      stale_selection_requests = stale_selection_requests + 1
+      return original_stale_request(self, method, params, function(err, response)
+        callback(err, response)
+        stale_selection_response_completed = true
+      end, request_bufnr)
+    end
+    return original_stale_request(self, method, params, callback, request_bufnr)
+  end
+  local before_stale_selection = #notifications
+  choose(stale_picker, stale_alpha)
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return has_notification_since(before_stale_selection, 'Project context changed while the picker was open')
+        or has_notification_since(before_stale_selection, 'newer project selection')
+        or stale_selection_response_completed
+    end),
+    'stale project selection callback did not complete'
+  )
+  client.request = original_stale_request
+  assert(stale_selection_requests == 0, 'stale project choice was sent after a newer selection')
+  assert(
+    project_context(client, probe, probe_uri).selectedProjectUri == beta_project_uri,
+    'stale project choice overwrote the newer selection'
+  )
+
+  -- Requests targeting one candidate directory are serialized, and a newer
+  -- explicit candidate replaces the pending choice without being rejected by
+  -- the context snapshot captured before the first request completes.
+  local original_queued_request = client.request
+  local queued_project_uris = {}
+  local release_first_project_request
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' then
+      queued_project_uris[#queued_project_uris + 1] = params.projectUri
+      if #queued_project_uris == 1 then
+        release_first_project_request = function()
+          local accepted = original_queued_request(self, method, params, callback, request_bufnr)
+          assert(accepted, 'held first project selection was not accepted after release')
+        end
+        return true
+      end
+    end
+    return original_queued_request(self, method, params, callback, request_bufnr)
+  end
+  local first_directory_picker = open_project_picker(probe)
+  choose(first_directory_picker, project_item(first_directory_picker, ambiguous_alpha_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return release_first_project_request ~= nil
+    end),
+    'first same-directory project request was not held'
+  )
+  local newer_directory_picker = open_project_picker(probe)
+  choose(newer_directory_picker, project_item(newer_directory_picker, beta_project_uri))
+  vim.wait(250, function()
+    return #queued_project_uris > 1
+  end)
+  assert(#queued_project_uris == 1, 'newer same-directory project choice was sent before the older request completed')
+  release_first_project_request()
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return #queued_project_uris == 2
+    end),
+    'newer same-directory project choice did not drain after the first request'
+  )
+  wait_for_project(client, probe, probe_uri, beta_project_uri)
+  client.request = original_queued_request
+
+  -- An Automatic reset queued behind a project selection must be validated
+  -- against the post-selection context and remain the latest user intent.
+  local reset_to_automatic = open_project_picker(probe)
+  choose(
+    reset_to_automatic,
+    find_item(reset_to_automatic, function(item)
+      return item.kind == 'project' and item.projectUri == vim.NIL
+    end, 'Automatic project reset')
+  )
+  wait_for_project(client, probe, probe_uri, vim.NIL)
+  queued_project_uris = {}
+  release_first_project_request = nil
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' then
+      queued_project_uris[#queued_project_uris + 1] = params.projectUri
+      if #queued_project_uris == 1 then
+        release_first_project_request = function()
+          local accepted = original_queued_request(self, method, params, callback, request_bufnr)
+          assert(accepted, 'held project selection was not accepted after release')
+        end
+        return true
+      end
+    end
+    return original_queued_request(self, method, params, callback, request_bufnr)
+  end
+  local older_project_picker = open_project_picker(probe)
+  choose(older_project_picker, project_item(older_project_picker, ambiguous_alpha_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return release_first_project_request ~= nil
+    end),
+    'project selection before the Automatic reset was not held'
+  )
+  local newer_reset_picker = open_project_picker(probe)
+  choose(
+    newer_reset_picker,
+    find_item(newer_reset_picker, function(item)
+      return item.kind == 'project' and item.projectUri == vim.NIL
+    end, 'Automatic project reset')
+  )
+  vim.wait(250, function()
+    return #queued_project_uris > 1
+  end)
+  assert(#queued_project_uris == 1, 'Automatic reset was sent before the older same-directory request completed')
+  release_first_project_request()
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return #queued_project_uris == 2
+    end),
+    'Automatic reset did not drain after the older project request'
+  )
+  wait_for_project(client, probe, probe_uri, vim.NIL)
+  client.request = original_queued_request
+
+  local project_picker = open_project_picker(probe)
+  local alpha_choice = find_item(project_picker, function(item)
+    return item.projectUri == ambiguous_alpha_uri
+  end, 'Alpha.dproj')
+  choose(project_picker, alpha_choice)
+  wait_for_project(client, probe, probe_uri, ambiguous_alpha_uri)
+
+  local picker_same_directory = open_project_picker(probe)
+  local catalogue_same_directory = browse_picker_from(picker_same_directory, probe)
+  assert(repo_item(catalogue_same_directory, 'ambiguous/Alpha.dproj (current)'))
+  local beta_choice = repo_item(catalogue_same_directory, 'ambiguous/Beta.dproj')
+  choose(catalogue_same_directory, beta_choice)
+  wait_for_project(client, probe, probe_uri, beta_project_uri)
+  assert(vim.api.nvim_get_current_buf() == probe, 'same-directory project browsing navigated away')
+
+  vim.bo[probe].bufhidden = 'hide'
+  local before_main_open = #pickers
+  vim.cmd.edit(vim.fn.fnameescape(main_path))
+  local main = vim.api.nvim_get_current_buf()
+  assert(main ~= probe, 'opening the installation project did not switch buffers')
+  local main_client = client_for(main)
+  assert(main_client.id == client.id, 'opening another project started a second LSP client')
+  vim.wait(250)
+  cancel_new_automatic_prompts(before_main_open)
+
+  local before_install_picker = #pickers
+  vim.api.nvim_buf_call(main, function()
+    vim.cmd.PascalDelphiVersion()
+  end)
+  local install_picker = wait_picker(before_install_picker, function(picker)
+    return picker.options.kind ~= 'lsp_message'
+      and type(picker.options.prompt) == 'string'
+      and picker.options.prompt:match('^Delphi installation %(') ~= nil
+  end, 'PascalDelphiVersion did not open its explicit picker')
+  local undecided_installation = installation_context(client, main, alpha_project_uri)
+  assert(
+    install_picker.options.prompt:find(undecided_installation.selectionMode, 1, true),
+    'installation picker prompt omitted its current selection mode'
+  )
+  assert(
+    find_item(install_picker, function(item)
+      return item.installationId == vim.NIL and item.label == 'Automatic'
+    end, 'Automatic installation reset'),
+    'Automatic must send a null installation ID'
+  )
+  local version_37 = find_item(install_picker, function(item)
+    return item.installationId == '37.0'
+  end, 'installation 37.0')
+  choose(install_picker, version_37)
+  local selected_installation = wait_for_installation(client, main, alpha_project_uri, '37.0')
+  assert(selected_installation.selectionMode == 'session', vim.inspect(selected_installation))
+  local selected_project_context = project_context(client, main, main_uri)
+  assert(
+    selected_project_context.selectedInstallationId == '37.0',
+    'source project context did not observe the selected profile: ' .. vim.inspect(selected_project_context)
+  )
+
+  local sdk_37_provider_path = root .. '/sdk/37.0/source/SdkUnit.pas'
+  vim.api.nvim_win_set_cursor(0, { 3, 5 })
+  vim.lsp.buf.definition()
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return vim.api.nvim_buf_get_name(0) == sdk_37_provider_path
+    end),
+    'definition did not navigate into the selected SDK root: ' .. vim.inspect(selected_project_context)
+  )
+  local definition_uri = vim.uri_from_bufnr(vim.api.nvim_get_current_buf())
+  local sdk_37_provider = vim.uri_from_fname(root .. '/sdk/37.0/source/SdkUnit.pas')
+  assert(definition_uri == sdk_37_provider, 'definition URI was not beneath the selected SDK root')
+  vim.api.nvim_set_current_buf(main)
+
+  local before_reset = #pickers
+  vim.api.nvim_buf_call(main, function()
+    vim.cmd.PascalDelphiVersion()
+  end)
+  local reset_picker = wait_picker(before_reset, function(picker)
+    return picker.options.kind ~= 'lsp_message'
+      and type(picker.options.prompt) == 'string'
+      and picker.options.prompt:match('^Delphi installation %(') ~= nil
+  end, 'installation picker did not reopen for reset')
+  assert(reset_picker.options.prompt:find('session', 1, true), 'installation picker omitted the session selection mode')
+  assert(find_item(reset_picker, function(item)
+    return item.installationId == '37.0' and item.label:find('(current)', 1, true) ~= nil
+  end, 'current installation profile'))
+  choose(
+    reset_picker,
+    find_item(reset_picker, function(item)
+      return item.installationId == vim.NIL
+    end, 'Automatic installation reset')
+  )
+  wait_for_installation(client, main, alpha_project_uri, vim.NIL)
+  local reset_notified = false
+  for _, notification in ipairs(notifications) do
+    if notification.message:match('^Delphi installation selection: Automatic') then
+      reset_notified = true
+      break
+    end
+  end
+  assert(reset_notified, 'Automatic reset response was not surfaced')
+  vim.wait(100)
+  cancel_new_automatic_prompts(0)
+
+  -- Reset with null, then restore the profile before testing browse isolation.
+  -- Browsing another directory must not overwrite Alpha's installation.
+  local before_restore_picker = #pickers
+  vim.api.nvim_buf_call(main, function()
+    vim.cmd.PascalDelphiVersion()
+  end)
+  local restore_picker = wait_picker(before_restore_picker, function(picker)
+    return picker.options.kind ~= 'lsp_message'
+      and type(picker.options.prompt) == 'string'
+      and picker.options.prompt:match('^Delphi installation %(') ~= nil
+  end, 'installation picker did not reopen after Automatic reset')
+  choose(
+    restore_picker,
+    find_item(restore_picker, function(item)
+      return item.installationId == '37.0'
+    end, 'installation 37.0')
+  )
+  wait_for_installation(client, main, alpha_project_uri, '37.0')
+
+  local unsaved_lines = vim.api.nvim_buf_get_lines(main, 0, -1, false)
+  unsaved_lines[#unsaved_lines + 1] = '// unsaved browse preservation check'
+  vim.api.nvim_buf_set_lines(main, 0, -1, false, unsaved_lines)
+  assert(vim.bo[main].modified, 'fixture source should have an unsaved overlay')
+
+  local picker_other_directory = open_project_picker(main)
+  local catalogue_other_directory = browse_picker_from(picker_other_directory, main)
+  local other_alpha = repo_item(catalogue_other_directory, 'other/Alpha.dproj')
+  local original_browse_request = client.request
+  local browse_selection_completed = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == other_alpha.projectUri then
+      return original_browse_request(self, method, params, function(err, response)
+        callback(err, response)
+        browse_selection_completed = true
+      end, request_bufnr)
+    end
+    return original_browse_request(self, method, params, callback, request_bufnr)
+  end
+  choose(catalogue_other_directory, other_alpha)
+  local other_main_path = root .. '/other/Alpha.pas'
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return browse_selection_completed
+    end),
+    'repository browse selection callback did not complete'
+  )
+  client.request = original_browse_request
+  wait_for_buffer_path(other_main_path, 'repository browsing did not open the selected main source')
+  assert(
+    vim.api.nvim_buf_get_name(0) == other_main_path,
+    'repository browsing did not navigate to the selected main source: '
+      .. vim.inspect({ current = vim.api.nvim_buf_get_name(0), notifications = notifications })
+  )
+  local other_main = vim.api.nvim_get_current_buf()
+  assert(vim.bo[main].modified, 'browsing another project discarded the unsaved source buffer')
+  assert(vim.api.nvim_buf_is_valid(main), 'browsing another project deleted the previous source buffer')
+  assert(vim.deep_equal(vim.fn.readfile(main_path), main_on_disk), 'browsing another project saved the unsaved source')
+  assert(
+    wait_for_installation(client, main, alpha_project_uri, '37.0').selectedInstallationId == '37.0',
+    'selecting a project in another directory changed Alpha.dproj installation'
+  )
+
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return #vim.lsp.get_clients({ bufnr = other_main, name = 'pascal_lsp' }) == 1
+    end),
+    'LSP did not attach to the browsed main source'
+  )
+  local other_client = vim.lsp.get_clients({ bufnr = other_main, name = 'pascal_lsp' })[1]
+  assert(other_client.id == client.id, 'repository browse started a second client')
+  local other_main_on_disk = vim.fn.readfile(other_main_path)
+  local in_scope_context = project_context(client, other_main, vim.uri_from_fname(other_main_path))
+  assert(
+    in_scope_context.selectedProjectUri == other_alpha.projectUri,
+    'in-scope main source did not resolve to the browsed project: ' .. vim.inspect(in_scope_context)
+  )
+  local other_main_lines = vim.api.nvim_buf_get_lines(other_main, 0, -1, false)
+  other_main_lines[#other_main_lines + 1] = '// unsaved browse-anchor preservation check'
+  vim.api.nvim_buf_set_lines(other_main, 0, -1, false, other_main_lines)
+  assert(vim.bo[other_main].modified, 'browsed source should have an unsaved overlay')
+
+  local competing_source_context = project_context(client, other_main, app_source_uri)
+  assert(
+    competing_source_context.selectedProjectUri == alpha_project_uri,
+    'cross-directory main source fixture must have a competing project owner: ' .. vim.inspect(competing_source_context)
+  )
+  local before_competing_browse = #notifications
+  choose_browsed_project(other_main, app_project_uri)
+  wait_for_buffer_path(app_project_path, 'cross-scope browse did not fall back to its project anchor')
+  wait_for_notification(
+    before_competing_browse,
+    'Main source does not resolve to the browsed project in its document context',
+    'cross-scope project ownership fallback reason was not surfaced'
+  )
+  assert(vim.bo[other_main].modified, 'cross-scope fallback discarded the dirty initiating source')
+  assert(vim.api.nvim_buf_is_valid(other_main), 'cross-scope fallback deleted the initiating source buffer')
+  assert(
+    vim.deep_equal(vim.api.nvim_buf_get_lines(other_main, 0, -1, false), other_main_lines),
+    'cross-scope fallback changed the dirty initiating source'
+  )
+  assert(
+    vim.deep_equal(vim.fn.readfile(other_main_path), other_main_on_disk),
+    'cross-scope fallback saved the dirty initiating source'
+  )
+
+  -- Browse must claim the selected project's candidate directory, even though
+  -- that target directory differs from the initiating source's context scope.
+  local browse_initiating_context = project_context(client, other_main, vim.uri_from_bufnr(other_main))
+  assert(
+    vim.fs.normalize(vim.uri_to_fname(browse_initiating_context.scopeUri))
+      ~= vim.fs.normalize(vim.fs.dirname(app_project_path)),
+    'Browse queue fixture must use different source and target selection scopes'
+  )
+  vim.api.nvim_set_current_buf(other_main)
+  vim.bo[other_main].bufhidden = 'hide'
+  vim.cmd.edit(vim.fn.fnameescape(chooser_path))
+  local chooser = vim.api.nvim_get_current_buf()
+  vim.bo[chooser].bufhidden = 'hide'
+  local chooser_client = client_for(chooser)
+  assert(chooser_client.id == client.id, 'opening the target-scope chooser started a second LSP client')
+  local browse_target_picker = open_project_picker(other_main)
+  local browse_target_catalogue = browse_picker_from(browse_target_picker, other_main)
+  local browse_source_owner_context = project_context(client, other_main, app_source_uri)
+  assert(
+    browse_source_owner_context.selectedProjectUri == alpha_project_uri,
+    'Browse navigation regression requires its independent source scope to remain owned by Alpha'
+  )
+  local original_browse_queue_request = client.request
+  local release_browse_target_request
+  local alternative_request_sent = false
+  local browse_selection_callback_completed = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/projectContext' and params.textDocument.uri == app_source_uri then
+      callback(nil, browse_source_owner_context)
+      return true
+    elseif method == 'pascal/selectProject' and params.projectUri == app_project_uri then
+      release_browse_target_request = function()
+        local accepted = original_browse_queue_request(self, method, params, function(err, response)
+          callback(err, response)
+          browse_selection_callback_completed = true
+        end, request_bufnr)
+        assert(accepted, 'held Browse target request was not accepted after release')
+      end
+      return true
+    elseif method == 'pascal/selectProject' and params.projectUri == alternative_project_uri then
+      alternative_request_sent = true
+    end
+    return original_browse_queue_request(self, method, params, callback, request_bufnr)
+  end
+  choose(browse_target_catalogue, project_item(browse_target_catalogue, app_project_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return release_browse_target_request ~= nil
+    end),
+    'Browse did not claim and hold its target candidate directory'
+  )
+  local alternative_picker = open_project_picker(chooser)
+  choose(alternative_picker, project_item(alternative_picker, alternative_project_uri))
+  vim.wait(250, function()
+    return alternative_request_sent
+  end)
+  assert(
+    not alternative_request_sent,
+    'ordinary project choice bypassed the in-flight Browse target-directory selection'
+  )
+  vim.api.nvim_set_current_buf(other_main)
+  assert(vim.api.nvim_buf_is_valid(chooser), 'target-scope chooser was deleted before the Browse queue drained')
+  assert(vim.lsp.buf_is_attached(chooser, client.id), 'target-scope chooser detached before the Browse queue drained')
+  release_browse_target_request()
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return browse_selection_callback_completed
+    end),
+    'Browse selection callback did not complete after releasing its held response'
+  )
+  assert(
+    vim.api.nvim_get_current_buf() == other_main,
+    'older Browse navigated after a newer choice was queued for its target directory'
+  )
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return alternative_request_sent
+    end),
+    'ordinary target-directory choice did not drain after Browse selection: ' .. vim.inspect(notifications)
+  )
+  wait_for_project(client, chooser, vim.uri_from_fname(chooser_path), alternative_project_uri)
+  client.request = original_browse_queue_request
+
+  local projectless_source_context = project_context(client, other_main, loose_source_uri)
+  assert(
+    #projectless_source_context.candidates == 0 and projectless_source_context.selectedProjectUri ~= loose_project_uri,
+    'projectless main source fixture unexpectedly selected the browsed project: '
+      .. vim.inspect(projectless_source_context)
+  )
+  vim.api.nvim_set_current_buf(other_main)
+  local before_projectless_browse = #notifications
+  choose_browsed_project(other_main, loose_project_uri)
+  wait_for_buffer_path(loose_project_path, 'projectless main source did not fall back to its project anchor')
+  wait_for_notification(
+    before_projectless_browse,
+    'Main source does not resolve to the browsed project in its document context',
+    'projectless main source fallback reason was not surfaced'
+  )
+  assert(vim.bo[other_main].modified, 'projectless fallback discarded the dirty initiating source')
+  assert(
+    vim.deep_equal(vim.api.nvim_buf_get_lines(other_main, 0, -1, false), other_main_lines),
+    'projectless fallback changed the dirty initiating source'
+  )
+
+  local empty_context = project_context(client, other_main, empty_project_uri)
+  assert(empty_context.mainSourceUri == vim.NIL, 'null-main-source project fixture unexpectedly has a source')
+  vim.api.nvim_set_current_buf(other_main)
+  local before_null_source_browse = #notifications
+  choose_browsed_project(other_main, empty_project_uri)
+  wait_for_buffer_path(empty_project_path, 'project with no main source did not open its project anchor')
+  wait_for_notification(
+    before_null_source_browse,
+    'Selected project has no usable main source',
+    'null-main-source fallback reason was not surfaced'
+  )
+  assert(vim.bo[other_main].modified, 'null-main-source fallback discarded the dirty initiating source')
+  assert(
+    vim.deep_equal(vim.fn.readfile(other_main_path), other_main_on_disk),
+    'null-main-source fallback saved the dirty initiating source'
+  )
+
+  -- A delayed ownership response must not navigate using an owner that became
+  -- stale after another picker changed the main source's effective project.
+  vim.api.nvim_set_current_buf(other_main)
+  local changing_owner_picker = open_project_picker(other_main)
+  local changing_owner_catalogue = browse_picker_from(changing_owner_picker, other_main)
+  local original_owner_context_request = client.request
+  local delayed_owner_context
+  local stale_owner_context
+  local captured_owner_context = false
+  client.request = function(self, method, params, callback, request_bufnr)
+    if not captured_owner_context and method == 'pascal/projectContext' and params.textDocument.uri == probe_uri then
+      captured_owner_context = true
+      return original_owner_context_request(self, method, params, function(err, context)
+        stale_owner_context = context
+        delayed_owner_context = function()
+          callback(err, context)
+        end
+      end, request_bufnr)
+    end
+    return original_owner_context_request(self, method, params, callback, request_bufnr)
+  end
+  choose(changing_owner_catalogue, project_item(changing_owner_catalogue, beta_project_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return delayed_owner_context ~= nil
+    end),
+    'Browse did not receive the delayed source ownership response'
+  )
+  client.request = original_owner_context_request
+  assert(
+    stale_owner_context.selectedProjectUri == beta_project_uri,
+    'delayed ownership response did not capture the browsed project as the source owner'
+  )
+  assert(vim.api.nvim_buf_is_valid(probe), 'source-owner buffer was deleted before changing its project')
+  assert(vim.lsp.buf_is_attached(probe, client.id), 'source-owner buffer detached before changing its project')
+  assert(vim.uri_from_bufnr(probe) == probe_uri, 'source-owner buffer URI changed before changing its project')
+  local changed_owner_picker = open_project_picker(probe)
+  choose(changed_owner_picker, project_item(changed_owner_picker, ambiguous_alpha_uri))
+  wait_for_project(client, probe, probe_uri, ambiguous_alpha_uri)
+  local before_stale_ownership = #notifications
+  delayed_owner_context()
+  assert(
+    vim.api.nvim_get_current_buf() == other_main,
+    'delayed Browse ownership response navigated after a newer source-project selection'
+  )
+  assert(
+    has_notification_since(before_stale_ownership, 'newer project selection'),
+    'delayed Browse ownership response did not report the superseding source-project selection'
+  )
+  assert(
+    project_context(client, probe, probe_uri).selectedProjectUri == ambiguous_alpha_uri,
+    'delayed Browse ownership response changed the newer source-project selection'
+  )
+
+  -- Changing focus after opening the catalogue must not steal it back when the
+  -- project-selection response arrives. The unrelated scratch buffer stays dirty.
+  vim.api.nvim_set_current_buf(other_main)
+  local source_context_picker = open_project_picker(other_main)
+  local source_context_catalogue = browse_picker_from(source_context_picker, other_main)
+  local original_context_request = client.request
+  local deliver_source_context
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/projectContext' and params.textDocument.uri == main_uri then
+      return original_context_request(self, method, params, function(err, context)
+        deliver_source_context = function()
+          callback(err, context)
+        end
+      end, request_bufnr)
+    end
+    return original_context_request(self, method, params, callback, request_bufnr)
+  end
+  choose(source_context_catalogue, project_item(source_context_catalogue, alpha_project_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return deliver_source_context ~= nil
+    end),
+    'browse did not request fresh context for its main source'
+  )
+  client.request = original_context_request
+  vim.bo[other_main].bufhidden = 'hide'
+  local ownership_unrelated = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(ownership_unrelated, root .. '/OwnershipUnrelated.txt')
+  vim.bo[ownership_unrelated].bufhidden = 'hide'
+  vim.api.nvim_buf_set_lines(ownership_unrelated, 0, -1, false, { 'unsaved ownership content' })
+  local ownership_unrelated_lines = vim.api.nvim_buf_get_lines(ownership_unrelated, 0, -1, false)
+  vim.api.nvim_set_current_buf(ownership_unrelated)
+  deliver_source_context()
+  assert(vim.api.nvim_get_current_buf() == ownership_unrelated, 'late source-context response stole focus')
+  assert(vim.bo[ownership_unrelated].modified, 'late source-context response cleared unrelated modifications')
+  assert(
+    vim.deep_equal(vim.api.nvim_buf_get_lines(ownership_unrelated, 0, -1, false), ownership_unrelated_lines),
+    'late source-context response changed unrelated buffer content'
+  )
+
+  -- Changing focus after opening the catalogue must not steal it back when the
+  -- project-selection response arrives. The unrelated scratch buffer stays dirty.
+  vim.api.nvim_set_current_buf(other_main)
+  vim.bo[other_main].bufhidden = 'hide'
+  local focus_picker = open_project_picker(other_main)
+  local focus_catalogue = browse_picker_from(focus_picker, other_main)
+  local original_request = client.request
+  local deliver_focus_response
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == beta_project_uri then
+      return original_request(self, method, params, function(err, response)
+        deliver_focus_response = function()
+          callback(err, response)
+        end
+      end, request_bufnr)
+    end
+    return original_request(self, method, params, callback, request_bufnr)
+  end
+  local unrelated = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(unrelated, root .. '/Unrelated.txt')
+  vim.bo[unrelated].bufhidden = 'hide'
+  vim.api.nvim_buf_set_lines(unrelated, 0, -1, false, { 'unsaved unrelated content' })
+  vim.api.nvim_set_current_buf(unrelated)
+  local unrelated_lines = vim.api.nvim_buf_get_lines(unrelated, 0, -1, false)
+  assert(vim.bo[unrelated].modified, 'unrelated buffer should be modified')
+  choose(focus_catalogue, repo_item(focus_catalogue, 'ambiguous/Beta.dproj'))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return deliver_focus_response ~= nil
+    end),
+    'server did not return the browse selection response'
+  )
+  vim.api.nvim_set_current_buf(unrelated)
+  deliver_focus_response()
+  client.request = original_request
+  assert(vim.api.nvim_get_current_buf() == unrelated, 'late browse response stole focus')
+  assert(vim.bo[unrelated].modified, 'late browse response cleared unrelated modifications')
+  assert(
+    vim.deep_equal(vim.api.nvim_buf_get_lines(unrelated, 0, -1, false), unrelated_lines),
+    'late browse response changed unrelated buffer content'
+  )
+  wait_for_project(client, other_main, probe_uri, beta_project_uri)
+  local restored_project = project_context(client, other_main, main_uri)
+  assert(restored_project.selectedProjectUri == alpha_project_uri, vim.inspect(restored_project))
+  assert(
+    installation_context(client, main, alpha_project_uri).selectedInstallationId == '37.0',
+    'browsing into another project scope replaced the prior installation selection'
+  )
+
+  -- Detach/reattach the same client and buffer while a selection response is
+  -- outstanding. Its callback must release the directory queue but must not
+  -- run the old attachment's user-facing completion path.
+  vim.api.nvim_set_current_buf(main)
+  local generation_picker = open_project_picker(main)
+  local original_generation_request = client.request
+  local generation_select_requests = 0
+  local release_stale_generation_response
+  local release_current_generation_response
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' and params.projectUri == alpha_project_uri then
+      generation_select_requests = generation_select_requests + 1
+      if generation_select_requests == 1 then
+        release_stale_generation_response = function()
+          callback({ code = -32800, message = 'Request cancelled' })
+        end
+        return true
+      elseif generation_select_requests == 2 then
+        return original_generation_request(self, method, params, function(err, response)
+          release_current_generation_response = function()
+            callback(err, response)
+          end
+        end, request_bufnr)
+      end
+    end
+    return original_generation_request(self, method, params, callback, request_bufnr)
+  end
+  choose(generation_picker, project_item(generation_picker, alpha_project_uri))
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return release_stale_generation_response ~= nil
+    end),
+    'old-attachment selection request was not held'
+  )
+  vim.lsp.buf_detach_client(main, client.id)
+  assert(not vim.lsp.buf_is_attached(main, client.id), 'same-buffer client detach did not complete')
+  assert(vim.lsp.buf_attach_client(main, client.id), 'same-buffer client reattach failed')
+  assert(vim.lsp.buf_is_attached(main, client.id), 'same-buffer client did not reattach')
+  local current_generation_picker = open_project_picker(main)
+  choose(current_generation_picker, project_item(current_generation_picker, alpha_project_uri))
+  vim.wait(250, function()
+    return generation_select_requests > 1
+  end)
+  assert(generation_select_requests == 1, 'reattached buffer bypassed the in-flight same-directory request')
+  local before_stale_generation_callback = #notifications
+  release_stale_generation_response()
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      return release_current_generation_response ~= nil
+    end),
+    'queue did not drain after the detached generation completed'
+  )
+  assert(
+    not has_notification_since(before_stale_generation_callback, 'newer project selection')
+      and not has_notification_since(before_stale_generation_callback, 'Request cancelled'),
+    'old attachment callback acted after the same buffer and client were reattached'
+  )
+  release_current_generation_response()
+  wait_for_notification(
+    before_stale_generation_callback,
+    'Pascal project selection:',
+    'current attachment selection response did not complete'
+  )
+  client.request = original_generation_request
+  vim.bo[main].bufhidden = 'hide'
+
+  -- Simulate a late selectProject response after its initiating buffer is deleted.
+  vim.api.nvim_set_current_buf(other_main)
+  local deleted_picker = open_project_picker(other_main)
+  local deleted_catalogue = browse_picker_from(deleted_picker, other_main)
+  local delayed_response
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' then
+      delayed_response = callback
+      return true
+    end
+    return original_request(self, method, params, callback, request_bufnr)
+  end
+  choose(deleted_catalogue, repo_item(deleted_catalogue, 'ambiguous/Beta.dproj'))
+  assert(
+    vim.wait(5000, function()
+      return delayed_response ~= nil
+    end),
+    'browse did not issue the selection request'
+  )
+  vim.api.nvim_set_current_buf(unrelated)
+  vim.api.nvim_buf_delete(other_main, { force = true })
+  delayed_response(nil, {
+    mainSourceUri = vim.uri_from_fname(root .. '/src/Main.pas'),
+    selectionMode = 'directory',
+    warnings = {},
+  })
+  client.request = original_request
+  assert(vim.api.nvim_get_current_buf() == unrelated, 'deleted-buffer response navigated away')
+
+  -- The same guard applies when the client detached from the initiating buffer.
+  vim.api.nvim_set_current_buf(main)
+  local detached_picker = open_project_picker(main)
+  local detached_catalogue = browse_picker_from(detached_picker, main)
+  delayed_response = nil
+  client.request = function(self, method, params, callback, request_bufnr)
+    if method == 'pascal/selectProject' then
+      delayed_response = callback
+      return true
+    end
+    return original_request(self, method, params, callback, request_bufnr)
+  end
+  choose(detached_catalogue, repo_item(detached_catalogue, 'other/Alpha.dproj'))
+  assert(
+    vim.wait(5000, function()
+      return delayed_response ~= nil
+    end),
+    'browse did not issue the detached-buffer selection request'
+  )
+  vim.lsp.buf_detach_client(main, client.id)
+  delayed_response(nil, {
+    mainSourceUri = vim.uri_from_fname(root .. '/other/Alpha.pas'),
+    selectionMode = 'directory',
+    warnings = {},
+  })
+  client.request = original_request
+  assert(vim.api.nvim_get_current_buf() == main, 'detached-buffer response navigated away')
+
+  local older_capabilities = client.server_capabilities.experimental
+  client.server_capabilities.experimental = { projectSelection = true, projectCatalogue = true }
+  local before_unsupported = #pickers
+  vim.api.nvim_buf_call(main, function()
+    vim.cmd.PascalDelphiVersion()
+  end)
+  vim.wait(100)
+  assert(#pickers == before_unsupported, 'older capability must not open the installation picker')
+  local warned_about_installation_capability = false
+  for _, notification in ipairs(notifications) do
+    if notification.message:match('does not support Delphi installation selection') then
+      warned_about_installation_capability = true
+      break
+    end
+  end
+  assert(warned_about_installation_capability, 'old installation capability warning was not surfaced')
+  client.server_capabilities.experimental = older_capabilities
+
+  vim.wait(100)
+  cancel_new_automatic_prompts(0)
+  vim.ui.select = original_select
+  vim.notify = original_notify
+  client:stop()
+  assert(
+    vim.wait(5000, function()
+      return client:is_stopped()
+    end),
+    'server did not shut down'
+  )
+  io.stdout:write('NEOVIM_INSTALLATION_SELECTION_OK\n')
+end
+
+local ok, error_message = xpcall(run, debug.traceback)
+if not ok then
+  io.stderr:write(tostring(error_message) .. '\n')
+  vim.cmd('cquit 1')
+else
+  vim.cmd('qa!')
+end

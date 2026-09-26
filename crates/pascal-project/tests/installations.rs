@@ -4,7 +4,7 @@ use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
 use pascal_project::installations::InstallationEvidence;
 use pascal_project::{
     InstallationOrigin, InstallationSelection, ProjectContext, ProjectOptions, ProjectPathEntry,
-    ProjectPathProvenance, ReadPolicy,
+    ProjectPathProvenance, ProjectSelections, ReadPolicy, discover_with_selections,
 };
 
 fn write(path: &Path, text: &str) {
@@ -36,6 +36,453 @@ fn installation_read_roots_authorize_only_the_selected_local_tree() {
     };
     assert!(policy.allows_location(&selected));
     assert!(!policy.allows_location(&not_selected));
+}
+
+#[test]
+fn invalid_selected_ide_path_is_reported_and_keeps_context_incomplete() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let ide = root.join("ide");
+    let project = root.join("App.dproj");
+    write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+    write(
+        &ide.join("EnvOptions.proj"),
+        "<Project><PropertyGroup><DelphiLibraryPath>/definitely/outside</DelphiLibraryPath></PropertyGroup></Project>",
+    );
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+            sdk.display(),
+            ide.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("outside selected installation read roots"))
+    );
+    assert!(!context.discovery_complete);
+}
+
+#[test]
+fn selected_profile_config_and_platform_precede_project_xml_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("App.dproj");
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win32</Platform></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        "[installations.\"37.0\".properties]\nConfig='Release'\nPlatform='Win64'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+    );
+
+    let discover = |build_config: Option<&str>, platform: Option<&str>| {
+        ProjectContext::discover_with_overrides(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project.clone()),
+                build_config: build_config.map(str::to_owned),
+                platform: platform.map(str::to_owned),
+                ..ProjectOptions::default()
+            },
+            &OverrideSession::new(None),
+        )
+        .unwrap()
+    };
+
+    let profile_context = discover(None, None);
+    assert!(matches!(
+        profile_context.installation_selection,
+        Some(InstallationSelection::Selected { ref id, .. }) if id == "37.0"
+    ));
+    assert_eq!(profile_context.config.as_deref(), Some("Release"));
+    assert_eq!(profile_context.platform.as_deref(), Some("Win64"));
+
+    let client_context = discover(Some("Client"), Some("Linux64"));
+    assert_eq!(client_context.config.as_deref(), Some("Client"));
+    assert_eq!(client_context.platform.as_deref(), Some("Linux64"));
+}
+
+#[test]
+fn project_bds_override_selects_its_installation_root_and_ide_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let project = root.join("projects/App.dproj");
+    let profile_sdk = tempfile::tempdir().unwrap();
+    let project_sdk = tempfile::tempdir().unwrap();
+    let appdata = tempfile::tempdir().unwrap();
+    write(&root.join("projects/App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win64</Platform><DCC_Namespace>$(LocalSdkMarker);$(ProfileSdkMarker)</DCC_Namespace></PropertyGroup></Project>",
+    );
+    write(
+        &profile_sdk.path().join("bin/rsvars.bat"),
+        &format!(
+            "SET BDS={}\nSET ProfileSdkMarker=PROFILE_SDK\n",
+            profile_sdk.path().display()
+        ),
+    );
+    write(
+        &project_sdk.path().join("bin/rsvars.bat"),
+        &format!(
+            "SET BDS={}\nSET LocalSdkMarker=LOCAL_SDK\n",
+            project_sdk.path().display()
+        ),
+    );
+    fs::create_dir_all(project_sdk.path().join("source")).unwrap();
+    fs::create_dir_all(profile_sdk.path().join("source")).unwrap();
+    write(
+        &appdata.path().join("EnvOptions.proj"),
+        "<Project><PropertyGroup><DelphiLibraryPath>$(BDS)/source</DelphiLibraryPath></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n[projects.\"projects/App.dproj\"]\ninstallation='37.0'\n",
+            profile_sdk.path().display(),
+            appdata.path().display()
+        ),
+    );
+    write(
+        &root.join("projects/.delphi-tools.local.toml"),
+        &format!("[properties]\nBDS='{}'\n", project_sdk.path().display()),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("projects/App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+
+    assert_eq!(
+        context.overrides.properties.get("bds"),
+        Some(&project_sdk.path().display().to_string())
+    );
+    assert!(
+        context
+            .unit_namespaces
+            .iter()
+            .any(|name| name == "LOCAL_SDK")
+    );
+    assert!(
+        !context
+            .unit_namespaces
+            .iter()
+            .any(|name| name == "PROFILE_SDK")
+    );
+    assert!(
+        context
+            .metadata_files
+            .contains(&project_sdk.path().join("bin/rsvars.bat"))
+    );
+    assert!(
+        !context
+            .metadata_files
+            .contains(&profile_sdk.path().join("bin/rsvars.bat"))
+    );
+    assert!(
+        context
+            .search_paths
+            .contains(&project_sdk.path().join("source"))
+    );
+    assert!(
+        !context
+            .search_paths
+            .contains(&profile_sdk.path().join("source"))
+    );
+    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+        path: project_sdk.path().join("source"),
+        provenance: ProjectPathProvenance::Configured,
+    }));
+    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+        path: profile_sdk.path().join("source"),
+        provenance: ProjectPathProvenance::Configured,
+    }));
+}
+
+#[test]
+fn configured_bdslib_and_bdscommondir_are_selected_read_roots() {
+    for property in ["BDSLIB", "BDSCOMMONDIR"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let selected_temp = tempfile::tempdir().unwrap();
+        let unrelated_temp = tempfile::tempdir().unwrap();
+        let selected_root = selected_temp.path().join("external-selected-root");
+        let unrelated = unrelated_temp.path().join("unrelated-import");
+        let project = root.join("App.dproj");
+        write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+        write(&root.join("App.dpr"), "program App; begin end.");
+        write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+        write(
+            &selected_root.join("units/Selected.pas"),
+            "unit Selected; interface implementation end.",
+        );
+        write(
+            &unrelated.join("units/Other.pas"),
+            "unit Other; interface implementation end.",
+        );
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{}'\n{}='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+                sdk.display(),
+                property,
+                selected_root.display()
+            ),
+        );
+
+        let context = ProjectContext::discover_with_overrides(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project),
+                ..ProjectOptions::default()
+            },
+            &OverrideSession::new(None),
+        )
+        .unwrap();
+        assert!(
+            context.read_policy.allows_location(&ProjectPathEntry {
+                path: selected_root.join("units/Selected.pas"),
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            "selected {property} root should be readable; warnings: {:?}",
+            context.warnings
+        );
+        assert!(
+            !context.read_policy.allows_location(&ProjectPathEntry {
+                path: unrelated.join("units/Other.pas"),
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            "arbitrary imported roots must not be authorized"
+        );
+    }
+}
+
+#[test]
+fn explicit_external_envoptions_locator_authorizes_only_that_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let appdata = root.join("ide");
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("settings.proj");
+    let sibling = external_dir.path().join("unrelated.proj");
+    let project = root.join("App.dproj");
+    write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+    write(&appdata.join("EnvOptions.proj"), "<Project/>");
+    write(&external, "<Project/>");
+    write(&sibling, "<Project/>");
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Win64</Platform></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\nEnvOptions='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+            sdk.display(),
+            appdata.display(),
+            external.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(context.metadata_files.contains(&external));
+    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+        path: external,
+        provenance: ProjectPathProvenance::Configured,
+    }));
+    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+        path: sibling,
+        provenance: ProjectPathProvenance::Configured,
+    }));
+}
+
+#[test]
+fn explicit_external_environmentsettings_locator_authorizes_only_that_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("environment.proj");
+    let sibling = external_dir.path().join("unrelated.proj");
+    let project = root.join("App.dproj");
+    write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+    write(&external, "<Project/>");
+    write(&sibling, "<Project/>");
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &project,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nEnvironmentSettings='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+            sdk.display(),
+            external.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(context.metadata_files.contains(&external));
+    assert!(context.read_policy.allows_location(&ProjectPathEntry {
+        path: external,
+        provenance: ProjectPathProvenance::Configured,
+    }));
+    assert!(!context.read_policy.allows_location(&ProjectPathEntry {
+        path: sibling,
+        provenance: ProjectPathProvenance::Configured,
+    }));
+}
+
+#[test]
+fn explicit_external_locators_respect_directory_and_filename_exclusions() {
+    for (relative_locator, exclusion) in [
+        ("private/settings.proj", "private/**"),
+        ("public/settings.proj", "settings.proj"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let external_dir = tempfile::tempdir().unwrap();
+        let external = external_dir.path().join(relative_locator);
+        let project = root.join("App.dproj");
+        write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+        write(&external, "<Project/>");
+        write(&root.join("App.dpr"), "program App; begin end.");
+        write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{}'\nEnvironmentSettings='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+                sdk.display(),
+                external.display()
+            ),
+        );
+
+        let context = discover_with_selections(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project),
+                ..ProjectOptions::default()
+            },
+            &ProjectSelections::default(),
+            &OverrideSession::new(None),
+            &[exclusion.to_owned()],
+        )
+        .unwrap();
+
+        assert!(
+            !context.read_policy.allows_location(&ProjectPathEntry {
+                path: external,
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            "exclusion {exclusion:?} should block explicit locator {relative_locator:?}"
+        );
+    }
+}
+
+#[test]
+fn explicit_external_locators_under_default_excluded_directories_are_denied() {
+    for directory in [".git", "node_modules"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let external_dir = tempfile::tempdir().unwrap();
+        let external = external_dir.path().join(directory).join("settings.proj");
+        let project = root.join("App.dproj");
+        write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+        write(&external, "<Project/>");
+        write(&root.join("App.dpr"), "program App; begin end.");
+        write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{}'\nEnvironmentSettings='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+                sdk.display(),
+                external.display()
+            ),
+        );
+
+        let context = discover_with_selections(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project),
+                ..ProjectOptions::default()
+            },
+            &ProjectSelections::default(),
+            &OverrideSession::new(None),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            !context.read_policy.allows_location(&ProjectPathEntry {
+                path: external,
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            "default-excluded directory {directory:?} must not be authorized"
+        );
+    }
 }
 
 #[test]

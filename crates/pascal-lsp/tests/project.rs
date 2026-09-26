@@ -399,8 +399,8 @@ fn delphi_overrides_are_immutable_project_properties() {
         &session,
     )
     .unwrap();
-    assert_eq!(context.config.as_deref(), Some("Debug"));
-    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(context.config.as_deref(), Some("Debug"), "{context:?}");
+    assert_eq!(context.platform.as_deref(), Some("Win32"), "{context:?}");
     assert!(
         context
             .unit_namespaces
@@ -552,6 +552,105 @@ fn immutable_globals_skip_unresolved_xml_rhs_expansion() {
             .any(|warning| warning.contains("MissingConfig") || warning.contains("MissingPlatform")),
         "immutable file globals expanded their XML RHS: {:?}",
         file_context.warnings
+    );
+}
+
+#[test]
+fn selected_installation_keeps_project_local_properties_and_profile_roots() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let project_dir = root.join("projects/app");
+    let sdk_root = tempfile::tempdir().unwrap();
+    let sdk = sdk_root.path().to_path_buf();
+    let main = project_dir.join("App.dpr");
+    write(&main, "program App; begin end.");
+    write(
+        &project_dir.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>$(MissingConfig)</Config><Platform>$(MissingPlatform)</Platform><DCC_UnitSearchPath>$(BDS)/source</DCC_UnitSearchPath></PropertyGroup></Project>",
+    );
+    write(
+        &sdk.join("source/ProfileUnit.pas"),
+        "unit ProfileUnit; interface implementation end.",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[properties]\nSharedVsProfile='shared'\n[installations.\"37.0\".properties]\nBDS='{}'\nProfileRoot='{}'\nConfig='Release'\nPlatform='Win64'\nSharedVsProfile='profile'\n[projects.\"projects/app/App.dproj\"]\ninstallation='37.0'\n",
+            sdk.display(),
+            sdk.display()
+        ),
+    );
+    write(
+        &project_dir.join(".delphi-tools.local.toml"),
+        "[properties]\nConfig='Debug'\nPlatform='Win32'\nProjectOnly='kept'\n",
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &main,
+        &[root.to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project_dir.join("App.dproj")),
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(None),
+    )
+    .expect("discover project using the selected installation");
+
+    assert!(matches!(
+        context.installation_selection,
+        Some(pascal_project::InstallationSelection::Selected { ref id, .. }) if id == "37.0"
+    ));
+    assert_eq!(context.config.as_deref(), Some("Debug"));
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(
+        context
+            .overrides
+            .properties
+            .get("config")
+            .map(String::as_str),
+        Some("Debug")
+    );
+    assert_eq!(
+        context
+            .overrides
+            .properties
+            .get("projectonly")
+            .map(String::as_str),
+        Some("kept")
+    );
+    assert_eq!(
+        context
+            .overrides
+            .properties
+            .get("sharedvsprofile")
+            .map(String::as_str),
+        Some("profile")
+    );
+    assert_eq!(
+        context.overrides.properties.get("bds"),
+        Some(&sdk.display().to_string())
+    );
+    assert_eq!(
+        context.overrides.properties.get("profileroot"),
+        Some(&sdk.display().to_string())
+    );
+    assert!(context.search_paths.contains(&sdk.join("source")));
+    assert!(
+        context
+            .read_policy
+            .allows_location(&pascal_project::ProjectPathEntry {
+                path: sdk.join("source"),
+                provenance: pascal_project::ProjectPathProvenance::Configured,
+            })
+    );
+    let unrelated_root = tempfile::tempdir().unwrap();
+    assert!(
+        !context
+            .read_policy
+            .allows_location(&pascal_project::ProjectPathEntry {
+                path: unrelated_root.path().to_path_buf(),
+                provenance: pascal_project::ProjectPathProvenance::Configured,
+            })
     );
 }
 
@@ -1036,6 +1135,42 @@ fn preserves_project_ambiguity_and_allows_explicit_project_override() {
         },
     );
     assert_eq!(selected.project_file, Some(root.join("src/Two.dproj")));
+}
+
+#[test]
+fn nested_unique_dproj_beats_ancestor_and_same_nearest_projects_stay_ambiguous() {
+    let temp = tempfile::tempdir().expect("temporary fixture");
+    let root = temp.path();
+    let nested = root.join("src/nested");
+    let source = nested.join("Unit.pas");
+    write(&source, "unit Unit; interface implementation end.");
+    write(
+        &root.join("Root.dproj"),
+        "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+    );
+    write(
+        &nested.join("Nested.dproj"),
+        "<Project><PropertyGroup><DCCReference Include=\"Unit.pas\" /></PropertyGroup></Project>",
+    );
+
+    let unique_nearest = discover(&source, root, &options());
+    assert_eq!(
+        unique_nearest.project_file,
+        Some(nested.join("Nested.dproj"))
+    );
+
+    write(
+        &nested.join("Other.dproj"),
+        "<Project><PropertyGroup><MainSource>Other.dpr</MainSource></PropertyGroup></Project>",
+    );
+    let ambiguous = discover(&source, root, &options());
+    assert_eq!(ambiguous.project_file, None, "{ambiguous:?}");
+    assert!(
+        ambiguous
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("multiple project files"))
+    );
 }
 
 #[test]
@@ -1752,7 +1887,7 @@ fn properties_from_unknown_prior_conditions_remain_unknown() {
 }
 
 #[test]
-fn automatic_selection_uses_the_unique_proven_source_owner() {
+fn automatic_selection_does_not_guess_from_unique_source_membership() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
     let source = root.join("src/Shared.pas");
@@ -1774,11 +1909,8 @@ fn automatic_selection_uses_the_unique_proven_source_owner() {
 
     let context = discover(&source, root, &options());
 
-    assert_eq!(context.project_file, Some(root.join("B.dproj")));
-    assert!(
-        context.discovery_complete,
-        "unique owner was not complete: {context:?}"
-    );
+    assert_eq!(context.project_file, None, "{context:?}");
+    assert!(!context.discovery_complete);
     assert!(
         context
             .metadata_files
@@ -2144,9 +2276,11 @@ fn metadata_limit_prevents_automatic_exclusion() {
     );
     let mut imports = String::new();
     for index in 0..64 {
-        imports.push_str(&format!(
-            "<Import Project=\"unused{index}.optset\" Condition=\"'a'=='b'\"/>"
-        ));
+        write(
+            root.join(format!("unused{index}.optset")).as_path(),
+            "<Project />",
+        );
+        imports.push_str(&format!("<Import Project=\"unused{index}.optset\"/>"));
     }
     imports.push_str("<Import Project=\"owner.optset\"/>");
     write(
@@ -2221,7 +2355,8 @@ fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
     );
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
-    assert_eq!(before.project_file, Some(root.join("A.dproj")));
+    assert!(before.project_file.is_none(), "{before:?}");
+    assert!(!before.discovery_complete);
     assert!(
         before
             .metadata_files
@@ -2261,7 +2396,8 @@ fn exists_dependencies_are_retained_in_the_ownership_readset() {
     );
 
     let before = discover(&root.join("src/Shared.pas"), root, &options());
-    assert_eq!(before.project_file, Some(root.join("A.dproj")));
+    assert!(before.project_file.is_none(), "{before:?}");
+    assert!(!before.discovery_complete);
     assert!(
         before
             .metadata_files

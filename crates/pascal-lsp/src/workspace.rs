@@ -51,7 +51,8 @@ use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTa
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod extract;
-pub(crate) mod projects;
+pub mod project_catalogue;
+pub mod projects;
 pub(crate) mod queries;
 pub(crate) mod rename;
 #[allow(dead_code)]
@@ -1271,6 +1272,8 @@ pub(crate) struct ReconciliationBudget {
     #[cfg(test)]
     cancel_after_path_visits: Cell<Option<usize>>,
     #[cfg(test)]
+    path_visit_limit: Cell<Option<usize>>,
+    #[cfg(test)]
     cancel_after_project_path_key_bytes: Cell<Option<usize>>,
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
@@ -1292,6 +1295,8 @@ impl ReconciliationBudget {
             exhausted: Cell::new(false),
             #[cfg(test)]
             cancel_after_path_visits: Cell::new(None),
+            #[cfg(test)]
+            path_visit_limit: Cell::new(None),
             #[cfg(test)]
             cancel_after_project_path_key_bytes: Cell::new(None),
             deleted_uris: RefCell::new(HashSet::new()),
@@ -1331,10 +1336,17 @@ impl ReconciliationBudget {
     }
 
     pub(crate) fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+        #[cfg(test)]
+        let limit = self
+            .path_visit_limit
+            .get()
+            .unwrap_or(MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS);
+        #[cfg(not(test))]
+        let limit = MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS;
         self.charge(
             self.used.get().filesystem_path_visits,
             amount,
-            MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
+            limit,
             |used, next| used.filesystem_path_visits = next,
         )?;
         #[cfg(test)]
@@ -1364,6 +1376,11 @@ impl ReconciliationBudget {
     #[cfg(test)]
     fn cancel_after_path_visits(&self, threshold: usize) {
         self.cancel_after_path_visits.set(Some(threshold));
+    }
+
+    #[cfg(test)]
+    fn set_path_visit_limit(&self, limit: usize) {
+        self.path_visit_limit.set(Some(limit));
     }
 
     fn charge_project_path_key_bytes(&self, amount: usize) -> Result<(), String> {
@@ -2016,6 +2033,7 @@ struct PreparedPackageWatch {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ContextKey {
     project_file: Option<PathBuf>,
+    installation_id: Option<String>,
     workspace_root: Option<PathBuf>,
     project_scope: Option<PathBuf>,
     selection_scope: Option<PathBuf>,
@@ -2024,6 +2042,13 @@ pub(crate) struct ContextKey {
     platform: Option<String>,
     conditional_context: ConditionalContext,
     overrides: EffectiveOverrides,
+}
+
+fn selected_installation_id(context: &ProjectContext) -> Option<String> {
+    match context.installation_selection.as_ref() {
+        Some(pascal_project::InstallationSelection::Selected { id, .. }) => Some(id.clone()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2054,6 +2079,9 @@ impl ContextKey {
         }
         if let Some(platform) = &self.platform {
             visit(platform.len())?;
+        }
+        if let Some(installation_id) = &self.installation_id {
+            visit(installation_id.len())?;
         }
         self.conditional_context.visit_recovery_payload(visit)?;
         self.overrides.visit_recovery_payload(visit)
@@ -2537,6 +2565,7 @@ pub struct Workspace {
     compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
+    installation_selections: HashMap<PathBuf, String>,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
     filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
     package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
@@ -3019,6 +3048,7 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_selections: input.project_selections.clone(),
+            installation_selections: input.installation_selections.clone(),
             analysis_records: Some(HashMap::new()),
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
@@ -3152,13 +3182,20 @@ impl Workspace {
     pub fn refresh_for_navigation(&mut self) {}
 
     fn project_options(&self) -> ProjectOptions {
+        self.project_options_with_installations(self.installation_selections.clone())
+    }
+
+    fn project_options_with_installations(
+        &self,
+        installation_selections: HashMap<PathBuf, String>,
+    ) -> ProjectOptions {
         ProjectOptions {
             project_file: self.options.project_file.clone(),
             build_config: self.options.build_config.clone(),
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
-            installation_selections: Default::default(),
+            installation_selections,
         }
     }
 
@@ -4297,6 +4334,7 @@ impl Workspace {
             count_recovery_entries!(self.expansions.len());
             count_recovery_entries!(self.include_parents.len());
             count_recovery_entries!(self.document_owners.len());
+            count_recovery_entries!(self.installation_selections.len());
             count_recovery_entries!(self.owner_last_used.len());
             count_recovery_entries!(self.pending_unit_file_renames.len());
             count_recovery_entries!(self.indexed_files.len());
@@ -4317,6 +4355,10 @@ impl Workspace {
             for (key, state) in &self.contexts {
                 key.visit_recovery_payload(&mut charge_retained_payload)?;
                 state.visit_recovery_payload(&mut charge_retained_payload)?;
+            }
+            for (project, installation_id) in &self.installation_selections {
+                charge_retained_payload(project.as_os_str().len())?;
+                charge_retained_payload(installation_id.len())?;
             }
             for (uri, key) in &self.document_contexts {
                 charge_retained_payload(uri.as_str().len())?;
@@ -5674,7 +5716,7 @@ impl Workspace {
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
-            installation_selections: Default::default(),
+            installation_selections: self.installation_selections.clone(),
         };
         let (context_key, context) =
             self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
@@ -6443,8 +6485,32 @@ impl Workspace {
                 section: ImportSection::Module,
             })
             .collect::<Vec<_>>();
+        // Compile candidates are validated before core lookup so a valid DCU
+        // can suppress only the IDE browsing fallback. It does not bypass
+        // explicit bindings or ordinary project/library source resolution.
+        let compiled_candidates = discover_compiled_units(
+            &context,
+            &sites
+                .iter()
+                .map(|site| site.requested_name.clone())
+                .collect::<Vec<_>>(),
+            resolver_cancel,
+        )?;
+        let mut compiled_by_name = HashMap::new();
+        for unit in compiled_candidates {
+            if let Some((_, _, unit_name)) = virtual_unit_identity(unit.document.uri()) {
+                compiled_by_name.insert(unit_name, unit);
+            }
+        }
+        let validated_compiled_names = compiled_by_name.keys().cloned().collect::<Vec<_>>();
         let resolved = resolver
-            .resolve_imports_with_text(&root, &sites, &indexed_text, resolver_cancel)
+            .resolve_imports_with_text_skipping_browsing(
+                &root,
+                &sites,
+                &indexed_text,
+                &validated_compiled_names,
+                resolver_cancel,
+            )
             .map_err(|error| {
                 if matches!(error, pascal_core::ResolverError::Cancelled) {
                     CANCELLATION_MESSAGE.to_string()
@@ -6533,10 +6599,10 @@ impl Workspace {
                 dependencies.push(dependency_uri);
             }
         }
-        for import in resolved.bindings {
-            if let ResolutionTarget::Found(source_id) = import.target {
-                if let Some(dependency_uri) = resolved_urls.get(&source_id) {
-                    bindings.insert(import.site.requested_name, dependency_uri.clone());
+        for import in &resolved.bindings {
+            if let ResolutionTarget::Found(source_id) = &import.target {
+                if let Some(dependency_uri) = resolved_urls.get(source_id) {
+                    bindings.insert(import.site.requested_name.clone(), dependency_uri.clone());
                 }
             }
         }
@@ -6555,58 +6621,74 @@ impl Workspace {
         // Source providers resolved above always win. Only unresolved imports
         // are eligible for the selected-context compiled provider, which itself
         // rejects source shadows and ambiguous DCUs.
-        let unresolved_units = sites
+        let activity = pascal_core::conditional::analyze_with_context(
+            &indexed_text,
+            &context.effective_conditional_context(),
+        );
+        let active_unavailable = resolved
+            .bindings
             .iter()
-            .map(|site| site.requested_name.as_str())
-            .filter(|name| {
-                !bindings
-                    .keys()
-                    .any(|bound| bound.eq_ignore_ascii_case(name))
+            .filter(|binding| matches!(binding.target, ResolutionTarget::Unavailable))
+            .filter(|binding| {
+                let range = &binding.site.byte_range;
+                activity.complete
+                    && !activity
+                        .inactive_spans
+                        .iter()
+                        .any(|span| span.start <= range.start && range.end <= span.end)
+                    && !activity
+                        .unknown_spans
+                        .iter()
+                        .any(|span| span.start <= range.start && range.end <= span.end)
             })
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if !unresolved_units.is_empty() {
-            let no_cancel = AtomicBool::new(false);
-            let provider_cancel = cancel.unwrap_or(&no_cancel);
-            let compiled = discover_compiled_units(&context, &unresolved_units, provider_cancel)?;
-            for unit in compiled {
-                check_workspace_cancel(cancel)?;
-                let Some((_, _, unit_name)) = virtual_unit_identity(unit.document.uri()) else {
-                    continue;
-                };
-                let requested_name = unresolved_units
-                    .iter()
-                    .find(|name| name.eq_ignore_ascii_case(&unit_name))
-                    .cloned();
-                let Some(requested_name) = requested_name else {
-                    continue;
-                };
-                if bindings
+            .map(|binding| binding.site.requested_name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        for (unit_name, unit) in compiled_by_name {
+            check_workspace_cancel(cancel)?;
+            let requested_names = active_unavailable
+                .iter()
+                .filter(|requested| {
+                    // Core applies unit aliases before browsing suppression;
+                    // match the validated canonical DCU back to every import
+                    // spelling that resolves through that alias.
+                    let resolved_name = context
+                        .unit_aliases
+                        .iter()
+                        .find(|(alias, _)| alias.eq_ignore_ascii_case(requested))
+                        .map_or(requested.as_str(), |(_, target)| target.as_str());
+                    resolved_name.eq_ignore_ascii_case(&unit_name)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if requested_names.is_empty() {
+                continue;
+            }
+            self.index
+                .update_compiled_unit_document(&unit.document)
+                .map_err(|error| format!("could not index compiled unit: {error}"))?;
+            self.compiled_units
+                .insert(unit.document.uri().clone(), unit.clone());
+            for requested_name in requested_names {
+                if !bindings
                     .keys()
                     .any(|bound| bound.eq_ignore_ascii_case(&requested_name))
                 {
-                    continue;
+                    bindings.insert(requested_name, unit.document.uri().clone());
                 }
-                self.index
-                    .update_compiled_unit_document(&unit.document)
-                    .map_err(|error| format!("could not index compiled unit: {error}"))?;
-                self.compiled_units
-                    .insert(unit.document.uri().clone(), unit.clone());
-                bindings.insert(requested_name, unit.document.uri().clone());
-                let (path, path_entry, content_hash) = unit.observation();
-                if let Some(record) = rename::path_record_at(
-                    path.to_path_buf(),
-                    path_stamp(path),
-                    Some(content_hash),
-                    None,
-                    None,
-                    Some(context.read_policy.clone()),
-                    Some(path_entry.clone()),
-                    false,
-                ) {
-                    let records = self.analysis_records.get_or_insert_with(HashMap::new);
-                    resolver::merge_source_record(records, record);
-                }
+            }
+            let (path, path_entry, content_hash) = unit.observation();
+            if let Some(record) = rename::path_record_at(
+                path.to_path_buf(),
+                path_stamp(path),
+                Some(content_hash),
+                None,
+                None,
+                Some(context.read_policy.clone()),
+                Some(path_entry.clone()),
+                false,
+            ) {
+                let records = self.analysis_records.get_or_insert_with(HashMap::new);
+                resolver::merge_source_record(records, record);
             }
         }
         self.index.bind_imports(uri, bindings);
@@ -8130,11 +8212,34 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, false)
+    }
+
+    pub(crate) fn context_for_project_protocol_anchor_with_control(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<ContextKey, String> {
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, true)
+    }
+
+    fn context_for_uri_with_cancel_and_budget_anchor_policy(
+        &mut self,
+        uri: &Url,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        allow_project_anchor: bool,
+    ) -> Result<ContextKey, String> {
         let path = uri
             .to_file_path()
             .map(absolute_path)
             .map_err(|_| format!("project context requires a file URI: {uri}"))?;
-        if !is_analyzable_source_path(&path) {
+        let is_project_protocol_anchor = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dproj"));
+        if !(is_analyzable_source_path(&path) || allow_project_anchor && is_project_protocol_anchor)
+        {
             return Err(format!(
                 "unsupported Pascal document path: {}",
                 path.display()
@@ -8194,16 +8299,15 @@ impl Workspace {
             platform: self.options.platform.clone(),
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
-            installation_selections: Default::default(),
+            installation_selections: self.installation_selections.clone(),
         };
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         if let Some(owner) = self.document_owners.get(uri).cloned() {
             if owner.origin != OwnerOrigin::Automatic
                 && !owner.follow_current_project_file
-                && (rediscover_open_context
-                    || self.known_owner_selection_is_current_with_cancel_and_budget(
-                        &path, &owner, cancel, budget,
-                    )?)
+                && self.known_owner_selection_is_current_with_cancel_and_budget(
+                    &path, &owner, cancel, budget,
+                )?
             {
                 return self
                     .restore_known_owner(
@@ -8772,6 +8876,7 @@ impl Workspace {
         let selection = self.runtime_selection_for_path_default(path);
         ContextKey {
             project_file: context.and_then(|context| context.project_file.clone()),
+            installation_id: context.and_then(selected_installation_id),
             workspace_root: self.root_for_path(path),
             project_scope: self.project_scope_for_path(path, context),
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
@@ -8808,6 +8913,7 @@ impl Workspace {
         };
         Ok(ContextKey {
             project_file: context.and_then(|context| context.project_file.clone()),
+            installation_id: context.and_then(selected_installation_id),
             workspace_root: self.root_for_path(path),
             project_scope,
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
@@ -9443,6 +9549,410 @@ impl Workspace {
         diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         check_workspace_cancel(cancel)?;
         Ok(diagnostic_uris)
+    }
+
+    fn invalidate_selection_contexts(
+        &mut self,
+        keys: &HashSet<ContextKey>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        let mut context_sources = Vec::new();
+        let mut context_metadata = Vec::new();
+        let mut retained_keys = Vec::new();
+        let mut stale_owners = Vec::new();
+        let mut affected = HashSet::new();
+        for key in keys {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if let Some(state) = self.contexts.get(key) {
+                retained_keys
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve invalidated contexts: {error}"))?;
+                retained_keys.push(key.clone());
+                if let Some(main_source) = state.context.main_source.as_ref() {
+                    context_sources.try_reserve(1).map_err(|error| {
+                        format!("could not reserve changed project sources: {error}")
+                    })?;
+                    context_sources.push(main_source.clone());
+                }
+                for path in &state.context.metadata_files {
+                    check_workspace_cancel(cancel)?;
+                    if let Some(budget) = budget {
+                        budget.charge_path_visits(1)?;
+                    }
+                    context_metadata.try_reserve(1).map_err(|error| {
+                        format!("could not reserve changed project metadata: {error}")
+                    })?;
+                    context_metadata.push(path.clone());
+                }
+            }
+        }
+        for (uri, owner) in &self.document_owners {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(&owner.key) {
+                stale_owners
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve stale project owners: {error}"))?;
+                stale_owners.push(uri.clone());
+            }
+        }
+        for (uri, context_key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(context_key)
+                && (self.index.contains(uri)
+                    || self
+                        .open_documents
+                        .get(uri)
+                        .is_some_and(|document| document.text.is_some()))
+            {
+                affected.try_reserve(1).map_err(|error| {
+                    format!("could not reserve affected project documents: {error}")
+                })?;
+                affected.insert(uri.clone());
+            }
+        }
+        for (uri, context_key) in &self.open_document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if keys.contains(context_key)
+                && self
+                    .open_documents
+                    .get(uri)
+                    .is_some_and(|document| document.text.is_some())
+            {
+                affected.try_reserve(1).map_err(|error| {
+                    format!("could not reserve affected open documents: {error}")
+                })?;
+                affected.insert(uri.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(
+                retained_keys
+                    .len()
+                    .saturating_add(stale_owners.len())
+                    .saturating_add(affected.len()),
+            )?;
+        }
+
+        // Preflight every fallible/cancellable operation that would otherwise
+        // occur while removing contexts and indexes. The apply phase below is
+        // deliberately infallible so a budget/cancellation error cannot leave
+        // a half-invalidated selection behind.
+        for uri in &affected {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+                if let Some(expansion) = self.expansions.get(uri) {
+                    let dependency_count = expansion.dependencies.len();
+                    for _ in &expansion.dependencies {
+                        check_workspace_cancel(cancel)?;
+                        budget.charge_path_visits(1)?;
+                    }
+                    budget.charge_path_visits(dependency_count.saturating_add(1))?;
+                }
+            }
+        }
+        let mut used_contexts = HashSet::new();
+        used_contexts
+            .try_reserve(
+                self.document_contexts
+                    .len()
+                    .saturating_add(self.open_document_contexts.len()),
+            )
+            .map_err(|error| format!("could not reserve selection context owners: {error}"))?;
+        for (uri, key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !affected.contains(uri) {
+                used_contexts.insert(key.clone());
+            }
+        }
+        for key in self.open_document_contexts.values() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            used_contexts.insert(key.clone());
+        }
+        let mut pruned_keys = Vec::new();
+        pruned_keys
+            .try_reserve(self.contexts.len())
+            .map_err(|error| format!("could not reserve pruned selection contexts: {error}"))?;
+        for key in self.contexts.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !used_contexts.contains(key) {
+                pruned_keys.push(key.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(pruned_keys.len())?;
+        }
+        let mut diagnostic_uris = Vec::new();
+        diagnostic_uris
+            .try_reserve(affected.len())
+            .map_err(|error| format!("could not reserve selection diagnostics: {error}"))?;
+        for uri in &affected {
+            check_workspace_cancel(cancel)?;
+            if self
+                .open_documents
+                .get(uri)
+                .is_some_and(|document| document.text.is_some())
+            {
+                diagnostic_uris.push(uri.clone());
+            }
+        }
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(diagnostic_uris.len()))?;
+            budget.check_cancelled()?;
+        }
+        check_workspace_cancel(cancel)?;
+        diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        check_workspace_cancel(cancel)?;
+
+        self.source_change_generations
+            .try_reserve(context_sources.len().saturating_add(affected.len()))
+            .map_err(|error| {
+                format!("could not reserve invalidated source generations: {error}")
+            })?;
+        self.configuration_change_generations
+            .try_reserve(context_metadata.len().saturating_add(affected.len()))
+            .map_err(|error| {
+                format!("could not reserve invalidated configuration generations: {error}")
+            })?;
+        self.pending_diagnostics
+            .try_reserve(diagnostic_uris.len())
+            .map_err(|error| format!("could not reserve invalidated diagnostics: {error}"))?;
+
+        for key in retained_keys {
+            self.contexts.remove(&key);
+        }
+        for uri in stale_owners {
+            if let Some(owner) = self.document_owners.get_mut(&uri) {
+                owner.legacy_route = None;
+                owner.needs_revalidation = true;
+            }
+        }
+        for uri in &affected {
+            if let Some(expansion) = self.expansions.remove(uri) {
+                for dependency in expansion.dependencies {
+                    if let Some(parents) = self.include_parents.get_mut(&dependency) {
+                        parents.remove(uri);
+                        if parents.is_empty() {
+                            self.include_parents.remove(&dependency);
+                        }
+                    }
+                }
+            }
+            self.index.remove(uri);
+            self.indexed_files.remove(uri);
+            self.last_used.remove(uri);
+            self.document_contexts.remove(uri);
+            self.index.clear_import_bindings(uri);
+            self.disk_stamps.remove(uri);
+            if let Some(size) = self.indexed_sizes.remove(uri) {
+                self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
+            }
+        }
+        for key in pruned_keys {
+            self.contexts.remove(&key);
+        }
+        for path in context_sources {
+            if let Ok(uri) = Url::from_file_path(path) {
+                mark_dependency_change(
+                    &mut self.source_change_generations,
+                    &uri,
+                    self.source_generation.wrapping_add(1),
+                    false,
+                );
+            }
+        }
+        for path in context_metadata {
+            if let Ok(uri) = Url::from_file_path(path) {
+                mark_dependency_change(
+                    &mut self.configuration_change_generations,
+                    &uri,
+                    self.configuration_generation.wrapping_add(1),
+                    false,
+                );
+            }
+        }
+        for uri in affected {
+            mark_dependency_change(
+                &mut self.source_change_generations,
+                &uri,
+                self.source_generation.wrapping_add(1),
+                false,
+            );
+            mark_dependency_change(
+                &mut self.configuration_change_generations,
+                &uri,
+                self.configuration_generation.wrapping_add(1),
+                false,
+            );
+            self.schedule_diagnostics(uri);
+        }
+        Ok(())
+    }
+
+    fn invalidate_project_selection_uris(
+        &mut self,
+        uris: &HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        // Coordinator-side selection commits may only mutate after every
+        // bounded traversal, cancellation check, and allocation reservation
+        // has succeeded. The apply phase below intentionally has no `Result`
+        // path and does not consult cancellation.
+        let mut diagnostic_uris = Vec::new();
+        diagnostic_uris
+            .try_reserve(uris.len())
+            .map_err(|error| format!("could not reserve project-switch diagnostics: {error}"))?;
+        for uri in uris {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if let Some(expansion) = self.expansions.get(uri) {
+                for _ in &expansion.dependencies {
+                    check_workspace_cancel(cancel)?;
+                    if let Some(budget) = budget {
+                        budget.charge_path_visits(1)?;
+                    }
+                }
+            }
+            if self
+                .open_documents
+                .get(uri)
+                .is_some_and(|document| document.text.is_some())
+            {
+                diagnostic_uris.push(uri.clone());
+            }
+        }
+
+        let mut used_contexts = HashSet::new();
+        used_contexts
+            .try_reserve(
+                self.document_contexts
+                    .len()
+                    .saturating_add(self.open_document_contexts.len()),
+            )
+            .map_err(|error| format!("could not reserve project-switch context owners: {error}"))?;
+        for (uri, key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !uris.contains(uri) {
+                used_contexts.insert(key.clone());
+            }
+        }
+        for (uri, key) in &self.open_document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !uris.contains(uri) {
+                used_contexts.insert(key.clone());
+            }
+        }
+        let mut pruned_contexts = Vec::new();
+        pruned_contexts
+            .try_reserve(self.contexts.len())
+            .map_err(|error| {
+                format!("could not reserve project-switch context cleanup: {error}")
+            })?;
+        for key in self.contexts.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !used_contexts.contains(key) {
+                pruned_contexts.push(key.clone());
+            }
+        }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(diagnostic_uris.len()))?;
+            budget.check_cancelled()?;
+        }
+        diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        self.source_change_generations
+            .try_reserve(uris.len())
+            .map_err(|error| {
+                format!("could not reserve project-switch source generations: {error}")
+            })?;
+        self.configuration_change_generations
+            .try_reserve(uris.len())
+            .map_err(|error| {
+                format!("could not reserve project-switch configuration generations: {error}")
+            })?;
+        self.pending_diagnostics
+            .try_reserve(diagnostic_uris.len())
+            .map_err(|error| format!("could not reserve project-switch diagnostics: {error}"))?;
+
+        for uri in uris {
+            if let Some(owner) = self.document_owners.get_mut(uri) {
+                owner.legacy_route = None;
+                owner.needs_revalidation = true;
+            }
+            self.open_document_contexts.remove(uri);
+            if let Some(expansion) = self.expansions.remove(uri) {
+                for dependency in expansion.dependencies {
+                    if let Some(parents) = self.include_parents.get_mut(&dependency) {
+                        parents.remove(uri);
+                        if parents.is_empty() {
+                            self.include_parents.remove(&dependency);
+                        }
+                    }
+                }
+            }
+            self.index.remove(uri);
+            self.indexed_files.remove(uri);
+            self.last_used.remove(uri);
+            self.document_contexts.remove(uri);
+            self.index.clear_import_bindings(uri);
+            self.disk_stamps.remove(uri);
+            if let Some(size) = self.indexed_sizes.remove(uri) {
+                self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
+            }
+            mark_dependency_change(
+                &mut self.source_change_generations,
+                uri,
+                self.source_generation,
+                false,
+            );
+            mark_dependency_change(
+                &mut self.configuration_change_generations,
+                uri,
+                self.configuration_generation,
+                false,
+            );
+        }
+        for key in pruned_contexts {
+            self.contexts.remove(&key);
+        }
+        for uri in diagnostic_uris {
+            self.schedule_diagnostics(uri);
+        }
+        Ok(())
     }
 
     fn invalidate_metadata_for_uri(
@@ -13955,6 +14465,7 @@ mod tests {
 
     fn budget_test_context_key(index: usize) -> ContextKey {
         ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(PathBuf::from(format!("/workspace-{index}"))),
             project_scope: None,
@@ -15074,6 +15585,614 @@ mod tests {
     }
 
     #[test]
+    fn installation_selection_is_project_scoped_and_invalid_choices_are_transactional() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let source_a = root.join("A/Main.pas");
+        let project_a = root.join("A/Main.dproj");
+        let source_b = root.join("B/Main.pas");
+        let provider_b = root.join("B/Provider.pas");
+        let shared = root.join("Shared.pas");
+        let project_b = root.join("B/Main.dproj");
+        fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(project_b.parent().unwrap()).unwrap();
+        fs::write(&source_a, "unit Main; interface implementation end.").unwrap();
+        fs::write(&project_a, "<Project><PropertyGroup><DCCReference Include=\"Main.pas\"/></PropertyGroup></Project>").unwrap();
+        fs::write(
+            &source_b,
+            "unit Main; interface uses Provider; implementation end.",
+        )
+        .unwrap();
+        fs::write(&provider_b, "unit Provider; interface implementation end.").unwrap();
+        fs::write(&shared, "unit Shared; interface implementation end.").unwrap();
+        fs::write(&project_b, "<Project><PropertyGroup><DCCReference Include=\"Main.pas\"/><DCCReference Include=\"Provider.pas\"/><DCCReference Include=\"../Shared.pas\"/></PropertyGroup></Project>").unwrap();
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            r#"
+[installations."10.0".properties]
+BDS = '/fake/10'
+[installations."37.0".properties]
+BDS = '/fake/37'
+"#,
+        )
+        .unwrap();
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let uri_a = Url::from_file_path(&project_a).unwrap();
+        let uri_b = Url::from_file_path(&project_b).unwrap();
+        let source_b_uri = Url::from_file_path(&source_b).unwrap();
+        let source_a_uri = Url::from_file_path(&source_a).unwrap();
+        workspace
+            .open_document(
+                source_a_uri.clone(),
+                fs::read_to_string(&source_a).unwrap(),
+                1,
+            )
+            .unwrap();
+        workspace.project_context(&source_a_uri).unwrap();
+        workspace
+            .open_document(
+                source_b_uri.clone(),
+                fs::read_to_string(&source_b).unwrap(),
+                1,
+            )
+            .unwrap();
+        workspace.project_context(&source_b_uri).unwrap();
+        let b_key = workspace
+            .document_contexts
+            .get(&source_b_uri)
+            .unwrap()
+            .clone();
+        let before_b_context = workspace.contexts.get(&b_key).unwrap().context.clone();
+        assert_eq!(
+            before_b_context.explicit_units.get("provider"),
+            Some(&vec![provider_b.clone()])
+        );
+        assert_eq!(
+            before_b_context.explicit_units.get("shared"),
+            Some(&vec![shared.clone()])
+        );
+        let before_b = workspace.installation_context(&uri_b).unwrap();
+        let invalid = workspace.select_installation(&uri_a, Some("99.0"));
+        assert!(invalid.is_err());
+        assert_eq!(
+            workspace
+                .installation_context(&uri_a)
+                .unwrap()
+                .selected_installation_id,
+            None
+        );
+
+        workspace.select_installation(&uri_a, Some("37.0")).unwrap();
+        workspace.project_context(&source_a_uri).unwrap();
+        let a_key = workspace.document_contexts.get(&source_a_uri).unwrap();
+        assert_eq!(a_key.installation_id.as_deref(), Some("37.0"));
+        let after_b = workspace.installation_context(&uri_b).unwrap();
+        assert_eq!(
+            before_b.selected_installation_id,
+            after_b.selected_installation_id
+        );
+        assert_eq!(workspace.document_contexts.get(&source_b_uri), Some(&b_key));
+        assert!(workspace.contexts.contains_key(&b_key));
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&b_key)
+                .unwrap()
+                .context
+                .explicit_units
+                .get("provider"),
+            Some(&vec![provider_b])
+        );
+        assert_eq!(
+            workspace
+                .contexts
+                .get(&b_key)
+                .unwrap()
+                .context
+                .explicit_units
+                .get("shared"),
+            Some(&vec![shared])
+        );
+        assert_eq!(
+            workspace
+                .installation_context(&uri_a)
+                .unwrap()
+                .selected_installation_id
+                .as_deref(),
+            Some("37.0")
+        );
+        workspace
+            .installation_selections
+            .insert(project_a.clone(), "99.0".to_string());
+        let stale = workspace.installation_context(&uri_a).unwrap();
+        assert_eq!(stale.selected_installation_id, None);
+        assert_eq!(stale.selection_mode, "invalid");
+        assert!(!stale.warnings.is_empty());
+    }
+
+    #[test]
+    fn failed_selection_invalidation_preserves_the_workspace_snapshot() {
+        fn populated_workspace() -> (tempfile::TempDir, Workspace, HashSet<ContextKey>) {
+            let directory = tempfile::tempdir().expect("workspace");
+            let root = directory.path();
+            let source = root.join("Main.pas");
+            let project = root.join("App.dproj");
+            fs::write(&source, "unit Main; interface implementation end.").unwrap();
+            fs::write(
+                &project,
+                "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+            )
+            .unwrap();
+            let mut workspace =
+                test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+            let uri = Url::from_file_path(&source).unwrap();
+            workspace
+                .open_document(uri.clone(), fs::read_to_string(&source).unwrap(), 1)
+                .unwrap();
+            workspace.project_context(&uri).unwrap();
+            let key = workspace.document_contexts.get(&uri).unwrap().clone();
+            let keys = HashSet::from([key]);
+            (directory, workspace, keys)
+        }
+
+        let (_success_dir, mut success_workspace, success_keys) = populated_workspace();
+        let success_budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        success_workspace
+            .invalidate_selection_contexts(&success_keys, None, Some(&success_budget))
+            .expect("unconstrained invalidation succeeds");
+        let invalidation_visits = success_budget.used.get().filesystem_path_visits;
+        assert!(invalidation_visits > 0);
+
+        let (_failure_dir, mut workspace, keys) = populated_workspace();
+        let source_generation = workspace.source_generation;
+        let configuration_generation = workspace.configuration_generation;
+        let contexts_before = workspace.contexts.clone();
+        let document_contexts_before = workspace.document_contexts.clone();
+        let open_contexts_before = workspace.open_document_contexts.clone();
+        let owners_before = workspace.document_owners.clone();
+        let indexed_files_before = workspace.indexed_files.clone();
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        // Trigger cancellation at the final charged invalidation step. The
+        // current implementation has already removed contexts/index state by
+        // this point, exposing the non-transactional mutation order.
+        budget.cancel_after_path_visits(invalidation_visits.saturating_sub(1));
+        let result = workspace.invalidate_selection_contexts(&keys, None, Some(&budget));
+        let error = result.expect_err("invalidation must observe the forced cancellation");
+        assert_eq!(error, super::CANCELLATION_MESSAGE);
+        assert_eq!(workspace.contexts.len(), contexts_before.len());
+        assert_eq!(workspace.document_contexts, document_contexts_before);
+        assert_eq!(workspace.open_document_contexts, open_contexts_before);
+        assert_eq!(workspace.document_owners.len(), owners_before.len());
+        assert_eq!(workspace.indexed_files, indexed_files_before);
+        assert_eq!(workspace.source_generation, source_generation);
+        assert_eq!(workspace.configuration_generation, configuration_generation);
+    }
+
+    #[test]
+    fn project_selection_preflight_budget_failure_preserves_all_retained_state() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let first = root.join("First.pas");
+        let second = root.join("Second.pas");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>First.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        for source in [&first, &second] {
+            fs::write(source, "unit Source; interface implementation end.").unwrap();
+        }
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let first_uri = Url::from_file_path(&first).unwrap();
+        let second_uri = Url::from_file_path(&second).unwrap();
+        for uri in [&first_uri, &second_uri] {
+            workspace
+                .open_document(
+                    uri.clone(),
+                    fs::read_to_string(uri.to_file_path().unwrap()).unwrap(),
+                    1,
+                )
+                .unwrap();
+            workspace.project_context(uri).unwrap();
+        }
+        let uris = HashSet::from([first_uri, second_uri]);
+        let before = (
+            format!("{:?}", workspace.contexts),
+            format!("{:?}", workspace.document_contexts),
+            format!("{:?}", workspace.open_document_contexts),
+            format!("{:?}", workspace.document_owners),
+            workspace.index.document_count(),
+            format!("{:?}", workspace.indexed_files),
+            format!("{:?}", workspace.pending_diagnostics),
+            workspace.source_change_generations.clone(),
+            workspace.configuration_change_generations.clone(),
+            workspace.source_generation,
+            workspace.configuration_generation,
+        );
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget.set_path_visit_limit(1);
+
+        let error = workspace
+            .invalidate_project_selection_uris(&uris, None, Some(&budget))
+            .expect_err("the second URI must exhaust the finite preflight budget");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        let after = (
+            format!("{:?}", workspace.contexts),
+            format!("{:?}", workspace.document_contexts),
+            format!("{:?}", workspace.open_document_contexts),
+            format!("{:?}", workspace.document_owners),
+            workspace.index.document_count(),
+            format!("{:?}", workspace.indexed_files),
+            format!("{:?}", workspace.pending_diagnostics),
+            workspace.source_change_generations.clone(),
+            workspace.configuration_change_generations.clone(),
+            workspace.source_generation,
+            workspace.configuration_generation,
+        );
+        assert_eq!(
+            after, before,
+            "budget failure must leave the workspace unchanged"
+        );
+    }
+
+    #[test]
+    fn reset_installation_context_ignores_a_cached_pre_reset_selection() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let source = root.join("Main.pas");
+        fs::write(&source, "unit Main; interface implementation end.").unwrap();
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(
+            root.join(LOCAL_CONFIG_NAME),
+            r#"
+[installations."7.0".properties]
+BDS = '/fake/7'
+[installations."37.0".properties]
+BDS = '/fake/37'
+[projects."App.dproj"]
+installation = '7.0'
+"#,
+        )
+        .unwrap();
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let project_uri = Url::from_file_path(&project).unwrap();
+        let source_uri = Url::from_file_path(&source).unwrap();
+        workspace
+            .select_installation(&project_uri, Some("37.0"))
+            .unwrap();
+        workspace.project_context(&source_uri).unwrap();
+        assert_eq!(
+            workspace
+                .installation_context(&project_uri)
+                .unwrap()
+                .selected_installation_id,
+            Some("37.0".to_string())
+        );
+
+        // Simulate the post-reset session map before context invalidation; the
+        // response must be based on automatic/configured selection, not the
+        // stale context fallback.
+        let project_path = project.canonicalize().unwrap();
+        workspace.installation_selections.remove(&project_path);
+        let reset_context = workspace.installation_context(&project_uri).unwrap();
+        assert_eq!(
+            reset_context.selected_installation_id.as_deref(),
+            Some("7.0"),
+            "reset response must reflect configured post-reset selection, not cached session selection"
+        );
+    }
+
+    #[test]
+    fn installation_switch_rejects_a_completed_result_using_the_old_project_context() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let source = root.join("App.pas");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><DCCReference Include=\"App.pas\"/></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&source, "unit App; interface implementation end.").unwrap();
+        fs::write(
+            root.join(".delphi-tools.local.toml"),
+            r#"
+[installations."10.0".properties]
+BDS = '/fake/10'
+[installations."37.0".properties]
+BDS = '/fake/37'
+"#,
+        )
+        .unwrap();
+        let source_uri = Url::from_file_path(&source).unwrap();
+        let project_uri = Url::from_file_path(&project).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(source_uri.clone(), fs::read_to_string(&source).unwrap(), 1)
+            .unwrap();
+        workspace.project_context(&source_uri).unwrap();
+
+        let old_source_generation = workspace.source_generation;
+        let old_configuration_generation = workspace.configuration_generation;
+        let old_result = super::rename::SourceRecord {
+            uri: source_uri.clone(),
+            text: "unit App; interface implementation end.".to_string(),
+            version: None,
+            stamp: None,
+            open: false,
+            path: Some(source.clone()),
+            path_stamp: None,
+            content_hash: None,
+            parsed_text_hash: None,
+            content_bytes: None,
+            candidate_membership: None,
+            candidate_observations: Vec::new(),
+            read_policy: None,
+            path_entry: None,
+            include_payload: false,
+            missing_provider_candidate: false,
+            document_link_missing_candidate: false,
+            directory_observation: false,
+            missing_provider_scope: None,
+            auto_import_provider_observation: false,
+            auto_import_scopes: Vec::new(),
+        };
+        assert!(
+            workspace
+                .dependency_scoped_result_is_fresh(
+                    old_source_generation,
+                    old_configuration_generation,
+                    std::slice::from_ref(&old_result),
+                )
+                .is_ok()
+        );
+
+        workspace
+            .select_installation(&project_uri, Some("37.0"))
+            .unwrap();
+        assert!(
+            workspace
+                .dependency_scoped_result_is_fresh(
+                    old_source_generation,
+                    old_configuration_generation,
+                    &[old_result],
+                )
+                .is_err(),
+            "result captured against the previous installation must not be deliverable"
+        );
+    }
+
+    #[test]
+    fn project_switch_invalidates_an_inherited_owner_in_the_prospective_scope() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let scope = root.join("nested");
+        fs::create_dir_all(&scope).unwrap();
+        let source = scope.join("Shared.pas");
+        let ancestor_project = root.join("Root.dproj");
+        let prospective_project = scope.join("Nested.dproj");
+        let other_scope = root.join("other");
+        fs::create_dir_all(&other_scope).unwrap();
+        let other_source = other_scope.join("Other.pas");
+        let other_project = other_scope.join("Other.dproj");
+        fs::write(&source, "unit Shared; interface implementation end.").unwrap();
+        fs::write(
+            &ancestor_project,
+            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
+        fs::write(&other_source, "unit Other; interface implementation end.").unwrap();
+        fs::write(&other_project, "<Project><PropertyGroup><DCCReference Include=\"Other.pas\"/></PropertyGroup></Project>").unwrap();
+        let source_uri = Url::from_file_path(&source).unwrap();
+        let other_uri = Url::from_file_path(&other_source).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(source_uri.clone(), fs::read_to_string(&source).unwrap(), 1)
+            .unwrap();
+        workspace
+            .open_document(
+                other_uri.clone(),
+                fs::read_to_string(&other_source).unwrap(),
+                1,
+            )
+            .unwrap();
+        workspace.project_context(&other_uri).unwrap();
+        let other_key = workspace.document_contexts.get(&other_uri).unwrap().clone();
+        let before = workspace.project_context(&source_uri).unwrap();
+        assert_eq!(
+            before.selected_project_uri,
+            Some(Url::from_file_path(&ancestor_project).unwrap())
+        );
+        let old_key = workspace
+            .document_contexts
+            .get(&source_uri)
+            .unwrap()
+            .clone();
+        assert_ne!(
+            old_key.project_scope.as_deref(),
+            Some(scope.as_path()),
+            "test must use an inherited owner outside the prospective scope: {old_key:?}"
+        );
+        assert_ne!(
+            old_key.selection_scope.as_deref(),
+            Some(scope.as_path()),
+            "test must require prospective ownership discovery: {old_key:?}"
+        );
+        assert!(
+            workspace
+                .selection_uris_for_scope(&scope, &source_uri)
+                .contains(&source_uri),
+            "a source under the prospective selection scope must invalidate its inherited owner"
+        );
+
+        fs::write(
+            &prospective_project,
+            "<Project><PropertyGroup><MainSource>Nested.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(scope.join("Nested.dpr"), "program Nested; begin end.").unwrap();
+        workspace
+            .select_project(
+                &source_uri,
+                Some(&Url::from_file_path(&prospective_project).unwrap()),
+            )
+            .unwrap();
+        assert!(
+            workspace
+                .source_change_generations
+                .contains_key(&source_uri)
+        );
+        assert!(
+            workspace
+                .configuration_change_generations
+                .contains_key(&source_uri)
+        );
+        assert!(
+            !workspace.contexts.contains_key(&old_key),
+            "inherited ancestor owner remained cached"
+        );
+        assert_eq!(
+            workspace.document_contexts.get(&other_uri),
+            Some(&other_key)
+        );
+        assert!(
+            workspace.contexts.contains_key(&other_key),
+            "unrelated project's context was invalidated"
+        );
+        assert_eq!(
+            workspace
+                .project_context(&source_uri)
+                .unwrap()
+                .selected_project_uri,
+            Some(Url::from_file_path(&prospective_project).unwrap())
+        );
+    }
+
+    #[test]
+    fn project_switch_moves_only_the_target_uri_from_a_shared_context_key() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let scope = root.join("nested");
+        let other = root.join("other");
+        fs::create_dir_all(&scope).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let shared = scope.join("Shared.pas");
+        let sibling = other.join("Other.pas");
+        let ancestor_project = root.join("Root.dproj");
+        let prospective_project = scope.join("Nested.dproj");
+        fs::write(&shared, "unit Shared; interface implementation end.").unwrap();
+        fs::write(&sibling, "unit Other; interface implementation end.").unwrap();
+        fs::write(
+            &ancestor_project,
+            "<Project><PropertyGroup><MainSource>Root.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("Root.dpr"), "program Root; begin end.").unwrap();
+        let shared_uri = Url::from_file_path(&shared).unwrap();
+        let sibling_uri = Url::from_file_path(&sibling).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        for (uri, path) in [(&shared_uri, &shared), (&sibling_uri, &sibling)] {
+            workspace
+                .open_document(uri.clone(), fs::read_to_string(path).unwrap(), 1)
+                .unwrap();
+            workspace.project_context(uri).unwrap();
+        }
+        let shared_key = workspace.document_contexts[&shared_uri].clone();
+        let sibling_key = workspace.document_contexts[&sibling_uri].clone();
+        assert_eq!(
+            shared_key, sibling_key,
+            "fixture must share the ancestor context key"
+        );
+        workspace.indexed_files.insert(sibling_uri.clone());
+        assert!(!workspace.document_owners[&sibling_uri].needs_revalidation);
+
+        fs::write(
+            &prospective_project,
+            "<Project><PropertyGroup><MainSource>Nested.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(scope.join("Nested.dpr"), "program Nested; begin end.").unwrap();
+        workspace
+            .select_project(
+                &shared_uri,
+                Some(&Url::from_file_path(&prospective_project).unwrap()),
+            )
+            .unwrap();
+
+        let switched_key = workspace.document_contexts.get(&shared_uri).unwrap();
+        assert_ne!(switched_key, &shared_key);
+        assert_eq!(
+            switched_key.project_file.as_deref(),
+            Some(prospective_project.as_path())
+        );
+        assert_eq!(
+            workspace.open_document_contexts.get(&shared_uri),
+            Some(switched_key)
+        );
+        assert!(
+            workspace.open_documents[&shared_uri].text.is_some(),
+            "switch must preserve the unsaved overlay"
+        );
+        assert_eq!(
+            workspace.document_contexts.get(&sibling_uri),
+            Some(&sibling_key)
+        );
+        assert_eq!(
+            workspace.open_document_contexts.get(&sibling_uri),
+            Some(&sibling_key)
+        );
+        assert!(workspace.contexts.contains_key(&sibling_key));
+        assert!(workspace.indexed_files.contains(&sibling_uri));
+        assert!(!workspace.document_owners[&sibling_uri].needs_revalidation);
+        assert_eq!(workspace.document_owners[&shared_uri].key, *switched_key);
+        assert!(
+            !workspace
+                .source_change_generations
+                .contains_key(&Url::from_file_path(root.join("Root.dpr")).unwrap())
+        );
+        assert!(
+            !workspace
+                .configuration_change_generations
+                .contains_key(&Url::from_file_path(&ancestor_project).unwrap())
+        );
+    }
+
+    #[test]
+    fn deleted_project_selection_is_rejected_without_changing_the_live_choice() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let source = root.join("Main.pas");
+        let project_a = root.join("A.dproj");
+        let project_b = root.join("B.dproj");
+        fs::write(&source, "unit Main; interface implementation end.").unwrap();
+        fs::write(&project_a, "<Project><PropertyGroup/></Project>").unwrap();
+        fs::write(&project_b, "<Project><PropertyGroup/></Project>").unwrap();
+        let uri = Url::from_file_path(&source).unwrap();
+        let a_uri = Url::from_file_path(&project_a).unwrap();
+        let b_uri = Url::from_file_path(&project_b).unwrap();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        workspace.select_project(&uri, Some(&a_uri)).unwrap();
+        fs::remove_file(&project_b).unwrap();
+        assert!(workspace.select_project(&uri, Some(&b_uri)).is_err());
+        assert_eq!(
+            workspace
+                .project_context(&uri)
+                .unwrap()
+                .selected_project_uri,
+            Some(a_uri)
+        );
+    }
+
+    #[test]
     fn compiled_virtual_content_is_bound_to_a_live_authorized_context() {
         let temp = tempfile::tempdir().expect("temporary authorized path");
         let fixture_root = temp.path().join("dcu");
@@ -15096,6 +16215,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(fixture_root.clone()),
             project_scope: None,
@@ -15235,6 +16355,7 @@ mod tests {
         .uri()
         .clone();
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
@@ -15308,6 +16429,299 @@ mod tests {
     }
 
     #[test]
+    fn validated_compiled_provider_precedes_browsing_only_source() {
+        let temp = tempfile::tempdir().expect("temporary project root");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug")
+            .canonicalize()
+            .expect("fixture directory exists");
+        let browsing = temp.path().join("ide-source");
+        fs::create_dir_all(&browsing).expect("browsing directory");
+        fs::write(
+            browsing.join("Lint4dFixture.Classes.pas"),
+            "unit Lint4dFixture.Classes; interface type TSourceOnly = class end; implementation end.",
+        )
+        .expect("write browsing-only provider");
+        let source_path = temp.path().join("Consumer.pas");
+        let source = "unit Consumer; interface uses Lint4dFixture.Classes; type TAlias = TSimpleClass; implementation end.";
+        fs::write(&source_path, source).expect("write importer");
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+        let context = ProjectContext {
+            discovery_complete: true,
+            project_file: Some(temp.path().join("App.dproj")),
+            browsing_path_entries: vec![ProjectPathEntry::legacy(browsing.clone())],
+            debug_dcu_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
+            read_policy: ReadPolicy::new(
+                &[temp.path().to_path_buf(), fixture_root.clone()],
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        assert_eq!(
+            super::discover_compiled_units(
+                &context,
+                &["Lint4dFixture.Classes".to_string()],
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .len(),
+            1,
+            "regression requires a validated DCU provider"
+        );
+        let key = ContextKey {
+            installation_id: None,
+            project_file: None,
+            workspace_root: Some(temp.path().to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context,
+                ..ContextState::default()
+            },
+        );
+        workspace
+            .index
+            .update(source_uri.clone(), source.to_string())
+            .expect("index importer");
+        workspace
+            .document_contexts
+            .insert(source_uri.clone(), key.clone());
+
+        workspace
+            .load_imports_with_cancel(
+                &source_uri,
+                &key,
+                &mut HashSet::new(),
+                Some(&AtomicBool::new(false)),
+            )
+            .expect("resolve importer dependencies");
+        let provider = workspace
+            .index
+            .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
+            .expect("compiled provider should bind");
+        assert_eq!(provider.scheme(), "lint4d-dcu");
+    }
+
+    #[test]
+    fn compiled_alias_and_canonical_import_bind_to_one_validated_dcu() {
+        let temp = tempfile::tempdir().expect("temporary project root");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug")
+            .canonicalize()
+            .expect("fixture directory exists");
+        let browsing = temp.path().join("ide-source");
+        fs::create_dir_all(&browsing).expect("browsing directory");
+        fs::write(
+            browsing.join("Lint4dFixture.Classes.pas"),
+            "unit Lint4dFixture.Classes; interface implementation end.",
+        )
+        .expect("write browsing-only provider");
+        let source_path = temp.path().join("Consumer.pas");
+        let source =
+            "unit Consumer; interface uses OldUnit, Lint4dFixture.Classes; implementation end.";
+        fs::write(&source_path, source).expect("write importer");
+        let source_uri = Url::from_file_path(&source_path).expect("source URI");
+        let context = ProjectContext {
+            discovery_complete: true,
+            project_file: Some(temp.path().join("App.dproj")),
+            unit_aliases: HashMap::from([(
+                "oldunit".to_string(),
+                "Lint4dFixture.Classes".to_string(),
+            )]),
+            browsing_path_entries: vec![ProjectPathEntry::legacy(browsing)],
+            debug_dcu_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
+            read_policy: ReadPolicy::new(
+                &[temp.path().to_path_buf(), fixture_root],
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        let key = ContextKey {
+            installation_id: None,
+            project_file: context.project_file.clone(),
+            workspace_root: Some(temp.path().to_path_buf()),
+            project_scope: None,
+            selection_scope: None,
+            selection_project: None,
+            config: None,
+            platform: None,
+            conditional_context: ConditionalContext::default(),
+            overrides: EffectiveOverrides::default(),
+        };
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace.contexts.insert(
+            key.clone(),
+            ContextState {
+                context,
+                ..ContextState::default()
+            },
+        );
+        workspace
+            .index
+            .update(source_uri.clone(), source.to_string())
+            .expect("index importer");
+        workspace
+            .document_contexts
+            .insert(source_uri.clone(), key.clone());
+        workspace
+            .load_imports_with_cancel(
+                &source_uri,
+                &key,
+                &mut HashSet::new(),
+                Some(&AtomicBool::new(false)),
+            )
+            .expect("resolve aliased imports");
+
+        let alias_provider = workspace
+            .index
+            .import_provider_uri(&source_uri, "OldUnit")
+            .expect("alias provider should bind");
+        let canonical_provider = workspace
+            .index
+            .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
+            .expect("canonical provider should bind");
+        assert_eq!(alias_provider.scheme(), "lint4d-dcu");
+        assert_eq!(alias_provider, canonical_provider);
+    }
+
+    #[test]
+    fn compiled_fallback_keeps_missing_explicit_and_inactive_imports_unbound() {
+        fn resolve_with_context(context: ProjectContext, root: &Path, source: &str) -> Option<Url> {
+            let source_path = root.join("Consumer.pas");
+            fs::write(&source_path, source).expect("write importer");
+            let source_uri = Url::from_file_path(&source_path).expect("source URI");
+            let key = ContextKey {
+                installation_id: None,
+                project_file: None,
+                workspace_root: Some(root.to_path_buf()),
+                project_scope: None,
+                selection_scope: None,
+                selection_project: None,
+                config: None,
+                platform: None,
+                conditional_context: ConditionalContext::default(),
+                overrides: EffectiveOverrides::default(),
+            };
+            let mut workspace =
+                test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+            workspace.contexts.insert(
+                key.clone(),
+                ContextState {
+                    context,
+                    ..ContextState::default()
+                },
+            );
+            workspace
+                .index
+                .update(source_uri.clone(), source.to_string())
+                .expect("index importer");
+            assert!(
+                workspace
+                    .index
+                    .imports(&source_uri)
+                    .iter()
+                    .any(|import| import.name.eq_ignore_ascii_case("Lint4dFixture.Classes"))
+            );
+            workspace
+                .document_contexts
+                .insert(source_uri.clone(), key.clone());
+            workspace
+                .load_imports_with_cancel(
+                    &source_uri,
+                    &key,
+                    &mut HashSet::new(),
+                    Some(&AtomicBool::new(false)),
+                )
+                .expect("resolve importer dependencies");
+            workspace
+                .index
+                .import_provider_uri(&source_uri, "Lint4dFixture.Classes")
+                .cloned()
+        }
+
+        let temp = tempfile::tempdir().expect("temporary project root");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lint4d/tests/fixtures/dcu/d13_win64/Win64/Debug")
+            .canonicalize()
+            .expect("fixture directory exists");
+        let browsing = temp.path().join("ide-source");
+        fs::create_dir_all(&browsing).expect("browsing directory");
+        fs::write(
+            browsing.join("Lint4dFixture.Classes.pas"),
+            "unit Lint4dFixture.Classes; interface implementation end.",
+        )
+        .expect("write browsing-only provider");
+        let mut context = ProjectContext {
+            discovery_complete: true,
+            project_file: Some(temp.path().join("App.dproj")),
+            browsing_path_entries: vec![ProjectPathEntry::legacy(browsing)],
+            debug_dcu_path_entries: vec![ProjectPathEntry::legacy(fixture_root.clone())],
+            read_policy: ReadPolicy::new(
+                &[temp.path().to_path_buf(), fixture_root],
+                &[],
+                &[],
+                &EffectiveOverrides::default(),
+            ),
+            ..ProjectContext::default()
+        };
+        assert_eq!(
+            super::discover_compiled_units(
+                &context,
+                &["Lint4dFixture.Classes".to_string()],
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .len(),
+            1,
+            "control cases require a real, validated DCU candidate"
+        );
+        context.path_issues.push(pascal_project::ProjectPathIssue {
+            kind: pascal_project::ProjectPathIssueKind::MissingReference,
+            source_file: temp.path().join("App.dproj"),
+            property: "DCCReference".to_string(),
+            raw: "Lint4dFixture.Classes.pas".to_string(),
+            path: Some(temp.path().join("Lint4dFixture.Classes.pas")),
+            unit_name: Some("lint4dfixture.classes".to_string()),
+            provenance: ProjectPathProvenance::LegacyNative,
+        });
+        let missing_reservation = resolve_with_context(
+            context.clone(),
+            temp.path(),
+            "unit Consumer; interface uses Lint4dFixture.Classes; implementation end.",
+        );
+        assert!(
+            missing_reservation.is_none(),
+            "missing explicit binding is a reservation"
+        );
+
+        context.path_issues.clear();
+        let inactive = resolve_with_context(
+            context,
+            temp.path(),
+            "unit Consumer; interface {$IFDEF NEVER} uses Lint4dFixture.Classes; {$ENDIF} implementation end.",
+        );
+        assert!(
+            inactive.is_none(),
+            "inactive imports cannot receive a DCU binding"
+        );
+    }
+
+    #[test]
     fn selected_project_pascal_source_precedes_same_named_dcu() {
         let temp = tempfile::tempdir().expect("temporary project root");
         let source_dir = temp.path().join("source");
@@ -15355,6 +16769,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(temp.path().to_path_buf()),
             project_scope: None,
@@ -15419,6 +16834,7 @@ mod tests {
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
         let context = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: None,
             project_scope: None,
@@ -15478,6 +16894,7 @@ mod tests {
         fs::write(&second, "package Second; end.").expect("second descriptor");
         let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -15570,6 +16987,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         let mut workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root),
             project_scope: None,
@@ -15639,6 +17057,7 @@ mod tests {
             ..ProjectContext::default()
         };
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -15689,6 +17108,7 @@ mod tests {
         fs::write(&package_path, "package Shared; end.").expect("package descriptor");
         let source = root.join("Main.pas");
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -15752,6 +17172,7 @@ mod tests {
         const EXISTING: usize = 1_200;
         let root = PathBuf::from("/tmp/package-watch-index");
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -15813,6 +17234,7 @@ mod tests {
             .expect("project candidate");
         }
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -15860,6 +17282,7 @@ mod tests {
             .expect("project candidate");
         }
         let key = ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root.clone()),
             project_scope: None,
@@ -16782,6 +18205,7 @@ mod tests {
             options: WorkspaceOptions::default(),
             overrides: OverrideSession::new(None),
             project_selections: HashMap::new(),
+            installation_selections: HashMap::new(),
             document_owners: HashMap::new(),
             overlays,
             cached_documents: HashMap::new(),
@@ -17827,6 +19251,7 @@ mod tests {
     fn legacy_route_proof_requires_the_exact_source_and_owner_context() {
         let source = PathBuf::from("/external/Helper.pas");
         let key = super::ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/workspace/A.dproj")),
             workspace_root: Some(PathBuf::from("/workspace")),
             project_scope: Some(PathBuf::from("/workspace")),
@@ -17861,6 +19286,7 @@ mod tests {
     fn legacy_route_proof_uses_native_case_sensitive_source_comparison() {
         let source = PathBuf::from("/external/Helper.pas");
         let key = super::ContextKey {
+            installation_id: None,
             project_file: Some(PathBuf::from("/workspace/App.dproj")),
             workspace_root: Some(PathBuf::from("/workspace")),
             project_scope: Some(PathBuf::from("/workspace")),
@@ -18481,6 +19907,7 @@ mod tests {
 
         let mut workspace = test_workspace(vec![root.clone()], Default::default());
         let key = super::ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(root),
             project_scope: None,
@@ -18543,6 +19970,7 @@ mod tests {
         symlink(&outside, mapped_a.join("escape")).expect("source escape symlink");
 
         let key_for = |mapped_root: PathBuf| super::ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: None,
             project_scope: None,
@@ -18623,6 +20051,7 @@ mod tests {
         fs::write(&custom_excluded, "package Shared; end.\n").expect("custom excluded descriptor");
 
         let key = super::ContextKey {
+            installation_id: None,
             project_file: None,
             workspace_root: Some(workspace_root.clone()),
             project_scope: None,

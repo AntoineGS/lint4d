@@ -541,6 +541,7 @@ impl<S: SourceStore> UnitResolver<S> {
             sites,
             &text,
             require_byte_preserving_coordinates,
+            None,
             cancel,
         )
     }
@@ -557,7 +558,26 @@ impl<S: SourceStore> UnitResolver<S> {
         text: &str,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedImports, ResolverError> {
-        self.resolve_imports_inner(importer, sites, text, false, cancel)
+        self.resolve_imports_inner(importer, sites, text, false, None, cancel)
+    }
+
+    /// Resolve imports while withholding browsing-only source fallback for
+    /// names that a caller has independently validated as compiled providers.
+    /// Explicit bindings, normal search paths, and conditional activity retain
+    /// their usual precedence; this does not itself select a compiled result.
+    pub fn resolve_imports_with_text_skipping_browsing(
+        &mut self,
+        importer: &ResolvedUnit,
+        sites: &[ImportSite],
+        text: &str,
+        validated_compiled_names: &[String],
+        cancel: &dyn CancellationToken,
+    ) -> Result<ResolvedImports, ResolverError> {
+        let names = validated_compiled_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        self.resolve_imports_inner(importer, sites, text, false, Some(&names), cancel)
     }
 
     fn resolve_imports_inner(
@@ -566,6 +586,7 @@ impl<S: SourceStore> UnitResolver<S> {
         sites: &[ImportSite],
         text: &str,
         require_byte_preserving_coordinates: bool,
+        validated_compiled_names: Option<&HashSet<String>>,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedImports, ResolverError> {
         let mut bindings = Vec::with_capacity(sites.len());
@@ -636,12 +657,18 @@ impl<S: SourceStore> UnitResolver<S> {
                         candidates: Vec::new(),
                     }
                 } else {
-                    self.resolve_unit_result(
+                    let aliased = aliased_name(&self.context, &site.requested_name);
+                    let suppress_browsing = validated_compiled_names.is_some_and(|names| {
+                        names.contains(&site.requested_name.to_ascii_lowercase())
+                            || names.contains(&aliased.to_ascii_lowercase())
+                    });
+                    self.resolve_unit_result_with_browsing(
                         UnitResolveRequest {
                             requested_name: &site.requested_name,
                             importer_path: &importer.source.path,
                             legacy_route: importer_route.as_ref(),
                         },
+                        suppress_browsing,
                         cancel,
                     )?
                 };
@@ -979,17 +1006,28 @@ impl<S: SourceStore> UnitResolver<S> {
         request: UnitResolveRequest<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
+        self.resolve_unit_result_with_browsing(request, false, cancel)
+    }
+
+    fn resolve_unit_result_with_browsing(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        skip_browsing: bool,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
         self.check_cancel(cancel)?;
         let key = UnitCacheKey::new(
             request.importer_path,
             request.requested_name,
             request.legacy_route,
         );
-        if let Some(unit) = self.unit_cache.get(&key).cloned() {
-            return Ok(Resolution::Found(unit));
+        if !skip_browsing {
+            if let Some(unit) = self.unit_cache.get(&key).cloned() {
+                return Ok(Resolution::Found(unit));
+            }
         }
         let route = request.legacy_route.cloned();
-        let result = self.resolve_unit_inner(request, cancel)?;
+        let result = self.resolve_unit_inner(request, skip_browsing, cancel)?;
         if matches!(&result, Resolution::Incomplete { .. }) {
             self.mark_incomplete("unit resolution was incomplete".to_string());
         }
@@ -1026,6 +1064,7 @@ impl<S: SourceStore> UnitResolver<S> {
     fn resolve_unit_inner(
         &mut self,
         request: UnitResolveRequest<'_>,
+        skip_browsing: bool,
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
         self.check_cancel(cancel)?;
@@ -1134,17 +1173,19 @@ impl<S: SourceStore> UnitResolver<S> {
         // Browsing paths are a positive source-navigation fallback only. They
         // follow every project/client and selected-installation library path,
         // and missing explicit bindings were reserved above.
-        for entry in self.context.browsing_path_entries.clone() {
-            if let Some(result) = self.resolve_directory(
-                &entry.path,
-                &lookup,
-                &self.context.unit_namespaces.clone(),
-                request.legacy_route,
-                cancel,
-                Some(&entry),
-                requested,
-            )? {
-                return Ok(result);
+        if !skip_browsing {
+            for entry in self.context.browsing_path_entries.clone() {
+                if let Some(result) = self.resolve_directory(
+                    &entry.path,
+                    &lookup,
+                    &self.context.unit_namespaces.clone(),
+                    request.legacy_route,
+                    cancel,
+                    Some(&entry),
+                    requested,
+                )? {
+                    return Ok(result);
+                }
             }
         }
 

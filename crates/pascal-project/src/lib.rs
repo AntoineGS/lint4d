@@ -16,18 +16,20 @@ pub mod configuration;
 pub mod delphi_overrides;
 pub mod installation_config;
 #[allow(dead_code)]
-pub(crate) mod installations;
+pub mod installations;
 pub mod path_issues;
 
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
 };
 pub use configuration::{ConfigRead, config_directories, read_config};
+pub use installations::{InstallationOrigin, InstallationSelection};
 pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
     EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
 };
+use crate::installations::{InstallationEvidence, select_installation};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use serde::Deserialize;
@@ -65,6 +67,9 @@ pub struct ProjectOptions {
     /// An explicit `.dproj`, `.dpr`, or `.dpk` path. Relative paths are
     /// resolved against the supplied workspace roots.
     pub project_file: Option<PathBuf>,
+    /// Exact-project session installation choices. An absent entry restores
+    /// Automatic selection; project directories are never used as keys.
+    pub installation_selections: HashMap<PathBuf, String>,
     /// The selected Delphi build configuration, such as `Debug` or `Release`.
     pub build_config: Option<String>,
     /// The selected Delphi platform, such as `Win32` or `Win64`.
@@ -768,6 +773,11 @@ pub struct ProjectContext {
     pub binding_metadata_complete: bool,
     pub path_issues: Vec<ProjectPathIssue>,
     pub project_file: Option<PathBuf>,
+    /// Direct root-project identity facts used before installation-dependent
+    /// imports are evaluated.
+    pub installation_evidence: InstallationEvidence,
+    /// The project-scoped installation result, if profile selection applies.
+    pub installation_selection: Option<InstallationSelection>,
     pub main_source: Option<PathBuf>,
     /// Ordered project and caller-provided unit search paths.
     pub search_paths: Vec<PathBuf>,
@@ -1946,6 +1956,18 @@ fn discover_context_with_selections(
             metadata_files,
             metadata_observations,
         } => {
+            let installation_workspace = project_file
+                .parent()
+                .and_then(|directory| relevant_override_workspace_root(directory, &roots));
+            let installation_config = match overrides
+                .configuration_for(installation_workspace.as_deref(), Some(&project_file))
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    warnings.push(error);
+                    crate::installation_config::ProjectConfiguration::from_layers(Vec::new())
+                }
+            };
             let effective_overrides =
                 match effective_overrides_for_project(&project_file, &roots, overrides) {
                     Ok(overrides) => overrides,
@@ -1956,6 +1978,7 @@ fn discover_context_with_selections(
                             &file_path,
                             &roots,
                             &options,
+                            installation_config.clone(),
                             EffectiveOverrides::default(),
                             warnings,
                             explicit,
@@ -1978,6 +2001,7 @@ fn discover_context_with_selections(
                 &file_path,
                 &roots,
                 &options,
+                installation_config,
                 effective_overrides,
                 warnings,
                 explicit,
@@ -3213,11 +3237,20 @@ fn inspect_project_candidate(
             };
         }
     };
+    let installation_workspace = project_file
+        .parent()
+        .and_then(|directory| relevant_override_workspace_root(directory, roots));
+    let installation_config = overrides
+        .configuration_for(installation_workspace.as_deref(), Some(project_file))
+        .unwrap_or_else(|_| {
+            crate::installation_config::ProjectConfiguration::from_layers(Vec::new())
+        });
     match build_project_context(
         project_file.to_path_buf(),
         file,
         roots,
         options,
+        installation_config,
         effective_overrides,
         Vec::new(),
         false,
@@ -3681,6 +3714,7 @@ fn build_project_context(
     file: &Path,
     roots: &[PathBuf],
     options: &ProjectOptions,
+    installation_config: crate::installation_config::ProjectConfiguration,
     overrides: EffectiveOverrides,
     warnings: Vec<String>,
     explicit: bool,
@@ -3695,8 +3729,34 @@ fn build_project_context(
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
+    let mut evaluation_options = options.clone();
+    let mut installation_evidence = InstallationEvidence::default();
+    if extension_is(&project_file, "dproj") {
+        let bootstrap_entry = ProjectPathEntry::legacy(project_file.clone());
+        let (bootstrap, observation) = read_policy
+            .read_payload_with_observation(&bootstrap_entry, MAX_PROJECT_BYTES)
+            .map_err(|error| format!("could not read project bootstrap metadata: {error}"))?;
+        tracker.record_metadata_path(project_file.clone());
+        tracker.record_metadata_observation(observation);
+        let bootstrap = parse_project_bootstrap(&bootstrap);
+        installation_evidence = bootstrap.evidence;
+        if evaluation_options.build_config.is_none() {
+            evaluation_options.build_config = bootstrap.config;
+        }
+        if evaluation_options.platform.is_none() {
+            evaluation_options.platform = bootstrap.platform;
+        }
+        if evaluation_options
+            .conditional_context
+            .compiler_version
+            .is_none()
+        {
+            evaluation_options.conditional_context.compiler_version =
+                installation_evidence.compiler_version;
+        }
+    }
     let mut builder = ProjectBuilder::new(
-        options,
+        &evaluation_options,
         &overrides,
         warnings,
         project_dir.clone(),
@@ -3943,7 +4003,7 @@ fn build_project_context(
     let project_defines = property_list(&builder, "dcc_define");
     let mut conditional_warnings = Vec::new();
     let conditional_context = merge_project_conditional_context(
-        options,
+        &evaluation_options,
         &builder,
         &project_defines,
         &mut conditional_warnings,
@@ -3966,7 +4026,18 @@ fn build_project_context(
         binding_metadata_complete: !builder.incomplete
             && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
         path_issues: builder.path_issues.clone(),
-        project_file: Some(project_file),
+        project_file: Some(project_file.clone()),
+        installation_evidence: installation_evidence.clone(),
+        installation_selection: Some(select_installation(
+            &installation_config,
+            &project_file,
+            &installation_evidence,
+            options
+                .installation_selections
+                .iter()
+                .find(|(path, _)| project_paths_equal(path, &project_file))
+                .map(|(_, id)| id.as_str()),
+        )),
         main_source,
         search_paths,
         search_path_entries,
@@ -3979,8 +4050,8 @@ fn build_project_context(
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
         defines,
         conditional_context,
-        config: selected_config(&builder, options),
-        platform: selected_platform(&builder, options),
+        config: selected_config(&builder, &evaluation_options),
+        platform: selected_platform(&builder, &evaluation_options),
         overrides,
         read_policy,
         packages: package_list(&builder),
@@ -4051,6 +4122,8 @@ fn build_standalone_context(
         binding_metadata_complete: discovery_complete,
         path_issues: Vec::new(),
         project_file: None,
+        installation_evidence: InstallationEvidence::default(),
+        installation_selection: None,
         main_source: None,
         search_paths,
         search_path_entries,
@@ -4233,6 +4306,121 @@ fn parse_conditional_fact(value: &str) -> Option<ConditionalFact> {
         "0" | "false" | "no" | "off" | "-" => Some(ConditionalFact::False),
         "" => None,
         _ => Some(ConditionalFact::Unknown),
+    }
+}
+
+#[derive(Default)]
+struct ProjectBootstrap {
+    evidence: InstallationEvidence,
+    config: Option<String>,
+    platform: Option<String>,
+}
+
+/// Extract only properties physically declared in the root project's direct
+/// PropertyGroups. Imports, target-time properties, package names, and
+/// reference paths are intentionally outside this bootstrap evidence set.
+fn parse_project_bootstrap(xml: &str) -> ProjectBootstrap {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut depth = 0usize;
+    let mut group_depth = None;
+    let mut property: Option<String> = None;
+    let mut property_depth = None;
+    let mut value = String::new();
+    let mut values = BTreeMap::<String, Vec<String>>::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                depth += 1;
+                let name =
+                    String::from_utf8_lossy(element.local_name().as_ref()).to_ascii_lowercase();
+                if name == "propertygroup" && depth == 2 {
+                    group_depth = Some(depth);
+                } else if group_depth == Some(depth - 1) {
+                    property = Some(name);
+                    property_depth = Some(depth);
+                    value.clear();
+                }
+            }
+            Ok(Event::Text(text)) if property.is_some() => {
+                if let Ok(decoded) = text.unescape() {
+                    value.push_str(&decoded);
+                }
+            }
+            Ok(Event::CData(text)) if property.is_some() => {
+                value.push_str(&String::from_utf8_lossy(text.as_ref()));
+            }
+            Ok(Event::End(element)) => {
+                let name =
+                    String::from_utf8_lossy(element.local_name().as_ref()).to_ascii_lowercase();
+                if property_depth == Some(depth) {
+                    if let Some(property) = property.take() {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            values.entry(property).or_default().push(value.to_owned());
+                        }
+                    }
+                    property_depth = None;
+                }
+                if name == "propertygroup" && group_depth == Some(depth) {
+                    group_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    let unique_value = |name: &str| -> Option<String> {
+        let candidates = values.get(name)?;
+        let first = candidates.first()?;
+        candidates
+            .iter()
+            .all(|candidate| candidate.eq_ignore_ascii_case(first))
+            .then(|| first.clone())
+    };
+    let compiler_raw = ["compilerversion", "dcc_compilerversion"]
+        .into_iter()
+        .filter_map(&unique_value)
+        .collect::<Vec<_>>();
+    let compiler_version = if let Some(first) = compiler_raw.first() {
+        let parsed = CompilerVersion::parse(first);
+        compiler_raw
+            .iter()
+            .all(|value| CompilerVersion::parse(value) == parsed)
+            .then_some(parsed)
+            .flatten()
+    } else {
+        None
+    };
+    let project_version = unique_value("projectversion");
+    let bds_root = unique_value("bds");
+    let conflicting = [
+        "projectversion",
+        "compilerversion",
+        "dcc_compilerversion",
+        "bds",
+    ]
+    .into_iter()
+    .any(|key| {
+        values.get(key).is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| !item.eq_ignore_ascii_case(&items[0]))
+        })
+    }) || compiler_raw.len() > 1
+        && compiler_raw
+            .iter()
+            .any(|value| CompilerVersion::parse(value) != compiler_version);
+    ProjectBootstrap {
+        evidence: InstallationEvidence {
+            compiler_version,
+            project_version,
+            bds_root,
+            conflicting,
+        },
+        config: unique_value("config"),
+        platform: unique_value("platform"),
     }
 }
 

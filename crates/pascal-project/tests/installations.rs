@@ -1,7 +1,11 @@
 use std::{fs, path::Path};
 
 use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
-use pascal_project::{ProjectPathEntry, ProjectPathProvenance, ReadPolicy};
+use pascal_project::installations::InstallationEvidence;
+use pascal_project::{
+    InstallationOrigin, InstallationSelection, ProjectContext, ProjectOptions, ProjectPathEntry,
+    ProjectPathProvenance, ReadPolicy,
+};
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -250,5 +254,92 @@ fn profile_lookup_rejects_unknown_ids_and_legacy_files_stay_shared_only() {
     assert_eq!(
         session.effective_for(None, None).unwrap().properties["bds"],
         "/legacy"
+    );
+}
+
+#[test]
+fn public_identity_selection_uses_compiler_facts_and_exact_project_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_file = temp.path().join("config.toml");
+    let project = temp.path().join("app/App.dproj");
+    write(
+        &config_file,
+        "[installations.\"7.0\".properties]\nBDS = '/sdk/7'\n\
+         [installations.\"10.0\".properties]\nBDS = '/sdk/10'\n",
+    );
+    let config = OverrideSession::new(Some(config_file))
+        .configuration_for(None, None)
+        .unwrap();
+    let selected = pascal_project::installations::select_installation(
+        &config,
+        &project,
+        &InstallationEvidence {
+            compiler_version: Some(pascal_project::CompilerVersion::new(24, 0)),
+            ..InstallationEvidence::default()
+        },
+        None,
+    );
+    assert_eq!(
+        selected,
+        InstallationSelection::Selected {
+            id: "10.0".into(),
+            origin: InstallationOrigin::Metadata,
+        }
+    );
+}
+
+#[test]
+fn project_bootstrap_reads_direct_identity_and_configuration_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("App.dproj");
+    let source = temp.path().join("App.dpr");
+    write(&source, "begin end.\n");
+    write(
+        &project,
+        r#"<Project>
+          <PropertyGroup>
+            <ProjectVersion>20.3</ProjectVersion>
+            <CompilerVersion>24.0</CompilerVersion>
+            <Config>Release</Config>
+            <Platform>Win32</Platform>
+            <MainSource>App.dpr</MainSource>
+          </PropertyGroup>
+        </Project>"#,
+    );
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        "[installations.\"7.0\".properties]\nBDS = '/sdk/7'\n\
+         [installations.\"10.0\".properties]\nBDS = '/sdk/10'\n",
+    );
+    let mut session_choices = std::collections::HashMap::new();
+    session_choices.insert(project.clone(), "7.0".into());
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &ProjectOptions {
+            project_file: Some(project),
+            installation_selections: session_choices,
+            ..ProjectOptions::default()
+        },
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    assert_eq!(context.config.as_deref(), Some("Release"));
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
+    assert_eq!(
+        context.conditional_context.compiler_version,
+        Some(pascal_project::CompilerVersion::new(24, 0))
+    );
+    assert_eq!(
+        context.installation_evidence.project_version.as_deref(),
+        Some("20.3")
+    );
+    assert_eq!(
+        context.installation_selection,
+        Some(InstallationSelection::Selected {
+            id: "7.0".into(),
+            origin: InstallationOrigin::Session,
+        })
     );
 }

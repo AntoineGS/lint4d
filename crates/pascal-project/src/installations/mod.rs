@@ -25,8 +25,15 @@ pub(crate) struct InstallationEnvironment {
 }
 
 mod ide_paths;
+mod identity;
 mod roots;
 mod rsvars;
+
+#[allow(unused_imports)]
+pub use identity::{
+    InstallationEvidence, InstallationOrigin, InstallationSelection,
+    compiler_version_for_installation, select_installation,
+};
 
 #[allow(unused_imports)]
 pub(crate) use ide_paths::{IdePaths, evaluate_ide_paths, load_installation};

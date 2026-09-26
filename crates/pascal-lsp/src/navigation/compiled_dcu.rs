@@ -300,6 +300,36 @@ pub(crate) fn project_context_fingerprint(context: &ProjectContext) -> u64 {
     context.project_file.hash(&mut hasher);
     context.main_source.hash(&mut hasher);
     context.search_path_entries.hash(&mut hasher);
+    context.debug_dcu_path_entries.hash(&mut hasher);
+    context.browsing_path_entries.hash(&mut hasher);
+    match &context.installation_selection {
+        Some(pascal_project::InstallationSelection::Legacy) => 0u8.hash(&mut hasher),
+        Some(pascal_project::InstallationSelection::Selected { id, origin }) => {
+            1u8.hash(&mut hasher);
+            id.hash(&mut hasher);
+            (*origin as u8).hash(&mut hasher);
+        }
+        Some(pascal_project::InstallationSelection::NeedsChoice { candidates }) => {
+            2u8.hash(&mut hasher);
+            candidates.hash(&mut hasher);
+        }
+        Some(pascal_project::InstallationSelection::Invalid { id }) => {
+            3u8.hash(&mut hasher);
+            id.hash(&mut hasher);
+        }
+        None => 4u8.hash(&mut hasher),
+    }
+    context
+        .installation_evidence
+        .compiler_version
+        .map(|version| (version.major, version.minor, version.patch))
+        .hash(&mut hasher);
+    context
+        .installation_evidence
+        .project_version
+        .hash(&mut hasher);
+    context.installation_evidence.bds_root.hash(&mut hasher);
+    context.installation_evidence.conflicting.hash(&mut hasher);
     context.unit_namespaces.hash(&mut hasher);
     let mut aliases = context.unit_aliases.iter().collect::<Vec<_>>();
     aliases.sort_by(|left, right| left.0.cmp(right.0));
@@ -328,7 +358,11 @@ pub fn discover_compiled_units(
     let started = Instant::now();
     if !context.discovery_complete
         || imported_units.len() > MAX_DCU_IMPORTS
-        || context.search_path_entries.len() > MAX_DCU_SEARCH_PATHS
+        || context
+            .search_path_entries
+            .len()
+            .saturating_add(context.debug_dcu_path_entries.len())
+            > MAX_DCU_SEARCH_PATHS
     {
         return Ok(Vec::new());
     }
@@ -352,7 +386,11 @@ pub fn discover_compiled_units(
         }
         let mut candidates = Vec::<PathBuf>::new();
         let mut source_exists = false;
-        for search in &context.search_path_entries {
+        for search in context
+            .search_path_entries
+            .iter()
+            .chain(&context.debug_dcu_path_entries)
+        {
             if cancel.load(Ordering::Relaxed) {
                 return Err("request cancelled".to_string());
             }

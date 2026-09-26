@@ -29,7 +29,9 @@ pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 use crate::delphi_overrides::{
     EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
 };
-use crate::installations::{InstallationEvidence, select_installation};
+use crate::installations::{
+    IdePaths, InstallationEvidence, evaluate_ide_paths, load_installation, select_installation,
+};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use serde::Deserialize;
@@ -784,6 +786,10 @@ pub struct ProjectContext {
     /// The same search paths tagged with their source provenance. This keeps
     /// legacy native roots distinct from configured and mapped roots.
     pub search_path_entries: Vec<ProjectPathEntry>,
+    /// Source-navigation-only fallbacks from the selected IDE installation.
+    pub browsing_path_entries: Vec<ProjectPathEntry>,
+    /// Selected IDE debug DCU locations, kept out of source lookup.
+    pub debug_dcu_path_entries: Vec<ProjectPathEntry>,
     /// MainSource and explicit references retain the provenance of the path
     /// expression that produced them so membership cannot bypass mapped-root
     /// safety checks.
@@ -851,10 +857,33 @@ impl ProjectContext {
         if let Some(path) = &self.main_source {
             visit(path.as_os_str().len())?;
         }
+        if let Some(version) = &self.installation_evidence.project_version {
+            visit(version.len())?;
+        }
+        if let Some(root) = &self.installation_evidence.bds_root {
+            visit(root.len())?;
+        }
+        match &self.installation_selection {
+            Some(InstallationSelection::Selected { id, .. })
+            | Some(InstallationSelection::Invalid { id }) => visit(id.len())?,
+            Some(InstallationSelection::NeedsChoice { candidates }) => {
+                for id in candidates {
+                    visit(id.len())?;
+                }
+            }
+            Some(InstallationSelection::Legacy) | None => {}
+        }
         for path in &self.search_paths {
             visit(path.as_os_str().len())?;
         }
         for entry in &self.search_path_entries {
+            entry.visit_recovery_payload(visit)?;
+        }
+        for entry in self
+            .browsing_path_entries
+            .iter()
+            .chain(&self.debug_dcu_path_entries)
+        {
             entry.visit_recovery_payload(visit)?;
         }
         if let Some(entry) = &self.main_source_entry {
@@ -1168,6 +1197,8 @@ impl ProjectContext {
 
         self.search_path_entries
             .iter()
+            .chain(&self.browsing_path_entries)
+            .chain(&self.debug_dcu_path_entries)
             .filter(|entry| project_path_starts_with(&path, &lexical_normalize(&entry.path)))
             .max_by_key(|entry| entry.path.components().count())
             .map(|entry| ProjectPathEntry {
@@ -3715,7 +3746,7 @@ fn build_project_context(
     roots: &[PathBuf],
     options: &ProjectOptions,
     installation_config: crate::installation_config::ProjectConfiguration,
-    overrides: EffectiveOverrides,
+    mut overrides: EffectiveOverrides,
     warnings: Vec<String>,
     explicit: bool,
     consulted_metadata_files: Vec<PathBuf>,
@@ -3728,7 +3759,7 @@ fn build_project_context(
     let project_dir = project_file
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
+    let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
     let caller_compiler_version = options.conditional_context.compiler_version;
     let mut installation_evidence = InstallationEvidence::default();
@@ -3788,6 +3819,77 @@ fn build_project_context(
             .find(|(path, _)| project_paths_equal(path, &project_file))
             .map(|(_, id)| id.as_str()),
     ));
+    let mut installation_environment = None;
+    let mut ide_paths = IdePaths::default();
+    let mut installation_warnings = Vec::new();
+    if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
+        match installation_config.profile(id) {
+            Ok(profile) => {
+                overrides = profile.overrides.clone();
+                let installation_roots = ["bds", "appdata"]
+                    .into_iter()
+                    .filter_map(|name| overrides.properties.get(name))
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                read_policy = ReadPolicy::new_with_installation_roots(
+                    roots,
+                    &options.source_paths,
+                    exclusions,
+                    &overrides,
+                    &installation_roots,
+                );
+                match load_installation(
+                    &profile,
+                    evaluation_options
+                        .build_config
+                        .as_deref()
+                        .unwrap_or("Debug"),
+                    evaluation_options.platform.as_deref().unwrap_or(""),
+                    tracker,
+                    &read_policy,
+                ) {
+                    Ok(environment) => {
+                        if let (Some(config), Some(platform)) = (
+                            evaluation_options.build_config.as_deref(),
+                            evaluation_options.platform.as_deref(),
+                        ) {
+                            match evaluate_ide_paths(
+                                &environment,
+                                &profile,
+                                config,
+                                platform,
+                                tracker,
+                                &read_policy,
+                            ) {
+                                Ok(paths) => ide_paths = paths,
+                                Err(error) => installation_warnings.push(error),
+                            }
+                        } else {
+                            // IDE paths are platform-conditioned; never union unknown platforms.
+                        }
+                        installation_environment = Some(environment);
+                    }
+                    Err(error) => {
+                        installation_warnings.push(error);
+                    }
+                }
+                if evaluation_options
+                    .conditional_context
+                    .compiler_version
+                    .is_none()
+                {
+                    if let Some(version) =
+                        crate::installations::compiler_version_for_installation(id)
+                    {
+                        evaluation_options.conditional_context.compiler_version = Some(version);
+                    }
+                }
+            }
+            Err(error) => {
+                installation_warnings.push(error);
+            }
+        }
+    }
     let mut builder = ProjectBuilder::new(
         &evaluation_options,
         &overrides,
@@ -3795,6 +3897,18 @@ fn build_project_context(
         project_dir.clone(),
         read_policy.clone(),
     );
+    if let Some(environment) = &installation_environment {
+        builder.seed_installation_properties(&environment.properties);
+        builder.warnings.extend(environment.warnings.clone());
+        builder
+            .metadata_files
+            .extend(environment.metadata_files.clone());
+        builder
+            .metadata_observations
+            .extend(environment.metadata_observations.clone());
+        builder.path_issues.extend(environment.path_issues.clone());
+    }
+    builder.warnings.extend(installation_warnings);
     let project_is_dproj = extension_is(&project_file, "dproj");
     if project_is_dproj {
         builder.process_root_dproj(&project_file, tracker)?;
@@ -3882,6 +3996,9 @@ fn build_project_context(
             "configured source path",
             ProjectPathProvenance::Configured,
         );
+    }
+    for entry in &ide_paths.library {
+        add_unique_project_path_entry(&mut search_path_entries, entry.clone());
     }
     let search_paths = paths_from_entries(&search_path_entries);
 
@@ -4065,12 +4182,17 @@ fn build_project_context(
         main_source,
         search_paths,
         search_path_entries,
+        browsing_path_entries: ide_paths.browsing,
+        debug_dcu_path_entries: ide_paths.debug_dcu,
         main_source_entry,
         explicit_unit_entries,
         include_paths,
         include_path_entries,
         explicit_units,
-        unit_namespaces: property_list(&builder, "dcc_namespace"),
+        unit_namespaces: property_list(&builder, "dcc_namespace")
+            .into_iter()
+            .chain(ide_paths.namespaces)
+            .collect(),
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
         defines,
         conditional_context,
@@ -4151,6 +4273,8 @@ fn build_standalone_context(
         main_source: None,
         search_paths,
         search_path_entries,
+        browsing_path_entries: Vec::new(),
+        debug_dcu_path_entries: Vec::new(),
         main_source_entry: None,
         explicit_unit_entries: HashMap::new(),
         include_paths: Vec::new(),

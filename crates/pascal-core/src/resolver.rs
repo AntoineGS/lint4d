@@ -1131,6 +1131,23 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
 
+        // Browsing paths are a positive source-navigation fallback only. They
+        // follow every project/client and selected-installation library path,
+        // and missing explicit bindings were reserved above.
+        for entry in self.context.browsing_path_entries.clone() {
+            if let Some(result) = self.resolve_directory(
+                &entry.path,
+                &lookup,
+                &self.context.unit_namespaces.clone(),
+                request.legacy_route,
+                cancel,
+                Some(&entry),
+                requested,
+            )? {
+                return Ok(result);
+            }
+        }
+
         if self.context.project_file.is_none() {
             let catalogue_groups = self.filename_catalogue_candidates(&lookup, cancel)?;
             for group in catalogue_groups {

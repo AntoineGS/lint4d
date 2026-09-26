@@ -4,9 +4,131 @@ use pascal_core::resolver::{
     SourceRevision, SourceStore, SourceStoreError, UnitResolveRequest, UnitResolver,
 };
 use pascal_project::{
-    ProjectContext, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
-    ProjectPathProvenance, ReadPolicy, content_hash_bytes,
+    ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
+    ProjectPathProvenance, ReadPolicy, content_hash_bytes, delphi_overrides::OverrideSession,
 };
+
+#[test]
+fn selected_installation_paths_resolve_after_project_paths_and_browsing_is_fallback() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let sdk = root.join("sdk");
+    let ide = root.join("ide");
+    let app = root.join("App.dproj");
+    let write = |path: &Path, text: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(&sdk.join("bin/rsvars.bat"), "@SET BDS=C:\\Original\\37.0\n");
+    write(
+        &ide.join("EnvOptions.proj"),
+        "<Project><PropertyGroup Condition=\"'$(Platform)'=='Linux64'\"><DelphiLibraryPath>$(BDS)\\lib</DelphiLibraryPath><DelphiBrowsingPath>$(BDS)\\source</DelphiBrowsingPath><DelphiDebugDCUPath>$(BDS)\\debug</DelphiDebugDCUPath></PropertyGroup></Project>",
+    );
+    write(
+        &app,
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><Config>Debug</Config><Platform>Linux64</Platform></PropertyGroup><ItemGroup><DCCReference Include=\"Reserved.pas\" /></ItemGroup></Project>",
+    );
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &root.join("Shared.pas"),
+        "unit Shared; interface const Winner = 1; implementation end.",
+    );
+    write(
+        &sdk.join("lib/Shared.pas"),
+        "unit Shared; interface const Winner = 2; implementation end.",
+    );
+    write(
+        &sdk.join("lib/SdkOnly.pas"),
+        "unit SdkOnly; interface implementation end.",
+    );
+    write(
+        &sdk.join("source/BrowseOnly.pas"),
+        "unit BrowseOnly; interface implementation end.",
+    );
+    write(
+        &sdk.join("source/Reserved.pas"),
+        "unit Reserved; interface implementation end.",
+    );
+    fs::create_dir_all(sdk.join("debug")).unwrap();
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS = '{}'\nAPPDATA = '{}'\n[projects.\"App.dproj\"]\ninstallation = '37.0'\n",
+            sdk.display(),
+            ide.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(matches!(
+        &context.installation_selection,
+        Some(pascal_project::InstallationSelection::Selected { id, .. }) if id == "37.0"
+    ));
+    assert!(
+        context
+            .search_path_entries
+            .iter()
+            .any(|entry| entry.path == sdk.join("lib"))
+    );
+    assert!(
+        context
+            .browsing_path_entries
+            .iter()
+            .any(|entry| entry.path == sdk.join("source"))
+    );
+    assert!(
+        context
+            .debug_dcu_path_entries
+            .iter()
+            .any(|entry| entry.path == sdk.join("debug"))
+    );
+    let store = FilesystemSourceStore::new();
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![root.to_path_buf()],
+        store,
+        ResolverLimits::default(),
+    );
+    let resolve = |resolver: &mut UnitResolver<FilesystemSourceStore>, name| {
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: name,
+                importer_path: &root.join("App.dpr"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        )
+    };
+
+    let shared = resolve(&mut resolver, "Shared");
+    let Resolution::Found(shared) = shared.result else {
+        panic!(
+            "project provider should resolve before SDK provider: {:?}",
+            shared.result
+        );
+    };
+    assert_eq!(shared.source.path, root.join("Shared.pas"));
+    assert!(matches!(
+        resolve(&mut resolver, "SdkOnly").result,
+        Resolution::Found(_)
+    ));
+    assert!(matches!(
+        resolve(&mut resolver, "BrowseOnly").result,
+        Resolution::Found(_)
+    ));
+    assert!(matches!(
+        resolve(&mut resolver, "Reserved").result,
+        Resolution::Incomplete { .. }
+    ));
+}
 
 #[test]
 fn missing_explicit_reference_reserves_name_without_blocking_other_units() {

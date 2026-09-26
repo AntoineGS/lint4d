@@ -14,11 +14,13 @@
 pub mod conditional;
 pub mod configuration;
 pub mod delphi_overrides;
+pub mod path_issues;
 
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
 };
 pub use configuration::{ConfigRead, config_directories, read_config};
+pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
     EffectiveOverrides, OverrideSession, PathMapping, ResolvedPath, user_config_path,
@@ -746,6 +748,8 @@ pub struct ProjectContext {
     /// Whether project selection and the metadata needed for binding completed
     /// without an ambiguity or an unresolved project-selection fallback.
     pub discovery_complete: bool,
+    pub binding_metadata_complete: bool,
+    pub path_issues: Vec<ProjectPathIssue>,
     pub project_file: Option<PathBuf>,
     pub main_source: Option<PathBuf>,
     /// Ordered project and caller-provided unit search paths.
@@ -794,6 +798,20 @@ pub struct ProjectContext {
 }
 
 impl ProjectContext {
+    pub fn can_resolve_units(&self) -> bool {
+        self.discovery_complete || self.binding_metadata_complete
+    }
+
+    pub fn missing_explicit_unit(&self, canonical_name: &str) -> Option<&ProjectPathIssue> {
+        self.path_issues.iter().find(|issue| {
+            issue.kind == ProjectPathIssueKind::MissingReference
+                && issue
+                    .unit_name
+                    .as_deref()
+                    .is_some_and(|unit| unit.eq_ignore_ascii_case(canonical_name))
+        })
+    }
+
     /// Visit each retained child and byte-bearing value that recovery would
     /// release. Callers provide bounded/cancellable admission at every visit.
     pub fn visit_recovery_payload(
@@ -860,6 +878,20 @@ impl ProjectContext {
         }
         for observation in &self.metadata_observations {
             observation.visit_recovery_payload(visit)?;
+        }
+        for issue in &self.path_issues {
+            visit(issue.source_file.as_os_str().len())?;
+            visit(issue.property.len())?;
+            visit(issue.raw.len())?;
+            if let Some(path) = &issue.path {
+                visit(path.as_os_str().len())?;
+            }
+            if let Some(unit_name) = &issue.unit_name {
+                visit(unit_name.len())?;
+            }
+            if let ProjectPathProvenance::Mapped { root } = &issue.provenance {
+                visit(root.as_os_str().len())?;
+            }
         }
         for warning in &self.warnings {
             visit(warning.len())?;
@@ -3797,19 +3829,66 @@ fn build_project_context(
         if is_compiled_reference(&expanded.value) {
             continue;
         }
-        let Some(entry) = resolve_project_path_entry(
+        let provenance = expanded_path_provenance(&expanded, &reference.source_provenance);
+        let Some(resolved) = project_path_candidate(
             &expanded.value,
             &builder.project_dir,
             &builder.overrides,
             &mut builder.warnings,
             "DCCReference",
-            true,
-            expanded.explicit_dependency,
         ) else {
             continue;
         };
-        let provenance = expanded_path_provenance(&expanded, &reference.source_provenance);
-        let entry = inherit_path_provenance(entry, &provenance);
+        let candidate = lexical_normalize(&resolved.path);
+        let entry = match resolve_existing_path_status_with_provenance(
+            &candidate,
+            &resolved,
+            &expanded.value,
+            &mut builder.warnings,
+            "DCCReference",
+        ) {
+            ExistingPathStatus::Found(path) => inherit_path_provenance(
+                ProjectPathEntry::resolved(path, &resolved, expanded.explicit_dependency),
+                &provenance,
+            ),
+            ExistingPathStatus::Missing => {
+                builder.warnings.push(missing_path_warning(
+                    "DCCReference",
+                    &expanded.value,
+                    &candidate,
+                    &resolved,
+                ));
+                let unit_name = candidate
+                    .file_stem()
+                    .map(|stem| canonical_unit_name(&stem.to_string_lossy()))
+                    .filter(|name| !name.is_empty());
+                builder.path_issues.push(ProjectPathIssue {
+                    kind: ProjectPathIssueKind::MissingReference,
+                    source_file: reference.source_file.clone(),
+                    property: "DCCReference".to_string(),
+                    raw: reference.include.clone(),
+                    path: Some(candidate.clone()),
+                    unit_name,
+                    provenance: inherit_path_provenance(
+                        ProjectPathEntry::resolved(
+                            candidate.clone(),
+                            &resolved,
+                            expanded.explicit_dependency,
+                        ),
+                        &provenance,
+                    )
+                    .provenance,
+                });
+                add_metadata_observation(
+                    &mut builder.metadata_observations,
+                    MetadataObservation::Stat {
+                        path: candidate.clone(),
+                    },
+                );
+                continue;
+            }
+            ExistingPathStatus::Unresolvable => continue,
+        };
         let Some(stem) = entry.path.file_stem() else {
             continue;
         };
@@ -3867,6 +3946,9 @@ fn build_project_context(
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
             && !project_context_warnings_incomplete(&builder.warnings, explicit),
+        binding_metadata_complete: !builder.incomplete
+            && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
+        path_issues: builder.path_issues.clone(),
         project_file: Some(project_file),
         main_source,
         search_paths,
@@ -3949,6 +4031,8 @@ fn build_standalone_context(
 
     Ok(ProjectContext {
         discovery_complete,
+        binding_metadata_complete: discovery_complete,
+        path_issues: Vec::new(),
         project_file: None,
         main_source: None,
         search_paths,
@@ -3998,6 +4082,37 @@ fn project_context_warnings_incomplete(warnings: &[String], explicit: bool) -> b
             || warning.contains("optset import path does not exist")
             || warning.contains("workspace root could not be resolved")
     })
+}
+
+fn binding_metadata_warnings_incomplete(warnings: &[String], explicit: bool) -> bool {
+    warnings.iter().any(|warning| {
+        let warning = warning.to_ascii_lowercase();
+        !(warning.starts_with("dccreference path does not exist and was omitted:"))
+            && warning_incomplete(&warning, explicit)
+    })
+}
+
+fn warning_incomplete(warning: &str, explicit: bool) -> bool {
+    (!explicit && warning.contains("no resolvable"))
+        || warning.contains("unresolved property")
+        || warning.contains("path does not exist and was omitted")
+        || warning.contains("could not read optset")
+        || warning.contains("could not read main source")
+        || warning.contains("metadata file limit")
+        || warning.contains("property expansion exceeds")
+        || warning.contains("could not inspect project")
+        || warning.contains("could not inspect")
+        || warning.contains("invalid xml")
+        || warning.contains("windows path")
+        || warning.contains("unavailable property path")
+        || warning.contains("unknown project condition")
+        || warning.contains("unsupported project condition")
+        || warning.contains("ambiguous case-insensitive")
+        || warning.contains("multiple main sources")
+        || warning.contains("property memory budget exceeded")
+        || warning.contains("optset import limit")
+        || warning.contains("optset import path does not exist")
+        || warning.contains("workspace root could not be resolved")
 }
 
 fn selected_config(builder: &ProjectBuilder, options: &ProjectOptions) -> Option<String> {
@@ -4748,10 +4863,30 @@ fn resolve_existing_path_status(
         };
         let wanted = component.to_string_lossy();
         let mut matches = Vec::new();
-        let Ok(entries) = fs::read_dir(&current) else {
-            return ExistingPathStatus::Missing;
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return ExistingPathStatus::Missing;
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "could not inspect {kind} path under {}: {error}",
+                    current.display()
+                ));
+                return ExistingPathStatus::Unresolvable;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(format!(
+                        "could not inspect {kind} path under {}: {error}",
+                        current.display()
+                    ));
+                    return ExistingPathStatus::Unresolvable;
+                }
+            };
             let name = entry.file_name();
             if name.to_string_lossy().eq_ignore_ascii_case(&wanted) {
                 matches.push(entry.path());
@@ -5407,6 +5542,7 @@ struct ProjectBuilder {
     unknown_properties: HashSet<String>,
     unknown_import_taint: bool,
     references: Vec<DccReference>,
+    path_issues: Vec<ProjectPathIssue>,
     warnings: Vec<String>,
     incomplete: bool,
     active_imports: HashSet<PathBuf>,
@@ -5526,6 +5662,7 @@ impl ProjectBuilder {
             unknown_properties: HashSet::new(),
             unknown_import_taint: false,
             references: Vec::new(),
+            path_issues: Vec::new(),
             warnings,
             incomplete,
             active_imports: HashSet::new(),

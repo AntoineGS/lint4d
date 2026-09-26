@@ -13961,6 +13961,55 @@ fn project_navigation_does_not_probe_unrelated_explicit_references() {
 }
 
 #[test]
+fn project_navigation_resolves_independent_unit_when_reference_is_missing() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    let main = root.join("Main.pas");
+    let provider = root.join("Provider.pas");
+    let main_source = "unit Main;\ninterface\nuses Provider, Missing;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\n  MissingRoutine;\nend;\nend.\n";
+    let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+    let fallback = root.join("later/Missing.pas");
+    fs::create_dir_all(&root).expect("create workspace");
+    fs::write(&main, main_source).expect("write main");
+    fs::write(&provider, provider_source).expect("write provider");
+    fs::create_dir_all(fallback.parent().expect("fallback directory"))
+        .expect("create fallback directory");
+    fs::write(
+        &fallback,
+        "unit Missing; interface procedure MissingRoutine; implementation procedure MissingRoutine; begin end; end.",
+    )
+    .expect("write fallback unit");
+    fs::write(root.join("App.dpr"), "program App; begin end.\n").expect("write DPR");
+    fs::write(
+        root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>later</DCC_UnitSearchPath></PropertyGroup><ItemGroup><DCCReference Include=\"Missing.pas\" /></ItemGroup></Project>",
+    )
+    .expect("write project");
+
+    let main_uri = Url::from_file_path(&main).expect("main URI");
+    let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+    let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
+    let locations = workspace.navigate(
+        &main_uri,
+        position_of(main_source, "ProviderRoutine", 0),
+        NavigationTarget::Declaration,
+    );
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, provider_uri);
+    assert!(
+        workspace
+            .navigate(
+                &main_uri,
+                position_of(main_source, "MissingRoutine", 0),
+                NavigationTarget::Declaration,
+            )
+            .is_empty(),
+        "the explicit missing unit must not bind to later/Missing.pas"
+    );
+}
+
+#[test]
 fn local_navigation_does_not_revalidate_unrelated_disk_cache() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("workspace");

@@ -37,6 +37,75 @@ fn public_api_discovers_a_standalone_pascal_source() {
 }
 
 #[test]
+fn missing_reference_keeps_independent_metadata_usable() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &root.join("Good.pas"),
+        "unit Good; interface implementation end.",
+    );
+    write(
+        &root.join("App.dproj"),
+        r#"<Project><PropertyGroup>
+      <MainSource>App.dpr</MainSource></PropertyGroup><ItemGroup>
+      <DCCReference Include="Missing.pas"/><DCCReference Include="Good.pas"/>
+      </ItemGroup></Project>"#,
+    );
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(context.can_resolve_units());
+    assert!(!context.discovery_complete);
+    assert!(context.missing_explicit_unit("missing").is_some());
+    assert!(context.explicit_units.contains_key("good"));
+    assert!(context.metadata_observations.iter().any(|observation| {
+        matches!(observation, MetadataObservation::Stat { path } if path.ends_with("Missing.pas"))
+    }));
+
+    write(
+        &root.join("Missing.pas"),
+        "unit Missing; interface implementation end.",
+    );
+    let refreshed = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+    assert!(refreshed.explicit_units.contains_key("missing"));
+    assert!(refreshed.missing_explicit_unit("missing").is_none());
+}
+
+#[test]
+fn inaccessible_reference_parent_is_not_a_proven_missing_unit() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(&root.join("Blocked"), "not a directory");
+    write(
+        &root.join("App.dproj"),
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+           <ItemGroup><DCCReference Include="Blocked/Missing.pas"/></ItemGroup></Project>"#,
+    );
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+
+    assert!(context.path_issues.is_empty());
+    assert!(!context.can_resolve_units());
+}
+
+#[test]
 fn public_api_finds_configuration_directories_from_a_workspace_root() {
     let directory = tempdir().expect("temporary directory");
     let source_directory = directory.path().join("src");

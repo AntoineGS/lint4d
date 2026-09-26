@@ -1035,7 +1035,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 "unit name is empty".to_string(),
             ));
         }
-        if !self.context.discovery_complete {
+        if !self.context.can_resolve_units() {
             self.mark_incomplete("project metadata is incomplete".to_string());
             return Ok(Resolution::Incomplete {
                 reason: "project metadata is incomplete".to_string(),
@@ -1043,6 +1043,16 @@ impl<S: SourceStore> UnitResolver<S> {
             });
         }
         let lookup = aliased_name(&self.context, requested);
+        if let Some(issue) = self.context.missing_explicit_unit(&lookup) {
+            let reason = issue.path.as_ref().map_or_else(
+                || format!("explicit unit {lookup} is missing"),
+                |path| format!("explicit unit {lookup} is missing: {}", path.display()),
+            );
+            return Ok(Resolution::Incomplete {
+                reason,
+                candidates: Vec::new(),
+            });
+        }
         if let Some(entries) = self
             .context
             .explicit_unit_entries

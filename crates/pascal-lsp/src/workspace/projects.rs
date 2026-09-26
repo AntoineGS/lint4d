@@ -24,6 +24,11 @@ pub struct ProjectContextInfo {
     pub(crate) selected_project_uri: Option<Url>,
     pub(crate) selection_mode: String,
     pub(crate) selected_installation_id: Option<String>,
+    pub(crate) installation_selection_mode: String,
+    pub(crate) installation_candidates: Vec<String>,
+    pub(crate) main_source_uri: Option<Url>,
+    pub(crate) installation_config_uris: Vec<Url>,
+    pub(crate) path_issues: Vec<serde_json::Value>,
     pub(crate) lint_config_uri: Option<Url>,
     pub(crate) fmt_config_uri: Option<Url>,
     pub(crate) warnings: Vec<String>,
@@ -122,6 +127,37 @@ impl Workspace {
             "standalone"
         };
 
+        let (installation_candidates, installation_selection_mode) =
+            if let Some(project_file) = context.project_file.as_deref() {
+                self.installation_selection_snapshot(project_file)
+                    .map(|(_, candidates, _)| {
+                        let mode = if self.installation_selections.contains_key(project_file) {
+                            "session"
+                        } else {
+                            "configured"
+                        };
+                        (candidates, mode.to_string())
+                    })
+                    .unwrap_or_else(|_| (Vec::new(), "automatic".to_string()))
+            } else {
+                (Vec::new(), "automatic".to_string())
+            };
+        let path_issues = context
+            .path_issues
+            .iter()
+            .map(|issue| {
+                serde_json::json!({
+                    "kind": format!("{:?}", issue.kind),
+                    "sourceUri": file_uri(&issue.source_file),
+                    "property": issue.property,
+                    "raw": issue.raw,
+                    "path": issue.path.as_deref().and_then(file_uri),
+                    "unitName": issue.unit_name,
+                    "provenance": format!("{:?}", issue.provenance),
+                })
+            })
+            .collect();
+
         Ok(ProjectContextInfo {
             scope_uri: scope.as_deref().and_then(file_uri),
             candidates: candidates
@@ -144,6 +180,11 @@ impl Workspace {
                     _ => None,
                 },
             ),
+            installation_selection_mode,
+            installation_candidates,
+            main_source_uri: context.main_source.as_deref().and_then(file_uri),
+            installation_config_uris: Vec::new(),
+            path_issues,
             lint_config_uri,
             fmt_config_uri,
             warnings,
@@ -155,6 +196,7 @@ impl Workspace {
         project_uri: &Url,
     ) -> Result<InstallationContextInfo, String> {
         let project_path = project_path(project_uri)?;
+        self.validate_project_scope(&project_path)?;
         let (project, candidates, selected) =
             self.installation_selection_snapshot(&project_path)?;
         let selection_is_valid = selected.as_ref().is_none_or(|id| {
@@ -193,6 +235,7 @@ impl Workspace {
         installation_id: Option<&str>,
     ) -> Result<InstallationContextInfo, String> {
         let project_path = project_path(project_uri)?;
+        self.validate_project_scope(&project_path)?;
         let (config, candidates, _) = self.installation_selection_snapshot(&project_path)?;
         if let Some(id) = installation_id {
             config.profile(id)?;
@@ -268,7 +311,8 @@ impl Workspace {
                 .map(PathBuf::as_path),
             Some(project_path),
         )?;
-        let candidates = configuration.installation_ids();
+        let mut candidates = configuration.installation_ids();
+        candidates.sort_by_key(|id| id.to_ascii_lowercase());
         let selected = self
             .installation_selections
             .get(project_path)
@@ -291,6 +335,21 @@ impl Workspace {
                 })
             });
         Ok((configuration, candidates, selected))
+    }
+
+    fn validate_project_scope(&self, project_path: &Path) -> Result<(), String> {
+        let roots = self.workspace_root_paths();
+        if roots
+            .iter()
+            .any(|root| crate::workspace::path_starts_with_native(project_path, root))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "project is outside the configured workspace scope: {}",
+                project_path.display()
+            ))
+        }
     }
 
     pub fn select_project(

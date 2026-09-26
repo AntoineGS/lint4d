@@ -58913,3 +58913,6 @@ fn runtime_configuration_processes_did_change_after_a_decreased_file_limit() {
     );
     server.shutdown();
 }
+
+#[path = "protocol/workspace_selection.rs"]
+mod workspace_selection;

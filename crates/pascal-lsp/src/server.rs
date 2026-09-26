@@ -1980,6 +1980,19 @@ struct SelectProjectRequestParams {
     project_uri: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationContextRequestParams {
+    project_uri: Url,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectInstallationRequestParams {
+    project_uri: Url,
+    installation_id: Option<String>,
+}
+
 #[derive(Debug)]
 enum AnalysisRequest {
     CompiledContent {
@@ -10324,6 +10337,8 @@ fn request_requires_configuration(method: &str) -> bool {
             | "textDocument/diagnostic"
             | "pascal/projectContext"
             | "pascal/selectProject"
+            | "pascal/installationContext"
+            | "pascal/selectInstallation"
             | "textDocument/hover"
             | "textDocument/completion"
             | "completionItem/resolve"
@@ -10809,6 +10824,45 @@ fn handle_request(
                 }
             };
             match workspace.project_context(&params.text_document.uri) {
+                Ok(context) => send_ok(connection, id, context)?,
+                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
+            }
+        }
+        "pascal/installationContext" => {
+            let id = request.id.clone();
+            let params: InstallationContextRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            match workspace.installation_context(&params.project_uri) {
+                Ok(context) => send_ok(connection, id, context)?,
+                Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
+            }
+        }
+        "pascal/selectInstallation" => {
+            let id = request.id.clone();
+            if request.params.get("installationId").is_none() {
+                send_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams,
+                    "installationId is required; use null to reset the session selection",
+                )?;
+                return Ok(());
+            }
+            let params: SelectInstallationRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            match workspace
+                .select_installation(&params.project_uri, params.installation_id.as_deref())
+            {
                 Ok(context) => send_ok(connection, id, context)?,
                 Err(error) => send_error(connection, id, ErrorCode::RequestFailed, error)?,
             }
@@ -12891,6 +12945,7 @@ fn server_capabilities(
         },
         "experimental": {
             "projectSelection": true,
+            "installationSelection": true,
             "compiledDcuVirtualDocuments": {
                 "uriScheme": "lint4d-dcu",
                 "contentMethod": "textDocument/content",

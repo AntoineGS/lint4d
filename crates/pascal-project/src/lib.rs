@@ -15,6 +15,8 @@ pub mod conditional;
 pub mod configuration;
 pub mod delphi_overrides;
 pub mod installation_config;
+#[allow(dead_code)]
+pub(crate) mod installations;
 pub mod path_issues;
 
 pub use conditional::{

@@ -1269,6 +1269,8 @@ pub(crate) struct ReconciliationBudget {
     #[cfg(test)]
     cancel_after_path_visits: Cell<Option<usize>>,
     #[cfg(test)]
+    path_visit_limit: Cell<Option<usize>>,
+    #[cfg(test)]
     cancel_after_project_path_key_bytes: Cell<Option<usize>>,
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
@@ -1290,6 +1292,8 @@ impl ReconciliationBudget {
             exhausted: Cell::new(false),
             #[cfg(test)]
             cancel_after_path_visits: Cell::new(None),
+            #[cfg(test)]
+            path_visit_limit: Cell::new(None),
             #[cfg(test)]
             cancel_after_project_path_key_bytes: Cell::new(None),
             deleted_uris: RefCell::new(HashSet::new()),
@@ -1329,10 +1333,17 @@ impl ReconciliationBudget {
     }
 
     pub(crate) fn charge_path_visits(&self, amount: usize) -> Result<(), String> {
+        #[cfg(test)]
+        let limit = self
+            .path_visit_limit
+            .get()
+            .unwrap_or(MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS);
+        #[cfg(not(test))]
+        let limit = MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS;
         self.charge(
             self.used.get().filesystem_path_visits,
             amount,
-            MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS,
+            limit,
             |used, next| used.filesystem_path_visits = next,
         )?;
         #[cfg(test)]
@@ -1362,6 +1373,11 @@ impl ReconciliationBudget {
     #[cfg(test)]
     fn cancel_after_path_visits(&self, threshold: usize) {
         self.cancel_after_path_visits.set(Some(threshold));
+    }
+
+    #[cfg(test)]
+    fn set_path_visit_limit(&self, limit: usize) {
+        self.path_visit_limit.set(Some(limit));
     }
 
     fn charge_project_path_key_bytes(&self, amount: usize) -> Result<(), String> {
@@ -9684,6 +9700,20 @@ impl Workspace {
         diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         check_workspace_cancel(cancel)?;
 
+        self.source_change_generations
+            .try_reserve(context_sources.len().saturating_add(affected.len()))
+            .map_err(|error| {
+                format!("could not reserve invalidated source generations: {error}")
+            })?;
+        self.configuration_change_generations
+            .try_reserve(context_metadata.len().saturating_add(affected.len()))
+            .map_err(|error| {
+                format!("could not reserve invalidated configuration generations: {error}")
+            })?;
+        self.pending_diagnostics
+            .try_reserve(diagnostic_uris.len())
+            .map_err(|error| format!("could not reserve invalidated diagnostics: {error}"))?;
+
         for key in retained_keys {
             self.contexts.remove(&key);
         }
@@ -9761,6 +9791,10 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
+        // Coordinator-side selection commits may only mutate after every
+        // bounded traversal, cancellation check, and allocation reservation
+        // has succeeded. The apply phase below intentionally has no `Result`
+        // path and does not consult cancellation.
         let mut diagnostic_uris = Vec::new();
         diagnostic_uris
             .try_reserve(uris.len())
@@ -9770,12 +9804,109 @@ impl Workspace {
             if let Some(budget) = budget {
                 budget.charge_path_visits(1)?;
             }
+            if let Some(expansion) = self.expansions.get(uri) {
+                for _ in &expansion.dependencies {
+                    check_workspace_cancel(cancel)?;
+                    if let Some(budget) = budget {
+                        budget.charge_path_visits(1)?;
+                    }
+                }
+            }
+            if self
+                .open_documents
+                .get(uri)
+                .is_some_and(|document| document.text.is_some())
+            {
+                diagnostic_uris.push(uri.clone());
+            }
+        }
+
+        let mut used_contexts = HashSet::new();
+        used_contexts
+            .try_reserve(
+                self.document_contexts
+                    .len()
+                    .saturating_add(self.open_document_contexts.len()),
+            )
+            .map_err(|error| format!("could not reserve project-switch context owners: {error}"))?;
+        for (uri, key) in &self.document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !uris.contains(uri) {
+                used_contexts.insert(key.clone());
+            }
+        }
+        for (uri, key) in &self.open_document_contexts {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !uris.contains(uri) {
+                used_contexts.insert(key.clone());
+            }
+        }
+        let mut pruned_contexts = Vec::new();
+        pruned_contexts
+            .try_reserve(self.contexts.len())
+            .map_err(|error| {
+                format!("could not reserve project-switch context cleanup: {error}")
+            })?;
+        for key in self.contexts.keys() {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            if !used_contexts.contains(key) {
+                pruned_contexts.push(key.clone());
+            }
+        }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(sort_work_estimate(diagnostic_uris.len()))?;
+            budget.check_cancelled()?;
+        }
+        diagnostic_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        self.source_change_generations
+            .try_reserve(uris.len())
+            .map_err(|error| {
+                format!("could not reserve project-switch source generations: {error}")
+            })?;
+        self.configuration_change_generations
+            .try_reserve(uris.len())
+            .map_err(|error| {
+                format!("could not reserve project-switch configuration generations: {error}")
+            })?;
+        self.pending_diagnostics
+            .try_reserve(diagnostic_uris.len())
+            .map_err(|error| format!("could not reserve project-switch diagnostics: {error}"))?;
+
+        for uri in uris {
             if let Some(owner) = self.document_owners.get_mut(uri) {
                 owner.legacy_route = None;
                 owner.needs_revalidation = true;
             }
             self.open_document_contexts.remove(uri);
-            self.remove_indexed_with_control(uri, cancel, budget, false)?;
+            if let Some(expansion) = self.expansions.remove(uri) {
+                for dependency in expansion.dependencies {
+                    if let Some(parents) = self.include_parents.get_mut(&dependency) {
+                        parents.remove(uri);
+                        if parents.is_empty() {
+                            self.include_parents.remove(&dependency);
+                        }
+                    }
+                }
+            }
+            self.index.remove(uri);
+            self.indexed_files.remove(uri);
+            self.last_used.remove(uri);
+            self.document_contexts.remove(uri);
+            self.index.clear_import_bindings(uri);
+            self.disk_stamps.remove(uri);
+            if let Some(size) = self.indexed_sizes.remove(uri) {
+                self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
+            }
             mark_dependency_change(
                 &mut self.source_change_generations,
                 uri,
@@ -9788,17 +9919,11 @@ impl Workspace {
                 self.configuration_generation,
                 false,
             );
-            if self
-                .open_documents
-                .get(uri)
-                .is_some_and(|document| document.text.is_some())
-            {
-                diagnostic_uris.push(uri.clone());
-            }
         }
-        self.prune_unused_contexts_with_control(cancel, budget)?;
+        for key in pruned_contexts {
+            self.contexts.remove(&key);
+        }
         for uri in diagnostic_uris {
-            check_workspace_cancel(cancel)?;
             self.schedule_diagnostics(uri);
         }
         Ok(())
@@ -15616,6 +15741,74 @@ BDS = '/fake/37'
         assert_eq!(workspace.indexed_files, indexed_files_before);
         assert_eq!(workspace.source_generation, source_generation);
         assert_eq!(workspace.configuration_generation, configuration_generation);
+    }
+
+    #[test]
+    fn project_selection_preflight_budget_failure_preserves_all_retained_state() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let first = root.join("First.pas");
+        let second = root.join("Second.pas");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>First.pas</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        for source in [&first, &second] {
+            fs::write(source, "unit Source; interface implementation end.").unwrap();
+        }
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let first_uri = Url::from_file_path(&first).unwrap();
+        let second_uri = Url::from_file_path(&second).unwrap();
+        for uri in [&first_uri, &second_uri] {
+            workspace
+                .open_document(
+                    uri.clone(),
+                    fs::read_to_string(uri.to_file_path().unwrap()).unwrap(),
+                    1,
+                )
+                .unwrap();
+            workspace.project_context(uri).unwrap();
+        }
+        let uris = HashSet::from([first_uri, second_uri]);
+        let before = (
+            format!("{:?}", workspace.contexts),
+            format!("{:?}", workspace.document_contexts),
+            format!("{:?}", workspace.open_document_contexts),
+            format!("{:?}", workspace.document_owners),
+            workspace.index.document_count(),
+            format!("{:?}", workspace.indexed_files),
+            format!("{:?}", workspace.pending_diagnostics),
+            workspace.source_change_generations.clone(),
+            workspace.configuration_change_generations.clone(),
+            workspace.source_generation,
+            workspace.configuration_generation,
+        );
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        budget.set_path_visit_limit(1);
+
+        let error = workspace
+            .invalidate_project_selection_uris(&uris, None, Some(&budget))
+            .expect_err("the second URI must exhaust the finite preflight budget");
+        assert_eq!(error, super::NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED);
+        let after = (
+            format!("{:?}", workspace.contexts),
+            format!("{:?}", workspace.document_contexts),
+            format!("{:?}", workspace.open_document_contexts),
+            format!("{:?}", workspace.document_owners),
+            workspace.index.document_count(),
+            format!("{:?}", workspace.indexed_files),
+            format!("{:?}", workspace.pending_diagnostics),
+            workspace.source_change_generations.clone(),
+            workspace.configuration_change_generations.clone(),
+            workspace.source_generation,
+            workspace.configuration_generation,
+        );
+        assert_eq!(
+            after, before,
+            "budget failure must leave the workspace unchanged"
+        );
     }
 
     #[test]

@@ -506,6 +506,53 @@ fn selection_result_is_rejected_for_disk_profile_change_without_notification() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn selection_rejects_configuration_changed_before_worker_discovery() {
+    let fixture = selection_fixture();
+    let environment = tempfile::tempdir().unwrap();
+    let (mut server, barrier) = TestServer::launch_with_project_operation_barrier(environment);
+    server.initialize(fixture.directory.path(), Value::Null);
+
+    let selection = RequestId::from("selection-profile-change-before-discovery".to_owned());
+    server.send_request(
+        selection.clone(),
+        "pascal/selectInstallation",
+        json!({"projectUri": uri(&fixture.project_a), "installationId": "37.0"}),
+    );
+    wait_for_path(&barrier.entered);
+
+    // The selection choice was cached from this configuration before the
+    // worker began discovery. It must not be made to look fresh by stamping
+    // only the edited bytes after discovery has completed.
+    let config_path = fixture.directory.path().join(".delphi-tools.local.toml");
+    let original = fs::read_to_string(&config_path).expect("read captured profile config");
+    let replacement = original.replace(
+        &fixture
+            .directory
+            .path()
+            .join("sdk/37.0")
+            .display()
+            .to_string(),
+        &fixture
+            .directory
+            .path()
+            .join("sdk/7.0")
+            .display()
+            .to_string(),
+    );
+    assert_ne!(original, replacement);
+    write_file(&config_path, &replacement);
+    fs::write(&barrier.release, b"release").expect("release project worker");
+
+    let response = server.response(&selection);
+    assert!(
+        response.error.is_some(),
+        "selection used configuration bytes from before the worker's read-set baseline: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn compiled_view_response_is_stale_after_installation_switch() {
     let fixture = selection_fixture();
     let root = fixture.directory.path();

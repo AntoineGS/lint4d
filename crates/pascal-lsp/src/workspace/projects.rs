@@ -54,6 +54,35 @@ pub(crate) struct ProjectOperationSnapshot {
     expected_installation: Option<String>,
 }
 
+pub(crate) struct ProjectOperationReadSet {
+    candidates: Vec<PathBuf>,
+    configuration: Vec<ConfigurationSourceStamp>,
+}
+
+impl ProjectOperationReadSet {
+    pub(crate) fn candidate_membership_matches(
+        &self,
+        candidate_uris: &[Url],
+        budget: &ReconciliationBudget,
+    ) -> Result<bool, String> {
+        let mut claimed = Vec::new();
+        claimed.try_reserve(candidate_uris.len()).map_err(|error| {
+            format!("could not reserve project candidate freshness check: {error}")
+        })?;
+        for uri in candidate_uris {
+            budget.charge_path_visits(1)?;
+            if let Ok(path) = uri.to_file_path() {
+                claimed.push(path);
+            }
+        }
+        budget.charge_path_visits(super::sort_work_estimate(claimed.len()))?;
+        claimed.sort();
+        claimed.dedup();
+        budget.charge_path_visits(self.candidates.len())?;
+        Ok(claimed == self.candidates)
+    }
+}
+
 impl fmt::Debug for ProjectOperationSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -70,7 +99,6 @@ pub(crate) struct ProjectContextPreparation {
     key: ContextKey,
     state: super::ContextState,
     owner: Option<super::KnownDocumentOwner>,
-    pub(crate) project_file: Option<PathBuf>,
     pub(crate) info: ProjectContextInfo,
 }
 
@@ -95,9 +123,109 @@ impl ProjectOperationSnapshot {
     pub(crate) fn workspace_mut(&mut self) -> &mut Workspace {
         &mut self.workspace
     }
+
+    pub(crate) fn capture_read_set(
+        &mut self,
+        input_path: &Path,
+        budget: &ReconciliationBudget,
+    ) -> Result<ProjectOperationReadSet, String> {
+        self.workspace
+            .project_operation_read_set(input_path, budget)
+    }
+
+    pub(crate) fn read_set_is_current(
+        &mut self,
+        input_path: &Path,
+        read_set: &ProjectOperationReadSet,
+        budget: &ReconciliationBudget,
+    ) -> Result<bool, String> {
+        self.workspace
+            .project_operation_read_set_is_current(input_path, read_set, budget)
+    }
 }
 
 impl Workspace {
+    fn project_operation_read_set(
+        &self,
+        input_path: &Path,
+        budget: &ReconciliationBudget,
+    ) -> Result<ProjectOperationReadSet, String> {
+        let roots = self.workspace_root_paths();
+        let candidates = project_candidates_with_work_budget(
+            input_path,
+            &roots,
+            None,
+            Some(budget as &dyn pascal_project::ProjectWorkBudget),
+        )?;
+        let mut candidate_paths = candidates.files;
+        budget.charge_path_visits(super::sort_work_estimate(candidate_paths.len()))?;
+        candidate_paths.sort();
+        candidate_paths.dedup();
+
+        // The read set is deliberately bounded by the same operation budget as
+        // candidate discovery. Include each discovered project directory, plus
+        // the original input directory when no project candidate exists.
+        let mut configuration: Vec<ConfigurationSourceStamp> = Vec::new();
+        let mut targets = Vec::new();
+        targets
+            .try_reserve(candidate_paths.len().max(1))
+            .map_err(|error| {
+                format!("could not reserve project configuration read set: {error}")
+            })?;
+        if candidate_paths.is_empty() {
+            targets.push(input_path.to_path_buf());
+        } else {
+            targets.extend(candidate_paths.iter().cloned());
+        }
+        for target in targets {
+            budget.charge_path_visits(1)?;
+            for stamp in self.project_operation_configuration(&target, Some(budget))? {
+                let mut known = false;
+                for current in &configuration {
+                    budget.charge_path_visits(1)?;
+                    if current.path == stamp.path {
+                        known = true;
+                        break;
+                    }
+                }
+                if !known {
+                    configuration.try_reserve(1).map_err(|error| {
+                        format!("could not reserve project configuration stamps: {error}")
+                    })?;
+                    configuration.push(stamp);
+                }
+            }
+        }
+        Ok(ProjectOperationReadSet {
+            candidates: candidate_paths,
+            configuration,
+        })
+    }
+
+    fn project_operation_read_set_is_current(
+        &self,
+        input_path: &Path,
+        read_set: &ProjectOperationReadSet,
+        budget: &ReconciliationBudget,
+    ) -> Result<bool, String> {
+        let roots = self.workspace_root_paths();
+        let current_candidates = project_candidates_with_work_budget(
+            input_path,
+            &roots,
+            None,
+            Some(budget as &dyn pascal_project::ProjectWorkBudget),
+        )?;
+        let mut current_candidates = current_candidates.files;
+        budget.charge_path_visits(super::sort_work_estimate(current_candidates.len()))?;
+        current_candidates.sort();
+        current_candidates.dedup();
+        budget.charge_path_visits(read_set.candidates.len())?;
+        if current_candidates != read_set.candidates {
+            return Ok(false);
+        }
+        self.project_operation_configuration_is_current(&read_set.configuration, Some(budget))
+    }
+
     pub(crate) fn project_operation_configuration(
         &self,
         project_path: &Path,
@@ -345,7 +473,6 @@ impl Workspace {
             key: context_key,
             state,
             owner,
-            project_file: context.project_file.clone(),
             info,
         })
     }
@@ -359,7 +486,6 @@ impl Workspace {
             key,
             state,
             owner,
-            project_file: _,
             info: _,
         } = prepared;
         let watched_paths = state.watched_paths.keys().cloned().collect::<Vec<_>>();
@@ -544,6 +670,7 @@ impl Workspace {
         project_path: &Path,
         installation_id: Option<&str>,
         expected_installation: Option<&str>,
+        budget: &ReconciliationBudget,
     ) -> Result<(), String> {
         if self
             .installation_selections
@@ -553,24 +680,37 @@ impl Workspace {
         {
             return Err("installation selection changed while the request was running".to_string());
         }
-        if !self
-            .workspace_root_paths()
-            .iter()
-            .any(|root| crate::workspace::path_starts_with_native(project_path, root))
-        {
+        let roots = self.workspace_root_paths();
+        let mut in_scope = false;
+        for root in &roots {
+            budget.charge_path_visits(1)?;
+            if crate::workspace::path_starts_with_native(project_path, root) {
+                in_scope = true;
+            }
+        }
+        if !in_scope {
             return Err("project is no longer in the configured workspace scope".to_string());
         }
-        let keys = self
-            .contexts
-            .keys()
-            .filter(|key| {
-                key.project_file
-                    .as_deref()
-                    .is_some_and(|path| project_paths_equal(path, project_path))
-            })
-            .cloned()
-            .collect::<HashSet<_>>();
-        self.invalidate_selection_contexts(&keys, None, None)?;
+        let mut keys = HashSet::new();
+        keys.try_reserve(self.contexts.len()).map_err(|error| {
+            format!("could not reserve installation selection contexts: {error}")
+        })?;
+        for key in self.contexts.keys() {
+            budget.charge_path_visits(1)?;
+            if key
+                .project_file
+                .as_deref()
+                .is_some_and(|path| project_paths_equal(path, project_path))
+            {
+                keys.insert(key.clone());
+            }
+        }
+        if installation_id.is_some() {
+            self.installation_selections
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve installation selection: {error}"))?;
+        }
+        self.invalidate_selection_contexts(&keys, None, Some(budget))?;
         match installation_id {
             Some(id) => {
                 self.installation_selections
@@ -866,12 +1006,21 @@ impl Workspace {
             if self.project_selections.get(&scope).cloned() != expected_selected {
                 return Err("project selection changed while the request was running".to_string());
             }
-            if !self
-                .workspace_root_paths()
-                .iter()
-                .any(|root| crate::workspace::path_starts_with_native(&scope, root))
-            {
+            let roots = self.workspace_root_paths();
+            let mut in_scope = false;
+            for root in &roots {
+                budget.charge_path_visits(1)?;
+                if crate::workspace::path_starts_with_native(&scope, root) {
+                    in_scope = true;
+                }
+            }
+            if !in_scope {
                 return Err("project selection scope is no longer configured".to_string());
+            }
+            if selected.is_some() {
+                self.project_selections
+                    .try_reserve(1)
+                    .map_err(|error| format!("could not reserve project selection: {error}"))?;
             }
             self.invalidate_project_selection_uris(&affected_uris, None, Some(budget))?;
             match selected {

@@ -6386,8 +6386,40 @@ impl AnalysisJobs {
             _ => unreachable!("only project protocol requests use this worker"),
         };
         let handle = thread::Builder::new()
-            .name("PascalLspProjectOperation".to_string())
-            .spawn(move || {
+                .name("PascalLspProjectOperation".to_string())
+                .spawn(move || {
+                let mut request = request;
+                let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
+                let capture = (|| {
+                    let (path, snapshot) = match &mut request {
+                        AnalysisRequest::ProjectContext { uri, snapshot }
+                        | AnalysisRequest::SelectProject { uri, snapshot, .. } => (
+                            uri.to_file_path()
+                                .map_err(|_| format!("document URI must be a file URI: {uri}"))?,
+                            snapshot,
+                        ),
+                        AnalysisRequest::InstallationContext {
+                            project_uri,
+                            snapshot,
+                        }
+                        | AnalysisRequest::SelectInstallation {
+                            project_uri,
+                            snapshot,
+                            ..
+                        } => (
+                            project_uri.to_file_path().map_err(|_| {
+                                format!("project URI must be a file URI: {project_uri}")
+                            })?,
+                            snapshot,
+                        ),
+                        _ => unreachable!("only project protocol requests use this worker"),
+                    };
+                    let read_set = snapshot.capture_read_set(&path, &budget)?;
+                    Ok::<_, String>((path, read_set))
+                })();
+                let result = match capture {
+                    Err(error) => Err(error),
+                    Ok((input_path, read_set)) => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     wait_at_test_barrier(
                         TestBarrier::ProjectOperation,
@@ -6397,7 +6429,6 @@ impl AnalysisJobs {
                     if worker_cancellation.load(Ordering::Acquire) {
                         return Err(rename::CANCELLATION_MESSAGE.to_string());
                     }
-                    let budget = ReconciliationBudget::new(Arc::clone(&worker_cancellation));
                     match request {
                         AnalysisRequest::ProjectContext { uri, mut snapshot } => {
                             let prepared = snapshot
@@ -6409,37 +6440,20 @@ impl AnalysisJobs {
                                 )?;
                             let value = serde_json::to_value(&prepared.info)
                                 .map_err(|error| error.to_string())?;
-                            if let Some(project_path) = prepared.project_file.as_deref() {
-                                let configuration = snapshot
-                                    .workspace_mut()
-                                    .project_operation_configuration(project_path, Some(&budget))?;
-                                wait_at_test_barrier(
-                                    TestBarrier::ProjectOperationPrepared,
-                                    &test_barriers,
-                                    &worker_cancellation,
-                                )?;
-                                if !snapshot
-                                    .workspace_mut()
-                                    .project_operation_configuration_is_current(
-                                        &configuration,
-                                        Some(&budget),
-                                    )?
-                                {
-                                    return Err("project configuration changed while resolving context; retry the request".to_string());
-                                }
-                            }
-                            Ok(ProjectOperationResponse::ProjectContext { value, prepared })
+                            wait_at_test_barrier(
+                                TestBarrier::ProjectOperationPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            Ok((
+                                ProjectOperationResponse::ProjectContext { value, prepared },
+                                snapshot,
+                            ))
                         }
                         AnalysisRequest::InstallationContext {
                             project_uri,
                             mut snapshot,
                         } => {
-                            let project_path = project_uri.to_file_path().map_err(|_| {
-                                format!("project URI must be a file URI: {project_uri}")
-                            })?;
-                            let configuration = snapshot
-                                .workspace_mut()
-                                .project_operation_configuration(&project_path, Some(&budget))?;
                             let value = snapshot
                                 .workspace_mut()
                                 .installation_context_with_budget(&project_uri, Some(&budget))
@@ -6451,16 +6465,7 @@ impl AnalysisJobs {
                                 &test_barriers,
                                 &worker_cancellation,
                             )?;
-                            if !snapshot
-                                .workspace_mut()
-                                .project_operation_configuration_is_current(
-                                    &configuration,
-                                    Some(&budget),
-                                )?
-                            {
-                                return Err("project configuration changed while resolving installation context; retry the request".to_string());
-                            }
-                            Ok(ProjectOperationResponse::InstallationContext(value))
+                            Ok((ProjectOperationResponse::InstallationContext(value), snapshot))
                         }
                         AnalysisRequest::SelectInstallation {
                             project_uri,
@@ -6472,9 +6477,6 @@ impl AnalysisJobs {
                             let project_path = project_uri.to_file_path().map_err(|_| {
                                 format!("project URI must be a file URI: {project_uri}")
                             })?;
-                            let configuration = snapshot
-                                .workspace_mut()
-                                .project_operation_configuration(&project_path, Some(&budget))?;
                             let context =
                                 snapshot.workspace_mut().select_installation_with_control(
                                     &project_uri,
@@ -6489,21 +6491,15 @@ impl AnalysisJobs {
                                 &test_barriers,
                                 &worker_cancellation,
                             )?;
-                            if !snapshot
-                                .workspace_mut()
-                                .project_operation_configuration_is_current(
-                                    &configuration,
-                                    Some(&budget),
-                                )?
-                            {
-                                return Err("project configuration changed while selecting installation; retry the request".to_string());
-                            }
-                            Ok(ProjectOperationResponse::SelectInstallation {
-                                value,
-                                project_path,
-                                installation_id,
-                                expected_installation,
-                            })
+                            Ok((
+                                ProjectOperationResponse::SelectInstallation {
+                                    value,
+                                    project_path,
+                                    installation_id,
+                                    expected_installation,
+                                },
+                                snapshot,
+                            ))
                         }
                         AnalysisRequest::SelectProject {
                             uri,
@@ -6518,26 +6514,12 @@ impl AnalysisJobs {
                                     &worker_cancellation,
                                     &budget,
                                 )?;
-                            if let Some(project_path) = prepared.context.project_file.as_deref() {
-                                let configuration = snapshot
-                                    .workspace_mut()
-                                    .project_operation_configuration(project_path, Some(&budget))?;
-                                wait_at_test_barrier(
-                                    TestBarrier::ProjectOperationPrepared,
-                                    &test_barriers,
-                                    &worker_cancellation,
-                                )?;
-                                if !snapshot
-                                    .workspace_mut()
-                                    .project_operation_configuration_is_current(
-                                        &configuration,
-                                        Some(&budget),
-                                    )?
-                                {
-                                    return Err("project configuration changed while selecting project; retry the request".to_string());
-                                }
-                            }
-                            Ok(ProjectOperationResponse::SelectProject { prepared })
+                            wait_at_test_barrier(
+                                TestBarrier::ProjectOperationPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            Ok((ProjectOperationResponse::SelectProject { prepared }, snapshot))
                         }
                         _ => unreachable!("only project protocol requests use this worker"),
                     }
@@ -6548,6 +6530,32 @@ impl AnalysisJobs {
                             .to_string(),
                     )
                 });
+                match result {
+                    Ok((response, mut snapshot)) => {
+                        let membership_current = match &response {
+                            ProjectOperationResponse::ProjectContext { prepared, .. } => read_set
+                                .candidate_membership_matches(&prepared.info.candidates, &budget),
+                            ProjectOperationResponse::SelectProject { prepared } => read_set
+                                .candidate_membership_matches(
+                                    &prepared.context.info.candidates,
+                                    &budget,
+                                ),
+                            _ => Ok(true),
+                        };
+                        match (
+                            snapshot.read_set_is_current(&input_path, &read_set, &budget),
+                            membership_current,
+                        ) {
+                            (Ok(true), Ok(true)) => Ok(response),
+                            (Ok(false), _) => Err("project configuration or candidate set changed while resolving the request; retry the request".to_string()),
+                            (Ok(true), Ok(false)) => Err("project candidate membership changed while resolving the request; retry the request".to_string()),
+                            (_, Err(error)) | (Err(error), _) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+                    }
+                };
                 let _ = sender.send(AnalysisResult {
                     id: worker_id,
                     source_generation,
@@ -8475,10 +8483,12 @@ fn deliver_analysis_result_with_store(
                 expected_installation,
             },
         )) => {
+            let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
             match workspace.commit_prepared_installation_selection(
                 &project_path,
                 installation_id.as_deref(),
                 expected_installation.as_deref(),
+                &budget,
             ) {
                 Ok(()) => send_ok(
                     connection,

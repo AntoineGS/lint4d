@@ -409,6 +409,52 @@ fn unsupported_active_directive_blocks_include_precision() {
 }
 
 #[test]
+fn rtl_switch_list_does_not_make_unit_resolution_unsupported() {
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/System.pas",
+        "{$H+,I-,R-,O+,W-} unit System; interface implementation end.",
+    );
+    let mut resolver = UnitResolver::new(
+        fixture_context(),
+        vec![PathBuf::from("/workspace")],
+        store,
+        Default::default(),
+    );
+
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "System",
+            importer_path: Path::new("/workspace/Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+
+    assert!(matches!(outcome.result, Resolution::Found(_)));
+    assert!(resolver.finish().complete);
+}
+
+#[test]
+fn comma_switch_effects_flow_through_resolved_includes() {
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/Main.pas",
+        "unit Main; interface {$R+,Q+}{$I options.inc}{$IFOPT Q-}{$I selected.inc}{$ENDIF} implementation end.",
+    );
+    store.add("/workspace/options.inc", "{$Q-}");
+    store.add("/workspace/selected.inc", "const Selected = 1;");
+
+    let project = resolve_memory_project(fixture_context(), store, Default::default());
+
+    assert!(project.complete);
+    assert!(project.includes.iter().any(|include| {
+        include.requested_name == "selected.inc"
+            && matches!(include.target, pascal_core::ResolutionTarget::Found(_))
+    }));
+}
+
+#[test]
 fn include_file_limit_is_checked_before_loading_payload() {
     let mut store = MemoryStore::default();
     store.add(

@@ -162,6 +162,90 @@ fn ifopt_switches_are_sequential_and_unknown_options_remain_unknown() {
 }
 
 #[test]
+fn comma_switches_update_each_ifopt_in_order() {
+    let source = "{$R-,Q-,R+}{$IFOPT R+}{$DEFINE RANGE_ON}{$ENDIF}\n\
+                  {$IFOPT Q-}{$DEFINE OVERFLOW_OFF}{$ENDIF}";
+    let context = ConditionalContext::default();
+    assert_eq!(
+        directive_activity(source, "DEFINE RANGE_ON", &context),
+        Truth::True
+    );
+    assert_eq!(
+        directive_activity(source, "DEFINE OVERFLOW_OFF", &context),
+        Truth::True
+    );
+    let analysis = conditional::analyze_with_context(source, &context);
+    assert!(analysis.complete);
+    assert_ne!(
+        analysis.directives[0].kind,
+        conditional::DirectiveKind::Other
+    );
+}
+
+#[test]
+fn comma_switch_lists_are_strict_and_keep_ordered_scalar_semantics() {
+    let context = ConditionalContext::default().with_option("R", Truth::False);
+    let source = concat!(
+        "{$R+, Q-, R-}",
+        "{$IFOPT R-}{$DEFINE LAST_WINS}{$ENDIF}",
+        "{$IFOPT Q-}{$DEFINE WHITESPACE}{$ENDIF}",
+        "{$IF Unknown}{$R+,Q-}{$ELSE}{$R-,Q+}{$ENDIF}",
+        "{$MESSAGE WARN 'a,b'}",
+        "{$R+,Q}",
+        "{$IFOPT R+}{$DEFINE MALFORMED_TRUE}{$ENDIF}",
+        "{$IFOPT R-}{$DEFINE MALFORMED_FALSE}{$ENDIF}",
+    );
+    let analysis = conditional::analyze_with_context(source, &context);
+    assert!(analysis.complete);
+    assert_eq!(
+        directive_activity(source, "DEFINE LAST_WINS", &context),
+        Truth::True
+    );
+    assert_eq!(
+        directive_activity(source, "DEFINE WHITESPACE", &context),
+        Truth::True
+    );
+    assert_eq!(
+        directive_activity(source, "DEFINE MALFORMED_TRUE", &context),
+        Truth::Unknown
+    );
+    assert_eq!(
+        directive_activity(source, "DEFINE MALFORMED_FALSE", &context),
+        Truth::Unknown
+    );
+    let message = analysis
+        .directives
+        .iter()
+        .find(|directive| directive.body.contains("MESSAGE"))
+        .expect("message directive");
+    assert_ne!(message.kind, conditional::DirectiveKind::Other);
+
+    let known = ConditionalContext::default().with_option("R", Truth::True);
+    let malformed =
+        "{$R+,Q}{$IFOPT R+}{$DEFINE POSSIBLY_ON}{$ENDIF}{$IFOPT R-}{$DEFINE POSSIBLY_OFF}{$ENDIF}";
+    assert_eq!(
+        directive_activity(malformed, "DEFINE POSSIBLY_ON", &known),
+        Truth::Unknown
+    );
+    assert_eq!(
+        directive_activity(malformed, "DEFINE POSSIBLY_OFF", &known),
+        Truth::Unknown
+    );
+}
+
+#[test]
+fn system_pascal_switch_list_accepts_untracked_boolean_options() {
+    for header in ["{$H+,I-,R-,O+,W-}", "{$H+,B-,R-}"] {
+        let analysis = conditional::analyze_with_context(header, &ConditionalContext::default());
+        assert!(analysis.complete, "header {header:?}");
+        assert_ne!(
+            analysis.directives[0].kind,
+            conditional::DirectiveKind::Other
+        );
+    }
+}
+
+#[test]
 fn typed_constants_support_checked_arithmetic_and_reject_unsafe_values() {
     let context =
         ConditionalContext::default().with_constant("Threshold", ConstantValue::Integer(3));

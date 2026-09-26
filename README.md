@@ -16,6 +16,7 @@ This repository also includes **fmt4d**, an opinionated code formatter for Delph
 - Inline suppression directives in source comments
 - `.dproj` project file support
 - BDS (RAD Studio) installation auto-discovery
+- Native `pascal-lsp` project/version switching with configurable, per-version Delphi installation roots and IDE paths (see the [installation profile guide](crates/pascal-project/README.md#delphi-installation-profiles))
 - Output in text or JSON format
 - Configurable severity thresholds and per-rule overrides
 

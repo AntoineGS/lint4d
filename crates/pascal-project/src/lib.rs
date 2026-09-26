@@ -616,7 +616,7 @@ impl ReadPolicy {
     }
 
     fn is_excluded_authorized_file(&self, path: &Path) -> bool {
-        if self.is_excluded(path) {
+        if path.components().any(is_default_excluded_component) || self.is_excluded(path) {
             return true;
         }
 

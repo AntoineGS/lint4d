@@ -438,6 +438,54 @@ fn explicit_external_locators_respect_directory_and_filename_exclusions() {
 }
 
 #[test]
+fn explicit_external_locators_under_default_excluded_directories_are_denied() {
+    for directory in [".git", "node_modules"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sdk = root.join("sdk");
+        let external_dir = tempfile::tempdir().unwrap();
+        let external = external_dir.path().join(directory).join("settings.proj");
+        let project = root.join("App.dproj");
+        write(&sdk.join("bin/rsvars.bat"), "SET BDS=C:\\Original\\37.0\n");
+        write(&external, "<Project/>");
+        write(&root.join("App.dpr"), "program App; begin end.");
+        write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        );
+        write(
+            &root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{}'\nEnvironmentSettings='{}'\n[projects.\"App.dproj\"]\ninstallation='37.0'\n",
+                sdk.display(),
+                external.display()
+            ),
+        );
+
+        let context = discover_with_selections(
+            &root.join("App.dpr"),
+            &[root.to_path_buf()],
+            &ProjectOptions {
+                project_file: Some(project),
+                ..ProjectOptions::default()
+            },
+            &ProjectSelections::default(),
+            &OverrideSession::new(None),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            !context.read_policy.allows_location(&ProjectPathEntry {
+                path: external,
+                provenance: ProjectPathProvenance::Configured,
+            }),
+            "default-excluded directory {directory:?} must not be authorized"
+        );
+    }
+}
+
+#[test]
 fn project_shared_properties_override_user_profile_properties() {
     let temp = tempfile::tempdir().unwrap();
     let user = temp.path().join("config.toml");

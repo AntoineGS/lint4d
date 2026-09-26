@@ -1,10 +1,37 @@
 use std::{fs, path::Path};
 
-use pascal_project::delphi_overrides::OverrideSession;
+use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
+use pascal_project::{ProjectPathEntry, ProjectPathProvenance, ReadPolicy};
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
+}
+
+#[test]
+fn installation_read_roots_authorize_only_the_selected_local_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let sdk = temp.path().join("sdk");
+    let unrelated = temp.path().join("other-sdk");
+    fs::create_dir_all(&sdk).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    let policy = ReadPolicy::new_with_installation_roots(
+        &[],
+        &[],
+        &[],
+        &EffectiveOverrides::default(),
+        std::slice::from_ref(&sdk),
+    );
+    let selected = ProjectPathEntry {
+        path: sdk.join("bin/rsvars.bat"),
+        provenance: ProjectPathProvenance::Configured,
+    };
+    let not_selected = ProjectPathEntry {
+        path: unrelated.join("bin/rsvars.bat"),
+        provenance: ProjectPathProvenance::Configured,
+    };
+    assert!(policy.allows_location(&selected));
+    assert!(!policy.allows_location(&not_selected));
 }
 
 #[test]

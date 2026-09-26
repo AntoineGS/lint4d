@@ -24,9 +24,12 @@ pub(crate) struct InstallationEnvironment {
     pub warnings: Vec<String>,
 }
 
+mod ide_paths;
 mod roots;
 mod rsvars;
 
+#[allow(unused_imports)]
+pub(crate) use ide_paths::{IdePaths, evaluate_ide_paths, load_installation};
 #[allow(unused_imports)]
 pub(crate) use roots::{relocate_environment, resolve_path_with_inferred};
 #[allow(unused_imports)]

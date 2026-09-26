@@ -31,7 +31,7 @@ use crate::delphi_overrides::{
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
@@ -233,6 +233,16 @@ impl ReadPolicy {
         exclusions: &[String],
         overrides: &EffectiveOverrides,
     ) -> Self {
+        Self::new_with_installation_roots(roots, source_paths, exclusions, overrides, &[])
+    }
+
+    pub fn new_with_installation_roots(
+        roots: &[PathBuf],
+        source_paths: &[String],
+        exclusions: &[String],
+        overrides: &EffectiveOverrides,
+        installation_roots: &[PathBuf],
+    ) -> Self {
         let mut configured_roots = Vec::new();
         for root in roots {
             let root = absolute_lexical(root).unwrap_or_else(|_| root.to_path_buf());
@@ -254,6 +264,10 @@ impl ReadPolicy {
                 let source = absolute_lexical(&source).unwrap_or(source);
                 add_unique_path(&mut configured_roots, source);
             }
+        }
+        for root in installation_roots {
+            let root = absolute_lexical(root).unwrap_or_else(|_| root.to_path_buf());
+            add_unique_path(&mut configured_roots, root);
         }
 
         let mut mapped_roots = Vec::new();
@@ -5680,6 +5694,57 @@ impl ProjectBuilder {
 
     fn record_payload_observation(&mut self, observation: MetadataObservation) {
         add_metadata_observation(&mut self.metadata_observations, observation);
+    }
+
+    fn seed_installation_properties(&mut self, properties: &BTreeMap<String, String>) {
+        for (name, value) in properties {
+            let key = name.to_ascii_lowercase();
+            if self.global_properties.contains(&key) {
+                continue;
+            }
+            if let Some(previous) = self.properties.insert(key.clone(), value.clone()) {
+                self.property_bytes = self.property_bytes.saturating_sub(previous.len());
+            }
+            self.property_bytes = self.property_bytes.saturating_add(value.len());
+            self.configured_ranges.remove(&key);
+            self.configured_properties.remove(&key);
+            self.property_provenance_ranges.insert(
+                key.clone(),
+                vec![ProvenanceRange {
+                    range: 0..value.len(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                }],
+            );
+            self.property_default_provenances
+                .insert(key, ProjectPathProvenance::LegacyNative);
+        }
+    }
+
+    fn process_installation_file(
+        &mut self,
+        contents: &str,
+        path: &Path,
+        tracker: &mut ProjectReadTracker<'_>,
+        provenance: &ProjectPathProvenance,
+    ) -> Result<(), String> {
+        let operations = parse_xml_operations(contents, path)?;
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        for operation in operations {
+            match operation {
+                XmlOperation::PropertyGroup(group) => {
+                    self.process_property_group(group, path, base, provenance);
+                }
+                XmlOperation::Import(import) => {
+                    self.process_import(import, path, base, tracker, provenance);
+                }
+                XmlOperation::DccReference(_) => self.warnings.push(format!(
+                    "ignored project references in installation data file {}",
+                    path.display()
+                )),
+                XmlOperation::Unsupported(message) => self.warnings.push(message),
+            }
+        }
+        Ok(())
     }
 
     fn property(&self, name: &str) -> Option<String> {

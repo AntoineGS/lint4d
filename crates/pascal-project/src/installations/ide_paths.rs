@@ -681,6 +681,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn reconciliation_accepts_case_correction_in_a_directory_with_over_256_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        fs::create_dir_all(root.join("Source/unit")).unwrap();
+        for index in 0..300 {
+            fs::create_dir(root.join(format!("entry-{index}"))).unwrap();
+        }
+        let result = super::reconcile_ide_path(
+            &root.join("source/unit"),
+            std::slice::from_ref(&root),
+            &mut ProjectReadTracker::default(),
+            &mut Vec::new(),
+            "delphilibrarypath",
+            "$(BDS)\\source\\unit",
+        )
+        .expect("bounded case correction succeeds");
+
+        assert_eq!(result, Some(root.join("Source/unit")));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reconciliation_rejects_symlink_components() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sdk");
@@ -735,11 +757,11 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_enforces_a_fixed_directory_scan_budget() {
+    fn reconciliation_enforces_the_project_directory_entry_limit() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sdk");
         fs::create_dir_all(&root).unwrap();
-        for index in 0..300 {
+        for index in 0..=crate::MAX_PROJECT_DIRECTORY_ENTRIES {
             fs::create_dir(root.join(format!("entry-{index}"))).unwrap();
         }
         let error = super::reconcile_ide_path(
@@ -752,7 +774,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("fixed work limit"));
+        assert!(error.contains("bounded work limit"));
     }
 
     #[test]
@@ -805,7 +827,6 @@ use std::path::{Path, PathBuf};
 
 const MAX_INSTALLATION_XML_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RS_VARS_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_IDE_PATH_RECONCILIATION_VISITS: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IdePaths {
@@ -1269,7 +1290,7 @@ fn property_paths(
                 ) {
                     Ok(Some(path)) => path,
                     Ok(None) => continue,
-                    Err(error) if error.contains("fixed work limit") => {
+                    Err(error) if error.contains("work limit") => {
                         warnings.push(format!("IDE {key} entry `{raw}` is uncertain: {error}"));
                         continue;
                     }
@@ -1313,11 +1334,23 @@ fn reconcile_ide_path(
         return Ok(None);
     };
 
+    let root_components = root.components().count();
+    let relative_components = candidate
+        .components()
+        .count()
+        .saturating_sub(root_components);
+    // Each candidate component can require an exact metadata probe, a
+    // case-insensitive scan bounded by the project directory-entry limit, and
+    // a metadata probe for a corrected component. Root components need one
+    // probe each.
+    let max_visits = root_components.saturating_add(
+        relative_components.saturating_mul(crate::MAX_PROJECT_DIRECTORY_ENTRIES.saturating_add(2)),
+    );
     let mut visits = 0usize;
     let mut current = PathBuf::new();
     for component in root.components() {
         current.push(component.as_os_str());
-        let metadata = match checked_symlink_metadata(&current, tracker, &mut visits)? {
+        let metadata = match checked_symlink_metadata(&current, tracker, &mut visits, max_visits)? {
             Some(metadata) => metadata,
             None => {
                 warnings.push(format!(
@@ -1352,7 +1385,7 @@ fn reconcile_ide_path(
             return Ok(None);
         };
         let exact = current.join(wanted);
-        let selected = match checked_symlink_metadata(&exact, tracker, &mut visits)? {
+        let selected = match checked_symlink_metadata(&exact, tracker, &mut visits, max_visits)? {
             Some(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     warnings.push(format!(
@@ -1376,8 +1409,15 @@ fn reconcile_ide_path(
                 };
                 let wanted_text = wanted.to_string_lossy();
                 let mut matches = Vec::new();
+                let mut directory_entries_visited = 0usize;
                 for entry in directory {
-                    check_reconciliation_budget(tracker, &mut visits)?;
+                    check_reconciliation_budget(tracker, &mut visits, max_visits)?;
+                    directory_entries_visited += 1;
+                    if directory_entries_visited > crate::MAX_PROJECT_DIRECTORY_ENTRIES {
+                        return Err(
+                            "IDE path reconciliation exceeded its bounded work limit".to_owned()
+                        );
+                    }
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
@@ -1413,10 +1453,11 @@ fn reconcile_ide_path(
                     }
                     return Ok(Some(current));
                 };
-                let metadata = match checked_symlink_metadata(&path, tracker, &mut visits)? {
-                    Some(metadata) => metadata,
-                    None => return Ok(None),
-                };
+                let metadata =
+                    match checked_symlink_metadata(&path, tracker, &mut visits, max_visits)? {
+                        Some(metadata) => metadata,
+                        None => return Ok(None),
+                    };
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     warnings.push(format!(
                         "IDE {key} entry `{raw}` is uncertain: path component is not a physical directory ({})",
@@ -1436,8 +1477,9 @@ fn checked_symlink_metadata(
     path: &Path,
     tracker: &mut ProjectReadTracker<'_>,
     visits: &mut usize,
+    max_visits: usize,
 ) -> Result<Option<fs::Metadata>, String> {
-    check_reconciliation_budget(tracker, visits)?;
+    check_reconciliation_budget(tracker, visits, max_visits)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1448,10 +1490,11 @@ fn checked_symlink_metadata(
 fn check_reconciliation_budget(
     tracker: &mut ProjectReadTracker<'_>,
     visits: &mut usize,
+    max_visits: usize,
 ) -> Result<(), String> {
     *visits += 1;
-    if *visits > MAX_IDE_PATH_RECONCILIATION_VISITS {
-        return Err("IDE path reconciliation exceeded its fixed work limit".to_owned());
+    if *visits > max_visits {
+        return Err("IDE path reconciliation exceeded its bounded work limit".to_owned());
     }
     if let Some(budget) = tracker.work_budget {
         budget.check_cancelled()?;

@@ -7036,7 +7036,25 @@ impl Workspace {
             .unwrap_or_default();
         let expansion = if rename::may_contain_include_directive(source.as_bytes()) {
             let mut expansion =
-                self.expand_source_with_control(uri, &source, context_key, cancel, budget)?;
+                match self.expand_source_with_control(uri, &source, context_key, cancel, budget) {
+                    Ok(expansion) => expansion,
+                    Err(error)
+                        if error == CANCELLATION_MESSAGE
+                            || budget.is_some_and(|budget| {
+                                budget.is_exhausted() || budget.is_cancelled()
+                            }) =>
+                    {
+                        return Err(error);
+                    }
+                    // One unit's failed expansion must not abort navigation
+                    // through its importers; leave only that unit unindexed.
+                    Err(error) => {
+                        self.warn(format!(
+                            "include expansion failed for {uri}; navigation is incomplete: {error}"
+                        ));
+                        return Ok(false);
+                    }
+                };
             let fallback_cancel = AtomicBool::new(false);
             let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
                 expansion.expanded.text(),
@@ -7141,11 +7159,20 @@ impl Workspace {
 
     fn include_expansion_limits(&self) -> ExpansionLimits {
         let limits = ExpansionLimits::default();
+        let max_expanded_bytes = limits
+            .max_expanded_bytes
+            .min(self.options.limits.max_total_bytes);
         ExpansionLimits {
             max_sources: limits.max_sources.min(self.options.limits.max_files),
-            max_expanded_bytes: limits
-                .max_expanded_bytes
-                .min(self.options.limits.max_total_bytes),
+            max_expanded_bytes,
+            // Work is charged per byte, and include payloads are charged when
+            // read and again when appended, so a fixed budget smaller than the
+            // byte budget rejects ordinary large units such as Windows.pas.
+            max_work: limits.max_work.max(
+                max_expanded_bytes
+                    .saturating_mul(2)
+                    .saturating_add(limits.max_directives),
+            ),
             ..limits
         }
     }
@@ -7313,17 +7340,25 @@ impl Workspace {
                 .map_err(|_| format!("include root is not a file URI: {root_uri}"))?;
             let root_stamp = disk_stamp(&root_path)
                 .ok_or_else(|| format!("include root disappeared while expanding {root_uri}"))?;
+            let root_entry =
+                context_path_entry(context, &root_path).unwrap_or_else(|| ProjectPathEntry {
+                    path: root_path.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                });
+            let root_content_hash = closed_source_content_hash(
+                &expansion.physical_source,
+                self.options.limits.max_file_bytes,
+                &context.read_policy,
+                &root_entry,
+            );
             self.record_closed_analysis_source(
                 root_uri,
                 &expansion.physical_source,
                 root_stamp,
-                content_hash_bytes(expansion.physical_source.as_bytes()),
+                root_content_hash,
                 &root_path,
                 &context.read_policy,
-                &context_path_entry(context, &root_path).unwrap_or_else(|| ProjectPathEntry {
-                    path: root_path.clone(),
-                    provenance: ProjectPathProvenance::LegacyNative,
-                }),
+                &root_entry,
             );
         }
 
@@ -13802,6 +13837,27 @@ fn read_disk_source_with_budget(
         },
         content_hash: content_hash_bytes(&bytes),
     })
+}
+
+/// Revalidation hashes raw disk bytes, so a record for already-decoded text
+/// must carry the raw hash; hashing the text never matches a non-UTF-8 source.
+/// If the bytes no longer decode to `text`, the text hash keeps the record
+/// mismatched so the request fails closed and retries.
+fn closed_source_content_hash(
+    text: &str,
+    max_bytes: usize,
+    read_policy: &pascal_project::ReadPolicy,
+    entry: &ProjectPathEntry,
+) -> u64 {
+    let bytes = if matches!(entry.provenance, ProjectPathProvenance::LegacyNative) {
+        read_policy.read_legacy_payload_bytes(entry, max_bytes as u64)
+    } else {
+        read_policy.read_payload_bytes(entry, max_bytes as u64)
+    };
+    match bytes {
+        Ok(bytes) if resolver::decode_source_bytes(&bytes) == text => content_hash_bytes(&bytes),
+        _ => content_hash_bytes(text.as_bytes()),
+    }
 }
 
 fn disk_stamp(path: &Path) -> Option<DiskStamp> {

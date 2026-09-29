@@ -30251,6 +30251,55 @@ fn project_diagnostics_match_a_latin1_disk_graph_and_overlay_positions() {
 }
 
 #[test]
+fn definition_into_latin1_disk_providers_is_not_rejected_as_changed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    let main = root.join("Main.pas");
+    let source = "unit Main;\ninterface\nuses Plain, Included;\nimplementation\nprocedure Test;\nbegin\n  PlainValue := 1;\n  IncludedValue := 1;\nend;\nend.\n";
+    write_file(&main, source);
+    write_bytes(
+        &root.join("Plain.pas"),
+        &latin1("unit Plain;\ninterface\n// café\nconst PlainValue = 1;\nimplementation\nend.\n"),
+    );
+    write_bytes(
+        &root.join("Included.pas"),
+        &latin1(
+            "unit Included;\ninterface\n// café\n{$I Included.inc}\nconst IncludedValue = 1;\nimplementation\nend.\n",
+        ),
+    );
+    write_bytes(&root.join("Included.inc"), &latin1("// déjà\n"));
+    write_file(
+        &root.join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"Main.pas\"/></ItemGroup></Project>",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), json!({"projectFile": "app/App.dproj"}));
+    for (attempt, needle) in ["PlainValue :=", "IncludedValue :=", "PlainValue :="]
+        .into_iter()
+        .enumerate()
+    {
+        let id = RequestId::from(format!("latin1-definition-{attempt}"));
+        server.send_request(
+            id.clone(),
+            "textDocument/definition",
+            navigation_params(&main, source, needle, 0),
+        );
+        let response = server.response(&id);
+        assert!(
+            response.error.is_none(),
+            "definition of {needle} failed: {response:?}"
+        );
+        assert_eq!(
+            result_locations(response).len(),
+            1,
+            "definition of {needle} did not resolve"
+        );
+    }
+    server.shutdown();
+}
+
+#[test]
 fn project_diagnostics_refresh_when_candidate_directory_membership_changes() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("app");

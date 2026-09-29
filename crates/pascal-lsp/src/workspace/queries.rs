@@ -1488,7 +1488,10 @@ pub(crate) fn navigation_from_input(
         Err(error) if error == CANCELLATION_MESSAGE => {
             return cancelled(source_generation, configuration_generation);
         }
-        Err(_error) => Ok(Vec::new()),
+        Err(error) => {
+            workspace.warn(format!("navigation failed for {uri}: {error}"));
+            Ok(Vec::new())
+        }
     };
     let state = workspace.navigation_state();
     let records = match workspace.analysis_records(cancel) {

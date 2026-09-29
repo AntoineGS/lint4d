@@ -2,7 +2,7 @@ use lsp_types::{
     CompletionItemKind, CompletionTextEdit, Documentation as LspDocumentation, HoverContents,
     Location, MarkedString, MarkupKind, Position, Range, Url,
 };
-use pascal_lsp::workspace::{Workspace, WorkspaceOptions};
+use pascal_lsp::workspace::{ResourceLimits, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
 use pascal_project::delphi_overrides::OverrideSession;
 use std::collections::HashMap;
@@ -97,6 +97,90 @@ fn workspace_navigation_expands_a_source_bearing_include() {
         vec![Location::new(
             include_uri,
             Range::new(Position::new(0, 6), Position::new(0, 17)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_expands_a_dependency_larger_than_one_megabyte() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let big = temp.path().join("Big.pas");
+    let source = "unit Main;\ninterface\nuses Big;\nimplementation\nprocedure Run;\nbegin\n  BigValue := 1;\nend;\nend.\n";
+    let big_source = format!(
+        "unit Big;\ninterface\n{{$I Big.inc}}\nconst BigValue = 1;\n{{{}}}\nimplementation\nend.\n",
+        "x".repeat(1_300_000)
+    );
+    fs::write(&main, source).expect("main source");
+    fs::write(&big, &big_source).expect("big source");
+    fs::write(temp.path().join("Big.inc"), "const IncValue = 2;\n").expect("include source");
+    let main_uri = Url::from_file_path(&main).expect("main URI");
+    let big_uri = Url::from_file_path(&big).expect("big URI");
+    let mut workspace =
+        test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+    workspace
+        .open_document(main_uri.clone(), source.to_owned(), 1)
+        .expect("open main");
+
+    let locations = workspace.navigate(
+        &main_uri,
+        position_of(source, "BigValue :=", 0),
+        NavigationTarget::Definition,
+    );
+
+    assert_eq!(
+        locations,
+        vec![Location::new(
+            big_uri,
+            Range::new(Position::new(3, 6), Position::new(3, 14)),
+        )]
+    );
+}
+
+#[test]
+fn workspace_navigation_survives_a_dependency_whose_include_expansion_fails() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let main = temp.path().join("Main.pas");
+    let small = temp.path().join("Small.pas");
+    let source = "unit Main;\ninterface\nuses Heavy, Small;\nimplementation\nprocedure Run;\nbegin\n  SmallValue := 1;\nend;\nend.\n";
+    let small_source = "unit Small;\ninterface\nconst SmallValue = 1;\nimplementation\nend.\n";
+    // The root and its include each fit, but together exceed the expanded
+    // byte budget, so expanding Heavy fails outright.
+    let heavy_source = format!(
+        "unit Heavy;\ninterface\n{{$I Heavy.inc}}\nconst HeavyValue = 1;\n{{{}}}\nimplementation\nend.\n",
+        "x".repeat(60_000)
+    );
+    let heavy_include = format!("const IncValue = 2;\n{{{}}}\n", "y".repeat(50_000));
+    fs::write(&main, source).expect("main source");
+    fs::write(&small, small_source).expect("small source");
+    fs::write(temp.path().join("Heavy.pas"), heavy_source).expect("heavy source");
+    fs::write(temp.path().join("Heavy.inc"), heavy_include).expect("include source");
+    let main_uri = Url::from_file_path(&main).expect("main URI");
+    let small_uri = Url::from_file_path(&small).expect("small URI");
+    let options = WorkspaceOptions {
+        limits: ResourceLimits {
+            max_file_bytes: 100_000,
+            max_total_bytes: 100_000,
+            ..ResourceLimits::default()
+        },
+        ..WorkspaceOptions::default()
+    };
+    let mut workspace = test_workspace(vec![temp.path().to_path_buf()], options);
+    workspace
+        .open_document(main_uri.clone(), source.to_owned(), 1)
+        .expect("open main");
+
+    let locations = workspace.navigate(
+        &main_uri,
+        position_of(source, "SmallValue :=", 0),
+        NavigationTarget::Definition,
+    );
+
+    assert_eq!(
+        locations,
+        vec![Location::new(
+            small_uri,
+            Range::new(Position::new(2, 6), Position::new(2, 16)),
         )]
     );
 }

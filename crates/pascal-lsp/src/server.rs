@@ -10195,7 +10195,7 @@ fn run_connection(
     let watcher_registration = watcher_registration_supported
         .then(|| register_file_watcher(connection, &workspace, relative_pattern_support))
         .transpose()?;
-    let (watch_sender, watch_events) = unbounded();
+    let (watch_sender, watch_events) = crate::file_watch::WatchEvents::channel();
     match crate::file_watch::NotifyWatcher::start(watch_sender) {
         Ok(watcher) => workspace.project_cache().set_watcher(Box::new(watcher)),
         Err(error) => {
@@ -10478,7 +10478,7 @@ fn event_loop(
     diagnostic_refresh_supported: bool,
     configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
-    watch_events: Receiver<crate::file_watch::WatchEvent>,
+    watch_events: crate::file_watch::WatchEvents,
     mut jobs: AnalysisJobs,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
@@ -11377,15 +11377,13 @@ fn event_loop(
 
 fn drain_watch_events(
     workspace: &Workspace,
-    watch_events: &Receiver<crate::file_watch::WatchEvent>,
+    watch_events: &crate::file_watch::WatchEvents,
     rewarm: &mut Vec<Url>,
 ) {
-    while let Ok(event) = watch_events.try_recv() {
-        rewarm.extend(crate::file_watch::apply_watch_event(
-            workspace.project_cache(),
-            event,
-        ));
-    }
+    rewarm.extend(watch_events.drain(
+        workspace.project_cache(),
+        crate::file_watch::MAX_WATCH_EVENTS_PER_TURN,
+    ));
     rewarm.clear();
 }
 
@@ -15842,7 +15840,7 @@ mod tests {
             false,
             &mut configuration,
             None,
-            crossbeam_channel::unbounded().1,
+            crate::file_watch::WatchEvents::channel().1,
             AnalysisJobs::new(),
         )
         .expect("event loop completes");

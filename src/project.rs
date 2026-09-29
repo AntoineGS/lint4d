@@ -453,7 +453,9 @@ impl ProjectSnapshot {
             }
 
             let root = unit.tree.root_node();
-            if root.start_byte() != 0 || root.end_byte() > unit.source.len() {
+            let root_starts_at_source = root.start_byte() == 0
+                || (unit.source.starts_with(&[0xEF, 0xBB, 0xBF]) && root.start_byte() == 3);
+            if !root_starts_at_source || root.end_byte() > unit.source.len() {
                 return Err(ProjectSnapshotError::InvalidTreeSource {
                     unit_id: unit.id.clone(),
                     tree_range: root.start_byte()..root.end_byte(),

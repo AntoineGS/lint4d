@@ -270,6 +270,24 @@ fn project_snapshot_rejects_non_uses_and_out_of_bounds_binding_sites() {
 }
 
 #[test]
+fn project_snapshot_accepts_utf8_bom_before_tree_root() {
+    let source = b"\xef\xbb\xbfunit Bom; interface implementation end.";
+    let tree = parse_clean(source);
+    let root = tree.root_node();
+    assert_eq!(root.start_byte(), 3);
+    assert_eq!(root.end_byte(), source.len());
+
+    let input = ProjectUnitInput::new(
+        ProjectUnitId::new("bom"),
+        ProjectSourceId::new("bom.pas"),
+        tree,
+        source,
+    );
+    ProjectSnapshot::new(vec![input], Vec::new())
+        .expect("UTF-8 BOM bytes are part of the source snapshot");
+}
+
+#[test]
 fn project_snapshot_validates_many_sites_in_a_large_unit_without_dropping_any_binding() {
     const IMPORT_COUNT: usize = 400;
     const STATEMENT_COUNT: usize = 20_000;

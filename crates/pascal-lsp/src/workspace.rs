@@ -46,7 +46,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
-use pascal_core::resolver::{ImportSection, ImportSite, LegacyRoute, ResolutionTarget, SourceKind};
+use pascal_core::resolver::{
+    ImportSection, ImportSite, LegacyRoute, ResolutionTarget, ResolverSessionCache, SourceKind,
+};
 
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
@@ -6306,6 +6308,7 @@ impl Workspace {
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
         let mut work = 0;
+        let resolver_session_cache = ResolverSessionCache::default();
 
         loop {
             check_workspace_cancel(cancel)?;
@@ -6325,8 +6328,13 @@ impl Workspace {
                     continue;
                 }
                 work += 1;
-                let dependencies =
-                    self.load_imports_with_cancel(&current, context_key, pinned, cancel)?;
+                let dependencies = self.load_imports_with_session_cache(
+                    &current,
+                    context_key,
+                    pinned,
+                    cancel,
+                    &resolver_session_cache,
+                )?;
                 for dependency in dependencies {
                     check_workspace_cancel(cancel)?;
                     if initialized.insert(dependency.clone()) {
@@ -6384,6 +6392,23 @@ impl Workspace {
         context_key: &ContextKey,
         pinned: &mut HashSet<Url>,
         cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Url>, String> {
+        self.load_imports_with_session_cache(
+            uri,
+            context_key,
+            pinned,
+            cancel,
+            &ResolverSessionCache::default(),
+        )
+    }
+
+    fn load_imports_with_session_cache(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: Option<&AtomicBool>,
+        session_cache: &ResolverSessionCache,
     ) -> Result<Vec<Url>, String> {
         check_workspace_cancel(cancel)?;
         let imports = self.index.imports(uri);
@@ -6448,11 +6473,16 @@ impl Workspace {
         let resolver_cancel = cancel.unwrap_or(&no_cancel);
         let legacy_route =
             self.legacy_route_for_resolver(uri, &path, &effective_context_key, &context);
-        let mut resolver = resolver::resolver_for_context(
+        let resolver_session_cache = if &effective_context_key == context_key {
+            session_cache.clone()
+        } else {
+            ResolverSessionCache::default()
+        };
+        let mut resolver = resolver::resolver_for_context_with_session_cache(
             context.clone(),
             input.roots.clone(),
             &input,
-            resolver_cancel,
+            resolver_session_cache,
         );
         let root = match resolver.load_source(
             &path,

@@ -16,8 +16,8 @@ use std::fmt;
 use std::fs;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A caller-owned cancellation source.
 pub trait CancellationToken {
@@ -372,7 +372,8 @@ pub struct ResolvedProject {
 mod store;
 pub use store::{FilesystemSourceStore, OverlaySource};
 
-/// Source resolver session.  All caches and observations are request-local.
+/// Resolver-owned caches and observations are request-local. Callers may
+/// explicitly share bounded package catalogues with an operation-scoped cache.
 pub struct UnitResolver<S> {
     context: ProjectContext,
     workspace_roots: Vec<PathBuf>,
@@ -381,7 +382,8 @@ pub struct UnitResolver<S> {
     report: ResolutionReport,
     loaded: HashMap<SourceId, LoadedSource>,
     directories: HashMap<DirectoryCacheKey, DirectoryListing>,
-    package_catalogues: HashMap<PathBuf, Catalogue>,
+    package_catalogues: HashMap<PathBuf, Arc<Catalogue>>,
+    session_cache: Option<ResolverSessionCache>,
     unit_cache: HashMap<UnitCacheKey, ResolvedUnit>,
     legacy_routes: HashMap<SourceId, LegacyRoute>,
     project_unit_ids: Option<HashSet<SourceId>>,
@@ -403,6 +405,31 @@ impl<S: SourceStore> UnitResolver<S> {
         store: S,
         limits: ResolverLimits,
     ) -> Self {
+        Self::new_inner(context, workspace_roots, store, limits, None)
+    }
+
+    /// Create a resolver that can reuse package catalogues from other
+    /// resolvers sharing the same immutable project context, resolver limits,
+    /// and unchanged source-store state in one operation. Discard the cache
+    /// when that operation completes.
+    pub fn new_with_session_cache(
+        context: ProjectContext,
+        workspace_roots: Vec<PathBuf>,
+        store: S,
+        limits: ResolverLimits,
+        session_cache: ResolverSessionCache,
+    ) -> Self {
+        Self::new_inner(context, workspace_roots, store, limits, Some(session_cache))
+    }
+
+    fn new_inner(
+        context: ProjectContext,
+        workspace_roots: Vec<PathBuf>,
+        store: S,
+        limits: ResolverLimits,
+        session_cache: Option<ResolverSessionCache>,
+    ) -> Self {
+        let session_cache = session_cache.filter(|cache| cache.bind(&context, limits));
         let mut report = ResolutionReport {
             observations: Vec::new(),
             warnings: Vec::new(),
@@ -435,6 +462,7 @@ impl<S: SourceStore> UnitResolver<S> {
             loaded: HashMap::new(),
             directories: HashMap::new(),
             package_catalogues: HashMap::new(),
+            session_cache,
             unit_cache: HashMap::new(),
             legacy_routes: HashMap::new(),
             project_unit_ids: None,
@@ -2134,7 +2162,7 @@ impl<S: SourceStore> UnitResolver<S> {
         &mut self,
         root: &Path,
         cancel: &dyn CancellationToken,
-    ) -> Result<Catalogue, ResolverError> {
+    ) -> Result<Arc<Catalogue>, ResolverError> {
         let root = canonical_path(root);
         if let Some(catalogue) = self.package_catalogues.get(&root).cloned() {
             return Ok(catalogue);
@@ -2144,12 +2172,31 @@ impl<S: SourceStore> UnitResolver<S> {
                 "package/source catalogue limit ({}) reached",
                 self.limits.max_package_catalogues
             ));
-            return Ok(Catalogue {
+            return Ok(Arc::new(Catalogue {
                 entries: HashMap::new(),
                 complete: false,
-            });
+            }));
         }
         self.package_catalogue_count += 1;
+        if let Some(session_cache) = &self.session_cache {
+            if let Some(cached) = session_cache.get(&root) {
+                for observation in cached.observations.iter().cloned() {
+                    self.record_observation(observation);
+                }
+                for warning in cached.warnings.iter().cloned() {
+                    self.warn(warning);
+                }
+                for reason in cached.incomplete_reasons.iter().cloned() {
+                    self.mark_incomplete(reason);
+                }
+                self.package_catalogues
+                    .insert(root, Arc::clone(&cached.catalogue));
+                return Ok(cached.catalogue);
+            }
+        }
+        let observations_before = self.report.observations.len();
+        let warnings_before = self.report.warnings.len();
+        let incomplete_reasons_before = self.report.incomplete_reasons.len();
         let mut queue = VecDeque::from([root.clone()]);
         let mut visited = HashSet::new();
         let mut entries = HashMap::new();
@@ -2211,8 +2258,22 @@ impl<S: SourceStore> UnitResolver<S> {
                 break;
             }
         }
-        let catalogue = Catalogue { entries, complete };
-        self.package_catalogues.insert(root, catalogue.clone());
+        let catalogue = Arc::new(Catalogue { entries, complete });
+        let cached = CachedCatalogue {
+            catalogue: Arc::clone(&catalogue),
+            observations: self.report.observations[observations_before..]
+                .to_vec()
+                .into(),
+            warnings: self.report.warnings[warnings_before..].to_vec().into(),
+            incomplete_reasons: self.report.incomplete_reasons[incomplete_reasons_before..]
+                .to_vec()
+                .into(),
+        };
+        self.package_catalogues
+            .insert(root.clone(), Arc::clone(&catalogue));
+        if let Some(session_cache) = &self.session_cache {
+            session_cache.insert(root, cached, self.limits.max_package_catalogues);
+        }
         Ok(catalogue)
     }
 
@@ -2825,6 +2886,76 @@ impl UnitCacheKey {
 struct Catalogue {
     entries: HashMap<String, Vec<PathBuf>>,
     complete: bool,
+}
+
+const MAX_SHARED_PACKAGE_CATALOGUES: usize = 16;
+
+/// Bounded cache for resolver instances sharing one project context and the
+/// same limits during a single operation. Discard this cache when the
+/// operation completes.
+#[derive(Debug, Clone, Default)]
+pub struct ResolverSessionCache {
+    state: Arc<Mutex<ResolverSessionCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct ResolverSessionCacheState {
+    scope: Option<ResolverSessionCacheScope>,
+    catalogues: HashMap<PathBuf, CachedCatalogue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolverSessionCacheScope {
+    context: ProjectContext,
+    limits: ResolverLimits,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCatalogue {
+    catalogue: Arc<Catalogue>,
+    observations: Arc<[ResolutionObservation]>,
+    warnings: Arc<[String]>,
+    incomplete_reasons: Arc<[String]>,
+}
+
+impl ResolverSessionCache {
+    fn bind(&self, context: &ProjectContext, limits: ResolverLimits) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &state.scope {
+            Some(bound_scope) => bound_scope.limits == limits && &bound_scope.context == context,
+            None => {
+                state.scope = Some(ResolverSessionCacheScope {
+                    context: context.clone(),
+                    limits,
+                });
+                true
+            }
+        }
+    }
+
+    fn get(&self, root: &Path) -> Option<CachedCatalogue> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .catalogues
+            .get(root)
+            .cloned()
+    }
+
+    fn insert(&self, root: PathBuf, catalogue: CachedCatalogue, maximum: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let catalogues = &mut state.catalogues;
+        let maximum = maximum.min(MAX_SHARED_PACKAGE_CATALOGUES);
+        if catalogues.contains_key(&root) || catalogues.len() < maximum {
+            catalogues.entry(root).or_insert(catalogue);
+        }
+    }
 }
 
 enum CaseInsensitiveLookup {

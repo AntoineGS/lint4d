@@ -5,8 +5,9 @@ use super::{DiskStamp, MAX_DEPENDENCY_WORK, absolute_path, canonical_file_uri, p
 use lsp_types::Url;
 use pascal_core::resolver::{
     CancellationToken, DirectoryListing, DirectoryRequest, FilesystemSourceStore, LegacyRoute,
-    LoadedSource, ResolutionObservation, ResolutionReport, ResolverLimits, SourceId, SourceKind,
-    SourceRequest, SourceRevision, SourceStore, SourceStoreError, UnitResolver,
+    LoadedSource, ResolutionObservation, ResolutionReport, ResolverLimits, ResolverSessionCache,
+    SourceId, SourceKind, SourceRequest, SourceRevision, SourceStore, SourceStoreError,
+    UnitResolver,
 };
 use pascal_project::{
     ProjectContext, ProjectPathEntry, ProjectPathProvenance, ReadPolicy, content_hash_bytes,
@@ -404,6 +405,34 @@ pub(crate) fn resolver_for_context_with_limits(
         roots,
         LspSourceStore::from_input(context, input),
         limits,
+    )
+}
+
+pub(crate) fn resolver_for_context_with_session_cache(
+    context: ProjectContext,
+    roots: Vec<PathBuf>,
+    input: &WorkspaceInput,
+    session_cache: ResolverSessionCache,
+) -> UnitResolver<LspSourceStore> {
+    let mut limits = ResolverLimits::default();
+    limits.max_dependency_units = MAX_DEPENDENCY_WORK;
+    limits.max_source_bytes = input.options.limits.max_file_bytes;
+    resolver_for_context_with_limits_and_session_cache(context, roots, limits, input, session_cache)
+}
+
+fn resolver_for_context_with_limits_and_session_cache(
+    context: ProjectContext,
+    roots: Vec<PathBuf>,
+    limits: ResolverLimits,
+    input: &WorkspaceInput,
+    session_cache: ResolverSessionCache,
+) -> UnitResolver<LspSourceStore> {
+    UnitResolver::new_with_session_cache(
+        context.clone(),
+        roots,
+        LspSourceStore::from_input(context, input),
+        limits,
+        session_cache,
     )
 }
 

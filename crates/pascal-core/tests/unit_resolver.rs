@@ -1,7 +1,8 @@
 use pascal_core::resolver::{
     CancellationToken, DirectoryListing, DirectoryRequest, FilesystemSourceStore, LoadedSource,
-    NoCancellation, Resolution, ResolverError, ResolverLimits, SourceId, SourceKind, SourceRequest,
-    SourceRevision, SourceStore, SourceStoreError, UnitResolveRequest, UnitResolver,
+    NoCancellation, Resolution, ResolverError, ResolverLimits, ResolverSessionCache, SourceId,
+    SourceKind, SourceRequest, SourceRevision, SourceStore, SourceStoreError, UnitResolveRequest,
+    UnitResolver,
 };
 use pascal_project::{
     ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
@@ -400,7 +401,7 @@ fn unreadable_higher_priority_directory_blocks_later_provider() {
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
@@ -729,6 +730,186 @@ fn package_lookup_prefers_dpk_descriptor_over_dproj() {
         other => panic!("expected package unit, got {other:?}"),
     };
     assert_eq!(found.source.path, unit);
+}
+
+#[test]
+fn shared_session_cache_reuses_package_catalogues_between_resolvers() {
+    let directory = tempdir().expect("package fixture");
+    let root = directory.path();
+    fs::create_dir_all(root.join("pkg")).expect("package source directory");
+    fs::write(
+        root.join("Core.dpk"),
+        "package Core; contains Errors in 'pkg/Errors.pas', Another in 'pkg/Another.pas'; end.",
+    )
+    .expect("package descriptor");
+    fs::write(root.join("pkg/Errors.pas"), "unit Errors; interface end.").expect("Errors source");
+    fs::write(root.join("pkg/Another.pas"), "unit Another; interface end.")
+        .expect("Another source");
+
+    let context = ProjectContext {
+        discovery_complete: true,
+        project_file: Some(root.join("App.dproj")),
+        packages: vec!["Core".to_string()],
+        search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
+        read_policy: ReadPolicy::default(),
+        ..ProjectContext::default()
+    };
+    let directory_reads = Arc::new(AtomicUsize::new(0));
+    let session_cache = ResolverSessionCache::default();
+    let resolve = |name: &str, session_cache: ResolverSessionCache| {
+        let mut resolver = UnitResolver::new_with_session_cache(
+            context.clone(),
+            vec![root.to_path_buf()],
+            CountingFilesystemStore {
+                inner: FilesystemSourceStore::new(),
+                directory_reads: Arc::clone(&directory_reads),
+            },
+            ResolverLimits::default(),
+            session_cache,
+        );
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: name,
+                importer_path: &root.join("App.pas"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        )
+    };
+
+    assert!(matches!(
+        resolve("Errors", session_cache.clone()).result,
+        Resolution::Found(_)
+    ));
+    let reads_after_first = directory_reads.load(Ordering::Relaxed);
+    let second = resolve("Another", session_cache);
+    assert!(matches!(second.result, Resolution::Found(_)));
+    let reads_after_second = directory_reads.load(Ordering::Relaxed);
+
+    assert_eq!(
+        reads_after_second - reads_after_first,
+        1,
+        "the second resolver should list only the importer's direct search path; the recursive package catalogue should be reused"
+    );
+    assert!(
+        second.observations.iter().any(|observation| matches!(
+            observation,
+            pascal_core::resolver::ResolutionObservation::Directory { path, .. }
+                if path == &root.join("pkg")
+        )),
+        "reused catalogues must replay their directory observations for freshness checks"
+    );
+}
+
+#[test]
+fn shared_session_cache_does_not_cross_read_policies() {
+    let directory = tempdir().expect("package fixture");
+    let root = directory.path();
+    fs::create_dir_all(root.join("pkg")).expect("package source directory");
+    fs::write(
+        root.join("pkg/Core.dpk"),
+        "package Core; contains Errors in 'Errors.pas'; end.",
+    )
+    .expect("package descriptor");
+    fs::write(root.join("pkg/Errors.pas"), "unit Errors; interface end.").expect("Errors source");
+
+    let restricted_context = ProjectContext {
+        discovery_complete: true,
+        project_file: Some(root.join("App.dproj")),
+        packages: vec!["Core".to_string()],
+        search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
+        read_policy: ReadPolicy::new(
+            &[root.to_path_buf()],
+            &[],
+            &["pkg/**".to_string()],
+            &Default::default(),
+        ),
+        ..ProjectContext::default()
+    };
+    let allowed_context = ProjectContext {
+        read_policy: ReadPolicy::default(),
+        ..restricted_context.clone()
+    };
+    let session_cache = ResolverSessionCache::default();
+    let resolve = |context, session_cache| {
+        let mut resolver = UnitResolver::new_with_session_cache(
+            context,
+            vec![root.to_path_buf()],
+            FilesystemSourceStore::new(),
+            ResolverLimits::default(),
+            session_cache,
+        );
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: "Errors",
+                importer_path: &root.join("App.pas"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        )
+    };
+
+    assert!(matches!(
+        resolve(restricted_context, session_cache.clone()).result,
+        Resolution::Unavailable { .. }
+    ));
+    assert!(matches!(
+        resolve(allowed_context, session_cache).result,
+        Resolution::Found(_)
+    ));
+}
+
+#[test]
+fn shared_session_cache_does_not_bypass_stricter_catalogue_limits() {
+    let directory = tempdir().expect("package fixture");
+    let root = directory.path();
+    fs::create_dir_all(root.join("pkg")).expect("package source directory");
+    fs::write(
+        root.join("Core.dpk"),
+        "package Core; contains Errors in 'pkg/Errors.pas'; end.",
+    )
+    .expect("package descriptor");
+    fs::write(root.join("pkg/Errors.pas"), "unit Errors; interface end.").expect("Errors source");
+
+    let context = ProjectContext {
+        discovery_complete: true,
+        project_file: Some(root.join("App.dproj")),
+        packages: vec!["Core".to_string()],
+        search_path_entries: vec![ProjectPathEntry::legacy(root.to_path_buf())],
+        read_policy: ReadPolicy::default(),
+        ..ProjectContext::default()
+    };
+    let session_cache = ResolverSessionCache::default();
+    let resolve = |limits, session_cache| {
+        let mut resolver = UnitResolver::new_with_session_cache(
+            context.clone(),
+            vec![root.to_path_buf()],
+            FilesystemSourceStore::new(),
+            limits,
+            session_cache,
+        );
+        resolver.resolve_unit(
+            UnitResolveRequest {
+                requested_name: "Errors",
+                importer_path: &root.join("App.pas"),
+                legacy_route: None,
+            },
+            &NoCancellation,
+        )
+    };
+
+    assert!(matches!(
+        resolve(ResolverLimits::default(), session_cache.clone()).result,
+        Resolution::Found(_)
+    ));
+    let stricter_limits = ResolverLimits {
+        max_package_catalogue_entries: 0,
+        ..ResolverLimits::default()
+    };
+    assert!(matches!(
+        resolve(stricter_limits, session_cache).result,
+        Resolution::Incomplete { .. }
+    ));
 }
 
 #[test]
@@ -2219,6 +2400,34 @@ impl SourceStore for MemoryStore {
                 content_hash: 0,
             },
         })
+    }
+}
+
+struct CountingFilesystemStore {
+    inner: FilesystemSourceStore,
+    directory_reads: Arc<AtomicUsize>,
+}
+
+impl SourceStore for CountingFilesystemStore {
+    fn list_directory(
+        &mut self,
+        request: DirectoryRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<DirectoryListing, SourceStoreError> {
+        self.directory_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_directory(request, cancel)
+    }
+
+    fn overlay_candidates(&self, roots: &[PathBuf], names: &[String]) -> Vec<PathBuf> {
+        self.inner.overlay_candidates(roots, names)
+    }
+
+    fn load(
+        &mut self,
+        request: SourceRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        self.inner.load(request, cancel)
     }
 }
 

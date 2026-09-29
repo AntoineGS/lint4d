@@ -7,6 +7,7 @@
 pub(crate) mod configuration;
 pub(crate) mod include_expansion;
 pub mod navigation;
+mod project_cache;
 pub mod server;
 pub mod text;
 pub mod workspace;

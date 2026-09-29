@@ -292,7 +292,9 @@ mod cache_tests {
 
     fn fill(cache: &ProjectCache, name: &str, ctx: &ProjectContext, hash: u64, bytes: usize) {
         match cache.imports(&uri(name), ctx, hash, &HashMap::new(), &no_cancel()) {
-            Lookup::Compute(claim) => cache.store_imports(claim, import_value(vec![]), bytes),
+            Lookup::Compute(claim) => {
+                cache.store_imports(claim, import_value(vec![]), bytes, &no_cancel())
+            }
             _ => panic!("expected a miss for {name}"),
         }
     }
@@ -347,6 +349,7 @@ mod cache_tests {
                 expected: None,
             }]),
             1,
+            &no_cancel(),
         );
         std::fs::write(&path, "x").unwrap();
         assert!(matches!(
@@ -368,6 +371,43 @@ mod cache_tests {
         assert!(matches!(
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Compute(_)
+        ));
+    }
+
+    #[test]
+    fn cancelled_owner_result_is_not_cached() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let Lookup::Compute(claim) =
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!()
+        };
+        let cancel = AtomicBool::new(false);
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        cache.store_imports(claim, import_value(vec![]), 1, &cancel);
+        assert!(matches!(
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Compute(_)
+        ));
+    }
+
+    #[test]
+    fn poisoned_cache_discards_entries_and_recovers() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        fill(&cache, "Main.pas", &ctx, 1, 1);
+        cache.poison_state();
+
+        let Lookup::Compute(claim) =
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("poisoned cache must miss")
+        };
+        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+        assert!(matches!(
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
         ));
     }
 
@@ -397,7 +437,7 @@ mod cache_tests {
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(50));
-        cache.store_imports(claim, import_value(vec![]), 1);
+        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
         assert!(
             waiter.join().unwrap(),
             "the waiter must reuse the in-flight result"
@@ -507,7 +547,7 @@ mod cache_tests {
             panic!()
         };
         cache.retain_fingerprints(&HashSet::from([project_context_fingerprint(&b)]));
-        cache.store_imports(stale, import_value(vec![]), 1);
+        cache.store_imports(stale, import_value(vec![]), 1, &no_cancel());
         assert!(matches!(
             cache.imports(&uri("Main.pas"), &a, 1, &HashMap::new(), &no_cancel()),
             Lookup::Compute(_)
@@ -544,6 +584,7 @@ mod cache_tests {
                 expected: stamp,
             }]),
             1,
+            &no_cancel(),
         );
         let affected = cache.invalidate_path(&dir.join("New.pas"));
         assert_eq!(affected, vec![uri("Main.pas")]);
@@ -559,6 +600,42 @@ mod cache_tests {
         let ctx = context("A.dproj");
         fill(&cache, "Main.pas", &ctx, 1, 1);
         cache.drop_imports();
+        assert!(matches!(
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Compute(_)
+        ));
+    }
+
+    #[test]
+    fn invalidated_during_probe_verification_is_not_returned() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Observed.pas");
+        std::fs::write(&path, "unit Observed;").unwrap();
+        let expected = pascal_project::path_stamp_result(&path).unwrap().unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let Lookup::Compute(claim) =
+            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!()
+        };
+        cache.store_imports(
+            claim,
+            import_value(vec![Probe::Stamp {
+                path: path.clone(),
+                expected: Some(expected),
+            }]),
+            1,
+            &no_cancel(),
+        );
+
+        let invalidating_cache = cache.clone();
+        cache.set_validation_hook(move || {
+            assert_eq!(
+                invalidating_cache.invalidate_path(&path),
+                vec![uri("Main.pas")]
+            );
+        });
         assert!(matches!(
             cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Compute(_)
@@ -655,6 +732,8 @@ impl Default for State {
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -668,6 +747,29 @@ impl std::fmt::Debug for ProjectCache {
         formatter
             .debug_struct("ProjectCache")
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl ProjectCache {
+    fn set_validation_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.inner.validation_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    fn run_validation_hook(&self) {
+        let hook = self.inner.validation_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn poison_state(&self) {
+        let inner = self.inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _state = inner.state.lock().unwrap();
+            panic!("intentional test poison");
+        })
+        .join();
     }
 }
 
@@ -712,7 +814,24 @@ pub(crate) struct CacheStats {
 }
 
 fn lock(inner: &Inner) -> MutexGuard<'_, State> {
-    inner.state.lock().unwrap_or_else(PoisonError::into_inner)
+    match inner.state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            let mut state = PoisonError::into_inner(poisoned);
+            state.slots.clear();
+            state.generation = state.generation.wrapping_add(1);
+            state.bytes = 0;
+            let watched_directories = state.watch_counts.keys().cloned().collect::<Vec<_>>();
+            if let Some(watcher) = state.watcher.as_mut() {
+                for directory in &watched_directories {
+                    watcher.unwatch(directory);
+                }
+            }
+            state.watch_counts.clear();
+            inner.state.clear_poison();
+            state
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -754,8 +873,20 @@ impl ProjectCache {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn store_unit(&self, claim: Claim, value: UnitValue, bytes: usize) {
-        self.store(claim, Value::Unit(Arc::new(value)), bytes, Vec::new());
+    pub(crate) fn store_unit(
+        &self,
+        claim: Claim,
+        value: UnitValue,
+        bytes: usize,
+        cancel: &AtomicBool,
+    ) {
+        self.store(
+            claim,
+            Value::Unit(Arc::new(value)),
+            bytes,
+            Vec::new(),
+            cancel,
+        );
     }
 
     pub(crate) fn imports(
@@ -780,9 +911,21 @@ impl ProjectCache {
         )
     }
 
-    pub(crate) fn store_imports(&self, claim: Claim, value: ImportValue, bytes: usize) {
+    pub(crate) fn store_imports(
+        &self,
+        claim: Claim,
+        value: ImportValue,
+        bytes: usize,
+        cancel: &AtomicBool,
+    ) {
         let watch_dirs = value.watch_dirs.clone();
-        self.store(claim, Value::Import(Arc::new(value)), bytes, watch_dirs);
+        self.store(
+            claim,
+            Value::Import(Arc::new(value)),
+            bytes,
+            watch_dirs,
+            cancel,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -822,8 +965,26 @@ impl ProjectCache {
                         break;
                     };
                     drop(state);
-                    if probes_hold(&probes, overlays) {
-                        let mut state = lock(&self.inner);
+                    let probes_hold = probes_hold(&probes, overlays);
+                    #[cfg(test)]
+                    if probes_hold {
+                        self.run_validation_hook();
+                    }
+                    state = lock(&self.inner);
+                    let same_entry = match state.slots.get(&key) {
+                        Some(Slot::Ready(entry))
+                            if entry.context.as_ref() == context
+                                && entry.input_hash == input_hash =>
+                        {
+                            extract(&entry.value)
+                                .is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
+                        }
+                        _ => false,
+                    };
+                    if !same_entry {
+                        continue;
+                    }
+                    if probes_hold {
                         state.clock += 1;
                         let clock = state.clock;
                         if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key) {
@@ -831,7 +992,6 @@ impl ProjectCache {
                         }
                         return Lookup::Hit(value);
                     }
-                    state = lock(&self.inner);
                     break;
                 }
                 _ => break,
@@ -918,9 +1078,17 @@ fn release_watches(state: &mut State, entry: &Entry) {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ProjectCache {
-    fn store(&self, claim: Claim, value: Value, bytes: usize, watch_dirs: Vec<PathBuf>) {
+    fn store(
+        &self,
+        claim: Claim,
+        value: Value,
+        bytes: usize,
+        watch_dirs: Vec<PathBuf>,
+        cancel: &AtomicBool,
+    ) {
         let mut state = lock(&self.inner);
-        let current = matches!(state.slots.get(&claim.key),
+        let current = !cancel.load(Ordering::Relaxed)
+            && matches!(state.slots.get(&claim.key),
             Some(Slot::Computing { generation }) if *generation == claim.generation && claim.generation == state.generation);
         if current {
             state.clock += 1;

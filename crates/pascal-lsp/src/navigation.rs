@@ -6230,25 +6230,36 @@ impl NavigationIndex {
     /// Unknown names and unknown receivers return an empty vector. In
     /// particular, this method never performs an unrelated workspace-wide
     /// name search merely because an expression could not be typed.
+    /// Whether `navigate` has an identifier to resolve at `position`. This
+    /// depends only on the queried document, so a `false` answer cannot be
+    /// changed by indexing further dependencies.
+    pub(crate) fn has_navigable_identifier(&self, uri: &Url, position: Position) -> bool {
+        self.query_identifier(uri, position).is_some()
+    }
+
+    fn query_identifier(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<(&Document, usize, Node<'_>)> {
+        let document = self.documents.get(uri)?;
+        let offset = text::position_to_offset(&document.source, position)?;
+        if document.conditionals.is_unknown_at(offset)
+            || is_ignored_offset(document.tree.root_node(), offset)
+        {
+            return None;
+        }
+        let identifier = identifier_at(document.tree.root_node(), offset)?;
+        Some((document, offset, identifier))
+    }
+
     pub fn navigate(
         &self,
         uri: &Url,
         position: Position,
         target: NavigationTarget,
     ) -> Vec<Location> {
-        let Some(document) = self.documents.get(uri) else {
-            return Vec::new();
-        };
-        let Some(offset) = text::position_to_offset(&document.source, position) else {
-            return Vec::new();
-        };
-        if document.conditionals.is_unknown_at(offset) {
-            return Vec::new();
-        }
-        if is_ignored_offset(document.tree.root_node(), offset) {
-            return Vec::new();
-        }
-        let Some(identifier) = identifier_at(document.tree.root_node(), offset) else {
+        let Some((document, offset, identifier)) = self.query_identifier(uri, position) else {
             return Vec::new();
         };
 

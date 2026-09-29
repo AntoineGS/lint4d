@@ -6304,6 +6304,9 @@ impl Workspace {
         // prevents a deleted or changed dependency from surviving in a stale
         // per-document binding map.
         self.index.clear_import_bindings(uri);
+        if !self.navigation_query_is_answerable(uri, position, cancel)? {
+            return Ok(Vec::new());
+        }
         let mut frontier = vec![uri.clone()];
         let mut visited = HashSet::new();
         let mut initialized = HashSet::from([uri.clone()]);
@@ -6362,6 +6365,43 @@ impl Workspace {
         let locations = self.resolve_virtual_navigation(uri, position, target, cancel)?;
         self.validate_compiled_navigation_locations(&locations)?;
         Ok(locations)
+    }
+
+    /// Dependencies only supply declarations. They cannot make a cursor
+    /// answerable when it maps into no complete expansion or lands on no
+    /// identifier, so such requests must not walk the import closure. Include
+    /// files are exempt because their query positions come from owners.
+    fn navigation_query_is_answerable(
+        &mut self,
+        uri: &Url,
+        position: Position,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, String> {
+        if uri
+            .to_file_path()
+            .ok()
+            .is_some_and(|path| extension_is(&path, "inc"))
+        {
+            return Ok(true);
+        }
+        let fallback_cancel = AtomicBool::new(false);
+        let mut budget = crate::include_expansion::MappingBudget::new(
+            cancel.unwrap_or(&fallback_cancel),
+            self.include_expansion_limits().max_work,
+        );
+        let positions = self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
+        if positions.is_empty() {
+            self.warn(format!(
+                "navigation is unavailable at {uri}:{}:{}; conditional or include analysis of this source is incomplete",
+                position.line + 1,
+                position.character + 1
+            ));
+            return Ok(false);
+        }
+        Ok(positions.iter().any(|(query_uri, query_position)| {
+            self.index
+                .has_navigable_identifier(query_uri, *query_position)
+        }))
     }
 
     fn resolve_virtual_navigation(
@@ -18423,6 +18463,89 @@ BDS = '/fake/37'
             locations[0].uri,
             Url::from_file_path(&provider).expect("provider URI")
         );
+    }
+
+    #[test]
+    fn fail_closed_importer_does_not_walk_its_dependency_closure() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let provider = root.join("Provider.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello;\n  {$IFDEF DEBUG}\n  Hello;\n  {$ENDIF}\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+        )
+        .expect("provider source");
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let locations =
+            workspace.navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+
+        assert!(
+            locations.is_empty(),
+            "fail-closed importer must not claim a location: {locations:?}"
+        );
+        assert!(
+            !workspace.index.contains(&provider_uri),
+            "an unanswerable query must not load the dependency closure"
+        );
+        assert!(
+            workspace
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("navigation is unavailable")),
+            "an unanswerable query must explain why: {:?}",
+            workspace.warnings()
+        );
+    }
+
+    #[test]
+    fn cursor_off_an_identifier_does_not_walk_the_dependency_closure() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let provider = root.join("Provider.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n\n  Hello;\nend;\nend.\n",
+        )
+        .expect("main source");
+        fs::write(
+            &provider,
+            "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+        )
+        .expect("provider source");
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let main_uri = Url::from_file_path(&main).expect("main URI");
+        let provider_uri = Url::from_file_path(&provider).expect("provider URI");
+        let locations =
+            workspace.navigate(&main_uri, Position::new(6, 0), NavigationTarget::Definition);
+
+        assert!(
+            locations.is_empty(),
+            "blank line has no target: {locations:?}"
+        );
+        assert!(
+            !workspace.index.contains(&provider_uri),
+            "a position without an identifier must not load the dependency closure"
+        );
+
+        let locations =
+            workspace.navigate(&main_uri, Position::new(7, 2), NavigationTarget::Definition);
+        assert_eq!(
+            locations.len(),
+            1,
+            "identifier still resolves: {locations:?}"
+        );
+        assert_eq!(locations[0].uri, provider_uri);
     }
 
     #[test]

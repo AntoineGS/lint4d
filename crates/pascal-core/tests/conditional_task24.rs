@@ -1226,3 +1226,69 @@ fn source_constant_provenance_changes_include_exit_semantics() {
         Truth::Unknown
     );
 }
+
+#[test]
+fn many_const_parameters_do_not_exhaust_the_analysis_budget() {
+    // RTL units such as StrUtils.pas declare hundreds of `const` parameters
+    // before later conditionals; scope checks must stay linear in the source.
+    let mut source = String::from("unit Rtl;\ninterface\n");
+    for index in 0..2_000 {
+        source.push_str(&format!(
+            "function Routine{index}(const Value: string): Integer;\n"
+        ));
+    }
+    source
+        .push_str("{$DEFINE LOCAL}{$IFDEF LOCAL}{$DEFINE ENABLED}{$ENDIF}\nimplementation\nend.\n");
+
+    let analysis = conditional::analyze_with_context(&source, &ConditionalContext::default());
+
+    assert!(analysis.complete);
+    assert!(analysis.unknown_spans.is_empty());
+}
+
+#[test]
+fn trailing_comments_on_else_and_end_directives_are_ignored() {
+    // Delphi ignores text after ELSE/ENDIF/IFEND; the RTL uses it to label
+    // branches (`{$ENDIF MSWINDOWS}`, `{$ELSE !MACOSX}`).
+    let source = concat!(
+        "{$DEFINE A}",
+        "{$IFDEF A}{$DEFINE B}{$ELSE !A}{$DEFINE C}{$ENDIF A}",
+        "{$IF Defined(B)}{$DEFINE D}{$IFEND B or C}",
+    );
+
+    let analysis = conditional::analyze_with_context(source, &ConditionalContext::default());
+
+    assert!(analysis.complete);
+    assert!(analysis.unknown_spans.is_empty());
+    let activity = |body: &str| {
+        analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains(body))
+            .expect("directive is lexed")
+            .activity
+    };
+    assert_eq!(activity("DEFINE C"), Truth::False);
+    assert_eq!(activity("DEFINE D"), Truth::True);
+}
+
+#[test]
+fn assembler_double_quoted_characters_do_not_stop_directive_lexing() {
+    let source = concat!(
+        "procedure P;\r\nasm\r\n  CMP AL,\"'\"\r\n  CMP AL,'\"'\r\nend;\r\n",
+        "{$DEFINE A}{$IFDEF A}{$DEFINE B}{$ENDIF}\r\n",
+    );
+
+    let analysis = conditional::analyze_with_context(source, &ConditionalContext::default());
+
+    assert!(analysis.complete);
+    assert_eq!(
+        analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE B"))
+            .expect("directive after the asm block is lexed")
+            .activity,
+        Truth::True
+    );
+}

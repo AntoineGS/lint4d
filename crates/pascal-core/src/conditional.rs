@@ -906,6 +906,7 @@ fn analyze_lexed(
     let mut unknown_spans = Vec::new();
     let mut directives = Vec::with_capacity(lexed.directives.len());
     let mut masked_spans = Vec::with_capacity(lexed.directives.len());
+    let mut scope_scan = GlobalScopeScan::default();
     let mut cursor = 0;
 
     for raw in lexed.directives {
@@ -919,6 +920,7 @@ fn analyze_lexed(
             active,
             environment,
             &mut complete,
+            &mut scope_scan,
             &mut budget,
         ) {
             complete = false;
@@ -976,10 +978,9 @@ fn analyze_lexed(
                     cursor = raw.end;
                     continue;
                 };
+                // Delphi ignores text after ELSE, ENDIF, and IFEND; the RTL
+                // uses it to label branches (`{$ELSE !MACOSX}`).
                 let is_else = is_else_directive(&raw.body);
-                if is_else && !directive_arguments(&raw.body).trim().is_empty() {
-                    complete = false;
-                }
                 if is_else && frame.has_else {
                     complete = false;
                 }
@@ -1017,9 +1018,6 @@ fn analyze_lexed(
                 active = frame.current_active;
             }
             DirectiveKind::ConditionalEnd => {
-                if !directive_arguments(&raw.body).trim().is_empty() {
-                    complete = false;
-                }
                 let Some(mut frame) = frames.pop() else {
                     complete = false;
                     active = Truth::Unknown;
@@ -1102,6 +1100,7 @@ fn analyze_lexed(
             active,
             environment,
             &mut complete,
+            &mut scope_scan,
             &mut budget,
         )
     {
@@ -1473,6 +1472,7 @@ fn observe_source_constants(
     activity: Truth,
     environment: &mut ConditionalEnvironment,
     complete: &mut bool,
+    scope_scan: &mut GlobalScopeScan,
     budget: &mut AnalysisBudget<'_>,
 ) -> bool {
     if activity == Truth::False || range.start >= range.end {
@@ -1507,6 +1507,7 @@ fn observe_source_constants(
         let Some(is_global) = source_constant_is_provably_global(
             source,
             range.start.saturating_add(keyword_start),
+            scope_scan,
             budget,
         ) else {
             return false;
@@ -1592,35 +1593,70 @@ fn observe_source_constants(
 fn source_constant_is_provably_global(
     source: &str,
     keyword_start: usize,
+    scan: &mut GlobalScopeScan,
     budget: &mut AnalysisBudget<'_>,
 ) -> Option<bool> {
-    let Some(prefix) = source.get(..keyword_start) else {
+    if source.get(..keyword_start).is_none() {
         return Some(false);
-    };
-    if !budget.charge(prefix.len()) || !budget.charge_bytes(prefix.len()) {
-        return None;
     }
-    let bytes = prefix.as_bytes();
-    let mut cursor = 0;
-    while let Some((start, end)) = next_source_identifier(bytes, cursor) {
-        if !budget.poll() {
-            return None;
-        }
-        cursor = end;
-        let identifier = &prefix[start..end];
-        if identifier.eq_ignore_ascii_case("procedure")
-            || identifier.eq_ignore_ascii_case("function")
-            || identifier.eq_ignore_ascii_case("constructor")
-            || identifier.eq_ignore_ascii_case("destructor")
-            || identifier.eq_ignore_ascii_case("operator")
-            || identifier.eq_ignore_ascii_case("begin")
-            || identifier.eq_ignore_ascii_case("class")
-            || identifier.eq_ignore_ascii_case("record")
-        {
+    // One analysis visits `const` keywords in source order, so the prefix
+    // scan resumes where the previous keyword stopped instead of charging the
+    // whole prefix again for every declaration or `const` parameter.
+    if keyword_start < scan.queried_to {
+        *scan = GlobalScopeScan::default();
+    }
+    scan.queried_to = keyword_start;
+    let bytes = source.as_bytes();
+    loop {
+        if scan.boundary_seen {
             return Some(false);
         }
+        let token = match scan.pending {
+            Some(token) => token,
+            None if scan.cursor >= bytes.len() => return Some(true),
+            None => {
+                let token = next_source_identifier(bytes, scan.cursor);
+                let scanned_to = token.map_or(bytes.len(), |(_, end)| end);
+                let scanned = scanned_to.saturating_sub(scan.cursor);
+                if !budget.charge(scanned.max(1)) || !budget.charge_bytes(scanned) {
+                    return None;
+                }
+                scan.cursor = scanned_to;
+                let Some(token) = token else {
+                    return Some(true);
+                };
+                token
+            }
+        };
+        let (start, end) = token;
+        if start >= keyword_start {
+            scan.pending = Some(token);
+            return Some(true);
+        }
+        let identifier = &source[start..end.min(keyword_start)];
+        if is_unsupported_scope_boundary(identifier) {
+            if end > keyword_start {
+                // Only the truncated prefix is proven for this keyword.
+                scan.pending = Some(token);
+                return Some(false);
+            }
+            scan.boundary_seen = true;
+        } else if end > keyword_start {
+            scan.pending = Some(token);
+            return Some(true);
+        }
+        scan.pending = None;
     }
-    Some(true)
+}
+
+/// Incremental state for `source_constant_is_provably_global` within one
+/// analysis.
+#[derive(Default)]
+struct GlobalScopeScan {
+    cursor: usize,
+    pending: Option<(usize, usize)>,
+    boundary_seen: bool,
+    queried_to: usize,
 }
 
 fn is_unsupported_scope_boundary(identifier: &str) -> bool {
@@ -1912,6 +1948,9 @@ fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexRe
                     break;
                 }
             },
+            // Only `asm` blocks accept double quotes, as same-line character
+            // literals (`CMP AL,"'"`); the quote inside is not a Pascal string.
+            b'"' => index = skip_assembler_string(bytes, index),
             b'/' if bytes.get(index + 1) == Some(&b'/') => index = skip_line_comment(bytes, index),
             b'{' if bytes.get(index + 1) == Some(&b'$') => {
                 let Some(close) = find_byte(bytes, index + 2, b'}') else {
@@ -1995,6 +2034,17 @@ fn skip_string(bytes: &[u8], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn skip_assembler_string(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() && bytes[index] != b'\n' {
+        if bytes[index] == b'"' {
+            return index + 1;
+        }
+        index += 1;
+    }
+    start + 1
 }
 
 fn skip_line_comment(bytes: &[u8], start: usize) -> usize {

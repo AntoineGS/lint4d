@@ -1020,11 +1020,24 @@ impl ProjectCache {
         overlays: &HashMap<Url, OverlayInput>,
         cancel: &AtomicBool,
     ) -> Lookup<UnitValue> {
+        self.unit_with_epoch(uri, context, source_hash, overlays, None, cancel)
+    }
+
+    pub(crate) fn unit_with_epoch(
+        &self,
+        uri: &Url,
+        context: &ProjectContext,
+        source_hash: u64,
+        overlays: &HashMap<Url, OverlayInput>,
+        snapshot_epoch: Option<u64>,
+        cancel: &AtomicBool,
+    ) -> Lookup<UnitValue> {
         self.lookup(
             Layer::Unit,
             uri,
             context,
             source_hash,
+            snapshot_epoch,
             overlays,
             cancel,
             |value| match value {
@@ -1079,11 +1092,24 @@ impl ProjectCache {
         overlays: &HashMap<Url, OverlayInput>,
         cancel: &AtomicBool,
     ) -> Lookup<ImportValue> {
+        self.imports_with_epoch(importer, context, input_hash, overlays, None, cancel)
+    }
+
+    pub(crate) fn imports_with_epoch(
+        &self,
+        importer: &Url,
+        context: &ProjectContext,
+        input_hash: u64,
+        overlays: &HashMap<Url, OverlayInput>,
+        snapshot_epoch: Option<u64>,
+        cancel: &AtomicBool,
+    ) -> Lookup<ImportValue> {
         self.lookup(
             Layer::Import,
             importer,
             context,
             input_hash,
+            snapshot_epoch,
             overlays,
             cancel,
             |value| match value {
@@ -1117,6 +1143,7 @@ impl ProjectCache {
         uri: &Url,
         context: &ProjectContext,
         input_hash: u64,
+        snapshot_epoch: Option<u64>,
         overlays: &HashMap<Url, OverlayInput>,
         cancel: &AtomicBool,
         extract: impl Fn(&Value) -> Option<(Arc<V>, Vec<Probe>)>,
@@ -1193,7 +1220,7 @@ impl ProjectCache {
             generation,
             context: Arc::new(context.clone()),
             input_hash,
-            invalidation_epoch: state.invalidation_epoch,
+            invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
         })
     }
 }
@@ -1388,6 +1415,10 @@ impl ProjectCache {
     pub(crate) fn has_room(&self) -> bool {
         let state = lock(&self.inner);
         state.bytes < state.max_bytes
+    }
+
+    pub(crate) fn invalidation_epoch(&self) -> u64 {
+        lock(&self.inner).invalidation_epoch
     }
 
     pub(crate) fn stats(&self) -> CacheStats {

@@ -2625,6 +2625,7 @@ pub struct Workspace {
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
+    cache_epoch: Option<u64>,
     expansions: HashMap<Url, ExpansionRecord>,
     include_parents: HashMap<Url, HashSet<Url>>,
 }
@@ -3097,6 +3098,7 @@ impl Workspace {
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
             project_cache: input.project_cache.clone(),
+            cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
             analysis_records: Some(HashMap::new()),
@@ -6612,9 +6614,14 @@ impl Workspace {
         };
         let overlays = self.overlay_inputs();
         let lookup_cancel = cancel.unwrap_or(&no_cancel);
-        let import_lookup =
-            self.project_cache
-                .imports(uri, &context, import_hash, &overlays, lookup_cancel);
+        let import_lookup = self.project_cache.imports_with_epoch(
+            uri,
+            &context,
+            import_hash,
+            &overlays,
+            self.cache_epoch,
+            lookup_cancel,
+        );
         let (resolved, cached_report, import_claim, mut resolver) = match import_lookup {
             crate::project_cache::Lookup::Hit(hit) => {
                 (hit.resolved.clone(), Some(hit.report.clone()), None, None)
@@ -7254,11 +7261,12 @@ impl Workspace {
         let overlays = self.overlay_inputs();
         let lookup_cancel = AtomicBool::new(false);
         let (cached_unit, claim) = match context.as_ref().map(|context| {
-            self.project_cache.unit(
+            self.project_cache.unit_with_epoch(
                 uri,
                 context,
                 source_hash,
                 &overlays,
+                self.cache_epoch,
                 cancel.unwrap_or(&lookup_cancel),
             )
         }) {
@@ -12139,6 +12147,11 @@ impl Workspace {
             })
             .unwrap_or(None);
         self.deleted_overrides.insert(uri.clone(), stamp);
+        // Fence a snapshot captured after the first invalidation but before
+        // this tombstone became part of the workspace input.
+        if let Ok(path) = uri.to_file_path() {
+            self.project_cache.invalidate_path(&absolute_path(path));
+        }
     }
 
     fn deleted_path_snapshot_with_control(
@@ -16021,6 +16034,37 @@ mod tests {
     }
 
     #[test]
+    fn pre_delete_workspace_snapshot_cannot_repopulate_invalidated_cache() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let mut main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let mut old_snapshot = Workspace::from_analysis_input(&main.analysis_input());
+
+        main.file_event(&provider_uri, FileChange::Deleted);
+        let cache_before_old_navigation = main.project_cache().stats();
+
+        let stale_result =
+            old_snapshot.navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+        assert_eq!(
+            stale_result.first().map(|location| &location.uri),
+            Some(&provider_uri),
+            "the pre-delete snapshot should demonstrate the delayed-claim ordering"
+        );
+        assert_eq!(
+            main.project_cache().stats(),
+            cache_before_old_navigation,
+            "a pre-delete snapshot must not store entries after its cache epoch is invalidated"
+        );
+
+        let current_result = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert!(current_result.is_empty());
+    }
+
+    #[test]
     fn created_shadowing_candidate_invalidates_cached_resolution() {
         let temp = tempfile::tempdir().expect("workspace");
         let root = temp.path();
@@ -18906,6 +18950,7 @@ BDS = '/fake/37'
             overlays,
             cached_documents: HashMap::new(),
             project_cache: Default::default(),
+            cache_epoch: 0,
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),
             admission_fence_active: false,

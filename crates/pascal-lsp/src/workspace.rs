@@ -410,6 +410,7 @@ pub struct ResourceLimits {
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
+    pub max_cache_bytes: usize,
 }
 
 impl Default for ResourceLimits {
@@ -418,6 +419,7 @@ impl Default for ResourceLimits {
             max_files: DEFAULT_MAX_FILES,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
         }
     }
 }
@@ -460,6 +462,7 @@ pub(crate) struct RuntimeOptionsUpdate {
     pub(crate) max_files: RuntimeOption<usize>,
     pub(crate) max_file_bytes: RuntimeOption<usize>,
     pub(crate) max_total_bytes: RuntimeOption<usize>,
+    pub(crate) max_cache_bytes: RuntimeOption<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -473,6 +476,7 @@ pub(crate) struct RuntimeOptionsOverride {
     max_files: Option<usize>,
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
+    max_cache_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -585,6 +589,7 @@ impl RuntimeOptionsUpdate {
             max_files: RuntimeOption::Reset,
             max_file_bytes: RuntimeOption::Reset,
             max_total_bytes: RuntimeOption::Reset,
+            max_cache_bytes: RuntimeOption::Reset,
         }
     }
 }
@@ -619,6 +624,7 @@ impl RuntimeOptionsOverride {
                 max_files: self.max_files.unwrap_or(base.limits.max_files),
                 max_file_bytes: self.max_file_bytes.unwrap_or(base.limits.max_file_bytes),
                 max_total_bytes: self.max_total_bytes.unwrap_or(base.limits.max_total_bytes),
+                max_cache_bytes: self.max_cache_bytes.unwrap_or(base.limits.max_cache_bytes),
             },
         }
     }
@@ -668,6 +674,12 @@ impl RuntimeOptionsOverride {
             &mut self.max_total_bytes,
             update.max_total_bytes,
             "maxTotalBytes",
+            &mut warnings,
+        );
+        apply_runtime_field(
+            &mut self.max_cache_bytes,
+            update.max_cache_bytes,
+            "maxCacheBytes",
             &mut warnings,
         );
         warnings
@@ -737,6 +749,11 @@ pub(crate) fn parse_runtime_options(
         max_files: parse_runtime_limit(object, "maxFiles", DEFAULT_MAX_FILES),
         max_file_bytes: parse_runtime_limit(object, "maxFileBytes", DEFAULT_MAX_FILE_BYTES),
         max_total_bytes: parse_runtime_limit(object, "maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES),
+        max_cache_bytes: parse_runtime_limit(
+            object,
+            "maxCacheBytes",
+            crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+        ),
     })
 }
 
@@ -1013,6 +1030,7 @@ struct RawWorkspaceOptions {
     max_files: Option<usize>,
     max_file_bytes: Option<usize>,
     max_total_bytes: Option<usize>,
+    max_cache_bytes: Option<usize>,
 }
 
 fn parse_conditional_context_values(
@@ -1192,6 +1210,14 @@ impl WorkspaceOptions {
         if let Some(value) = raw.max_total_bytes {
             limits.max_total_bytes =
                 bounded_limit(value, 1, DEFAULT_MAX_TOTAL_BYTES, "maxTotalBytes")?;
+        }
+        if let Some(value) = raw.max_cache_bytes {
+            limits.max_cache_bytes = bounded_limit(
+                value,
+                1,
+                crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
+                "maxCacheBytes",
+            )?;
         }
         Ok(Self {
             source_paths: raw.source_paths,
@@ -2913,6 +2939,9 @@ impl Workspace {
             roots,
             ..Self::default()
         };
+        workspace
+            .project_cache
+            .set_max_bytes(workspace.options.limits.max_cache_bytes);
         if let Err(error) = workspace.overrides.effective_for(None, None) {
             workspace.warn(error);
         }
@@ -2970,6 +2999,8 @@ impl Workspace {
 
         let project_file_changed = self.options.project_file != prepared.options.project_file;
         self.options = prepared.options;
+        self.project_cache
+            .set_max_bytes(self.options.limits.max_cache_bytes);
         self.roots = prepared.roots;
 
         self.bump_source_generation();
@@ -18463,6 +18494,103 @@ BDS = '/fake/37'
         );
     }
 
+    fn store_pinned_test_import(workspace: &Workspace, root: &std::path::Path, bytes: usize) {
+        let context = ProjectContext::default();
+        let importer = Url::from_file_path(root.join("Main.pas")).expect("importer URI");
+        let owner = Url::from_file_path(root.join("Owner.pas")).expect("owner URI");
+        let cancel = AtomicBool::new(false);
+        let crate::project_cache::Lookup::Compute(claim) =
+            workspace
+                .project_cache
+                .imports(&importer, &context, 1, &HashMap::new(), &cancel)
+        else {
+            panic!("expected an import cache miss");
+        };
+        workspace.project_cache.pin(
+            &owner,
+            vec![(
+                importer,
+                crate::navigation::compiled_dcu::project_context_fingerprint(&context),
+            )],
+        );
+        workspace.project_cache.store_imports(
+            claim,
+            crate::project_cache::ImportValue {
+                resolved: pascal_core::ResolvedImports {
+                    bindings: vec![],
+                    dependencies: vec![],
+                    complete: true,
+                },
+                report: pascal_core::ResolutionReport {
+                    observations: vec![],
+                    warnings: vec![],
+                    complete: true,
+                    incomplete_reasons: vec![],
+                },
+                probes: vec![],
+                watch_dirs: vec![],
+            },
+            bytes,
+            &cancel,
+        );
+    }
+
+    #[test]
+    fn max_cache_bytes_initialization_option_sets_cache_budget() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let options = WorkspaceOptions::parse(Some(&json!({"maxCacheBytes": 1_048_576})))
+            .expect("maxCacheBytes initialization option");
+        assert_eq!(options.limits.max_cache_bytes, 1_048_576);
+
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], options);
+        store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
+
+        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
+        assert!(!workspace.project_cache.has_room());
+    }
+
+    #[test]
+    fn max_cache_bytes_defaults_to_two_gibibytes() {
+        let options = WorkspaceOptions::parse(None).expect("default initialization options");
+
+        assert_eq!(options.limits.max_cache_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_cache_bytes_zero_initialization_option_is_rejected() {
+        let error = WorkspaceOptions::parse(Some(&json!({"maxCacheBytes": 0})))
+            .expect_err("zero cache budget must be rejected");
+
+        assert_eq!(
+            error,
+            "initializationOptions.maxCacheBytes must be at least 1"
+        );
+    }
+
+    #[test]
+    fn max_cache_bytes_runtime_option_updates_cache_budget() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let update = super::parse_runtime_options(&json!({"maxCacheBytes": 1_048_576}))
+            .expect("runtime cache budget option");
+        let mut overrides = RuntimeOptionsOverride::default();
+        assert!(overrides.apply(update).is_empty());
+        let options = overrides.effective(&workspace.options);
+        let prepared = Workspace::prepare_runtime_options_for_roots(
+            workspace.configuration_root_paths(),
+            options,
+            &AtomicBool::new(false),
+        )
+        .expect("prepared runtime options");
+
+        assert!(workspace.apply_prepared_runtime_options(prepared));
+        store_pinned_test_import(&workspace, temp.path(), 2 * 1024 * 1024);
+
+        assert_eq!(workspace.project_cache.stats().bytes, 2 * 1024 * 1024);
+        assert!(!workspace.project_cache.has_room());
+    }
+
     #[test]
     fn runtime_conditional_context_parsing_is_typed_and_bounded() {
         let update = super::parse_runtime_options(&json!({
@@ -19681,6 +19809,7 @@ BDS = '/fake/37'
                 max_files: 10,
                 max_file_bytes: source.len() + 3,
                 max_total_bytes: source.len() * 3,
+                max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
             },
             ..WorkspaceOptions::default()
         };
@@ -19745,6 +19874,7 @@ BDS = '/fake/37'
                 max_files: 10,
                 max_file_bytes: 1024,
                 max_total_bytes: first_source.len() * 2 + second_source.len() * 2,
+                max_cache_bytes: crate::project_cache::DEFAULT_MAX_CACHE_BYTES,
             },
             ..WorkspaceOptions::default()
         };

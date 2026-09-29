@@ -3934,6 +3934,7 @@ fn runtime_settings_section(settings: &Value) -> Result<Option<Value>, String> {
         "maxFiles",
         "maxFileBytes",
         "maxTotalBytes",
+        "maxCacheBytes",
     ]
     .iter()
     .any(|key| object.contains_key(*key))

@@ -733,6 +733,27 @@ mod cache_tests {
     }
 
     #[test]
+    fn invalidation_after_claim_prevents_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!()
+        };
+
+        cache.invalidate_path(&temp.path().join("Provider.pas"));
+        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+
+        assert_eq!(cache.stats().imports, 0);
+        assert!(matches!(
+            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Compute(_)
+        ));
+    }
+
+    #[test]
     fn drop_imports_forces_resolution_again() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
@@ -845,6 +866,7 @@ struct State {
     bytes: usize,
     clock: u64,
     generation: u64,
+    invalidation_epoch: u64,
     max_bytes: usize,
     pins: HashMap<Url, HashSet<(Url, u64)>>,
     watch_counts: HashMap<PathBuf, usize>,
@@ -858,6 +880,7 @@ impl Default for State {
             bytes: 0,
             clock: 0,
             generation: 0,
+            invalidation_epoch: 0,
             max_bytes: DEFAULT_MAX_CACHE_BYTES,
             pins: HashMap::new(),
             watch_counts: HashMap::new(),
@@ -926,6 +949,7 @@ pub(crate) struct Claim {
     inner: Arc<Inner>,
     key: Key,
     generation: u64,
+    invalidation_epoch: u64,
     context: Arc<ProjectContext>,
     input_hash: u64,
 }
@@ -1169,6 +1193,7 @@ impl ProjectCache {
             generation,
             context: Arc::new(context.clone()),
             input_hash,
+            invalidation_epoch: state.invalidation_epoch,
         })
     }
 }
@@ -1246,6 +1271,7 @@ impl ProjectCache {
     ) {
         let mut state = lock(&self.inner);
         let current = !cancel.load(Ordering::Relaxed)
+            && claim.invalidation_epoch == state.invalidation_epoch
             && matches!(state.slots.get(&claim.key),
             Some(Slot::Computing { generation }) if *generation == claim.generation && claim.generation == state.generation);
         if current {
@@ -1283,6 +1309,7 @@ impl ProjectCache {
     /// Evicts every entry that depends on `path` and returns the affected URIs.
     pub(crate) fn invalidate_path(&self, path: &Path) -> Vec<Url> {
         let mut state = lock(&self.inner);
+        state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
         let parent = path.parent();
         let doomed = state
             .slots
@@ -1302,7 +1329,9 @@ impl ProjectCache {
                         | Probe::Content { path: observed, .. } => {
                             observed == path || Some(observed.as_path()) == parent
                         }
-                        Probe::Overlay { .. } => false,
+                        Probe::Overlay { uri, .. } => {
+                            uri.to_file_path().ok().as_deref() == Some(path)
+                        }
                     });
                 hit.then(|| key.clone())
             })

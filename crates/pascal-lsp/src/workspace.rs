@@ -4154,6 +4154,11 @@ impl Workspace {
         let override_changed = uri
             .to_file_path()
             .is_ok_and(|path| is_immutable_override_file(&path));
+        if override_changed {
+            if let Ok(path) = uri.to_file_path() {
+                self.project_cache.invalidate_path(&absolute_path(path));
+            }
+        }
         if !override_changed {
             self.bump_source_generation();
             diagnostic_uris.extend(self.mark_source_change_with_control(uri, cancel, budget)?);
@@ -4730,6 +4735,9 @@ impl Workspace {
             // interrupted. Check cancellation on both sides; if it lands
             // during the syscall the worker latches the global fail-closed
             // fence and restores every batch tombstone without further I/O.
+            if let Ok(path) = uri.to_file_path() {
+                self.project_cache.invalidate_path(&absolute_path(path));
+            }
             self.remember_deleted(uri);
             check_workspace_cancel(Some(&budget.cancellation))?;
         }
@@ -4789,6 +4797,9 @@ impl Workspace {
                 // observation. The permanent global fence prevents serving
                 // state that could depend on the unretained deletion.
                 continue;
+            }
+            if let Ok(path) = uri.to_file_path() {
+                self.project_cache.invalidate_path(&absolute_path(path));
             }
             self.deleted_overrides.insert(uri.clone(), None);
         }
@@ -12121,7 +12132,11 @@ impl Workspace {
         let stamp = uri
             .to_file_path()
             .ok()
-            .map(|path| disk_stamp(&absolute_path(path)))
+            .map(|path| {
+                let path = absolute_path(path);
+                self.project_cache.invalidate_path(&path);
+                disk_stamp(&path)
+            })
             .unwrap_or(None);
         self.deleted_overrides.insert(uri.clone(), stamp);
     }
@@ -12467,6 +12482,9 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Url>, String> {
+        if let Ok(path) = uri.to_file_path() {
+            self.project_cache.invalidate_path(&absolute_path(path));
+        }
         let dependent_diagnostics =
             self.invalidate_expansion_dependents_with_control(uri, cancel, budget)?;
         // Worker freshness uses exact source observations and the bounded
@@ -15971,6 +15989,35 @@ mod tests {
         super::test_reset_import_resolution_count();
         worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
         assert_eq!(super::test_import_resolution_count(), 0);
+    }
+
+    #[test]
+    fn client_delete_invalidates_cached_resolution_even_if_file_remains_on_disk() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let mut main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let first = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(
+            first.first().map(|location| &location.uri),
+            Some(&provider_uri)
+        );
+
+        main.file_event(&provider_uri, FileChange::Deleted);
+        assert!(provider_uri.to_file_path().unwrap().is_file());
+
+        let second = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert!(
+            second.is_empty(),
+            "an authoritative client delete must beat unchanged bytes and cache probes"
+        );
     }
 
     #[test]

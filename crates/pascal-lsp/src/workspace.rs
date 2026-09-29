@@ -12214,6 +12214,10 @@ impl Workspace {
         self.source_generation
     }
 
+    pub(crate) fn project_cache(&self) -> &crate::project_cache::ProjectCache {
+        &self.project_cache
+    }
+
     pub(crate) fn configuration_generation(&self) -> u64 {
         self.configuration_generation
     }

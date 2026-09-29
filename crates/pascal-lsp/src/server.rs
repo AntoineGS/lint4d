@@ -10195,6 +10195,13 @@ fn run_connection(
     let watcher_registration = watcher_registration_supported
         .then(|| register_file_watcher(connection, &workspace, relative_pattern_support))
         .transpose()?;
+    let (watch_sender, watch_events) = unbounded();
+    match crate::file_watch::NotifyWatcher::start(watch_sender) {
+        Ok(watcher) => workspace.project_cache().set_watcher(Box::new(watcher)),
+        Err(error) => {
+            eprintln!("pascal-lsp: warning: {error}; cache freshness uses stat checks only")
+        }
+    }
     let jobs =
         AnalysisJobs::with_test_barriers_and_progress(test_barriers, work_done_progress_supported);
 
@@ -10208,6 +10215,7 @@ fn run_connection(
         diagnostic_refresh_supported,
         &mut configuration,
         watcher_registration,
+        watch_events,
         jobs,
     )
 }
@@ -10470,6 +10478,7 @@ fn event_loop(
     diagnostic_refresh_supported: bool,
     configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
+    watch_events: Receiver<crate::file_watch::WatchEvent>,
     mut jobs: AnalysisJobs,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
@@ -10480,7 +10489,9 @@ fn event_loop(
     let mut file_notification_worker: Option<WorkspaceFileNotificationWorker> = None;
     let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
     let mut pending_diagnostic_clears = PendingDiagnosticClears::default();
+    let mut rewarm = Vec::new();
     loop {
+        drain_watch_events(workspace, &watch_events, &mut rewarm);
         connection.flush()?;
         let diagnostic_clears_were_pending = !pending_diagnostic_clears.is_empty();
         let mut diagnostic_publication_budget = DiagnosticPublicationTurnBudget::default();
@@ -10757,6 +10768,7 @@ fn event_loop(
                 None => match connection.receiver().recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
+                        drain_watch_events(workspace, &watch_events, &mut rewarm);
                         if !workspace_busy
                             && !shutdown_received
                             && !pull_diagnostics_supported
@@ -10783,6 +10795,7 @@ fn event_loop(
             match connection.receiver().recv_timeout(timeout) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
+                    drain_watch_events(workspace, &watch_events, &mut rewarm);
                     if !workspace_busy
                         && !shutdown_received
                         && !pull_diagnostics_supported
@@ -11360,6 +11373,20 @@ fn event_loop(
             jobs.pump_partial_deliveries(connection, workspace)?;
         }
     }
+}
+
+fn drain_watch_events(
+    workspace: &Workspace,
+    watch_events: &Receiver<crate::file_watch::WatchEvent>,
+    rewarm: &mut Vec<Url>,
+) {
+    while let Ok(event) = watch_events.try_recv() {
+        rewarm.extend(crate::file_watch::apply_watch_event(
+            workspace.project_cache(),
+            event,
+        ));
+    }
+    rewarm.clear();
 }
 
 fn event_loop_receive_timeout(
@@ -15815,6 +15842,7 @@ mod tests {
             false,
             &mut configuration,
             None,
+            crossbeam_channel::unbounded().1,
             AnalysisJobs::new(),
         )
         .expect("event loop completes");

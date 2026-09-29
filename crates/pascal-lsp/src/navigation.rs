@@ -15553,6 +15553,10 @@ pub(crate) struct ParsedDocument {
 }
 
 impl ParsedDocument {
+    pub(crate) fn unit_name(&self) -> &str {
+        &self.unit_name
+    }
+
     pub(crate) fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

@@ -114,6 +114,13 @@ pub trait SourceStore {
         request: SourceRequest<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<LoadedSource, SourceStoreError>;
+
+    /// Declared unit name for an already loaded source, when the store knows
+    /// it for exactly these bytes. `Some(None)` means the source declares no
+    /// unit. `None` means unknown, so the resolver parses the source.
+    fn declared_unit_name(&self, _source: &LoadedSource) -> Option<Option<String>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1451,13 +1458,16 @@ impl<S: SourceStore> UnitResolver<S> {
                 cancel,
             ) {
                 Ok(source) => {
-                    let metadata = parse_source_metadata(&source);
+                    let declared_name = self
+                        .store
+                        .declared_unit_name(&source)
+                        .unwrap_or_else(|| parse_source_metadata(&source).declared_name);
                     let candidate = ResolutionCandidate {
                         path: source.path.clone(),
-                        declared_name: metadata.declared_name.clone(),
+                        declared_name: declared_name.clone(),
                     };
                     if declared_name_matches(
-                        metadata.declared_name.as_deref(),
+                        declared_name.as_deref(),
                         requested,
                         lookup,
                         &self.context,

@@ -55,6 +55,7 @@ pub(crate) struct LspSourceStore {
     deleted_overrides: HashMap<PathBuf, Option<DiskStamp>>,
     rejected_paths: std::collections::HashSet<PathBuf>,
     context: ProjectContext,
+    project_cache: crate::project_cache::ProjectCache,
     disk: FilesystemSourceStore,
 }
 
@@ -111,6 +112,7 @@ impl LspSourceStore {
             deleted_overrides,
             rejected_paths,
             context,
+            project_cache: input.project_cache.clone(),
             disk: FilesystemSourceStore::new(),
         }
     }
@@ -219,6 +221,15 @@ impl LspSourceStore {
 }
 
 impl SourceStore for LspSourceStore {
+    fn declared_unit_name(&self, source: &LoadedSource) -> Option<Option<String>> {
+        let uri = Url::from_file_path(&source.path).ok()?;
+        let hash = match &source.revision {
+            SourceRevision::Disk { content_hash, .. }
+            | SourceRevision::Overlay { content_hash, .. } => *content_hash,
+        };
+        self.project_cache.declared_unit_name(&uri, hash)
+    }
+
     fn list_directory(
         &mut self,
         request: DirectoryRequest<'_>,

@@ -54,6 +54,106 @@ pub(crate) fn unit_value_bytes(indexed_len: usize) -> usize {
     indexed_len.saturating_mul(RETAINED_BYTES_PER_SOURCE_BYTE)
 }
 
+pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usize {
+    resolved
+        .dependencies
+        .iter()
+        .map(|unit| unit.source.bytes.len())
+        .sum::<usize>()
+        .saturating_add(4096)
+}
+
+/// Converts resolver observations and dependency revisions into probes, and
+/// lists the directories whose watches protect the entry.
+pub(crate) fn report_probes(
+    report: &pascal_core::ResolutionReport,
+    resolved: &pascal_core::ResolvedImports,
+) -> (Vec<Probe>, Vec<PathBuf>) {
+    use pascal_core::ResolutionObservation as O;
+
+    fn push_revision(probes: &mut Vec<Probe>, path: &Path, revision: &pascal_core::SourceRevision) {
+        match revision {
+            pascal_core::SourceRevision::Disk {
+                stamp,
+                content_hash,
+                ..
+            } => probes.push(Probe::Content {
+                path: path.to_path_buf(),
+                stamp: Some(stamp.clone()),
+                content_hash: *content_hash,
+            }),
+            pascal_core::SourceRevision::Overlay {
+                version,
+                content_hash,
+            } => {
+                if let Ok(uri) = Url::from_file_path(path) {
+                    probes.push(Probe::Overlay {
+                        uri,
+                        version: *version,
+                        content_hash: *content_hash,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut probes = Vec::new();
+    let mut dirs = Vec::new();
+
+    for unit in &resolved.dependencies {
+        push_revision(&mut probes, &unit.source.path, &unit.source.revision);
+    }
+    for observation in &report.observations {
+        match observation {
+            O::Directory { path, stamp, .. } => {
+                probes.push(Probe::Stamp {
+                    path: path.clone(),
+                    expected: stamp.clone(),
+                });
+                dirs.push(path.clone());
+            }
+            O::Candidate {
+                path,
+                stamp,
+                present,
+                ..
+            } => probes.push(Probe::Stamp {
+                path: path.clone(),
+                expected: if *present { stamp.clone() } else { None },
+            }),
+            O::Payload {
+                path,
+                revision: source_revision,
+                ..
+            } => push_revision(&mut probes, path, source_revision),
+            O::Metadata(pascal_project::MetadataObservation::Stat { path }) => {
+                probes.push(Probe::Stamp {
+                    path: path.clone(),
+                    expected: pascal_project::path_stamp_result(path).ok().flatten(),
+                });
+            }
+            O::Metadata(pascal_project::MetadataObservation::Payload {
+                path,
+                stamp,
+                content_hash,
+                ..
+            }) => probes.push(Probe::Content {
+                path: path.clone(),
+                stamp: stamp.clone(),
+                content_hash: *content_hash,
+            }),
+            O::ProjectRead(read) => probes.push(Probe::Content {
+                path: read.path.clone(),
+                stamp: Some(read.stamp.clone()),
+                content_hash: read.content_hash,
+            }),
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    (probes, dirs)
+}
+
 /// Every include candidate observed while resolving an expansion, plus the
 /// content revision of each include source that was read.
 pub(crate) fn expansion_probes(expansion: &ExpansionResult) -> Vec<Probe> {
@@ -908,6 +1008,26 @@ impl ProjectCache {
                 Value::Import(_) => None,
             },
         )
+    }
+
+    /// Declared unit name of a cached parse of exactly these bytes, under any
+    /// project context. The declared name does not depend on project settings.
+    pub(crate) fn declared_unit_name(
+        &self,
+        uri: &Url,
+        content_hash: u64,
+    ) -> Option<Option<String>> {
+        let state = lock(&self.inner);
+        state.slots.iter().find_map(|(key, slot)| match slot {
+            Slot::Ready(Entry {
+                value: Value::Unit(unit),
+                input_hash,
+                ..
+            }) if key.uri == *uri && *input_hash == content_hash => {
+                Some(Some(unit.parsed.unit_name().to_string()).filter(|name| !name.is_empty()))
+            }
+            _ => None,
+        })
     }
 
     #[allow(dead_code)]

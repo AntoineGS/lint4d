@@ -640,6 +640,69 @@ fn declared_name_mismatch_is_not_a_unit_match() {
     assert!(matches!(result.result, Resolution::Unavailable { .. }));
 }
 
+struct DeclaredNameStore {
+    inner: MemoryStore,
+    names: HashMap<PathBuf, String>,
+}
+
+impl SourceStore for DeclaredNameStore {
+    fn list_directory(
+        &mut self,
+        request: DirectoryRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<DirectoryListing, SourceStoreError> {
+        self.inner.list_directory(request, cancel)
+    }
+
+    fn overlay_candidates(&self, roots: &[PathBuf], names: &[String]) -> Vec<PathBuf> {
+        self.inner.overlay_candidates(roots, names)
+    }
+
+    fn load(
+        &mut self,
+        request: SourceRequest<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        self.inner.load(request, cancel)
+    }
+
+    fn declared_unit_name(&self, source: &LoadedSource) -> Option<Option<String>> {
+        self.names.get(&source.path).cloned().map(Some)
+    }
+}
+
+#[test]
+fn resolver_uses_store_provided_declared_names() {
+    let mut inner = MemoryStore::default();
+    inner.add(
+        "/workspace/Errors.pas",
+        "unit Different.Errors; interface implementation end.",
+    );
+    let store = DeclaredNameStore {
+        inner,
+        names: HashMap::from([(PathBuf::from("/workspace/Errors.pas"), "Errors".to_string())]),
+    };
+    let mut resolver = UnitResolver::new(
+        fixture_context(),
+        vec![PathBuf::from("/workspace")],
+        store,
+        Default::default(),
+    );
+
+    let result = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Errors",
+            importer_path: Path::new("/workspace/App.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+    assert!(
+        matches!(result.result, Resolution::Found(_)),
+        "the store-provided declared name must replace parsing the candidate"
+    );
+}
+
 #[test]
 fn project_graph_retains_active_include_payload_and_occurrence() {
     let mut store = MemoryStore::default();

@@ -2583,6 +2583,7 @@ pub struct Workspace {
     configuration_change_generations: HashMap<Url, u64>,
     global_source_change_generation: u64,
     global_configuration_change_generation: u64,
+    project_cache: crate::project_cache::ProjectCache,
     expansions: HashMap<Url, ExpansionRecord>,
     include_parents: HashMap<Url, HashSet<Url>>,
 }
@@ -3049,6 +3050,7 @@ impl Workspace {
             deleted_overrides: input.deleted_overrides.clone(),
             document_owners: input.document_owners.clone(),
             cached_documents: input.cached_documents.clone(),
+            project_cache: input.project_cache.clone(),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
             analysis_records: Some(HashMap::new()),
@@ -7099,12 +7101,38 @@ impl Workspace {
             }
             return Ok(false);
         }
-        let conditional_context = self
+        let context = self
             .contexts
             .get(context_key)
-            .map(|state| state.context.effective_conditional_context())
+            .map(|state| state.context.clone());
+        let conditional_context = context
+            .as_ref()
+            .map(|context| context.effective_conditional_context())
             .unwrap_or_default();
-        let expansion = if rename::may_contain_include_directive(source.as_bytes()) {
+        let source_hash = crate::project_cache::overlay_content_hash(&source);
+        let overlays = self.overlay_inputs();
+        let lookup_cancel = AtomicBool::new(false);
+        let (cached_unit, claim) = match context.as_ref().map(|context| {
+            self.project_cache.unit(
+                uri,
+                context,
+                source_hash,
+                &overlays,
+                cancel.unwrap_or(&lookup_cancel),
+            )
+        }) {
+            Some(crate::project_cache::Lookup::Hit(unit)) => (Some(unit), None),
+            Some(crate::project_cache::Lookup::Compute(claim)) => (None, Some(claim)),
+            Some(crate::project_cache::Lookup::Cancelled) => {
+                return Err(CANCELLATION_MESSAGE.to_string());
+            }
+            None => (None, None),
+        };
+        let expansion = if let Some(expansion) =
+            cached_unit.as_ref().and_then(|unit| unit.expansion.clone())
+        {
+            Some((*expansion).clone())
+        } else if rename::may_contain_include_directive(source.as_bytes()) {
             let mut expansion =
                 match self.expand_source_with_control(uri, &source, context_key, cancel, budget) {
                     Ok(expansion) => expansion,
@@ -7155,15 +7183,19 @@ impl Workspace {
         if let Some(budget) = budget {
             budget.charge_indexed_bytes(indexed_source.len())?;
         }
-        let cached = self
-            .cached_documents
-            .get(uri)
-            .filter(|cached| {
-                self.contexts
-                    .get(context_key)
-                    .is_some_and(|state| state.context == cached.context)
-            })
-            .map(|cached| cached.parsed.clone());
+        let cached = cached_unit
+            .as_ref()
+            .map(|unit| unit.parsed.clone())
+            .or_else(|| {
+                self.cached_documents
+                    .get(uri)
+                    .filter(|cached| {
+                        context
+                            .as_ref()
+                            .is_some_and(|context| *context == cached.context)
+                    })
+                    .map(|cached| cached.parsed.clone())
+            });
         let update = match cancel {
             Some(cancel) => self.index.update_with_context_and_cached_with_cancel(
                 uri.clone(),
@@ -7192,6 +7224,11 @@ impl Workspace {
             return Ok(false);
         }
         check_workspace_cancel(cancel)?;
+        let cached_expansion = if claim.is_some() {
+            expansion.clone()
+        } else {
+            None
+        };
 
         let old_size = self.indexed_sizes.insert(uri.clone(), indexed_source.len());
         if let Some(old_size) = old_size {
@@ -7224,7 +7261,42 @@ impl Workspace {
                 cancel.unwrap_or(&fallback_cancel),
             )?;
         }
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.check_cancelled()?;
+        }
+        if let (Some(claim), Some(parsed)) = (claim, self.index.parsed_document(uri)) {
+            let probes = cached_expansion
+                .as_ref()
+                .map(crate::project_cache::expansion_probes)
+                .unwrap_or_default();
+            self.project_cache.store_unit(
+                claim,
+                crate::project_cache::UnitValue {
+                    parsed,
+                    expansion: cached_expansion.map(std::sync::Arc::new),
+                    probes,
+                },
+                crate::project_cache::unit_value_bytes(indexed_source.len()),
+                cancel.unwrap_or(&lookup_cancel),
+            );
+        }
         Ok(true)
+    }
+
+    fn overlay_inputs(&self) -> HashMap<Url, rename::OverlayInput> {
+        self.open_documents
+            .iter()
+            .filter_map(|(uri, document)| {
+                Some((
+                    canonical_file_uri(uri),
+                    rename::OverlayInput {
+                        text: document.text.clone()?,
+                        version: document.version,
+                    },
+                ))
+            })
+            .collect()
     }
 
     fn include_expansion_limits(&self) -> ExpansionLimits {
@@ -15713,6 +15785,102 @@ mod tests {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
     }
 
+    fn worker_view(main: &Workspace) -> Workspace {
+        Workspace::from_analysis_input(&main.analysis_input())
+    }
+
+    fn provider_fixture(root: &std::path::Path) -> (Url, Url) {
+        let main = root.join("Main.pas");
+        let provider = root.join("Provider.pas");
+        fs::write(&main, "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n").unwrap();
+        fs::write(&provider, "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n").unwrap();
+        (
+            Url::from_file_path(&main).unwrap(),
+            Url::from_file_path(&provider).unwrap(),
+        )
+    }
+
+    #[test]
+    fn second_navigation_reuses_cached_dependency_parse() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+
+        let first = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(first.first().map(|l| &l.uri), Some(&provider_uri));
+
+        crate::navigation::test_reset_document_parse_count();
+        let second = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(second.first().map(|l| &l.uri), Some(&provider_uri));
+        assert_eq!(
+            crate::navigation::test_document_parse_count(),
+            0,
+            "a later request must reuse every cached parse"
+        );
+    }
+
+    #[test]
+    fn edited_dependency_on_disk_is_reparsed_not_served_stale() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+
+        fs::write(temp.path().join("Provider.pas"),
+            "unit Provider;\ninterface\n\n\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n").unwrap();
+        let moved = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].uri, provider_uri);
+        assert_eq!(
+            moved[0].range.start.line, 6,
+            "declaration moved; the cache must not serve the pre-edit line 4"
+        );
+    }
+
+    #[test]
+    fn changed_include_invalidates_cached_expansion() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(root.join("Main.pas"), "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n").unwrap();
+        fs::write(root.join("Provider.pas"), "unit Provider;\ninterface\n{$I Decl.inc}\nimplementation\nprocedure Hello; begin end;\nend.\n").unwrap();
+        fs::write(root.join("Decl.inc"), "procedure Hello;\n").unwrap();
+        let main_uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let main = test_workspace(vec![root.to_path_buf()], Default::default());
+        let first = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(
+            first.len(),
+            1,
+            "fixture must resolve through the include: {first:?}"
+        );
+
+        fs::write(root.join("Decl.inc"), "procedure Goodbye;\n").unwrap();
+        let second = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert!(
+            second.is_empty(),
+            "Hello no longer exists; the cached expansion must not be reused: {second:?}"
+        );
+    }
+
     #[test]
     fn installation_selection_is_project_scoped_and_invalid_choices_are_transactional() {
         let temp = tempfile::tempdir().expect("workspace");
@@ -18338,6 +18506,7 @@ BDS = '/fake/37'
             document_owners: HashMap::new(),
             overlays,
             cached_documents: HashMap::new(),
+            project_cache: Default::default(),
             rejected_documents: HashSet::new(),
             rejection_reasons: HashMap::new(),
             admission_fence_active: false,

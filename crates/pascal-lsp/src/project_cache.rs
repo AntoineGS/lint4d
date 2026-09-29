@@ -50,6 +50,44 @@ pub(crate) fn overlay_content_hash(text: &str) -> u64 {
     pascal_project::content_hash_bytes(text.as_bytes())
 }
 
+pub(crate) fn unit_value_bytes(indexed_len: usize) -> usize {
+    indexed_len.saturating_mul(RETAINED_BYTES_PER_SOURCE_BYTE)
+}
+
+/// Every include candidate observed while resolving an expansion, plus the
+/// content revision of each include source that was read.
+pub(crate) fn expansion_probes(expansion: &ExpansionResult) -> Vec<Probe> {
+    expansion
+        .dependencies
+        .iter()
+        .flat_map(|include| include.observations.iter())
+        .filter_map(|observation| {
+            let path = observation.path.clone();
+            if let (Some(version), Some(content_hash)) =
+                (observation.overlay_version, observation.content_hash)
+            {
+                return Url::from_file_path(&path).ok().map(|uri| Probe::Overlay {
+                    uri,
+                    version,
+                    content_hash,
+                });
+            }
+
+            Some(match observation.content_hash {
+                Some(content_hash) => Probe::Content {
+                    path,
+                    stamp: observation.stamp.clone(),
+                    content_hash,
+                },
+                None => Probe::Stamp {
+                    path,
+                    expected: observation.stamp.clone(),
+                },
+            })
+        })
+        .collect()
+}
+
 fn current_stamp(path: &Path) -> Result<Option<ProjectReadStamp>, ()> {
     pascal_project::path_stamp_result(path).map_err(|_| ())
 }

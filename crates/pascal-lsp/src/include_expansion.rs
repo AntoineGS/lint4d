@@ -321,7 +321,7 @@ pub(crate) trait IncludeResolver {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ExpansionResult {
     pub(crate) expanded: ExpandedSource,
     pub(crate) dependencies: Vec<ResolvedInclude>,

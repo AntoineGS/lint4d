@@ -133,6 +133,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
+    pub(crate) project_cache: crate::project_cache::ProjectCache,
     pub(crate) rejected_documents: HashSet<Url>,
     pub(crate) rejection_reasons: HashMap<Url, String>,
     pub(crate) admission_fence_active: bool,
@@ -1347,6 +1348,7 @@ impl Workspace {
             document_owners: self.document_owners.clone(),
             overlays,
             cached_documents,
+            project_cache: self.project_cache.clone(),
             rejected_documents,
             rejection_reasons,
             admission_fence_active: self.rejected_open_fence_permanent

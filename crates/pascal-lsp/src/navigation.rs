@@ -1005,6 +1005,12 @@ impl NavigationIndex {
             .collect()
     }
 
+    pub(crate) fn parsed_document(&self, uri: &Url) -> Option<Arc<ParsedDocument>> {
+        self.documents
+            .get(uri)
+            .map(|document| document.parsed.clone())
+    }
+
     /// Remove a document and all symbols contributed by it.
     pub fn remove(&mut self, uri: &Url) {
         if self.compiled_unit_uris.remove(uri) {

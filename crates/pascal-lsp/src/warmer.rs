@@ -1,0 +1,587 @@
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, Sender};
+use lsp_types::Url;
+
+use crate::workspace::Workspace;
+use crate::workspace::rename::WorkspaceInput;
+
+#[derive(Default)]
+pub(crate) struct InteractiveGate {
+    busy: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl InteractiveGate {
+    pub(crate) fn set(&self, busy: usize) {
+        *self.busy.lock().unwrap_or_else(PoisonError::into_inner) = busy;
+        if busy == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    /// Returns `false` if cancelled while interactive work was pending.
+    pub(crate) fn wait_idle(&self, cancel: &AtomicBool) -> bool {
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        while *busy > 0 {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            busy = self
+                .idle
+                .wait_timeout(busy, Duration::from_millis(25))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        !cancel.load(Ordering::Relaxed)
+    }
+
+    /// Checks whether warming may proceed without waiting while it owns a cache claim.
+    pub(crate) fn try_wait_idle(&self, cancel: &AtomicBool) -> bool {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        *self.busy.lock().unwrap_or_else(PoisonError::into_inner) == 0
+            && !cancel.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WarmQueue {
+    order: VecDeque<Url>,
+    queued: HashSet<Url>,
+}
+
+impl WarmQueue {
+    pub(crate) fn push_front(&mut self, uri: Url) {
+        if !self.queued.insert(uri.clone()) {
+            self.order.retain(|queued| queued != &uri);
+        }
+        self.order.push_front(uri);
+    }
+
+    pub(crate) fn remove(&mut self, uri: &Url) {
+        if self.queued.remove(uri) {
+            self.order.retain(|queued| queued != uri);
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Url> {
+        let uri = self.order.pop_front()?;
+        self.queued.remove(&uri);
+        Some(uri)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.order.clear();
+        self.queued.clear();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WarmEvent {
+    Begin {
+        uri: Url,
+        total: usize,
+    },
+    Progress {
+        uri: Url,
+        done: usize,
+        total: usize,
+    },
+    End {
+        uri: Url,
+        fingerprint: Option<u64>,
+        pins: Vec<(Url, u64)>,
+        generation: u64,
+    },
+    Paused {
+        uri: Url,
+        generation: u64,
+    },
+}
+
+struct WarmJob {
+    uri: Url,
+    input: WorkspaceInput,
+    cancel: Arc<AtomicBool>,
+    generation: u64,
+}
+
+pub(crate) struct Warmer {
+    queue: WarmQueue,
+    jobs: Sender<WarmJob>,
+    events: Receiver<WarmEvent>,
+    cancel: Arc<AtomicBool>,
+    generation: u64,
+    busy: bool,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl Warmer {
+    pub(crate) fn start(gate: Arc<InteractiveGate>) -> Self {
+        let (jobs, job_receiver) = crossbeam_channel::unbounded::<WarmJob>();
+        let (event_sender, events) = crossbeam_channel::unbounded();
+        let thread = std::thread::Builder::new()
+            .name("PascalLspWarmer".to_string())
+            .spawn(move || {
+                lower_thread_priority();
+                for job in job_receiver {
+                    run_job(job, gate.clone(), &event_sender);
+                }
+            })
+            .expect("spawn warmer thread");
+        Self {
+            queue: WarmQueue::default(),
+            jobs,
+            events,
+            cancel: Arc::new(AtomicBool::new(false)),
+            generation: 0,
+            busy: false,
+            _thread: thread,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn open(&mut self, uri: Url) {
+        self.queue.push_front(uri);
+    }
+
+    pub(crate) fn close(&mut self, uri: &Url, cache: &crate::project_cache::ProjectCache) {
+        self.queue.remove(uri);
+        cache.unpin(uri);
+    }
+
+    /// Project switch: cancel in-flight work and crawl `open` again.
+    pub(crate) fn reset(
+        &mut self,
+        open: impl IntoIterator<Item = Url>,
+        cache: &crate::project_cache::ProjectCache,
+    ) {
+        self.cancel.store(true, Ordering::Relaxed);
+        cache.clear_pins();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.generation = self.generation.wrapping_add(1);
+        self.queue.clear();
+        for uri in open {
+            self.queue.push_front(uri);
+        }
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.busy && self.queue.is_empty()
+    }
+
+    pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            if self.accept_event(&event, workspace) {
+                events.push(event);
+            }
+        }
+        if !self.busy && workspace.project_cache().has_room() {
+            while let Some(uri) = self.queue.pop() {
+                if !workspace.is_open(&uri) {
+                    continue;
+                }
+                let job = WarmJob {
+                    uri,
+                    input: workspace.analysis_input(),
+                    cancel: self.cancel.clone(),
+                    generation: self.generation,
+                };
+                if self.jobs.send(job).is_ok() {
+                    self.busy = true;
+                }
+                break;
+            }
+        }
+        events
+    }
+
+    fn accept_event(&mut self, event: &WarmEvent, workspace: &Workspace) -> bool {
+        match event {
+            WarmEvent::End { generation, .. } => {
+                self.busy = false;
+                *generation == self.generation
+            }
+            WarmEvent::Paused { uri, generation } => {
+                self.busy = false;
+                if *generation != self.generation {
+                    return false;
+                }
+                if workspace.is_open(uri) {
+                    self.queue.push_front(uri.clone());
+                }
+                true
+            }
+            WarmEvent::Begin { .. } | WarmEvent::Progress { .. } => true,
+        }
+    }
+}
+
+fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>) {
+    let end = |fingerprint, pins| {
+        let _ = events.send(WarmEvent::End {
+            uri: job.uri.clone(),
+            fingerprint,
+            pins,
+            generation: job.generation,
+        });
+    };
+    if !gate.wait_idle(&job.cancel) {
+        return end(None, Vec::new());
+    }
+    let mut workspace = Workspace::from_analysis_input(&job.input);
+    let hook_events = events.clone();
+    let hook_uri = job.uri.clone();
+    let hook_cancel = job.cancel.clone();
+    let hook_gate = gate.clone();
+    let paused = Arc::new(AtomicBool::new(false));
+    let hook_paused = paused.clone();
+    workspace.set_dependency_hook(Arc::new(move |_, done, total| {
+        if done == 0 {
+            let _ = hook_events.send(WarmEvent::Begin {
+                uri: hook_uri.clone(),
+                total,
+            });
+        } else {
+            let _ = hook_events.send(WarmEvent::Progress {
+                uri: hook_uri.clone(),
+                done,
+                total,
+            });
+        }
+        // Pause between units while interactive requests run.
+        if hook_gate.try_wait_idle(&hook_cancel) {
+            Ok(())
+        } else {
+            if !hook_cancel.load(Ordering::Relaxed) {
+                hook_paused.store(true, Ordering::Relaxed);
+            }
+            Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
+        }
+    }));
+    match workspace.warm_with_cancel(&job.uri, &job.cancel) {
+        Ok(outcome) => {
+            let pins = outcome
+                .fingerprint
+                .map(|fingerprint| {
+                    std::iter::once(job.uri.clone())
+                        .chain(outcome.dependencies)
+                        .map(|uri| (uri, fingerprint))
+                        .collect()
+                })
+                .unwrap_or_default();
+            end(outcome.fingerprint, pins)
+        }
+        Err(_) if paused.load(Ordering::Relaxed) => {
+            let _ = events.send(WarmEvent::Paused {
+                uri: job.uri,
+                generation: job.generation,
+            });
+        }
+        Err(_) => end(None, Vec::new()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lower_thread_priority() {
+    // SAFETY: gettid and setpriority only affect the calling thread.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lower_thread_priority() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    fn uri(name: &str) -> Url {
+        Url::parse(&format!("file:///ws/{name}")).unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, crate::workspace::Workspace, Url) {
+        let temp = tempfile::tempdir().unwrap();
+        let main_text = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n".to_string();
+        std::fs::write(temp.path().join("Main.pas"), &main_text).unwrap();
+        std::fs::write(
+            temp.path().join("Provider.pas"),
+            "unit Provider;\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+        )
+        .unwrap();
+        let mut workspace = crate::workspace::Workspace::with_override_session(
+            vec![temp.path().to_path_buf()],
+            Default::default(),
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        workspace
+            .open_document(main.clone(), main_text, 1)
+            .expect("open main unit");
+        (temp, workspace, main)
+    }
+
+    fn run_until_end(
+        warmer: &mut Warmer,
+        workspace: &crate::workspace::Workspace,
+    ) -> Vec<WarmEvent> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            events.extend(warmer.poll(workspace));
+            if events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::End { .. }))
+            {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("warmer did not finish: {events:?}");
+    }
+
+    #[test]
+    fn most_recently_opened_file_is_warmed_first_and_deduplicated() {
+        let mut queue = WarmQueue::default();
+        queue.push_front(uri("A.pas"));
+        queue.push_front(uri("B.pas"));
+        queue.push_front(uri("A.pas"));
+        assert_eq!(queue.pop(), Some(uri("A.pas")));
+        assert_eq!(queue.pop(), Some(uri("B.pas")));
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn closing_removes_pending_work() {
+        let mut queue = WarmQueue::default();
+        queue.push_front(uri("A.pas"));
+        queue.remove(&uri("A.pas"));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn gate_blocks_until_interactive_work_finishes() {
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || gate.wait_idle(&AtomicBool::new(false)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "the warmer must pause while interactive work is pending"
+        );
+        gate.set(0);
+        assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn cancelled_gate_wait_returns_false() {
+        let gate = InteractiveGate::default();
+        gate.set(1);
+        assert!(!gate.wait_idle(&AtomicBool::new(true)));
+    }
+
+    #[test]
+    fn opened_file_is_warmed_with_progress_and_pins() {
+        let (_temp, workspace, main) = fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        let mut warmer = Warmer::start(gate);
+        warmer.open(main.clone());
+        let events = run_until_end(&mut warmer, &workspace);
+        assert!(
+            matches!(events.first(), Some(WarmEvent::Begin { total: 1, .. })),
+            "{events:?}"
+        );
+        let Some(WarmEvent::End { pins, .. }) = events.last() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(
+            pins.len(),
+            2,
+            "the file and its one direct import are pinned"
+        );
+        assert_eq!(workspace.project_cache().stats().units, 2);
+    }
+
+    #[test]
+    fn warmer_waits_for_interactive_work() {
+        let (_temp, workspace, main) = fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main);
+        std::thread::sleep(Duration::from_millis(200));
+        let early = warmer.poll(&workspace);
+        assert!(
+            !early
+                .iter()
+                .any(|event| matches!(event, WarmEvent::End { .. })),
+            "{early:?}"
+        );
+        gate.set(0);
+        run_until_end(&mut warmer, &workspace);
+    }
+
+    #[test]
+    fn project_switch_cancels_crawl_and_discards_results() {
+        let (_temp, workspace, main) = fixture();
+        let cache_before = workspace.project_cache().stats();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1); // Hold the crawl before its first unit.
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main.clone());
+        warmer.poll(&workspace);
+        warmer.reset(Vec::<Url>::new(), workspace.project_cache());
+        gate.set(0);
+        std::thread::sleep(Duration::from_millis(300));
+        let events = warmer.poll(&workspace);
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                WarmEvent::End { generation, .. } if *generation == warmer.generation()
+            )),
+            "{events:?}"
+        );
+        assert_eq!(workspace.project_cache().stats(), cache_before);
+    }
+
+    #[test]
+    fn project_switch_clears_old_pins_and_recrawls_full_cache() {
+        let (_temp, workspace, main) = fixture();
+        let cache = workspace.project_cache();
+        let gate = Arc::new(InteractiveGate::default());
+        let mut warmer = Warmer::start(gate);
+        warmer.open(main.clone());
+        let first_events = run_until_end(&mut warmer, &workspace);
+        let Some(WarmEvent::End { pins, .. }) = first_events
+            .iter()
+            .find(|event| matches!(event, WarmEvent::End { .. }))
+        else {
+            panic!("{first_events:?}");
+        };
+        cache.pin(&main, pins.clone());
+        let budget = cache.stats().bytes;
+        assert!(budget > 0);
+        cache.set_max_bytes(budget);
+        assert!(!cache.has_room(), "old crawl pins use the full budget");
+
+        warmer.reset([main.clone()], cache);
+        assert!(cache.has_room(), "reset releases old crawl pins");
+        assert_eq!(cache.stats().bytes, budget, "reset retains cache entries");
+
+        let second_events = run_until_end(&mut warmer, &workspace);
+        assert!(
+            second_events.iter().any(|event| matches!(
+                event,
+                WarmEvent::End { generation, .. } if *generation == warmer.generation()
+            )),
+            "{second_events:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_lookup_can_proceed_after_warm_releases_import_claim() {
+        let (_temp, workspace, main) = fixture();
+        let input = workspace.analysis_input();
+        let gate = Arc::new(InteractiveGate::default());
+        let warm_cancel = Arc::new(AtomicBool::new(false));
+        let hook_gate = gate.clone();
+        let hook_cancel = warm_cancel.clone();
+        let (claim_acquired_tx, claim_acquired_rx) = std::sync::mpsc::channel();
+        let (resume_hook_tx, resume_hook_rx) = crossbeam_channel::bounded(1);
+        let warm_uri = main.clone();
+        let mut warming_workspace = Workspace::from_analysis_input(&input);
+        warming_workspace.set_dependency_hook(Arc::new(move |_, _, _| {
+            hook_gate.set(1);
+            claim_acquired_tx.send(()).unwrap();
+            resume_hook_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test releases the dependency hook");
+            if hook_gate.try_wait_idle(&hook_cancel) {
+                Ok(())
+            } else {
+                Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
+            }
+        }));
+        let warm_thread =
+            std::thread::spawn(move || warming_workspace.warm_with_cancel(&warm_uri, &warm_cancel));
+        claim_acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("warmer reached the dependency hook while holding its imports claim");
+
+        let interactive_input = workspace.analysis_input();
+        let interactive_uri = main.clone();
+        let (interactive_started_tx, interactive_started_rx) = std::sync::mpsc::channel();
+        let (interactive_done_tx, interactive_done_rx) = std::sync::mpsc::channel();
+        let interactive_thread = std::thread::spawn(move || {
+            let mut interactive_workspace = Workspace::from_analysis_input(&interactive_input);
+            interactive_started_tx.send(()).unwrap();
+            let result = interactive_workspace
+                .warm_with_cancel(&interactive_uri, &AtomicBool::new(false))
+                .map(|_| ());
+            interactive_done_tx.send(result).unwrap();
+        });
+        interactive_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("interactive cache consumer started");
+        std::thread::sleep(Duration::from_millis(50));
+        resume_hook_tx.send(()).unwrap();
+
+        let completed_while_gate_busy = interactive_done_rx.recv_timeout(Duration::from_secs(2));
+        let completed_before_release = completed_while_gate_busy.is_ok();
+        gate.set(0);
+        let warm_result = warm_thread.join().unwrap();
+        let interactive_result = match completed_while_gate_busy {
+            Ok(result) => result,
+            Err(_) => interactive_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("interactive request finishes after releasing the gate"),
+        };
+        interactive_thread.join().unwrap();
+
+        assert!(
+            completed_before_release,
+            "interactive cache lookup must not wait for the warmer's paused claim"
+        );
+        assert!(
+            warm_result.is_err(),
+            "the paused warm attempt must yield its claim"
+        );
+        assert!(interactive_result.is_ok());
+    }
+
+    #[test]
+    fn paused_event_requeues_open_file_for_retry() {
+        let (_temp, workspace, main) = fixture();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.busy = true;
+        let event = WarmEvent::Paused {
+            uri: main.clone(),
+            generation: warmer.generation,
+        };
+
+        assert!(warmer.accept_event(&event, &workspace));
+        assert!(!warmer.busy);
+        assert_eq!(warmer.queue.pop(), Some(main));
+    }
+}

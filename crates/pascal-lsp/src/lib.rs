@@ -11,6 +11,7 @@ pub mod navigation;
 mod project_cache;
 pub mod server;
 pub mod text;
+pub(crate) mod warmer;
 pub mod workspace;
 
 pub use navigation::{NavigationIndex, NavigationTarget};

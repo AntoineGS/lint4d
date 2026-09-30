@@ -657,6 +657,32 @@ mod cache_tests {
     }
 
     #[test]
+    fn unpinned_entries_at_budget_still_allow_room_for_warming() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+
+        assert_eq!(cache.stats().bytes, 10);
+        assert!(cache.has_room());
+        assert!(!cache.stats().pinned_over_budget);
+    }
+
+    #[test]
+    fn pinned_entries_at_budget_report_no_room() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        cache.pin(
+            &uri("Open.pas"),
+            vec![(uri("A.pas"), project_context_fingerprint(&ctx))],
+        );
+        fill(&cache, "A.pas", &ctx, 1, 10);
+
+        assert_eq!(cache.stats().bytes, 10);
+        assert!(!cache.has_room());
+        assert!(!cache.stats().pinned_over_budget);
+    }
+
+    #[test]
     fn pinned_entries_over_budget_report_no_room() {
         let cache = ProjectCache::new(5);
         let ctx = context("A.dproj");
@@ -1232,6 +1258,19 @@ fn is_pinned(state: &State, key: &Key) -> bool {
         .any(|pins| pins.contains(&(key.uri.clone(), key.fingerprint)))
 }
 
+fn pinned_bytes(state: &State) -> usize {
+    state
+        .slots
+        .iter()
+        .filter_map(|(key, slot)| match slot {
+            Slot::Ready(entry) if is_pinned(state, key) => Some(entry.bytes),
+            _ => None,
+        })
+        .fold(0usize, |bytes, entry_bytes| {
+            bytes.saturating_add(entry_bytes)
+        })
+}
+
 fn evict_to_budget(state: &mut State) {
     while state.bytes > state.max_bytes {
         let victim = state
@@ -1333,6 +1372,12 @@ impl ProjectCache {
         evict_to_budget(&mut state);
     }
 
+    pub(crate) fn clear_pins(&self) {
+        let mut state = lock(&self.inner);
+        state.pins.clear();
+        evict_to_budget(&mut state);
+    }
+
     /// Evicts every entry that depends on `path` and returns the affected URIs.
     pub(crate) fn invalidate_path(&self, path: &Path) -> Vec<Url> {
         let mut state = lock(&self.inner);
@@ -1414,7 +1459,7 @@ impl ProjectCache {
 
     pub(crate) fn has_room(&self) -> bool {
         let state = lock(&self.inner);
-        state.bytes < state.max_bytes
+        pinned_bytes(&state) < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -1434,7 +1479,7 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
-            pinned_over_budget: state.bytes > state.max_bytes,
+            pinned_over_budget: pinned_bytes(&state) > state.max_bytes,
         }
     }
 

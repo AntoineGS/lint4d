@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
@@ -2626,8 +2627,17 @@ pub struct Workspace {
     global_configuration_change_generation: u64,
     project_cache: crate::project_cache::ProjectCache,
     cache_epoch: Option<u64>,
+    dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
     include_parents: HashMap<Url, HashSet<Url>>,
+}
+
+pub(crate) type DependencyHook =
+    Arc<dyn Fn(&Url, usize, usize) -> Result<(), String> + Send + Sync>;
+
+pub(crate) struct WarmOutcome {
+    pub(crate) fingerprint: Option<u64>,
+    pub(crate) dependencies: Vec<Url>,
 }
 
 fn build_workspace_roots(
@@ -5332,6 +5342,10 @@ impl Workspace {
         self.open_documents.keys().cloned().collect()
     }
 
+    pub(crate) fn is_open(&self, uri: &Url) -> bool {
+        self.open_documents.contains_key(uri)
+    }
+
     pub(crate) fn open_diagnostic_roots_with_semantic_claims(&self) -> Vec<Url> {
         self.diagnostic_publications
             .iter()
@@ -6687,9 +6701,22 @@ impl Workspace {
         let import_bytes = resolved_for_cache
             .as_ref()
             .map(crate::project_cache::import_value_bytes);
+        let mut dependency_units = resolved.dependencies;
+        if self.dependency_hook.is_some() {
+            // Warm workspace units before library units: they are small and
+            // are where navigation usually lands.
+            let roots = self
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>();
+            dependency_units
+                .sort_by_key(|unit| !roots.iter().any(|root| unit.source.path.starts_with(root)));
+        }
+        let total = dependency_units.len();
         let mut resolved_urls = HashMap::new();
         let mut dependencies = Vec::new();
-        for dependency in resolved.dependencies {
+        for (done, dependency) in dependency_units.into_iter().enumerate() {
             check_workspace_cancel(cancel)?;
             let dependency_uri = Url::from_file_path(&dependency.source.path).map_err(|_| {
                 format!(
@@ -6699,6 +6726,9 @@ impl Workspace {
             })?;
             if dependency_uri == *uri {
                 continue;
+            }
+            if let Some(hook) = &self.dependency_hook {
+                hook(&dependency_uri, done, total)?;
             }
             let dependency_text = dependency.source.decoded_text.as_deref().map_or_else(
                 || resolver::decode_source_bytes(&dependency.source.bytes),
@@ -6901,6 +6931,40 @@ impl Workspace {
         }
         self.index.bind_imports(uri, bindings);
         Ok(dependencies)
+    }
+
+    pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
+        self.dependency_hook = Some(hook);
+    }
+
+    /// Loads `uri` and every direct import into the shared cache.
+    pub(crate) fn warm_with_cancel(
+        &mut self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<WarmOutcome, String> {
+        let context_key = self.context_for_uri_with_cancel_and_budget(uri, Some(cancel), None)?;
+        let fingerprint = self.contexts.get(&context_key).map(|state| {
+            crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
+        });
+        if !self.load_source_with_cancel(uri, &context_key, &HashSet::new(), Some(cancel))? {
+            return Ok(WarmOutcome {
+                fingerprint,
+                dependencies: Vec::new(),
+            });
+        }
+        let mut pinned = HashSet::from([uri.clone()]);
+        let dependencies = self.load_imports_with_session_cache(
+            uri,
+            &context_key,
+            &mut pinned,
+            Some(cancel),
+            &ResolverSessionCache::default(),
+        )?;
+        Ok(WarmOutcome {
+            fingerprint,
+            dependencies,
+        })
     }
 
     #[allow(dead_code)]
@@ -14828,6 +14892,7 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     fn budget_test_context_key(index: usize) -> ContextKey {
         ContextKey {
@@ -15963,6 +16028,96 @@ mod tests {
             Url::from_file_path(&main).unwrap(),
             Url::from_file_path(&provider).unwrap(),
         )
+    }
+
+    #[test]
+    fn warming_a_file_caches_it_and_its_direct_imports() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+
+        let outcome = worker_view(&main)
+            .warm_with_cancel(&main_uri, &AtomicBool::new(false))
+            .expect("warm");
+        assert_eq!(outcome.dependencies, vec![provider_uri.clone()]);
+        assert!(outcome.fingerprint.is_some());
+
+        crate::navigation::test_reset_document_parse_count();
+        super::test_reset_import_resolution_count();
+        let located = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(located[0].uri, provider_uri);
+        assert_eq!(crate::navigation::test_document_parse_count(), 0);
+        assert_eq!(super::test_import_resolution_count(), 0);
+    }
+
+    #[test]
+    fn dependency_hook_sees_each_dependency_and_can_cancel() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, _) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = worker_view(&main);
+        let recorded = seen.clone();
+        worker.set_dependency_hook(Arc::new(move |_, done, total| {
+            recorded.lock().unwrap().push((done, total));
+            Err(super::CANCELLATION_MESSAGE.to_string())
+        }));
+        let result = worker.warm_with_cancel(&main_uri, &AtomicBool::new(false));
+        assert_eq!(result.err().as_deref(), Some(super::CANCELLATION_MESSAGE));
+        assert_eq!(*seen.lock().unwrap(), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn warming_indexes_workspace_units_before_library_units() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().join("ws");
+        let lib = temp.path().join("lib");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main;\ninterface\nuses LibUnit, Local;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Local.pas"),
+            "unit Local;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            lib.join("LibUnit.pas"),
+            "unit LibUnit;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let options = WorkspaceOptions {
+            source_paths: vec![lib.display().to_string()],
+            ..Default::default()
+        };
+        let main = test_workspace(vec![root.clone()], options);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = worker_view(&main);
+        let recorded = order.clone();
+        worker.set_dependency_hook(Arc::new(move |uri, _, _| {
+            recorded.lock().unwrap().push(uri.clone());
+            Ok(())
+        }));
+        worker
+            .warm_with_cancel(
+                &Url::from_file_path(root.join("Main.pas")).unwrap(),
+                &AtomicBool::new(false),
+            )
+            .expect("warm");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![
+                Url::from_file_path(root.join("Local.pas")).unwrap(),
+                Url::from_file_path(lib.join("LibUnit.pas")).unwrap(),
+            ]
+        );
     }
 
     #[test]

@@ -5045,6 +5045,7 @@ struct PendingAnalysis {
     handle: JoinHandle<()>,
     recipients: Vec<ClientRecipient>,
     key: Option<ObservationKey>,
+    priority: AnalysisPriority,
 }
 
 struct PendingDiagnostic {
@@ -5164,6 +5165,7 @@ struct AnalysisJobs {
     retired_partial_validations: VecDeque<RetiredPartialValidation>,
     partial_tokens: HashMap<ProgressToken, (AnalysisComputationId, RequestId)>,
     queue: PriorityQueue<QueuedAnalysis>,
+    interactive_gate: Arc<crate::warmer::InteractiveGate>,
     request_to_job: HashMap<RequestId, AnalysisComputationId>,
     observation_jobs: HashMap<ObservationKey, AnalysisComputationId>,
     diagnostic_jobs: HashMap<Url, AnalysisComputationId>,
@@ -5246,6 +5248,27 @@ impl CompiledContentPayloadBudget {
 }
 
 impl AnalysisJobs {
+    fn publish_interactive_load(&self) {
+        let running = self
+            .pending
+            .values()
+            .filter(|job| job.priority == AnalysisPriority::Interactive)
+            .count();
+        let queued = self
+            .queue
+            .iter()
+            .filter(|queued| {
+                matches!(
+                    queued,
+                    QueuedAnalysis::Client(job)
+                        if AnalysisPriority::for_request(&job.request)
+                            == AnalysisPriority::Interactive
+                )
+            })
+            .count();
+        self.interactive_gate.set(running + queued);
+    }
+
     fn fence_automatic_answers_for_scope(&mut self, scope_uri: &Url) {
         for answer in self.automatic_answer_requests.values_mut() {
             if &answer.key.scope_uri == scope_uri {
@@ -5341,6 +5364,7 @@ impl AnalysisJobs {
             retired_partial_validations: VecDeque::new(),
             partial_tokens: HashMap::new(),
             queue: PriorityQueue::new(),
+            interactive_gate: Arc::new(crate::warmer::InteractiveGate::default()),
             request_to_job: HashMap::new(),
             observation_jobs: HashMap::new(),
             diagnostic_jobs: HashMap::new(),
@@ -5384,6 +5408,7 @@ impl AnalysisJobs {
         ) {
             return self.spawn_project_operation(id, request);
         }
+        let priority = AnalysisPriority::for_request(&request);
         if let AnalysisRequest::CompiledContent { snapshot, symbols } = request {
             // Keep the admission-time generations. A queued request must not
             // adopt the post-edit generations when it finally gets a worker.
@@ -5453,6 +5478,7 @@ impl AnalysisJobs {
                 handle,
                 recipients: Vec::new(),
                 key: None,
+                priority,
             });
         }
         let input = workspace.analysis_input();
@@ -6580,6 +6606,7 @@ impl AnalysisJobs {
             handle,
             recipients: Vec::new(),
             key: None,
+            priority,
         })
     }
 
@@ -6588,6 +6615,7 @@ impl AnalysisJobs {
         id: AnalysisJobId,
         request: AnalysisRequest,
     ) -> Result<PendingAnalysis, String> {
+        let priority = AnalysisPriority::for_request(&request);
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
         let test_barriers = self.test_barriers.clone();
@@ -6839,6 +6867,7 @@ impl AnalysisJobs {
             handle,
             recipients: Vec::new(),
             key: None,
+            priority,
         })
     }
 
@@ -7253,6 +7282,7 @@ impl AnalysisJobs {
                     Some("Superseded"),
                 )?;
             }
+            self.publish_interactive_load();
             return Ok(());
         }
 
@@ -7337,6 +7367,7 @@ impl AnalysisJobs {
                     self.remove_observation(job.key.as_ref(), &primary_id);
                 }
             }
+            self.publish_interactive_load();
             return Ok(());
         }
 
@@ -7579,6 +7610,7 @@ impl AnalysisJobs {
                     }
                 }
             }
+            self.publish_interactive_load();
             return failures;
         }
         while self.pending.len().saturating_add(self.diagnostics.len()) < MAX_ANALYSIS_JOBS {
@@ -7588,8 +7620,8 @@ impl AnalysisJobs {
             match queued {
                 QueuedAnalysis::Client(job) => {
                     let primary_id = job.id;
-                    self.test_barriers
-                        .record_dispatch(AnalysisPriority::for_request(&job.request));
+                    let priority = AnalysisPriority::for_request(&job.request);
+                    self.test_barriers.record_dispatch(priority);
                     match self.spawn(
                         AnalysisJobId::Client(primary_id),
                         job.request,
@@ -7599,6 +7631,7 @@ impl AnalysisJobs {
                         Ok(mut analysis) => {
                             analysis.recipients = job.recipients;
                             analysis.key = job.key;
+                            analysis.priority = priority;
                             self.pending.insert(primary_id, analysis);
                             if let Some(connection) = connection {
                                 if let Err(error) = self
@@ -7672,6 +7705,7 @@ impl AnalysisJobs {
                 }
             }
         }
+        self.publish_interactive_load();
         failures
     }
 
@@ -8350,6 +8384,7 @@ impl AnalysisJobs {
                     let Some(job) = self.pending.remove(&primary_id) else {
                         continue;
                     };
+                    self.publish_interactive_load();
                     self.compiled_content_payload_budget.release(&primary_id);
                     let cancelled = job.cancellation.load(std::sync::atomic::Ordering::Relaxed);
                     let recipients = job.recipients;
@@ -10358,6 +10393,7 @@ fn spawn_workspace_file_notification(
                         cancel: Some(&worker_cancellation),
                         budget: Some(&budget),
                         defer_push_clears: false,
+                        warmer: None,
                     },
                 )
             });
@@ -10490,6 +10526,11 @@ fn event_loop(
     let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
     let mut pending_diagnostic_clears = PendingDiagnosticClears::default();
     let mut rewarm = Vec::new();
+    let mut warmer = crate::warmer::Warmer::start(jobs.interactive_gate.clone());
+    let mut last_configuration_generation = workspace.configuration_generation();
+    let mut sweep_pending = false;
+    let mut swept_fingerprints = HashSet::new();
+    let mut budget_warned = false;
     loop {
         drain_watch_events(workspace, &watch_events, &mut rewarm);
         connection.flush()?;
@@ -10663,6 +10704,17 @@ fn event_loop(
         }
         let workspace_busy = file_notification_worker.is_some();
         if !workspace_busy {
+            maintain_warmer(
+                workspace,
+                &mut warmer,
+                &mut rewarm,
+                &mut last_configuration_generation,
+                &mut sweep_pending,
+                &mut swept_fingerprints,
+                &mut budget_warned,
+            );
+        }
+        if !workspace_busy {
             if let Some(effect) = configuration.poll(workspace)? {
                 if let Some(registration) = watcher_registration.as_mut() {
                     sync_file_watcher(connection, workspace, registration)?;
@@ -10692,6 +10744,15 @@ fn event_loop(
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 }
             }
+            maintain_warmer(
+                workspace,
+                &mut warmer,
+                &mut rewarm,
+                &mut last_configuration_generation,
+                &mut sweep_pending,
+                &mut swept_fingerprints,
+                &mut budget_warned,
+            );
         }
         if !workspace_busy
             && !shutdown_received
@@ -10730,7 +10791,7 @@ fn event_loop(
         let timeout = event_loop_receive_timeout(
             pull_diagnostics_supported,
             workspace.next_diagnostic_timeout(),
-            jobs.is_empty(),
+            jobs.is_empty() && (warmer.is_idle() || !workspace.project_cache().has_room()),
             output_pending,
             configuration.is_preparing() || workspace_busy,
         );
@@ -10769,6 +10830,17 @@ fn event_loop(
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
                         drain_watch_events(workspace, &watch_events, &mut rewarm);
+                        if !workspace_busy {
+                            maintain_warmer(
+                                workspace,
+                                &mut warmer,
+                                &mut rewarm,
+                                &mut last_configuration_generation,
+                                &mut sweep_pending,
+                                &mut swept_fingerprints,
+                                &mut budget_warned,
+                            );
+                        }
                         if !workspace_busy
                             && !shutdown_received
                             && !pull_diagnostics_supported
@@ -10796,6 +10868,17 @@ fn event_loop(
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     drain_watch_events(workspace, &watch_events, &mut rewarm);
+                    if !workspace_busy {
+                        maintain_warmer(
+                            workspace,
+                            &mut warmer,
+                            &mut rewarm,
+                            &mut last_configuration_generation,
+                            &mut sweep_pending,
+                            &mut swept_fingerprints,
+                            &mut budget_warned,
+                        );
+                    }
                     if !workspace_busy
                         && !shutdown_received
                         && !pull_diagnostics_supported
@@ -11147,8 +11230,12 @@ fn event_loop(
                         notification,
                         workspace_folders_supported,
                         !pull_diagnostics_supported,
-                        None,
-                        !pending_diagnostic_clears.is_empty(),
+                        NotificationWorkControl {
+                            cancel: None,
+                            budget: None,
+                            defer_push_clears: !pending_diagnostic_clears.is_empty(),
+                            warmer: Some(&mut warmer),
+                        },
                     );
                     if refresh_configuration && result.is_ok() {
                         configuration
@@ -11371,6 +11458,15 @@ fn event_loop(
         }
         if file_notification_worker.is_none() {
             jobs.pump_partial_deliveries(connection, workspace)?;
+            maintain_warmer(
+                workspace,
+                &mut warmer,
+                &mut rewarm,
+                &mut last_configuration_generation,
+                &mut sweep_pending,
+                &mut swept_fingerprints,
+                &mut budget_warned,
+            );
         }
     }
 }
@@ -11384,7 +11480,61 @@ fn drain_watch_events(
         workspace.project_cache(),
         crate::file_watch::MAX_WATCH_EVENTS_PER_TURN,
     ));
-    rewarm.clear();
+}
+
+fn maintain_warmer(
+    workspace: &Workspace,
+    warmer: &mut crate::warmer::Warmer,
+    rewarm: &mut Vec<Url>,
+    last_configuration_generation: &mut u64,
+    sweep_pending: &mut bool,
+    swept_fingerprints: &mut HashSet<u64>,
+    budget_warned: &mut bool,
+) {
+    let cache = workspace.project_cache();
+    let configuration_generation = workspace.configuration_generation();
+    if configuration_generation != *last_configuration_generation {
+        *last_configuration_generation = configuration_generation;
+        let open = workspace.open_document_uris();
+        warmer.reset(open.clone(), cache);
+        *sweep_pending = true;
+        swept_fingerprints.clear();
+        if open.is_empty() {
+            cache.retain_fingerprints(&HashSet::new());
+            *sweep_pending = false;
+        }
+    }
+    for uri in rewarm.drain(..) {
+        if workspace.is_open(&uri) {
+            warmer.open(uri);
+        }
+    }
+    for event in warmer.poll(workspace) {
+        if let crate::warmer::WarmEvent::End {
+            uri,
+            fingerprint,
+            pins,
+            ..
+        } = &event
+        {
+            if workspace.is_open(uri) {
+                cache.pin(uri, pins.clone());
+                if let Some(fingerprint) = fingerprint {
+                    swept_fingerprints.insert(*fingerprint);
+                }
+            }
+        }
+    }
+    if *sweep_pending && (warmer.is_idle() || !cache.has_room()) {
+        cache.retain_fingerprints(swept_fingerprints);
+        *sweep_pending = false;
+    }
+    if !cache.has_room() && !*budget_warned {
+        eprintln!(
+            "pascal-lsp: warning: project cache budget (maxCacheBytes) is full of pinned entries; warming paused"
+        );
+        *budget_warned = true;
+    }
 }
 
 fn event_loop_receive_timeout(
@@ -13139,8 +13289,7 @@ fn handle_notification_with_cancel(
     notification: Notification,
     workspace_folders_supported: bool,
     push_diagnostics_supported: bool,
-    cancel: Option<&AtomicBool>,
-    defer_push_clears: bool,
+    control: NotificationWorkControl<'_>,
 ) -> Result<DiagnosticNotificationEffect, String> {
     handle_notification_with_control(
         connection,
@@ -13148,11 +13297,7 @@ fn handle_notification_with_cancel(
         notification,
         workspace_folders_supported,
         push_diagnostics_supported,
-        NotificationWorkControl {
-            cancel,
-            budget: None,
-            defer_push_clears,
-        },
+        control,
     )
 }
 
@@ -13160,6 +13305,7 @@ struct NotificationWorkControl<'a> {
     cancel: Option<&'a AtomicBool>,
     budget: Option<&'a ReconciliationBudget>,
     defer_push_clears: bool,
+    warmer: Option<&'a mut crate::warmer::Warmer>,
 }
 
 fn handle_notification_with_control(
@@ -13268,6 +13414,7 @@ fn handle_notification_with_control_inner(
         cancel,
         budget,
         defer_push_clears,
+        warmer,
     } = control;
     match notification.method.as_str() {
         "initialized" => Ok(DiagnosticNotificationEffect::default()),
@@ -13294,6 +13441,9 @@ fn handle_notification_with_control_inner(
                     return Ok(effect);
                 }
                 return Err(error);
+            }
+            if let Some(warmer) = warmer {
+                warmer.open(uri.clone());
             }
             let mut effect = DiagnosticNotificationEffect::default();
             effect.refresh_uri_with_budget(uri.clone(), budget)?;
@@ -13375,6 +13525,9 @@ fn handle_notification_with_control_inner(
             let params: DidCloseTextDocumentParams = parse_notification(&notification)?;
             let uri = params.text_document.uri;
             let closed = workspace.close_document(&uri);
+            if let Some(warmer) = warmer {
+                warmer.close(&uri, workspace.project_cache());
+            }
             if closed {
                 mark_publication_root_stale(connection, workspace, &uri);
                 let replacement = if push_diagnostics_supported && !defer_push_clears {
@@ -15046,8 +15199,12 @@ mod tests {
             ),
             false,
             true,
-            None,
-            false,
+            super::NotificationWorkControl {
+                cancel: None,
+                budget: None,
+                defer_push_clears: false,
+                warmer: None,
+            },
         )
         .expect("valid didChange");
         let mut budget = DiagnosticPublicationTurnBudget::default();
@@ -15192,6 +15349,7 @@ mod tests {
                 cancel: Some(&cancelled),
                 budget: Some(&budget),
                 defer_push_clears: false,
+                warmer: None,
             },
         )
         .expect("partial mutation becomes fail-closed effect");
@@ -15277,6 +15435,7 @@ mod tests {
                         handle: thread::spawn(|| {}),
                         recipients: Vec::new(),
                         key: None,
+                        priority: AnalysisPriority::Diagnostics,
                     },
                 },
             );
@@ -15989,6 +16148,7 @@ mod tests {
                     handle,
                     recipients: Vec::new(),
                     key: None,
+                    priority: AnalysisPriority::Diagnostics,
                 },
             },
         );
@@ -16034,6 +16194,7 @@ mod tests {
                     handle,
                     recipients: Vec::new(),
                     key: None,
+                    priority: AnalysisPriority::Diagnostics,
                 },
             },
         );
@@ -16423,8 +16584,12 @@ mod tests {
             ),
             false,
             true,
-            None,
-            true,
+            super::NotificationWorkControl {
+                cancel: None,
+                budget: None,
+                defer_push_clears: true,
+                warmer: None,
+            },
         )
         .expect("count-cap rejection schedules cleanup rather than exiting");
         assert!(workspace.analysis_admission_fenced());
@@ -18414,6 +18579,82 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_last_queued_interactive_request_releases_warmer_gate() {
+        let mut jobs = AnalysisJobs::new();
+        let computation_id = AnalysisComputationId(1);
+        let request_id = RequestId::from("queued-hover".to_string());
+        jobs.request_to_job
+            .insert(request_id.clone(), computation_id);
+        jobs.queue.push(
+            AnalysisPriority::Interactive,
+            super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                id: computation_id,
+                request: AnalysisRequest::Hover {
+                    uri: Url::parse("file:///Main.pas").unwrap(),
+                    position: Position::new(0, 0),
+                    format: MarkupKind::PlainText,
+                },
+                features: symbol_client_features(),
+                recipients: vec![super::ClientRecipient {
+                    id: request_id.clone(),
+                    work_done_token: None,
+                    partial_result_token: None,
+                }],
+                key: None,
+            }),
+        );
+        jobs.publish_interactive_load();
+        assert!(!jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)));
+
+        let (server, _client) = Connection::memory();
+        jobs.cancel(&server, &request_id)
+            .expect("cancel the queued interactive request");
+
+        assert!(
+            jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)),
+            "removing the last queued interactive request must reopen the warmer gate"
+        );
+    }
+
+    #[test]
+    fn superseding_queued_interactive_request_releases_warmer_gate() {
+        let mut jobs = AnalysisJobs::new();
+        let computation_id = AnalysisComputationId(1);
+        let request_id = RequestId::from("superseded-hover".to_string());
+        jobs.request_to_job
+            .insert(request_id.clone(), computation_id);
+        jobs.queue.push(
+            AnalysisPriority::Interactive,
+            super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                id: computation_id,
+                request: AnalysisRequest::Hover {
+                    uri: Url::parse("file:///Main.pas").unwrap(),
+                    position: Position::new(0, 0),
+                    format: MarkupKind::PlainText,
+                },
+                features: symbol_client_features(),
+                recipients: vec![super::ClientRecipient {
+                    id: request_id,
+                    work_done_token: None,
+                    partial_result_token: None,
+                }],
+                key: None,
+            }),
+        );
+        jobs.publish_interactive_load();
+        assert!(!jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)));
+
+        let (server, _client) = Connection::memory();
+        jobs.supersede_client(&computation_id, Some(&server))
+            .expect("supersede the queued interactive request");
+
+        assert!(
+            jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)),
+            "removing a superseded queued request must reopen the warmer gate"
+        );
+    }
+
+    #[test]
     fn delivery_rejects_a_computed_symbol_result_after_an_overlay_change() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().join("fixture");
@@ -19397,6 +19638,7 @@ mod tests {
                 handle,
                 recipients: Vec::new(),
                 key: None,
+                priority: AnalysisPriority::Interactive,
             },
         );
 

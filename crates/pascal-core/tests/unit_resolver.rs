@@ -1544,6 +1544,63 @@ fn dependency_limit_does_not_publish_orphan_found_target() {
 }
 
 #[test]
+fn project_walk_can_stop_once_the_graph_is_known_to_be_incomplete() {
+    let walk = |stop: bool| {
+        let loads = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MemoryStore::with_log(loads.clone());
+        store.add(
+            "/workspace/Main.pas",
+            "unit Main; interface uses A; implementation end.",
+        );
+        store.add(
+            "/workspace/A.pas",
+            "unit A; interface uses B; {$IFDEF UNKNOWN} const X=1; {$ENDIF} implementation end.",
+        );
+        store.add(
+            "/workspace/B.pas",
+            "unit B; interface uses C; implementation end.",
+        );
+        store.add("/workspace/C.pas", "unit C; interface implementation end.");
+        let mut resolver = UnitResolver::new(
+            fixture_context(),
+            vec![PathBuf::from("/workspace")],
+            store,
+            Default::default(),
+        );
+        resolver.stop_project_walk_when_incomplete(stop);
+        let project = resolver
+            .resolve_project(
+                UnitResolveRequest {
+                    requested_name: "Main",
+                    importer_path: Path::new("/workspace/Main.pas"),
+                    legacy_route: None,
+                },
+                &[],
+                &NoCancellation,
+            )
+            .expect("project graph");
+        let loads = loads.lock().expect("load log").clone();
+        (project, loads)
+    };
+
+    let (full, full_loads) = walk(false);
+    assert!(!full.complete);
+    assert!(full_loads.iter().any(|path| path == "/workspace/C.pas"));
+
+    let (stopped, stopped_loads) = walk(true);
+    assert!(!stopped.complete);
+    assert!(!stopped.report.complete);
+    assert!(
+        stopped_loads.iter().any(|path| path == "/workspace/A.pas"),
+        "the unit that made the graph incomplete is still read: {stopped_loads:?}"
+    );
+    assert!(
+        !stopped_loads.iter().any(|path| path == "/workspace/C.pas"),
+        "units beyond the incomplete frontier must not be resolved: {stopped_loads:?}"
+    );
+}
+
+#[test]
 fn standalone_imports_retain_dependencies_after_project_resolution() {
     let mut store = MemoryStore::default();
     store.add(

@@ -121,7 +121,7 @@ pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<
             affected
         }
         WatchEvent::Overflow => {
-            cache.drop_imports();
+            cache.invalidate_after_overflow();
             Vec::new()
         }
     }

@@ -629,7 +629,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             });
         }
         // Pause between units while interactive requests run.
-        if hook_gate.try_wait_idle(&hook_cancel) {
+        if done == total || hook_gate.try_wait_idle(&hook_cancel) {
             Ok(())
         } else {
             if !hook_cancel.load(Ordering::Relaxed) {
@@ -778,6 +778,17 @@ mod tests {
             matches!(events.first(), Some(WarmEvent::Begin { total: 1, .. })),
             "{events:?}"
         );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                WarmEvent::Progress {
+                    done: 1,
+                    total: 1,
+                    ..
+                }
+            )),
+            "the final report must reach 1/1: {events:?}"
+        );
         let Some(WarmEvent::End { pins, .. }) = events.last() else {
             panic!("{events:?}")
         };
@@ -787,6 +798,36 @@ mod tests {
             "the file and its one direct import are pinned"
         );
         assert_eq!(workspace.project_cache().stats().units, 2);
+    }
+
+    #[test]
+    fn zero_dependency_warm_emits_no_progress() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let main_text = "unit Main;\ninterface\nimplementation\nend.\n".to_string();
+        let path = temp.path().join("Main.pas");
+        std::fs::write(&path, &main_text).unwrap();
+        let main = Url::from_file_path(path).unwrap();
+        let mut workspace = crate::workspace::Workspace::with_override_session(
+            vec![temp.path().to_path_buf()],
+            Default::default(),
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        workspace
+            .open_document(main.clone(), main_text, 1)
+            .expect("open main unit");
+        let gate = Arc::new(InteractiveGate::default());
+        let mut warmer = Warmer::start(gate);
+        warmer.open(main);
+
+        let events = run_until_end(&mut warmer, &workspace);
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Begin { .. } | WarmEvent::Progress { .. })),
+            "zero-dependency crawls emit no progress lifecycle: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(WarmEvent::End { .. })));
     }
 
     #[test]

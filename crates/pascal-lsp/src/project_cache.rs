@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::time::Duration;
 
 use lsp_types::Url;
@@ -55,12 +55,16 @@ pub(crate) fn unit_value_bytes(indexed_len: usize) -> usize {
 }
 
 pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usize {
-    resolved
-        .dependencies
-        .iter()
-        .map(|unit| unit.source.bytes.len())
-        .sum::<usize>()
-        .saturating_add(4096)
+    resolved.dependencies.iter().fold(4096usize, |total, unit| {
+        total
+            .saturating_add(unit.source.bytes.len())
+            .saturating_add(
+                unit.source
+                    .decoded_text
+                    .as_deref()
+                    .map_or(0, |text| text.len()),
+            )
+    })
 }
 
 /// Converts resolver observations and dependency revisions into probes, and
@@ -428,6 +432,38 @@ mod cache_tests {
         AtomicBool::new(false)
     }
 
+    #[test]
+    fn import_accounting_includes_raw_and_decoded_source_and_metadata() {
+        let raw = Arc::<[u8]>::from(vec![b'x'; 13]);
+        let decoded = Arc::<str>::from("decoded source text");
+        let resolved = pascal_core::ResolvedImports {
+            bindings: vec![],
+            dependencies: vec![pascal_core::ResolvedUnit {
+                requested_name: "Provider".to_string(),
+                declared_name: "Provider".to_string(),
+                source: pascal_core::LoadedSource {
+                    id: pascal_core::SourceId::new("Provider.pas"),
+                    path: PathBuf::from("/ws/Provider.pas"),
+                    bytes: raw.clone(),
+                    decoded_text: Some(decoded.clone()),
+                    revision: pascal_core::SourceRevision::Overlay {
+                        version: 1,
+                        content_hash: 2,
+                    },
+                },
+            }],
+            complete: true,
+        };
+
+        assert_eq!(
+            import_value_bytes(&resolved),
+            4096usize
+                .saturating_add(raw.len())
+                .saturating_add(decoded.len()),
+            "the estimate includes both retained source payloads and entry metadata"
+        );
+    }
+
     fn fill(cache: &ProjectCache, name: &str, ctx: &ProjectContext, hash: u64, bytes: usize) {
         match cache.imports(&uri(name), ctx, hash, &HashMap::new(), &no_cancel()) {
             Lookup::Compute(claim) => {
@@ -613,6 +649,54 @@ mod cache_tests {
     }
 
     #[test]
+    fn waiter_recovers_poisoned_state_when_condvar_reacquires() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected initial miss")
+        };
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        cache.set_waiter_hook(waiting_tx);
+        let waiter = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                let was_compute =
+                    match cache.imports(&main, &ctx, 1, &HashMap::new(), &AtomicBool::new(false)) {
+                        Lookup::Compute(claim) => {
+                            cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+                            true
+                        }
+                        Lookup::Hit(_) | Lookup::Cancelled => false,
+                    };
+                result_tx.send(was_compute).unwrap();
+            })
+        };
+
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter reached the Computing slot");
+        cache.poison_state();
+        cache.inner.changed.notify_all();
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        drop(claim);
+        let waiter_joined = waiter.join().is_ok();
+        assert!(
+            matches!(result, Ok(true)) && waiter_joined,
+            "the woken waiter must recover poison and compute a miss"
+        );
+        assert!(matches!(
+            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
     fn cancelled_waiter_returns_cancelled() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
@@ -780,13 +864,64 @@ mod cache_tests {
     }
 
     #[test]
-    fn drop_imports_forces_resolution_again() {
+    fn overflow_drops_imports_releases_watches_and_keeps_pins() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
-        fill(&cache, "Main.pas", &ctx, 1, 1);
-        cache.drop_imports();
+        let main = uri("Main.pas");
+        let watch_dir = PathBuf::from("/ws/includes");
+        let owner = uri("Open.pas");
+        cache.pin(
+            &owner,
+            vec![(main.clone(), project_context_fingerprint(&ctx))],
+        );
+        let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected import miss")
+        };
+        let mut imports = import_value(vec![]);
+        imports.watch_dirs.push(watch_dir.clone());
+        cache.store_imports(claim, imports, 1, &no_cancel());
+        assert_eq!(lock(&cache.inner).watch_counts.get(&watch_dir), Some(&1));
+
+        cache.invalidate_after_overflow();
         assert!(matches!(
-            cache.imports(&uri("Main.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Compute(_)
+        ));
+        let state = lock(&cache.inner);
+        assert!(
+            state.watch_counts.is_empty(),
+            "overflow releases import watches"
+        );
+        assert!(
+            state.pins.contains_key(&owner),
+            "overflow keeps open-file pins"
+        );
+    }
+
+    #[test]
+    fn overflow_prevents_a_prior_import_claim_from_storing() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let snapshot_epoch = cache.invalidation_epoch();
+        let Lookup::Compute(claim) = cache.imports_with_epoch(
+            &main,
+            &ctx,
+            1,
+            &HashMap::new(),
+            Some(snapshot_epoch),
+            &no_cancel(),
+        ) else {
+            panic!("expected import miss")
+        };
+
+        cache.invalidate_after_overflow();
+        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+
+        assert_eq!(cache.stats().imports, 0);
+        assert!(matches!(
+            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
             Lookup::Compute(_)
         ));
     }
@@ -921,6 +1056,8 @@ struct Inner {
     changed: Condvar,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    waiter_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -947,6 +1084,16 @@ impl ProjectCache {
         let hook = self.inner.validation_hook.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
+        }
+    }
+
+    fn set_waiter_hook(&self, sender: std::sync::mpsc::Sender<()>) {
+        *self.inner.waiter_hook.lock().unwrap() = Some(sender);
+    }
+
+    fn signal_waiter_hook(&self) {
+        if let Some(sender) = self.inner.waiter_hook.lock().unwrap().take() {
+            let _ = sender.send(());
         }
     }
 
@@ -1001,23 +1148,40 @@ pub(crate) struct CacheStats {
     pub pinned_over_budget: bool,
 }
 
+fn recover_poisoned_state<'a>(
+    inner: &'a Inner,
+    mut state: MutexGuard<'a, State>,
+) -> MutexGuard<'a, State> {
+    state.slots.clear();
+    state.generation = state.generation.wrapping_add(1);
+    state.bytes = 0;
+    let watched_directories = state.watch_counts.keys().cloned().collect::<Vec<_>>();
+    if let Some(watcher) = state.watcher.as_mut() {
+        for directory in &watched_directories {
+            watcher.unwatch(directory);
+        }
+    }
+    state.watch_counts.clear();
+    inner.state.clear_poison();
+    state
+}
+
 fn lock(inner: &Inner) -> MutexGuard<'_, State> {
     match inner.state.lock() {
         Ok(state) => state,
+        Err(poisoned) => recover_poisoned_state(inner, poisoned.into_inner()),
+    }
+}
+
+fn wait_timeout_recovering_poison<'a>(
+    inner: &'a Inner,
+    state: MutexGuard<'a, State>,
+) -> (MutexGuard<'a, State>, WaitTimeoutResult) {
+    match inner.changed.wait_timeout(state, WAIT_SLICE) {
+        Ok(result) => result,
         Err(poisoned) => {
-            let mut state = PoisonError::into_inner(poisoned);
-            state.slots.clear();
-            state.generation = state.generation.wrapping_add(1);
-            state.bytes = 0;
-            let watched_directories = state.watch_counts.keys().cloned().collect::<Vec<_>>();
-            if let Some(watcher) = state.watcher.as_mut() {
-                for directory in &watched_directories {
-                    watcher.unwatch(directory);
-                }
-            }
-            state.watch_counts.clear();
-            inner.state.clear_poison();
-            state
+            let (state, timeout) = poisoned.into_inner();
+            (recover_poisoned_state(inner, state), timeout)
         }
     }
 }
@@ -1186,12 +1350,9 @@ impl ProjectCache {
                     if cancel.load(Ordering::Relaxed) {
                         return Lookup::Cancelled;
                     }
-                    state = self
-                        .inner
-                        .changed
-                        .wait_timeout(state, WAIT_SLICE)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
+                    #[cfg(test)]
+                    self.signal_waiter_hook();
+                    state = wait_timeout_recovering_poison(&self.inner, state).0;
                 }
                 Some(Slot::Ready(entry))
                     if entry.context.as_ref() == context && entry.input_hash == input_hash =>
@@ -1421,13 +1582,15 @@ impl ProjectCache {
         affected
     }
 
-    /// Watcher overflow: every resolution must list its directories again.
-    pub(crate) fn drop_imports(&self) {
+    /// Watcher overflow loses change details, so discard every verified cache
+    /// entry and reject claims based on snapshots from before the overflow.
+    pub(crate) fn invalidate_after_overflow(&self) {
         let mut state = lock(&self.inner);
+        state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
         let doomed = state
             .slots
             .iter()
-            .filter(|(key, slot)| key.layer == Layer::Import && matches!(slot, Slot::Ready(_)))
+            .filter(|(_, slot)| matches!(slot, Slot::Ready(_)))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in doomed {
@@ -1436,6 +1599,8 @@ impl ProjectCache {
                 release_watches(&mut state, &entry);
             }
         }
+        drop(state);
+        self.inner.changed.notify_all();
     }
 
     pub(crate) fn retain_fingerprints(&self, keep: &HashSet<u64>) {

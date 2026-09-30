@@ -6714,9 +6714,14 @@ impl Workspace {
                 .sort_by_key(|unit| !roots.iter().any(|root| unit.source.path.starts_with(root)));
         }
         let total = dependency_units.len();
+        if total > 0 {
+            if let Some(hook) = &self.dependency_hook {
+                hook(uri, 0, total)?;
+            }
+        }
         let mut resolved_urls = HashMap::new();
         let mut dependencies = Vec::new();
-        for (done, dependency) in dependency_units.into_iter().enumerate() {
+        for (index, dependency) in dependency_units.into_iter().enumerate() {
             check_workspace_cancel(cancel)?;
             let dependency_uri = Url::from_file_path(&dependency.source.path).map_err(|_| {
                 format!(
@@ -6724,83 +6729,88 @@ impl Workspace {
                     dependency.source.path.display()
                 )
             })?;
-            if dependency_uri == *uri {
-                continue;
+            if dependency_uri != *uri {
+                let dependency_text = dependency.source.decoded_text.as_deref().map_or_else(
+                    || resolver::decode_source_bytes(&dependency.source.bytes),
+                    ToOwned::to_owned,
+                );
+                let disk_size = matches!(
+                    &dependency.source.revision,
+                    pascal_core::SourceRevision::Disk { .. }
+                )
+                .then_some(dependency.source.bytes.len());
+                let raw_content_hash = match &dependency.source.revision {
+                    pascal_core::SourceRevision::Disk { content_hash, .. }
+                    | pascal_core::SourceRevision::Overlay { content_hash, .. } => {
+                        Some(*content_hash)
+                    }
+                };
+                let already_indexed = self.index.contains(&dependency_uri)
+                    && self
+                        .document_contexts
+                        .get(&dependency_uri)
+                        .is_some_and(|key| key == &effective_context_key)
+                    && self
+                        .index
+                        .source_text(&dependency_uri)
+                        .is_some_and(|source| source == dependency_text);
+                let indexed = if already_indexed {
+                    true
+                } else {
+                    self.index_source_with_cancel(
+                        &dependency_uri,
+                        dependency_text,
+                        disk_size,
+                        raw_content_hash,
+                        &effective_context_key,
+                        pinned,
+                        cancel,
+                    )?
+                };
+                if indexed {
+                    if let pascal_core::SourceRevision::Disk { stamp, .. } =
+                        &dependency.source.revision
+                    {
+                        self.disk_stamps.insert(
+                            dependency_uri.clone(),
+                            DiskStamp {
+                                bytes: stamp.bytes,
+                                modified: stamp.modified,
+                            },
+                        );
+                    }
+                    pinned.insert(dependency_uri.clone());
+                    resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
+                    let dependency_is_legacy = match &dependency.source.revision {
+                        pascal_core::SourceRevision::Disk { path_entry, .. } => {
+                            matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative)
+                        }
+                        pascal_core::SourceRevision::Overlay { .. } => context
+                            .path_entry_for(&dependency.source.path)
+                            .is_some_and(|entry| {
+                                matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+                            }),
+                    };
+                    if legacy_route.is_some() && dependency_is_legacy {
+                        self.remember_legacy_route(
+                            &dependency_uri,
+                            &effective_context_key,
+                            &dependency.source.path,
+                        );
+                    }
+                    self.record_resolved_source(
+                        &context,
+                        &dependency.source,
+                        dependency_uri.clone(),
+                        false,
+                    )?;
+                    if !dependencies.contains(&dependency_uri) {
+                        dependencies.push(dependency_uri.clone());
+                    }
+                }
             }
             if let Some(hook) = &self.dependency_hook {
-                hook(&dependency_uri, done, total)?;
-            }
-            let dependency_text = dependency.source.decoded_text.as_deref().map_or_else(
-                || resolver::decode_source_bytes(&dependency.source.bytes),
-                ToOwned::to_owned,
-            );
-            let disk_size = matches!(
-                &dependency.source.revision,
-                pascal_core::SourceRevision::Disk { .. }
-            )
-            .then_some(dependency.source.bytes.len());
-            let raw_content_hash = match &dependency.source.revision {
-                pascal_core::SourceRevision::Disk { content_hash, .. }
-                | pascal_core::SourceRevision::Overlay { content_hash, .. } => Some(*content_hash),
-            };
-            let already_indexed = self.index.contains(&dependency_uri)
-                && self
-                    .document_contexts
-                    .get(&dependency_uri)
-                    .is_some_and(|key| key == &effective_context_key)
-                && self
-                    .index
-                    .source_text(&dependency_uri)
-                    .is_some_and(|source| source == dependency_text);
-            if !already_indexed
-                && !self.index_source_with_cancel(
-                    &dependency_uri,
-                    dependency_text,
-                    disk_size,
-                    raw_content_hash,
-                    &effective_context_key,
-                    pinned,
-                    cancel,
-                )?
-            {
-                continue;
-            }
-            if let pascal_core::SourceRevision::Disk { stamp, .. } = &dependency.source.revision {
-                self.disk_stamps.insert(
-                    dependency_uri.clone(),
-                    DiskStamp {
-                        bytes: stamp.bytes,
-                        modified: stamp.modified,
-                    },
-                );
-            }
-            pinned.insert(dependency_uri.clone());
-            resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
-            let dependency_is_legacy = match &dependency.source.revision {
-                pascal_core::SourceRevision::Disk { path_entry, .. } => {
-                    matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative)
-                }
-                pascal_core::SourceRevision::Overlay { .. } => context
-                    .path_entry_for(&dependency.source.path)
-                    .is_some_and(|entry| {
-                        matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
-                    }),
-            };
-            if legacy_route.is_some() && dependency_is_legacy {
-                self.remember_legacy_route(
-                    &dependency_uri,
-                    &effective_context_key,
-                    &dependency.source.path,
-                );
-            }
-            self.record_resolved_source(
-                &context,
-                &dependency.source,
-                dependency_uri.clone(),
-                false,
-            )?;
-            if !dependencies.contains(&dependency_uri) {
-                dependencies.push(dependency_uri);
+                hook(&dependency_uri, index + 1, total)?;
             }
         }
         for import in &resolved.bindings {
@@ -16099,10 +16109,15 @@ mod tests {
         };
         let main = test_workspace(vec![root.clone()], options);
         let order = Arc::new(Mutex::new(Vec::new()));
+        let progress = Arc::new(Mutex::new(Vec::new()));
         let mut worker = worker_view(&main);
         let recorded = order.clone();
-        worker.set_dependency_hook(Arc::new(move |uri, _, _| {
-            recorded.lock().unwrap().push(uri.clone());
+        let recorded_progress = progress.clone();
+        worker.set_dependency_hook(Arc::new(move |uri, done, total| {
+            if done > 0 {
+                recorded.lock().unwrap().push(uri.clone());
+            }
+            recorded_progress.lock().unwrap().push((done, total));
             Ok(())
         }));
         worker
@@ -16118,6 +16133,33 @@ mod tests {
                 Url::from_file_path(lib.join("LibUnit.pas")).unwrap(),
             ]
         );
+        assert_eq!(
+            *progress.lock().unwrap(),
+            vec![(0, 2), (1, 2), (2, 2)],
+            "progress begins at zero and reaches total after the final completed unit"
+        );
+    }
+
+    #[test]
+    fn dependency_hook_emits_no_progress_for_a_warm_with_no_dependencies() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let path = temp.path().join("Main.pas");
+        fs::write(&path, "unit Main;\ninterface\nimplementation\nend.\n").unwrap();
+        let main_uri = Url::from_file_path(path).unwrap();
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = worker_view(&main);
+        let recorded = progress.clone();
+        worker.set_dependency_hook(Arc::new(move |_, done, total| {
+            recorded.lock().unwrap().push((done, total));
+            Ok(())
+        }));
+
+        worker
+            .warm_with_cancel(&main_uri, &AtomicBool::new(false))
+            .expect("warm without dependencies");
+
+        assert!(progress.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -16380,6 +16422,52 @@ mod tests {
             second.is_empty(),
             "Hello no longer exists; the cached expansion must not be reused: {second:?}"
         );
+    }
+
+    #[test]
+    fn watcher_overflow_makes_a_cached_include_expansion_miss() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(root.join("Main.pas"), "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n").unwrap();
+        fs::write(root.join("Provider.pas"), "unit Provider;\ninterface\n{$I Decl.inc}\nimplementation\nprocedure Hello; begin end;\nend.\n").unwrap();
+        fs::write(root.join("Decl.inc"), "procedure Hello;\n").unwrap();
+        let main_uri = Url::from_file_path(root.join("Main.pas")).unwrap();
+        let provider_uri = Url::from_file_path(root.join("Provider.pas")).unwrap();
+        let main = test_workspace(vec![root.to_path_buf()], Default::default());
+        let mut worker = worker_view(&main);
+        let first = worker.navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+        assert_eq!(first.len(), 1, "fixture must resolve through the include");
+
+        let context_key = worker
+            .document_contexts
+            .get(&provider_uri)
+            .expect("provider context was recorded");
+        let context = &worker
+            .contexts
+            .get(context_key)
+            .expect("provider context is retained")
+            .context;
+        let source_bytes = fs::read(root.join("Provider.pas")).unwrap();
+        let source_hash = pascal_project::content_hash_bytes(&source_bytes);
+        let overlays = worker.overlay_inputs();
+        let cancel = AtomicBool::new(false);
+        let cache = main.project_cache();
+        let crate::project_cache::Lookup::Hit(cached) =
+            cache.unit(&provider_uri, context, source_hash, &overlays, &cancel)
+        else {
+            panic!("provider with a retained include expansion must be cached")
+        };
+        assert!(
+            cached.expansion.is_some(),
+            "fixture must cache its include expansion"
+        );
+
+        crate::file_watch::apply_watch_event(cache, crate::file_watch::WatchEvent::Overflow);
+
+        assert!(matches!(
+            cache.unit(&provider_uri, context, source_hash, &overlays, &cancel),
+            crate::project_cache::Lookup::Compute(_)
+        ));
     }
 
     #[test]

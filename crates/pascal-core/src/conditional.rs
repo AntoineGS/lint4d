@@ -233,6 +233,7 @@ pub struct ConditionalEnvironment {
     options: HashMap<String, Truth>,
     constants: BTreeMap<String, ConstantValue>,
     source_constants: BTreeSet<String>,
+    source_declarations: BTreeMap<String, Truth>,
     compiler_version: Option<CompilerVersion>,
     absent_define: Truth,
     rtl_constants_known: bool,
@@ -247,6 +248,7 @@ impl Default for ConditionalEnvironment {
             options: HashMap::new(),
             constants: BTreeMap::new(),
             source_constants: BTreeSet::new(),
+            source_declarations: BTreeMap::new(),
             compiler_version: None,
             absent_define: Truth::Unknown,
             rtl_constants_known: false,
@@ -408,6 +410,10 @@ impl ConditionalEnvironment {
         key.len()
     }
 
+    fn source_declaration_entry_size(&self, key: &str) -> usize {
+        key.len().saturating_add(size_of::<Truth>())
+    }
+
     fn replace_fact_bytes(&mut self, key: &str, new_bytes: usize) {
         let old_bytes = self
             .values
@@ -544,11 +550,29 @@ impl ConditionalEnvironment {
         true
     }
 
+    fn try_insert_source_declaration(&mut self, key: &str, value: Truth) -> bool {
+        let additional = if self.source_declarations.contains_key(key) {
+            0
+        } else {
+            self.source_declaration_entry_size(key)
+        };
+        if self.len() >= MAX_ENVIRONMENT_ENTRIES && additional > 0 {
+            return false;
+        }
+        if self.bytes.saturating_add(additional) > MAX_ENVIRONMENT_BYTES {
+            return false;
+        }
+        self.bytes += additional;
+        self.source_declarations.insert(key.to_owned(), value);
+        true
+    }
+
     /// Whether this environment carries any inherited DEFINE/UNDEF facts.
     pub fn has_facts(&self) -> bool {
         !self.values.is_empty()
             || !self.options.is_empty()
             || !self.constants.is_empty()
+            || !self.source_declarations.is_empty()
             || self.compiler_version.is_some()
             || self.absent_define != Truth::Unknown
             || self.rtl_constants_known
@@ -595,6 +619,8 @@ impl ConditionalEnvironment {
         7_u8.hash(&mut hasher);
         self.absent_define.hash(&mut hasher);
         self.rtl_constants_known.hash(&mut hasher);
+        8_u8.hash(&mut hasher);
+        self.source_declarations.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -603,6 +629,7 @@ impl ConditionalEnvironment {
             .len()
             .saturating_add(self.options.len())
             .saturating_add(self.constants.len())
+            .saturating_add(self.source_declarations.len())
             .saturating_add(usize::from(self.compiler_version.is_some()))
     }
     fn contains_key(&self, key: &str) -> bool {
@@ -637,6 +664,8 @@ impl ConditionalEnvironment {
     fn clear_constants(&mut self) {
         self.constants.clear();
         self.source_constants.clear();
+        self.source_declarations.clear();
+        self.rtl_constants_known = false;
         self.recompute_bytes();
     }
 
@@ -663,10 +692,30 @@ impl ConditionalEnvironment {
                 .bytes
                 .saturating_sub(self.source_constant_entry_size(key));
         }
+        self.remove_source_declaration(key);
+    }
+
+    fn remove_source_declaration(&mut self, key: &str) {
+        if self.source_declarations.remove(key).is_some() {
+            self.bytes = self
+                .bytes
+                .saturating_sub(self.source_declaration_entry_size(key));
+        }
     }
 
     fn remove_source_constants(&mut self) {
-        let names = self.source_constants.iter().cloned().collect::<Vec<_>>();
+        let names = self
+            .source_constants
+            .iter()
+            .chain(self.source_declarations.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if names
+            .iter()
+            .any(|name| ConditionalContext::is_rtl_version_constant(name))
+        {
+            self.rtl_constants_known = false;
+        }
         for name in names {
             self.remove_constant(&name);
         }
@@ -680,6 +729,7 @@ impl ConditionalEnvironment {
                 value.hash(&mut hasher);
             }
         }
+        self.source_declarations.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -700,6 +750,9 @@ impl ConditionalEnvironment {
         }
         for key in &self.source_constants {
             bytes = bytes.saturating_add(self.source_constant_entry_size(key));
+        }
+        for key in self.source_declarations.keys() {
+            bytes = bytes.saturating_add(self.source_declaration_entry_size(key));
         }
         self.bytes = bytes;
     }
@@ -1495,6 +1548,22 @@ fn short_switch_name(member: &str) -> Option<&str> {
     (token_end == bytes.len() || bytes[token_end].is_ascii_whitespace()).then(|| &member[..1])
 }
 
+fn record_source_declaration_without_value(
+    name: &str,
+    environment: &mut ConditionalEnvironment,
+    budget: &mut AnalysisBudget<'_>,
+) -> bool {
+    if !budget.charge_bytes(environment.source_declaration_entry_size(name)) {
+        return false;
+    }
+    environment.remove_constant(name);
+    if !environment.try_insert_source_declaration(name, Truth::True) {
+        budget.exhausted = true;
+        return false;
+    }
+    true
+}
+
 fn observe_source_constants(
     source: &str,
     range: Range<usize>,
@@ -1558,8 +1627,15 @@ fn observe_source_constants(
             declaration = name_end;
             skip_source_space_and_comments(bytes, &mut declaration);
             if bytes.get(declaration) == Some(&b':') {
-                // Typed declarations without an initializer do not prove a
-                // value; stop this const block rather than guessing its extent.
+                // Typed declarations are outside the value scanner, but the
+                // name is still declared and must not be treated as absent.
+                let Some(name) = canonical_symbol(&text[name_start..name_end]) else {
+                    *complete = false;
+                    return false;
+                };
+                if !record_source_declaration_without_value(&name, environment, budget) {
+                    return false;
+                }
                 break;
             }
             if bytes.get(declaration) != Some(&b'=') {
@@ -1570,9 +1646,13 @@ fn observe_source_constants(
                 *complete = false;
                 return false;
             };
+            let Some(name) = canonical_symbol(&text[name_start..name_end]) else {
+                *complete = false;
+                return false;
+            };
             let expression = &text[declaration..end];
             let mut expression_complete = true;
-            let value =
+            let evaluated_value =
                 evaluate_typed_expression(expression, environment, &mut expression_complete);
             // An unsupported source-constant initializer is simply not an
             // admitted fact.  It is not a malformed conditional directive,
@@ -1581,14 +1661,12 @@ fn observe_source_constants(
             // block as well: after an unsupported initializer we no longer
             // have enough grammar context to distinguish another constant
             // declarator from a recovered Pascal declaration.
-            if !expression_complete {
-                break;
-            }
-            if let Some(value) = value.to_constant() {
-                let Some(name) = canonical_symbol(&text[name_start..name_end]) else {
-                    *complete = false;
-                    return false;
-                };
+            let value = if expression_complete {
+                evaluated_value.to_constant()
+            } else {
+                None
+            };
+            if let Some(value) = value {
                 let provenance_bytes = if !environment.source_constants.contains(&name) {
                     environment.source_constant_entry_size(&name)
                 } else {
@@ -1598,15 +1676,22 @@ fn observe_source_constants(
                     name.len()
                         .saturating_add(size_of::<ConstantValue>())
                         .saturating_add(constant_size(&value)),
-                ) {
+                ) || !budget.charge_bytes(provenance_bytes)
+                {
                     return false;
                 }
-                if !budget.charge_bytes(provenance_bytes)
-                    || !environment.try_insert_source_constant(&name, &value)
-                {
+                environment.remove_source_declaration(&name);
+                if !environment.try_insert_source_constant(&name, &value) {
                     budget.exhausted = true;
                     return false;
                 }
+            } else {
+                if !record_source_declaration_without_value(&name, environment, budget) {
+                    return false;
+                }
+            }
+            if !expression_complete {
+                break;
             }
             declaration = end.saturating_add(1);
         }
@@ -1812,6 +1897,35 @@ fn merge_environment(
     constant_keys.extend(incoming.constants.keys().cloned());
     constant_keys.sort();
     constant_keys.dedup();
+    let mut declaration_keys = constant_keys.clone();
+    declaration_keys.extend(current.source_declarations.keys().cloned());
+    declaration_keys.extend(incoming.source_declarations.keys().cloned());
+    declaration_keys.sort();
+    declaration_keys.dedup();
+    let merged_declarations = declaration_keys
+        .iter()
+        .map(|key| {
+            let left = if current.constants.contains_key(key) {
+                Truth::True
+            } else {
+                current
+                    .source_declarations
+                    .get(key)
+                    .copied()
+                    .unwrap_or(Truth::False)
+            };
+            let right = if incoming.constants.contains_key(key) {
+                Truth::True
+            } else {
+                incoming
+                    .source_declarations
+                    .get(key)
+                    .copied()
+                    .unwrap_or(Truth::False)
+            };
+            (key.clone(), left.merge(right))
+        })
+        .collect::<Vec<_>>();
 
     let mut merged_bytes = current
         .compiler_version
@@ -1871,6 +1985,20 @@ fn merge_environment(
             merged_bytes = bytes;
         }
     }
+    for (name, declared) in &merged_declarations {
+        let has_common_constant = matches!(
+            (current.constants.get(name), incoming.constants.get(name)),
+            (Some(left), Some(right)) if left == right
+        );
+        if *declared != Truth::False && !has_common_constant {
+            let Some(bytes) = merged_bytes.checked_add(current.source_declaration_entry_size(name))
+            else {
+                budget.exhausted = true;
+                return false;
+            };
+            merged_bytes = bytes;
+        }
+    }
     if !budget.check_environment_bytes(merged_bytes)
         || !budget.charge_bytes(
             current
@@ -1882,6 +2010,8 @@ fn merge_environment(
         return false;
     }
 
+    current.source_declarations.clear();
+    current.recompute_bytes();
     for key in keys {
         let left = current.get(&key).copied().unwrap_or(current.absent_define);
         let right = incoming
@@ -1924,6 +2054,15 @@ fn merge_environment(
         .source_constants
         .retain(|name| current.constants.contains_key(name));
     current.recompute_bytes();
+    for (name, declared) in merged_declarations {
+        if declared != Truth::False
+            && !current.constants.contains_key(&name)
+            && !current.try_insert_source_declaration(&name, declared)
+        {
+            budget.exhausted = true;
+            return false;
+        }
+    }
     if current.len() > MAX_ENVIRONMENT_ENTRIES || current.bytes() > MAX_ENVIRONMENT_BYTES {
         budget.exhausted = true;
         return false;
@@ -2632,17 +2771,23 @@ impl ExpressionParser<'_> {
                 let symbol = self.parse_function_identifier();
                 symbol
                     .map(|symbol| {
-                        Value::Truth(if self.environment.constant(&symbol).is_some() {
-                            Truth::True
-                        } else if self.environment.rtl_constants_known
-                            && pascal_project::conditional::ConditionalContext::is_rtl_version_constant(
-                                &symbol,
-                            )
-                        {
-                            Truth::False
-                        } else {
-                            Truth::Unknown
-                        })
+                        Value::Truth(
+                            if self.environment.constant(&symbol).is_some() {
+                                Truth::True
+                            } else if let Some(declared) =
+                                self.environment.source_declarations.get(&symbol)
+                            {
+                                *declared
+                            } else if self.environment.rtl_constants_known
+                                && pascal_project::conditional::ConditionalContext::is_rtl_version_constant(
+                                    &symbol,
+                                )
+                            {
+                                Truth::False
+                            } else {
+                                Truth::Unknown
+                            },
+                        )
                     })
                     .unwrap_or_else(|| {
                         self.malformed = true;
@@ -2729,6 +2874,12 @@ impl ExpressionParser<'_> {
                             .constant(&key)
                             .cloned()
                             .map(Value::from_constant)
+                            .or_else(|| {
+                                self.environment
+                                    .source_declarations
+                                    .contains_key(&key)
+                                    .then_some(Value::Unknown)
+                            })
                             .or_else(|| {
                                 self.environment.values.get(&key).copied().map(Value::Truth)
                             })

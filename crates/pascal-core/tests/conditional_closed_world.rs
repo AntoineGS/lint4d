@@ -1,4 +1,7 @@
-use pascal_core::conditional::{self, CompilerVersion, ConditionalContext, ConstantValue, Truth};
+use pascal_core::conditional::{
+    self, CompilerVersion, ConditionalContext, ConstantValue, IncludeTransition, Truth,
+};
+use pascal_core::resolver::NoCancellation;
 
 fn activity(source: &str, needle: &str, context: &ConditionalContext) -> Truth {
     conditional::analyze_with_context(source, context)
@@ -102,6 +105,112 @@ fn rtl_rule_does_not_apply_to_other_identifiers() {
     context.rtl_constants_known = true;
     let source = "{$IF Declared(TFoo)}{$DEFINE A}{$IFEND}";
     assert_eq!(activity(source, "DEFINE A", &context), Truth::Unknown);
+}
+
+#[test]
+fn source_declared_unknown_rtl_constant_is_not_absent() {
+    let mut context = ConditionalContext::default();
+    context.rtl_constants_known = true;
+    let source = concat!(
+        "const RTLVersion113 = SOME_OTHER;",
+        "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
+        "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
+    );
+
+    assert_eq!(activity(source, "DEFINE DECLARED", &context), Truth::True);
+    assert_eq!(activity(source, "DEFINE VALUE", &context), Truth::Unknown);
+}
+
+#[test]
+fn conditional_unknown_rtl_declaration_stays_unknown_after_branch_merge() {
+    let mut context = ConditionalContext::default();
+    context.rtl_constants_known = true;
+    let source = concat!(
+        "{$IF MAYBE}",
+        "const RTLVersion113 = SOME_OTHER;",
+        "{$ENDIF}",
+        "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
+        "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
+    );
+
+    assert_eq!(
+        activity(source, "DEFINE DECLARED", &context),
+        Truth::Unknown
+    );
+    assert_eq!(activity(source, "DEFINE VALUE", &context), Truth::Unknown);
+}
+
+#[test]
+fn unsupported_source_scope_does_not_claim_rtl_constants_absent() {
+    let mut context = ConditionalContext::default();
+    context.rtl_constants_known = true;
+    let source = concat!(
+        "procedure Local; const RTLVersion113 = SOME_OTHER; begin",
+        "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
+        "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
+        "end;",
+    );
+
+    assert_eq!(
+        activity(source, "DEFINE DECLARED", &context),
+        Truth::Unknown
+    );
+    assert_eq!(activity(source, "DEFINE VALUE", &context), Truth::Unknown);
+}
+
+#[test]
+fn included_unknown_rtl_constant_does_not_become_absent_on_return() {
+    let mut context = ConditionalContext::default();
+    context.rtl_constants_known = true;
+    let mut environment = conditional::ConditionalEnvironment::from_context(&context);
+    let mut include =
+        |_directive: &conditional::ConditionalDirective,
+         environment: &mut conditional::ConditionalEnvironment| {
+            let included = conditional::analyze_with_include_callback(
+                "const RTLVersion113 = SOME_OTHER;",
+                environment,
+                &NoCancellation,
+                &mut |_nested, _environment| IncludeTransition {
+                    complete: true,
+                    environment_known: true,
+                },
+            );
+            IncludeTransition {
+                complete: included.complete,
+                environment_known: included.complete,
+            }
+        };
+    let source = concat!(
+        "{$I child.inc}",
+        "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
+        "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
+    );
+
+    let analysis = conditional::analyze_with_include_callback(
+        source,
+        &mut environment,
+        &NoCancellation,
+        &mut include,
+    );
+
+    assert_eq!(
+        analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE DECLARED"))
+            .expect("declared branch")
+            .activity,
+        Truth::Unknown
+    );
+    assert_eq!(
+        analysis
+            .directives
+            .iter()
+            .find(|directive| directive.body.contains("DEFINE VALUE"))
+            .expect("value branch")
+            .activity,
+        Truth::Unknown
+    );
 }
 
 #[test]

@@ -1343,6 +1343,7 @@ impl ProjectContext {
     /// define values retained in older manually-constructed contexts.
     pub fn effective_conditional_context(&self) -> ConditionalContext {
         let mut context = self.conditional_context.clone();
+        context.absent_define = ConditionalFact::Unknown;
         for define in &self.defines {
             let name = define.trim().trim_start_matches('&').to_ascii_uppercase();
             if !name.is_empty() && !context.defines.contains_key(&name) {

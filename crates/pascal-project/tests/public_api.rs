@@ -37,6 +37,25 @@ fn public_api_discovers_a_standalone_pascal_source() {
 }
 
 #[test]
+fn effective_conditional_context_is_open_even_when_stored_context_is_closed() {
+    let context = ProjectContext {
+        defines: vec!["LEGACY".into()],
+        conditional_context: ConditionalContext {
+            absent_define: ConditionalFact::False,
+            rtl_constants_known: true,
+            ..ConditionalContext::default()
+        },
+        ..ProjectContext::default()
+    };
+
+    let effective = context.effective_conditional_context();
+
+    assert_eq!(effective.absent_define, ConditionalFact::Unknown);
+    assert!(effective.rtl_constants_known);
+    assert_eq!(effective.define("LEGACY"), ConditionalFact::True);
+}
+
+#[test]
 fn missing_reference_keeps_independent_metadata_usable() {
     let temp = tempdir().unwrap();
     let root = temp.path();

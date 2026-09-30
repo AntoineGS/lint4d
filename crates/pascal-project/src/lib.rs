@@ -11,6 +11,7 @@
 //! `pascal-lsp` owns stateful workspace orchestration, overlays, indexes, and
 //! the include/rename resolver that consumes this crate's bounded results.
 
+pub mod build_selection;
 pub mod compiler_defines;
 pub mod conditional;
 pub mod configuration;
@@ -21,6 +22,7 @@ pub mod installations;
 pub mod path_issues;
 pub mod rtl_constants;
 
+pub use build_selection::{BuildCandidates, BuildSelection, BuildSelectionMode};
 pub use compiler_defines::TargetPlatform;
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
@@ -885,6 +887,10 @@ pub struct ProjectContext {
     pub conditional_context: ConditionalContext,
     pub config: Option<String>,
     pub platform: Option<String>,
+    /// The selected build configuration and the `.dproj` configuration choices.
+    pub config_selection: BuildSelection,
+    /// The selected target platform and the `.dproj` platform choices.
+    pub platform_selection: BuildSelection,
     /// The immutable Delphi override snapshot used to evaluate this context.
     pub overrides: EffectiveOverrides,
     /// The requester-scoped read policy used while evaluating this context.
@@ -1000,6 +1006,17 @@ impl ProjectContext {
         }
         if let Some(platform) = &self.platform {
             visit(platform.len())?;
+        }
+        for selection in [&self.config_selection, &self.platform_selection] {
+            if let Some(selected) = &selection.selected {
+                visit(selected.len())?;
+            }
+            for candidate in &selection.candidates {
+                visit(candidate.len())?;
+            }
+            if let Some(project_default) = &selection.project_default {
+                visit(project_default.len())?;
+            }
         }
         self.overrides.visit_recovery_payload(visit)?;
         self.read_policy.visit_recovery_payload(visit)?;
@@ -3897,18 +3914,24 @@ fn build_project_context(
     let caller_compiler_version = options.conditional_context.compiler_version;
     let mut bootstrap_config = None;
     let mut bootstrap_platform = None;
+    let mut build_candidates = BuildCandidates::default();
+    let mut config_is_configured =
+        options.build_config.is_some() || overrides.properties.contains_key("config");
+    let mut platform_is_configured =
+        options.platform.is_some() || overrides.properties.contains_key("platform");
     let mut installation_evidence = InstallationEvidence::default();
     let mut compiler_identity_conflicting = false;
     let mut other_identity_conflicting = false;
     if extension_is(&project_file, "dproj") {
         let bootstrap_entry = ProjectPathEntry::legacy(project_file.clone());
-        let (bootstrap, observation) = read_policy
+        let (bootstrap_payload, observation) = read_policy
             .read_payload_with_observation(&bootstrap_entry, MAX_PROJECT_BYTES)
             .map_err(|error| format!("could not read project bootstrap metadata: {error}"))?;
         tracker.record_metadata_path(project_file.clone());
         tracker.record_metadata_observation(observation);
+        build_candidates = build_selection::parse_build_candidates(&bootstrap_payload);
         let bootstrap = parse_project_bootstrap(
-            &bootstrap,
+            &bootstrap_payload,
             &project_file,
             &evaluation_options,
             &overrides,
@@ -3969,6 +3992,8 @@ fn build_project_context(
                     ),
                 };
                 overrides = effective_profile.overrides.clone();
+                config_is_configured |= overrides.properties.contains_key("config");
+                platform_is_configured |= overrides.properties.contains_key("platform");
                 if evaluation_options.build_config.is_none() {
                     evaluation_options.build_config = effective_profile
                         .overrides
@@ -4367,6 +4392,23 @@ fn build_project_context(
         }
     }
 
+    let config = selected_config(&builder, &evaluation_options);
+    let platform = selected_platform(&builder, &evaluation_options);
+    let config_selection = build_selection::selection_for_value(
+        config.as_deref(),
+        &build_candidates.configs,
+        build_candidates.default_config.as_deref(),
+        config_is_configured,
+        false,
+    );
+    let platform_selection = build_selection::selection_for_value(
+        platform.as_deref(),
+        &build_candidates.platforms,
+        build_candidates.default_platform.as_deref(),
+        platform_is_configured,
+        true,
+    );
+
     Ok(ProjectContext {
         discovery_complete: !builder.incomplete
             && ide_path_warnings.is_empty()
@@ -4394,8 +4436,10 @@ fn build_project_context(
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
         defines,
         conditional_context,
-        config: selected_config(&builder, &evaluation_options),
-        platform: selected_platform(&builder, &evaluation_options),
+        config,
+        platform,
+        config_selection,
+        platform_selection,
         overrides,
         read_policy,
         packages: package_list(&builder),
@@ -4485,6 +4529,8 @@ fn build_standalone_context(
         conditional_context,
         config: selected_standalone_property(&overrides, options.build_config.as_ref(), "config"),
         platform: selected_standalone_property(&overrides, options.platform.as_ref(), "platform"),
+        config_selection: BuildSelection::default(),
+        platform_selection: BuildSelection::default(),
         overrides,
         read_policy,
         packages: Vec::new(),

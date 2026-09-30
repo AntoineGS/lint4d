@@ -2,7 +2,11 @@ use pascal_project::build_selection::{
     BuildChoice, BuildSelection, BuildSelectionMode, parse_build_candidates,
 };
 use pascal_project::delphi_overrides::OverrideSession;
-use pascal_project::{ProjectContext, ProjectOptions};
+use pascal_project::rtl_constants::RtlConstantSource;
+use pascal_project::{
+    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, OpenReason,
+    ProjectContext, ProjectOptions, SourceOrigin,
+};
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
@@ -528,12 +532,412 @@ fn project_context_recovery_visits_build_selection_strings() {
     assert_eq!(visited, [15, 16, 14, 17, 18, 16]);
 }
 
+#[test]
+fn project_effective_context_includes_compiler_predefined_symbols() {
+    let options = ProjectOptions {
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(21, 0)),
+        ..ProjectOptions::default()
+    };
+    let context = discover_webquery(&options);
+
+    let conditional_context = context.effective_conditional_context();
+    assert_eq!(
+        conditional_context.define("MSWINDOWS"),
+        ConditionalFact::True
+    );
+    assert_eq!(conditional_context.define("CPUX86"), ConditionalFact::False);
+}
+
+#[test]
+fn project_compiled_sources_close_undefined_defines_and_keep_project_facts() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let context = discover_webquery_at(root, &d2010_options(), &OverrideSession::new(None));
+
+    assert!(context.conditional_closure.closed);
+    assert!(context.conditional_closure.open_reasons.is_empty());
+    assert_eq!(context.config.as_deref(), Some("Release"));
+    assert_eq!(
+        context.config_selection.mode,
+        BuildSelectionMode::ProjectDefault
+    );
+    let svc = root.join("SvcMain.pas");
+    assert_eq!(context.source_origin(&svc), SourceOrigin::ProjectCompiled);
+    let conditionals = context.conditional_context_for(&svc);
+    assert_eq!(conditionals.define("DEBUG"), ConditionalFact::False);
+    assert_eq!(conditionals.define("RELEASE"), ConditionalFact::True);
+    assert_eq!(conditionals.define("NOSF"), ConditionalFact::True);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::True);
+    assert_eq!(conditionals.define("CPUX86"), ConditionalFact::False);
+    assert_eq!(
+        context.effective_conditional_context().absent_define,
+        ConditionalFact::Unknown
+    );
+}
+
+#[test]
+fn library_sources_keep_an_open_define_world_but_receive_predefined_facts() {
+    let project = tempdir().expect("project directory");
+    write_webquery_fixture(project.path());
+    let library_dir = tempdir().expect("library directory");
+    let library_file = library_dir.path().join("LibraryUnit.pas");
+    write(
+        &library_file,
+        "unit LibraryUnit; interface implementation end.",
+    );
+    let context = discover_webquery_at(
+        project.path(),
+        &d2010_options(),
+        &OverrideSession::new(None),
+    );
+
+    assert_eq!(context.source_origin(&library_file), SourceOrigin::Library);
+    let conditionals = context.conditional_context_for(&library_file);
+    assert_eq!(conditionals.define("DEBUG"), ConditionalFact::Unknown);
+    assert_eq!(conditionals.define("RELEASE"), ConditionalFact::Unknown);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::True);
+    assert_eq!(conditionals.absent_define, ConditionalFact::Unknown);
+}
+
+#[test]
+fn caller_source_paths_are_classified_as_project_compiled_roots() {
+    let temp = tempdir().expect("temporary directory");
+    let project = temp.path().join("project");
+    let shared = temp.path().join("shared");
+    write_webquery_fixture(&project);
+    let shared_file = shared.join("SharedUnit.pas");
+    write(
+        &shared_file,
+        "unit SharedUnit; interface implementation end.",
+    );
+    let options = ProjectOptions {
+        source_paths: vec!["shared".into()],
+        ..d2010_options()
+    };
+
+    let context = ProjectContext::discover_with_overrides(
+        &project.join("App.dpr"),
+        &[temp.path().to_path_buf()],
+        &options,
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert!(context.project_source_roots.contains(&shared));
+    assert_eq!(
+        context.source_origin(&shared_file),
+        SourceOrigin::ProjectCompiled
+    );
+    assert_eq!(
+        context
+            .conditional_context_for(&shared_file)
+            .define("DEBUG"),
+        ConditionalFact::False
+    );
+}
+
+#[test]
+fn project_define_wins_over_a_conflicting_predefined_symbol() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let dproj = WEBQUERY_DPROJ.replace(
+        "<DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>",
+        "<DCC_Define>WIN64;RELEASE;$(DCC_Define)</DCC_Define>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+    let context = discover_webquery_at(root, &d2010_options(), &OverrideSession::new(None));
+
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("WIN64"),
+        ConditionalFact::True
+    );
+}
+
+#[test]
+fn client_conditional_fact_wins_over_project_and_predefined_facts() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let dproj = WEBQUERY_DPROJ.replace(
+        "<DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>",
+        "<DCC_Define>MSWINDOWS;RELEASE;$(DCC_Define)</DCC_Define>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+    let mut conditional_context =
+        ConditionalContext::default().with_compiler_version(CompilerVersion::new(21, 0));
+    conditional_context.set_define("MSWINDOWS", ConditionalFact::False);
+    let options = ProjectOptions {
+        conditional_context,
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("MSWINDOWS"),
+        ConditionalFact::False
+    );
+}
+
+#[test]
+fn missing_compiler_version_keeps_project_defines_open() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let context = discover_webquery_at(
+        root,
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    );
+
+    assert!(!context.conditional_closure.closed);
+    assert!(
+        context
+            .conditional_closure
+            .open_reasons
+            .contains(&OpenReason::CompilerVersionUnknown)
+    );
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("DEBUG"),
+        ConditionalFact::Unknown
+    );
+}
+
+#[test]
+fn system_pas_rtl_constants_are_tracked_and_added_to_contexts() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let dproj = WEBQUERY_DPROJ.replace(
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler>",
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler><DCC_UnitSearchPath>rtl</DCC_UnitSearchPath>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+    let system_pas = root.join("rtl/System.pas");
+    write(
+        &system_pas,
+        "unit System; interface const RTLVersion111 = True; implementation end.",
+    );
+    let library_dir = tempdir().expect("library directory");
+    let library_file = library_dir.path().join("LibraryUnit.pas");
+    write(
+        &library_file,
+        "unit LibraryUnit; interface implementation end.",
+    );
+    let options = ProjectOptions {
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(35, 0)),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(
+        context.conditional_closure.rtl_source,
+        RtlConstantSource::SystemPas
+    );
+    assert!(
+        context
+            .conditional_closure
+            .rtl_constants
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| name == "RTLVersion111"))
+    );
+    assert!(context.conditional_context.rtl_constants_known);
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .constants
+            .get("RTLVERSION111"),
+        Some(&ConstantValue::Boolean(true))
+    );
+    assert_eq!(
+        context
+            .conditional_context_for(&library_file)
+            .constants
+            .get("RTLVERSION111"),
+        Some(&ConstantValue::Boolean(true))
+    );
+    assert!(
+        context
+            .metadata_observations
+            .iter()
+            .any(|observation| observation.path() == system_pas)
+    );
+    assert!(context.project_source_roots.contains(&root.join("rtl")));
+    assert_eq!(
+        context.source_origin(&system_pas),
+        SourceOrigin::ProjectCompiled
+    );
+}
+
+#[test]
+fn console_predefined_symbol_comes_from_main_source_directive() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    write(
+        &root.join("App.dpr"),
+        "program App; {$APPTYPE\n CONSOLE} uses SvcMain; begin end.",
+    );
+    let context = discover_webquery_at(root, &d2010_options(), &OverrideSession::new(None));
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("CONSOLE"),
+        ConditionalFact::True
+    );
+
+    write(
+        &root.join("App.dpr"),
+        "program App; uses SvcMain; begin end.",
+    );
+    let plain_context = discover_webquery_at(root, &d2010_options(), &OverrideSession::new(None));
+    assert_eq!(
+        plain_context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("CONSOLE"),
+        ConditionalFact::False
+    );
+}
+
+#[test]
+fn console_predefined_symbol_ignores_directive_text_in_comments_and_strings() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    write(
+        &root.join("App.dpr"),
+        "program App; // {$APPTYPE CONSOLE}\n uses SvcMain; begin WriteLn('{$APPTYPE CONSOLE}'); end.",
+    );
+    let context = discover_webquery_at(root, &d2010_options(), &OverrideSession::new(None));
+
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("CONSOLE"),
+        ConditionalFact::False
+    );
+}
+
+#[test]
+fn standalone_contexts_remain_open_and_use_client_predefined_symbols() {
+    let temp = tempdir().expect("temporary directory");
+    let source = temp.path().join("Standalone.pas");
+    write(&source, "unit Standalone; interface implementation end.");
+    let options = ProjectOptions {
+        platform: Some("Win32".into()),
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(21, 0)),
+        ..ProjectOptions::default()
+    };
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &options,
+        &OverrideSession::new(None),
+    )
+    .expect("standalone discovery");
+
+    assert!(!context.conditional_closure.closed);
+    assert!(
+        context
+            .conditional_closure
+            .open_reasons
+            .contains(&OpenReason::NoProject)
+    );
+    assert_eq!(
+        context.conditional_context_for(&source).define("MSWINDOWS"),
+        ConditionalFact::True
+    );
+}
+
+#[test]
+fn invalid_build_selection_is_an_explicit_open_reason() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let options = ProjectOptions {
+        build_selections: [(
+            root.join("App.dproj"),
+            BuildChoice {
+                config: Some("Gone".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(21, 0)),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert!(!context.conditional_closure.closed);
+    assert!(
+        context
+            .conditional_closure
+            .open_reasons
+            .contains(&OpenReason::ConfigInvalid)
+    );
+    assert_eq!(OpenReason::ConfigInvalid.as_str(), "configInvalid");
+}
+
+#[test]
+fn configured_value_outside_project_candidates_keeps_conditionals_open() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let options = ProjectOptions {
+        build_config: Some("Gone".into()),
+        platform: Some("Win32".into()),
+        ..d2010_options()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(
+        context.config_selection.mode,
+        BuildSelectionMode::Configured
+    );
+    assert!(!context.conditional_closure.closed);
+    assert!(
+        context
+            .conditional_closure
+            .open_reasons
+            .contains(&OpenReason::DiscoveryIncomplete),
+        "unexpected open reasons: {:?}",
+        context.conditional_closure.open_reasons
+    );
+    assert_eq!(
+        context
+            .conditional_context_for(&root.join("SvcMain.pas"))
+            .define("DEBUG"),
+        ConditionalFact::Unknown
+    );
+}
+
 fn discover_webquery(options: &ProjectOptions) -> ProjectContext {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
     write_webquery_fixture(root);
 
     discover_webquery_at(root, options, &OverrideSession::new(None))
+}
+
+fn d2010_options() -> ProjectOptions {
+    ProjectOptions {
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(21, 0)),
+        ..ProjectOptions::default()
+    }
 }
 
 fn discover_webquery_at(

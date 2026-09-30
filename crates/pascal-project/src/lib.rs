@@ -14,6 +14,7 @@
 pub mod build_selection;
 pub mod compiler_defines;
 pub mod conditional;
+pub mod conditional_closure;
 pub mod configuration;
 pub mod delphi_overrides;
 pub mod installation_config;
@@ -27,6 +28,7 @@ pub use compiler_defines::TargetPlatform;
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
 };
+pub use conditional_closure::{ConditionalClosure, OpenReason, SourceOrigin};
 pub use configuration::{ConfigRead, config_directories, read_config};
 pub use installations::{InstallationOrigin, InstallationSelection};
 pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
@@ -527,6 +529,23 @@ impl ReadPolicy {
         Ok((contents, observation))
     }
 
+    fn read_pascal_payload_with_observation(
+        &self,
+        entry: &ProjectPathEntry,
+        limit: u64,
+    ) -> Result<(String, MetadataObservation), String> {
+        let stamp = path_stamp_result(&entry.path).ok().flatten();
+        let bytes = self.read_payload_bytes(entry, limit)?;
+        let observation = MetadataObservation::Payload {
+            path: entry.path.clone(),
+            read_policy: self.clone(),
+            path_entry: entry.clone(),
+            stamp,
+            content_hash: content_hash_bytes(&bytes),
+        };
+        Ok((decode_source_payload(&bytes), observation))
+    }
+
     /// Read an authorized payload with strict symlink-free semantics.
     ///
     /// This is the normal payload API: configured and mapped entries, as well
@@ -842,6 +861,7 @@ fn open_payload_file(path: &Path) -> io::Result<fs::File> {
 struct ProjectDirectoryEntries {
     dproj: Vec<PathBuf>,
     dpr_or_dpk: Vec<PathBuf>,
+    system_pas: Option<PathBuf>,
     candidate_overflow: bool,
 }
 
@@ -888,6 +908,12 @@ pub struct ProjectContext {
     /// Effective compiler/version/options/constants used by source analysis.
     /// `defines` remains as a compatibility projection for existing callers.
     pub conditional_context: ConditionalContext,
+    /// Whether project sources can close their define set and resolved RTL constants.
+    pub conditional_closure: ConditionalClosure,
+    /// Caller facts and compiler/RTL predefined facts for library sources.
+    pub library_conditional_context: ConditionalContext,
+    /// Project and caller-configured source roots, excluding installation paths.
+    pub project_source_roots: Vec<PathBuf>,
     pub config: Option<String>,
     pub platform: Option<String>,
     /// The selected build configuration and the `.dproj` configuration choices.
@@ -962,6 +988,9 @@ impl ProjectContext {
         for path in &self.search_paths {
             visit(path.as_os_str().len())?;
         }
+        for path in &self.project_source_roots {
+            visit(path.as_os_str().len())?;
+        }
         for entry in &self.search_path_entries {
             entry.visit_recovery_payload(visit)?;
         }
@@ -1004,6 +1033,13 @@ impl ProjectContext {
             visit(define.len())?;
         }
         self.conditional_context.visit_recovery_payload(visit)?;
+        self.library_conditional_context
+            .visit_recovery_payload(visit)?;
+        if let Some(names) = &self.conditional_closure.rtl_constants {
+            for name in names {
+                visit(name.len())?;
+            }
+        }
         if let Some(config) = &self.config {
             visit(config.len())?;
         }
@@ -1374,6 +1410,44 @@ impl ProjectContext {
             }
         }
         context
+    }
+
+    /// Classify a source as project-compiled or external library code.
+    pub fn source_origin(&self, path: &Path) -> SourceOrigin {
+        let is_explicit = self
+            .main_source
+            .as_deref()
+            .is_some_and(|main| project_paths_equal(main, path))
+            || self
+                .explicit_units
+                .values()
+                .flatten()
+                .any(|unit| project_paths_equal(unit, path));
+        let under_project_root = self.project_source_roots.iter().any(|root| {
+            path.parent()
+                .is_some_and(|parent| project_paths_equal(parent, root))
+                || path_starts_with_ci(path, root)
+        });
+        if self.project_file.is_some() && (is_explicit || under_project_root) {
+            SourceOrigin::ProjectCompiled
+        } else {
+            SourceOrigin::Library
+        }
+    }
+
+    /// Return the source-specific context without changing the compatibility
+    /// behavior of `effective_conditional_context` for older call sites.
+    pub fn conditional_context_for(&self, path: &Path) -> ConditionalContext {
+        if self.project_file.is_none() {
+            return self.effective_conditional_context();
+        }
+        match self.source_origin(path) {
+            SourceOrigin::ProjectCompiled if self.conditional_closure.closed => self
+                .effective_conditional_context()
+                .with_absent_define(ConditionalFact::False),
+            SourceOrigin::ProjectCompiled => self.effective_conditional_context(),
+            SourceOrigin::Library => self.library_conditional_context.clone(),
+        }
     }
 
     /// Discover the nearest safe project context for `file`.
@@ -2688,6 +2762,13 @@ fn project_directory_entries(
         })?;
         if !file_type.is_file() {
             continue;
+        }
+        if result.system_pas.is_none()
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("System.pas"))
+        {
+            result.system_pas = Some(path.clone());
         }
         if extension_is(&path, "dproj") {
             push_bounded_candidate(&mut result.dproj, path);
@@ -4004,12 +4085,14 @@ fn build_project_context(
     ));
     let mut installation_environment = None;
     let mut installation_config_files = Vec::new();
+    let mut rtl_constants_override = None;
     let mut ide_paths = IdePaths::default();
     let mut installation_warnings = Vec::new();
     let mut ide_path_warnings = Vec::new();
     if let Some(InstallationSelection::Selected { id, .. }) = &installation_selection {
         match installation_config.profile(id) {
             Ok(profile) => {
+                rtl_constants_override = profile.rtl_version_constants.clone();
                 let effective_profile = crate::installation_config::ResolvedInstallation {
                     id: profile.id.clone(),
                     rtl_version_constants: profile.rtl_version_constants.clone(),
@@ -4243,6 +4326,7 @@ fn build_project_context(
             ProjectPathProvenance::Configured,
         );
     }
+    let project_source_roots = paths_from_entries(&search_path_entries);
     for entry in &ide_paths.library {
         if !search_path_entries
             .iter()
@@ -4391,6 +4475,94 @@ fn build_project_context(
             metadata_files.push(metadata_file);
         }
     }
+    let project_defines = property_list(&builder, "dcc_define");
+    let config = selected_config(&builder, &evaluation_options);
+    let platform = selected_platform(&builder, &evaluation_options);
+    let console_target = if builder
+        .property("dcc_consoletarget")
+        .as_deref()
+        .and_then(parse_conditional_fact)
+        == Some(ConditionalFact::True)
+    {
+        ConditionalFact::True
+    } else if let Some(main_source_entry) = &main_source_entry {
+        match builder
+            .read_policy
+            .read_pascal_payload_with_observation(main_source_entry, MAX_PROJECT_BYTES)
+        {
+            Ok((source, observation)) => {
+                add_metadata_observation(&mut builder.metadata_observations, observation);
+                if conditional_closure::source_has_console_apptype(&source) {
+                    ConditionalFact::True
+                } else {
+                    ConditionalFact::False
+                }
+            }
+            Err(error) => {
+                builder.warnings.push(format!(
+                    "could not read main source to determine CONSOLE in {}: {error}",
+                    project_file.display()
+                ));
+                ConditionalFact::Unknown
+            }
+        }
+    } else {
+        ConditionalFact::Unknown
+    };
+    let mut conditional_warnings = Vec::new();
+    let mut conditional_context = merge_project_conditional_context(
+        &evaluation_options,
+        &builder,
+        &project_defines,
+        &mut conditional_warnings,
+    );
+    builder.warnings.extend(conditional_warnings);
+
+    let predefined = match (
+        conditional_context.compiler_version,
+        platform.as_deref().and_then(TargetPlatform::parse),
+    ) {
+        (Some(version), Some(platform)) => {
+            crate::compiler_defines::predefined_defines(version, &platform, console_target)
+        }
+        _ => BTreeMap::new(),
+    };
+    let version = conditional_context.compiler_version;
+    let system_pas = if version.is_some_and(|version| {
+        version.cmp_numeric(CompilerVersion::new(34, 0)) != Some(std::cmp::Ordering::Less)
+    }) {
+        scan_system_pas_from_paths(
+            &search_path_entries,
+            &ide_paths.browsing,
+            &builder.read_policy,
+            tracker.work_budget,
+            cancel,
+            &mut builder.metadata_observations,
+            &mut builder.warnings,
+        )?
+    } else {
+        None
+    };
+    let (rtl_source, rtl_constants, rtl_warnings) = crate::rtl_constants::resolve_rtl_constants(
+        version,
+        rtl_constants_override.as_deref(),
+        system_pas,
+    );
+    builder.warnings.extend(rtl_warnings);
+
+    conditional_closure::merge_predefined_facts(&mut conditional_context, &predefined);
+    conditional_closure::merge_rtl_constants(&mut conditional_context, rtl_constants.as_deref());
+    conditional_context.absent_define = ConditionalFact::Unknown;
+
+    let mut library_conditional_context = options.conditional_context.clone();
+    library_conditional_context.compiler_version = conditional_context.compiler_version;
+    conditional_closure::merge_predefined_facts(&mut library_conditional_context, &predefined);
+    conditional_closure::merge_rtl_constants(
+        &mut library_conditional_context,
+        rtl_constants.as_deref(),
+    );
+    library_conditional_context.absent_define = ConditionalFact::Unknown;
+
     let metadata_observations = complete_metadata_observations(
         &metadata_files,
         builder
@@ -4401,15 +4573,6 @@ fn build_project_context(
             .collect(),
     );
 
-    let project_defines = property_list(&builder, "dcc_define");
-    let mut conditional_warnings = Vec::new();
-    let conditional_context = merge_project_conditional_context(
-        &evaluation_options,
-        &builder,
-        &project_defines,
-        &mut conditional_warnings,
-    );
-    builder.warnings.extend(conditional_warnings);
     let mut defines = project_defines;
     for (name, value) in &conditional_context.defines {
         if *value == ConditionalFact::True
@@ -4421,8 +4584,6 @@ fn build_project_context(
         }
     }
 
-    let config = selected_config(&builder, &evaluation_options);
-    let platform = selected_platform(&builder, &evaluation_options);
     let mut config_selection = build_selection::selection_for_value(
         config.as_deref(),
         &build_candidates.configs,
@@ -4466,10 +4627,27 @@ fn build_project_context(
         &mut builder.warnings,
     );
 
+    let discovery_complete = !builder.incomplete
+        && ide_path_warnings.is_empty()
+        && !project_context_warnings_incomplete(&builder.warnings, explicit);
+    let open_reasons = conditional_closure::open_reasons(
+        true,
+        discovery_complete,
+        conditional_context.compiler_version.is_some(),
+        config.as_deref(),
+        platform.as_deref(),
+        &config_selection,
+        &platform_selection,
+    );
+    let conditional_closure = ConditionalClosure {
+        closed: open_reasons.is_empty(),
+        open_reasons,
+        rtl_source,
+        rtl_constants,
+    };
+
     Ok(ProjectContext {
-        discovery_complete: !builder.incomplete
-            && ide_path_warnings.is_empty()
-            && !project_context_warnings_incomplete(&builder.warnings, explicit),
+        discovery_complete,
         binding_metadata_complete: !builder.incomplete
             && !binding_metadata_warnings_incomplete(&builder.warnings, explicit),
         path_issues: builder.path_issues.clone(),
@@ -4478,6 +4656,7 @@ fn build_project_context(
         installation_selection,
         main_source,
         search_paths,
+        project_source_roots,
         search_path_entries,
         browsing_path_entries: ide_paths.browsing,
         debug_dcu_path_entries: ide_paths.debug_dcu,
@@ -4493,6 +4672,8 @@ fn build_project_context(
         unit_aliases: parse_aliases(builder.property("dcc_unitalias").as_deref()),
         defines,
         conditional_context,
+        conditional_closure,
+        library_conditional_context,
         config,
         platform,
         config_selection,
@@ -4517,7 +4698,7 @@ fn build_standalone_context(
     mut warnings: Vec<String>,
     discovery_complete: bool,
     metadata_files: Vec<PathBuf>,
-    metadata_observations: Vec<MetadataObservation>,
+    mut metadata_observations: Vec<MetadataObservation>,
     exclusions: &[String],
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectContext, String> {
@@ -4553,15 +4734,83 @@ fn build_standalone_context(
         );
     }
     let search_paths = paths_from_entries(&search_path_entries);
-    let metadata_observations =
-        complete_metadata_observations(&metadata_files, metadata_observations);
-    let conditional_context = options.conditional_context.clone();
+    let project_source_roots = paths_from_entries(&search_path_entries);
+    let config = selected_standalone_property(&overrides, options.build_config.as_ref(), "config");
+    let platform = selected_standalone_property(&overrides, options.platform.as_ref(), "platform");
+    let console_target = if overrides
+        .properties
+        .get("dcc_consoletarget")
+        .and_then(|value| parse_conditional_fact(value.as_str()))
+        == Some(ConditionalFact::True)
+    {
+        ConditionalFact::True
+    } else if let Some(source_entry) = search_path_entries
+        .iter()
+        .find(|root| project_path_starts_with(file, &root.path))
+        .map(|root| ProjectPathEntry {
+            path: file.to_path_buf(),
+            provenance: root.provenance.clone(),
+        })
+    {
+        match read_policy.read_pascal_payload_with_observation(&source_entry, MAX_PROJECT_BYTES) {
+            Ok((source, observation)) => {
+                add_metadata_observation(&mut metadata_observations, observation);
+                if conditional_closure::source_has_console_apptype(&source) {
+                    ConditionalFact::True
+                } else {
+                    ConditionalFact::False
+                }
+            }
+            Err(_) => ConditionalFact::Unknown,
+        }
+    } else {
+        ConditionalFact::Unknown
+    };
+    let mut conditional_context = options.conditional_context.clone();
+    let predefined = match (
+        conditional_context.compiler_version,
+        platform.as_deref().and_then(TargetPlatform::parse),
+    ) {
+        (Some(version), Some(platform)) => {
+            crate::compiler_defines::predefined_defines(version, &platform, console_target)
+        }
+        _ => BTreeMap::new(),
+    };
+    let (rtl_source, rtl_constants, rtl_warnings) = crate::rtl_constants::resolve_rtl_constants(
+        conditional_context.compiler_version,
+        None,
+        None,
+    );
+    warnings.extend(rtl_warnings);
+    conditional_closure::merge_predefined_facts(&mut conditional_context, &predefined);
+    conditional_closure::merge_rtl_constants(&mut conditional_context, rtl_constants.as_deref());
+    conditional_context.absent_define = ConditionalFact::Unknown;
+    let library_conditional_context = conditional_context.clone();
     let defines = conditional_context
         .defines
         .iter()
         .filter(|(_, value)| **value == ConditionalFact::True)
         .map(|(name, _)| name.clone())
         .collect();
+    let config_selection = BuildSelection::default();
+    let platform_selection = BuildSelection::default();
+    let open_reasons = conditional_closure::open_reasons(
+        false,
+        discovery_complete,
+        conditional_context.compiler_version.is_some(),
+        config.as_deref(),
+        platform.as_deref(),
+        &config_selection,
+        &platform_selection,
+    );
+    let conditional_closure = ConditionalClosure {
+        closed: false,
+        open_reasons,
+        rtl_source,
+        rtl_constants,
+    };
+    let metadata_observations =
+        complete_metadata_observations(&metadata_files, metadata_observations);
 
     Ok(ProjectContext {
         discovery_complete,
@@ -4572,6 +4821,7 @@ fn build_standalone_context(
         installation_selection: None,
         main_source: None,
         search_paths,
+        project_source_roots,
         search_path_entries,
         browsing_path_entries: Vec::new(),
         debug_dcu_path_entries: Vec::new(),
@@ -4584,10 +4834,12 @@ fn build_standalone_context(
         unit_aliases: HashMap::new(),
         defines,
         conditional_context,
-        config: selected_standalone_property(&overrides, options.build_config.as_ref(), "config"),
-        platform: selected_standalone_property(&overrides, options.platform.as_ref(), "platform"),
-        config_selection: BuildSelection::default(),
-        platform_selection: BuildSelection::default(),
+        conditional_closure,
+        library_conditional_context,
+        config,
+        platform,
+        config_selection,
+        platform_selection,
         overrides,
         read_policy,
         packages: Vec::new(),
@@ -4718,6 +4970,53 @@ fn selected_platform(builder: &ProjectBuilder, options: &ProjectOptions) -> Opti
         .or_else(|| builder.property("dcc_platform"))
         .filter(|value| !value.is_empty() && !value.contains(UNRESOLVED_MARKER))
         .or_else(|| options.platform.clone())
+}
+
+fn scan_system_pas_from_paths(
+    search_paths: &[ProjectPathEntry],
+    browsing_paths: &[ProjectPathEntry],
+    read_policy: &ReadPolicy,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+    cancel: Option<&AtomicBool>,
+    metadata_observations: &mut Vec<MetadataObservation>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<Result<crate::rtl_constants::SystemPasScan, String>>, String> {
+    for directory in search_paths.iter().chain(browsing_paths) {
+        check_project_scan_cancel(cancel)?;
+        let entries = match project_directory_entries(&directory.path, cancel, work_budget) {
+            Ok(entries) => entries,
+            Err(error)
+                if error == "request cancelled"
+                    || work_budget.is_some_and(|budget| budget.is_transient_error(&error)) =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "could not inspect {} for System.pas: {error}",
+                    directory.path.display()
+                ));
+                continue;
+            }
+        };
+        let Some(path) = entries.system_pas else {
+            continue;
+        };
+        let entry = ProjectPathEntry {
+            path,
+            provenance: directory.provenance.clone(),
+        };
+        return Ok(Some(
+            match read_policy.read_pascal_payload_with_observation(&entry, MAX_PROJECT_BYTES) {
+                Ok((source, observation)) => {
+                    add_metadata_observation(metadata_observations, observation);
+                    Ok(crate::rtl_constants::scan_system_pas(&source))
+                }
+                Err(error) => Err(error),
+            },
+        ));
+    }
+    Ok(None)
 }
 
 fn merge_project_conditional_context(

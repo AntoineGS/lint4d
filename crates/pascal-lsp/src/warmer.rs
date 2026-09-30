@@ -155,10 +155,20 @@ impl WarmProgress {
         format!("Indexing {stem}")
     }
 
+    #[cfg(test)]
     pub(crate) fn handle(
         &mut self,
         connection: &dyn crate::server::ProtocolSender,
         event: &WarmEvent,
+    ) -> Result<(), String> {
+        self.handle_with_retry(connection, event, true)
+    }
+
+    pub(crate) fn handle_with_retry(
+        &mut self,
+        connection: &dyn crate::server::ProtocolSender,
+        event: &WarmEvent,
+        paused_will_retry: bool,
     ) -> Result<(), String> {
         if !self.supported {
             return Ok(());
@@ -252,7 +262,8 @@ impl WarmProgress {
                     None => Ok(()),
                 }
             }
-            WarmEvent::Paused { .. } => Ok(()),
+            WarmEvent::Paused { .. } if paused_will_retry => Ok(()),
+            WarmEvent::Paused { uri, .. } => self.close(connection, uri),
         }
     }
 
@@ -464,11 +475,17 @@ impl Warmer {
                 if workspace.is_open(uri) {
                     self.queue.push_front(uri.clone());
                 }
+                // Keep a closed-file pause only long enough for WarmProgress
+                // to end any token that escaped the didClose cleanup. It is
+                // never requeued and cannot produce a progress report.
                 true
             }
-            WarmEvent::Begin { generation, .. } | WarmEvent::Progress { generation, .. } => {
-                *generation == self.generation
+            WarmEvent::Begin {
+                uri, generation, ..
             }
+            | WarmEvent::Progress {
+                uri, generation, ..
+            } => *generation == self.generation && workspace.is_open(uri),
         }
     }
 
@@ -981,5 +998,98 @@ mod tests {
             warmer.queue.is_empty(),
             "stale pause must not requeue the file"
         );
+    }
+
+    #[test]
+    fn close_drops_late_same_generation_events_without_resurrecting_progress() {
+        let (_temp, mut workspace, main) = fixture();
+        let (connection, client) = lsp_server::Connection::memory();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        let mut progress = WarmProgress::new(true);
+        warmer.open(main.clone());
+        warmer.busy = true;
+
+        assert!(workspace.close_document(&main));
+        warmer.close(&main, workspace.project_cache());
+        progress
+            .close(&connection, &main)
+            .expect("close progress for the document");
+
+        let late_begin = WarmEvent::Begin {
+            uri: main.clone(),
+            total: 1,
+            generation: warmer.generation,
+        };
+        let begin_accepted = warmer.accept_event(&late_begin, &workspace);
+        if begin_accepted {
+            progress
+                .handle_with_retry(&connection, &late_begin, true)
+                .expect("handle late begin");
+        }
+        let late_paused = WarmEvent::Paused {
+            uri: main.clone(),
+            generation: warmer.generation,
+        };
+        let paused_accepted = warmer.accept_event(&late_paused, &workspace);
+        if paused_accepted {
+            progress
+                .handle_with_retry(&connection, &late_paused, workspace.is_open(&main))
+                .expect("handle late pause");
+        }
+
+        assert!(!begin_accepted, "closed URI must drop a late Begin");
+        assert!(!warmer.busy, "late Paused still releases the worker slot");
+        assert!(progress.active.is_empty());
+        assert!(progress.pending_creates.is_empty());
+        assert!(
+            client.receiver.try_recv().is_err(),
+            "late events for a closed URI must not create or begin progress"
+        );
+    }
+
+    #[test]
+    fn paused_closed_uri_ends_active_progress_when_no_retry_is_planned() {
+        let (connection, client) = lsp_server::Connection::memory();
+        let uri = uri("Closed.pas");
+        let mut progress = WarmProgress::new(true);
+        let begin = WarmEvent::Begin {
+            uri: uri.clone(),
+            total: 1,
+            generation: 0,
+        };
+        progress
+            .handle_with_retry(&connection, &begin, true)
+            .expect("request progress token");
+        let Message::Request(create) = client.receiver.recv().expect("create request") else {
+            panic!("expected progress creation request");
+        };
+        progress
+            .handle_response(
+                &connection,
+                &Response::new_ok(create.id, serde_json::Value::Null),
+            )
+            .expect("acknowledge progress token");
+        let Message::Notification(begin) = client.receiver.recv().expect("progress begin") else {
+            panic!("expected progress begin");
+        };
+
+        progress
+            .handle_with_retry(
+                &connection,
+                &WarmEvent::Paused {
+                    uri: uri.clone(),
+                    generation: 0,
+                },
+                false,
+            )
+            .expect("end a token for a closed file");
+        let Message::Notification(end) = client.receiver.recv().expect("progress end") else {
+            panic!("expected progress end");
+        };
+
+        assert_eq!(end.params["token"], begin.params["token"]);
+        assert_eq!(end.params["value"]["kind"], "end");
+        assert!(!progress.active.contains_key(&uri));
+        assert!(client.receiver.try_recv().is_err());
     }
 }

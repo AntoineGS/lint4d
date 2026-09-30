@@ -11576,8 +11576,12 @@ fn maintain_warmer(
                 }
             }
         }
+        let paused_will_retry = match &event {
+            crate::warmer::WarmEvent::Paused { uri, .. } => workspace.is_open(uri),
+            _ => true,
+        };
         warm_progress
-            .handle(connection, &event)
+            .handle_with_retry(connection, &event, paused_will_retry)
             .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
     }
     if *sweep_pending && (warmer.is_idle() || !cache.has_room()) {

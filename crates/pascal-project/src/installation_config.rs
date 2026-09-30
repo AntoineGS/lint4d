@@ -3,12 +3,14 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::conditional::ConditionalContext;
 use crate::delphi_overrides::{EffectiveOverrides, OverrideLayer, RawPathMapping, config_error};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigurationLayer {
     pub(crate) shared: OverrideLayer,
     pub(crate) installations: BTreeMap<String, OverrideLayer>,
+    pub(crate) rtl_constants: BTreeMap<String, Vec<String>>,
     projects: HashMap<PathBuf, String>,
     pub(crate) source_stamp: ConfigurationSourceStamp,
 }
@@ -40,6 +42,8 @@ struct RawInstallation {
     properties: BTreeMap<String, String>,
     #[serde(default)]
     path_mappings: Vec<RawPathMapping>,
+    #[serde(default, rename = "rtlVersionConstants")]
+    rtl_version_constants: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,14 +59,28 @@ impl ConfigurationLayer {
         let shared = OverrideLayer::from_parts(raw.properties, raw.path_mappings, config_file)?;
 
         let mut installations = BTreeMap::new();
+        let mut rtl_constants = BTreeMap::new();
         let mut installation_ids = HashSet::new();
         for (id, profile) in raw.installations {
             let canonical_id = id.to_ascii_lowercase();
-            if id.trim().is_empty() || !installation_ids.insert(canonical_id) {
+            if id.trim().is_empty() || !installation_ids.insert(canonical_id.clone()) {
                 return Err(config_error(
                     config_file,
                     format_args!("empty or duplicate installation ID `{id}`"),
                 ));
+            }
+            if let Some(names) = &profile.rtl_version_constants {
+                for name in names {
+                    if !ConditionalContext::is_rtl_version_constant(name) {
+                        return Err(config_error(
+                            config_file,
+                            format_args!(
+                                "invalid rtlVersionConstants entry `{name}` for installation `{id}`"
+                            ),
+                        ));
+                    }
+                }
+                rtl_constants.insert(canonical_id.clone(), names.clone());
             }
             installations.insert(
                 id,
@@ -90,6 +108,7 @@ impl ConfigurationLayer {
         Ok(Self {
             shared,
             installations,
+            rtl_constants,
             projects,
             source_stamp: ConfigurationSourceStamp {
                 path: config_file.to_path_buf(),
@@ -114,6 +133,7 @@ pub struct ProjectConfiguration {
 pub struct ResolvedInstallation {
     pub id: String,
     pub overrides: EffectiveOverrides,
+    pub rtl_version_constants: Option<Vec<String>>,
 }
 
 impl ProjectConfiguration {
@@ -166,8 +186,12 @@ impl ProjectConfiguration {
             return Err(format!("unknown Delphi installation `{id}`"));
         };
         let mut applicable = Vec::new();
+        let mut rtl_version_constants = None;
         for layer in &self.layers {
             applicable.push(layer.shared.clone());
+            if let Some(names) = layer.rtl_constants.get(&canonical.to_ascii_lowercase()) {
+                rtl_version_constants = Some(names.clone());
+            }
             if let Some(profile) = layer
                 .installations
                 .iter()
@@ -180,6 +204,7 @@ impl ProjectConfiguration {
         Ok(ResolvedInstallation {
             id: canonical,
             overrides: EffectiveOverrides::merge(&applicable),
+            rtl_version_constants,
         })
     }
 

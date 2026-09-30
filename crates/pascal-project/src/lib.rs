@@ -19,6 +19,7 @@ pub mod installation_config;
 #[allow(dead_code)]
 pub mod installations;
 pub mod path_issues;
+pub mod rtl_constants;
 
 pub use compiler_defines::TargetPlatform;
 pub use conditional::{
@@ -3959,6 +3960,7 @@ fn build_project_context(
             Ok(profile) => {
                 let effective_profile = crate::installation_config::ResolvedInstallation {
                     id: profile.id.clone(),
+                    rtl_version_constants: profile.rtl_version_constants.clone(),
                     overrides: merge_effective_overrides(
                         profile.overrides,
                         &overrides,

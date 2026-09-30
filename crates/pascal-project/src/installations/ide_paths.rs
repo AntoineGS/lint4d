@@ -42,6 +42,7 @@ mod tests {
         };
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides,
         };
         let roots = [sdk.clone(), ide.clone()];
@@ -104,6 +105,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "7.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -159,6 +161,7 @@ mod tests {
         let ide = temp.path().join("ide");
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -221,6 +224,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [("bds".to_owned(), temp.path().to_string_lossy().into_owned())]
                     .into_iter()
@@ -254,6 +258,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -298,6 +303,7 @@ mod tests {
         write(&ide.join("EnvOptions.proj"), "<Project/>");
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -343,6 +349,7 @@ mod tests {
         write(&ide.join("EnvOptions.proj"), "<Project/>");
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -385,6 +392,7 @@ mod tests {
         write(&ide.join("EnvOptions.proj"), "<Project/>");
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -476,6 +484,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -519,6 +528,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -575,6 +585,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -608,6 +619,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),
@@ -649,6 +661,7 @@ mod tests {
         );
         let profile = ResolvedInstallation {
             id: "37.0".to_owned(),
+            rtl_version_constants: None,
             overrides: EffectiveOverrides {
                 properties: [
                     ("bds".to_owned(), sdk.to_string_lossy().into_owned()),

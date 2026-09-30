@@ -509,6 +509,57 @@ fn project_shared_properties_override_user_profile_properties() {
 }
 
 #[test]
+fn profile_reads_rtl_version_constants_and_rejects_invalid_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("config.toml");
+    write(
+        &user,
+        "[installations.\"22.0\"]\nrtlVersionConstants = [\"RTLVersion111\"]\n",
+    );
+    let profile = OverrideSession::new(Some(user.clone()))
+        .configuration_for(None, None)
+        .unwrap()
+        .profile("22.0")
+        .unwrap();
+    assert_eq!(
+        profile.rtl_version_constants,
+        Some(vec!["RTLVersion111".into()])
+    );
+
+    write(
+        &user,
+        "[installations.\"22.0\"]\nrtlVersionConstants = [\"RTLVersion11x\"]\n",
+    );
+    let error = OverrideSession::new(Some(user.clone()))
+        .configuration_for(None, None)
+        .expect_err("invalid RTL constant names must be rejected");
+    assert!(error.contains(&user.display().to_string()));
+    assert!(error.contains("RTLVersion11x"));
+}
+
+#[test]
+fn more_local_rtl_constant_profile_override_wins_even_when_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("config.toml");
+    let workspace = temp.path().join("repo");
+    write(
+        &user,
+        "[installations.\"22.0\"]\nrtlVersionConstants = [\"RTLVersion111\"]\n",
+    );
+    write(
+        &workspace.join(".delphi-tools.local.toml"),
+        "[installations.\"22.0\"]\nrtlVersionConstants = []\n",
+    );
+
+    let profile = OverrideSession::new(Some(user))
+        .configuration_for(Some(&workspace), None)
+        .unwrap()
+        .profile("22.0")
+        .unwrap();
+    assert_eq!(profile.rtl_version_constants, Some(vec![]));
+}
+
+#[test]
 fn profiles_inherit_shared_values_and_keep_independent_direct_appdata_roots() {
     let temp = tempfile::tempdir().unwrap();
     let user = temp.path().join("config.toml");

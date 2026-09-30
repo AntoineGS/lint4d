@@ -109,8 +109,10 @@ fn rtl_rule_does_not_apply_to_other_identifiers() {
 
 #[test]
 fn source_declared_unknown_rtl_constant_is_not_absent() {
-    let mut context = ConditionalContext::default();
-    context.rtl_constants_known = true;
+    let context = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
     let source = concat!(
         "const RTLVersion113 = SOME_OTHER;",
         "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
@@ -123,8 +125,10 @@ fn source_declared_unknown_rtl_constant_is_not_absent() {
 
 #[test]
 fn conditional_unknown_rtl_declaration_stays_unknown_after_branch_merge() {
-    let mut context = ConditionalContext::default();
-    context.rtl_constants_known = true;
+    let context = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
     let source = concat!(
         "{$IF MAYBE}",
         "const RTLVersion113 = SOME_OTHER;",
@@ -142,8 +146,10 @@ fn conditional_unknown_rtl_declaration_stays_unknown_after_branch_merge() {
 
 #[test]
 fn unsupported_source_scope_does_not_claim_rtl_constants_absent() {
-    let mut context = ConditionalContext::default();
-    context.rtl_constants_known = true;
+    let context = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
     let source = concat!(
         "procedure Local; const RTLVersion113 = SOME_OTHER; begin",
         "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
@@ -160,8 +166,10 @@ fn unsupported_source_scope_does_not_claim_rtl_constants_absent() {
 
 #[test]
 fn included_unknown_rtl_constant_does_not_become_absent_on_return() {
-    let mut context = ConditionalContext::default();
-    context.rtl_constants_known = true;
+    let context = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
     let mut environment = conditional::ConditionalEnvironment::from_context(&context);
     let mut include =
         |_directive: &conditional::ConditionalDirective,
@@ -217,8 +225,10 @@ fn included_unknown_rtl_constant_does_not_become_absent_on_return() {
 fn fingerprint_distinguishes_the_new_fields() {
     let open = ConditionalContext::default();
     let closed = ConditionalContext::default().with_absent_define(Truth::False);
-    let mut rtl = ConditionalContext::default();
-    rtl.rtl_constants_known = true;
+    let rtl = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
     assert_ne!(open.fingerprint(), closed.fingerprint());
     assert_ne!(open.fingerprint(), rtl.fingerprint());
 }

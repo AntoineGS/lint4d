@@ -366,6 +366,7 @@ pub(crate) struct Warmer {
     next_open_epoch: u64,
     open_epochs: HashMap<Url, u64>,
     busy: bool,
+    busy_attempt: Option<(Url, u64)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -392,6 +393,7 @@ impl Warmer {
             next_open_epoch: 0,
             open_epochs: HashMap::new(),
             busy: false,
+            busy_attempt: None,
             thread: Some(thread),
         }
     }
@@ -402,14 +404,30 @@ impl Warmer {
     }
 
     pub(crate) fn open(&mut self, uri: Url) {
-        self.next_open_epoch = self
-            .next_open_epoch
-            .checked_add(1)
-            .expect("warm open identity space exhausted");
-        self.open_epochs.insert(uri.clone(), self.next_open_epoch);
+        // Keep an identity for the full open lifetime so duplicate didOpen
+        // notifications cannot stale an active attempt or its progress token.
+        let open_epoch = if let Some(open_epoch) = self.open_epochs.get(&uri).copied() {
+            open_epoch
+        } else {
+            // A missing entry follows a didClose or reset boundary; the server
+            // retires progress in those same lifecycle paths before reopening.
+            self.next_open_epoch = self
+                .next_open_epoch
+                .checked_add(1)
+                .expect("warm open identity space exhausted");
+            self.open_epochs.insert(uri.clone(), self.next_open_epoch);
+            self.next_open_epoch
+        };
         self.open_order.retain(|opened| opened != &uri);
         self.open_order.push_front(uri.clone());
-        self.queue.push_front(uri);
+        let already_queued = self.queue.queued.contains(&uri);
+        let already_in_flight = self
+            .busy_attempt
+            .as_ref()
+            .is_some_and(|(busy_uri, busy_epoch)| busy_uri == &uri && *busy_epoch == open_epoch);
+        if already_queued || !already_in_flight {
+            self.queue.push_front(uri);
+        }
     }
 
     /// Schedules another attempt for an already-open file without changing
@@ -460,6 +478,7 @@ impl Warmer {
                 let Some(open_epoch) = self.open_epochs.get(&uri).copied() else {
                     continue;
                 };
+                let busy_uri = uri.clone();
                 let job = WarmJob {
                     uri,
                     input: workspace.analysis_input(),
@@ -473,6 +492,7 @@ impl Warmer {
                     .is_some_and(|jobs| jobs.send(job).is_ok())
                 {
                     self.busy = true;
+                    self.busy_attempt = Some((busy_uri, open_epoch));
                 }
                 break;
             }
@@ -489,6 +509,7 @@ impl Warmer {
                 ..
             } => {
                 self.busy = false;
+                self.busy_attempt = None;
                 *generation == self.generation
                     && self.open_epochs.get(uri).copied() == Some(*open_epoch)
             }
@@ -498,6 +519,7 @@ impl Warmer {
                 open_epoch,
             } => {
                 self.busy = false;
+                self.busy_attempt = None;
                 if *generation != self.generation
                     || self.open_epochs.get(uri).copied() != Some(*open_epoch)
                 {
@@ -531,6 +553,7 @@ impl Warmer {
         drop(self.jobs.take());
         self.queue.clear();
         self.busy = false;
+        self.busy_attempt = None;
 
         let Some(thread) = self.thread.take() else {
             return true;
@@ -992,6 +1015,86 @@ mod tests {
         assert!(warmer.accept_event(&event));
         assert!(!warmer.busy);
         assert_eq!(warmer.queue.pop(), Some(main));
+    }
+
+    #[test]
+    fn repeated_open_preserves_inflight_attempt_and_finishes_progress() {
+        let (_temp, workspace, main) = fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate);
+        let (events_tx, events_rx) = crossbeam_channel::unbounded();
+        warmer.events = events_rx;
+        warmer.open(main.clone());
+
+        assert!(warmer.poll(&workspace).is_empty());
+        assert!(warmer.busy, "poll should dispatch the first attempt");
+        let open_epoch = warmer.open_epochs[&main];
+
+        let (connection, client) = lsp_server::Connection::memory();
+        let mut progress = WarmProgress::new(true);
+        let begin = WarmEvent::Begin {
+            uri: main.clone(),
+            total: 1,
+            generation: warmer.generation,
+            open_epoch,
+        };
+        events_tx.send(begin.clone()).expect("queue begin event");
+        assert_eq!(warmer.poll(&workspace), vec![begin.clone()]);
+        progress
+            .handle_with_retry(&connection, &begin, true)
+            .expect("create progress for accepted begin");
+        let Message::Request(create) = client.receiver.recv().expect("progress create") else {
+            panic!("expected progress creation request");
+        };
+        progress
+            .handle_response(
+                &connection,
+                &Response::new_ok(create.id, serde_json::Value::Null),
+            )
+            .expect("acknowledge progress create");
+        let Message::Notification(progress_begin) = client.receiver.recv().expect("progress begin")
+        else {
+            panic!("expected progress begin notification");
+        };
+
+        // Repeated didOpen for this already-open URI must neither rotate the
+        // in-flight attempt's identity nor queue a duplicate crawl.
+        warmer.open(main.clone());
+        workspace.project_cache().set_max_bytes(0);
+        let end = WarmEvent::End {
+            uri: main.clone(),
+            fingerprint: None,
+            pins: Vec::new(),
+            generation: warmer.generation,
+            open_epoch,
+        };
+        events_tx.send(end.clone()).expect("queue end event");
+        let accepted = warmer.poll(&workspace);
+        assert_eq!(
+            accepted,
+            vec![end.clone()],
+            "the in-flight End remains current"
+        );
+        for event in &accepted {
+            progress
+                .handle_with_retry(&connection, event, true)
+                .expect("finish accepted warm progress");
+        }
+
+        let Message::Notification(progress_end) = client.receiver.recv().expect("progress end")
+        else {
+            panic!("expected progress end notification");
+        };
+        assert_eq!(progress_end.params["token"], progress_begin.params["token"]);
+        assert_eq!(progress_end.params["value"]["kind"], "end");
+        assert!(progress.active.is_empty());
+        assert!(progress.pending_creates.is_empty());
+        assert!(
+            warmer.queue.is_empty(),
+            "repeated open must not queue an in-flight URI"
+        );
+        assert!(client.receiver.try_recv().is_err());
     }
 
     #[test]

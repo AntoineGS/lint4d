@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use lsp_types::Url;
+use notify::event::ModifyKind;
 use notify::{RecursiveMode, Watcher};
 
 use crate::project_cache::ProjectCache;
@@ -20,6 +21,9 @@ pub(crate) trait DirectoryWatch: Send {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WatchEvent {
+    /// Data or metadata changed without changing directory membership.
+    Modified(Vec<PathBuf>),
+    /// A path was created, removed, renamed, or changed in an unknown way.
     Changed(Vec<PathBuf>),
     Overflow,
 }
@@ -84,6 +88,14 @@ impl NotifyWatcher {
             let event = match result {
                 Ok(event) if event.need_rescan() => WatchEvent::Overflow,
                 Ok(event) if event.kind.is_access() => return,
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        notify::EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+                    ) =>
+                {
+                    WatchEvent::Modified(event.paths)
+                }
                 Ok(event) => WatchEvent::Changed(event.paths),
                 Err(_) => WatchEvent::Overflow,
             };
@@ -108,11 +120,17 @@ impl DirectoryWatch for NotifyWatcher {
 
 /// Applies one watcher event and returns the URIs whose entries were evicted.
 pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<Url> {
+    let include_parent = !matches!(event, WatchEvent::Modified(_));
     match event {
-        WatchEvent::Changed(paths) => {
+        WatchEvent::Modified(paths) | WatchEvent::Changed(paths) => {
             let mut affected = Vec::new();
             for path in paths {
-                for uri in cache.invalidate_path(&path) {
+                let invalidated = if include_parent {
+                    cache.invalidate_path(&path)
+                } else {
+                    cache.invalidate_file_contents(&path)
+                };
+                for uri in invalidated {
                     if !affected.contains(&uri) {
                         affected.push(uri);
                     }
@@ -133,7 +151,7 @@ mod tests {
     use crate::project_cache::{ImportValue, Lookup, Probe, ProjectCache};
     use std::time::Duration;
 
-    fn store_import(cache: &ProjectCache, main: &Url) {
+    fn store_import(cache: &ProjectCache, main: &Url, probes: Vec<Probe>) {
         let context = pascal_project::ProjectContext::default();
         let no = std::sync::atomic::AtomicBool::new(false);
         let Lookup::Compute(claim) = cache.imports(main, &context, 1, &Default::default(), &no)
@@ -154,7 +172,7 @@ mod tests {
                     complete: true,
                     incomplete_reasons: vec![],
                 },
-                probes: vec![],
+                probes,
                 watch_dirs: vec![],
             },
             1,
@@ -174,7 +192,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("event");
         match event {
-            WatchEvent::Changed(paths) => {
+            WatchEvent::Modified(paths) | WatchEvent::Changed(paths) => {
                 assert!(
                     paths.iter().any(|path| path.ends_with("New.pas")),
                     "{paths:?}"
@@ -198,6 +216,129 @@ mod tests {
                 .recv_timeout(Duration::from_millis(500))
                 .is_err()
         );
+    }
+
+    // Linux reports an in-place write as Modify(Data). Backends that report
+    // only an unknown change deliberately keep conservative invalidation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_content_write_does_not_requeue_directory_consumer() {
+        let temp = tempfile::tempdir().unwrap();
+        let unrelated = temp.path().join("Unrelated.pas");
+        std::fs::write(&unrelated, "unit Unrelated;").unwrap();
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let cache = ProjectCache::new(1 << 20);
+        let context = pascal_project::ProjectContext::default();
+        let no = AtomicBool::new(false);
+        store_import(
+            &cache,
+            &main,
+            vec![Probe::Stamp {
+                path: temp.path().to_path_buf(),
+                expected: pascal_project::path_stamp_result(temp.path()).unwrap(),
+            }],
+        );
+        let (sender, events) = WatchEvents::channel();
+        let mut watcher = NotifyWatcher::start(sender).unwrap();
+        assert!(watcher.watch(temp.path()));
+
+        std::fs::write(&unrelated, "unit Unrelated; interface implementation end.").unwrap();
+        let event = events
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated file write must reach the watcher");
+        let mut affected = apply_watch_event(&cache, event);
+        affected.extend(events.drain(&cache, MAX_WATCH_EVENTS_PER_TURN));
+
+        assert!(
+            affected.is_empty(),
+            "writing an unrelated sibling must not schedule indexing: {affected:?}"
+        );
+        assert!(matches!(
+            cache.imports(&main, &context, 1, &Default::default(), &no),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn modified_event_requeues_exact_dependencies_but_not_directory_only_consumers() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("include.custom");
+        std::fs::write(&provider, "{$DEFINE BEFORE}").unwrap();
+        let provider_uri = Url::from_file_path(&provider).unwrap();
+        let consumer = Url::from_file_path(temp.path().join("Consumer.pas")).unwrap();
+        let unrelated = Url::from_file_path(temp.path().join("Unrelated.pas")).unwrap();
+        let directory_probe = Probe::Stamp {
+            path: temp.path().to_path_buf(),
+            expected: pascal_project::path_stamp_result(temp.path()).unwrap(),
+        };
+        let cache = ProjectCache::new(1 << 20);
+        store_import(&cache, &provider_uri, vec![]);
+        store_import(
+            &cache,
+            &consumer,
+            vec![
+                directory_probe.clone(),
+                Probe::Content {
+                    path: provider.clone(),
+                    stamp: pascal_project::path_stamp_result(&provider).unwrap(),
+                    content_hash: pascal_project::content_hash_bytes(b"{$DEFINE BEFORE}"),
+                },
+            ],
+        );
+        store_import(&cache, &unrelated, vec![directory_probe]);
+
+        std::fs::write(&provider, "{$DEFINE AFTER}").unwrap();
+        let mut affected = apply_watch_event(&cache, WatchEvent::Modified(vec![provider]));
+        affected.sort();
+        let mut expected = vec![consumer, provider_uri];
+        expected.sort();
+        assert_eq!(affected, expected);
+        assert!(matches!(
+            cache.imports(
+                &unrelated,
+                &pascal_project::ProjectContext::default(),
+                1,
+                &Default::default(),
+                &AtomicBool::new(false),
+            ),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn directory_membership_events_still_requeue_consumers() {
+        for operation in ["create", "delete", "rename"] {
+            let temp = tempfile::tempdir().unwrap();
+            let old = temp.path().join("Old.pas");
+            let new = temp.path().join("New.pas");
+            std::fs::write(&old, "unit Old;").unwrap();
+            let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+            let cache = ProjectCache::new(1 << 20);
+            store_import(
+                &cache,
+                &main,
+                vec![Probe::Stamp {
+                    path: temp.path().to_path_buf(),
+                    expected: pascal_project::path_stamp_result(temp.path()).unwrap(),
+                }],
+            );
+            let (sender, events) = WatchEvents::channel();
+            let mut watcher = NotifyWatcher::start(sender).unwrap();
+            assert!(watcher.watch(temp.path()));
+
+            match operation {
+                "create" => std::fs::write(&new, "unit New;").unwrap(),
+                "delete" => std::fs::remove_file(&old).unwrap(),
+                "rename" => std::fs::rename(&old, &new).unwrap(),
+                _ => unreachable!(),
+            }
+            let event = events
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("directory membership event");
+            assert_eq!(apply_watch_event(&cache, event), vec![main], "{operation}");
+        }
     }
 
     #[test]
@@ -250,7 +391,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache = ProjectCache::new(1 << 20);
         let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
-        store_import(&cache, &main);
+        store_import(&cache, &main, vec![]);
         let (sender, events) = WatchEvents::channel();
 
         for _ in 0..WATCH_EVENT_CAPACITY {
@@ -280,7 +421,7 @@ mod tests {
             .map(|index| Url::from_file_path(temp.path().join(format!("Main{index}.pas"))).unwrap())
             .collect::<Vec<_>>();
         for uri in &uris {
-            store_import(&cache, uri);
+            store_import(&cache, uri, vec![]);
         }
         let (sender, events) = WatchEvents::channel();
         for uri in &uris {

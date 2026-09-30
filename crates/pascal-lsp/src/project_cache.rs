@@ -1541,6 +1541,17 @@ impl ProjectCache {
 
     /// Evicts every entry that depends on `path` and returns the affected URIs.
     pub(crate) fn invalidate_path(&self, path: &Path) -> Vec<Url> {
+        self.invalidate_path_with_parent(path, true)
+    }
+
+    /// A content or metadata write does not change the parent's directory
+    /// listing. Keep entries that only observed that listing, while evicting
+    /// exact source, include, and metadata dependencies regardless of extension.
+    pub(crate) fn invalidate_file_contents(&self, path: &Path) -> Vec<Url> {
+        self.invalidate_path_with_parent(path, false)
+    }
+
+    fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
         let parent = path.parent();
@@ -1560,7 +1571,8 @@ impl ProjectCache {
                     || probes.iter().any(|probe| match probe {
                         Probe::Stamp { path: observed, .. }
                         | Probe::Content { path: observed, .. } => {
-                            observed == path || Some(observed.as_path()) == parent
+                            observed == path
+                                || (include_parent && Some(observed.as_path()) == parent)
                         }
                         Probe::Overlay { uri, .. } => {
                             uri.to_file_path().ok().as_deref() == Some(path)

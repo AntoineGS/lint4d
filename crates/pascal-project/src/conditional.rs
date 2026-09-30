@@ -262,13 +262,32 @@ pub enum ConstantValue {
 }
 
 /// Explicit facts supplied by a project/configuration or inherited at an
-/// include boundary.  Facts absent from these maps are unknown.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+/// include boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConditionalContext {
     pub compiler_version: Option<CompilerVersion>,
     pub defines: BTreeMap<String, ConditionalFact>,
     pub options: BTreeMap<String, ConditionalFact>,
     pub constants: BTreeMap<String, ConstantValue>,
+    /// Value of a define that is absent from `defines`. `False` only for a
+    /// closed, fully known project define set.
+    pub absent_define: ConditionalFact,
+    /// Whether the `RTLVersionNNN` constants in `constants` are the complete
+    /// declared set for the selected RTL.
+    pub rtl_constants_known: bool,
+}
+
+impl Default for ConditionalContext {
+    fn default() -> Self {
+        Self {
+            compiler_version: None,
+            defines: BTreeMap::new(),
+            options: BTreeMap::new(),
+            constants: BTreeMap::new(),
+            absent_define: ConditionalFact::Unknown,
+            rtl_constants_known: false,
+        }
+    }
 }
 
 impl ConditionalContext {
@@ -302,6 +321,18 @@ impl ConditionalContext {
     pub fn with_compiler_version(mut self, version: CompilerVersion) -> Self {
         self.compiler_version = Some(version);
         self
+    }
+
+    pub fn with_absent_define(mut self, value: ConditionalFact) -> Self {
+        self.absent_define = value;
+        self
+    }
+
+    pub fn is_rtl_version_constant(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        bytes.len() > b"RTLVERSION".len()
+            && bytes[..b"RTLVERSION".len()].eq_ignore_ascii_case(b"RTLVERSION")
+            && bytes[b"RTLVERSION".len()..].iter().all(u8::is_ascii_digit)
     }
 
     pub fn with_option(mut self, name: impl AsRef<str>, value: ConditionalFact) -> Self {
@@ -340,7 +371,7 @@ impl ConditionalContext {
     pub fn define(&self, name: &str) -> ConditionalFact {
         canonical_name(name)
             .and_then(|name| self.defines.get(&name).copied())
-            .unwrap_or(ConditionalFact::Unknown)
+            .unwrap_or(self.absent_define)
     }
 
     pub fn option(&self, name: &str) -> ConditionalFact {
@@ -375,6 +406,10 @@ impl ConditionalContext {
             name.hash(&mut hasher);
             value.hash(&mut hasher);
         }
+        4_u8.hash(&mut hasher);
+        self.absent_define.hash(&mut hasher);
+        5_u8.hash(&mut hasher);
+        self.rtl_constants_known.hash(&mut hasher);
         hasher.finish()
     }
 }

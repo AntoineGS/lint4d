@@ -227,15 +227,33 @@ struct LexResult {
     complete: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ConditionalEnvironment {
     values: HashMap<String, Truth>,
     options: HashMap<String, Truth>,
     constants: BTreeMap<String, ConstantValue>,
     source_constants: BTreeSet<String>,
     compiler_version: Option<CompilerVersion>,
+    absent_define: Truth,
+    rtl_constants_known: bool,
     bytes: usize,
     rejected_context: bool,
+}
+
+impl Default for ConditionalEnvironment {
+    fn default() -> Self {
+        Self {
+            values: HashMap::new(),
+            options: HashMap::new(),
+            constants: BTreeMap::new(),
+            source_constants: BTreeSet::new(),
+            compiler_version: None,
+            absent_define: Truth::Unknown,
+            rtl_constants_known: false,
+            bytes: 0,
+            rejected_context: false,
+        }
+    }
 }
 
 impl ConditionalEnvironment {
@@ -271,6 +289,8 @@ impl ConditionalEnvironment {
         budget: &mut AnalysisBudget<'_>,
     ) -> Option<Self> {
         let mut environment = Self::new();
+        environment.absent_define = context.absent_define;
+        environment.rtl_constants_known = context.rtl_constants_known;
         if let Some(version) = context.compiler_version {
             if !budget.charge(1) || !budget.charge_bytes(size_of::<CompilerVersion>()) {
                 return None;
@@ -354,6 +374,8 @@ impl ConditionalEnvironment {
                 .map(|(key, value)| (key.clone(), *value))
                 .collect(),
             constants: self.constants.clone(),
+            absent_define: self.absent_define,
+            rtl_constants_known: self.rtl_constants_known,
         }
     }
 
@@ -528,6 +550,8 @@ impl ConditionalEnvironment {
             || !self.options.is_empty()
             || !self.constants.is_empty()
             || self.compiler_version.is_some()
+            || self.absent_define != Truth::Unknown
+            || self.rtl_constants_known
     }
 
     /// Return a stable identity for the currently established facts.
@@ -568,6 +592,9 @@ impl ConditionalEnvironment {
         }
         6_u8.hash(&mut hasher);
         self.rejected_context.hash(&mut hasher);
+        7_u8.hash(&mut hasher);
+        self.absent_define.hash(&mut hasher);
+        self.rtl_constants_known.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -603,6 +630,8 @@ impl ConditionalEnvironment {
         self.values.clear();
         self.options.clear();
         self.clear_constants();
+        self.absent_define = Truth::Unknown;
+        self.rtl_constants_known = false;
     }
 
     fn clear_constants(&mut self) {
@@ -1174,7 +1203,7 @@ fn canonical_symbol_ref(symbol: &str) -> Option<&str> {
 fn environment_value(environment: &ConditionalEnvironment, symbol: &str) -> Truth {
     canonical_symbol(symbol)
         .and_then(|symbol| environment.get(&symbol).copied())
-        .unwrap_or(Truth::Unknown)
+        .unwrap_or(environment.absent_define)
 }
 
 fn clone_environment(
@@ -1854,8 +1883,11 @@ fn merge_environment(
     }
 
     for key in keys {
-        let left = current.get(&key).copied().unwrap_or(Truth::Unknown);
-        let right = incoming.get(&key).copied().unwrap_or(Truth::Unknown);
+        let left = current.get(&key).copied().unwrap_or(current.absent_define);
+        let right = incoming
+            .get(&key)
+            .copied()
+            .unwrap_or(incoming.absent_define);
         current.insert(key, left.merge(right));
     }
     for key in option_keys {
@@ -1883,6 +1915,8 @@ fn merge_environment(
     } else {
         None
     };
+    current.absent_define = current.absent_define.merge(incoming.absent_define);
+    current.rtl_constants_known &= incoming.rtl_constants_known;
     current
         .source_constants
         .extend(incoming.source_constants.iter().cloned());
@@ -2600,6 +2634,12 @@ impl ExpressionParser<'_> {
                     .map(|symbol| {
                         Value::Truth(if self.environment.constant(&symbol).is_some() {
                             Truth::True
+                        } else if self.environment.rtl_constants_known
+                            && pascal_project::conditional::ConditionalContext::is_rtl_version_constant(
+                                &symbol,
+                            )
+                        {
+                            Truth::False
                         } else {
                             Truth::Unknown
                         })
@@ -2691,6 +2731,13 @@ impl ExpressionParser<'_> {
                             .map(Value::from_constant)
                             .or_else(|| {
                                 self.environment.values.get(&key).copied().map(Value::Truth)
+                            })
+                            .or_else(|| {
+                                (self.environment.rtl_constants_known
+                                    && pascal_project::conditional::ConditionalContext::is_rtl_version_constant(
+                                        &key,
+                                    ))
+                                .then_some(Value::Truth(Truth::False))
                             })
                     })
                     .unwrap_or(Value::Unknown)

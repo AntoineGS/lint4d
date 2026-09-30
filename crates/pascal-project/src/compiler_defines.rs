@@ -42,11 +42,7 @@ pub fn ver_symbols(version: CompilerVersion) -> Vec<String> {
     };
 
     let mut symbols = vec![format!("VER{}{first_fractional_digit}", version.major)];
-    if version.cmp_numeric(CompilerVersion::new(18, 5)) == Some(Ordering::Equal)
-        || (version.numeric_parts().is_none()
-            && version.major == 18
-            && strip_decimal_trailing_zeroes(version.minor) == 5)
-    {
+    if version.cmp_numeric(CompilerVersion::new(18, 5)) == Some(Ordering::Equal) {
         symbols.push("VER180".to_owned());
     }
     symbols.sort();
@@ -54,25 +50,11 @@ pub fn ver_symbols(version: CompilerVersion) -> Vec<String> {
 }
 
 fn first_fractional_digit(version: CompilerVersion) -> Option<u8> {
-    if let Some((mantissa, scale)) = version.numeric_parts() {
-        let denominator = 10_u64.checked_pow(u32::from(scale))?;
-        let whole = u64::from(version.major).checked_mul(denominator)?;
-        let fraction = mantissa.checked_sub(whole)?;
-        u8::try_from(fraction.checked_mul(10)? / denominator).ok()
-    } else {
-        let mut digit = version.minor;
-        while digit >= 10 {
-            digit /= 10;
-        }
-        u8::try_from(digit).ok()
-    }
-}
-
-fn strip_decimal_trailing_zeroes(mut value: u32) -> u32 {
-    while value > 0 && value % 10 == 0 {
-        value /= 10;
-    }
-    value
+    let (mantissa, scale) = version.numeric_parts()?;
+    let denominator = 10_u64.checked_pow(u32::from(scale))?;
+    let whole = u64::from(version.major).checked_mul(denominator)?;
+    let fraction = mantissa.checked_sub(whole)?;
+    u8::try_from(fraction.checked_mul(10)? / denominator).ok()
 }
 
 /// Return compiler and platform predefined symbols for a target build.
@@ -142,6 +124,7 @@ pub fn predefined_defines(
 enum Since {
     Always,
     At(u32, u32),
+    ConfirmedFrom(u32, u32),
     Unverified,
 }
 
@@ -153,6 +136,12 @@ fn since_fact(version: CompilerVersion, since: Since, defined: bool) -> Conditio
             Some(Ordering::Equal | Ordering::Greater) => bool_fact(defined),
             None => ConditionalFact::Unknown,
         },
+        Since::ConfirmedFrom(major, minor) => {
+            match version.cmp_numeric(CompilerVersion::new(major, minor)) {
+                Some(Ordering::Less) | None => ConditionalFact::Unknown,
+                Some(Ordering::Equal | Ordering::Greater) => bool_fact(defined),
+            }
+        }
         Since::Unverified => ConditionalFact::Unknown,
     }
 }
@@ -172,12 +161,12 @@ const HISTORICAL_VER_SYMBOLS: &[&str] = &[
     "VER310", "VER320", "VER330", "VER340", "VER350", "VER360", "VER370",
 ];
 
-// Source pages required for the documented symbol/version comparison:
-// https://docwiki.embarcadero.com/RADStudio/Athens/en/Conditional_compilation_(Delphi)
-// https://docwiki.embarcadero.com/RADStudio/XE2/en/Conditional_compilation_(Delphi)
-// https://docwiki.embarcadero.com/RADStudio/XE8/en/Conditional_compilation_(Delphi)
-// https://docwiki.embarcadero.com/RADStudio/2010/en/Conditional_compilation_(Delphi)
-// Direct requests were Cloudflare-blocked; unverified rows intentionally remain Unknown.
+// Thresholds cross-checked against third-party Delphi compatibility sources:
+// - Spring4D JEDI include, spring4d/Source/jedi.inc:1780: ASSEMBLER appeared in Delphi 7;
+//   also treats undefined CPUX86 as a pre-XE2 compiler.
+// - Indy Lib/System/IdCompilerDefines.inc: XE2 gates for CPUX86, CPUX64, WIN64,
+//   DCC, and NATIVECODE; CPU32BITS/CPU64BITS are gated on VCL_XE8_OR_ABOVE.
+// - Indy defines MSWINDOWS manually only below VCL 6; this confirms Delphi 6+.
 const WINDOWS_SYMBOLS: &[(&str, bool, bool, Since)] = &[
     ("MSWINDOWS", true, true, Since::At(14, 0)),
     ("WIN32", true, false, Since::Always),
@@ -187,10 +176,10 @@ const WINDOWS_SYMBOLS: &[(&str, bool, bool, Since)] = &[
     ("CPUX64", false, true, Since::At(23, 0)),
     ("CPU32BITS", true, false, Since::At(29, 0)),
     ("CPU64BITS", false, true, Since::At(29, 0)),
-    ("ASSEMBLER", true, true, Since::At(23, 0)),
+    ("ASSEMBLER", true, true, Since::At(15, 0)),
     ("CPUINTEL", true, true, Since::Unverified),
-    ("NATIVECODE", true, true, Since::At(16, 0)),
-    ("DCC", true, true, Since::At(23, 0)),
+    ("NATIVECODE", true, true, Since::ConfirmedFrom(23, 0)),
+    ("DCC", true, true, Since::ConfirmedFrom(23, 0)),
 ];
 
 const NON_WINDOWS_SYMBOLS: &[&str] = &[
@@ -261,6 +250,7 @@ mod tests {
         assert_eq!(d2010["MSWINDOWS"], F::True);
         assert_eq!(d2010["WIN32"], F::True);
         assert_eq!(d2010["CPU386"], F::True);
+        assert_eq!(d2010["ASSEMBLER"], F::True);
         assert_eq!(d2010["UNICODE"], F::True);
         assert_eq!(d2010["CONDITIONALEXPRESSIONS"], F::True);
         assert_eq!(d2010["CPUX86"], F::False);
@@ -309,9 +299,9 @@ mod tests {
     #[test]
     fn version_facts_with_an_unsupported_numeric_version_are_unknown() {
         let unsupported = CompilerVersion::with_patch(38, 0, 1);
-        assert_eq!(ver_symbols(unsupported), ["VER380"]);
+        assert!(ver_symbols(unsupported).is_empty());
         let facts = predefined_defines(unsupported, &TargetPlatform::Win32, F::Unknown);
-        assert_eq!(facts["VER380"], F::Unknown);
+        assert!(!facts.contains_key("VER380"));
         assert_eq!(facts["VER370"], F::Unknown);
         assert_eq!(facts["CONDITIONALEXPRESSIONS"], F::Unknown);
         assert_eq!(facts["UNICODE"], F::Unknown);
@@ -321,10 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn unverified_windows_symbols_stay_unknown() {
+    fn cpuintel_stays_unknown_and_dcc_is_confirmed_from_xe2() {
         let win32 = facts(37, 0, "Win32");
         assert_eq!(win32["CPUINTEL"], F::Unknown);
-        assert_eq!(facts(21, 0, "Win32")["DCC"], F::False);
+        assert_eq!(facts(21, 0, "Win32")["DCC"], F::Unknown);
         assert_eq!(win32["DCC"], F::True);
     }
 
@@ -332,9 +322,16 @@ mod tests {
     fn windows_symbols_respect_their_first_version() {
         let before_native = facts(15, 0, "Win32");
         let at_native = facts(16, 0, "Win32");
-        assert_eq!(before_native["NATIVECODE"], F::False);
-        assert_eq!(at_native["NATIVECODE"], F::True);
+        assert_eq!(before_native["NATIVECODE"], F::Unknown);
+        assert_eq!(at_native["NATIVECODE"], F::Unknown);
         assert_eq!(facts(22, 0, "Win64")["WIN64"], F::False);
         assert_eq!(facts(23, 0, "Win64")["WIN64"], F::True);
+        assert_eq!(facts(22, 0, "Win32")["DCC"], F::Unknown);
+        assert_eq!(facts(22, 0, "Win32")["NATIVECODE"], F::Unknown);
+        assert_eq!(facts(23, 0, "Win32")["DCC"], F::True);
+        assert_eq!(facts(23, 0, "Win32")["NATIVECODE"], F::True);
+        assert_eq!(facts(14, 0, "Win32")["ASSEMBLER"], F::False);
+        assert_eq!(facts(15, 0, "Win32")["ASSEMBLER"], F::True);
+        assert_eq!(facts(15, 0, "Win64")["ASSEMBLER"], F::True);
     }
 }

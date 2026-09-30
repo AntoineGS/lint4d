@@ -206,6 +206,17 @@ and cached documents, and reschedules open-document diagnostics. Stale
 navigation/formatting results are rejected for retry; stale or cancelled
 diagnostics are discarded rather than published.
 
+Workers and `PascalLspWarmer` share a bounded project cache (`project_cache.rs`)
+of parsed units and import resolutions keyed by URI and project-context
+fingerprint. Cache hits verify stat/content-hash probes and replay observations
+before delivery. Directory watches (`file_watch.rs`) and authoritative client
+file events invalidate affected entries; stores from snapshots preceding an
+invalidation are refused. The warmer caches each opened file and its direct
+imports, yields to interactive work without holding a cache claim, and keeps
+per-file `Indexing <file stem>` progress tokens (`<done>/<total> units`).
+`maxCacheBytes` (default 2 GiB) bounds the cache; open files and their direct
+imports remain pinned.
+
 The include auditor uses the shared conditional analyzer and resolver. A known-
 inactive unresolved include can be skipped, but an active or unknown include
 that is unmappable, unavailable, ambiguous, unauthorized, cyclic, malformed,

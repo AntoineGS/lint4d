@@ -59925,3 +59925,6 @@ fn runtime_configuration_processes_did_change_after_a_decreased_file_limit() {
 
 #[path = "protocol/workspace_selection.rs"]
 mod workspace_selection;
+
+#[path = "protocol/build_selection.rs"]
+mod build_selection;

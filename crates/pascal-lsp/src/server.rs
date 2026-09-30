@@ -932,7 +932,9 @@ impl AnalysisPriority {
             | AnalysisRequest::ProjectContext { .. }
             | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
+            | AnalysisRequest::BuildContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
+            | AnalysisRequest::SelectBuild { .. }
             | AnalysisRequest::SelectProject { .. }
             | AnalysisRequest::CompiledContent { .. }
             | AnalysisRequest::Completion { .. }
@@ -2069,9 +2071,29 @@ struct InstallationContextRequestParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BuildContextRequestParams {
+    project_uri: Url,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SelectInstallationRequestParams {
     project_uri: Url,
     installation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectBuildConfigRequestParams {
+    project_uri: Url,
+    config: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectPlatformRequestParams {
+    project_uri: Url,
+    platform: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2088,9 +2110,20 @@ enum AnalysisRequest {
         project_uri: Url,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
     },
+    BuildContext {
+        project_uri: Url,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
     SelectInstallation {
         project_uri: Url,
         installation_id: Option<String>,
+        automatic: bool,
+        snapshot: crate::workspace::projects::ProjectOperationSnapshot,
+    },
+    SelectBuild {
+        project_uri: Url,
+        field: crate::workspace::projects::BuildField,
+        value: Option<String>,
         automatic: bool,
         snapshot: crate::workspace::projects::ProjectOperationSnapshot,
     },
@@ -2227,7 +2260,9 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
         AnalysisRequest::ProjectContext { .. }
         | AnalysisRequest::ListProjects { .. }
         | AnalysisRequest::InstallationContext { .. }
+        | AnalysisRequest::BuildContext { .. }
         | AnalysisRequest::SelectInstallation { .. }
+        | AnalysisRequest::SelectBuild { .. }
         | AnalysisRequest::SelectProject { .. } => "Resolving Delphi project context",
         AnalysisRequest::CompiledContent { .. } => "Reading compiled virtual document",
         AnalysisRequest::Diagnostics { .. } => "Indexing workspace",
@@ -2314,11 +2349,19 @@ enum ProjectOperationResponse {
         prepared: crate::workspace::projects::ProjectContextPreparation,
     },
     InstallationContext(Value),
+    BuildContext(Value),
     SelectInstallation {
         value: Value,
         project_path: PathBuf,
         installation_id: Option<String>,
         expected_installation: Option<String>,
+    },
+    SelectBuild {
+        value: Value,
+        project_path: PathBuf,
+        field: crate::workspace::projects::BuildField,
+        selection: Option<String>,
+        expected_build: Option<pascal_project::BuildChoice>,
     },
     SelectProject {
         prepared: crate::workspace::projects::ProjectSelectionPreparation,
@@ -4974,7 +5017,9 @@ impl ObservationKey {
             | AnalysisRequest::ProjectContext { .. }
             | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
+            | AnalysisRequest::BuildContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
+            | AnalysisRequest::SelectBuild { .. }
             | AnalysisRequest::SelectProject { .. } => return None,
         };
         let version = uri.as_ref().and_then(|uri| workspace.document_version(uri));
@@ -5209,6 +5254,7 @@ enum AutomaticAnswerStage {
 enum ManualSelectionIntent {
     Project,
     Installation { project_uri: Url },
+    Build { project_uri: Url },
 }
 
 #[derive(Debug)]
@@ -5403,7 +5449,9 @@ impl AnalysisJobs {
             AnalysisRequest::ProjectContext { .. }
                 | AnalysisRequest::ListProjects { .. }
                 | AnalysisRequest::InstallationContext { .. }
+                | AnalysisRequest::BuildContext { .. }
                 | AnalysisRequest::SelectInstallation { .. }
+                | AnalysisRequest::SelectBuild { .. }
                 | AnalysisRequest::SelectProject { .. }
         ) {
             return self.spawn_project_operation(id, request);
@@ -5504,7 +5552,9 @@ impl AnalysisJobs {
             AnalysisRequest::ProjectContext { .. }
             | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
+            | AnalysisRequest::BuildContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
+            | AnalysisRequest::SelectBuild { .. }
             | AnalysisRequest::SelectProject { .. } => AnalysisResultValue::ProjectOperation(Err(
                 "project operation worker panicked".to_string(),
             )),
@@ -5667,7 +5717,9 @@ impl AnalysisJobs {
                         AnalysisRequest::ProjectContext { .. }
                         | AnalysisRequest::ListProjects { .. }
                         | AnalysisRequest::InstallationContext { .. }
+                        | AnalysisRequest::BuildContext { .. }
                         | AnalysisRequest::SelectInstallation { .. }
+                        | AnalysisRequest::SelectBuild { .. }
                         | AnalysisRequest::SelectProject { .. } => unreachable!(
                             "project operations use their dedicated worker admission path"
                         ),
@@ -6625,7 +6677,9 @@ impl AnalysisJobs {
             AnalysisRequest::ProjectContext { snapshot, .. }
             | AnalysisRequest::ListProjects { snapshot, .. }
             | AnalysisRequest::InstallationContext { snapshot, .. }
+            | AnalysisRequest::BuildContext { snapshot, .. }
             | AnalysisRequest::SelectInstallation { snapshot, .. }
+            | AnalysisRequest::SelectBuild { snapshot, .. }
             | AnalysisRequest::SelectProject { snapshot, .. } => snapshot.generations(),
             _ => unreachable!("only project protocol requests use this worker"),
         };
@@ -6652,7 +6706,16 @@ impl AnalysisJobs {
                             project_uri,
                             snapshot,
                         }
+                        | AnalysisRequest::BuildContext {
+                            project_uri,
+                            snapshot,
+                        }
                         | AnalysisRequest::SelectInstallation {
+                            project_uri,
+                            snapshot,
+                            ..
+                        }
+                        | AnalysisRequest::SelectBuild {
                             project_uri,
                             snapshot,
                             ..
@@ -6731,6 +6794,23 @@ impl AnalysisJobs {
                             )?;
                             Ok((ProjectOperationResponse::InstallationContext(value), snapshot))
                         }
+                        AnalysisRequest::BuildContext {
+                            project_uri,
+                            mut snapshot,
+                        } => {
+                            let value = snapshot
+                                .workspace_mut()
+                                .build_context_with_budget(&project_uri, Some(&budget))
+                                .and_then(|context| {
+                                    serde_json::to_value(context).map_err(|error| error.to_string())
+                                })?;
+                            wait_at_test_barrier(
+                                TestBarrier::ProjectOperationPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            Ok((ProjectOperationResponse::BuildContext(value), snapshot))
+                        }
                         AnalysisRequest::SelectInstallation {
                             project_uri,
                             installation_id,
@@ -6775,6 +6855,55 @@ impl AnalysisJobs {
                                     project_path,
                                     installation_id,
                                     expected_installation,
+                                },
+                                snapshot,
+                            ))
+                        }
+                        AnalysisRequest::SelectBuild {
+                            project_uri,
+                            field,
+                            value,
+                            automatic,
+                            mut snapshot,
+                        } => {
+                            let expected_build = snapshot.expected_build().cloned();
+                            let project_path = project_uri.to_file_path().map_err(|_| {
+                                format!("project URI must be a file URI: {project_uri}")
+                            })?;
+                            let context = snapshot.workspace_mut().select_build_with_control(
+                                &project_uri,
+                                field,
+                                value.as_deref(),
+                                &worker_cancellation,
+                                &budget,
+                            )?;
+                            let response_value = serde_json::to_value(context)
+                                .map_err(|error| error.to_string())?;
+                            wait_at_test_barrier(
+                                TestBarrier::ProjectOperationPrepared,
+                                &test_barriers,
+                                &worker_cancellation,
+                            )?;
+                            if automatic {
+                                wait_at_test_barrier(
+                                    TestBarrier::AutomaticSelectionPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                            } else {
+                                wait_at_test_barrier(
+                                    TestBarrier::ManualSelectionPrepared,
+                                    &test_barriers,
+                                    &worker_cancellation,
+                                )?;
+                            }
+                            Ok((
+                                ProjectOperationResponse::SelectBuild {
+                                    value: response_value,
+                                    project_path,
+                                    field,
+                                    selection: value,
+                                    expected_build,
                                 },
                                 snapshot,
                             ))
@@ -8589,6 +8718,11 @@ impl AnalysisJobs {
                                                     project_uri,
                                                 );
                                             }
+                                            ManualSelectionIntent::Build { project_uri } => {
+                                                self.fence_automatic_answers_for_project(
+                                                    project_uri,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -9112,6 +9246,13 @@ fn deliver_analysis_result_with_store(
             client_id.clone().expect("project operation client result"),
             value,
         ),
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::BuildContext(
+            value,
+        ))) => send_ok(
+            connection,
+            client_id.clone().expect("project operation client result"),
+            value,
+        ),
         AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::ListProjects(
             value,
         ))) => send_ok(
@@ -9132,6 +9273,36 @@ fn deliver_analysis_result_with_store(
                 &project_path,
                 installation_id.as_deref(),
                 expected_installation.as_deref(),
+                &budget,
+            ) {
+                Ok(()) => {
+                    selection_committed = true;
+                    send_ok(
+                        connection,
+                        client_id.clone().expect("project operation client result"),
+                        value,
+                    )
+                }
+                Err(error) => send_analysis_error(
+                    connection,
+                    client_id.clone().expect("project operation client result"),
+                    error,
+                ),
+            }
+        }
+        AnalysisResultValue::ProjectOperation(Ok(ProjectOperationResponse::SelectBuild {
+            value,
+            project_path,
+            field,
+            selection,
+            expected_build,
+        })) => {
+            let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+            match workspace.commit_prepared_build_selection(
+                &project_path,
+                field,
+                selection.as_deref(),
+                expected_build.as_ref(),
                 &budget,
             ) {
                 Ok(()) => {
@@ -11699,6 +11870,9 @@ fn request_requires_configuration(method: &str) -> bool {
             | "pascal/selectProject"
             | "pascal/installationContext"
             | "pascal/selectInstallation"
+            | "pascal/buildContext"
+            | "pascal/selectBuildConfig"
+            | "pascal/selectPlatform"
             | "textDocument/hover"
             | "textDocument/completion"
             | "completionItem/resolve"
@@ -12278,6 +12452,30 @@ fn handle_request(
                 None,
             )?;
         }
+        "pascal/buildContext" => {
+            let id = request.id.clone();
+            let params: BuildContextRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let project_path = params.project_uri.to_file_path().ok();
+            let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::BuildContext {
+                    project_uri: params.project_uri,
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
+        }
         "pascal/selectInstallation" => {
             let id = request.id.clone();
             if request.params.get("installationId").is_none() {
@@ -12313,6 +12511,102 @@ fn handle_request(
                 AnalysisRequest::SelectInstallation {
                     project_uri: params.project_uri,
                     installation_id: params.installation_id,
+                    automatic: jobs.automatic_answer_requests.contains_key(&request.id),
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
+            if jobs.request_to_job.contains_key(&request_id) {
+                if let Some(intent) = manual_intent {
+                    jobs.manual_selection_requests.insert(request_id, intent);
+                }
+            }
+        }
+        "pascal/selectBuildConfig" => {
+            let id = request.id.clone();
+            if request.params.get("config").is_none() {
+                send_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams,
+                    "config is required; use null to reset the session selection",
+                )?;
+                return Ok(());
+            }
+            let params: SelectBuildConfigRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let manual_intent =
+                (!jobs.automatic_answer_requests.contains_key(&request.id)).then(|| {
+                    ManualSelectionIntent::Build {
+                        project_uri: params.project_uri.clone(),
+                    }
+                });
+            let request_id = request.id.clone();
+            let project_path = params.project_uri.to_file_path().ok();
+            let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::SelectBuild {
+                    project_uri: params.project_uri,
+                    field: crate::workspace::projects::BuildField::Config,
+                    value: params.config,
+                    automatic: jobs.automatic_answer_requests.contains_key(&request.id),
+                    snapshot,
+                },
+                client_features,
+                None,
+            )?;
+            if jobs.request_to_job.contains_key(&request_id) {
+                if let Some(intent) = manual_intent {
+                    jobs.manual_selection_requests.insert(request_id, intent);
+                }
+            }
+        }
+        "pascal/selectPlatform" => {
+            let id = request.id.clone();
+            if request.params.get("platform").is_none() {
+                send_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams,
+                    "platform is required; use null to reset the session selection",
+                )?;
+                return Ok(());
+            }
+            let params: SelectPlatformRequestParams = match parse_params(&request) {
+                Ok(params) => params,
+                Err(error) => {
+                    send_error(connection, id, ErrorCode::InvalidParams, error)?;
+                    return Ok(());
+                }
+            };
+            let manual_intent =
+                (!jobs.automatic_answer_requests.contains_key(&request.id)).then(|| {
+                    ManualSelectionIntent::Build {
+                        project_uri: params.project_uri.clone(),
+                    }
+                });
+            let request_id = request.id.clone();
+            let project_path = params.project_uri.to_file_path().ok();
+            let snapshot = workspace.project_operation_snapshot(project_path.as_deref());
+            start_analysis(
+                connection,
+                workspace,
+                jobs,
+                id,
+                AnalysisRequest::SelectBuild {
+                    project_uri: params.project_uri,
+                    field: crate::workspace::projects::BuildField::Platform,
+                    value: params.platform,
                     automatic: jobs.automatic_answer_requests.contains_key(&request.id),
                     snapshot,
                 },
@@ -14469,6 +14763,7 @@ fn server_capabilities(
             "projectSelection": true,
             "projectCatalogue": true,
             "installationSelection": true,
+            "buildSelection": true,
             "compiledDcuVirtualDocuments": {
                 "uriScheme": "lint4d-dcu",
                 "contentMethod": "textDocument/content",

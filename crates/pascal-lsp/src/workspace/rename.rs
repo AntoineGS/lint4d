@@ -36,8 +36,8 @@ use pascal_core::resolver::{
 };
 use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{
-    ConditionalContext, MetadataObservation, ProjectCandidateMembership, ProjectContext,
-    ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
+    BuildChoice, ConditionalContext, MetadataObservation, ProjectCandidateMembership,
+    ProjectContext, ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
     has_invalid_project_selection,
 };
 #[cfg(test)]
@@ -131,6 +131,7 @@ pub(crate) struct WorkspaceInput {
     pub(crate) overrides: pascal_project::delphi_overrides::OverrideSession,
     pub(crate) project_selections: ProjectSelections,
     pub(crate) installation_selections: HashMap<PathBuf, String>,
+    pub(crate) build_selections: HashMap<PathBuf, BuildChoice>,
     pub(crate) document_owners: HashMap<Url, KnownDocumentOwner>,
     pub(crate) overlays: HashMap<Url, OverlayInput>,
     pub(crate) cached_documents: HashMap<Url, CachedDocument>,
@@ -985,7 +986,7 @@ impl Enumeration {
                         self.complete = false;
                         self.reason.get_or_insert_with(|| {
                             format!(
-                                "source {path:?} was discovered under incompatible project contexts"
+                                "project context changed while building the workspace snapshot: source {path:?} was discovered under incompatible project contexts"
                             )
                         });
                     }
@@ -1010,7 +1011,7 @@ impl Enumeration {
             if existing_owner != &owner {
                 self.complete = false;
                 self.reason.get_or_insert_with(|| {
-                    format!("source {path:?} was discovered under incompatible project contexts")
+                    format!("project context changed while building the workspace snapshot: source {path:?} was discovered under incompatible project contexts")
                 });
             }
         } else {
@@ -1347,6 +1348,7 @@ impl Workspace {
             overrides: self.overrides.clone(),
             project_selections: self.project_selections.clone(),
             installation_selections: self.installation_selections.clone(),
+            build_selections: self.build_selections.clone(),
             document_owners: self.document_owners.clone(),
             overlays,
             cached_documents,
@@ -10521,6 +10523,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
@@ -10550,6 +10553,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
@@ -10703,6 +10707,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
@@ -11034,6 +11039,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
@@ -11109,6 +11115,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
@@ -11203,6 +11210,7 @@ mod tests {
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),

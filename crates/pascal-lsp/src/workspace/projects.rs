@@ -7,13 +7,14 @@ use super::{
 use crate::configuration::{config_directories, resolve_fmt, resolve_lint};
 use lsp_types::Url;
 use pascal_project::installation_config::ConfigurationSourceStamp;
+use pascal_project::rtl_constants::RtlConstantSource;
 use pascal_project::{
-    InstallationSelection, discover_with_selections,
+    BuildChoice, BuildSelection, InstallationSelection, ProjectContext, discover_with_selections,
     discover_with_selections_and_observations_with_work_budget, project_candidates,
     project_candidates_with_work_budget, runtime_project_selection, selected_project_is_current,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -47,12 +48,53 @@ pub struct InstallationContextInfo {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BuildField {
+    Config,
+    Platform,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildContextInfo {
+    pub project_uri: Url,
+    pub config: BuildSelectionInfo,
+    pub platform: BuildSelectionInfo,
+    pub conditionals: ConditionalsInfo,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildSelectionInfo {
+    pub selected: Option<String>,
+    pub candidates: Vec<String>,
+    pub mode: String,
+    pub project_default: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalsInfo {
+    pub closed: bool,
+    pub open_reasons: Vec<String>,
+    pub rtl_version_constants: RtlConstantsInfo,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtlConstantsInfo {
+    pub source: String,
+    pub names: Vec<String>,
+}
+
 /// Admission-time immutable authority for project protocol workers.
 pub(crate) struct ProjectOperationSnapshot {
     workspace: Workspace,
     source_generation: u64,
     configuration_generation: u64,
     expected_installation: Option<String>,
+    expected_build: Option<BuildChoice>,
 }
 
 pub(crate) struct ProjectOperationReadSet {
@@ -128,6 +170,10 @@ impl ProjectOperationSnapshot {
 
     pub(crate) fn expected_installation(&self) -> Option<&str> {
         self.expected_installation.as_deref()
+    }
+
+    pub(crate) fn expected_build(&self) -> Option<&BuildChoice> {
+        self.expected_build.as_ref()
     }
 
     pub(crate) fn workspace_mut(&mut self) -> &mut Workspace {
@@ -299,6 +345,7 @@ impl Workspace {
                 .collect(),
             project_selections: self.project_selections.clone(),
             installation_selections: self.installation_selections.clone(),
+            build_selections: self.build_selections.clone(),
             contexts: self.contexts.clone(),
             document_contexts: self.document_contexts.clone(),
             open_document_contexts: self.open_document_contexts.clone(),
@@ -314,11 +361,13 @@ impl Workspace {
         };
         let expected_installation =
             project_path.and_then(|path| self.installation_selections.get(path).cloned());
+        let expected_build = project_path.and_then(|path| self.build_selections.get(path).cloned());
         ProjectOperationSnapshot {
             workspace,
             source_generation: self.source_generation,
             configuration_generation: self.configuration_generation,
             expected_installation,
+            expected_build,
         }
     }
 
@@ -587,6 +636,159 @@ impl Workspace {
         })
     }
 
+    pub fn build_context(&mut self, project_uri: &Url) -> Result<BuildContextInfo, String> {
+        self.build_context_with_budget(project_uri, None)
+    }
+
+    pub(crate) fn build_context_with_budget(
+        &mut self,
+        project_uri: &Url,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<BuildContextInfo, String> {
+        let project_path = project_path(project_uri)?;
+        let context = self.discover_build_context(
+            &project_path,
+            self.build_selections.clone(),
+            None,
+            budget,
+        )?;
+        Ok(build_context_info(project_uri, &context))
+    }
+
+    pub fn select_build(
+        &mut self,
+        project_uri: &Url,
+        field: BuildField,
+        value: Option<&str>,
+    ) -> Result<BuildContextInfo, String> {
+        self.select_build_inner(project_uri, field, value, None, None)
+    }
+
+    pub(crate) fn select_build_with_control(
+        &mut self,
+        project_uri: &Url,
+        field: BuildField,
+        value: Option<&str>,
+        cancel: &std::sync::atomic::AtomicBool,
+        budget: &ReconciliationBudget,
+    ) -> Result<BuildContextInfo, String> {
+        self.select_build_inner(project_uri, field, value, Some(cancel), Some(budget))
+    }
+
+    fn select_build_inner(
+        &mut self,
+        project_uri: &Url,
+        field: BuildField,
+        value: Option<&str>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<BuildContextInfo, String> {
+        let project_path = project_path(project_uri)?;
+        self.validate_project_scope(&project_path)?;
+        check_project_operation_cancel(cancel)?;
+
+        let mut selections = self.build_selections.clone();
+        let mut choice = selections.get(&project_path).cloned().unwrap_or_default();
+        match field {
+            BuildField::Config => choice.config = value.map(str::to_owned),
+            BuildField::Platform => choice.platform = value.map(str::to_owned),
+        }
+        if choice.config.is_none() && choice.platform.is_none() {
+            selections.remove(&project_path);
+        } else {
+            selections.insert(project_path.clone(), choice);
+        }
+
+        // Discover with the tentative selection before mutating live state.
+        let validation =
+            self.discover_build_context(&project_path, selections.clone(), cancel, budget)?;
+        if let Some(value) = value {
+            let selection = match field {
+                BuildField::Config => &validation.config_selection,
+                BuildField::Platform => &validation.platform_selection,
+            };
+            if !selection
+                .candidates
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(value))
+            {
+                return Err(match field {
+                    BuildField::Config => {
+                        format!("unknown build configuration `{value}`")
+                    }
+                    BuildField::Platform => format!("unknown platform `{value}`"),
+                });
+            }
+        }
+
+        let mut keys = HashSet::new();
+        keys.try_reserve(self.contexts.len())
+            .map_err(|error| format!("could not reserve build selection contexts: {error}"))?;
+        for key in self.contexts.keys() {
+            if key
+                .project_file
+                .as_deref()
+                .is_some_and(|path| project_paths_equal(path, &project_path))
+            {
+                keys.insert(key.clone());
+            }
+        }
+        let project_dependency =
+            self.preflight_project_selection_dependency(&project_path, budget)?;
+        if selections.contains_key(&project_path) {
+            self.build_selections
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve build selection: {error}"))?;
+        }
+        self.invalidate_selection_contexts(&keys, cancel, budget)?;
+        // Context invalidation is preflighted; the session choice and its
+        // freshness changes can now be committed without another fallible step.
+        self.build_selections = selections;
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_configuration_change(&project_dependency, false);
+        Ok(build_context_info(project_uri, &validation))
+    }
+
+    fn discover_build_context(
+        &self,
+        project_path: &Path,
+        build_selections: HashMap<PathBuf, BuildChoice>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<ProjectContext, String> {
+        self.validate_project_scope(project_path)?;
+        check_project_operation_cancel(cancel)?;
+        let roots = self.workspace_root_paths_with_control(cancel, budget)?;
+        let options = self.project_options_with_selections(
+            self.installation_selections.clone(),
+            build_selections,
+        );
+        let fallback_cancel = std::sync::atomic::AtomicBool::new(false);
+        let context = discover_with_selections_and_observations_with_work_budget(
+            project_path,
+            &roots,
+            &options,
+            &self.project_selections,
+            &self.overrides,
+            &self.options.exclude,
+            cancel.unwrap_or(&fallback_cancel),
+            budget.map(|budget| budget as &dyn pascal_project::ProjectWorkBudget),
+        )?
+        .context;
+        if context
+            .project_file
+            .as_deref()
+            .is_none_or(|path| !project_paths_equal(path, project_path))
+        {
+            return Err(format!(
+                "project is no longer valid: {}",
+                project_path.display()
+            ));
+        }
+        Ok(context)
+    }
+
     pub fn select_installation(
         &mut self,
         project_uri: &Url,
@@ -770,6 +972,77 @@ impl Workspace {
             }
             None => {
                 self.installation_selections.remove(project_path);
+            }
+        }
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_configuration_change(&project_dependency, false);
+        Ok(())
+    }
+
+    /// Commit a worker-validated build choice without rediscovering the
+    /// project on the coordinator thread.
+    pub(crate) fn commit_prepared_build_selection(
+        &mut self,
+        project_path: &Path,
+        field: BuildField,
+        value: Option<&str>,
+        expected_build: Option<&BuildChoice>,
+        budget: &ReconciliationBudget,
+    ) -> Result<(), String> {
+        if self.build_selections.get(project_path) != expected_build {
+            return Err("build selection changed while the request was running".to_string());
+        }
+        let roots = self.workspace_root_paths();
+        let mut in_scope = false;
+        for root in &roots {
+            budget.charge_path_visits(1)?;
+            if crate::workspace::path_starts_with_native(project_path, root) {
+                in_scope = true;
+            }
+        }
+        if !in_scope {
+            return Err("project is no longer in the configured workspace scope".to_string());
+        }
+
+        let mut choice = self
+            .build_selections
+            .get(project_path)
+            .cloned()
+            .unwrap_or_default();
+        match field {
+            BuildField::Config => choice.config = value.map(str::to_owned),
+            BuildField::Platform => choice.platform = value.map(str::to_owned),
+        }
+        let choice = (choice.config.is_some() || choice.platform.is_some()).then_some(choice);
+        let mut keys = HashSet::new();
+        keys.try_reserve(self.contexts.len())
+            .map_err(|error| format!("could not reserve build selection contexts: {error}"))?;
+        for key in self.contexts.keys() {
+            budget.charge_path_visits(1)?;
+            if key
+                .project_file
+                .as_deref()
+                .is_some_and(|path| project_paths_equal(path, project_path))
+            {
+                keys.insert(key.clone());
+            }
+        }
+        let project_dependency =
+            self.preflight_project_selection_dependency(project_path, Some(budget))?;
+        if choice.is_some() {
+            self.build_selections
+                .try_reserve(1)
+                .map_err(|error| format!("could not reserve build selection: {error}"))?;
+        }
+        self.invalidate_selection_contexts(&keys, None, Some(budget))?;
+        match choice {
+            Some(choice) => {
+                self.build_selections
+                    .insert(project_path.to_path_buf(), choice);
+            }
+            None => {
+                self.build_selections.remove(project_path);
             }
         }
         self.bump_source_generation();
@@ -1183,6 +1456,43 @@ impl Workspace {
                 .entry(path.clone())
                 .or_insert_with(|| path_stamp(&path));
         }
+    }
+}
+
+fn build_context_info(project_uri: &Url, context: &ProjectContext) -> BuildContextInfo {
+    let rtl_constants = &context.conditional_closure;
+    BuildContextInfo {
+        project_uri: canonical_file_uri(project_uri),
+        config: build_selection_info(&context.config_selection),
+        platform: build_selection_info(&context.platform_selection),
+        conditionals: ConditionalsInfo {
+            closed: rtl_constants.closed,
+            open_reasons: rtl_constants
+                .open_reasons
+                .iter()
+                .map(|reason| reason.as_str().to_string())
+                .collect(),
+            rtl_version_constants: RtlConstantsInfo {
+                source: match rtl_constants.rtl_source {
+                    RtlConstantSource::Override => "override",
+                    RtlConstantSource::SystemPas => "systemPas",
+                    RtlConstantSource::Table => "table",
+                    RtlConstantSource::Unknown => "unknown",
+                }
+                .to_string(),
+                names: rtl_constants.rtl_constants.clone().unwrap_or_default(),
+            },
+        },
+        warnings: context.warnings.clone(),
+    }
+}
+
+fn build_selection_info(selection: &BuildSelection) -> BuildSelectionInfo {
+    BuildSelectionInfo {
+        selected: selection.selected.clone(),
+        candidates: selection.candidates.clone(),
+        mode: selection.mode.as_str().to_string(),
+        project_default: selection.project_default.clone(),
     }
 }
 

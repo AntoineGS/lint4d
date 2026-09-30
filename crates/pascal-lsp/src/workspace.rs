@@ -20,11 +20,11 @@ use pascal_project::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
 };
 use pascal_project::{
-    CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
-    PackageMetadata, ProjectCandidateMembership, ProjectCandidates, ProjectContext,
-    ProjectDiscovery, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ProjectSelections, ProjectWorkBudget, ReadPolicy,
-    discover_with_selections,
+    BuildChoice, BuildSelectionMode, CompilerVersion, ConditionalContext, ConditionalFact,
+    ConstantValue, MetadataObservation, PackageMetadata, ProjectCandidateMembership,
+    ProjectCandidates, ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry,
+    ProjectPathProvenance, ProjectReadObservation, ProjectReadStamp, ProjectSelections,
+    ProjectWorkBudget, ReadPolicy, discover_with_selections,
     discover_with_selections_and_observations_with_overrides_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths,
@@ -2108,6 +2108,7 @@ pub(crate) struct ContextKey {
     selection_project: Option<PathBuf>,
     config: Option<String>,
     platform: Option<String>,
+    build_selection_modes: Option<(BuildSelectionMode, BuildSelectionMode)>,
     conditional_context: ConditionalContext,
     context_fingerprint: Option<u64>,
     overrides: EffectiveOverrides,
@@ -2635,6 +2636,7 @@ pub struct Workspace {
     owner_last_used: HashMap<Url, u64>,
     project_selections: ProjectSelections,
     installation_selections: HashMap<PathBuf, String>,
+    build_selections: HashMap<PathBuf, BuildChoice>,
     directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
     filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
     package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
@@ -3136,6 +3138,7 @@ impl Workspace {
             cache_epoch: Some(input.cache_epoch),
             project_selections: input.project_selections.clone(),
             installation_selections: input.installation_selections.clone(),
+            build_selections: input.build_selections.clone(),
             analysis_records: Some(HashMap::new()),
             source_generation: input.source_generation,
             configuration_generation: input.configuration_generation,
@@ -3269,12 +3272,23 @@ impl Workspace {
     pub fn refresh_for_navigation(&mut self) {}
 
     fn project_options(&self) -> ProjectOptions {
-        self.project_options_with_installations(self.installation_selections.clone())
+        self.project_options_with_selections(
+            self.installation_selections.clone(),
+            self.build_selections.clone(),
+        )
     }
 
     fn project_options_with_installations(
         &self,
         installation_selections: HashMap<PathBuf, String>,
+    ) -> ProjectOptions {
+        self.project_options_with_selections(installation_selections, self.build_selections.clone())
+    }
+
+    fn project_options_with_selections(
+        &self,
+        installation_selections: HashMap<PathBuf, String>,
+        build_selections: HashMap<PathBuf, BuildChoice>,
     ) -> ProjectOptions {
         ProjectOptions {
             project_file: self.options.project_file.clone(),
@@ -3283,7 +3297,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
             installation_selections,
-            build_selections: Default::default(),
+            build_selections,
         }
     }
 
@@ -4428,6 +4442,7 @@ impl Workspace {
             count_recovery_entries!(self.include_parents.len());
             count_recovery_entries!(self.document_owners.len());
             count_recovery_entries!(self.installation_selections.len());
+            count_recovery_entries!(self.build_selections.len());
             count_recovery_entries!(self.owner_last_used.len());
             count_recovery_entries!(self.pending_unit_file_renames.len());
             count_recovery_entries!(self.indexed_files.len());
@@ -4452,6 +4467,15 @@ impl Workspace {
             for (project, installation_id) in &self.installation_selections {
                 charge_retained_payload(project.as_os_str().len())?;
                 charge_retained_payload(installation_id.len())?;
+            }
+            for (project, choice) in &self.build_selections {
+                charge_retained_payload(project.as_os_str().len())?;
+                if let Some(config) = &choice.config {
+                    charge_retained_payload(config.len())?;
+                }
+                if let Some(platform) = &choice.platform {
+                    charge_retained_payload(platform.len())?;
+                }
             }
             for (uri, key) in &self.document_contexts {
                 charge_retained_payload(uri.as_str().len())?;
@@ -5820,7 +5844,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
             installation_selections: self.installation_selections.clone(),
-            build_selections: Default::default(),
+            build_selections: self.build_selections.clone(),
         };
         let (context_key, context) =
             self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
@@ -8730,7 +8754,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
             installation_selections: self.installation_selections.clone(),
-            build_selections: Default::default(),
+            build_selections: self.build_selections.clone(),
         };
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         if let Some(owner) = self.document_owners.get(uri).cloned() {
@@ -9314,6 +9338,12 @@ impl Workspace {
             selection_project: selection.map(|(_, project)| project),
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
+            build_selection_modes: context.map(|context| {
+                (
+                    context.config_selection.mode,
+                    context.platform_selection.mode,
+                )
+            }),
             conditional_context: context
                 .map(|context| conditional_context_for_path(context, path))
                 .unwrap_or_default(),
@@ -9353,6 +9383,12 @@ impl Workspace {
             selection_project: selection.map(|(_, project)| project),
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
+            build_selection_modes: context.map(|context| {
+                (
+                    context.config_selection.mode,
+                    context.platform_selection.mode,
+                )
+            }),
             conditional_context: context
                 .map(|context| conditional_context_for_path(context, path))
                 .unwrap_or_default(),
@@ -14951,6 +14987,8 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         }
@@ -17147,6 +17185,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17288,6 +17328,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17405,6 +17447,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17486,6 +17530,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17542,6 +17588,8 @@ BDS = '/fake/37'
                 config: None,
                 platform: None,
                 conditional_context: ConditionalContext::default(),
+                build_selection_modes: None,
+
                 context_fingerprint: None,
                 overrides: EffectiveOverrides::default(),
             };
@@ -17706,6 +17754,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17772,6 +17822,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17833,6 +17885,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17927,6 +17981,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -17998,6 +18054,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -18050,6 +18108,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -18115,6 +18175,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -18178,6 +18240,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -18227,6 +18291,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -19240,6 +19306,7 @@ BDS = '/fake/37'
             overrides: OverrideSession::new(None),
             project_selections: HashMap::new(),
             installation_selections: HashMap::new(),
+            build_selections: HashMap::new(),
             document_owners: HashMap::new(),
             overlays,
             cached_documents: HashMap::new(),
@@ -20381,6 +20448,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -20417,6 +20486,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -21094,6 +21165,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
@@ -21158,6 +21231,8 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            build_selection_modes: None,
+
             context_fingerprint: None,
             overrides: EffectiveOverrides {
                 path_mappings: vec![PathMapping {

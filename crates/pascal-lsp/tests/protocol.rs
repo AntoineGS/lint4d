@@ -11359,6 +11359,94 @@ fn generated_work_done_tokens_avoid_active_partial_tokens() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn opening_a_file_reports_indexing_progress() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    write_file(
+        &main,
+        "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n",
+    );
+    write_file(
+        &root.path().join("Provider.pas"),
+        "unit Provider;\ninterface\nimplementation\nend.\n",
+    );
+    let mut server = TestServer::launch();
+    server.initialize_with_progress(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&main), "languageId": "pascal", "version": 1,
+            "text": fs::read_to_string(&main).unwrap()}}),
+    );
+
+    let mut seen_titles = Vec::new();
+    let mut indexing_token = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && indexing_token.is_none() {
+        let Some(create) = server.request_with_timeout(
+            "window/workDoneProgress/create",
+            deadline.saturating_duration_since(Instant::now()),
+        ) else {
+            break;
+        };
+        let token = create.params["token"].clone();
+        server.send(Message::Response(Response::new_ok(create.id, Value::Null)));
+
+        while Instant::now() < deadline {
+            let progress = server.notification_with_timeout(
+                "$/progress",
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            if progress["value"]["kind"] != "begin" || progress["token"] != token {
+                continue;
+            }
+            let title = progress["value"]["title"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            seen_titles.push(title.clone());
+            if title == "Indexing Main" {
+                assert_eq!(progress["value"]["message"], "0/1 units");
+                indexing_token = Some(token.clone());
+            }
+            break;
+        }
+    }
+    let token =
+        indexing_token.unwrap_or_else(|| panic!("no Indexing progress; saw {seen_titles:?}"));
+    loop {
+        let progress = server.notification("$/progress");
+        if progress["token"] == token && progress["value"]["kind"] == "end" {
+            break;
+        }
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn no_indexing_progress_without_client_support() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&main), "languageId": "pascal", "version": 1,
+            "text": fs::read_to_string(&main).unwrap()}}),
+    );
+    assert!(
+        server
+            .request_with_timeout("window/workDoneProgress/create", Duration::from_secs(2))
+            .is_none()
+    );
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn coalesced_partial_recipients_keep_independent_tokens_and_ordinary_results() {
     let root = tempfile::tempdir().expect("workspace");
     let source = root.path().join("Main.pas");

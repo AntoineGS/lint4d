@@ -187,7 +187,7 @@ const MAX_DEFERRED_OUTBOUND_MESSAGES: usize =
 const MAX_PARTIAL_VALIDATION_RETIREMENTS: usize = MAX_CLIENT_ANALYSIS_RECIPIENTS;
 
 #[derive(Debug)]
-enum OutputError {
+pub(crate) enum OutputError {
     Disconnected,
     Backpressure,
     ResultBackpressure,
@@ -242,7 +242,7 @@ struct PendingOutboundMessage {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct DiagnosticPublicationDiscardScan {
+pub(crate) struct DiagnosticPublicationDiscardScan {
     scanned_messages: usize,
     scanned_bytes: usize,
     removed_messages: usize,
@@ -559,7 +559,7 @@ impl OutboundQueue {
 /// production wrapper retains a bounded, ordered queue in front of the
 /// transport channel; the plain `Connection` implementation keeps the
 /// memory-connection unit tests lightweight.
-trait ProtocolSender {
+pub(crate) trait ProtocolSender {
     fn send_control(&self, message: Message) -> Result<(), OutputError>;
     fn send_result(&self, message: Message) -> Result<(), OutputError>;
     fn send_data(&self, message: Message) -> Result<bool, OutputError>;
@@ -4617,7 +4617,7 @@ impl ProgressTracker {
     }
 }
 
-fn send_progress_begin(
+pub(crate) fn send_progress_begin(
     connection: &dyn ProtocolSender,
     token: &ProgressToken,
     title: &str,
@@ -4639,7 +4639,7 @@ fn send_progress_begin(
         .map_err(|error| error.to_string())
 }
 
-fn send_progress_report(
+pub(crate) fn send_progress_report(
     connection: &dyn ProtocolSender,
     token: &ProgressToken,
     message: &str,
@@ -4659,7 +4659,7 @@ fn send_progress_report(
         .map_err(|error| error.to_string())
 }
 
-fn send_progress_end(
+pub(crate) fn send_progress_end(
     connection: &dyn ProtocolSender,
     token: &ProgressToken,
     message: Option<&str>,
@@ -10251,6 +10251,7 @@ fn run_connection(
         &mut configuration,
         watcher_registration,
         watch_events,
+        work_done_progress_supported,
         jobs,
     )
 }
@@ -10515,6 +10516,7 @@ fn event_loop(
     configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
     watch_events: crate::file_watch::WatchEvents,
+    work_done_progress_supported: bool,
     mut jobs: AnalysisJobs,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let mut shutdown_received = false;
@@ -10527,6 +10529,7 @@ fn event_loop(
     let mut pending_diagnostic_clears = PendingDiagnosticClears::default();
     let mut rewarm = Vec::new();
     let mut warmer = crate::warmer::Warmer::start(jobs.interactive_gate.clone());
+    let mut warm_progress = crate::warmer::WarmProgress::new(work_done_progress_supported);
     let mut last_configuration_generation = workspace.configuration_generation();
     let mut sweep_pending = false;
     let mut swept_fingerprints = HashSet::new();
@@ -10569,6 +10572,9 @@ fn event_loop(
                                 "workspace reconciliation worker panicked; retry after reconnect",
                             )?;
                         }
+                        warm_progress
+                            .end_all(connection)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         warmer.shutdown();
                         jobs.shutdown_with_connection(connection)?;
                         return Ok(true);
@@ -10688,6 +10694,9 @@ fn event_loop(
                             "workspace reconciliation worker failed; retry after reconnect",
                         )?;
                     }
+                    warm_progress
+                        .end_all(connection)
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     warmer.shutdown();
                     jobs.shutdown_with_connection(connection)?;
                     return Ok(true);
@@ -10707,14 +10716,16 @@ fn event_loop(
         let workspace_busy = file_notification_worker.is_some();
         if !workspace_busy {
             maintain_warmer(
+                connection,
                 workspace,
                 &mut warmer,
+                &mut warm_progress,
                 &mut rewarm,
                 &mut last_configuration_generation,
                 &mut sweep_pending,
                 &mut swept_fingerprints,
                 &mut budget_warned,
-            );
+            )?;
         }
         if !workspace_busy {
             if let Some(effect) = configuration.poll(workspace)? {
@@ -10747,14 +10758,16 @@ fn event_loop(
                 }
             }
             maintain_warmer(
+                connection,
                 workspace,
                 &mut warmer,
+                &mut warm_progress,
                 &mut rewarm,
                 &mut last_configuration_generation,
                 &mut sweep_pending,
                 &mut swept_fingerprints,
                 &mut budget_warned,
-            );
+            )?;
         }
         if !workspace_busy
             && !shutdown_received
@@ -10834,14 +10847,16 @@ fn event_loop(
                         drain_watch_events(workspace, &watch_events, &mut rewarm);
                         if !workspace_busy {
                             maintain_warmer(
+                                connection,
                                 workspace,
                                 &mut warmer,
+                                &mut warm_progress,
                                 &mut rewarm,
                                 &mut last_configuration_generation,
                                 &mut sweep_pending,
                                 &mut swept_fingerprints,
                                 &mut budget_warned,
-                            );
+                            )?;
                         }
                         if !workspace_busy
                             && !shutdown_received
@@ -10858,6 +10873,9 @@ fn event_loop(
                     Err(RecvTimeoutError::Disconnected) => {
                         let _ =
                             cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                        warm_progress
+                            .end_all(connection)
+                            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                         warmer.shutdown();
                         jobs.shutdown();
                         configuration.shutdown();
@@ -10873,14 +10891,16 @@ fn event_loop(
                     drain_watch_events(workspace, &watch_events, &mut rewarm);
                     if !workspace_busy {
                         maintain_warmer(
+                            connection,
                             workspace,
                             &mut warmer,
+                            &mut warm_progress,
                             &mut rewarm,
                             &mut last_configuration_generation,
                             &mut sweep_pending,
                             &mut swept_fingerprints,
                             &mut budget_warned,
-                        );
+                        )?;
                     }
                     if !workspace_busy
                         && !shutdown_received
@@ -10896,6 +10916,9 @@ fn event_loop(
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                    warm_progress
+                        .end_all(connection)
+                        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                     warmer.shutdown();
                     jobs.shutdown();
                     configuration.shutdown();
@@ -10908,6 +10931,9 @@ fn event_loop(
         match message {
             Message::Request(request) if request.method == "shutdown" => {
                 let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                warm_progress
+                    .end_all(connection)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 warmer.shutdown();
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
@@ -11070,6 +11096,9 @@ fn event_loop(
             }
             Message::Notification(notification) if notification.method == "exit" => {
                 let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                warm_progress
+                    .end_all(connection)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
                 warmer.shutdown();
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
@@ -11256,6 +11285,9 @@ fn event_loop(
                 match result {
                     Ok(effect) => {
                         if let Some(closed_uri) = closed_document_uri {
+                            warm_progress.close(connection, &closed_uri).map_err(
+                                |error| -> Box<dyn Error + Send + Sync> { error.into() },
+                            )?;
                             jobs.remove_prompts_for_closed_source(&closed_uri);
                         }
                         if !pull_diagnostics_supported {
@@ -11329,6 +11361,12 @@ fn event_loop(
                 }
             }
             Message::Response(response) => {
+                if warm_progress
+                    .handle_response(connection, &response)
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?
+                {
+                    continue;
+                }
                 if file_notification_worker.is_some() {
                     queue_workspace_message(
                         &mut deferred_workspace_messages,
@@ -11465,14 +11503,16 @@ fn event_loop(
         if file_notification_worker.is_none() {
             jobs.pump_partial_deliveries(connection, workspace)?;
             maintain_warmer(
+                connection,
                 workspace,
                 &mut warmer,
+                &mut warm_progress,
                 &mut rewarm,
                 &mut last_configuration_generation,
                 &mut sweep_pending,
                 &mut swept_fingerprints,
                 &mut budget_warned,
-            );
+            )?;
         }
     }
 }
@@ -11488,20 +11528,26 @@ fn drain_watch_events(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maintain_warmer(
+    connection: &dyn ProtocolSender,
     workspace: &Workspace,
     warmer: &mut crate::warmer::Warmer,
+    warm_progress: &mut crate::warmer::WarmProgress,
     rewarm: &mut Vec<Url>,
     last_configuration_generation: &mut u64,
     sweep_pending: &mut bool,
     swept_fingerprints: &mut HashSet<u64>,
     budget_warned: &mut bool,
-) {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let cache = workspace.project_cache();
     let configuration_generation = workspace.configuration_generation();
     if configuration_generation != *last_configuration_generation {
         *last_configuration_generation = configuration_generation;
         let open = workspace.open_document_uris();
+        warm_progress
+            .end_all(connection)
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
         warmer.reset(open.clone(), cache);
         *sweep_pending = true;
         swept_fingerprints.clear();
@@ -11530,6 +11576,9 @@ fn maintain_warmer(
                 }
             }
         }
+        warm_progress
+            .handle(connection, &event)
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
     }
     if *sweep_pending && (warmer.is_idle() || !cache.has_room()) {
         cache.retain_fingerprints(swept_fingerprints);
@@ -11541,6 +11590,7 @@ fn maintain_warmer(
         );
         *budget_warned = true;
     }
+    Ok(())
 }
 
 fn event_loop_receive_timeout(
@@ -16006,6 +16056,7 @@ mod tests {
             &mut configuration,
             None,
             crate::file_watch::WatchEvents::channel().1,
+            false,
             AnalysisJobs::new(),
         )
         .expect("event loop completes");
@@ -19928,5 +19979,312 @@ mod tests {
         };
         assert_eq!(response.id, signature_id);
         assert_eq!(response.error.expect("signature cancellation").code, -32800);
+    }
+
+    #[test]
+    fn warm_progress_finishing_before_create_response_still_reports_and_ends() {
+        let (connection, client) = Connection::memory();
+        let uri = Url::parse("file:///workspace/Main.pas").expect("warm URI");
+        let mut progress = crate::warmer::WarmProgress::new(true);
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Begin {
+                    uri: uri.clone(),
+                    total: 1,
+                    generation: 0,
+                },
+            )
+            .expect("create warm progress");
+        let Message::Request(create) = client.receiver.recv().expect("warm create") else {
+            panic!("warm progress must request a token");
+        };
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Progress {
+                    uri: uri.clone(),
+                    done: 1,
+                    total: 1,
+                    generation: 0,
+                },
+            )
+            .expect("record completed unit");
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::End {
+                    uri,
+                    fingerprint: None,
+                    pins: Vec::new(),
+                    generation: 0,
+                },
+            )
+            .expect("finish warm attempt");
+        assert!(client.receiver.try_recv().is_err());
+
+        assert!(
+            progress
+                .handle_response(
+                    &connection,
+                    &Response::new_ok(create.id, serde_json::Value::Null),
+                )
+                .expect("acknowledge warm token")
+        );
+        let mut notifications = Vec::new();
+        for _ in 0..3 {
+            let Message::Notification(notification) = client
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("begin, report, and end after create acknowledgement")
+            else {
+                panic!("warm progress output must be a notification");
+            };
+            notifications.push(notification.params);
+        }
+        assert_eq!(
+            notifications
+                .iter()
+                .map(|params| params["value"]["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["begin", "report", "end"]
+        );
+        assert_eq!(notifications[0]["value"]["title"], "Indexing Main");
+        assert_eq!(notifications[1]["value"]["message"], "1/1 units");
+        assert!(
+            notifications
+                .iter()
+                .all(|params| params["token"] == notifications[0]["token"])
+        );
+    }
+
+    #[test]
+    fn warm_progress_reset_ends_active_and_forgets_pending_creates() {
+        let (connection, client) = Connection::memory();
+        let active_uri = Url::parse("file:///workspace/Active.pas").expect("active URI");
+        let pending_uri = Url::parse("file:///workspace/Pending.pas").expect("pending URI");
+        let mut progress = crate::warmer::WarmProgress::new(true);
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Begin {
+                    uri: active_uri,
+                    total: 0,
+                    generation: 0,
+                },
+            )
+            .expect("create active token");
+        let Message::Request(active_create) = client.receiver.recv().expect("active create") else {
+            panic!("active progress must create a token");
+        };
+        progress
+            .handle_response(
+                &connection,
+                &Response::new_ok(active_create.id, serde_json::Value::Null),
+            )
+            .expect("acknowledge active token");
+        let Message::Notification(begin) = client.receiver.recv().expect("active begin") else {
+            panic!("active progress must begin");
+        };
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Begin {
+                    uri: pending_uri,
+                    total: 0,
+                    generation: 0,
+                },
+            )
+            .expect("create pending token");
+        let Message::Request(pending_create) = client.receiver.recv().expect("pending create")
+        else {
+            panic!("pending progress must create a token");
+        };
+
+        progress.end_all(&connection).expect("reset progress state");
+        let Message::Notification(end) = client.receiver.recv().expect("active end") else {
+            panic!("reset must end the active progress token");
+        };
+        assert_eq!(end.params["token"], begin.params["token"]);
+        assert_eq!(end.params["value"]["kind"], "end");
+        assert!(
+            progress
+                .handle_response(
+                    &connection,
+                    &Response::new_ok(pending_create.id, serde_json::Value::Null),
+                )
+                .expect("consume response for forgotten create")
+        );
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn warm_progress_reuses_one_token_across_paused_retries() {
+        let (connection, client) = Connection::memory();
+        let uri = Url::parse("file:///workspace/Retry.pas").expect("warm URI");
+        let mut progress = crate::warmer::WarmProgress::new(true);
+        let begin = crate::warmer::WarmEvent::Begin {
+            uri: uri.clone(),
+            total: 2,
+            generation: 0,
+        };
+        progress.handle(&connection, &begin).expect("create token");
+        let Message::Request(create) = client.receiver.recv().expect("create request") else {
+            panic!("expected work-done create request");
+        };
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Progress {
+                    uri: uri.clone(),
+                    done: 1,
+                    total: 2,
+                    generation: 0,
+                },
+            )
+            .expect("save first unit report until create ack");
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Paused {
+                    uri: uri.clone(),
+                    generation: 0,
+                },
+            )
+            .expect("pause first attempt");
+        progress
+            .handle(&connection, &begin)
+            .expect("retry while create is pending");
+        assert!(
+            client.receiver.try_recv().is_err(),
+            "retry must not create again"
+        );
+        progress
+            .handle_response(
+                &connection,
+                &Response::new_ok(create.id, serde_json::Value::Null),
+            )
+            .expect("acknowledge shared token");
+        let Message::Notification(initial_begin) = client.receiver.recv().expect("progress begin")
+        else {
+            panic!("expected one progress begin");
+        };
+        let Message::Notification(pending_retry_report) =
+            client.receiver.recv().expect("pending retry report")
+        else {
+            panic!("retry must report on the existing token");
+        };
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Paused {
+                    uri: uri.clone(),
+                    generation: 0,
+                },
+            )
+            .expect("pause second attempt");
+        progress
+            .handle(&connection, &begin)
+            .expect("retry active token");
+        let Message::Notification(active_retry_report) =
+            client.receiver.recv().expect("active retry report")
+        else {
+            panic!("active retry must report on the existing token");
+        };
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::End {
+                    uri,
+                    fingerprint: None,
+                    pins: Vec::new(),
+                    generation: 0,
+                },
+            )
+            .expect("finish retry");
+        let Message::Notification(end) = client.receiver.recv().expect("progress end") else {
+            panic!("expected progress end");
+        };
+
+        for notification in [
+            &initial_begin,
+            &pending_retry_report,
+            &active_retry_report,
+            &end,
+        ] {
+            assert_eq!(notification.method, "$/progress");
+            assert_eq!(notification.params["token"], initial_begin.params["token"]);
+        }
+        assert_eq!(initial_begin.params["value"]["kind"], "begin");
+        assert_eq!(pending_retry_report.params["value"]["kind"], "report");
+        assert_eq!(pending_retry_report.params["value"]["message"], "1/2 units");
+        assert_eq!(active_retry_report.params["value"]["kind"], "report");
+        assert_eq!(active_retry_report.params["value"]["message"], "1/2 units");
+        assert_eq!(end.params["value"]["kind"], "end");
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn warm_progress_close_ends_and_forgets_only_the_closed_file() {
+        let (connection, client) = Connection::memory();
+        let active_uri = Url::parse("file:///workspace/Active.pas").expect("active URI");
+        let pending_uri = Url::parse("file:///workspace/Pending.pas").expect("pending URI");
+        let mut progress = crate::warmer::WarmProgress::new(true);
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Begin {
+                    uri: active_uri.clone(),
+                    total: 0,
+                    generation: 0,
+                },
+            )
+            .expect("create active token");
+        let Message::Request(active_create) = client.receiver.recv().expect("active create") else {
+            panic!("active progress must create a token");
+        };
+        progress
+            .handle_response(
+                &connection,
+                &Response::new_ok(active_create.id, serde_json::Value::Null),
+            )
+            .expect("acknowledge active token");
+        let Message::Notification(begin) = client.receiver.recv().expect("active begin") else {
+            panic!("active progress must begin");
+        };
+        progress
+            .handle(
+                &connection,
+                &crate::warmer::WarmEvent::Begin {
+                    uri: pending_uri.clone(),
+                    total: 0,
+                    generation: 0,
+                },
+            )
+            .expect("create pending token");
+        let Message::Request(pending_create) = client.receiver.recv().expect("pending create")
+        else {
+            panic!("pending progress must create a token");
+        };
+
+        progress
+            .close(&connection, &active_uri)
+            .expect("close active file");
+        let Message::Notification(end) = client.receiver.recv().expect("active end") else {
+            panic!("closing an active file must end its token");
+        };
+        assert_eq!(end.params["token"], begin.params["token"]);
+        progress
+            .close(&connection, &pending_uri)
+            .expect("close pending file");
+        assert!(
+            progress
+                .handle_response(
+                    &connection,
+                    &Response::new_ok(pending_create.id, serde_json::Value::Null),
+                )
+                .expect("consume response for closed file")
+        );
+        assert!(client.receiver.try_recv().is_err());
     }
 }

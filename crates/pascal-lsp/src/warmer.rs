@@ -1,10 +1,11 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use lsp_types::Url;
+use lsp_server::{Message, Request, RequestId, Response};
+use lsp_types::{ProgressToken, Url};
 
 use crate::workspace::Workspace;
 use crate::workspace::rename::WorkspaceInput;
@@ -90,11 +91,13 @@ pub(crate) enum WarmEvent {
     Begin {
         uri: Url,
         total: usize,
+        generation: u64,
     },
     Progress {
         uri: Url,
         done: usize,
         total: usize,
+        generation: u64,
     },
     End {
         uri: Url,
@@ -106,6 +109,228 @@ pub(crate) enum WarmEvent {
         uri: Url,
         generation: u64,
     },
+}
+
+pub(crate) const WARM_CREATE_PREFIX: &str = "pascal-lsp-warm-create-";
+const WARM_TOKEN_PREFIX: &str = "pascal-lsp-warm-";
+
+struct PendingWarmCreate {
+    uri: Url,
+    token: ProgressToken,
+    title: String,
+    total: usize,
+    latest_message: Option<String>,
+    report_on_ack: bool,
+    completed: bool,
+}
+
+pub(crate) struct WarmProgress {
+    supported: bool,
+    next: u64,
+    active: HashMap<Url, ProgressToken>,
+    latest_messages: HashMap<Url, String>,
+    pending_creates: HashMap<RequestId, PendingWarmCreate>,
+}
+
+impl WarmProgress {
+    pub(crate) fn new(supported: bool) -> Self {
+        Self {
+            supported,
+            next: 0,
+            active: HashMap::new(),
+            latest_messages: HashMap::new(),
+            pending_creates: HashMap::new(),
+        }
+    }
+
+    fn title(uri: &Url) -> String {
+        let stem = uri
+            .to_file_path()
+            .ok()
+            .and_then(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| uri.to_string());
+        format!("Indexing {stem}")
+    }
+
+    pub(crate) fn handle(
+        &mut self,
+        connection: &dyn crate::server::ProtocolSender,
+        event: &WarmEvent,
+    ) -> Result<(), String> {
+        if !self.supported {
+            return Ok(());
+        }
+        match event {
+            WarmEvent::Begin { uri, total, .. } => {
+                if let Some(token) = self.active.get(uri) {
+                    let message = self
+                        .latest_messages
+                        .get(uri)
+                        .cloned()
+                        .unwrap_or_else(|| format!("0/{total} units"));
+                    self.latest_messages.insert(uri.clone(), message.clone());
+                    return crate::server::send_progress_report(connection, token, &message);
+                }
+                if let Some(pending) = self
+                    .pending_creates
+                    .values_mut()
+                    .find(|pending| pending.uri == *uri)
+                {
+                    // The create response gates progress notifications. Retain
+                    // the retry report here and emit it immediately after the
+                    // original begin once the client accepts the token.
+                    pending
+                        .latest_message
+                        .get_or_insert_with(|| format!("0/{total} units"));
+                    pending.report_on_ack = true;
+                    return Ok(());
+                }
+
+                self.next = self
+                    .next
+                    .checked_add(1)
+                    .ok_or_else(|| "warm progress token space exhausted".to_string())?;
+                let token = ProgressToken::String(format!("{WARM_TOKEN_PREFIX}{}", self.next));
+                let id = RequestId::from(format!("{WARM_CREATE_PREFIX}{}", self.next));
+                let pending = PendingWarmCreate {
+                    uri: uri.clone(),
+                    token: token.clone(),
+                    title: Self::title(uri),
+                    total: *total,
+                    latest_message: None,
+                    report_on_ack: false,
+                    completed: false,
+                };
+                self.pending_creates.insert(id.clone(), pending);
+                let request = Request::new(
+                    id.clone(),
+                    "window/workDoneProgress/create".to_string(),
+                    serde_json::json!({"token": token}),
+                );
+                if let Err(error) = connection.send_control(Message::Request(request)) {
+                    self.pending_creates.remove(&id);
+                    return Err(error.to_string());
+                }
+                Ok(())
+            }
+            WarmEvent::Progress {
+                uri, done, total, ..
+            } => {
+                let message = format!("{done}/{total} units");
+                if let Some(token) = self.active.get(uri) {
+                    self.latest_messages.insert(uri.clone(), message.clone());
+                    crate::server::send_progress_report(connection, token, &message)
+                } else if let Some(pending) = self
+                    .pending_creates
+                    .values_mut()
+                    .find(|pending| pending.uri == *uri)
+                {
+                    pending.latest_message = Some(message);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            WarmEvent::End { uri, .. } => {
+                if let Some(pending) = self
+                    .pending_creates
+                    .values_mut()
+                    .find(|pending| pending.uri == *uri)
+                {
+                    // The create request may still be awaiting its client
+                    // response. Preserve the terminal state so its eventual
+                    // acknowledgement can receive a balanced begin/end pair.
+                    pending.completed = true;
+                    return Ok(());
+                }
+                self.latest_messages.remove(uri);
+                match self.active.remove(uri) {
+                    Some(token) => crate::server::send_progress_end(connection, &token, None),
+                    None => Ok(()),
+                }
+            }
+            WarmEvent::Paused { .. } => Ok(()),
+        }
+    }
+
+    /// Returns `true` when `response` answered one of our create requests.
+    pub(crate) fn handle_response(
+        &mut self,
+        connection: &dyn crate::server::ProtocolSender,
+        response: &Response,
+    ) -> Result<bool, String> {
+        let Some(pending) = self.pending_creates.remove(&response.id) else {
+            return Ok(is_warm_create_id(&response.id));
+        };
+        if response.error.is_some() {
+            return Ok(true);
+        }
+
+        let initial_message = format!("0/{} units", pending.total);
+        crate::server::send_progress_begin(
+            connection,
+            &pending.token,
+            &pending.title,
+            &initial_message,
+        )?;
+        let latest_message = pending.latest_message.unwrap_or(initial_message);
+        if pending.report_on_ack || latest_message != format!("0/{} units", pending.total) {
+            crate::server::send_progress_report(connection, &pending.token, &latest_message)?;
+        }
+        if pending.completed {
+            crate::server::send_progress_end(connection, &pending.token, None)?;
+        } else {
+            self.active
+                .insert(pending.uri.clone(), pending.token.clone());
+            self.latest_messages.insert(pending.uri, latest_message);
+        }
+        Ok(true)
+    }
+
+    /// Ends every active warm progress token and forgets outstanding creates.
+    pub(crate) fn end_all(
+        &mut self,
+        connection: &dyn crate::server::ProtocolSender,
+    ) -> Result<(), String> {
+        let tokens = self
+            .active
+            .drain()
+            .map(|(_, token)| token)
+            .collect::<Vec<_>>();
+        self.pending_creates.clear();
+        self.latest_messages.clear();
+        let mut first_error = None;
+        for token in tokens {
+            if let Err(error) = crate::server::send_progress_end(connection, &token, None) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn close(
+        &mut self,
+        connection: &dyn crate::server::ProtocolSender,
+        uri: &Url,
+    ) -> Result<(), String> {
+        self.pending_creates
+            .retain(|_, pending| pending.uri != *uri);
+        self.latest_messages.remove(uri);
+        match self.active.remove(uri) {
+            Some(token) => crate::server::send_progress_end(connection, &token, None),
+            None => Ok(()),
+        }
+    }
+}
+
+fn is_warm_create_id(id: &RequestId) -> bool {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .is_some_and(|id| id.starts_with(WARM_CREATE_PREFIX))
 }
 
 struct WarmJob {
@@ -241,7 +466,9 @@ impl Warmer {
                 }
                 true
             }
-            WarmEvent::Begin { .. } | WarmEvent::Progress { .. } => true,
+            WarmEvent::Begin { generation, .. } | WarmEvent::Progress { generation, .. } => {
+                *generation == self.generation
+            }
         }
     }
 
@@ -302,6 +529,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     let mut workspace = Workspace::from_analysis_input(&job.input);
     let hook_events = events.clone();
     let hook_uri = job.uri.clone();
+    let hook_generation = job.generation;
     let hook_cancel = job.cancel.clone();
     let hook_gate = gate.clone();
     let paused = Arc::new(AtomicBool::new(false));
@@ -311,12 +539,14 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             let _ = hook_events.send(WarmEvent::Begin {
                 uri: hook_uri.clone(),
                 total,
+                generation: hook_generation,
             });
         } else {
             let _ = hook_events.send(WarmEvent::Progress {
                 uri: hook_uri.clone(),
                 done,
                 total,
+                generation: hook_generation,
             });
         }
         // Pause between units while interactive requests run.
@@ -699,5 +929,57 @@ mod tests {
         assert!(warmer.accept_event(&event, &workspace));
         assert!(!warmer.busy);
         assert_eq!(warmer.queue.pop(), Some(main));
+    }
+
+    #[test]
+    fn poll_drops_stale_generation_progress_events() {
+        let (_temp, workspace, main) = fixture();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.generation = 4;
+        let (sender, events) = crossbeam_channel::unbounded();
+        warmer.events = events;
+        for event in [
+            WarmEvent::Begin {
+                uri: main.clone(),
+                total: 1,
+                generation: 3,
+            },
+            WarmEvent::Progress {
+                uri: main.clone(),
+                done: 1,
+                total: 1,
+                generation: 3,
+            },
+            WarmEvent::Paused {
+                uri: main.clone(),
+                generation: 3,
+            },
+            WarmEvent::Begin {
+                uri: main.clone(),
+                total: 1,
+                generation: 4,
+            },
+            WarmEvent::Progress {
+                uri: main,
+                done: 1,
+                total: 1,
+                generation: 4,
+            },
+        ] {
+            sender.send(event).expect("queue warmer event");
+        }
+
+        let events = warmer.poll(&workspace);
+        assert_eq!(events.len(), 2, "only current-generation progress survives");
+        assert!(events.iter().all(|event| match event {
+            WarmEvent::Begin { generation, .. } | WarmEvent::Progress { generation, .. } => {
+                *generation == 4
+            }
+            _ => false,
+        }));
+        assert!(
+            warmer.queue.is_empty(),
+            "stale pause must not requeue the file"
+        );
     }
 }

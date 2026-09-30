@@ -10569,6 +10569,7 @@ fn event_loop(
                                 "workspace reconciliation worker panicked; retry after reconnect",
                             )?;
                         }
+                        warmer.shutdown();
                         jobs.shutdown_with_connection(connection)?;
                         return Ok(true);
                     }
@@ -10687,6 +10688,7 @@ fn event_loop(
                             "workspace reconciliation worker failed; retry after reconnect",
                         )?;
                     }
+                    warmer.shutdown();
                     jobs.shutdown_with_connection(connection)?;
                     return Ok(true);
                 }
@@ -10856,6 +10858,7 @@ fn event_loop(
                     Err(RecvTimeoutError::Disconnected) => {
                         let _ =
                             cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                        warmer.shutdown();
                         jobs.shutdown();
                         configuration.shutdown();
                         diagnostic_refresh.shutdown();
@@ -10893,6 +10896,7 @@ fn event_loop(
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                    warmer.shutdown();
                     jobs.shutdown();
                     configuration.shutdown();
                     diagnostic_refresh.shutdown();
@@ -10904,6 +10908,7 @@ fn event_loop(
         match message {
             Message::Request(request) if request.method == "shutdown" => {
                 let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                warmer.shutdown();
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
@@ -11065,6 +11070,7 @@ fn event_loop(
             }
             Message::Notification(notification) if notification.method == "exit" => {
                 let _ = cancel_and_join_workspace_file_worker(&mut file_notification_worker);
+                warmer.shutdown();
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
@@ -11506,7 +11512,7 @@ fn maintain_warmer(
     }
     for uri in rewarm.drain(..) {
         if workspace.is_open(&uri) {
-            warmer.open(uri);
+            warmer.rewarm(uri);
         }
     }
     for event in warmer.poll(workspace) {

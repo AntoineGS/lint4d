@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use lsp_types::Url;
@@ -117,12 +117,13 @@ struct WarmJob {
 
 pub(crate) struct Warmer {
     queue: WarmQueue,
-    jobs: Sender<WarmJob>,
+    open_order: VecDeque<Url>,
+    jobs: Option<Sender<WarmJob>>,
     events: Receiver<WarmEvent>,
     cancel: Arc<AtomicBool>,
     generation: u64,
     busy: bool,
-    _thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Warmer {
@@ -140,12 +141,13 @@ impl Warmer {
             .expect("spawn warmer thread");
         Self {
             queue: WarmQueue::default(),
-            jobs,
+            open_order: VecDeque::new(),
+            jobs: Some(jobs),
             events,
             cancel: Arc::new(AtomicBool::new(false)),
             generation: 0,
             busy: false,
-            _thread: thread,
+            thread: Some(thread),
         }
     }
 
@@ -155,11 +157,18 @@ impl Warmer {
     }
 
     pub(crate) fn open(&mut self, uri: Url) {
+        self.open_order.retain(|opened| opened != &uri);
+        self.open_order.push_front(uri.clone());
+        self.queue.push_front(uri);
+    }
+
+    pub(crate) fn rewarm(&mut self, uri: Url) {
         self.queue.push_front(uri);
     }
 
     pub(crate) fn close(&mut self, uri: &Url, cache: &crate::project_cache::ProjectCache) {
         self.queue.remove(uri);
+        self.open_order.retain(|opened| opened != uri);
         cache.unpin(uri);
     }
 
@@ -174,8 +183,10 @@ impl Warmer {
         self.cancel = Arc::new(AtomicBool::new(false));
         self.generation = self.generation.wrapping_add(1);
         self.queue.clear();
-        for uri in open {
-            self.queue.push_front(uri);
+        let open = open.into_iter().collect::<HashSet<_>>();
+        self.open_order.retain(|uri| open.contains(uri));
+        for uri in self.open_order.iter().rev() {
+            self.queue.push_front(uri.clone());
         }
     }
 
@@ -201,7 +212,11 @@ impl Warmer {
                     cancel: self.cancel.clone(),
                     generation: self.generation,
                 };
-                if self.jobs.send(job).is_ok() {
+                if self
+                    .jobs
+                    .as_ref()
+                    .is_some_and(|jobs| jobs.send(job).is_ok())
+                {
                     self.busy = true;
                 }
                 break;
@@ -228,6 +243,47 @@ impl Warmer {
             }
             WarmEvent::Begin { .. } | WarmEvent::Progress { .. } => true,
         }
+    }
+
+    /// Stops accepting work, cancels the active job, and joins within two seconds.
+    /// Returns `true` when the worker thread was joined successfully.
+    pub(crate) fn shutdown(&mut self) -> bool {
+        self.cancel.store(true, Ordering::Relaxed);
+        drop(self.jobs.take());
+        self.queue.clear();
+        self.busy = false;
+
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+        if thread.is_finished() {
+            if thread.join().is_ok() {
+                true
+            } else {
+                eprintln!("pascal-lsp: warning: warmer thread panicked during shutdown");
+                false
+            }
+        } else {
+            eprintln!(
+                "pascal-lsp: warning: warmer thread did not stop within 2 seconds; detaching it"
+            );
+            drop(thread);
+            false
+        }
+    }
+}
+
+impl Drop for Warmer {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -496,6 +552,66 @@ mod tests {
                 WarmEvent::End { generation, .. } if *generation == warmer.generation()
             )),
             "{second_events:?}"
+        );
+    }
+
+    #[test]
+    fn project_switch_recrawl_dispatches_most_recently_opened_file_first() {
+        let (temp, mut workspace, _main) = fixture();
+        let mut uris = Vec::new();
+        for name in ["A", "B", "C"] {
+            let source = format!("unit {name};\ninterface\nimplementation\nend.\n");
+            let path = temp.path().join(format!("{name}.pas"));
+            std::fs::write(&path, &source).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+            workspace
+                .open_document(uri.clone(), source, 1)
+                .expect("open recrawl fixture unit");
+            uris.push(uri);
+        }
+        let [a, b, c] = uris.as_slice() else {
+            unreachable!();
+        };
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(a.clone());
+        warmer.open(b.clone());
+        warmer.open(c.clone());
+        warmer.rewarm(a.clone());
+
+        // Workspace enumeration is unordered and may supply the reverse of
+        // the warmer's recency order.
+        warmer.reset([c.clone(), b.clone(), a.clone()], workspace.project_cache());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut dispatched = Vec::new();
+        while std::time::Instant::now() < deadline && dispatched.len() < 3 {
+            for event in warmer.poll(&workspace) {
+                if let WarmEvent::End { uri, .. } = event {
+                    dispatched.push(uri);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(dispatched, vec![c.clone(), b.clone(), a.clone()]);
+    }
+
+    #[test]
+    fn shutdown_cancels_and_joins_worker_waiting_for_interactive_gate() {
+        let (_temp, workspace, main) = fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate);
+        warmer.open(main);
+        warmer.poll(&workspace);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let joined = warmer.shutdown();
+
+        assert!(joined, "the canceled worker should finish and be joined");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "warmer teardown must respect its bounded join deadline"
         );
     }
 

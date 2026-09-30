@@ -1,4 +1,3 @@
-use super::KnownDocumentOwner;
 use super::rename::{
     BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
     SourceRecord, WorkspaceInput, auto_import_source_is_relevant, build_snapshot,
@@ -7,6 +6,7 @@ use super::rename::{
     query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
+use super::{KnownDocumentOwner, conditional_context_for_uri};
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
     SemanticTokenResolutionMode, completion_prefix_at_position,
@@ -486,7 +486,7 @@ pub(crate) fn folding_ranges_from_input(
     if let Err(error) = index.update_with_context_with_cancel(
         uri.clone(),
         source,
-        &context.effective_conditional_context(),
+        &conditional_context_for_uri(&context, &uri),
         cancel,
     ) {
         return failed(
@@ -1363,7 +1363,7 @@ fn syntax_index_for_document(
         .get(uri)
         .filter(|cached| cached.context == document.context)
         .map(|cached| cached.parsed.clone());
-    let conditional_context = document.context.effective_conditional_context();
+    let conditional_context = conditional_context_for_uri(&document.context, uri);
     let mut index = NavigationIndex::new();
     index
         .update_with_context_and_cached_with_cancel(
@@ -1574,7 +1574,7 @@ pub(crate) fn document_links_from_input(
     };
     let conditionals = pascal_core::conditional::analyze_with_context_and_cancel(
         &source,
-        &context.effective_conditional_context(),
+        &conditional_context_for_uri(&context, &uri),
         cancel,
     );
     if is_cancelled(cancel) {

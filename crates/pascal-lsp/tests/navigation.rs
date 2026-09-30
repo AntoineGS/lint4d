@@ -4,6 +4,7 @@ use lsp_types::{
 };
 use pascal_lsp::workspace::{ResourceLimits, Workspace, WorkspaceOptions};
 use pascal_lsp::{NavigationIndex, NavigationTarget, text};
+use pascal_project::CompilerVersion;
 use pascal_project::delphi_overrides::OverrideSession;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -14402,6 +14403,90 @@ fn project_navigation_resolves_independent_unit_when_reference_is_missing() {
             .is_empty(),
         "the explicit missing unit must not bind to later/Missing.pas"
     );
+}
+
+#[test]
+fn build_config_project_navigation_uses_the_selected_conditional_context() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("create workspace");
+
+    let app = "program App; uses SvcMain in 'SvcMain.pas', Helper in 'Helper.pas'; begin end.\n";
+    let helper =
+        "unit Helper; interface procedure Help; implementation procedure Help; begin end; end.\n";
+    let service = "unit SvcMain;\ninterface\nuses Helper;\nprocedure Run;\nimplementation\nprocedure Run;\nbegin\n  {$IFDEF DEBUG}\n  Help;\n  {$ENDIF}\n  Help;\nend;\nend.\n";
+    fs::write(root.join("App.dpr"), app).expect("write project main source");
+    fs::write(root.join("Helper.pas"), helper).expect("write helper unit");
+    fs::write(root.join("SvcMain.pas"), service).expect("write service unit");
+    fs::write(
+        root.join("App.dproj"),
+        r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectVersion>12.0</ProjectVersion>
+    <MainSource>App.dpr</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''"><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''"><Cfg_1>true</Cfg_1><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Debug' or '$(Cfg_2)'!=''"><Cfg_2>true</Cfg_2><CfgParent>Base</CfgParent><Base>true</Base></PropertyGroup>
+  <PropertyGroup Condition="'$(Base)'!=''"><DCC_Define>NOSF;$(DCC_Define)</DCC_Define><DCC_Platform>x86</DCC_Platform></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_1)'!=''"><DCC_Define>RELEASE;$(DCC_Define)</DCC_Define></PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_2)'!=''"><DCC_Define>DEBUG;$(DCC_Define)</DCC_Define></PropertyGroup>
+  <ItemGroup>
+    <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+    <DCCReference Include="SvcMain.pas" />
+    <DCCReference Include="Helper.pas" />
+    <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+    <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+    <BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+  </ItemGroup>
+</Project>"#,
+    )
+    .expect("write project file");
+
+    let service_path = root.join("SvcMain.pas");
+    let helper_uri = Url::from_file_path(root.join("Helper.pas")).expect("helper URI");
+    let service_uri = Url::from_file_path(&service_path).expect("service URI");
+    let workspace_with_config = |build_config: Option<&str>| {
+        let mut options = WorkspaceOptions {
+            project_file: Some(root.join("App.dproj")),
+            build_config: build_config.map(str::to_owned),
+            ..WorkspaceOptions::default()
+        };
+        options.conditional_context.compiler_version = Some(CompilerVersion::new(21, 0));
+        test_workspace(vec![root.clone()], options)
+    };
+
+    let mut release = workspace_with_config(None);
+    let outside_release = release.navigate(
+        &service_uri,
+        position_of(service, "Help;", 1),
+        NavigationTarget::Definition,
+    );
+    assert_eq!(outside_release.len(), 1);
+    assert_eq!(outside_release[0].uri, helper_uri);
+    assert!(
+        release
+            .navigate(
+                &service_uri,
+                position_of(service, "Help;", 0),
+                NavigationTarget::Definition,
+            )
+            .is_empty(),
+        "DEBUG-only code must not be navigable in the default Release configuration"
+    );
+
+    let mut debug = workspace_with_config(Some("Debug"));
+    for occurrence in 0..2 {
+        let locations = debug.navigate(
+            &service_uri,
+            position_of(service, "Help;", occurrence),
+            NavigationTarget::Definition,
+        );
+        assert_eq!(locations.len(), 1, "Help occurrence {occurrence}");
+        assert_eq!(locations[0].uri, helper_uri);
+    }
 }
 
 #[test]

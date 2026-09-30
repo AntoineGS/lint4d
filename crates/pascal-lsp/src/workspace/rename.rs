@@ -9,9 +9,10 @@
 use super::resolver as shared_resolver;
 use super::{
     ContextKey, ContextState, DiskStamp, KnownDocumentOwner, OpenDocument, PathStamp, Workspace,
-    WorkspaceOptions, absolute_path, canonical_file_uri, disk_stamp, is_analyzable_source_path,
-    is_configuration_file, is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci,
-    path_starts_with_native, paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
+    WorkspaceOptions, absolute_path, canonical_file_uri, conditional_context_for_path,
+    conditional_context_for_uri, disk_stamp, is_analyzable_source_path, is_configuration_file,
+    is_pascal_path, path_stamp, path_stamp_result, path_starts_with_ci, path_starts_with_native,
+    paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
 use crate::include_expansion::{
@@ -2533,7 +2534,7 @@ fn binding_classification_for_input(
         if !context.discovery_complete && !matches!(self_contained_mode, SelfContainedMode::None) {
             ConditionalContext::default()
         } else {
-            context.effective_conditional_context()
+            conditional_context_for_uri(&context, uri)
         };
     let expanded_info = expanded_binding_info_for_input(
         input,
@@ -6044,7 +6045,7 @@ pub(crate) fn build_snapshot(
             let expansion_context = loader
                 .contexts
                 .get(&source_context_key)
-                .map(|state| state.context.effective_conditional_context())
+                .map(|state| conditional_context_for_path(&state.context, &path))
                 .unwrap_or_default();
             match loader.expand_source_with_cancel(&uri, &source, &source_context_key, Some(cancel))
             {
@@ -6269,7 +6270,7 @@ pub(crate) fn build_snapshot(
                 {
                     ConditionalContext::default()
                 } else {
-                    state.context.effective_conditional_context()
+                    conditional_context_for_path(&state.context, &path)
                 }
             })
             .unwrap_or_default();
@@ -7923,7 +7924,7 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
                 {
                     ConditionalContext::default()
                 } else {
-                    context.effective_conditional_context()
+                    conditional_context_for_uri(context, &uri)
                 }
             })
             .unwrap_or_else(ConditionalContext::default);
@@ -9365,7 +9366,7 @@ pub(super) fn expand_source_with_workspace(
         budget,
         legacy_authorizations: HashMap::new(),
     };
-    let conditional_context = context.effective_conditional_context();
+    let conditional_context = conditional_context_for_uri(&context, root_uri);
     include_expansion::expand_source_with_context(
         root_uri.clone(),
         source,
@@ -10521,6 +10522,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let b_owner = ContextKey {
@@ -10549,6 +10551,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let old = ContextState {
@@ -10701,6 +10704,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
@@ -11031,6 +11035,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let state = ContextState {
@@ -11105,6 +11110,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         for index in (0..SOURCES).rev() {
@@ -11198,6 +11204,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let membership = ProjectCandidateMembership {

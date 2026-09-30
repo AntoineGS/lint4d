@@ -77,6 +77,30 @@ pub(crate) mod rename;
 pub(crate) mod resolver;
 pub(crate) mod signature;
 
+pub(super) fn conditional_context_for_path(
+    context: &ProjectContext,
+    path: &Path,
+) -> ConditionalContext {
+    if extension_is(path, "inc") {
+        // A standalone include path has no owning source here. Actual include
+        // expansion uses its root source's context instead of classifying the
+        // physical include file independently.
+        context.effective_conditional_context()
+    } else {
+        context.conditional_context_for(path)
+    }
+}
+
+pub(super) fn conditional_context_for_uri(
+    context: &ProjectContext,
+    uri: &Url,
+) -> ConditionalContext {
+    uri.to_file_path().map_or_else(
+        |_| context.effective_conditional_context(),
+        |path| conditional_context_for_path(context, &path),
+    )
+}
+
 /// Maximum syntax-tree depth used before invoking the recursive lint/format pipelines.
 pub const MAX_TREE_DEPTH: usize = 256;
 const MAX_RANGE_MAPPING_NODES: usize = 100_000;
@@ -2085,6 +2109,7 @@ pub(crate) struct ContextKey {
     config: Option<String>,
     platform: Option<String>,
     conditional_context: ConditionalContext,
+    context_fingerprint: Option<u64>,
     overrides: EffectiveOverrides,
 }
 
@@ -6873,7 +6898,7 @@ impl Workspace {
         // rejects source shadows and ambiguous DCUs.
         let activity = pascal_core::conditional::analyze_with_context(
             &indexed_text,
-            &context.effective_conditional_context(),
+            &context.conditional_context_for(&path),
         );
         let active_unavailable = resolved
             .bindings
@@ -7330,7 +7355,7 @@ impl Workspace {
             .map(|state| state.context.clone());
         let conditional_context = context
             .as_ref()
-            .map(|context| context.effective_conditional_context())
+            .map(|context| conditional_context_for_uri(context, uri))
             .unwrap_or_default();
         let source_hash =
             raw_content_hash.unwrap_or_else(|| crate::project_cache::overlay_content_hash(&source));
@@ -9290,8 +9315,10 @@ impl Workspace {
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
             conditional_context: context
-                .map(ProjectContext::effective_conditional_context)
+                .map(|context| conditional_context_for_path(context, path))
                 .unwrap_or_default(),
+            context_fingerprint: context
+                .map(crate::navigation::compiled_dcu::project_context_fingerprint),
             overrides: context
                 .map(|context| context.overrides.clone())
                 .unwrap_or_default(),
@@ -9327,8 +9354,10 @@ impl Workspace {
             config: context.and_then(|context| context.config.clone()),
             platform: context.and_then(|context| context.platform.clone()),
             conditional_context: context
-                .map(ProjectContext::effective_conditional_context)
+                .map(|context| conditional_context_for_path(context, path))
                 .unwrap_or_default(),
+            context_fingerprint: context
+                .map(crate::navigation::compiled_dcu::project_context_fingerprint),
             overrides: context
                 .map(|context| context.overrides.clone())
                 .unwrap_or_default(),
@@ -11041,7 +11070,7 @@ impl Workspace {
             read_policy: context.read_policy.clone(),
             config: context.config.clone(),
             platform: context.platform.clone(),
-            conditional_context: context.effective_conditional_context(),
+            conditional_context: conditional_context_for_path(context, path),
         };
         let stamp = path_stamp(path);
         if let Some(cached) = self.package_metadata_cache.get(&key) {
@@ -12869,7 +12898,7 @@ impl Workspace {
         check_workspace_cancel(Some(cancel))?;
         let mut expansion =
             self.expand_source_with_cancel(uri, &source, &context_key, Some(cancel))?;
-        let conditional_context = context.effective_conditional_context();
+        let conditional_context = conditional_context_for_path(&context, &path);
         let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
             expansion.expanded.text(),
             &conditional_context,
@@ -13145,7 +13174,7 @@ impl Workspace {
             }
         };
         let mut source_index = NavigationIndex::new();
-        let conditional_context = context.effective_conditional_context();
+        let conditional_context = conditional_context_for_path(context, path);
         match source_index.update_with_context_with_cancel(
             uri.clone(),
             source_text.to_owned(),
@@ -13328,7 +13357,7 @@ impl Workspace {
             };
             let mut expansion =
                 self.expand_source_with_cancel(&root_uri, &source, &context_key, Some(cancel))?;
-            let conditional_context = context.effective_conditional_context();
+            let conditional_context = conditional_context_for_uri(&context, &root_uri);
             let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
                 expansion.expanded.text(),
                 &conditional_context,
@@ -13382,7 +13411,7 @@ impl Workspace {
             }
             let mut expansion =
                 self.expand_source_with_cancel(&root_uri, &source, &context_key, Some(cancel))?;
-            let conditional_context = context.effective_conditional_context();
+            let conditional_context = conditional_context_for_uri(&context, &root_uri);
             let conditional = pascal_core::conditional::analyze_with_context_and_cancel(
                 expansion.expanded.text(),
                 &conditional_context,
@@ -14922,6 +14951,7 @@ mod tests {
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         }
     }
@@ -17117,6 +17147,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace = test_workspace(vec![fixture_root.clone()], WorkspaceOptions::default());
@@ -17257,6 +17288,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace =
@@ -17373,6 +17405,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace =
@@ -17453,6 +17486,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace =
@@ -17508,6 +17542,7 @@ BDS = '/fake/37'
                 config: None,
                 platform: None,
                 conditional_context: ConditionalContext::default(),
+                context_fingerprint: None,
                 overrides: EffectiveOverrides::default(),
             };
             let mut workspace =
@@ -17671,6 +17706,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace =
@@ -17736,6 +17772,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: ConditionalContext::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
@@ -17796,6 +17833,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         workspace
@@ -17889,6 +17927,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let watched_paths = (0..WATCHED)
@@ -17959,6 +17998,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
@@ -18010,6 +18050,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut workspace = test_workspace(vec![root], WorkspaceOptions::default());
@@ -18074,6 +18115,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let metadata_files = (0..EXISTING)
@@ -18136,6 +18178,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let workspace = test_workspace(vec![root], WorkspaceOptions::default());
@@ -18184,6 +18227,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let owner = KnownDocumentOwner {
@@ -20337,6 +20381,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let mut owner = super::KnownDocumentOwner {
@@ -20372,6 +20417,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let owner = super::KnownDocumentOwner {
@@ -21048,6 +21094,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides::default(),
         };
         let context = ProjectContext {
@@ -21111,6 +21158,7 @@ BDS = '/fake/37'
             config: None,
             platform: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides {
                 path_mappings: vec![PathMapping {
                     from: "c:/sdk".to_owned(),

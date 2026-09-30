@@ -628,7 +628,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut dependencies = Vec::new();
         let mut dependency_ids = HashSet::new();
         let mut complete = true;
-        let conditional_context = self.context.effective_conditional_context();
+        let conditional_context = self.context.conditional_context_for(&importer.source.path);
         let analysis =
             crate::conditional::analyze_with_context_and_cancel(text, &conditional_context, cancel);
         self.check_cancel(cancel)?;
@@ -934,7 +934,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
             }
             let include_route = self.legacy_routes.get(&importer.source.id).cloned();
-            let conditional_context = self.context.effective_conditional_context();
+            // Includes inherit the importing source's context; the include
+            // path itself is not independently classified.
+            let conditional_context = self.context.conditional_context_for(&importer.source.path);
             let mut conditional_environment =
                 match crate::conditional::ConditionalEnvironment::try_from_context(
                     &conditional_context,

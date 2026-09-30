@@ -1093,13 +1093,16 @@ fn honors_explicit_debug_config_and_reads_local_optset_imports() {
 
     assert_eq!(context.config.as_deref(), Some("Debug"));
     assert_eq!(context.platform.as_deref(), Some("Win32"));
-    assert_eq!(context.defines, ["DEBUG"]);
+    assert_eq!(context.defines, ["DEBUG", "CPU386", "WIN32"]);
     assert!(context.search_paths.contains(&debug_units));
-    assert!(
-        context.warnings.is_empty(),
+    assert_eq!(
+        context.warnings.len(),
+        2,
         "unexpected warnings: {:?}",
         context.warnings
     );
+    assert!(context.warnings[0].contains("build configuration `Debug` is not defined"));
+    assert!(context.warnings[1].contains("platform `Win32` is not defined"));
 }
 
 #[test]
@@ -1767,7 +1770,7 @@ fn legacy_project_keeps_release_metadata_and_reference_paths() {
         context.main_source,
         Some(root.join("Projects/Tools/WebQueryExporter/WebQuery.dpr"))
     );
-    assert_eq!(context.defines, ["RELEASE", "NOSF"]);
+    assert_eq!(context.defines, ["RELEASE", "NOSF", "CPU386", "WIN32"]);
     assert_eq!(context.platform.as_deref(), Some("x86"));
     assert_eq!(
         context.explicit_units.get("hartlib"),
@@ -1831,7 +1834,7 @@ fn ordinary_undefined_configuration_properties_are_empty() {
         },
     );
 
-    assert_eq!(context.defines, ["DEBUG"]);
+    assert_eq!(context.defines, ["DEBUG", "CPU386", "WIN32"]);
     assert!(
         context.discovery_complete,
         "unexpected incomplete context: {context:?}"
@@ -2444,7 +2447,7 @@ fn unknown_import_taints_later_property_conditions_until_reassignment() {
         },
     );
 
-    assert_eq!(context.defines, ["KNOWN"]);
+    assert_eq!(context.defines, ["KNOWN", "CPU386", "WIN32"]);
     assert_eq!(context.config.as_deref(), Some("Debug"));
     assert_eq!(context.platform.as_deref(), Some("Win32"));
     assert!(!context.discovery_complete);

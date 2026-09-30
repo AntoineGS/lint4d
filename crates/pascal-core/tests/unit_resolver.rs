@@ -5,8 +5,9 @@ use pascal_core::resolver::{
     UnitResolver,
 };
 use pascal_project::{
-    ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind,
-    ProjectPathProvenance, ReadPolicy, content_hash_bytes, delphi_overrides::OverrideSession,
+    CompilerVersion, ConditionalContext, ConditionalFact, ProjectContext, ProjectOptions,
+    ProjectPathEntry, ProjectPathIssue, ProjectPathIssueKind, ProjectPathProvenance, ReadPolicy,
+    SourceOrigin, content_hash_bytes, delphi_overrides::OverrideSession,
 };
 
 #[test]
@@ -2309,6 +2310,84 @@ fn incomplete_outcome_taints_the_final_report() {
     );
     assert!(matches!(outcome.result, Resolution::Incomplete { .. }));
     assert!(!resolver.finish().complete);
+}
+
+#[test]
+fn library_source_keeps_unknown_project_define_activity_incomplete() {
+    let project_root = PathBuf::from("/workspace");
+    let library_root = PathBuf::from("/sdk/lib");
+    let mut context = ProjectContext {
+        discovery_complete: true,
+        project_file: Some(project_root.join("App.dproj")),
+        main_source: Some(project_root.join("Main.pas")),
+        project_source_roots: vec![project_root.clone()],
+        search_paths: vec![project_root.clone(), library_root.clone()],
+        search_path_entries: vec![
+            ProjectPathEntry::legacy(project_root.clone()),
+            ProjectPathEntry::legacy(library_root.clone()),
+        ],
+        defines: vec!["DEBUG".to_string()],
+        read_policy: ReadPolicy::default(),
+        ..ProjectContext::default()
+    };
+    context.conditional_closure.closed = true;
+    context.conditional_context.compiler_version = Some(CompilerVersion::new(21, 0));
+    context
+        .conditional_context
+        .set_define("DEBUG", ConditionalFact::True);
+    context.conditional_context = context
+        .conditional_context
+        .with_absent_define(ConditionalFact::False);
+    context.library_conditional_context = ConditionalContext {
+        compiler_version: Some(CompilerVersion::new(21, 0)),
+        ..ConditionalContext::default()
+    };
+    assert_eq!(
+        context.source_origin(&library_root.join("External.pas")),
+        SourceOrigin::Library
+    );
+
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/Main.pas",
+        "unit Main; interface uses External; implementation end.",
+    );
+    store.add(
+        "/sdk/lib/External.pas",
+        "unit External; interface {$IFDEF DEBUG} procedure Hidden; {$ENDIF} implementation end.",
+    );
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![project_root.clone()],
+        store,
+        ResolverLimits::default(),
+    );
+
+    let result = resolver
+        .resolve_project(
+            UnitResolveRequest {
+                requested_name: "Main",
+                importer_path: &project_root.join("Main.pas"),
+                legacy_route: None,
+            },
+            &[],
+            &NoCancellation,
+        )
+        .expect("resolve project graph");
+
+    assert!(
+        !result.report.complete,
+        "library code must not inherit the project's DEBUG define"
+    );
+    assert!(
+        result
+            .report
+            .incomplete_reasons
+            .iter()
+            .any(|reason| reason.contains("unknown conditional activity")),
+        "expected unknown conditional activity to make library resolution incomplete: {:?}",
+        result.report.incomplete_reasons
+    );
 }
 
 fn fixture_context() -> ProjectContext {

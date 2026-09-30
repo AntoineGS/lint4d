@@ -1751,6 +1751,17 @@ impl TestServer {
 
 #[cfg(feature = "test-support")]
 impl TestBarrier {
+    // Queue-admission tests must occupy the interactive-only slot as well as
+    // the two general workers before asserting that later work stays queued.
+    fn occupy_interactive_slot(&self, server: &mut TestServer, path: &Path) {
+        server.send_request(
+            RequestId::from("additional-interactive-slot-blocker".to_string()),
+            "textDocument/declaration",
+            json!({"textDocument": {"uri": uri(path)}, "position": {"line": 0, "character": 0}}),
+        );
+        self.wait_for_entries(3);
+    }
+
     fn wait_until_entered(&self) {
         self.wait_for_entries(1);
     }
@@ -3009,7 +3020,7 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_and_project() {
     fs::remove_file(&barrier.release).expect("re-arm navigation barrier");
     fs::remove_file(&barrier.entered).expect("reset navigation entry count");
 
-    for number in 0..2 {
+    for number in 0..3 {
         let other = root.join(format!("Blocker{number}.pas"));
         write_file(
             &other,
@@ -3023,7 +3034,7 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_and_project() {
             json!({"textDocument": {"uri": uri(&other)}, "position": {"line": 2, "character": 7}}),
         );
     }
-    barrier.wait_for_entries(2);
+    barrier.wait_for_entries(3);
     let queued_content = RequestId::from("queued-compiled-content".to_string());
     let queued_symbols = RequestId::from("queued-compiled-symbols".to_string());
     server.send_request(
@@ -3044,7 +3055,7 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_and_project() {
         }),
     );
     // This inline response fences the preceding notification in the protocol
-    // stream while both analysis workers remain blocked.
+    // stream while all analysis workers remain blocked.
     let fence_id = RequestId::from("compiled-queue-overlay-fence".to_string());
     server.send_request(
         fence_id.clone(),
@@ -3081,7 +3092,7 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_and_project() {
     );
     fs::remove_file(&barrier.release).expect("re-arm project-change barrier");
     fs::remove_file(&barrier.entered).expect("reset project-change barrier count");
-    for number in 2..4 {
+    for number in 3..6 {
         let other = root.join(format!("Blocker{number}.pas"));
         write_file(
             &other,
@@ -3095,7 +3106,7 @@ fn queued_compiled_content_and_symbols_reject_changed_importer_and_project() {
             json!({"textDocument": {"uri": uri(&other)}, "position": {"line": 2, "character": 7}}),
         );
     }
-    barrier.wait_for_entries(2);
+    barrier.wait_for_entries(3);
     let queued_project_content = RequestId::from("queued-project-compiled-content".to_string());
     let queued_project_symbols = RequestId::from("queued-project-compiled-symbols".to_string());
     server.send_request(
@@ -9973,7 +9984,7 @@ fn rejected_open_fence_fails_queued_client_jobs_without_dispatch() {
         "unit DiskProvider;\ninterface\nconst\n  diskOnly = 1;\nimplementation\nend.\n",
     );
     let mut consumers = Vec::new();
-    for name in ["First", "Second", "Queued"] {
+    for name in ["First", "Second", "Third", "Queued"] {
         let path = root.join(format!("{name}.pas"));
         let text = format!("unit {name};\ninterface\nuses DiskProvider;\nimplementation\nend.\n");
         write_file(&path, &text);
@@ -9997,7 +10008,7 @@ fn rejected_open_fence_fails_queued_client_jobs_without_dispatch() {
     let (mut server, barrier) = TestServer::launch_with_navigation_barrier(temp);
     server.initialize(&root, Value::Null);
     let mut running_ids = Vec::new();
-    for (index, (path, text)) in consumers.iter().take(2).enumerate() {
+    for (index, (path, text)) in consumers.iter().take(3).enumerate() {
         let id = RequestId::from(format!("running-definition-{index}"));
         server.send_request(
             id.clone(),
@@ -10009,9 +10020,9 @@ fn rejected_open_fence_fails_queued_client_jobs_without_dispatch() {
         );
         running_ids.push(id);
     }
-    barrier.wait_for_entries(2);
+    barrier.wait_for_entries(3);
     let queued_id = RequestId::from("queued-definition-before-rejected-open".to_string());
-    let (queued_path, queued_text) = &consumers[2];
+    let (queued_path, queued_text) = &consumers[3];
     server.send_request(
         queued_id.clone(),
         "textDocument/definition",
@@ -11802,8 +11813,8 @@ fn cancelled_partial_validators_are_bounded_until_they_retire() {
     let error = rejected.expect("retiring validator admission must eventually be bounded");
     assert_eq!(error.code, -32803);
     assert_eq!(
-        admitted, 33,
-        "retiring validators must consume the existing 33-recipient admission budget"
+        admitted, 34,
+        "retiring validators must consume the 34-recipient admission budget"
     );
     barrier.release();
     server.shutdown();
@@ -12928,6 +12939,7 @@ fn run_queued_progress_cancellation(cancel_with_work_done_token: bool) {
     second_params["workDoneToken"] = json!("queued-cancel-blocker-second-progress");
     server.send_request(second_id.clone(), "textDocument/declaration", second_params);
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let blocker_tokens = [
         "queued-cancel-blocker-first-progress",
@@ -12998,8 +13010,8 @@ fn run_queued_progress_cancellation(cancel_with_work_done_token: bool) {
         fs::read(&barrier.entered)
             .expect("queued cancellation barrier entries")
             .len(),
-        2,
-        "cancelled queued work must not dispatch a third worker"
+        3,
+        "cancelled queued work must not dispatch a fourth worker"
     );
     server.shutdown();
 }
@@ -47168,7 +47180,7 @@ fn code_lens_queued_resolution_cancellation_returns_no_locations() {
         .as_array()
         .expect("lens array")[0]
         .clone();
-    for number in 0..2 {
+    for number in 0..3 {
         let blocker = root.join(format!("Blocker{number}.pas"));
         write_file(
             &blocker,
@@ -47180,7 +47192,7 @@ fn code_lens_queued_resolution_cancellation_returns_no_locations() {
             json!({"textDocument": {"uri": uri(&blocker)}, "position": {"line": 0, "character": 5}}),
         );
     }
-    barrier.wait_for_entries(2);
+    barrier.wait_for_entries(3);
     let resolve_id = RequestId::from("code-lens-cancel-resolve".to_string());
     server.send_request(resolve_id.clone(), "codeLens/resolve", lens);
     server.send_notification("$/cancelRequest", json!({"id": resolve_id}));
@@ -47366,7 +47378,7 @@ fn change_signature_queued_source_edit_rejects_old_call_set() {
         "textDocument/didOpen",
         json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
     );
-    for number in 0..2 {
+    for number in 0..3 {
         let blocker = root.join(format!("Blocker{number}.pas"));
         write_file(
             &blocker,
@@ -47378,7 +47390,7 @@ fn change_signature_queued_source_edit_rejects_old_call_set() {
             json!({"textDocument": {"uri": uri(&blocker)}, "position": {"line": 0, "character": 5}}),
         );
     }
-    barrier.wait_for_entries(2);
+    barrier.wait_for_entries(3);
     let id = RequestId::from("queued-change-signature".to_string());
     server.send_request(
         id.clone(),
@@ -47626,7 +47638,7 @@ fn extract_queued_source_change_cannot_publish_old_edit() {
         "textDocument/didOpen",
         json!({"textDocument": {"uri": uri(&main), "languageId": "pascal", "version": 1, "text": source}}),
     );
-    for number in 0..2 {
+    for number in 0..3 {
         let blocker = root.join(format!("Blocker{number}.pas"));
         write_file(
             &blocker,
@@ -47638,7 +47650,7 @@ fn extract_queued_source_change_cannot_publish_old_edit() {
             json!({"textDocument": {"uri": uri(&blocker)}, "position": {"line": 0, "character": 5}}),
         );
     }
-    barrier.wait_for_entries(2);
+    barrier.wait_for_entries(3);
     let extraction_id = RequestId::from("queued-extract-variable".to_string());
     server.send_request(
         extraction_id.clone(),
@@ -56584,6 +56596,7 @@ fn full_analysis_queue_returns_explicit_overflow_without_starting_an_extra_worke
         navigation_params(&main, main_source, "Run", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let queued_ids = (0..31)
         .map(|index| RequestId::from(format!("full-queue-{index}")))
@@ -56650,6 +56663,7 @@ fn diagnostics_use_reserved_capacity_when_the_client_queue_is_full() {
         );
     }
     navigation.wait_for_entries(2);
+    navigation.occupy_interactive_slot(&mut server, &main);
 
     let queued_ids = (0..31)
         .map(|index| RequestId::from(format!("diagnostic-capacity-client-{index}")))
@@ -56675,14 +56689,14 @@ fn diagnostics_use_reserved_capacity_when_the_client_queue_is_full() {
     thread::sleep(Duration::from_millis(350));
 
     navigation.release();
-    let dispatches = dispatch.wait_for_entries(3);
+    let dispatches = dispatch.wait_for_entries(4);
     assert_eq!(
-        &dispatches[..2],
-        b"II",
-        "the two blocking requests must dispatch first"
+        &dispatches[..3],
+        b"III",
+        "the three blocking requests must dispatch first"
     );
     assert_eq!(
-        dispatches[2], b'D',
+        dispatches[3], b'D',
         "diagnostics must occupy the reserved queue slot before client work"
     );
     diagnostics.wait_until_entered();
@@ -56762,6 +56776,14 @@ fn reusing_a_cancelled_request_id_keeps_attached_work_and_response_ids_exact() {
         }),
     );
     formatting.wait_until_entered();
+    // One navigation worker is already blocked, so this fills the remaining
+    // slot alongside the formatting worker.
+    server.send_request(
+        RequestId::from("id-reuse-extra-blocker".to_string()),
+        "textDocument/declaration",
+        navigation_params(&main, main_source, "Run", 0),
+    );
+    navigation.wait_for_entries(2);
 
     let queued_id = RequestId::from("request-after-id-reuse".to_string());
     server.send_request(
@@ -56773,11 +56795,11 @@ fn reusing_a_cancelled_request_id_keeps_attached_work_and_response_ids_exact() {
         server
             .response_with_timeout(&queued_id, Duration::from_millis(100))
             .is_none(),
-        "a third computation must remain queued while two workers are active"
+        "a fourth computation must remain queued while three workers are active"
     );
     assert_eq!(
         fs::read(&dispatch.path).expect("dispatch log before release"),
-        b"IB",
+        b"IBI",
         "request ID reuse must not dispatch an extra worker"
     );
 
@@ -56838,6 +56860,7 @@ fn running_shared_client_recipients_are_bounded_and_cancellation_frees_capacity(
         navigation_params(&main, main_source, "Run", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let attachments = (0..31)
         .map(|index| RequestId::from(format!("running-recipient-attachment-{index}")))
@@ -56941,6 +56964,7 @@ fn queued_shared_client_recipients_are_bounded_and_cancellation_frees_capacity()
         navigation_params(&main, main_source, "PublicRoutine", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let primary_id = RequestId::from("queued-recipient-primary".to_string());
     let target = navigation_params(&main, main_source, "Run", 0);
@@ -57048,6 +57072,7 @@ fn full_client_queue_rejects_coalesced_recipients_without_unbounded_shutdown_res
         navigation_params(&main, main_source, "PublicRoutine", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let primary_id = RequestId::from("full-recipient-primary".to_string());
     let target = navigation_params(&main, main_source, "Run", 0);
@@ -57115,6 +57140,138 @@ fn full_client_queue_rejects_coalesced_recipients_without_unbounded_shutdown_res
 
 #[cfg(feature = "test-support")]
 #[test]
+fn interactive_worker_resolves_navigation_while_two_bulk_workers_are_blocked() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run(aDatabase: Integer);\nbegin\n  aDatabase := 1;\nend;\nend.\n";
+    let paths = [
+        root.join("Main.pas"),
+        root.join("Other.pas"),
+        root.join("Queued.pas"),
+    ];
+    for path in &paths {
+        write_file(path, source);
+    }
+    let (mut server, navigation, formatting, _) =
+        TestServer::launch_with_navigation_and_formatting_barriers_and_dispatch_log(environment);
+    server.initialize(&root, Value::Null);
+    for (index, path) in paths.iter().enumerate() {
+        server.send_request(
+            RequestId::from(format!("bulk-{index}")),
+            "textDocument/formatting",
+            json!({"textDocument": {"uri": uri(path)}, "options": {"tabSize": 2, "insertSpaces": true}}),
+        );
+    }
+    formatting.wait_for_entries(2);
+    navigation.release();
+    let id = RequestId::from("interactive-navigation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&paths[0], source, "aDatabase", 1),
+    );
+    let response = server
+        .response_with_timeout(&id, IO_TIMEOUT)
+        .expect("navigation must complete without releasing either bulk worker");
+    let locations = result_locations(response);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(
+        locations[0]["range"]["start"],
+        json!({"line": 3, "character": 14})
+    );
+    assert!(
+        server
+            .response_with_timeout(
+                &RequestId::from("bulk-2".to_string()),
+                Duration::from_millis(100)
+            )
+            .is_none(),
+        "bulk work must not use the additional interactive slot"
+    );
+    assert_eq!(fs::read(&formatting.entered).unwrap().len(), 2);
+    formatting.release();
+    for index in 0..3 {
+        assert!(
+            server
+                .response(&RequestId::from(format!("bulk-{index}")))
+                .error
+                .is_none()
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn interactive_worker_is_bounded_and_cancellation_releases_its_capacity() {
+    let environment = tempfile::tempdir().expect("isolated server environment");
+    let root = environment.path().join("workspace");
+    let source = "unit Main;\ninterface\nimplementation\nprocedure Run(aDatabase: Integer);\nbegin\n  aDatabase := 1;\nend;\nend.\n";
+    let paths = [root.join("Main.pas"), root.join("Other.pas")];
+    for path in &paths {
+        write_file(path, source);
+    }
+    let (mut server, navigation, formatting, dispatch) =
+        TestServer::launch_with_navigation_and_formatting_barriers_and_dispatch_log(environment);
+    server.initialize(&root, Value::Null);
+    for (index, path) in paths.iter().enumerate() {
+        server.send_request(
+            RequestId::from(format!("bulk-{index}")),
+            "textDocument/formatting",
+            json!({"textDocument": {"uri": uri(path)}, "options": {"tabSize": 2, "insertSpaces": true}}),
+        );
+    }
+    formatting.wait_for_entries(2);
+    let first = RequestId::from("interactive-first".to_string());
+    server.send_request(
+        first.clone(),
+        "textDocument/definition",
+        navigation_params(&paths[0], source, "aDatabase", 1),
+    );
+    navigation.wait_until_entered();
+    let next = RequestId::from("interactive-next".to_string());
+    server.send_request(
+        next.clone(),
+        "textDocument/hover",
+        navigation_params(&paths[0], source, "aDatabase", 1),
+    );
+    assert!(
+        server
+            .response_with_timeout(&next, Duration::from_millis(100))
+            .is_none(),
+        "a fourth worker must not be spawned"
+    );
+    assert_eq!(fs::read(&dispatch.path).unwrap(), b"BBI");
+    server.send_notification("$/cancelRequest", json!({"id": first}));
+    assert_eq!(
+        server
+            .response(&first)
+            .error
+            .expect("cancelled navigation")
+            .code,
+        -32800
+    );
+    let response = server.response(&next);
+    assert!(
+        response.error.is_none(),
+        "interactive capacity must be reusable after cancellation: {response:?}"
+    );
+    assert!(!response.result.unwrap().is_null());
+    assert_eq!(fs::read(&formatting.entered).unwrap().len(), 2);
+    formatting.release();
+    for index in 0..2 {
+        assert!(
+            server
+                .response(&RequestId::from(format!("bulk-{index}")))
+                .error
+                .is_none()
+        );
+    }
+    server.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn bounded_analysis_queue_prioritizes_interactive_work_over_bulk_work() {
     let environment = tempfile::tempdir().expect("isolated server environment");
     let root = environment.path().join("workspace");
@@ -57142,6 +57299,7 @@ fn bounded_analysis_queue_prioritizes_interactive_work_over_bulk_work() {
         navigation_params(&main, main_source, "Run", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let bulk_id = RequestId::from("priority-bulk".to_string());
     server.send_request(
@@ -57159,29 +57317,29 @@ fn bounded_analysis_queue_prioritizes_interactive_work_over_bulk_work() {
         server
             .response_with_timeout(&bulk_id, Duration::from_millis(100))
             .is_none(),
-        "bulk work must remain queued while both workers are occupied"
+        "bulk work must remain queued while all workers are occupied"
     );
     assert!(
         server
             .response_with_timeout(&interactive_id, Duration::from_millis(100))
             .is_none(),
-        "interactive work must remain queued while both workers are occupied"
+        "interactive work must remain queued while all workers are occupied"
     );
 
     barrier.release();
-    let dispatches = dispatch.wait_for_entries(4);
+    let dispatches = dispatch.wait_for_entries(5);
     assert!(
-        dispatches.len() >= 4,
+        dispatches.len() >= 5,
         "all queued requests must be dispatched: {dispatches:?}"
     );
     assert_eq!(
-        &dispatches[..2],
-        b"II",
-        "the two blockers must dispatch first"
+        &dispatches[..3],
+        b"III",
+        "the three blockers must dispatch first"
     );
-    assert_eq!(dispatches[2], b'I', "interactive work must dispatch first");
+    assert_eq!(dispatches[3], b'I', "interactive work must dispatch first");
     assert_eq!(
-        dispatches[3], b'B',
+        dispatches[4], b'B',
         "bulk work must dispatch after interactive work"
     );
     let bulk_response = server.response(&bulk_id);
@@ -57222,6 +57380,7 @@ fn cancelling_a_queued_request_removes_it_without_starting_a_worker() {
         navigation_params(&main, main_source, "Run", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let queued_id = RequestId::from("queued-cancelled".to_string());
     server.send_request(
@@ -57273,6 +57432,7 @@ fn identical_queued_observations_share_one_worker_but_distinct_positions_do_not(
         navigation_params(&main, main_source, "Run", 0),
     );
     same_barrier.wait_for_entries(2);
+    same_barrier.occupy_interactive_slot(&mut same_server, &main);
     let first = RequestId::from("coalesced-query-first".to_string());
     let second = RequestId::from("coalesced-query-second".to_string());
     for id in [first.clone(), second.clone()] {
@@ -57283,13 +57443,13 @@ fn identical_queued_observations_share_one_worker_but_distinct_positions_do_not(
         );
     }
     same_barrier.release();
-    same_barrier.wait_for_entries(3);
+    same_barrier.wait_for_entries(4);
     thread::sleep(Duration::from_millis(100));
     assert_eq!(
         fs::read(&same_barrier.entered)
             .expect("coalesced barrier entries")
             .len(),
-        3,
+        4,
         "identical observations must share one dispatched worker"
     );
     let first_response = same_server.response(&first);
@@ -57326,6 +57486,7 @@ fn identical_queued_observations_share_one_worker_but_distinct_positions_do_not(
         navigation_params(&main, main_source, "Main", 0),
     );
     distinct_barrier.wait_for_entries(2);
+    distinct_barrier.occupy_interactive_slot(&mut distinct_server, &main);
     let first = RequestId::from("distinct-position-first".to_string());
     let second = RequestId::from("distinct-position-second".to_string());
     distinct_server.send_request(
@@ -57339,7 +57500,7 @@ fn identical_queued_observations_share_one_worker_but_distinct_positions_do_not(
         navigation_params(&main, main_source, "Run", 0),
     );
     distinct_barrier.release();
-    distinct_barrier.wait_for_entries(4);
+    distinct_barrier.wait_for_entries(5);
     assert!(
         distinct_server.response(&first).error.is_none(),
         "first distinct-position response failed"
@@ -57388,6 +57549,7 @@ fn queued_analysis_dispatches_against_the_latest_document_snapshot() {
         }),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let symbols_id = RequestId::from("latest-snapshot-symbols".to_string());
     server.send_request(
@@ -57465,6 +57627,7 @@ fn newer_document_version_supersedes_a_queued_observation_once() {
         navigation_params(&provider, provider_source, "PublicRoutine", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
 
     let old_id = RequestId::from("superseded-old".to_string());
     let mut old_params = navigation_params(&main, first_source, "PublicRoutine", 0);
@@ -57543,6 +57706,7 @@ fn shutdown_cancels_queued_requests_without_dispatching_them() {
         navigation_params(&main, main_source, "Run", 0),
     );
     barrier.wait_for_entries(2);
+    barrier.occupy_interactive_slot(&mut server, &main);
     let queued_id = RequestId::from("shutdown-queued".to_string());
     server.send_request(
         queued_id.clone(),
@@ -57564,7 +57728,7 @@ fn shutdown_cancels_queued_requests_without_dispatching_them() {
         fs::read(&barrier.entered)
             .expect("shutdown barrier entries")
             .len(),
-        2,
+        3,
         "shutdown must not dispatch a queued request"
     );
     server.send_notification("exit", Value::Null);

@@ -367,20 +367,23 @@ implementation proof; stale or cancelled resolution fails closed.
 ### Background analysis
 
 Navigation, formatting, and open-buffer diagnostics run as cancellable,
-snapshot-based background work. The server limits analysis to two concurrent
-jobs, so the stdio loop remains responsive while a source or dependency graph
-is being read. Up to 32 analysis jobs wait in a bounded FIFO-within-priority
+snapshot-based background work. The server allows two general-purpose jobs plus
+one interactive-only job, for at most three concurrent jobs, so the stdio loop
+remains responsive while a source or dependency graph is being read. Up to 32
+analysis jobs wait in a bounded FIFO-within-priority
 queue; one slot is reserved for diagnostics. Completion, hover, signature,
 navigation, type-definition, and other interactive requests are preferred over
-bulk symbols, references, rename, and formatting, but at most three
-interactive jobs are dispatched before a waiting diagnostic or bulk job. A
+bulk symbols, references, rename, and formatting. General capacity yields to a
+waiting diagnostic or bulk job after at most three interactive dispatches. The
+reserved interactive slot bypasses this burst limit when both general slots
+are occupied; diagnostics and bulk work cannot borrow it. A
 diagnostic burst is limited to two jobs when bulk work is also waiting, so
 neither lower-priority class can starve. Queue overflow returns an explicit
 `RequestFailed` response (`-32803`) with `analysis queue is full; retry the
 request`; the server does not capture source snapshots until a job is
 dispatched.
 
-Client request recipients have a separate total bound of 33 outstanding
+Client request recipients have a separate total bound of 34 outstanding
 request IDs across running jobs, queued jobs, and coalesced attachments. Every
 coalesced client request consumes one recipient slot, even when it asks for
 the same computation as another request; reaching this limit returns the same
@@ -390,13 +393,13 @@ while the shared computation may remain queued or running for its other
 recipients.
 
 Stdio output is nonblocking and ordered. The writer-facing queue keeps a
-16-message partial-result-data reserve and a 260-message control reserve,
+16-message partial-result-data reserve and a 264-message control reserve,
 with 16 MiB total pending bytes and an 8 MiB per-message/aggregate pending
 control-byte bound. When a valid ordinary response temporarily cannot fit,
 it is retained in a separate FIFO deferred queue rather than terminating the
-session: deferred results are capped at 260 messages and 64 MiB, deferred
-lifecycle/control output at 260 messages and 8 MiB, and the combined deferred
-queue at 520 messages and 72 MiB. A result is retired from analysis/admission
+session: deferred results are capped at 264 messages and 64 MiB, deferred
+lifecycle/control output at 264 messages and 8 MiB, and the combined deferred
+queue at 528 messages and 72 MiB. A result is retired from analysis/admission
 accounting only after its response (or a bounded request-scoped fallback) has
 been accepted by one of those queues. Individual control/result messages still
 must fit the 8 MiB bound; an oversized ordinary result receives `-32803`
@@ -437,9 +440,14 @@ while another recipient remains. Cancelling server-initiated indexing cancels
 the diagnostic snapshot and permits a later fresh retry; worker snapshots are
 never published as a partially built complete index.
 
-Diagnostics stay debounced and coalesced per document; if both worker slots are
-occupied, the diagnostic request is retried rather than spawning an unbounded
-worker. Identical observational requests share a computation only when their
+Analysis has two general worker slots plus one additional slot reserved for
+interactive requests such as navigation, hover, and completion. At most three
+analysis jobs run concurrently, and at most two can be diagnostics or bulk work
+such as semantic highlighting. Queued work retains weighted priority and FIFO
+ordering within each priority; the reserved slot only admits interactive work.
+Diagnostics stay debounced and coalesced per document; when general capacity is
+occupied, they wait rather than spawning an unbounded worker. Identical
+observational requests share a computation only when their
 method, document, position, options, and captured version/generations match.
 Queued observations invalidated by a newer document version receive one
 `RequestCanceled` response (`-32800`) and are replaced by the latest request;
@@ -1641,7 +1649,7 @@ complete safe result. A source or configuration change during delivery stops
 the stream and returns a stale-result error; cancellation likewise stops future
 chunks and returns the request-cancelled error.
 
-Partial delivery is also subject to the global 33-recipient client-analysis
+Partial delivery is also subject to the global 34-recipient client-analysis
 admission bound: queued, running, coalesced, and already-delivering recipients
 all count, so a request beyond the bound receives a retryable queue-capacity
 error rather than creating unbounded retained work. Retained staged payloads

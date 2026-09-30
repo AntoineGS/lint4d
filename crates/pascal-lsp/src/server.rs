@@ -59,7 +59,10 @@ const SERVER_NAME: &str = "pascal-lsp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-const MAX_ANALYSIS_JOBS: usize = 2;
+const MAX_GENERAL_ANALYSIS_JOBS: usize = 2;
+// One additional slot is reserved for interactive work. Bulk analysis and
+// diagnostics must never occupy all workers while a navigation request waits.
+const MAX_ANALYSIS_JOBS: usize = MAX_GENERAL_ANALYSIS_JOBS + 1;
 /// Maximum number of accepted analysis requests waiting for a worker.
 ///
 /// Queued requests retain only their parsed request parameters, never a
@@ -1024,9 +1027,14 @@ impl<T> PriorityQueue<T> {
     }
 
     fn pop(&mut self) -> Option<T> {
+        self.pop_for_worker(false)
+    }
+
+    fn pop_for_worker(&mut self, interactive_only: bool) -> Option<T> {
         let lower_pending = !self.diagnostics.is_empty() || !self.bulk.is_empty();
-        let priority = if !self.interactive.is_empty()
-            && (!lower_pending || self.interactive_burst < MAX_INTERACTIVE_BURST)
+        let priority = if interactive_only
+            || !self.interactive.is_empty()
+                && (!lower_pending || self.interactive_burst < MAX_INTERACTIVE_BURST)
         {
             AnalysisPriority::Interactive
         } else if !self.diagnostics.is_empty()
@@ -7614,7 +7622,19 @@ impl AnalysisJobs {
             return failures;
         }
         while self.pending.len().saturating_add(self.diagnostics.len()) < MAX_ANALYSIS_JOBS {
-            let Some(queued) = self.queue.pop() else {
+            // Any running interactive job can occupy the reserved slot. This
+            // also lets the general slots be refilled as jobs finish in any
+            // order, without pinning a particular thread to a slot forever.
+            let general_jobs = self.diagnostics.len()
+                + self
+                    .pending
+                    .values()
+                    .filter(|job| job.priority != AnalysisPriority::Interactive)
+                    .count();
+            let Some(queued) = self
+                .queue
+                .pop_for_worker(general_jobs >= MAX_GENERAL_ANALYSIS_JOBS)
+            else {
                 break;
             };
             match queued {
@@ -17750,6 +17770,23 @@ mod tests {
         budget.release(&third);
         assert!(budget.reservations.is_empty());
         assert_eq!(budget.retained_bytes, 0);
+    }
+
+    #[test]
+    fn reserved_worker_runs_interactive_work_even_after_the_fairness_burst() {
+        let mut queue = PriorityQueue::new();
+        queue.push(AnalysisPriority::Diagnostics, "diagnostic");
+        queue.push(AnalysisPriority::Bulk, "bulk");
+        for value in ["first", "second", "third", "fourth"] {
+            queue.push(AnalysisPriority::Interactive, value);
+        }
+        for value in ["first", "second", "third"] {
+            assert_eq!(queue.pop(), Some(value));
+        }
+        assert_eq!(queue.pop_for_worker(true), Some("fourth"));
+        assert_eq!(queue.pop_for_worker(true), None);
+        assert_eq!(queue.pop(), Some("diagnostic"));
+        assert_eq!(queue.pop(), Some("bulk"));
     }
 
     #[test]

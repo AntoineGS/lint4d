@@ -11,6 +11,7 @@
 //! `pascal-lsp` owns stateful workspace orchestration, overlays, indexes, and
 //! the include/rename resolver that consumes this crate's bounded results.
 
+pub mod compiler_defines;
 pub mod conditional;
 pub mod configuration;
 pub mod delphi_overrides;
@@ -19,6 +20,7 @@ pub mod installation_config;
 pub mod installations;
 pub mod path_issues;
 
+pub use compiler_defines::TargetPlatform;
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
 };

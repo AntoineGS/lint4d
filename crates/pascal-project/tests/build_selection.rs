@@ -1001,6 +1001,128 @@ fn configured_value_outside_project_candidates_keeps_conditionals_open() {
     );
 }
 
+#[test]
+fn empty_configuration_candidates_accept_each_selection_source() {
+    const NO_CONFIG_CANDIDATES: &str = r#"<Project>
+      <PropertyGroup>
+        <ProjectVersion>21.0</ProjectVersion>
+        <MainSource>App.dpr</MainSource>
+        <Config Condition="'$(Config)'==''">Debug</Config>
+        <DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+      </PropertyGroup>
+      <ItemGroup>
+        <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+        <DCCReference Include="SvcMain.pas" />
+      </ItemGroup>
+    </Project>"#;
+
+    for (origin, expected_mode) in [
+        (
+            EmptyCandidatesSelection::Session,
+            BuildSelectionMode::Session,
+        ),
+        (
+            EmptyCandidatesSelection::ConfigToml,
+            BuildSelectionMode::Configured,
+        ),
+        (
+            EmptyCandidatesSelection::Client,
+            BuildSelectionMode::Configured,
+        ),
+    ] {
+        let temp = tempdir().expect("temporary workspace");
+        let root = temp.path();
+        write_webquery_fixture_with_dproj(root, NO_CONFIG_CANDIDATES);
+        let (options, overrides) = empty_candidate_selection_input(root, origin, false);
+
+        let context = discover_webquery_at(root, &options, &overrides);
+
+        assert!(context.config_selection.candidates.is_empty());
+        assert_eq!(context.config_selection.selected.as_deref(), Some("Debug"));
+        assert_eq!(context.config_selection.mode, expected_mode);
+        assert!(
+            !context
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("build configuration `Debug` is not defined") })
+        );
+        assert!(
+            !context
+                .conditional_closure
+                .open_reasons
+                .contains(&OpenReason::ConfigInvalid)
+        );
+        assert!(
+            !context
+                .conditional_closure
+                .open_reasons
+                .contains(&OpenReason::DiscoveryIncomplete)
+        );
+    }
+}
+
+#[test]
+fn empty_platform_candidates_accept_each_selection_source() {
+    const NO_PLATFORM_CANDIDATES: &str = r#"<Project>
+      <PropertyGroup>
+        <MainSource>App.dpr</MainSource>
+      </PropertyGroup>
+      <ItemGroup>
+        <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+        <DCCReference Include="SvcMain.pas" />
+        <BuildConfiguration Include="Debug" />
+      </ItemGroup>
+    </Project>"#;
+
+    for (origin, expected_mode) in [
+        (
+            EmptyCandidatesSelection::Session,
+            BuildSelectionMode::Session,
+        ),
+        (
+            EmptyCandidatesSelection::ConfigToml,
+            BuildSelectionMode::Configured,
+        ),
+        (
+            EmptyCandidatesSelection::Client,
+            BuildSelectionMode::Configured,
+        ),
+    ] {
+        let temp = tempdir().expect("temporary workspace");
+        let root = temp.path();
+        write_webquery_fixture_with_dproj(root, NO_PLATFORM_CANDIDATES);
+        let (options, overrides) = empty_candidate_selection_input(root, origin, true);
+
+        let context = discover_webquery_at(root, &options, &overrides);
+
+        assert_eq!(context.config_selection.candidates, ["Debug"]);
+        assert!(context.platform_selection.candidates.is_empty());
+        assert_eq!(
+            context.platform_selection.selected.as_deref(),
+            Some("Win32")
+        );
+        assert_eq!(context.platform_selection.mode, expected_mode);
+        assert!(
+            !context
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("platform `Win32` is not defined"))
+        );
+        assert!(
+            !context
+                .conditional_closure
+                .open_reasons
+                .contains(&OpenReason::PlatformInvalid)
+        );
+        assert!(
+            !context
+                .conditional_closure
+                .open_reasons
+                .contains(&OpenReason::DiscoveryIncomplete)
+        );
+    }
+}
+
 fn discover_webquery(options: &ProjectOptions) -> ProjectContext {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -1029,6 +1151,53 @@ fn discover_webquery_at(
         overrides,
     )
     .expect("WebQuery discovery")
+}
+
+#[derive(Clone, Copy)]
+enum EmptyCandidatesSelection {
+    Session,
+    ConfigToml,
+    Client,
+}
+
+fn empty_candidate_selection_input(
+    root: &Path,
+    origin: EmptyCandidatesSelection,
+    is_platform: bool,
+) -> (ProjectOptions, OverrideSession) {
+    let value = if is_platform { "Win32" } else { "Debug" };
+    let field = if is_platform { "platform" } else { "config" };
+    let mut options = d2010_options();
+    let mut overrides = OverrideSession::new(None);
+    match origin {
+        EmptyCandidatesSelection::Session => {
+            let mut choice = BuildChoice::default();
+            if is_platform {
+                choice.platform = Some(value.to_owned());
+            } else {
+                choice.config = Some(value.to_owned());
+            }
+            options
+                .build_selections
+                .insert(root.join("App.dproj"), choice);
+        }
+        EmptyCandidatesSelection::ConfigToml => {
+            let config_file = root.join("config.toml");
+            write(
+                &config_file,
+                &format!("[projects.\"App.dproj\"]\n{field} = '{value}'\n"),
+            );
+            overrides = OverrideSession::new(Some(config_file));
+        }
+        EmptyCandidatesSelection::Client => {
+            if is_platform {
+                options.platform = Some(value.to_owned());
+            } else {
+                options.build_config = Some(value.to_owned());
+            }
+        }
+    }
+    (options, overrides)
 }
 
 fn write_webquery_fixture(root: &Path) {

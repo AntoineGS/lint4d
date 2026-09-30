@@ -1095,14 +1095,11 @@ fn honors_explicit_debug_config_and_reads_local_optset_imports() {
     assert_eq!(context.platform.as_deref(), Some("Win32"));
     assert_eq!(context.defines, ["DEBUG", "CPU386", "WIN32"]);
     assert!(context.search_paths.contains(&debug_units));
-    assert_eq!(
-        context.warnings.len(),
-        2,
+    assert!(
+        context.warnings.is_empty(),
         "unexpected warnings: {:?}",
         context.warnings
     );
-    assert!(context.warnings[0].contains("build configuration `Debug` is not defined"));
-    assert!(context.warnings[1].contains("platform `Win32` is not defined"));
 }
 
 #[test]

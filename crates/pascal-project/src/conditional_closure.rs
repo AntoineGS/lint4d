@@ -90,10 +90,15 @@ pub(crate) fn build_selection_values_are_candidates(
         .all(
             |selection| match (selection.mode, selection.selected.as_deref()) {
                 (BuildSelectionMode::Invalid, _) | (_, None) => true,
-                (_, Some(selected)) => selection
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(selected)),
+                (_, Some(selected)) => {
+                    // Missing candidates cannot prove that a configured value
+                    // is invalid; the other selection field is checked alone.
+                    selection.candidates.is_empty()
+                        || selection
+                            .candidates
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(selected))
+                }
             },
         )
 }

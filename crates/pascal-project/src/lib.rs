@@ -4892,10 +4892,13 @@ fn warn_for_unknown_build_selection(
     let Some(selected) = selection.selected.as_deref() else {
         return;
     };
-    if selection
-        .candidates
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(selected))
+    // An empty candidate list provides no declared set against which to
+    // validate this field; preserve the value and its selection mode.
+    if selection.candidates.is_empty()
+        || selection
+            .candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(selected))
     {
         return;
     }

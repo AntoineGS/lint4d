@@ -3,6 +3,9 @@ use std::collections::HashSet;
 
 use crate::{CompilerVersion, ConditionalContext};
 
+// Bounds lexer work and token storage (at most one token per source byte).
+const MAX_SYSTEM_PAS_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RtlConstantSource {
     Override,
@@ -36,6 +39,10 @@ struct Token<'a> {
 /// Lexically scan a System.pas interface section for unconditional RTL update
 /// constants. This intentionally does not depend on the Pascal parser.
 pub fn scan_system_pas(source: &str) -> SystemPasScan {
+    if source.len() > MAX_SYSTEM_PAS_SCAN_BYTES {
+        return SystemPasScan::Inconclusive("System.pas exceeds the 4 MiB scan limit".to_owned());
+    }
+
     let bytes = source.as_bytes();
     let mut cursor = 0;
     let mut conditional_depth = 0;
@@ -382,6 +389,25 @@ mod tests {
             scan_system_pas("unit System; interface const RTLVersion111 = True;"),
             SystemPasScan::Inconclusive(_)
         ));
+    }
+
+    #[test]
+    fn scanner_rejects_input_over_four_mib_with_a_resolver_warning() {
+        const SCAN_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+        let comment_body = "x".repeat(SCAN_LIMIT_BYTES - 1);
+        let source = format!("{{{comment_body}}}");
+        assert_eq!(source.len(), SCAN_LIMIT_BYTES + 1);
+
+        let scan = scan_system_pas(&source);
+        let SystemPasScan::Inconclusive(reason) = &scan else {
+            panic!("oversized source should be inconclusive: {scan:?}");
+        };
+        assert!(reason.contains("4 MiB"), "unexpected scan reason: {reason}");
+
+        let (_, _, warnings) =
+            resolve_rtl_constants(Some(CompilerVersion::new(35, 0)), None, Some(Ok(scan)));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("4 MiB"));
     }
 
     #[test]

@@ -330,6 +330,108 @@ function M.attach(client, bufnr)
     end)
   end
 
+  local function select_build(field)
+    local field_label = field == 'config' and 'Build configuration' or 'Platform'
+    local capability_feature = field == 'config' and 'build configuration selection' or 'platform selection'
+    if not require_capability('buildSelection', capability_feature) then
+      return
+    end
+
+    request_project_context(function(project_context)
+      local project_uri = project_context.selectedProjectUri
+      if type(project_uri) ~= 'string' then
+        vim.notify('Project selection is unresolved; choose a project with :PascalProject first.', vim.log.levels.WARN)
+        return
+      end
+
+      request('pascal/buildContext', { projectUri = project_uri }, function(err, context)
+        if not still_attached() then
+          return
+        end
+        if err or not context then
+          vim.notify(err and err.message or 'Missing build context', vim.log.levels.ERROR)
+          return
+        end
+        notify_warnings(context.warnings)
+
+        local info = context[field]
+        local project_default = type(info.projectDefault) == 'string' and info.projectDefault or 'project default'
+        local entries = {
+          {
+            value = vim.NIL,
+            label = 'Automatic (' .. project_default .. ')',
+          },
+        }
+        for _, candidate in ipairs(info.candidates or {}) do
+          local label = candidate
+          if candidate == info.selected then
+            label = label .. ' (current)'
+          end
+          entries[#entries + 1] = { value = candidate, label = label }
+        end
+
+        vim.ui.select(entries, {
+          prompt = field_label .. ' (' .. info.mode .. ')',
+          format_item = function(item)
+            return item.label
+          end,
+        }, function(choice)
+          if not choice or not still_attached() then
+            return
+          end
+
+          request('pascal/buildContext', { projectUri = project_uri }, function(fresh_err, fresh_context)
+            if not still_attached() then
+              return
+            end
+            if fresh_err or not fresh_context then
+              vim.notify(fresh_err and fresh_err.message or 'Missing build context', vim.log.levels.ERROR)
+              return
+            end
+            notify_warnings(fresh_context.warnings)
+            local fresh_info = fresh_context[field]
+            if
+              fresh_info.selected ~= info.selected
+              or fresh_info.mode ~= info.mode
+              or not vim.deep_equal(fresh_info.candidates or {}, info.candidates or {})
+            then
+              vim.notify('Build choices changed while the picker was open; reopen it.', vim.log.levels.WARN)
+              return
+            end
+
+            local method = field == 'config' and 'pascal/selectBuildConfig' or 'pascal/selectPlatform'
+            local params = { projectUri = project_uri }
+            params[field] = choice.value
+            request(method, params, function(select_err, selected)
+              if not still_attached() then
+                return
+              end
+              if select_err then
+                vim.notify(select_err.message, vim.log.levels.ERROR)
+              elseif selected then
+                notify_warnings(selected.warnings)
+                local selection = selected[field].selected
+                if type(selection) ~= 'string' then
+                  selection = 'Automatic'
+                end
+                local conditional_status
+                if selected.conditionals.closed then
+                  conditional_status = 'conditionals closed'
+                else
+                  conditional_status = 'conditionals open: '
+                    .. table.concat(selected.conditionals.openReasons or {}, ', ')
+                end
+                vim.notify(
+                  field_label .. ': ' .. selection .. ' (' .. selected[field].mode .. '); ' .. conditional_status
+                )
+              end
+            end)
+          end)
+        end)
+      end)
+    end)
+  end
+
   local function select_project(project_uri, expected_context, scope, intent)
     if not still_attached() or not has_current_intent(scope, intent) then
       return
@@ -696,6 +798,10 @@ function M.attach(client, bufnr)
       if supports('installationSelection') then
         entries[#entries + 1] = { kind = 'installation', label = 'Select Delphi installation' }
       end
+      if supports('buildSelection') then
+        entries[#entries + 1] = { kind = 'build-config', label = 'Select build configuration' }
+        entries[#entries + 1] = { kind = 'platform', label = 'Select platform' }
+      end
 
       local prompt = 'Pascal project (' .. (context.selectionMode or 'automatic')
       if type(context.selectedProjectUri) == 'string' and not selected_is_candidate then
@@ -719,6 +825,10 @@ function M.attach(client, bufnr)
           browse_repository(context, scope, begin_intent(scope))
         elseif choice.kind == 'installation' then
           select_installation()
+        elseif choice.kind == 'build-config' then
+          select_build('config')
+        elseif choice.kind == 'platform' then
+          select_build('platform')
         elseif choice.kind == 'project' then
           select_project(choice.projectUri, context, scope, begin_intent(scope))
         end
@@ -728,11 +838,23 @@ function M.attach(client, bufnr)
 
   pcall(vim.api.nvim_buf_del_user_command, bufnr, 'PascalProject')
   pcall(vim.api.nvim_buf_del_user_command, bufnr, 'PascalDelphiVersion')
+  pcall(vim.api.nvim_buf_del_user_command, bufnr, 'PascalBuildConfig')
+  pcall(vim.api.nvim_buf_del_user_command, bufnr, 'PascalPlatform')
   vim.api.nvim_buf_create_user_command(bufnr, 'PascalProject', select_project_picker, {
     desc = 'Select Pascal project',
   })
   vim.api.nvim_buf_create_user_command(bufnr, 'PascalDelphiVersion', select_installation, {
     desc = 'Select Delphi installation for the current project',
+  })
+  vim.api.nvim_buf_create_user_command(bufnr, 'PascalBuildConfig', function()
+    select_build('config')
+  end, {
+    desc = 'Select build configuration for the current project',
+  })
+  vim.api.nvim_buf_create_user_command(bufnr, 'PascalPlatform', function()
+    select_build('platform')
+  end, {
+    desc = 'Select platform for the current project',
   })
   vim.keymap.set('n', '<leader>wp', select_project_picker, {
     buffer = bufnr,

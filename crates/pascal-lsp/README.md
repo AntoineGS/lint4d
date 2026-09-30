@@ -780,8 +780,23 @@ defaults and that layer's selected profile overrides them. Layers still apply
 user, workspace, project order, so a project shared value can override a user
 profile value. A `[projects."App.dproj"]` table with
 `installation = "37.0"` selects an exact project path, not a glob; relative keys
-are resolved against their config file,
-and more-local selectors override the same project's earlier choice. See the
+are resolved against their config file, and more-local selectors override the
+same project's earlier choice. This table also accepts `config = "Debug"` and
+`platform = "Win64"` to select a build configuration and target. An installation
+table can set `rtlVersionConstants` outside its `properties` subtable:
+
+```toml
+[installations."37.0"]
+rtlVersionConstants = ["RTLVersion131"]
+
+[projects."App.dproj"]
+installation = "37.0"
+config = "Debug"
+platform = "Win64"
+```
+
+`rtlVersionConstants` replaces automatic RTL-update constant discovery for the
+selected installation; `[]` means that no such constants are declared. See the
 [`pascal-project` installation-profile reference](../pascal-project/README.md#delphi-installation-profiles)
 for a validated full example.
 
@@ -1181,6 +1196,100 @@ picker retains the buffer URI and verifies that the buffer is still valid and
 attached before applying asynchronous results, so a response cannot select a
 project for a different buffer. Install or point Neovim at an updated server to
 use this capability; this documentation does not install or deploy one.
+
+### Build configuration and platform selection
+
+Build selections are per-project and session-local; they are not written back to
+the project or configuration files. The server advertises
+`experimental.buildSelection: true` and supports these camelCase requests:
+
+```text
+pascal/buildContext { projectUri }
+pascal/selectBuildConfig { projectUri, config: string | null }
+pascal/selectPlatform { projectUri, platform: string | null }
+```
+
+Each selection request must include its named field, including when resetting
+with `null`, and returns the same shape as `buildContext`. All request and
+response fields use camelCase.
+
+`buildContext` returns `projectUri`, `config` and `platform` selections (each
+with `selected`, `candidates`, `mode`, and `projectDefault`), `conditionals`
+(`closed`, `openReasons`, and `rtlVersionConstants` with `source` and `names`),
+and `warnings`. Selection modes are `session`, `configured`, `projectDefault`,
+and `invalid`. Candidate configurations come from `.dproj`
+`BuildConfiguration` entries other than `Base`; platform candidates are the
+enabled `.dproj` platforms or an implicit platform from DCC32/DCC64 when the
+project has no platforms block.
+
+For each field, resolution precedence is:
+
+1. Session per-project selection through `pascal/selectBuildConfig` or
+   `pascal/selectPlatform`.
+2. Per-project `config.toml` `[projects."App.dproj"]` `config` or `platform`.
+3. Global client `buildConfig` or `platform` from runtime or initialization
+   options.
+4. `.delphilsp.json` `buildConfiguration` (configuration only).
+5. `config.toml` `[properties]` or installation-profile `Config` and `Platform`.
+6. The `.dproj` default, then its implicit platform when applicable.
+
+Names match candidates case-insensitively, and the reported value uses the
+`.dproj` spelling. A `null` `config` or `platform` resets that session choice to
+Automatic, which resumes the remaining precedence. A non-null selection must be
+a current candidate; the request fails without replacing the live selection if
+it is not. If a `.dproj` declares candidates, stale values at the session or
+project-specific configuration level are reported with mode `invalid` and a
+warning; lower configured values that do not match are warned about but are not
+discarded. When a field has no declared candidates, configuration values are
+accepted without that validation or warning, while a non-null selection request
+is rejected because there is no candidate to choose.
+
+The bundled Neovim helper adds **Select build configuration** and **Select
+platform** to `:PascalProject` when the capability is advertised, and provides
+buffer-local `:PascalBuildConfig` and `:PascalPlatform` commands. Each picker
+offers an Automatic choice and marks the current candidate. Before applying a
+choice it fetches the context again and warns if the selection, mode, or
+candidates changed while the picker was open. Selections invalidate affected
+analysis and diagnostics without restarting the server.
+
+### Closed-world conditionals
+
+The LSP closes the absent-define world only for project-compiled files when
+discovery is complete, a `.dproj` is selected, the compiler version is known,
+and both configuration and platform are resolved and valid. Project-compiled
+sources include the project main source, `DCCReference` units, files under the
+project directory, `.dproj` unit-search paths and client/local `sourcePaths`.
+Installation-library and browsing-path sources are treated as library code:
+they receive caller facts, predefined symbols, and RTL constants, but keep
+undefined names `Unknown` and do not receive the project's `DCC_Define` set.
+Includes inherit the including source's context. Standalone files never close.
+
+Predefined symbols supplement explicit project and client facts. Version symbols
+include `VERnnn`; `MSWINDOWS` is modeled at versions ≥14.0, `ASSEMBLER` at
+≥15.0, `CPUX86`, `CPUX64`, and `WIN64` at ≥23.0, and `CPU32BITS`/`CPU64BITS`
+at ≥29.0. `DCC` and `NATIVECODE` are known only at ≥23.0. `CPUINTEL` always
+stays Unknown. Platform-derived symbols are modeled only for Win32 and Win64;
+other or unresolved platforms leave that group Unknown. `CONSOLE` is derived
+from project console-target metadata or the main source's `{$APPTYPE CONSOLE}`;
+standalone files leave it Unknown. The `lint4d` CLI gains only these predefined
+symbols and deliberately remains open-world.
+
+`RTLVersionNNN` values are constants rather than compiler defines. The declared
+set is resolved in this order: the selected installation's `rtlVersionConstants`
+override; a lexical scan of that installation's `System.pas`; the latest-known
+table; then Unknown. The scan is limited to 4 MiB, reads unconditional
+`RTLVersionNNN = True` declarations in the interface section, and skips comments
+and strings. A conditional declaration, unreadable or oversized file, or
+inconclusive scan produces a warning and falls through to the table. The table
+currently has no update constants through 33.0, `RTLVersion1041`/`RTLVersion1042`
+for 34.0, `RTLVersion111`–`RTLVersion113` for 35.0,
+`RTLVersion121`–`RTLVersion123` for 36.0, and `RTLVersion131` for 37.0.
+`rtlVersionConstants.source` reports `override`, `systemPas`, `table`, or
+`unknown`.
+
+When conditionals remain open, `openReasons` reports any of `noProject`,
+`discoveryIncomplete`, `compilerVersionUnknown`, `configUnresolved`,
+`configInvalid`, `platformUnresolved`, and `platformInvalid`.
 
 Source discovery is lazy: initialization never walks or parses the workspace.
 An opened buffer parses immediately; a navigation request parses its requested

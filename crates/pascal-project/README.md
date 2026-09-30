@@ -88,6 +88,11 @@ to = '/work/Delphi-Main/data'
 
 [projects."Projects/ChainDriveAPI/ChainDriveAPI.dproj"]
 installation = '37.0'
+config = 'Debug'
+platform = 'Win64'
+
+[installations."37.0"]
+rtlVersionConstants = ['RTLVersion131']
 ```
 
 `BDS` is the direct local installation root. `APPDATA` is also a direct path,
@@ -111,8 +116,13 @@ BDSUSERDIR are not guessed: supply them explicitly or map their paths.
 Project selector keys are exact paths, not globs. Relative paths are relative
 to the containing config file; a project-local file can simply name
 `"ChainDriveAPI.dproj"`. User config also accepts absolute native paths.
-More-local selectors override the same project's choice. Interactive
-installation selections do not persist themselves to disk. The parser is
+`config` and `platform` choose that project's build configuration and target;
+more-local selectors override the same project's choice. Names are matched
+case-insensitively against `.dproj` candidates when candidates are declared.
+`rtlVersionConstants` belongs to an installation table, not its `properties`
+subtable; it replaces automatic RTL update-constant discovery, and an empty list
+means none are declared. Interactive installation and build selections do not
+persist themselves to disk. The parser is
 [`installation_config.rs`](src/installation_config.rs); input and IDE path
 handling lives in [`installations/`](src/installations/mod.rs).
 

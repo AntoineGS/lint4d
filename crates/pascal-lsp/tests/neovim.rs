@@ -411,6 +411,80 @@ fn neovim_installation_selection() {
 }
 
 #[test]
+fn neovim_build_selection() {
+    if !neovim_is_available() {
+        eprintln!("Neovim build-selection integration skipped: nvim is not installed");
+        return;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("pascal lsp neovim build selection ")
+        .tempdir()
+        .unwrap();
+    let root = directory.path();
+    fs::write(root.join(".lint4d.toml"), "").unwrap();
+    fs::write(
+        root.join("App.dproj"),
+        r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MainSource>App.dpr</MainSource>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+  </PropertyGroup>
+  <ItemGroup>
+    <BuildConfiguration Include="Base"><Key>Base</Key></BuildConfiguration>
+    <BuildConfiguration Include="Debug"><Key>Cfg_2</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+    <BuildConfiguration Include="Release"><Key>Cfg_1</Key><CfgParent>Base</CfgParent></BuildConfiguration>
+  </ItemGroup>
+  <ProjectExtensions><BorlandProject><Platforms>
+    <Platform value="Win32">True</Platform>
+  </Platforms></BorlandProject></ProjectExtensions>
+</Project>"#,
+    )
+    .unwrap();
+    fs::write(root.join("App.dpr"), "program App; begin end.\n").unwrap();
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let environment = tempfile::tempdir().expect("isolated Neovim environment");
+    let mut command = Command::new("nvim");
+    command
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(manifest.join("tests/neovim_build_smoke.lua"))
+        .env("PASCAL_LSP_BIN", env!("CARGO_BIN_EXE_pascal-lsp"))
+        .env("PASCAL_LSP_SMOKE_ROOT", root)
+        .env("PASCAL_LSP_CONFIG", manifest.join("examples/neovim.lua"));
+    configure_neovim_environment(&mut command, &environment);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "Neovim build-selection smoke timed out:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "Neovim build-selection smoke failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NEOVIM_BUILD_SELECTION_OK"));
+}
+
+#[test]
 fn neovim_delphi_overrides_navigate_to_native_source() {
     if !neovim_is_available() {
         eprintln!("Neovim integration skipped: nvim is not installed");

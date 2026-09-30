@@ -165,6 +165,44 @@ fn unsupported_source_scope_does_not_claim_rtl_constants_absent() {
 }
 
 #[test]
+fn typed_const_declaration_before_rtl_constant_invalidates_rtl_completeness() {
+    let context = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
+    let source = concat!(
+        "const Foo: Integer = 1; RTLVersion113 = True;",
+        "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
+        "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
+    );
+
+    assert_eq!(
+        activity(source, "DEFINE DECLARED", &context),
+        Truth::Unknown
+    );
+    assert_eq!(activity(source, "DEFINE VALUE", &context), Truth::Unknown);
+}
+
+#[test]
+fn unsupported_const_initializer_before_rtl_constant_invalidates_rtl_completeness() {
+    let context = ConditionalContext {
+        rtl_constants_known: true,
+        ..ConditionalContext::default()
+    };
+    let source = concat!(
+        "const Foo = SizeOf(Integer); RTLVersion113 = True;",
+        "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
+        "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
+    );
+
+    assert_eq!(
+        activity(source, "DEFINE DECLARED", &context),
+        Truth::Unknown
+    );
+    assert_eq!(activity(source, "DEFINE VALUE", &context), Truth::Unknown);
+}
+
+#[test]
 fn included_unknown_rtl_constant_does_not_become_absent_on_return() {
     let context = ConditionalContext {
         rtl_constants_known: true,

@@ -770,6 +770,7 @@ fn system_pas_rtl_constants_are_tracked_and_added_to_contexts() {
             .iter()
             .any(|observation| observation.path() == system_pas)
     );
+    assert!(context.metadata_files.contains(&system_pas));
     assert!(context.project_source_roots.contains(&root.join("rtl")));
     assert_eq!(
         context.source_origin(&system_pas),
@@ -856,6 +857,55 @@ fn standalone_contexts_remain_open_and_use_client_predefined_symbols() {
         context.conditional_context_for(&source).define("MSWINDOWS"),
         ConditionalFact::True
     );
+}
+
+#[test]
+fn standalone_context_keeps_version_symbols_when_platform_is_unknown() {
+    let temp = tempdir().expect("temporary directory");
+    let source = temp.path().join("Standalone.pas");
+    write(&source, "unit Standalone; interface implementation end.");
+    let options = ProjectOptions {
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(35, 0)),
+        ..ProjectOptions::default()
+    };
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &options,
+        &OverrideSession::new(None),
+    )
+    .expect("standalone discovery");
+    let conditionals = context.conditional_context_for(&source);
+
+    assert_eq!(conditionals.define("VER350"), ConditionalFact::True);
+    assert_eq!(conditionals.define("UNICODE"), ConditionalFact::True);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::Unknown);
+}
+
+#[test]
+fn dcc_and_nativecode_are_version_facts_on_other_platforms() {
+    let temp = tempdir().expect("temporary directory");
+    let source = temp.path().join("Standalone.pas");
+    write(&source, "unit Standalone; interface implementation end.");
+    let options = ProjectOptions {
+        platform: Some("Linux".into()),
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(35, 0)),
+        ..ProjectOptions::default()
+    };
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &options,
+        &OverrideSession::new(None),
+    )
+    .expect("standalone discovery");
+    let conditionals = context.conditional_context_for(&source);
+
+    assert_eq!(conditionals.define("DCC"), ConditionalFact::True);
+    assert_eq!(conditionals.define("NATIVECODE"), ConditionalFact::True);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::Unknown);
 }
 
 #[test]

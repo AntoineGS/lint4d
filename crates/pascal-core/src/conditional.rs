@@ -1636,6 +1636,7 @@ fn observe_source_constants(
                 if !record_source_declaration_without_value(&name, environment, budget) {
                     return false;
                 }
+                environment.rtl_constants_known = false;
                 break;
             }
             if bytes.get(declaration) != Some(&b'=') {
@@ -1691,6 +1692,7 @@ fn observe_source_constants(
                 }
             }
             if !expression_complete {
+                environment.rtl_constants_known = false;
                 break;
             }
             declaration = end.saturating_add(1);

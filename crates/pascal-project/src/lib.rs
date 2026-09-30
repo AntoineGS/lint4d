@@ -4518,15 +4518,12 @@ fn build_project_context(
     );
     builder.warnings.extend(conditional_warnings);
 
-    let predefined = match (
+    let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
+    let predefined = crate::compiler_defines::predefined_defines(
         conditional_context.compiler_version,
-        platform.as_deref().and_then(TargetPlatform::parse),
-    ) {
-        (Some(version), Some(platform)) => {
-            crate::compiler_defines::predefined_defines(version, &platform, console_target)
-        }
-        _ => BTreeMap::new(),
-    };
+        target_platform.as_ref(),
+        console_target,
+    );
     let version = conditional_context.compiler_version;
     let system_pas = if version.is_some_and(|version| {
         version.cmp_numeric(CompilerVersion::new(34, 0)) != Some(std::cmp::Ordering::Less)
@@ -4534,11 +4531,10 @@ fn build_project_context(
         scan_system_pas_from_paths(
             &search_path_entries,
             &ide_paths.browsing,
-            &builder.read_policy,
+            &mut builder,
             tracker.work_budget,
             cancel,
-            &mut builder.metadata_observations,
-            &mut builder.warnings,
+            &mut metadata_files,
         )?
     } else {
         None
@@ -4767,15 +4763,12 @@ fn build_standalone_context(
         ConditionalFact::Unknown
     };
     let mut conditional_context = options.conditional_context.clone();
-    let predefined = match (
+    let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
+    let predefined = crate::compiler_defines::predefined_defines(
         conditional_context.compiler_version,
-        platform.as_deref().and_then(TargetPlatform::parse),
-    ) {
-        (Some(version), Some(platform)) => {
-            crate::compiler_defines::predefined_defines(version, &platform, console_target)
-        }
-        _ => BTreeMap::new(),
-    };
+        target_platform.as_ref(),
+        console_target,
+    );
     let (rtl_source, rtl_constants, rtl_warnings) = crate::rtl_constants::resolve_rtl_constants(
         conditional_context.compiler_version,
         None,
@@ -4975,11 +4968,10 @@ fn selected_platform(builder: &ProjectBuilder, options: &ProjectOptions) -> Opti
 fn scan_system_pas_from_paths(
     search_paths: &[ProjectPathEntry],
     browsing_paths: &[ProjectPathEntry],
-    read_policy: &ReadPolicy,
+    builder: &mut ProjectBuilder,
     work_budget: Option<&dyn ProjectWorkBudget>,
     cancel: Option<&AtomicBool>,
-    metadata_observations: &mut Vec<MetadataObservation>,
-    warnings: &mut Vec<String>,
+    metadata_files: &mut Vec<PathBuf>,
 ) -> Result<Option<Result<crate::rtl_constants::SystemPasScan, String>>, String> {
     for directory in search_paths.iter().chain(browsing_paths) {
         check_project_scan_cancel(cancel)?;
@@ -4992,7 +4984,7 @@ fn scan_system_pas_from_paths(
                 return Err(error);
             }
             Err(error) => {
-                warnings.push(format!(
+                builder.warnings.push(format!(
                     "could not inspect {} for System.pas: {error}",
                     directory.path.display()
                 ));
@@ -5002,14 +4994,22 @@ fn scan_system_pas_from_paths(
         let Some(path) = entries.system_pas else {
             continue;
         };
+        add_unique_path(metadata_files, path.clone());
+        add_metadata_observation(
+            &mut builder.metadata_observations,
+            MetadataObservation::Stat { path: path.clone() },
+        );
         let entry = ProjectPathEntry {
             path,
             provenance: directory.provenance.clone(),
         };
         return Ok(Some(
-            match read_policy.read_pascal_payload_with_observation(&entry, MAX_PROJECT_BYTES) {
+            match builder
+                .read_policy
+                .read_pascal_payload_with_observation(&entry, MAX_PROJECT_BYTES)
+            {
                 Ok((source, observation)) => {
-                    add_metadata_observation(metadata_observations, observation);
+                    add_metadata_observation(&mut builder.metadata_observations, observation);
                     Ok(crate::rtl_constants::scan_system_pas(&source))
                 }
                 Err(error) => Err(error),

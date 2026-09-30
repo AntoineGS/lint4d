@@ -59,21 +59,24 @@ fn first_fractional_digit(version: CompilerVersion) -> Option<u8> {
 
 /// Return compiler and platform predefined symbols for a target build.
 pub fn predefined_defines(
-    version: CompilerVersion,
-    platform: &TargetPlatform,
+    version: Option<CompilerVersion>,
+    platform: Option<&TargetPlatform>,
     console: ConditionalFact,
 ) -> BTreeMap<String, ConditionalFact> {
     let mut defines = BTreeMap::new();
-    let version_is_numeric = version.numeric_parts().is_some();
-    let current_symbols = ver_symbols(version);
+    let version_is_numeric = version.is_some_and(|version| version.numeric_parts().is_some());
+    let current_symbols = version.map(ver_symbols).unwrap_or_default();
 
     for symbol in HISTORICAL_VER_SYMBOLS {
-        let fact = if !version_is_numeric {
-            ConditionalFact::Unknown
-        } else if current_symbols.iter().any(|current| current == symbol) {
-            ConditionalFact::True
-        } else {
-            ConditionalFact::False
+        let fact = match version {
+            Some(_) if version_is_numeric => {
+                if current_symbols.iter().any(|current| current == symbol) {
+                    ConditionalFact::True
+                } else {
+                    ConditionalFact::False
+                }
+            }
+            _ => ConditionalFact::Unknown,
         };
         defines.insert((*symbol).to_owned(), fact);
     }
@@ -99,20 +102,28 @@ pub fn predefined_defines(
     defines.insert("CPPBUILDER".to_owned(), ConditionalFact::False);
     defines.insert("BCB".to_owned(), ConditionalFact::False);
     defines.insert("CONSOLE".to_owned(), console);
+    defines.insert(
+        "NATIVECODE".to_owned(),
+        since_fact(version, Since::ConfirmedFrom(23, 0), true),
+    );
+    defines.insert(
+        "DCC".to_owned(),
+        since_fact(version, Since::ConfirmedFrom(23, 0), true),
+    );
 
     for &(symbol, win32, win64, since) in WINDOWS_SYMBOLS {
         let fact = match platform {
-            TargetPlatform::Win32 => since_fact(version, since, win32),
-            TargetPlatform::Win64 => since_fact(version, since, win64),
-            TargetPlatform::Other(_) => ConditionalFact::Unknown,
+            Some(TargetPlatform::Win32) => since_fact(version, since, win32),
+            Some(TargetPlatform::Win64) => since_fact(version, since, win64),
+            Some(TargetPlatform::Other(_)) | None => ConditionalFact::Unknown,
         };
         defines.insert(symbol.to_owned(), fact);
     }
 
     for &symbol in NON_WINDOWS_SYMBOLS {
         let fact = match platform {
-            TargetPlatform::Win32 | TargetPlatform::Win64 => ConditionalFact::False,
-            TargetPlatform::Other(_) => ConditionalFact::Unknown,
+            Some(TargetPlatform::Win32 | TargetPlatform::Win64) => ConditionalFact::False,
+            Some(TargetPlatform::Other(_)) | None => ConditionalFact::Unknown,
         };
         defines.insert(symbol.to_owned(), fact);
     }
@@ -128,16 +139,19 @@ enum Since {
     Unverified,
 }
 
-fn since_fact(version: CompilerVersion, since: Since, defined: bool) -> ConditionalFact {
+fn since_fact(version: Option<CompilerVersion>, since: Since, defined: bool) -> ConditionalFact {
     match since {
         Since::Always => bool_fact(defined),
-        Since::At(major, minor) => match version.cmp_numeric(CompilerVersion::new(major, minor)) {
-            Some(Ordering::Less) => ConditionalFact::False,
-            Some(Ordering::Equal | Ordering::Greater) => bool_fact(defined),
-            None => ConditionalFact::Unknown,
-        },
+        Since::At(major, minor) => version
+            .and_then(|version| version.cmp_numeric(CompilerVersion::new(major, minor)))
+            .map_or(ConditionalFact::Unknown, |ordering| match ordering {
+                Ordering::Less => ConditionalFact::False,
+                Ordering::Equal | Ordering::Greater => bool_fact(defined),
+            }),
         Since::ConfirmedFrom(major, minor) => {
-            match version.cmp_numeric(CompilerVersion::new(major, minor)) {
+            match version
+                .and_then(|version| version.cmp_numeric(CompilerVersion::new(major, minor)))
+            {
                 Some(Ordering::Less) | None => ConditionalFact::Unknown,
                 Some(Ordering::Equal | Ordering::Greater) => bool_fact(defined),
             }
@@ -178,8 +192,6 @@ const WINDOWS_SYMBOLS: &[(&str, bool, bool, Since)] = &[
     ("CPU64BITS", false, true, Since::At(29, 0)),
     ("ASSEMBLER", true, true, Since::At(15, 0)),
     ("CPUINTEL", true, true, Since::Unverified),
-    ("NATIVECODE", true, true, Since::ConfirmedFrom(23, 0)),
-    ("DCC", true, true, Since::ConfirmedFrom(23, 0)),
 ];
 
 const NON_WINDOWS_SYMBOLS: &[&str] = &[
@@ -224,9 +236,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn facts(major: u32, minor: u32, platform: &str) -> BTreeMap<String, F> {
+        let target_platform = TargetPlatform::parse(platform).unwrap();
         predefined_defines(
-            CompilerVersion::new(major, minor),
-            &TargetPlatform::parse(platform).unwrap(),
+            Some(CompilerVersion::new(major, minor)),
+            Some(&target_platform),
             F::False,
         )
     }
@@ -300,7 +313,7 @@ mod tests {
     fn version_facts_with_an_unsupported_numeric_version_are_unknown() {
         let unsupported = CompilerVersion::with_patch(38, 0, 1);
         assert!(ver_symbols(unsupported).is_empty());
-        let facts = predefined_defines(unsupported, &TargetPlatform::Win32, F::Unknown);
+        let facts = predefined_defines(Some(unsupported), Some(&TargetPlatform::Win32), F::Unknown);
         assert!(!facts.contains_key("VER380"));
         assert_eq!(facts["VER370"], F::Unknown);
         assert_eq!(facts["CONDITIONALEXPRESSIONS"], F::Unknown);
@@ -333,5 +346,28 @@ mod tests {
         assert_eq!(facts(14, 0, "Win32")["ASSEMBLER"], F::False);
         assert_eq!(facts(15, 0, "Win32")["ASSEMBLER"], F::True);
         assert_eq!(facts(15, 0, "Win64")["ASSEMBLER"], F::True);
+    }
+
+    #[test]
+    fn known_version_facts_survive_unknown_platform() {
+        let facts = predefined_defines(Some(CompilerVersion::new(35, 0)), None, F::Unknown);
+
+        assert_eq!(facts["VER350"], F::True);
+        assert_eq!(facts["UNICODE"], F::True);
+        assert_eq!(facts["DCC"], F::True);
+        assert_eq!(facts["NATIVECODE"], F::True);
+        assert_eq!(facts["MSWINDOWS"], F::Unknown);
+        assert_eq!(facts["LINUX"], F::Unknown);
+    }
+
+    #[test]
+    fn known_platform_facts_survive_unknown_version() {
+        let facts = predefined_defines(None, Some(&TargetPlatform::Win32), F::False);
+
+        assert_eq!(facts["WIN32"], F::True);
+        assert_eq!(facts["LINUX"], F::False);
+        assert_eq!(facts["VER350"], F::Unknown);
+        assert_eq!(facts["UNICODE"], F::Unknown);
+        assert_eq!(facts["CPUX86"], F::Unknown);
     }
 }

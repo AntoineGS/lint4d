@@ -13874,16 +13874,20 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         let MetadataObservation::Payload { path, .. } = observation else {
             continue;
         };
-        if !(extension_is(path, "json")
+        let is_system_pas = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("System.pas"));
+        if !(is_system_pas
+            || extension_is(path, "json")
             || extension_is(path, "dproj")
             || extension_is(path, "dpr")
             || extension_is(path, "dpk")
             || extension_is(path, "optset")
             || extension_is(path, "props"))
-            || !state
-                .project_read_observations
-                .iter()
-                .any(|read| package_paths_equal(&read.path, path) && read.content_bytes.is_some())
+            || (!is_system_pas
+                && !state.project_read_observations.iter().any(|read| {
+                    package_paths_equal(&read.path, path) && read.content_bytes.is_some()
+                }))
         {
             continue;
         }
@@ -14895,8 +14899,8 @@ mod tests {
     };
     use pascal_project::{
         CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, MetadataObservation,
-        ProjectContext, ProjectPathEntry, ProjectPathProvenance, ProjectReadObservation,
-        ProjectReadStamp, ReadPolicy,
+        ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance,
+        ProjectReadObservation, ProjectReadStamp, ReadPolicy,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -20721,6 +20725,61 @@ BDS = '/fake/37'
         assert!(
             !context_state_is_fresh_with_cancel(&state, None, None).expect("freshness check"),
             "repeated candidate-enumeration errors must not prove freshness"
+        );
+    }
+
+    #[test]
+    fn system_pas_payload_change_invalidates_project_context_even_with_matching_stamp() {
+        let temp = tempfile::tempdir().expect("temporary project");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("App.dpr");
+        let system_pas = root.join("rtl/System.pas");
+        fs::create_dir_all(system_pas.parent().expect("RTL directory"))
+            .expect("create RTL directory");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>rtl</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project file");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            &system_pas,
+            "unit System; interface const RTLVersion111 = True; implementation end.",
+        )
+        .expect("initial System.pas");
+
+        let options = ProjectOptions {
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(35, 0)),
+            ..ProjectOptions::default()
+        };
+        let mut context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &OverrideSession::new(None),
+        )
+        .expect("project context");
+        assert!(context.metadata_observations.iter().any(|observation| {
+            matches!(observation, MetadataObservation::Payload { path, .. } if path == &system_pas)
+        }));
+
+        fs::write(
+            &system_pas,
+            "unit System; interface const RTLVersion110 = True; implementation end.",
+        )
+        .expect("updated System.pas with same length");
+        let state = ContextState {
+            context: std::mem::take(&mut context),
+            watched_paths: HashMap::from([(system_pas.clone(), super::path_stamp(&system_pas))]),
+            project_candidate_memberships: HashMap::new(),
+            project_read_observations: Vec::new(),
+        };
+
+        assert!(
+            !context_state_is_fresh_with_cancel(&state, None, None).expect("freshness check"),
+            "payload verification must detect a same-size System.pas update even when its current file stamp is already installed"
         );
     }
 

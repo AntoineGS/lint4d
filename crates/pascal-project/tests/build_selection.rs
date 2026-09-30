@@ -1,4 +1,6 @@
-use pascal_project::build_selection::{BuildSelection, BuildSelectionMode, parse_build_candidates};
+use pascal_project::build_selection::{
+    BuildChoice, BuildSelection, BuildSelectionMode, parse_build_candidates,
+};
 use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::{ProjectContext, ProjectOptions};
 use std::fs;
@@ -149,6 +151,287 @@ fn explicit_build_configuration_is_reported_using_candidate_spelling() {
 }
 
 #[test]
+fn session_build_choice_selects_debug_and_overrides_project_configuration() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    write(
+        &root.join("config.toml"),
+        "[projects.\"App.dproj\"]\nconfig = 'Release'\n",
+    );
+    let project_file = root.join("App.dproj");
+    let options = ProjectOptions {
+        build_config: Some("Release".into()),
+        build_selections: [(
+            project_file,
+            BuildChoice {
+                config: Some("Debug".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+
+    let context = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(context.config_selection.mode, BuildSelectionMode::Session);
+    assert_eq!(context.config_selection.selected.as_deref(), Some("Debug"));
+    assert!(context.defines.iter().any(|define| define == "DEBUG"));
+    assert!(!context.defines.iter().any(|define| define == "RELEASE"));
+}
+
+#[test]
+fn config_toml_build_choice_selects_debug_over_global_option() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    write(
+        &root.join("config.toml"),
+        "[projects.\"App.dproj\"]\nconfig = 'Debug'\nplatform = 'Win32'\n",
+    );
+    let options = ProjectOptions {
+        build_config: Some("Release".into()),
+        ..ProjectOptions::default()
+    };
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+
+    let context = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(
+        context.config_selection.mode,
+        BuildSelectionMode::Configured
+    );
+    assert_eq!(context.config_selection.selected.as_deref(), Some("Debug"));
+    assert_eq!(
+        context.platform_selection.mode,
+        BuildSelectionMode::Configured
+    );
+    assert_eq!(
+        context.platform_selection.selected.as_deref(),
+        Some("Win32")
+    );
+    assert!(context.defines.iter().any(|define| define == "DEBUG"));
+    assert!(!context.defines.iter().any(|define| define == "RELEASE"));
+}
+
+#[test]
+fn config_toml_platform_choice_overrides_global_platform() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture_with_platforms(root);
+    write(
+        &root.join("config.toml"),
+        "[projects.\"App.dproj\"]\nplatform = 'Win64'\n",
+    );
+    let options = ProjectOptions {
+        platform: Some("Win32".into()),
+        ..ProjectOptions::default()
+    };
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+
+    let context = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(
+        context.platform_selection.mode,
+        BuildSelectionMode::Configured
+    );
+    assert_eq!(
+        context.platform_selection.selected.as_deref(),
+        Some("Win64")
+    );
+    assert_eq!(context.platform.as_deref(), Some("Win64"));
+}
+
+#[test]
+fn session_platform_choice_overrides_config_toml_platform() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture_with_platforms(root);
+    write(
+        &root.join("config.toml"),
+        "[projects.\"App.dproj\"]\nplatform = 'Win64'\n",
+    );
+    let options = ProjectOptions {
+        platform: Some("Win64".into()),
+        build_selections: [(
+            root.join("App.dproj"),
+            BuildChoice {
+                platform: Some("Win32".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+
+    let context = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(context.platform_selection.mode, BuildSelectionMode::Session);
+    assert_eq!(
+        context.platform_selection.selected.as_deref(),
+        Some("Win32")
+    );
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
+}
+
+#[test]
+fn invalid_session_build_choice_is_reported_without_falling_back() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let project_file = root.join("App.dproj");
+    let options = ProjectOptions {
+        build_config: Some("Release".into()),
+        build_selections: [(
+            project_file.clone(),
+            BuildChoice {
+                config: Some("Gone".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(context.config_selection.mode, BuildSelectionMode::Invalid);
+    assert_eq!(context.config_selection.selected.as_deref(), Some("Gone"));
+    assert!(context.warnings.iter().any(|warning| {
+        warning
+            == &format!(
+                "build configuration `Gone` is not defined by {}",
+                project_file.display()
+            )
+    }));
+}
+
+#[test]
+fn invalid_session_platform_choice_has_its_own_invalid_mode() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    let project_file = root.join("App.dproj");
+    let options = ProjectOptions {
+        build_selections: [(
+            project_file.clone(),
+            BuildChoice {
+                platform: Some("Gone".into()),
+                ..BuildChoice::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(context.platform_selection.mode, BuildSelectionMode::Invalid);
+    assert_eq!(context.platform_selection.selected.as_deref(), Some("Gone"));
+    assert!(context.warnings.iter().any(|warning| {
+        warning
+            == &format!(
+                "platform `Gone` is not defined by {}",
+                project_file.display()
+            )
+    }));
+}
+
+#[test]
+fn invalid_config_toml_build_choice_is_reported_without_falling_back() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+    write(
+        &root.join("config.toml"),
+        "[projects.\"App.dproj\"]\nconfig = 'Gone'\n",
+    );
+    let options = ProjectOptions {
+        build_config: Some("Debug".into()),
+        ..ProjectOptions::default()
+    };
+    let overrides = OverrideSession::new(Some(root.join("config.toml")));
+
+    let context = discover_webquery_at(root, &options, &overrides);
+
+    assert_eq!(context.config_selection.mode, BuildSelectionMode::Invalid);
+    assert_eq!(context.config_selection.selected.as_deref(), Some("Gone"));
+    assert!(context.warnings.iter().any(|warning| {
+        warning
+            == &format!(
+                "build configuration `Gone` is not defined by {}",
+                root.join("App.dproj").display()
+            )
+    }));
+}
+
+#[test]
+fn invalid_global_build_configuration_stays_configured_and_warns() {
+    let options = ProjectOptions {
+        build_config: Some("Gone".into()),
+        ..ProjectOptions::default()
+    };
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    write_webquery_fixture(root);
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(
+        context.config_selection.mode,
+        BuildSelectionMode::Configured
+    );
+    assert_eq!(context.config_selection.selected.as_deref(), Some("Gone"));
+    assert!(context.warnings.iter().any(|warning| {
+        warning
+            == &format!(
+                "build configuration `Gone` is not defined by {}",
+                root.join("App.dproj").display()
+            )
+    }));
+}
+
+#[test]
+fn project_selector_without_any_choice_is_a_configuration_error() {
+    let temp = tempdir().expect("temporary directory");
+    let config_file = temp.path().join("config.toml");
+    write(&config_file, "[projects.\"App.dproj\"]\n");
+
+    let error = OverrideSession::new(Some(config_file.clone()))
+        .configuration_for(None, None)
+        .expect_err("empty project selectors are rejected");
+
+    assert!(
+        error.contains("project selector `App.dproj` sets no installation, config, or platform")
+    );
+}
+
+#[test]
+fn project_selector_rejects_blank_build_values() {
+    for (key, value) in [("config", "''"), ("platform", "''")] {
+        let temp = tempdir().expect("temporary directory");
+        let config_file = temp.path().join("config.toml");
+        write(
+            &config_file,
+            &format!("[projects.\"App.dproj\"]\n{key} = {value}\n"),
+        );
+
+        let error = OverrideSession::new(Some(config_file))
+            .configuration_for(None, None)
+            .expect_err("blank project choices are rejected");
+
+        assert!(error.contains(&format!("project selector `App.dproj` has an empty {key}")));
+    }
+}
+
+#[test]
 fn override_property_configuration_is_reported_as_configured() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -248,6 +531,40 @@ fn project_context_recovery_visits_build_selection_strings() {
 fn discover_webquery(options: &ProjectOptions) -> ProjectContext {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
+    write_webquery_fixture(root);
+
+    discover_webquery_at(root, options, &OverrideSession::new(None))
+}
+
+fn discover_webquery_at(
+    root: &Path,
+    options: &ProjectOptions,
+    overrides: &OverrideSession,
+) -> ProjectContext {
+    ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        options,
+        overrides,
+    )
+    .expect("WebQuery discovery")
+}
+
+fn write_webquery_fixture(root: &Path) {
+    write_webquery_fixture_with_dproj(root, WEBQUERY_DPROJ);
+}
+
+fn write_webquery_fixture_with_platforms(root: &Path) {
+    let dproj = WEBQUERY_DPROJ.replace(
+        "</Project>",
+        "<ProjectExtensions><BorlandProject><Platforms>\
+         <Platform value=\"Win32\">True</Platform><Platform value=\"Win64\">True</Platform>\
+         </Platforms></BorlandProject></ProjectExtensions></Project>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+}
+
+fn write_webquery_fixture_with_dproj(root: &Path, dproj: &str) {
     write(
         &root.join("App.dpr"),
         "program App; uses SvcMain in 'SvcMain.pas'; begin end.",
@@ -256,18 +573,7 @@ fn discover_webquery(options: &ProjectOptions) -> ProjectContext {
         &root.join("SvcMain.pas"),
         "unit SvcMain; interface implementation end.",
     );
-    write(
-        &root.join("App.dproj"),
-        &format!("\u{feff}{WEBQUERY_DPROJ}"),
-    );
-
-    ProjectContext::discover_with_overrides(
-        &root.join("App.dpr"),
-        &[root.to_path_buf()],
-        options,
-        &OverrideSession::new(None),
-    )
-    .expect("WebQuery discovery")
+    write(&root.join("App.dproj"), &format!("\u{feff}{dproj}"));
 }
 
 fn write(path: &Path, contents: &str) {

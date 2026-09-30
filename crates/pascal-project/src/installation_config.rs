@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::build_selection::BuildChoice;
 use crate::conditional::ConditionalContext;
 use crate::delphi_overrides::{EffectiveOverrides, OverrideLayer, RawPathMapping, config_error};
 
@@ -12,6 +13,7 @@ pub(crate) struct ConfigurationLayer {
     pub(crate) installations: BTreeMap<String, OverrideLayer>,
     pub(crate) rtl_constants: BTreeMap<String, Vec<String>>,
     projects: HashMap<PathBuf, String>,
+    build_projects: HashMap<PathBuf, BuildChoice>,
     pub(crate) source_stamp: ConfigurationSourceStamp,
 }
 
@@ -49,7 +51,12 @@ struct RawInstallation {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProject {
-    installation: String,
+    #[serde(default)]
+    installation: Option<String>,
+    #[serde(default)]
+    config: Option<String>,
+    #[serde(default)]
+    platform: Option<String>,
 }
 
 impl ConfigurationLayer {
@@ -89,19 +96,54 @@ impl ConfigurationLayer {
         }
 
         let mut projects = HashMap::new();
+        let mut build_projects = HashMap::new();
+        let mut project_selectors = HashSet::new();
         for (selector, project) in raw.projects {
-            if project.installation.trim().is_empty() {
+            if project.installation.is_none()
+                && project.config.is_none()
+                && project.platform.is_none()
+            {
+                return Err(config_error(
+                    config_file,
+                    format_args!(
+                        "project selector `{selector}` sets no installation, config, or platform"
+                    ),
+                ));
+            }
+            if project
+                .installation
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
                 return Err(config_error(
                     config_file,
                     format_args!("project selector `{selector}` has an empty installation ID"),
                 ));
             }
+            for (name, value) in [("config", &project.config), ("platform", &project.platform)] {
+                if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                    return Err(config_error(
+                        config_file,
+                        format_args!("project selector `{selector}` has an empty {name}"),
+                    ));
+                }
+            }
             let key = normalize_selector(config_file, &selector)?;
-            if projects.insert(key, project.installation).is_some() {
+            if !project_selectors.insert(key.clone()) {
                 return Err(config_error(
                     config_file,
                     format_args!("duplicate normalized project selector `{selector}`"),
                 ));
+            }
+            if let Some(installation) = project.installation {
+                projects.insert(key.clone(), installation);
+            }
+            let build_choice = BuildChoice {
+                config: project.config,
+                platform: project.platform,
+            };
+            if build_choice.config.is_some() || build_choice.platform.is_some() {
+                build_projects.insert(key, build_choice);
             }
         }
 
@@ -110,6 +152,7 @@ impl ConfigurationLayer {
             installations,
             rtl_constants,
             projects,
+            build_projects,
             source_stamp: ConfigurationSourceStamp {
                 path: config_file.to_path_buf(),
                 byte_len: Some(text.len() as u64),
@@ -126,6 +169,7 @@ impl ConfigurationLayer {
 pub struct ProjectConfiguration {
     layers: Vec<ConfigurationLayer>,
     selectors: HashMap<PathBuf, String>,
+    build_selectors: HashMap<PathBuf, BuildChoice>,
     source_stamps: Vec<ConfigurationSourceStamp>,
 }
 
@@ -139,8 +183,10 @@ pub struct ResolvedInstallation {
 impl ProjectConfiguration {
     pub(crate) fn from_layers(layers: Vec<ConfigurationLayer>) -> Self {
         let mut selectors = HashMap::new();
+        let mut build_selectors = HashMap::new();
         for layer in &layers {
             selectors.extend(layer.projects.clone());
+            build_selectors.extend(layer.build_projects.clone());
         }
         let source_stamps = layers
             .iter()
@@ -149,6 +195,7 @@ impl ProjectConfiguration {
         Self {
             layers,
             selectors,
+            build_selectors,
             source_stamps,
         }
     }
@@ -212,6 +259,14 @@ impl ProjectConfiguration {
         let project = absolute_lexical(project).ok()?;
         let key = canonical_path(&project);
         self.selectors.get(&key).map(String::as_str)
+    }
+
+    pub fn configured_build_for(&self, project: &Path) -> BuildChoice {
+        let Ok(project) = absolute_lexical(project) else {
+            return BuildChoice::default();
+        };
+        let key = canonical_path(&project);
+        self.build_selectors.get(&key).cloned().unwrap_or_default()
     }
 }
 

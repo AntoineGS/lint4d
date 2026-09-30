@@ -3258,6 +3258,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
             installation_selections,
+            build_selections: Default::default(),
         }
     }
 
@@ -5794,6 +5795,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
             installation_selections: self.installation_selections.clone(),
+            build_selections: Default::default(),
         };
         let (context_key, context) =
             self.readonly_context_for_uri(uri, &path, &roots, &project_options)?;
@@ -8703,6 +8705,7 @@ impl Workspace {
             source_paths: self.options.source_paths.clone(),
             conditional_context: self.options.conditional_context.clone(),
             installation_selections: self.installation_selections.clone(),
+            build_selections: Default::default(),
         };
         let deleted_paths = self.deleted_path_snapshot_with_control(cancel, budget)?;
         if let Some(owner) = self.document_owners.get(uri).cloned() {

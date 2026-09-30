@@ -2,6 +2,12 @@ use crate::TargetPlatform;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct BuildChoice {
+    pub config: Option<String>,
+    pub platform: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildCandidates {
     pub configs: Vec<String>,

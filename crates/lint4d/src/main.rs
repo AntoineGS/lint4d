@@ -548,6 +548,7 @@ fn resolve_source_project(cli: &Cli, config: &Config, files: &[FileInfo]) -> Opt
         source_paths: Vec::new(),
         conditional_context: Default::default(),
         installation_selections: Default::default(),
+        build_selections: Default::default(),
     };
     let probe = files
         .first()

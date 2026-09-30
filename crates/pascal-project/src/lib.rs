@@ -22,7 +22,7 @@ pub mod installations;
 pub mod path_issues;
 pub mod rtl_constants;
 
-pub use build_selection::{BuildCandidates, BuildSelection, BuildSelectionMode};
+pub use build_selection::{BuildCandidates, BuildChoice, BuildSelection, BuildSelectionMode};
 pub use compiler_defines::TargetPlatform;
 pub use conditional::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, canonical_option_name,
@@ -78,6 +78,9 @@ pub struct ProjectOptions {
     /// Exact-project session installation choices. An absent entry restores
     /// Automatic selection; project directories are never used as keys.
     pub installation_selections: HashMap<PathBuf, String>,
+    /// Exact-project session build choices. Missing fields use the next
+    /// configured source independently for the configuration and platform.
+    pub build_selections: HashMap<PathBuf, BuildChoice>,
     /// The selected Delphi build configuration, such as `Debug` or `Release`.
     pub build_config: Option<String>,
     /// The selected Delphi platform, such as `Win32` or `Win64`.
@@ -3911,6 +3914,32 @@ fn build_project_context(
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let mut read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut evaluation_options = options.clone();
+    let session_build_choice = options
+        .build_selections
+        .iter()
+        .find(|(path, _)| project_paths_equal(path, &project_file))
+        .map(|(_, choice)| choice);
+    let configured_build_choice = installation_config.configured_build_for(&project_file);
+    let config_selected_in_session = session_build_choice
+        .and_then(|choice| choice.config.as_ref())
+        .is_some();
+    let platform_selected_in_session = session_build_choice
+        .and_then(|choice| choice.platform.as_ref())
+        .is_some();
+    let config_selected_in_project_config =
+        !config_selected_in_session && configured_build_choice.config.is_some();
+    let platform_selected_in_project_config =
+        !platform_selected_in_session && configured_build_choice.platform.is_some();
+    if let Some(config) = session_build_choice.and_then(|choice| choice.config.as_ref()) {
+        evaluation_options.build_config = Some(config.clone());
+    } else if let Some(config) = configured_build_choice.config.as_ref() {
+        evaluation_options.build_config = Some(config.clone());
+    }
+    if let Some(platform) = session_build_choice.and_then(|choice| choice.platform.as_ref()) {
+        evaluation_options.platform = Some(platform.clone());
+    } else if let Some(platform) = configured_build_choice.platform.as_ref() {
+        evaluation_options.platform = Some(platform.clone());
+    }
     let caller_compiler_version = options.conditional_context.compiler_version;
     let mut bootstrap_config = None;
     let mut bootstrap_platform = None;
@@ -4394,19 +4423,47 @@ fn build_project_context(
 
     let config = selected_config(&builder, &evaluation_options);
     let platform = selected_platform(&builder, &evaluation_options);
-    let config_selection = build_selection::selection_for_value(
+    let mut config_selection = build_selection::selection_for_value(
         config.as_deref(),
         &build_candidates.configs,
         build_candidates.default_config.as_deref(),
         config_is_configured,
         false,
     );
-    let platform_selection = build_selection::selection_for_value(
+    config_selection.mode = if config_selected_in_session {
+        BuildSelectionMode::Session
+    } else if config_selected_in_project_config || config_is_configured {
+        BuildSelectionMode::Configured
+    } else {
+        BuildSelectionMode::ProjectDefault
+    };
+    warn_for_unknown_build_selection(
+        &mut config_selection,
+        config_selected_in_session || config_selected_in_project_config,
+        false,
+        &project_file,
+        &mut builder.warnings,
+    );
+    let mut platform_selection = build_selection::selection_for_value(
         platform.as_deref(),
         &build_candidates.platforms,
         build_candidates.default_platform.as_deref(),
         platform_is_configured,
         true,
+    );
+    platform_selection.mode = if platform_selected_in_session {
+        BuildSelectionMode::Session
+    } else if platform_selected_in_project_config || platform_is_configured {
+        BuildSelectionMode::Configured
+    } else {
+        BuildSelectionMode::ProjectDefault
+    };
+    warn_for_unknown_build_selection(
+        &mut platform_selection,
+        platform_selected_in_session || platform_selected_in_project_config,
+        true,
+        &project_file,
+        &mut builder.warnings,
     );
 
     Ok(ProjectContext {
@@ -4604,6 +4661,37 @@ fn selected_config(builder: &ProjectBuilder, options: &ProjectOptions) -> Option
         .property("config")
         .filter(|value| !value.is_empty() && !value.contains(UNRESOLVED_MARKER))
         .or_else(|| options.build_config.clone())
+}
+
+fn warn_for_unknown_build_selection(
+    selection: &mut BuildSelection,
+    reject_as_invalid: bool,
+    is_platform: bool,
+    project_file: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let Some(selected) = selection.selected.as_deref() else {
+        return;
+    };
+    if selection
+        .candidates
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(selected))
+    {
+        return;
+    }
+    let subject = if is_platform {
+        "platform"
+    } else {
+        "build configuration"
+    };
+    warnings.push(format!(
+        "{subject} `{selected}` is not defined by {}",
+        project_file.display()
+    ));
+    if reject_as_invalid {
+        selection.mode = BuildSelectionMode::Invalid;
+    }
 }
 
 fn selected_standalone_property(

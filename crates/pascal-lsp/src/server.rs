@@ -19997,6 +19997,7 @@ mod tests {
                     uri: uri.clone(),
                     total: 1,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("create warm progress");
@@ -20011,6 +20012,7 @@ mod tests {
                     done: 1,
                     total: 1,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("record completed unit");
@@ -20022,6 +20024,7 @@ mod tests {
                     fingerprint: None,
                     pins: Vec::new(),
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("finish warm attempt");
@@ -20075,6 +20078,7 @@ mod tests {
                     uri: active_uri,
                     total: 0,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("create active token");
@@ -20097,6 +20101,7 @@ mod tests {
                     uri: pending_uri,
                     total: 0,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("create pending token");
@@ -20131,6 +20136,7 @@ mod tests {
             uri: uri.clone(),
             total: 2,
             generation: 0,
+            open_epoch: 0,
         };
         progress.handle(&connection, &begin).expect("create token");
         let Message::Request(create) = client.receiver.recv().expect("create request") else {
@@ -20144,6 +20150,7 @@ mod tests {
                     done: 1,
                     total: 2,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("save first unit report until create ack");
@@ -20153,6 +20160,7 @@ mod tests {
                 &crate::warmer::WarmEvent::Paused {
                     uri: uri.clone(),
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("pause first attempt");
@@ -20184,6 +20192,7 @@ mod tests {
                 &crate::warmer::WarmEvent::Paused {
                     uri: uri.clone(),
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("pause second attempt");
@@ -20203,6 +20212,7 @@ mod tests {
                     fingerprint: None,
                     pins: Vec::new(),
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("finish retry");
@@ -20241,6 +20251,7 @@ mod tests {
                     uri: active_uri.clone(),
                     total: 0,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("create active token");
@@ -20263,6 +20274,7 @@ mod tests {
                     uri: pending_uri.clone(),
                     total: 0,
                     generation: 0,
+                    open_epoch: 0,
                 },
             )
             .expect("create pending token");

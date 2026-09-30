@@ -92,22 +92,26 @@ pub(crate) enum WarmEvent {
         uri: Url,
         total: usize,
         generation: u64,
+        open_epoch: u64,
     },
     Progress {
         uri: Url,
         done: usize,
         total: usize,
         generation: u64,
+        open_epoch: u64,
     },
     End {
         uri: Url,
         fingerprint: Option<u64>,
         pins: Vec<(Url, u64)>,
         generation: u64,
+        open_epoch: u64,
     },
     Paused {
         uri: Url,
         generation: u64,
+        open_epoch: u64,
     },
 }
 
@@ -349,6 +353,7 @@ struct WarmJob {
     input: WorkspaceInput,
     cancel: Arc<AtomicBool>,
     generation: u64,
+    open_epoch: u64,
 }
 
 pub(crate) struct Warmer {
@@ -358,6 +363,8 @@ pub(crate) struct Warmer {
     events: Receiver<WarmEvent>,
     cancel: Arc<AtomicBool>,
     generation: u64,
+    next_open_epoch: u64,
+    open_epochs: HashMap<Url, u64>,
     busy: bool,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -382,6 +389,8 @@ impl Warmer {
             events,
             cancel: Arc::new(AtomicBool::new(false)),
             generation: 0,
+            next_open_epoch: 0,
+            open_epochs: HashMap::new(),
             busy: false,
             thread: Some(thread),
         }
@@ -393,11 +402,18 @@ impl Warmer {
     }
 
     pub(crate) fn open(&mut self, uri: Url) {
+        self.next_open_epoch = self
+            .next_open_epoch
+            .checked_add(1)
+            .expect("warm open identity space exhausted");
+        self.open_epochs.insert(uri.clone(), self.next_open_epoch);
         self.open_order.retain(|opened| opened != &uri);
         self.open_order.push_front(uri.clone());
         self.queue.push_front(uri);
     }
 
+    /// Schedules another attempt for an already-open file without changing
+    /// its identity. Watcher invalidations are not document reopenings.
     pub(crate) fn rewarm(&mut self, uri: Url) {
         self.queue.push_front(uri);
     }
@@ -405,6 +421,7 @@ impl Warmer {
     pub(crate) fn close(&mut self, uri: &Url, cache: &crate::project_cache::ProjectCache) {
         self.queue.remove(uri);
         self.open_order.retain(|opened| opened != uri);
+        self.open_epochs.remove(uri);
         cache.unpin(uri);
     }
 
@@ -421,6 +438,7 @@ impl Warmer {
         self.queue.clear();
         let open = open.into_iter().collect::<HashSet<_>>();
         self.open_order.retain(|uri| open.contains(uri));
+        self.open_epochs.retain(|uri, _| open.contains(uri));
         for uri in self.open_order.iter().rev() {
             self.queue.push_front(uri.clone());
         }
@@ -433,20 +451,21 @@ impl Warmer {
     pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.events.try_recv() {
-            if self.accept_event(&event, workspace) {
+            if self.accept_event(&event) {
                 events.push(event);
             }
         }
         if !self.busy && workspace.project_cache().has_room() {
             while let Some(uri) = self.queue.pop() {
-                if !workspace.is_open(&uri) {
+                let Some(open_epoch) = self.open_epochs.get(&uri).copied() else {
                     continue;
-                }
+                };
                 let job = WarmJob {
                     uri,
                     input: workspace.analysis_input(),
                     cancel: self.cancel.clone(),
                     generation: self.generation,
+                    open_epoch,
                 };
                 if self
                     .jobs
@@ -461,31 +480,47 @@ impl Warmer {
         events
     }
 
-    fn accept_event(&mut self, event: &WarmEvent, workspace: &Workspace) -> bool {
+    fn accept_event(&mut self, event: &WarmEvent) -> bool {
         match event {
-            WarmEvent::End { generation, .. } => {
+            WarmEvent::End {
+                uri,
+                generation,
+                open_epoch,
+                ..
+            } => {
                 self.busy = false;
                 *generation == self.generation
+                    && self.open_epochs.get(uri).copied() == Some(*open_epoch)
             }
-            WarmEvent::Paused { uri, generation } => {
+            WarmEvent::Paused {
+                uri,
+                generation,
+                open_epoch,
+            } => {
                 self.busy = false;
-                if *generation != self.generation {
+                if *generation != self.generation
+                    || self.open_epochs.get(uri).copied() != Some(*open_epoch)
+                {
                     return false;
                 }
-                if workspace.is_open(uri) {
-                    self.queue.push_front(uri.clone());
-                }
-                // Keep a closed-file pause only long enough for WarmProgress
-                // to end any token that escaped the didClose cleanup. It is
-                // never requeued and cannot produce a progress report.
+                self.queue.push_front(uri.clone());
                 true
             }
             WarmEvent::Begin {
-                uri, generation, ..
+                uri,
+                generation,
+                open_epoch,
+                ..
             }
             | WarmEvent::Progress {
-                uri, generation, ..
-            } => *generation == self.generation && workspace.is_open(uri),
+                uri,
+                generation,
+                open_epoch,
+                ..
+            } => {
+                *generation == self.generation
+                    && self.open_epochs.get(uri).copied() == Some(*open_epoch)
+            }
         }
     }
 
@@ -538,6 +573,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             fingerprint,
             pins,
             generation: job.generation,
+            open_epoch: job.open_epoch,
         });
     };
     if !gate.wait_idle(&job.cancel) {
@@ -547,6 +583,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     let hook_events = events.clone();
     let hook_uri = job.uri.clone();
     let hook_generation = job.generation;
+    let hook_open_epoch = job.open_epoch;
     let hook_cancel = job.cancel.clone();
     let hook_gate = gate.clone();
     let paused = Arc::new(AtomicBool::new(false));
@@ -557,6 +594,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
                 uri: hook_uri.clone(),
                 total,
                 generation: hook_generation,
+                open_epoch: hook_open_epoch,
             });
         } else {
             let _ = hook_events.send(WarmEvent::Progress {
@@ -564,6 +602,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
                 done,
                 total,
                 generation: hook_generation,
+                open_epoch: hook_open_epoch,
             });
         }
         // Pause between units while interactive requests run.
@@ -593,6 +632,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             let _ = events.send(WarmEvent::Paused {
                 uri: job.uri,
                 generation: job.generation,
+                open_epoch: job.open_epoch,
             });
         }
         Err(_) => end(None, Vec::new()),
@@ -823,11 +863,14 @@ mod tests {
         warmer.open(a.clone());
         warmer.open(b.clone());
         warmer.open(c.clone());
+        let a_open_epoch = warmer.open_epochs[a];
         warmer.rewarm(a.clone());
+        assert_eq!(warmer.open_epochs[a], a_open_epoch);
 
         // Workspace enumeration is unordered and may supply the reverse of
         // the warmer's recency order.
         warmer.reset([c.clone(), b.clone(), a.clone()], workspace.project_cache());
+        assert_eq!(warmer.open_epochs[a], a_open_epoch);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut dispatched = Vec::new();
         while std::time::Instant::now() < deadline && dispatched.len() < 3 {
@@ -935,15 +978,18 @@ mod tests {
 
     #[test]
     fn paused_event_requeues_open_file_for_retry() {
-        let (_temp, workspace, main) = fixture();
+        let (_temp, _workspace, main) = fixture();
         let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        warmer.queue.clear();
         warmer.busy = true;
         let event = WarmEvent::Paused {
             uri: main.clone(),
             generation: warmer.generation,
+            open_epoch: warmer.open_epochs[&main],
         };
 
-        assert!(warmer.accept_event(&event, &workspace));
+        assert!(warmer.accept_event(&event));
         assert!(!warmer.busy);
         assert_eq!(warmer.queue.pop(), Some(main));
     }
@@ -952,7 +998,10 @@ mod tests {
     fn poll_drops_stale_generation_progress_events() {
         let (_temp, workspace, main) = fixture();
         let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        warmer.queue.clear();
         warmer.generation = 4;
+        let open_epoch = warmer.open_epochs[&main];
         let (sender, events) = crossbeam_channel::unbounded();
         warmer.events = events;
         for event in [
@@ -960,27 +1009,32 @@ mod tests {
                 uri: main.clone(),
                 total: 1,
                 generation: 3,
+                open_epoch,
             },
             WarmEvent::Progress {
                 uri: main.clone(),
                 done: 1,
                 total: 1,
                 generation: 3,
+                open_epoch,
             },
             WarmEvent::Paused {
                 uri: main.clone(),
                 generation: 3,
+                open_epoch,
             },
             WarmEvent::Begin {
                 uri: main.clone(),
                 total: 1,
                 generation: 4,
+                open_epoch,
             },
             WarmEvent::Progress {
                 uri: main,
                 done: 1,
                 total: 1,
                 generation: 4,
+                open_epoch,
             },
         ] {
             sender.send(event).expect("queue warmer event");
@@ -1007,6 +1061,7 @@ mod tests {
         let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
         let mut progress = WarmProgress::new(true);
         warmer.open(main.clone());
+        let open_epoch = warmer.open_epochs[&main];
         warmer.busy = true;
 
         assert!(workspace.close_document(&main));
@@ -1019,8 +1074,9 @@ mod tests {
             uri: main.clone(),
             total: 1,
             generation: warmer.generation,
+            open_epoch,
         };
-        let begin_accepted = warmer.accept_event(&late_begin, &workspace);
+        let begin_accepted = warmer.accept_event(&late_begin);
         if begin_accepted {
             progress
                 .handle_with_retry(&connection, &late_begin, true)
@@ -1029,8 +1085,9 @@ mod tests {
         let late_paused = WarmEvent::Paused {
             uri: main.clone(),
             generation: warmer.generation,
+            open_epoch,
         };
-        let paused_accepted = warmer.accept_event(&late_paused, &workspace);
+        let paused_accepted = warmer.accept_event(&late_paused);
         if paused_accepted {
             progress
                 .handle_with_retry(&connection, &late_paused, workspace.is_open(&main))
@@ -1048,6 +1105,102 @@ mod tests {
     }
 
     #[test]
+    fn close_reopen_drops_events_from_the_first_open() {
+        let (temp, mut workspace, main) = fixture();
+        let other_text = "unit Other;\ninterface\nimplementation\nend.\n";
+        let other_path = temp.path().join("Other.pas");
+        std::fs::write(&other_path, other_text).expect("write other unit");
+        let other = Url::from_file_path(other_path).expect("other URI");
+        workspace
+            .open_document(other.clone(), other_text.to_string(), 1)
+            .expect("open other unit");
+
+        let (connection, client) = lsp_server::Connection::memory();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        let mut progress = WarmProgress::new(true);
+        warmer.open(main.clone());
+        let first_open_epoch = warmer.open_epochs[&main];
+        warmer.busy = true;
+
+        assert!(workspace.close_document(&main));
+        warmer.close(&main, workspace.project_cache());
+        progress
+            .close(&connection, &main)
+            .expect("close first-open progress");
+        let main_text = std::fs::read_to_string(temp.path().join("Main.pas"))
+            .expect("read main unit for reopen");
+        workspace
+            .open_document(main.clone(), main_text, 2)
+            .expect("reopen main unit");
+        warmer.open(main.clone());
+        let reopened_epoch = warmer.open_epochs[&main];
+        assert_ne!(reopened_epoch, first_open_epoch);
+        warmer.open(other);
+        let queue_before_old_events = warmer.queue.order.clone();
+        workspace.project_cache().set_max_bytes(0);
+
+        let (sender, old_events) = crossbeam_channel::unbounded();
+        warmer.events = old_events;
+        let generation = warmer.generation;
+        for event in [
+            WarmEvent::Begin {
+                uri: main.clone(),
+                total: 1,
+                generation,
+                open_epoch: first_open_epoch,
+            },
+            WarmEvent::Progress {
+                uri: main.clone(),
+                done: 1,
+                total: 1,
+                generation,
+                open_epoch: first_open_epoch,
+            },
+            WarmEvent::Paused {
+                uri: main.clone(),
+                generation,
+                open_epoch: first_open_epoch,
+            },
+            WarmEvent::End {
+                uri: main.clone(),
+                fingerprint: Some(7),
+                pins: vec![(main.clone(), 7)],
+                generation,
+                open_epoch: first_open_epoch,
+            },
+        ] {
+            sender.send(event).expect("queue old-open event");
+        }
+
+        let accepted = warmer.poll(&workspace);
+        for event in &accepted {
+            let paused_will_retry = match event {
+                WarmEvent::Paused { uri, .. } => workspace.is_open(uri),
+                _ => true,
+            };
+            progress
+                .handle_with_retry(&connection, event, paused_will_retry)
+                .expect("handle accepted event");
+        }
+
+        assert!(
+            accepted
+                .iter()
+                .all(|event| !matches!(event, WarmEvent::End { .. })),
+            "a stale End must not reach the caller's cache pinning path"
+        );
+        assert!(accepted.is_empty(), "old-open events must all be fenced");
+        assert_eq!(warmer.queue.order, queue_before_old_events);
+        assert!(!warmer.busy, "stale End still releases the old worker slot");
+        assert!(progress.active.is_empty());
+        assert!(progress.pending_creates.is_empty());
+        assert!(
+            client.receiver.try_recv().is_err(),
+            "a stale Begin must not create progress for the reopened URI"
+        );
+    }
+
+    #[test]
     fn paused_closed_uri_ends_active_progress_when_no_retry_is_planned() {
         let (connection, client) = lsp_server::Connection::memory();
         let uri = uri("Closed.pas");
@@ -1056,6 +1209,7 @@ mod tests {
             uri: uri.clone(),
             total: 1,
             generation: 0,
+            open_epoch: 0,
         };
         progress
             .handle_with_retry(&connection, &begin, true)
@@ -1079,6 +1233,7 @@ mod tests {
                 &WarmEvent::Paused {
                     uri: uri.clone(),
                     generation: 0,
+                    open_epoch: 0,
                 },
                 false,
             )

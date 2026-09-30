@@ -860,6 +860,33 @@ fn standalone_contexts_remain_open_and_use_client_predefined_symbols() {
 }
 
 #[test]
+fn standalone_pas_sources_do_not_infer_console_target() {
+    let temp = tempdir().expect("temporary directory");
+    let source = temp.path().join("Standalone.pas");
+    write(&source, "unit Standalone; interface implementation end.");
+
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[temp.path().to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .expect("standalone discovery");
+
+    assert_eq!(
+        context.conditional_context_for(&source).define("CONSOLE"),
+        ConditionalFact::Unknown
+    );
+    assert!(
+        context
+            .metadata_observations
+            .iter()
+            .all(|observation| observation.path() != source),
+        "standalone source must not be recorded as a metadata observation"
+    );
+}
+
+#[test]
 fn standalone_context_keeps_version_symbols_when_platform_is_unknown() {
     let temp = tempdir().expect("temporary directory");
     let source = temp.path().join("Standalone.pas");

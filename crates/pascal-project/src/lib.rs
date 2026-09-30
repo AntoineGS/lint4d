@@ -4694,7 +4694,7 @@ fn build_standalone_context(
     mut warnings: Vec<String>,
     discovery_complete: bool,
     metadata_files: Vec<PathBuf>,
-    mut metadata_observations: Vec<MetadataObservation>,
+    metadata_observations: Vec<MetadataObservation>,
     exclusions: &[String],
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectContext, String> {
@@ -4733,35 +4733,9 @@ fn build_standalone_context(
     let project_source_roots = paths_from_entries(&search_path_entries);
     let config = selected_standalone_property(&overrides, options.build_config.as_ref(), "config");
     let platform = selected_standalone_property(&overrides, options.platform.as_ref(), "platform");
-    let console_target = if overrides
-        .properties
-        .get("dcc_consoletarget")
-        .and_then(|value| parse_conditional_fact(value.as_str()))
-        == Some(ConditionalFact::True)
-    {
-        ConditionalFact::True
-    } else if let Some(source_entry) = search_path_entries
-        .iter()
-        .find(|root| project_path_starts_with(file, &root.path))
-        .map(|root| ProjectPathEntry {
-            path: file.to_path_buf(),
-            provenance: root.provenance.clone(),
-        })
-    {
-        match read_policy.read_pascal_payload_with_observation(&source_entry, MAX_PROJECT_BYTES) {
-            Ok((source, observation)) => {
-                add_metadata_observation(&mut metadata_observations, observation);
-                if conditional_closure::source_has_console_apptype(&source) {
-                    ConditionalFact::True
-                } else {
-                    ConditionalFact::False
-                }
-            }
-            Err(_) => ConditionalFact::Unknown,
-        }
-    } else {
-        ConditionalFact::Unknown
-    };
+    // A standalone source is not necessarily a program's main source, so it
+    // cannot establish the project-level CONSOLE target.
+    let console_target = ConditionalFact::Unknown;
     let mut conditional_context = options.conditional_context.clone();
     let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
     let predefined = crate::compiler_defines::predefined_defines(

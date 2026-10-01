@@ -157,6 +157,9 @@ fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
 // scheduler stalls on loaded hosts without weakening the short, explicit
 // negative-assertion timeouts used below.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Requests that deliberately drive a server limit to its maximum in a debug
+/// build, such as 32 missing-unit binding proofs.
+const LIMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {
     Workspace::with_override_session(roots, options, OverrideSession::new(None))
@@ -2044,6 +2047,19 @@ fn request_missing_unit_actions(
     identifier: &str,
     request_id: &str,
 ) -> Vec<Value> {
+    request_missing_unit_actions_with_timeout(
+        server, path, source, identifier, request_id, IO_TIMEOUT,
+    )
+}
+
+fn request_missing_unit_actions_with_timeout(
+    server: &mut TestServer,
+    path: &Path,
+    source: &str,
+    identifier: &str,
+    request_id: &str,
+    timeout: Duration,
+) -> Vec<Value> {
     let id = RequestId::from(request_id.to_string());
     server.send_request(
         id.clone(),
@@ -2057,7 +2073,9 @@ fn request_missing_unit_actions(
             "context": {"diagnostics": [], "only": ["quickfix"]}
         }),
     );
-    let response = server.response(&id);
+    let response = server
+        .response_with_timeout(&id, timeout)
+        .expect("code action response");
     assert!(response.error.is_none(), "codeAction failed: {response:?}");
     response
         .result
@@ -42404,6 +42422,29 @@ fn malformed_delete_after_uri_byte_overflow_permanently_fences_analysis() {
     server.shutdown();
 }
 
+/// Wait until the server has handled every earlier message and has no
+/// diagnostic refresh in flight or coalesced behind one, so the next refresh
+/// is caused by whatever the test sends afterwards.
+fn settle_diagnostic_refreshes(server: &mut TestServer, label: &str) {
+    for round in 0.. {
+        let ping_id = RequestId::from(format!("{label}-settle-{round}"));
+        server.send_request(ping_id.clone(), "review/ping", Value::Null);
+        server
+            .response_with_timeout(&ping_id, LIMIT_REQUEST_TIMEOUT)
+            .expect("settling ping response");
+        let mut answered = false;
+        while let Some(refresh) =
+            server.request_with_timeout("workspace/diagnostic/refresh", Duration::ZERO)
+        {
+            server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+            answered = true;
+        }
+        if !answered {
+            return;
+        }
+    }
+}
+
 #[test]
 fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
     for open_count in [128usize, 129] {
@@ -42436,6 +42477,9 @@ fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
                 json!({"textDocument":{"uri":uri(path),"languageId":"pascal","version":index as i32 + 1,"text":source}}),
             );
         }
+        // The opens request refreshes of their own; only a refresh after this
+        // point proves the malformed rename fence.
+        settle_diagnostic_refreshes(&mut server, &format!("open-boundary-{open_count}"));
         server.send_notification(
             "workspace/didRenameFiles",
             json!({"files":[
@@ -49840,7 +49884,8 @@ fn code_action_creation_rejects_overlong_identity_and_caps_serialized_output() {
                 }
             }),
         );
-        let actions = request_missing_unit_actions(
+        // Each of the 32 candidates needs its own post-edit binding proof.
+        let actions = request_missing_unit_actions_with_timeout(
             &mut server,
             &consumer,
             &consumer_source,
@@ -49850,6 +49895,7 @@ fn code_action_creation_rejects_overlong_identity_and_caps_serialized_output() {
             } else {
                 "missing-unit-eager-output-budget"
             },
+            LIMIT_REQUEST_TIMEOUT,
         );
         let encoded = serde_json::to_vec(&actions).expect("serialized code actions");
         assert!(

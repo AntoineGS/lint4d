@@ -2005,14 +2005,13 @@ pub(crate) fn workspace_diagnostics_from_input(
         return cancelled(source_generation, configuration_generation);
     }
 
-    let snapshot =
-        match build_snapshot(&input, &[], &[], SnapshotMode::Workspace, None, &[], cancel) {
-            Ok(snapshot) => snapshot,
-            Err(error) if error == CANCELLATION_MESSAGE => {
-                return cancelled(source_generation, configuration_generation);
-            }
-            Err(error) => return failed(source_generation, configuration_generation, error),
-        };
+    let snapshot = match super::rename::build_rejectable_workspace_snapshot(&input, cancel) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error == CANCELLATION_MESSAGE => {
+            return cancelled(source_generation, configuration_generation);
+        }
+        Err(error) => return failed(source_generation, configuration_generation, error),
+    };
     if !snapshot.complete {
         let reason = snapshot
             .incomplete_reason

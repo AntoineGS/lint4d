@@ -16695,6 +16695,83 @@ mod tests {
     }
 
     #[test]
+    fn workspace_diagnostics_stop_discovery_at_the_first_incomplete_context() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let ambiguous = root.join("Ambiguous");
+        let clean = root.join("Clean");
+        fs::create_dir_all(&ambiguous).unwrap();
+        fs::create_dir_all(&clean).unwrap();
+        for name in ["First", "Second"] {
+            fs::write(
+                ambiguous.join(format!("{name}.dproj")),
+                format!("<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"),
+            )
+            .unwrap();
+        }
+        let mut ambiguous_sources = Vec::new();
+        for index in 0..5 {
+            let path = ambiguous.join(format!("Unit{index}.pas"));
+            fs::write(
+                &path,
+                format!("unit Unit{index}; interface implementation end."),
+            )
+            .unwrap();
+            ambiguous_sources.push(path);
+        }
+        let clean_source = clean.join("Clean.pas");
+        fs::write(&clean_source, "unit Clean; interface implementation end.").unwrap();
+
+        let mut fresh = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let discovery_complete = |workspace: &mut Workspace, path: &Path| {
+            let key = workspace
+                .context_for_uri(&Url::from_file_path(path).unwrap())
+                .unwrap();
+            workspace.contexts[&key].context.discovery_complete
+        };
+        assert!(
+            discovery_complete(&mut fresh, &clean_source),
+            "fixture precondition: the clean source has a complete context"
+        );
+        assert!(
+            !discovery_complete(&mut fresh, &ambiguous_sources[0]),
+            "fixture precondition: two project files make the context incomplete"
+        );
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let _ = super::rename::test_take_enumerated_owners();
+        let computed = super::queries::workspace_diagnostics_from_input(
+            workspace.analysis_input(),
+            &AtomicBool::new(false),
+        );
+        let discovered = super::rename::test_take_enumerated_owners();
+
+        let Err(error) = computed.value else {
+            panic!("an incomplete workspace scan must fail");
+        };
+        assert!(
+            error.starts_with("workspace diagnostic scan incomplete:"),
+            "{error}"
+        );
+        assert!(
+            discovered.len() < ambiguous_sources.len(),
+            "discovery must stop at the first incomplete context, not visit all {} sources: {:?}",
+            ambiguous_sources.len() + 1,
+            discovered.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        );
+        let discovered = discovered
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        let (last, earlier) = discovered.split_last().expect("at least one source");
+        assert!(ambiguous_sources.contains(last), "{discovered:?}");
+        assert!(
+            earlier.iter().all(|path| path == &clean_source),
+            "{discovered:?}"
+        );
+    }
+
+    #[test]
     fn workspace_snapshot_keeps_ambiguous_dpr_ownership_source_specific() {
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path();

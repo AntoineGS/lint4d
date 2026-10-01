@@ -5290,9 +5290,11 @@ fn discover_enumerated_contexts(
     enumeration: &mut Enumeration,
     priority_contexts: &HashMap<Url, ContextKey>,
     project_contexts: &HashSet<ContextKey>,
+    stop_at_incomplete_context: bool,
     cancel: &AtomicBool,
-) -> Result<HashSet<ContextKey>, String> {
+) -> Result<(HashSet<ContextKey>, bool), String> {
     let mut context_keys = priority_contexts.values().cloned().collect::<HashSet<_>>();
+    let mut stopped_at_incomplete_context = false;
     let mut reusable_directory_contexts = HashMap::<PathBuf, ContextKey>::new();
     let mut deferred_context_pruning = false;
     context_keys.extend(project_contexts.iter().cloned());
@@ -5413,12 +5415,27 @@ fn discover_enumerated_contexts(
         }
         #[cfg(test)]
         cancel_after_enumerated_contexts(index + 1, cancel);
+        if stop_at_incomplete_context
+            && enumeration
+                .contexts
+                .get(&owner)
+                .is_some_and(|state| !state.context.discovery_complete)
+        {
+            enumeration.complete = false;
+            enumeration.reason.get_or_insert_with(|| {
+                let source = Url::from_file_path(&path)
+                    .map_or_else(|()| path.display().to_string(), |uri| uri.to_string());
+                format!("project context is ambiguous or incomplete for {source}")
+            });
+            stopped_at_incomplete_context = true;
+            break;
+        }
     }
     if deferred_context_pruning {
         loader.prune_unused_contexts_with_control(Some(cancel), None)?;
     }
     context_keys.extend(enumeration.contexts.keys().cloned());
-    Ok(context_keys)
+    Ok((context_keys, stopped_at_incomplete_context))
 }
 
 fn discover_project_metadata_contexts(
@@ -5816,6 +5833,52 @@ pub(crate) fn build_snapshot(
     skip_imports_for: &[Url],
     cancel: &AtomicBool,
 ) -> Result<RenameSnapshot, String> {
+    build_snapshot_with_policy(
+        input,
+        priority,
+        candidate_names,
+        mode,
+        priority_seed,
+        skip_imports_for,
+        false,
+        cancel,
+    )
+}
+
+/// Build an unfiltered workspace snapshot for a caller that rejects
+/// incomplete snapshots.
+///
+/// Without candidate names every enumerated source is retained and checked,
+/// so the first source whose project context is incomplete already makes the
+/// snapshot incomplete. Discovery stops there instead of resolving the rest
+/// of the workspace for a result that would be discarded.
+pub(crate) fn build_rejectable_workspace_snapshot(
+    input: &WorkspaceInput,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
+    build_snapshot_with_policy(
+        input,
+        &[],
+        &[],
+        SnapshotMode::Workspace,
+        None,
+        &[],
+        true,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_snapshot_with_policy(
+    input: &WorkspaceInput,
+    priority: &[Url],
+    candidate_names: &[String],
+    mode: SnapshotMode,
+    priority_seed: Option<SnapshotSeed>,
+    skip_imports_for: &[Url],
+    stop_at_incomplete_context: bool,
+    cancel: &AtomicBool,
+) -> Result<RenameSnapshot, String> {
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
@@ -5945,14 +6008,33 @@ pub(crate) fn build_snapshot(
     };
     let enumerated_contexts =
         if mode == SnapshotMode::Workspace || mode == SnapshotMode::WorkspaceSymbols {
-            discover_enumerated_contexts(
+            let (contexts, stopped_at_incomplete_context) = discover_enumerated_contexts(
                 &mut loader,
                 input,
                 &mut enumeration,
                 &priority_contexts,
                 &project_contexts,
+                stop_at_incomplete_context
+                    && mode == SnapshotMode::Workspace
+                    && candidate_names.is_empty(),
                 cancel,
-            )?
+            )?;
+            if stopped_at_incomplete_context {
+                return Ok(RenameSnapshot {
+                    index: NavigationIndex::new(),
+                    sources: HashMap::new(),
+                    records: HashMap::new(),
+                    expansions: HashMap::new(),
+                    readable: HashSet::new(),
+                    editable: HashSet::new(),
+                    complete: false,
+                    incomplete_reason: enumeration.reason,
+                    include_errors: Vec::new(),
+                    baseline_records: Vec::new(),
+                    mode,
+                });
+            }
+            contexts
         } else {
             priority_contexts.values().cloned().collect()
         };

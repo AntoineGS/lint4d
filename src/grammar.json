@@ -1104,20 +1104,50 @@
           "name": "kRaise"
         },
         {
-          "type": "FIELD",
-          "name": "exception",
-          "content": {
-            "type": "CHOICE",
-            "members": [
-              {
-                "type": "SYMBOL",
-                "name": "_expr"
-              },
-              {
-                "type": "BLANK"
-              }
-            ]
-          }
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "FIELD",
+                  "name": "exception",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_expr"
+                  }
+                },
+                {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SEQ",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "kRaiseAt"
+                        },
+                        {
+                          "type": "FIELD",
+                          "name": "address",
+                          "content": {
+                            "type": "SYMBOL",
+                            "name": "_expr"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -2152,20 +2182,50 @@
           "name": "kRaise"
         },
         {
-          "type": "FIELD",
-          "name": "exception",
-          "content": {
-            "type": "CHOICE",
-            "members": [
-              {
-                "type": "SYMBOL",
-                "name": "_expr"
-              },
-              {
-                "type": "BLANK"
-              }
-            ]
-          }
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "FIELD",
+                  "name": "exception",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_expr"
+                  }
+                },
+                {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SEQ",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "kRaiseAt"
+                        },
+                        {
+                          "type": "FIELD",
+                          "name": "address",
+                          "content": {
+                            "type": "SYMBOL",
+                            "name": "_expr"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         }
       ]
     },
@@ -4496,34 +4556,207 @@
           "name": "literalNumber"
         },
         {
-          "type": "SEQ",
-          "members": [
-            {
-              "type": "CHOICE",
-              "members": [
-                {
-                  "type": "STRING",
-                  "value": "-"
-                },
-                {
-                  "type": "STRING",
-                  "value": "+"
-                }
-              ]
-            },
-            {
-              "type": "SYMBOL",
-              "name": "literalNumber"
-            }
-          ]
-        },
-        {
           "type": "SYMBOL",
           "name": "literalString"
         },
         {
           "type": "SYMBOL",
           "name": "_typeref"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_subRangeCall"
+          },
+          "named": true,
+          "value": "exprCall"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_subRangeUnary"
+          },
+          "named": true,
+          "value": "exprUnary"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_subRangeBinary"
+          },
+          "named": true,
+          "value": "exprBinary"
+        }
+      ]
+    },
+    "_subRangeCall": {
+      "type": "PREC_LEFT",
+      "value": 5,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "FIELD",
+            "name": "entity",
+            "content": {
+              "type": "SYMBOL",
+              "name": "identifier"
+            }
+          },
+          {
+            "type": "STRING",
+            "value": "("
+          },
+          {
+            "type": "FIELD",
+            "name": "args",
+            "content": {
+              "type": "SYMBOL",
+              "name": "exprArgs"
+            }
+          },
+          {
+            "type": "STRING",
+            "value": ")"
+          }
+        ]
+      }
+    },
+    "_subRangeUnary": {
+      "type": "PREC_LEFT",
+      "value": 4,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "FIELD",
+            "name": "operator",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "kAdd"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "kSub"
+                }
+              ]
+            }
+          },
+          {
+            "type": "FIELD",
+            "name": "operand",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_subRangeBound"
+            }
+          }
+        ]
+      }
+    },
+    "_subRangeBinary": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "PREC_LEFT",
+          "value": 2,
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "FIELD",
+                "name": "lhs",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_subRangeBound"
+                }
+              },
+              {
+                "type": "FIELD",
+                "name": "operator",
+                "content": {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "kAdd"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "kSub"
+                    }
+                  ]
+                }
+              },
+              {
+                "type": "FIELD",
+                "name": "rhs",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_subRangeBound"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "PREC_LEFT",
+          "value": 3,
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "FIELD",
+                "name": "lhs",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_subRangeBound"
+                }
+              },
+              {
+                "type": "FIELD",
+                "name": "operator",
+                "content": {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SYMBOL",
+                      "name": "kMul"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "kDiv"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "kMod"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "kShl"
+                    },
+                    {
+                      "type": "SYMBOL",
+                      "name": "kShr"
+                    }
+                  ]
+                }
+              },
+              {
+                "type": "FIELD",
+                "name": "rhs",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_subRangeBound"
+                }
+              }
+            ]
+          }
         }
       ]
     },
@@ -6356,8 +6589,409 @@
                         "type": "SEQ",
                         "members": [
                           {
-                            "type": "SYMBOL",
-                            "name": "identifier"
+                            "type": "CHOICE",
+                            "members": [
+                              {
+                                "type": "SYMBOL",
+                                "name": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kStatic"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kVirtual"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kDynamic"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kAbstract"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kOverride"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kOverload"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kReintroduce"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kInline"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kStdcall"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kCdecl"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kPascal"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kRegister"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kSafecall"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kAssembler"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kNoreturn"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kLocal"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kFar"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kNear"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kDefault"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kNodefault"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kDeprecated"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kExperimental"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kMessage"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kPlatform"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kUnimplemented"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kCppdecl"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kCvar"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kMwpascal"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kNostackframe"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kInterrupt"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kIocheck"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kHardfloat"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kSoftfloat"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kMs_abi_default"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kMs_abi_cdecl"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kSaveregisters"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kSysv_abi_default"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kSysv_abi_cdecl"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kVectorcall"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kVarargs"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kWinapi"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kExport"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kPublic"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              },
+                              {
+                                "type": "ALIAS",
+                                "content": {
+                                  "type": "SYMBOL",
+                                  "name": "kDispId"
+                                },
+                                "named": true,
+                                "value": "identifier"
+                              }
+                            ]
                           },
                           {
                             "type": "STRING",
@@ -6373,8 +7007,409 @@
                 ]
               },
               {
-                "type": "SYMBOL",
-                "name": "identifier"
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "SYMBOL",
+                    "name": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kStatic"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kVirtual"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kDynamic"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kAbstract"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kOverride"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kOverload"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kReintroduce"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kInline"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kStdcall"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kCdecl"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kPascal"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kRegister"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kSafecall"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kAssembler"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kNoreturn"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kLocal"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kFar"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kNear"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kDefault"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kNodefault"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kDeprecated"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kExperimental"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kMessage"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kPlatform"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kUnimplemented"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kCppdecl"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kCvar"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kMwpascal"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kNostackframe"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kInterrupt"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kIocheck"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kHardfloat"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kSoftfloat"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kMs_abi_default"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kMs_abi_cdecl"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kSaveregisters"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kSysv_abi_default"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kSysv_abi_cdecl"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kVectorcall"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kVarargs"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kWinapi"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kExport"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kPublic"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "kDispId"
+                    },
+                    "named": true,
+                    "value": "identifier"
+                  }
+                ]
               }
             ]
           }
@@ -10451,6 +11486,11 @@
     "kRaise": {
       "type": "PATTERN",
       "value": "raise",
+      "flags": "i"
+    },
+    "kRaiseAt": {
+      "type": "PATTERN",
+      "value": "at",
       "flags": "i"
     },
     "kOn": {

@@ -53,6 +53,36 @@ function delimited(rule, delimiter = ',') {
 	return optional(delimited1(rule, delimiter));
 }
 
+// After `a: b;` a routine attribute keyword may start `a`'s attribute list
+// (`cvar;`) or name the next variable (`Default: Integer;`). Only the following
+// `;` or `:`/`,` tells them apart. `external` is left out because a
+// preprocessor block could not tell `procExternal` from a variable after a
+// routine header. This is inlined rather than a rule so that a plain
+// identifier is shifted exactly as in `declConst` and `declField`.
+function varName($) {
+	return choice(
+		$.identifier,
+		...[
+			$.kStatic, $.kVirtual, $.kDynamic, $.kAbstract, $.kOverride,
+			$.kOverload, $.kReintroduce, $.kInline, $.kStdcall,
+			$.kCdecl, $.kPascal, $.kRegister, $.kSafecall, $.kAssembler,
+			$.kNoreturn, $.kLocal, $.kFar, $.kNear,
+			$.kDefault, $.kNodefault, $.kDeprecated, $.kExperimental,
+			$.kMessage,
+			...enable_if(fpc,
+				$.kPlatform, $.kUnimplemented,
+				$.kCppdecl, $.kCvar, $.kMwpascal, $.kNostackframe,
+				$.kInterrupt, $.kIocheck, $.kHardfloat,
+				$.kSoftfloat, $.kMs_abi_default, $.kMs_abi_cdecl,
+				$.kSaveregisters, $.kSysv_abi_default, $.kSysv_abi_cdecl,
+				$.kVectorcall, $.kVarargs, $.kWinapi, $.kExport,
+				...enable_if(public_name, $.kPublic),
+			),
+			...enable_if(delphi, $.kDispId),
+		].map(keyword => alias(keyword, $.identifier)),
+	);
+}
+
 // Preprocessor wrapper: `if[def] ... [else[if] ...]* endif` around a rule.
 // It is inteded for code like this:
 //
@@ -265,7 +295,10 @@ function statements(trailing) {
 
 		[rn('raise'),       $ => seq(
 			$.kRaise,
-			field('exception', optional($._expr)),
+			optional(seq(
+				field('exception', $._expr),
+				optional(seq($.kRaiseAt, field('address', $._expr))),
+			)),
 			...semicolon
 		)],
 
@@ -636,15 +669,27 @@ module.exports = grammar({
 		// `TMultiPayProcs = sppShift4 .. sppTenderRetail;`. Bounds are
 		// narrowed (not full `_expr`) so that `type = '(' ident ')'` stays
 		// unambiguous against `declEnum`; in particular we exclude paren-
-		// wrapped expressions so `(` can only start a `declEnum`.
+		// wrapped expressions so `(` can only start a `declEnum`. Bounds are
+		// arithmetic constant expressions such as `-MaxLongint`,
+		// `Low(Word)` or `BitsPerInt - 1`, but never comparisons, so that
+		// `const X: 0..9 = 5;` keeps `= 5` as its value.
 		declSubRange:    $ => prec(1, seq(
 			$._subRangeBound, '..', $._subRangeBound
 		)),
 		_subRangeBound:  $ => choice(
 			$.literalNumber,
-			seq(choice('-', '+'), $.literalNumber),
 			$.literalString,
 			$._typeref,
+			alias($._subRangeCall,   $.exprCall),
+			alias($._subRangeUnary,  $.exprUnary),
+			alias($._subRangeBinary, $.exprBinary),
+		),
+		_subRangeCall:   $ => op.args(5, $.identifier, '(', $.exprArgs, ')'),
+		_subRangeUnary:  $ => op.prefix(4, choice($.kAdd, $.kSub), $._subRangeBound),
+		_subRangeBinary: $ => choice(
+			op.infix(2, $._subRangeBound, choice($.kAdd, $.kSub), $._subRangeBound),
+			op.infix(3, $._subRangeBound,
+				choice($.kMul, $.kDiv, $.kMod, $.kShl, $.kShr), $._subRangeBound),
 		),
 
 		typeref:         $ => seq(
@@ -863,7 +908,7 @@ module.exports = grammar({
 
 		declVar:         $ => seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
-			field('name', delimited1($.identifier)),
+			field('name', delimited1(varName($))),
 			':',
 			field('type', $.type),
 			optional(choice(
@@ -1308,6 +1353,7 @@ module.exports = grammar({
 		kExcept:           $ => /except/i,
 		kFinally:          $ => /finally/i,
 		kRaise:            $ => /raise/i,
+		kRaiseAt:          $ => /at/i,
 		kOn:               $ => /on/i,
 		kCase:             $ => /case/i,
 		kWith:             $ => /with/i,

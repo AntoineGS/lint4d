@@ -489,6 +489,41 @@ end;
       (kEnd))))
 
 ===
+raise at
+===
+
+procedure Main;
+var
+  At: Integer;
+begin
+  raise EListError.CreateFmt(Msg, [Data]) at ReturnAddr;
+  raise E at Caller.Address;
+  At := 1;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (declVars (kVar)
+      (declVar (identifier) (type (typeref (identifier)))))
+    (block
+      (kBegin)
+      (raise (kRaise)
+        (exprCall
+          (exprDot (identifier) (kDot) (identifier))
+          (exprArgs (identifier) (exprBrackets (identifier))))
+        (kRaiseAt)
+        (identifier))
+      (raise (kRaise)
+        (identifier)
+        (kRaiseAt)
+        (exprDot (identifier) (kDot) (identifier)))
+      (assignment (identifier) (kAssign) (literalNumber))
+      (kEnd))))
+
+===
 goto + label
 ===
 

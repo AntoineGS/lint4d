@@ -135,6 +135,7 @@
 	(kExcept)
 	(kFinally)
 	(kRaise)
+	(kRaiseAt)
 	(kOn)
 	(kCase)
 	(kWith)

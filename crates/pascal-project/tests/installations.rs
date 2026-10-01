@@ -3,8 +3,9 @@ use std::{fs, path::Path};
 use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
 use pascal_project::installations::InstallationEvidence;
 use pascal_project::{
-    InstallationOrigin, InstallationSelection, ProjectContext, ProjectOptions, ProjectPathEntry,
-    ProjectPathProvenance, ProjectSelections, ReadPolicy, discover_with_selections,
+    ConditionalFact, InstallationOrigin, InstallationSelection, ProjectContext, ProjectOptions,
+    ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
+    discover_with_selections,
 };
 
 fn write(path: &Path, text: &str) {
@@ -1263,4 +1264,103 @@ fn explicit_compiler_resolves_compiler_conflicts_but_not_bds_conflicts() {
             candidates: vec!["10.0".into(), "23.0".into()]
         })
     );
+}
+
+#[test]
+fn standalone_source_under_an_installation_uses_its_compiler_and_platform() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let bds = temp.path().join("RAD Studio/7.0");
+    let classes = bds.join("source/Win32/rtl/common/Classes.pas");
+    write(
+        &workspace.join("App.pas"),
+        "unit App; interface implementation end.",
+    );
+    write(&classes, "unit Classes; interface implementation end.");
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        &format!(
+            "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n\
+             [installations.\"10.0\".properties]\nBDS = '{}'\n",
+            bds.display(),
+            temp.path().join("RAD Studio/10.0").display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &classes,
+        &[workspace],
+        &ProjectOptions::default(),
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    let conditionals = context.conditional_context_for(&classes);
+
+    assert_eq!(
+        conditionals.compiler_version,
+        Some(pascal_project::CompilerVersion::new(21, 0))
+    );
+    assert_eq!(conditionals.define("VER210"), ConditionalFact::True);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::True);
+    assert_eq!(conditionals.define("LINUX"), ConditionalFact::False);
+    assert_eq!(conditionals.define("PIC"), ConditionalFact::False);
+}
+
+#[test]
+fn standalone_source_under_an_installation_without_platform_keeps_platform_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let bds = temp.path().join("RAD Studio/10.0");
+    let classes = bds.join("source/rtl/common/System.Classes.pas");
+    write(
+        &classes,
+        "unit System.Classes; interface implementation end.",
+    );
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        &format!(
+            "[installations.\"10.0\".properties]\nBDS = '{}'\n",
+            bds.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &classes,
+        &[],
+        &ProjectOptions::default(),
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    let conditionals = context.conditional_context_for(&classes);
+
+    assert_eq!(conditionals.define("VER240"), ConditionalFact::True);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::Unknown);
+}
+
+#[test]
+fn standalone_source_outside_installations_keeps_unknown_compiler() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("elsewhere/Classes.pas");
+    write(&source, "unit Classes; interface implementation end.");
+    let configuration = temp.path().join("config.toml");
+    write(
+        &configuration,
+        &format!(
+            "[installations.\"7.0\".properties]\nBDS = '{}'\nPlatform = 'Win32'\n",
+            temp.path().join("RAD Studio/7.0").display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &source,
+        &[],
+        &ProjectOptions::default(),
+        &OverrideSession::new(Some(configuration)),
+    )
+    .unwrap();
+    let conditionals = context.conditional_context_for(&source);
+
+    assert_eq!(conditionals.compiler_version, None);
+    assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::Unknown);
 }

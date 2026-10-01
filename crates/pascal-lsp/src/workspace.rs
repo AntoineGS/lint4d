@@ -13254,6 +13254,9 @@ impl Workspace {
         };
         let mut resolver =
             resolver::resolver_for_context(context.clone(), input.roots.clone(), &input, cancel);
+        // An incomplete graph only selects the file-local fallback below, so
+        // resolving the rest of the dependency closure is wasted work.
+        resolver.stop_project_walk_when_incomplete(true);
         let sites = source_index
             .imports(uri)
             .into_iter()
@@ -13286,6 +13289,13 @@ impl Workspace {
         };
         check_workspace_cancel(Some(cancel))?;
         self.merge_resolution_report(context_key, &project.report);
+        if !project.complete {
+            // Keep local rules on the proven expanded physical source, but do
+            // not invent file-local CFG facts when project resolution is
+            // incomplete. The normal expanded mapping preserves include URI
+            // and range provenance for independent diagnostics.
+            return Ok(run_file_local(lint_source, false));
+        }
         let configuration_id = format!(
             "config={};platform={}",
             context.config.as_deref().unwrap_or_default(),
@@ -13312,7 +13322,6 @@ impl Workspace {
                 .collect(),
             ..Default::default()
         };
-        let project_complete = project.complete;
         let snapshot = match lint4d::cfg::to_cfg_project_snapshot(project, options) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -13323,13 +13332,6 @@ impl Workspace {
             }
         };
         check_workspace_cancel(Some(cancel))?;
-        if !project_complete {
-            // Keep local rules on the proven expanded physical source, but do
-            // not invent file-local CFG facts when project resolution is
-            // incomplete. The normal expanded mapping preserves include URI
-            // and range provenance for independent diagnostics.
-            return Ok(run_file_local(lint_source, false));
-        }
         if source != lint_source {
             // Keep resolver coordinates and CFG snapshot bytes identical. The
             // expanded representation is still used for the conservative
@@ -16376,6 +16378,120 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_stop_resolving_the_project_once_it_is_known_to_be_incomplete() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let write = |name: &str, text: &str| {
+            let path = root.join(name);
+            fs::write(&path, text).unwrap();
+            path
+        };
+        let main = write(
+            "Main.pas",
+            "unit Main;\ninterface\nuses First;\nimplementation\nend.\n",
+        );
+        let first = write(
+            "First.pas",
+            "unit First;\ninterface\nuses Second;\n{$IFDEF UNKNOWN_FEATURE}\nconst Flag = 1;\n{$ENDIF}\nimplementation\nend.\n",
+        );
+        write(
+            "Second.pas",
+            "unit Second;\ninterface\nuses Third;\nimplementation\nend.\n",
+        );
+        let third = write(
+            "Third.pas",
+            "unit Third;\ninterface\nimplementation\nend.\n",
+        );
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+
+        super::resolver::reset_test_source_loads();
+        let computed = super::queries::diagnostics_from_input(input.clone(), &main_uri, &cancel);
+
+        assert!(computed.value.is_ok(), "{:?}", computed.value.err());
+        assert_eq!(
+            super::resolver::test_source_load_count(&third),
+            0,
+            "units past the incomplete frontier must not be loaded for diagnostics"
+        );
+        super::rename::revalidate_input(&input, &computed.records, &cancel)
+            .expect("unchanged sources must revalidate");
+        // The unit that proved the graph incomplete stays in the read set, so
+        // editing it invalidates the result.
+        fs::write(
+            &first,
+            "unit First;\ninterface\nuses Second;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        assert!(super::rename::revalidate_input(&input, &computed.records, &cancel).is_err());
+    }
+
+    #[test]
+    fn semantic_tokens_reuse_the_warmed_project_cache() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, _) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        worker_view(&main)
+            .warm_with_cancel(&main_uri, &AtomicBool::new(false))
+            .expect("warm");
+
+        crate::navigation::test_reset_document_parse_count();
+        super::test_reset_import_resolution_count();
+        let tokens = super::queries::semantic_tokens_from_input(
+            main.analysis_input(),
+            &main_uri,
+            None,
+            &AtomicBool::new(false),
+        );
+        assert!(tokens.value.is_ok(), "{:?}", tokens.value.err());
+        assert_eq!(super::test_import_resolution_count(), 0);
+        // The requested document is indexed directly; its dependency must
+        // come from the cache.
+        assert_eq!(crate::navigation::test_document_parse_count(), 1);
+    }
+
+    #[test]
+    fn semantic_tokens_records_revalidate_for_an_include_backed_dependency() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\n{$I Defs.inc}\ninterface\nprocedure Hello;\nimplementation\nprocedure Hello; begin end;\nend.\n",
+        )
+        .unwrap();
+        fs::write(root.join("Defs.inc"), "{$DEFINE PROVIDER_DEFS}\n").unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+
+        let tokens =
+            super::queries::semantic_tokens_from_input(input.clone(), &main_uri, None, &cancel);
+
+        assert!(tokens.value.is_ok(), "{:?}", tokens.value.err());
+        super::rename::revalidate_input(&input, &tokens.records, &cancel)
+            .expect("unchanged sources must revalidate");
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\n{$I Defs.inc}\ninterface\nprocedure Hello;\nprocedure Other;\nimplementation\nprocedure Hello; begin end;\nprocedure Other; begin end;\nend.\n",
+        )
+        .unwrap();
+        assert!(
+            super::rename::revalidate_input(&input, &tokens.records, &cancel).is_err(),
+            "a changed physical dependency must still invalidate the result"
+        );
+    }
+
+    #[test]
     fn second_navigation_skips_import_resolution() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, _) = provider_fixture(temp.path());
@@ -16413,6 +16529,32 @@ mod tests {
         assert!(
             second.is_empty(),
             "an authoritative client delete must beat unchanged bytes and cache probes"
+        );
+    }
+
+    #[test]
+    fn semantic_snapshot_after_client_delete_cannot_resurrect_the_source_in_the_cache() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let mut main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        main.file_event(&provider_uri, FileChange::Deleted);
+        assert!(provider_uri.to_file_path().unwrap().is_file());
+
+        let _ = super::queries::semantic_tokens_from_input(
+            main.analysis_input(),
+            &main_uri,
+            None,
+            &AtomicBool::new(false),
+        );
+        let located = worker_view(&main).navigate(
+            &main_uri,
+            Position::new(6, 2),
+            NavigationTarget::Definition,
+        );
+
+        assert!(
+            located.is_empty(),
+            "a snapshot must honour client deletes before publishing to the shared cache"
         );
     }
 

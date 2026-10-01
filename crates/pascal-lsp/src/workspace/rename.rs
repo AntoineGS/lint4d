@@ -5622,6 +5622,11 @@ pub(crate) fn build_snapshot(
         input.overrides.clone(),
     );
     loader.cached_documents = input.cached_documents.clone();
+    // The loader publishes into the shared cache, so it must honour client
+    // deletes exactly like the other analysis workers.
+    loader.deleted_overrides = input.deleted_overrides.clone();
+    loader.project_cache = input.project_cache.clone();
+    loader.cache_epoch = Some(input.cache_epoch);
     loader.project_selections = input.project_selections.clone();
     loader.document_owners = input.document_owners.clone();
     for (uri, overlay) in &input.overlays {
@@ -6507,11 +6512,16 @@ pub(crate) fn build_snapshot(
                 },
             )
         } else {
-            let source = loader
-                .index
-                .source_text(&uri)
-                .ok_or_else(|| format!("loaded dependency {path:?} lost its indexed source"))?
-                .to_owned();
+            // An include-backed unit is indexed as its expanded buffer; the
+            // record must describe the physical file that revalidation reads.
+            let source = match loader.expansions.get(&uri) {
+                Some(expansion) => expansion.physical_source.clone(),
+                None => loader
+                    .index
+                    .source_text(&uri)
+                    .ok_or_else(|| format!("loaded dependency {path:?} lost its indexed source"))?
+                    .to_owned(),
+            };
             let stamp = loader
                 .disk_stamps
                 .get(&uri)

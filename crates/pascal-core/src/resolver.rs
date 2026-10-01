@@ -403,6 +403,8 @@ pub struct UnitResolver<S> {
     scanned_bytes: usize,
     project_includes: Vec<ResolvedInclude>,
     include_seen: HashSet<SourceId>,
+    source_metadata: HashMap<SourceId, CachedSourceMetadata>,
+    stop_when_incomplete: bool,
 }
 
 impl<S: SourceStore> UnitResolver<S> {
@@ -482,7 +484,41 @@ impl<S: SourceStore> UnitResolver<S> {
             scanned_bytes: 0,
             project_includes: Vec::new(),
             include_seen: HashSet::new(),
+            source_metadata: HashMap::new(),
+            stop_when_incomplete: false,
         }
+    }
+
+    /// Declared name and imports of a loaded source, parsed at most once per
+    /// resolver for the same content. Each importer reloads its candidates, so
+    /// the cache compares content rather than allocation identity.
+    fn source_metadata(&mut self, source: &LoadedSource) -> Arc<ParsedSourceMetadata> {
+        if let Some(cached) = self
+            .source_metadata
+            .get(&source.id)
+            .filter(|cached| cached.matches(source))
+        {
+            return cached.metadata.clone();
+        }
+        let metadata = Arc::new(parse_source_metadata(source));
+        self.source_metadata.insert(
+            source.id.clone(),
+            CachedSourceMetadata {
+                bytes: source.bytes.clone(),
+                decoded_text: source.decoded_text.clone(),
+                metadata: metadata.clone(),
+            },
+        );
+        metadata
+    }
+
+    /// Stop project walks as soon as the graph is known to be incomplete.
+    ///
+    /// Callers that discard incomplete graphs use this to avoid resolving the
+    /// rest of the dependency closure. The report still covers every source
+    /// read before stopping, which is what proved the graph incomplete.
+    pub fn stop_project_walk_when_incomplete(&mut self, stop: bool) {
+        self.stop_when_incomplete = stop;
     }
 
     pub fn resolve_unit(
@@ -863,9 +899,10 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<ResolvedProject, ResolverError> {
         self.check_cancel(cancel)?;
         let source = self.load_source(path, legacy_route, SourceKind::Unit, cancel)?;
-        let metadata = parse_source_metadata(&source);
+        let metadata = self.source_metadata(&source);
         let declared_name = metadata
             .declared_name
+            .clone()
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| {
                 ResolverError::InvalidRequest(format!(
@@ -910,7 +947,7 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<ResolvedProject, ResolverError> {
         self.check_cancel(cancel)?;
         let root_sites = if sites.is_empty() {
-            parse_source_metadata(&root.source).imports
+            self.source_metadata(&root.source).imports.clone()
         } else {
             sites.to_vec()
         };
@@ -923,12 +960,15 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut complete = self.context.discovery_complete && self.report.complete;
         while let Some((importer, importer_sites)) = queue.pop_front() {
             self.check_cancel(cancel)?;
+            if self.stop_when_incomplete && !complete {
+                break;
+            }
             let resolved = self.resolve_imports(&importer, &importer_sites, cancel)?;
             complete &= resolved.complete;
             imports.extend(resolved.bindings);
             for dependency in resolved.dependencies {
                 if loaded_ids.insert(dependency.source.id.clone()) {
-                    let dependency_sites = parse_source_metadata(&dependency.source).imports;
+                    let dependency_sites = self.source_metadata(&dependency.source).imports.clone();
                     units.push(dependency.clone());
                     queue.push_back((dependency, dependency_sites));
                 }
@@ -1460,10 +1500,10 @@ impl<S: SourceStore> UnitResolver<S> {
                 cancel,
             ) {
                 Ok(source) => {
-                    let declared_name = self
-                        .store
-                        .declared_unit_name(&source)
-                        .unwrap_or_else(|| parse_source_metadata(&source).declared_name);
+                    let declared_name = match self.store.declared_unit_name(&source) {
+                        Some(declared_name) => declared_name,
+                        None => self.source_metadata(&source).declared_name.clone(),
+                    };
                     let candidate = ResolutionCandidate {
                         path: source.path.clone(),
                         declared_name: declared_name.clone(),
@@ -2444,7 +2484,7 @@ impl<S: SourceStore> UnitResolver<S> {
                         cancel,
                     ) {
                         Ok(source) => {
-                            let metadata = parse_source_metadata(&source);
+                            let metadata = self.source_metadata(&source);
                             if declared_name_matches(
                                 metadata.declared_name.as_deref(),
                                 requested,
@@ -2455,7 +2495,7 @@ impl<S: SourceStore> UnitResolver<S> {
                                     source,
                                     ResolutionCandidate {
                                         path: entry.path.clone(),
-                                        declared_name: metadata.declared_name,
+                                        declared_name: metadata.declared_name.clone(),
                                     },
                                 ));
                             }
@@ -2554,8 +2594,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 complete: false,
             });
         }
-        let metadata = parse_source_metadata(source);
-        let text = metadata.text;
+        let text = source_text(source);
         let lexical_analysis = crate::conditional::analyze_with_cancel(&text, &[], cancel);
         let include_directives = lexical_analysis
             .directives
@@ -2985,16 +3024,55 @@ struct IncludeWalkResult {
 
 #[derive(Debug, Clone)]
 struct ParsedSourceMetadata {
-    text: String,
     declared_name: Option<String>,
     imports: Vec<ImportSite>,
 }
 
-fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
-    let text = source.decoded_text.as_deref().map_or_else(
+/// Parsed metadata for one loaded source. The parser inputs are retained so a
+/// reload with different content under the same ID is never served stale
+/// metadata.
+#[derive(Debug, Clone)]
+struct CachedSourceMetadata {
+    bytes: Arc<[u8]>,
+    decoded_text: Option<Arc<str>>,
+    metadata: Arc<ParsedSourceMetadata>,
+}
+
+impl CachedSourceMetadata {
+    fn matches(&self, source: &LoadedSource) -> bool {
+        (Arc::ptr_eq(&self.bytes, &source.bytes) || self.bytes == source.bytes)
+            && self.decoded_text == source.decoded_text
+    }
+}
+
+fn source_text(source: &LoadedSource) -> String {
+    source.decoded_text.as_deref().map_or_else(
         || crate::text::decode_bytes(&source.bytes).into_owned(),
         ToOwned::to_owned,
-    );
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_METADATA_PARSES: std::cell::RefCell<HashMap<PathBuf, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+fn reset_test_metadata_parses() {
+    TEST_METADATA_PARSES.with(|parses| parses.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn test_metadata_parses(path: &Path) -> usize {
+    TEST_METADATA_PARSES.with(|parses| parses.borrow().get(path).copied().unwrap_or(0))
+}
+
+fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
+    #[cfg(test)]
+    TEST_METADATA_PARSES.with(|parses| {
+        *parses.borrow_mut().entry(source.path.clone()).or_default() += 1;
+    });
     let parse_bytes = source
         .decoded_text
         .as_deref()
@@ -3006,7 +3084,6 @@ fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
         Ok(parsed) => parsed,
         Err(_) => {
             return ParsedSourceMetadata {
-                text,
                 declared_name: None,
                 imports: Vec::new(),
             };
@@ -3047,7 +3124,6 @@ fn parse_source_metadata(source: &LoadedSource) -> ParsedSourceMetadata {
         });
     }
     ParsedSourceMetadata {
-        text,
         declared_name,
         imports,
     }
@@ -3452,4 +3528,143 @@ fn path_equivalent_ignore_case(left: &Path, right: &Path) -> bool {
                     .to_string_lossy()
                     .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
             })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MemoryStore {
+        sources: HashMap<PathBuf, Vec<u8>>,
+    }
+
+    impl SourceStore for MemoryStore {
+        fn list_directory(
+            &mut self,
+            request: DirectoryRequest<'_>,
+            _cancel: &dyn CancellationToken,
+        ) -> Result<DirectoryListing, SourceStoreError> {
+            let files = self
+                .sources
+                .keys()
+                .filter(|path| path.parent() == Some(request.directory))
+                .cloned()
+                .collect();
+            Ok(DirectoryListing {
+                files,
+                directories: Vec::new(),
+                stamp: None,
+                complete: true,
+            })
+        }
+
+        fn overlay_candidates(&self, _roots: &[PathBuf], _names: &[String]) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn load(
+            &mut self,
+            request: SourceRequest<'_>,
+            _cancel: &dyn CancellationToken,
+        ) -> Result<LoadedSource, SourceStoreError> {
+            let bytes = self.sources.get(request.path).cloned().ok_or_else(|| {
+                SourceStoreError::NotFound {
+                    path: request.path.to_path_buf(),
+                }
+            })?;
+            Ok(LoadedSource {
+                id: SourceId::new(format!("source:{}", request.path.display())),
+                path: request.path.to_path_buf(),
+                bytes: Arc::<[u8]>::from(bytes),
+                decoded_text: None,
+                revision: SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 0,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn source_metadata_is_reparsed_when_a_reload_changes_content() {
+        let mut resolver = UnitResolver::new(
+            ProjectContext::default(),
+            Vec::new(),
+            MemoryStore::default(),
+            Default::default(),
+        );
+        let source = |text: &str| LoadedSource {
+            id: SourceId::new("source:/workspace/A.pas"),
+            path: PathBuf::from("/workspace/A.pas"),
+            bytes: Arc::<[u8]>::from(text.as_bytes()),
+            decoded_text: None,
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 0,
+            },
+        };
+
+        let before = resolver.source_metadata(&source("unit A; interface implementation end."));
+        let same = resolver.source_metadata(&source("unit A; interface implementation end."));
+        let after = resolver.source_metadata(&source("unit B; interface implementation end."));
+
+        let mut decoded = source("unit B; interface implementation end.");
+        decoded.decoded_text = Some(Arc::from("unit C; interface implementation end."));
+        let decoded = resolver.source_metadata(&decoded);
+
+        assert!(Arc::ptr_eq(&before, &same));
+        assert_eq!(before.declared_name.as_deref(), Some("A"));
+        assert_eq!(after.declared_name.as_deref(), Some("B"));
+        assert_eq!(decoded.declared_name.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn project_walk_parses_each_source_once() {
+        let root = PathBuf::from("/workspace");
+        let mut store = MemoryStore::default();
+        for (name, text) in [
+            (
+                "Main.pas",
+                "unit Main; interface uses A, B; implementation end.",
+            ),
+            ("A.pas", "unit A; interface uses B; implementation end."),
+            ("B.pas", "unit B; interface implementation end."),
+        ] {
+            store
+                .sources
+                .insert(root.join(name), text.as_bytes().to_vec());
+        }
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![root.clone()],
+            search_path_entries: vec![ProjectPathEntry {
+                path: root.clone(),
+                provenance: ProjectPathProvenance::LegacyNative,
+            }],
+            ..ProjectContext::default()
+        };
+        reset_test_metadata_parses();
+        let project = UnitResolver::new(context, vec![root.clone()], store, Default::default())
+            .resolve_project(
+                UnitResolveRequest {
+                    requested_name: "Main",
+                    importer_path: &root.join("Main.pas"),
+                    legacy_route: None,
+                },
+                &[],
+                &NoCancellation,
+            )
+            .expect("project graph");
+
+        assert!(project.complete);
+        assert_eq!(project.units.len(), 2);
+        for name in ["Main.pas", "A.pas", "B.pas"] {
+            assert_eq!(
+                test_metadata_parses(&root.join(name)),
+                1,
+                "{name} must be parsed once per resolver"
+            );
+        }
+    }
 }

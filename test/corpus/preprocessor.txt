@@ -1396,3 +1396,39 @@ end.
       (kImplementation))
     (kEnd)
     (kEndDot)))
+
+===
+Routine directive fragment inside a directive block
+===
+
+{$IFDEF X86}
+function G: Integer; {$IFDEF FPC} assembler; nostackframe; {$ENDIF}
+asm
+  nop
+end;
+{$ENDIF}
+
+---
+
+(root
+  (ppBlock
+    (ppIf)
+    (defProc
+      (declProc
+        (kFunction)
+        (identifier)
+        (typeref
+          (identifier)))
+      (ppBlock
+        (ppIf)
+        (statement
+          (identifier))
+        (statement
+          (identifier))
+        (ppEndIf))
+      (asm
+        (kAsm)
+        (asmBody
+          (identifier))
+        (kEnd)))
+    (ppEndIf)))

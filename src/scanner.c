@@ -45,6 +45,27 @@ static size_t read_ascii_keyword(TSLexer *lexer, char *buf, size_t cap) {
     return len;
 }
 
+// Routine directives that take no arguments. A fragment holding only these
+// (e.g. `{$IFDEF FPC} assembler; nostackframe; {$ENDIF}` after a routine
+// header) is left to the grammar's directive handling instead.
+static const char *const ROUTINE_DIRECTIVES[] = {
+    "abstract", "assembler", "cdecl", "cppdecl", "deprecated", "dynamic",
+    "experimental", "far", "hardfloat", "inline", "interrupt", "iocheck",
+    "local", "mwpascal", "near", "noreturn", "nostackframe", "overload",
+    "override", "pascal", "platform", "register", "reintroduce", "safecall",
+    "saveregisters", "softfloat", "static", "stdcall", "unimplemented",
+    "varargs", "vectorcall", "virtual", "winapi",
+};
+
+static bool is_routine_directive(const char *word, size_t len) {
+    for (size_t i = 0; i < sizeof(ROUTINE_DIRECTIVES) / sizeof(ROUTINE_DIRECTIVES[0]); i++) {
+        if (strlen(ROUTINE_DIRECTIVES[i]) == len && memcmp(ROUTINE_DIRECTIVES[i], word, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Skip input up to and including the next `}`. Returns false on EOF.
 static bool skip_to_close_brace(TSLexer *lexer) {
     while (lexer->lookahead != 0) {
@@ -177,6 +198,8 @@ bool tree_sitter_pascal_external_scanner_scan(
     // content" check is required.
     bool saw_newline = false;
     bool saw_top_level_semi = false;
+    bool saw_directive = false;
+    bool directives_only = true;
 
     // Walk forward to the matching `{$endif}` / `{$ifend}`, tracking depth
     // for nested `{$if*}` pairs.
@@ -186,6 +209,19 @@ bool tree_sitter_pascal_external_scanner_scan(
             return false; // Unterminated fragment — give up, let regex handle it.
         }
         if (lexer->lookahead != '{') {
+            if (depth == 1 && is_ascii_letter(lexer->lookahead)) {
+                char word[16] = {0};
+                size_t word_len = read_ascii_keyword(lexer, word, sizeof(word) - 1);
+                if (is_ascii_letter(lexer->lookahead) || !is_routine_directive(word, word_len)) {
+                    directives_only = false;
+                } else {
+                    saw_directive = true;
+                }
+                continue;
+            }
+            if (lexer->lookahead != ';' && !is_space_or_newline(lexer->lookahead)) {
+                directives_only = false;
+            }
             if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
                 saw_newline = true;
             } else if (lexer->lookahead == ';' && depth == 1) {
@@ -200,6 +236,7 @@ bool tree_sitter_pascal_external_scanner_scan(
         }
         lexer->advance(lexer, false);
         if (lexer->lookahead != '$') {
+            directives_only = false; // A comment or nested text.
             continue;
         }
         lexer->advance(lexer, false);
@@ -212,6 +249,7 @@ bool tree_sitter_pascal_external_scanner_scan(
             (inner_len == 6 && memcmp(inner, "ifndef", 6) == 0)
         ) {
             depth++;
+            directives_only = false;
         } else if (
             (inner_len == 5 && memcmp(inner, "endif", 5) == 0) ||
             (inner_len == 5 && memcmp(inner, "ifend", 5) == 0)
@@ -224,7 +262,7 @@ bool tree_sitter_pascal_external_scanner_scan(
         }
     }
 
-    if (saw_newline) {
+    if (saw_newline || (saw_directive && directives_only)) {
         return false;
     }
 

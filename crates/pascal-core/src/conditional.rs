@@ -3280,40 +3280,69 @@ fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Whether a directive keyword cannot affect parsing or name binding, such as
+/// compiler switches, C++Builder header directives, and linker directives.
+pub fn is_harmless_directive_keyword(keyword: &str) -> bool {
+    is_harmless_keyword(&keyword.trim().to_ascii_lowercase())
+}
+
 fn is_harmless_keyword(keyword: &str) -> bool {
     let keyword = keyword.trim_end_matches(['+', '-']);
     matches!(
         keyword,
-        "apptype"
+        "a" | "a1"
+            | "a2"
+            | "a4"
+            | "a8"
+            | "a16"
+            | "align"
+            | "apptype"
             | "asmmode"
             | "assertions"
             | "booleval"
             | "debug"
             | "debugsymbols"
+            | "denypackageunit"
             | "endregion"
             | "excessprecision"
             | "extendedsyntax"
+            | "externalsym"
             | "h"
             | "hints"
+            | "hppemit"
+            | "imagebase"
+            | "l"
             | "longstrings"
             | "m"
             | "message"
+            | "minenumsize"
             | "mode"
+            | "nodefine"
+            | "noinclude"
             | "objexportall"
+            | "objtypename"
             | "optimization"
             | "overflowchecks"
             | "q"
             | "r"
             | "rangechecks"
             | "region"
+            | "resource"
             | "rtti"
+            | "stackframes"
             | "stronglinktypes"
             | "t"
             | "typedaddress"
+            | "varpropsetter"
             | "warn"
             | "warnings"
+            | "weakpackageunit"
             | "writeableconst"
             | "x"
+            | "z"
+            | "z1"
+            | "z2"
+            | "z4"
     )
 }
 

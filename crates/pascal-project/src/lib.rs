@@ -4403,7 +4403,8 @@ fn build_standalone_context_with_overrides(
     session: &OverrideSession,
     exclusions: &[String],
 ) -> Result<ProjectContext, String> {
-    let (effective_overrides, override_error) = match standalone_overrides(file, roots, session) {
+    let (mut effective_overrides, override_error) = match standalone_overrides(file, roots, session)
+    {
         Ok(overrides) => (overrides, None),
         Err(error) => {
             warnings.push(error.clone());
@@ -4411,10 +4412,25 @@ fn build_standalone_context_with_overrides(
             (EffectiveOverrides::default(), Some(error))
         }
     };
+    let mut options = options.clone();
+    if override_error.is_none() {
+        if let Some(installation) = containing_installation(file, roots, session) {
+            effective_overrides = merge_effective_overrides(
+                installation.overrides,
+                &effective_overrides,
+                relevant_override_workspace_root(file, roots).as_deref(),
+                file.parent().unwrap_or(file),
+            );
+            if options.conditional_context.compiler_version.is_none() {
+                options.conditional_context.compiler_version =
+                    crate::installations::compiler_version_for_installation(&installation.id);
+            }
+        }
+    }
     let mut context = build_standalone_context(
         file,
         roots,
-        options,
+        &options,
         effective_overrides,
         warnings,
         discovery_complete,
@@ -4425,6 +4441,32 @@ fn build_standalone_context_with_overrides(
     )?;
     context.override_error = override_error;
     Ok(context)
+}
+
+/// A source inside exactly one configured installation's `BDS` tree (its RTL
+/// and VCL sources) is compiled by that installation, so a standalone context
+/// for it takes the installation's compiler and profile properties such as
+/// `Platform`.
+fn containing_installation(
+    file: &Path,
+    roots: &[PathBuf],
+    session: &OverrideSession,
+) -> Option<crate::installation_config::ResolvedInstallation> {
+    let workspace_root = relevant_override_workspace_root(file, roots);
+    let configuration = session
+        .configuration_for(workspace_root.as_deref(), None)
+        .ok()?;
+    let mut containing = configuration
+        .installation_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let profile = configuration.profile(&id).ok()?;
+            let bds = profile.overrides.properties.get("bds")?;
+            let bds = profile.overrides.resolve_path(bds, Path::new("/")).ok()?;
+            path_starts_with_ci(file, &bds.path).then_some(profile)
+        });
+    let installation = containing.next()?;
+    containing.next().is_none().then_some(installation)
 }
 
 fn effective_overrides_for_project(

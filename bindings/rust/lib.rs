@@ -105,6 +105,27 @@ mod tests {
     }
 
     #[test]
+    fn test_line_comments_exclude_line_terminators() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&super::LANGUAGE.into()).unwrap();
+        for (source, comment_end) in [
+            ("unit U;\n// hello\ninterface\nimplementation\nend.\n", 16),
+            ("unit U;\r\n// hello\r\ninterface\r\nimplementation\r\nend.\r\n", 17),
+            ("unit U;\r// hello\rinterface\rimplementation\rend.\r", 16),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            let mut cursor = tree.walk();
+            let unit = tree.root_node().child(0).unwrap();
+            let comment = unit
+                .children(&mut cursor)
+                .find(|node| node.kind() == "comment")
+                .unwrap_or_else(|| panic!("{:?}: {}", source, tree.root_node().to_sexp()));
+            assert_eq!(comment.end_byte(), comment_end, "{:?}", source);
+            assert_eq!(&source[comment.byte_range()], "// hello", "{:?}", source);
+        }
+    }
+
+    #[test]
     fn test_modern_syntax_with_preprocessor_and_incremental_edits() {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&super::LANGUAGE.into()).unwrap();

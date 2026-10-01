@@ -1388,7 +1388,7 @@ module.exports = grammar({
 	  	_space:            $ => /[\s\r\n\t]+/,
 		ppDirective:       $ => token(prec(-1, /\{\$[^}]*\}/)),
 		comment:           $ => token(choice(
-			seq('//', /.*/),
+			seq('//', /[^\r\n]*/),
 			seq('{', /([^$}][^}]*)?/, '}'),
 			/[(][*]([^*]*[*]+[^)*])*[^*]*[*]+[)]/
 		)),

@@ -1260,7 +1260,7 @@ fn property_paths(
     policy: &ReadPolicy,
     tracker: &mut ProjectReadTracker<'_>,
     warnings: &mut Vec<String>,
-) -> Result<Vec<(ProjectPathEntry, String)>, String> {
+) -> Result<Vec<(ProjectPathEntry, Vec<String>)>, String> {
     let mut entries = Vec::new();
     for (raw, _provenance) in builder.property_list_with_provenance(key) {
         let raw = raw.trim();
@@ -1322,13 +1322,15 @@ fn property_paths(
                     ));
                     continue;
                 }
-                if entries
-                    .iter()
-                    .all(|(existing, _): &(ProjectPathEntry, String)| {
-                        !crate::project_paths_equal(&existing.path, &entry.path)
-                    })
-                {
-                    entries.push((entry, raw.to_owned()));
+                // Keep every spelling of a duplicate: installation ownership is
+                // decided from the entry text, and any owned spelling counts.
+                match entries.iter_mut().find(
+                    |(existing, _): &&mut (ProjectPathEntry, Vec<String>)| {
+                        crate::project_paths_equal(&existing.path, &entry.path)
+                    },
+                ) {
+                    Some((_, spellings)) => spellings.push(raw.to_owned()),
+                    None => entries.push((entry, vec![raw.to_owned()])),
                 }
             }
             Err(error) => warnings.push(format!("could not resolve {key} entry `{raw}`: {error}")),
@@ -1337,7 +1339,7 @@ fn property_paths(
     Ok(entries)
 }
 
-fn without_raw_text(entries: Vec<(ProjectPathEntry, String)>) -> Vec<ProjectPathEntry> {
+fn without_raw_text(entries: Vec<(ProjectPathEntry, Vec<String>)>) -> Vec<ProjectPathEntry> {
     entries.into_iter().map(|(entry, _)| entry).collect()
 }
 
@@ -1349,7 +1351,7 @@ fn compiled_library_roots(
     builder: &ProjectBuilder,
     profile: &ResolvedInstallation,
     environment: &InstallationEnvironment,
-    library: &[(ProjectPathEntry, String)],
+    library: &[(ProjectPathEntry, Vec<String>)],
 ) -> Vec<PathBuf> {
     let mut text_roots = Vec::new();
     let mut resolved_roots = Vec::new();
@@ -1375,24 +1377,44 @@ fn compiled_library_roots(
     }
     library
         .iter()
-        .filter(|(entry, raw)| {
-            let raw = normalized_path_text(raw);
-            !text_roots
-                .iter()
-                .any(|root| raw == *root || raw.starts_with(&format!("{root}/")))
-                && !resolved_roots
+        .filter(|(entry, spellings)| {
+            !spellings.iter().any(|raw| {
+                let raw = normalized_path_text(raw);
+                text_roots
                     .iter()
-                    .any(|root| crate::project_path_starts_with(&entry.path, root))
+                    .any(|root| raw == *root || raw.starts_with(&format!("{root}/")))
+            }) && !resolved_roots
+                .iter()
+                .any(|root| crate::project_path_starts_with(&entry.path, root))
         })
         .map(|(entry, _)| entry.path.clone())
         .collect()
 }
 
+/// Lower-case, `/`-separated text with `.` and `..` collapsed, matching the
+/// lexical normalization the path resolver applies.
 fn normalized_path_text(value: &str) -> String {
-    value
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    let value = value.replace('\\', "/").to_ascii_lowercase();
+    let mut components: Vec<&str> = Vec::new();
+    for component in value.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() > 1 || components.first().is_some_and(|c| !c.ends_with(':')) {
+                    components.pop();
+                }
+            }
+            component => components.push(component),
+        }
+    }
+    let prefix = if value.starts_with("//") {
+        "//"
+    } else if value.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    format!("{prefix}{}", components.join("/"))
 }
 
 fn reconcile_ide_path(

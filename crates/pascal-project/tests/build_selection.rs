@@ -836,6 +836,57 @@ fn library_path_under_an_unmapped_installation_root_stays_library_code() {
     assert_library(&context, &source_file);
 }
 
+#[test]
+fn library_path_with_dot_dot_segments_under_an_unmapped_root_stays_library_code() {
+    let fixture = IdeLibraryFixture::new();
+    let mapped_source = fixture.root.join("mapped-sdk-source");
+    let source_file = fixture.unit(&mapped_source, "SysUtils");
+    let context = fixture.discover_with_bds(
+        "C:\\SDK",
+        "<PropertyGroup>\
+         <DelphiLibraryPath>C:\\Other\\..\\SDK\\.\\source</DelphiLibraryPath>\
+         </PropertyGroup>",
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\\\SDK\\\\source'\nto = '{}'\n",
+            mapped_source.display()
+        ),
+    );
+
+    assert!(
+        context.search_paths.contains(&mapped_source),
+        "warnings: {:?}",
+        context.warnings
+    );
+    assert_library(&context, &source_file);
+}
+
+#[test]
+fn any_installation_spelling_of_a_duplicate_library_entry_keeps_it_library_code() {
+    for library in ["C:\\Alias;C:\\SDK\\source", "C:\\SDK\\source;C:\\Alias"] {
+        let fixture = IdeLibraryFixture::new();
+        let mapped_source = fixture.root.join("mapped-sdk-source");
+        let source_file = fixture.unit(&mapped_source, "SysUtils");
+        let context = fixture.discover_with_bds(
+            "C:\\SDK",
+            &format!(
+                "<PropertyGroup><DelphiLibraryPath>{library}</DelphiLibraryPath></PropertyGroup>"
+            ),
+            &format!(
+                "[[path_mappings]]\nfrom = 'C:\\\\Alias'\nto = '{0}'\n\
+                 [[path_mappings]]\nfrom = 'C:\\\\SDK\\\\source'\nto = '{0}'\n",
+                mapped_source.display()
+            ),
+        );
+
+        assert!(
+            context.search_paths.contains(&mapped_source),
+            "{library}: warnings: {:?}",
+            context.warnings
+        );
+        assert_library(&context, &source_file);
+    }
+}
+
 struct IdeLibraryFixture {
     _temp: tempfile::TempDir,
     root: std::path::PathBuf,

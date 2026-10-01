@@ -54,6 +54,7 @@ use pascal_core::resolver::{
 #[cfg(test)]
 thread_local! {
     static TEST_IMPORT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_CONTEXT_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -64,6 +65,16 @@ pub(crate) fn test_import_resolution_count() -> usize {
 #[cfg(test)]
 pub(crate) fn test_reset_import_resolution_count() {
     TEST_IMPORT_RESOLUTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_context_prune_count() -> usize {
+    TEST_CONTEXT_PRUNES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_context_prune_count() {
+    TEST_CONTEXT_PRUNES.with(|count| count.set(0));
 }
 
 pub(crate) mod code_lenses;
@@ -8685,7 +8696,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
-        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, false)
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, false, false)
     }
 
     pub(crate) fn context_for_project_protocol_anchor_with_control(
@@ -8694,7 +8705,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
-        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, true)
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, true, false)
     }
 
     fn context_for_uri_with_cancel_and_budget_anchor_policy(
@@ -8703,6 +8714,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
         allow_project_anchor: bool,
+        defer_context_pruning: bool,
     ) -> Result<ContextKey, String> {
         let path = uri
             .to_file_path()
@@ -8792,6 +8804,7 @@ impl Workspace {
                         &project_options,
                         cancel,
                         budget,
+                        defer_context_pruning,
                     )
                     .map_err(|error| {
                         if error == CANCELLATION_MESSAGE {
@@ -8811,7 +8824,14 @@ impl Workspace {
                 // Once project candidates change, freshness fails and normal
                 // automatic discovery is allowed to reconsider the owner.
                 self.contexts.insert(owner.key.clone(), owner.state.clone());
-                self.select_document_context(uri, &owner.key, owner.origin, cancel, budget)?;
+                self.select_document_context_with_pruning(
+                    uri,
+                    &owner.key,
+                    owner.origin,
+                    cancel,
+                    budget,
+                    !defer_context_pruning,
+                )?;
                 return Ok(owner.key);
             }
         }
@@ -8842,11 +8862,19 @@ impl Workspace {
             context,
             observations,
             candidate_memberships,
+            project_selection,
+            project_scope,
         } = discovery;
         for warning in context.warnings.iter().cloned() {
             self.warn(warning);
         }
-        let key = self.context_key_for_path_with_cancel(&path, Some(&context), cancel)?;
+        let key = self.context_key_for_project_discovery(
+            &path,
+            &context,
+            project_selection,
+            project_scope,
+            cancel,
+        )?;
         self.install_context(
             key.clone(),
             context,
@@ -8856,12 +8884,13 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.select_document_context(
+        self.select_document_context_with_pruning(
             uri,
             &key,
             self.owner_origin_for_context_key(&key),
             cancel,
             budget,
+            !defer_context_pruning,
         )?;
         Ok(key)
     }
@@ -8876,12 +8905,20 @@ impl Workspace {
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
+        defer_context_pruning: bool,
     ) -> Result<ContextKey, String> {
         if !owner.needs_revalidation
             && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
         {
             self.contexts.insert(owner.key.clone(), owner.state.clone());
-            self.select_document_context(uri, &owner.key, owner.origin, cancel, budget)?;
+            self.select_document_context_with_pruning(
+                uri,
+                &owner.key,
+                owner.origin,
+                cancel,
+                budget,
+                !defer_context_pruning,
+            )?;
             return Ok(owner.key.clone());
         }
 
@@ -8899,7 +8936,14 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.select_document_context(uri, &key, owner.origin, cancel, budget)?;
+        self.select_document_context_with_pruning(
+            uri,
+            &key,
+            owner.origin,
+            cancel,
+            budget,
+            !defer_context_pruning,
+        )?;
         Ok(key)
     }
 
@@ -8947,6 +8991,8 @@ impl Workspace {
                     },
                     observations: Vec::new(),
                     candidate_memberships: HashMap::new(),
+                    project_selection: Some((scope.to_path_buf(), selected.to_path_buf())),
+                    project_scope: Some(scope.to_path_buf()),
                 };
                 let mut key = owner.key.clone();
                 key.project_file = None;
@@ -9374,48 +9420,40 @@ impl Workspace {
         }
     }
 
-    fn context_key_for_path_with_cancel(
+    fn context_key_for_project_discovery(
         &self,
         path: &Path,
-        context: Option<&ProjectContext>,
+        context: &ProjectContext,
+        selection: Option<(PathBuf, PathBuf)>,
+        discovered_scope: Option<PathBuf>,
         cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
-        let selection = self.runtime_selection_for_path_with_cancel(
-            path,
-            &self.workspace_root_paths(),
-            cancel,
-        )?;
-        let project_scope = if let Some(scope) = context
-            .and_then(|context| context.project_file.as_deref())
-            .and_then(Path::parent)
-        {
-            Some(scope.to_path_buf())
-        } else {
-            self.project_scope_for_path_with_cancel(path, context, cancel)?
-        };
+        check_workspace_cancel(cancel)?;
+        let project_scope = discovered_scope.or_else(|| {
+            context
+                .project_file
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        });
         Ok(ContextKey {
-            project_file: context.and_then(|context| context.project_file.clone()),
-            installation_id: context.and_then(selected_installation_id),
+            project_file: context.project_file.clone(),
+            installation_id: selected_installation_id(context),
             workspace_root: self.root_for_path(path),
             project_scope,
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
             selection_project: selection.map(|(_, project)| project),
-            config: context.and_then(|context| context.config.clone()),
-            platform: context.and_then(|context| context.platform.clone()),
-            build_selection_modes: context.map(|context| {
-                (
-                    context.config_selection.mode,
-                    context.platform_selection.mode,
-                )
-            }),
-            conditional_context: context
-                .map(|context| conditional_context_for_path(context, path))
-                .unwrap_or_default(),
-            context_fingerprint: context
-                .map(crate::navigation::compiled_dcu::project_context_fingerprint),
-            overrides: context
-                .map(|context| context.overrides.clone())
-                .unwrap_or_default(),
+            config: context.config.clone(),
+            platform: context.platform.clone(),
+            build_selection_modes: Some((
+                context.config_selection.mode,
+                context.platform_selection.mode,
+            )),
+            conditional_context: conditional_context_for_path(context, path),
+            context_fingerprint: Some(
+                crate::navigation::compiled_dcu::project_context_fingerprint(context),
+            ),
+            overrides: context.overrides.clone(),
         })
     }
 
@@ -9454,15 +9492,6 @@ impl Workspace {
             budget.map(|budget| budget as &dyn ProjectWorkBudget),
             &deleted_paths,
         )
-    }
-
-    fn runtime_selection_for_path_with_cancel(
-        &self,
-        path: &Path,
-        roots: &[PathBuf],
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-        self.runtime_selection_for_path_with_cancel_and_budget(path, roots, cancel, None)
     }
 
     fn runtime_selection_for_path_with_cancel_and_budget(
@@ -9512,27 +9541,6 @@ impl Workspace {
         runtime_project_selection(path, &candidates, &self.project_selections)
             .map(|(scope, _)| scope)
             .or(candidates.directory)
-    }
-
-    fn project_scope_for_path_with_cancel(
-        &self,
-        path: &Path,
-        context: Option<&ProjectContext>,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<PathBuf>, String> {
-        if let Some(scope) = context
-            .and_then(|context| context.project_file.as_deref())
-            .and_then(Path::parent)
-        {
-            return Ok(Some(scope.to_path_buf()));
-        }
-        let roots = self.workspace_root_paths();
-        let candidates = self.project_candidates_with_deleted_paths(path, &roots, cancel)?;
-        Ok(
-            runtime_project_selection(path, &candidates, &self.project_selections)
-                .map(|(scope, _)| scope)
-                .or(candidates.directory),
-        )
     }
 
     fn root_for_path(&self, path: &Path) -> Option<PathBuf> {
@@ -12222,6 +12230,8 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        TEST_CONTEXT_PRUNES.with(|count| count.set(count.get().saturating_add(1)));
         check_workspace_cancel(cancel)?;
         let mut used = HashSet::new();
         used.try_reserve(
@@ -12271,13 +12281,25 @@ impl Workspace {
         Ok(())
     }
 
-    fn select_document_context(
+    fn select_document_context_deferred(
         &mut self,
         uri: &Url,
         context_key: &ContextKey,
         origin: OwnerOrigin,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        self.select_document_context_with_pruning(uri, context_key, origin, cancel, budget, false)
+    }
+
+    fn select_document_context_with_pruning(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        origin: OwnerOrigin,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        prune_unused: bool,
     ) -> Result<(), String> {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
@@ -12290,7 +12312,15 @@ impl Workspace {
         self.document_contexts
             .insert(uri.clone(), context_key.clone());
         self.remember_document_owner_with_origin(uri, context_key, origin);
-        self.prune_unused_contexts_with_control(cancel, budget)
+        if prune_unused {
+            self.prune_unused_contexts_with_control(cancel, budget)
+        } else {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+            }
+            Ok(())
+        }
     }
 
     fn remember_deleted(&mut self, uri: &Url) {
@@ -16226,6 +16256,477 @@ mod tests {
             Url::from_file_path(&main).unwrap(),
             Url::from_file_path(&provider).unwrap(),
         )
+    }
+
+    #[test]
+    fn workspace_contexts_keep_project_and_source_specific_inputs() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let left = root.join("Left");
+        let nested = left.join("Nested");
+        let right = root.join("Right");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&right).unwrap();
+
+        let left_project = left.join("Left.dproj");
+        let left_source = left.join("Left.dpr");
+        let nested_source = nested.join("Nested.pas");
+        let right_project = right.join("Right.dproj");
+        let right_source = right.join("Right.dpr");
+        let shared_source = root.join("Shared.pas");
+        fs::write(
+            &left_project,
+            "<Project><PropertyGroup><MainSource>Left.dpr</MainSource><DCCReference Include=\"../Shared.pas\"/></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&left_source, "program Left; begin end.").unwrap();
+        fs::write(&nested_source, "unit Nested; interface implementation end.").unwrap();
+        fs::write(
+            &right_project,
+            "<Project><PropertyGroup><MainSource>Right.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&right_source, "program Right; begin end.").unwrap();
+        fs::write(&shared_source, "unit Shared; interface implementation end.").unwrap();
+        fs::write(
+            nested.join(".delphilsp.json"),
+            r#"{"version":1,"defines":["NESTED_ONLY"]}"#,
+        )
+        .unwrap();
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let left_uri = Url::from_file_path(&left_source).unwrap();
+        let nested_uri = Url::from_file_path(&nested_source).unwrap();
+        let right_uri = Url::from_file_path(&right_source).unwrap();
+        let left_key = workspace.context_for_uri(&left_uri).unwrap();
+        let nested_key = workspace.context_for_uri(&nested_uri).unwrap();
+        let right_key = workspace.context_for_uri(&right_uri).unwrap();
+
+        let left_context = &workspace.contexts[&left_key].context;
+        let nested_context = &workspace.contexts[&nested_key].context;
+        let right_context = &workspace.contexts[&right_key].context;
+        assert_eq!(
+            left_context.project_file.as_deref(),
+            Some(left_project.as_path())
+        );
+        assert_eq!(
+            right_context.project_file.as_deref(),
+            Some(right_project.as_path())
+        );
+        assert_ne!(left_key, right_key);
+        assert!(
+            !left_context
+                .effective_conditional_context()
+                .defines
+                .contains_key("NESTED_ONLY")
+        );
+        assert_eq!(
+            nested_context
+                .effective_conditional_context()
+                .defines
+                .get("NESTED_ONLY"),
+            Some(&ConditionalFact::True)
+        );
+        assert!(
+            left_context
+                .explicit_units
+                .get("shared")
+                .is_some_and(|paths| paths.iter().any(|path| path == &shared_source))
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_revalidates_project_changes_and_deletions() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        let first = root.join("First.pas");
+        let second = root.join("Second.pas");
+        let original_project =
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>";
+        fs::write(&project, original_project).unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        fs::write(&first, "unit First; interface implementation end.").unwrap();
+        fs::write(&second, "unit Second; interface implementation end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let cancel = AtomicBool::new(false);
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("workspace snapshot");
+        let records = super::rename::snapshot_records(&snapshot);
+
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource><DCC_Define>CHANGED</DCC_Define></PropertyGroup></Project>",
+        )
+        .unwrap();
+        assert!(super::rename::revalidate_input(&input, &records, &cancel).is_err());
+
+        fs::write(&project, original_project).unwrap();
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("second workspace snapshot");
+        let records = super::rename::snapshot_records(&snapshot);
+        fs::remove_file(&project).unwrap();
+        assert!(super::rename::revalidate_input(&input, &records, &cancel).is_err());
+    }
+
+    #[test]
+    fn workspace_snapshot_discovery_checks_cancellation_between_sources() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        for index in 0..8 {
+            fs::write(
+                root.join(format!("Unit{index}.pas")),
+                format!("unit Unit{index}; interface implementation end."),
+            )
+            .unwrap();
+        }
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let cancel = AtomicBool::new(false);
+        let _cancel_after_first = super::rename::test_cancel_enumerated_contexts_after(1);
+        let result = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        );
+
+        assert_eq!(result.err().as_deref(), Some("request cancelled"));
+    }
+
+    #[test]
+    fn workspace_snapshot_reuses_project_context_builds() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        for directory in 0..4 {
+            let source_dir = root.join(format!("Units{directory}"));
+            fs::create_dir_all(&source_dir).unwrap();
+            for source in 0..5 {
+                let unit = format!("Unit{directory}_{source}");
+                fs::write(
+                    source_dir.join(format!("{unit}.pas")),
+                    format!("unit {unit}; interface implementation end."),
+                )
+                .unwrap();
+            }
+        }
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let cancel = AtomicBool::new(false);
+        pascal_project::test_reset_project_discovery_counts();
+        pascal_project::test_reset_project_directory_listing_counts();
+        super::rename::test_reset_sibling_context_reuse_checks();
+        super::test_reset_context_prune_count();
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("workspace snapshot");
+        let (discoveries, context_builds) = pascal_project::test_project_discovery_counts();
+        let (directory_listing_reads, directory_listing_stamp_checks) =
+            pascal_project::test_project_directory_listing_counts();
+        let (freshness_checks, selection_checks) =
+            super::rename::test_sibling_context_reuse_checks();
+
+        assert_eq!(
+            super::test_context_prune_count(),
+            2,
+            "priority plus one enumeration prune"
+        );
+        assert_eq!(discoveries, 5, "one discovery per exact source directory");
+        assert_eq!(context_builds, 1, "one project has one context build");
+        assert_eq!((freshness_checks, selection_checks), (16, 16));
+        assert!(
+            directory_listing_stamp_checks >= freshness_checks,
+            "cached project listings are stat-validated during sibling freshness checks"
+        );
+        assert!(
+            directory_listing_reads < freshness_checks,
+            "unchanged sibling reuse must validate cached listings without re-listing each time"
+        );
+        assert_eq!(snapshot.sources.len(), 21);
+    }
+
+    #[test]
+    fn workspace_snapshot_rechecks_directory_membership_before_sibling_reuse() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let legacy_project = root.join("Main.dpr");
+        let project = root.join("App.dproj");
+        let first = root.join("A.pas");
+        let second = root.join("B.pas");
+        fs::write(&legacy_project, "program Main; begin end.").unwrap();
+        fs::write(&first, "unit A; interface implementation end.").unwrap();
+        fs::write(&second, "unit B; interface implementation end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook_seen = Arc::clone(&seen);
+        let hook_project = project.clone();
+        let _hook = super::rename::test_after_enumerated_context(
+            move |processed, path, context| {
+                hook_seen
+                    .lock()
+                    .expect("context observations")
+                    .push((path.to_path_buf(), context.project_file.clone()));
+                if processed == 1 {
+                    fs::write(
+                        &hook_project,
+                        "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+                    )
+                    .expect("create a nearer project after the first sibling discovery");
+                }
+            },
+        );
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .expect("workspace snapshot");
+        let seen = seen.lock().expect("context observations");
+        let first_project = seen
+            .iter()
+            .find(|(path, _)| path == &first)
+            .map(|(_, project)| project.as_deref());
+        let second_project = seen
+            .iter()
+            .find(|(path, _)| path == &second)
+            .map(|(_, project)| project.as_deref());
+
+        assert!(
+            snapshot
+                .sources
+                .contains_key(&Url::from_file_path(&second).unwrap())
+        );
+        assert_ne!(first_project.flatten(), Some(project.as_path()));
+        assert_eq!(second_project.flatten(), Some(project.as_path()));
+    }
+
+    #[test]
+    fn workspace_snapshot_rechecks_project_metadata_before_sibling_reuse() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        let first = root.join("A.pas");
+        let second = root.join("B.pas");
+        let project_text = |define: &str| {
+            format!(
+                "<Project><PropertyGroup><MainSource>Main.dpr</MainSource><DCC_Define>{define}</DCC_Define></PropertyGroup></Project>"
+            )
+        };
+        fs::write(&project, project_text("OLD_FLAG")).unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        fs::write(&first, "unit A; interface implementation end.").unwrap();
+        fs::write(&second, "unit B; interface implementation end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook_seen = Arc::clone(&seen);
+        let replacement = project_text("NEW_FLAG");
+        let _hook =
+            super::rename::test_after_enumerated_context(move |processed, path, context| {
+                let defines = &context.effective_conditional_context().defines;
+                hook_seen.lock().expect("context observations").push((
+                    path.to_path_buf(),
+                    defines.contains_key("OLD_FLAG"),
+                    defines.contains_key("NEW_FLAG"),
+                ));
+                if processed == 1 {
+                    fs::write(&project, &replacement)
+                        .expect("change project metadata after the first sibling discovery");
+                }
+            });
+        super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .expect("workspace snapshot");
+        let seen = seen.lock().expect("context observations");
+        let first_defines = seen
+            .iter()
+            .find(|(path, _, _)| path == &first)
+            .map(|(_, old, new)| (*old, *new));
+        let second_defines = seen
+            .iter()
+            .find(|(path, _, _)| path == &second)
+            .map(|(_, old, new)| (*old, *new));
+
+        assert_eq!(first_defines, Some((true, false)));
+        assert_eq!(second_defines, Some((false, true)));
+    }
+
+    #[test]
+    fn workspace_snapshot_assigns_every_source_its_own_discovered_context_key() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let app = root.join("App");
+        let units = app.join("Units");
+        let configured = units.join("Configured");
+        let shared = root.join("Shared");
+        for directory in [&units, &configured, &shared] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            app.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"..\\Shared\\Listed.pas\"/></ItemGroup></Project>",
+        )
+        .unwrap();
+        fs::write(
+            app.join("App.dpr"),
+            "program App; uses Listed in '..\\Shared\\Listed.pas'; begin end.",
+        )
+        .unwrap();
+        fs::write(
+            configured.join(".delphilsp.json"),
+            r#"{"version":1,"defines":["CONFIGURED_ONLY"]}"#,
+        )
+        .unwrap();
+        let mut sources = Vec::new();
+        for (directory, names) in [
+            (&app, &["First", "Second"][..]),
+            (&units, &["Third", "Fourth"][..]),
+            (&configured, &["Fifth", "Sixth"][..]),
+            (&shared, &["Listed", "Unlisted"][..]),
+        ] {
+            for name in names {
+                let path = directory.join(format!("{name}.pas"));
+                fs::write(&path, format!("unit {name}; interface implementation end.")).unwrap();
+                sources.push(path);
+            }
+        }
+
+        let mut fresh = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let expected = sources
+            .iter()
+            .map(|path| {
+                let key = fresh
+                    .context_for_uri(&Url::from_file_path(path).unwrap())
+                    .unwrap();
+                (path.clone(), key)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let _ = super::rename::test_take_enumerated_owners();
+        super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .expect("workspace snapshot");
+        let assigned = super::rename::test_take_enumerated_owners()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        for path in &sources {
+            assert_eq!(
+                assigned.get(path),
+                Some(&expected[path]),
+                "{} must get the context key that its own discovery yields",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_snapshot_keeps_ambiguous_dpr_ownership_source_specific() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let first = root.join("First.dpr");
+        let second = root.join("Second.dpr");
+        fs::write(&first, "program First; begin end.").unwrap();
+        fs::write(&second, "program Second; begin end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        pascal_project::test_reset_project_discovery_counts();
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("workspace snapshot");
+        let (discoveries, _) = pascal_project::test_project_discovery_counts();
+
+        let first_uri = Url::from_file_path(first).unwrap();
+        let second_uri = Url::from_file_path(second).unwrap();
+        assert!(snapshot.sources.contains_key(&first_uri));
+        assert!(snapshot.sources.contains_key(&second_uri));
+        assert_eq!(
+            discoveries, 2,
+            "ambiguous sibling candidates need per-source discovery"
+        );
     }
 
     #[test]

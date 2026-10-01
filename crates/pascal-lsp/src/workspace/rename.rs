@@ -37,8 +37,8 @@ use pascal_core::resolver::{
 use pascal_project::delphi_overrides::EffectiveOverrides;
 use pascal_project::{
     BuildChoice, ConditionalContext, MetadataObservation, ProjectCandidateMembership,
-    ProjectContext, ProjectPathEntry, ProjectPathProvenance, ProjectSelections, ReadPolicy,
-    has_invalid_project_selection,
+    ProjectContext, ProjectDiscoveryCacheScope, ProjectPathEntry, ProjectPathProvenance,
+    ProjectSelections, ReadPolicy, has_invalid_project_selection,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -90,6 +90,13 @@ const INCLUDE_BYTE_BUDGET_ERROR: &str =
 #[cfg(test)]
 thread_local! {
     static TEST_CANCEL_INCLUDE_ANALYSIS: Cell<bool> = const { Cell::new(false) };
+    static TEST_CANCEL_ENUMERATED_CONTEXTS_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    static TEST_ENUMERATED_CONTEXT_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnMut(usize, &Path, &ProjectContext)>>> =
+        std::cell::RefCell::new(None);
+    static TEST_SIBLING_CONTEXT_REUSE_CHECKS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static TEST_ENUMERATED_OWNERS: std::cell::RefCell<Vec<(PathBuf, ContextKey)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -103,6 +110,100 @@ pub(crate) fn test_cancel_in_include_analysis() -> TestIncludeCancellationGuard 
         previous
     });
     TestIncludeCancellationGuard(previous)
+}
+
+#[cfg(test)]
+pub(crate) struct TestEnumeratedContextCancellationGuard(Option<usize>);
+
+#[cfg(test)]
+pub(crate) fn test_cancel_enumerated_contexts_after(
+    processed: usize,
+) -> TestEnumeratedContextCancellationGuard {
+    TestEnumeratedContextCancellationGuard(
+        TEST_CANCEL_ENUMERATED_CONTEXTS_AFTER
+            .with(|cancel_after| cancel_after.replace(Some(processed))),
+    )
+}
+
+#[cfg(test)]
+impl Drop for TestEnumeratedContextCancellationGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_ENUMERATED_CONTEXTS_AFTER.with(|cancel_after| {
+            cancel_after.set(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+fn cancel_after_enumerated_contexts(processed: usize, cancel: &AtomicBool) {
+    TEST_CANCEL_ENUMERATED_CONTEXTS_AFTER.with(|cancel_after| {
+        if cancel_after.get() == Some(processed) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) struct TestEnumeratedContextHookGuard(
+    Option<Box<dyn FnMut(usize, &Path, &ProjectContext)>>,
+);
+
+#[cfg(test)]
+pub(crate) fn test_after_enumerated_context(
+    hook: impl FnMut(usize, &Path, &ProjectContext) + 'static,
+) -> TestEnumeratedContextHookGuard {
+    let previous =
+        TEST_ENUMERATED_CONTEXT_HOOK.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+    TestEnumeratedContextHookGuard(previous)
+}
+
+#[cfg(test)]
+impl Drop for TestEnumeratedContextHookGuard {
+    fn drop(&mut self) {
+        TEST_ENUMERATED_CONTEXT_HOOK.with(|slot| {
+            *slot.borrow_mut() = self.0.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn run_test_enumerated_context_hook(processed: usize, path: &Path, context: &ProjectContext) {
+    TEST_ENUMERATED_CONTEXT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(processed, path, context);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_take_enumerated_owners() -> Vec<(PathBuf, ContextKey)> {
+    TEST_ENUMERATED_OWNERS.with(|owners| std::mem::take(&mut *owners.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_sibling_context_reuse_checks() {
+    TEST_SIBLING_CONTEXT_REUSE_CHECKS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(test)]
+pub(crate) fn test_sibling_context_reuse_checks() -> (usize, usize) {
+    TEST_SIBLING_CONTEXT_REUSE_CHECKS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_test_sibling_context_freshness_check() {
+    TEST_SIBLING_CONTEXT_REUSE_CHECKS.with(|counts| {
+        let (freshness, selection) = counts.get();
+        counts.set((freshness.saturating_add(1), selection));
+    });
+}
+
+#[cfg(test)]
+fn record_test_sibling_context_selection_check() {
+    TEST_SIBLING_CONTEXT_REUSE_CHECKS.with(|counts| {
+        let (freshness, selection) = counts.get();
+        counts.set((freshness, selection.saturating_add(1)));
+    });
 }
 
 #[cfg(test)]
@@ -5082,6 +5183,7 @@ fn snapshot_context_for_uri(
     loader: &mut Workspace,
     uri: &Url,
     cancel: &AtomicBool,
+    defer_context_pruning: bool,
 ) -> Result<ContextKey, String> {
     if let Some(owner) = loader.document_owners.get(uri).cloned() {
         if loader.context_has_open_legacy_overlay(&owner.state)
@@ -5100,7 +5202,50 @@ fn snapshot_context_for_uri(
                 .insert(uri.clone(), owner.key.clone());
         }
     }
-    loader.context_for_uri_with_cancel(uri, Some(cancel))
+    loader.context_for_uri_with_cancel_and_budget_anchor_policy(
+        uri,
+        Some(cancel),
+        None,
+        false,
+        defer_context_pruning,
+    )
+}
+
+fn context_state_is_reusable_for_exact_directory(state: &ContextState) -> bool {
+    if !state.context.discovery_complete
+        || !state.context.binding_metadata_complete
+        || state.project_candidate_memberships.is_empty()
+    {
+        return false;
+    }
+    state
+        .project_candidate_memberships
+        .values()
+        .all(|membership| {
+            let Ok(membership) = membership else {
+                return false;
+            };
+            if !membership.readable {
+                return false;
+            }
+            let mut dproj_count = 0;
+            let mut dpr_or_dpk_count = 0;
+            for path in &membership.paths {
+                let Some(extension) = path.extension() else {
+                    continue;
+                };
+                match extension.to_string_lossy().to_ascii_lowercase().as_str() {
+                    "dproj" => dproj_count += 1,
+                    "dpr" | "dpk" => dpr_or_dpk_count += 1,
+                    _ => {}
+                }
+            }
+            if dproj_count > 0 {
+                dproj_count == 1
+            } else {
+                dpr_or_dpk_count <= 1
+            }
+        })
 }
 
 fn snapshot_payload_dependency(
@@ -5148,6 +5293,8 @@ fn discover_enumerated_contexts(
     cancel: &AtomicBool,
 ) -> Result<HashSet<ContextKey>, String> {
     let mut context_keys = priority_contexts.values().cloned().collect::<HashSet<_>>();
+    let mut reusable_directory_contexts = HashMap::<PathBuf, ContextKey>::new();
+    let mut deferred_context_pruning = false;
     context_keys.extend(project_contexts.iter().cloned());
     for context_key in context_keys.clone() {
         if let Some(state) = loader.contexts.get(&context_key).cloned() {
@@ -5185,7 +5332,66 @@ fn discover_enumerated_contexts(
         } else {
             let uri = Url::from_file_path(&path)
                 .map_err(|()| format!("could not create a file URI for {path:?}"))?;
-            let owner = snapshot_context_for_uri(loader, &uri, cancel)?;
+            let had_known_owner = loader.document_owners.contains_key(&uri);
+            let directory = path.parent().map(Path::to_path_buf);
+            let reusable_owner = if had_known_owner {
+                None
+            } else {
+                directory
+                    .as_ref()
+                    .and_then(|directory| reusable_directory_contexts.get(directory))
+                    .filter(|key| loader.contexts.contains_key(*key))
+                    .cloned()
+            };
+            let owner = if let Some(owner) = reusable_owner {
+                if is_cancelled(cancel) {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+                // Enumeration spans filesystem time. A sibling can reuse the
+                // retained owner only while its read set, candidate membership,
+                // and current project selection still match this source.
+                #[cfg(test)]
+                record_test_sibling_context_freshness_check();
+                let context_is_fresh =
+                    loader.context_is_fresh_with_cancel(&owner, Some(cancel), None)?;
+                let selection_is_current = if context_is_fresh {
+                    #[cfg(test)]
+                    record_test_sibling_context_selection_check();
+                    loader.context_matches_current_selection_with_cancel_and_budget(
+                        &path,
+                        &owner,
+                        Some(cancel),
+                        None,
+                    )?
+                } else {
+                    false
+                };
+                if context_is_fresh && selection_is_current {
+                    let origin = loader.owner_origin_for_context_key(&owner);
+                    loader.select_document_context_deferred(
+                        &uri,
+                        &owner,
+                        origin,
+                        Some(cancel),
+                        None,
+                    )?;
+                    deferred_context_pruning = true;
+                    owner
+                } else {
+                    snapshot_context_for_uri(loader, &uri, cancel, true)?
+                }
+            } else {
+                let owner = snapshot_context_for_uri(loader, &uri, cancel, true)?;
+                deferred_context_pruning = true;
+                owner
+            };
+            if !had_known_owner
+                && let (Some(directory), Some(state)) =
+                    (directory.as_ref(), loader.contexts.get(&owner))
+                && context_state_is_reusable_for_exact_directory(state)
+            {
+                reusable_directory_contexts.insert(directory.clone(), owner.clone());
+            }
             let Some(state) = loader.contexts.get(&owner).cloned() else {
                 enumeration.complete = false;
                 enumeration.reason.get_or_insert_with(|| {
@@ -5197,7 +5403,19 @@ fn discover_enumerated_contexts(
             owner
         };
         enumeration.assign_owner(&path, owner.clone());
-        context_keys.insert(owner);
+        #[cfg(test)]
+        TEST_ENUMERATED_OWNERS
+            .with(|owners| owners.borrow_mut().push((path.clone(), owner.clone())));
+        context_keys.insert(owner.clone());
+        #[cfg(test)]
+        if let Some(state) = loader.contexts.get(&owner) {
+            run_test_enumerated_context_hook(index + 1, &path, &state.context);
+        }
+        #[cfg(test)]
+        cancel_after_enumerated_contexts(index + 1, cancel);
+    }
+    if deferred_context_pruning {
+        loader.prune_unused_contexts_with_control(Some(cancel), None)?;
     }
     context_keys.extend(enumeration.contexts.keys().cloned());
     Ok(context_keys)
@@ -5601,6 +5819,14 @@ pub(crate) fn build_snapshot(
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
+    let _project_discovery_cache_scope = if matches!(
+        mode,
+        SnapshotMode::Workspace | SnapshotMode::WorkspaceSymbols
+    ) {
+        Some(ProjectDiscoveryCacheScope::new())
+    } else {
+        None
+    };
 
     let mut loader_options = input.options.clone();
     if mode == SnapshotMode::Workspace {
@@ -5655,7 +5881,7 @@ pub(crate) fn build_snapshot(
     let priority = priority.iter().map(canonical_file_uri).collect::<Vec<_>>();
     let mut priority_contexts = HashMap::new();
     for uri in &priority {
-        let context_key = snapshot_context_for_uri(&mut loader, uri, cancel)?;
+        let context_key = snapshot_context_for_uri(&mut loader, uri, cancel, false)?;
         priority_contexts.insert(uri.clone(), context_key);
     }
     #[cfg(test)]
@@ -5888,7 +6114,7 @@ pub(crate) fn build_snapshot(
         } else if let Some(context_key) = priority_contexts.get(&uri) {
             context_key.clone()
         } else {
-            snapshot_context_for_uri(&mut loader, &uri, cancel)?
+            snapshot_context_for_uri(&mut loader, &uri, cancel, false)?
         };
         let (read_policy, path_entry) =
             match snapshot_payload_dependency(&loader, &source_context_key, &path) {

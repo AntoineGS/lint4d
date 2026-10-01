@@ -53,6 +53,7 @@ use pascal_core::resolver::{
 thread_local! {
     static TEST_IMPORT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_CONTEXT_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_CONTEXT_PRUNE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -73,6 +74,13 @@ pub(crate) fn test_context_prune_count() -> usize {
 #[cfg(test)]
 pub(crate) fn test_reset_context_prune_count() {
     TEST_CONTEXT_PRUNES.with(|count| count.set(0));
+    TEST_CONTEXT_PRUNE_VISITS.with(|count| count.set(0));
+}
+
+/// Document-to-context mappings inspected by context pruning.
+#[cfg(test)]
+pub(crate) fn test_context_prune_visit_count() -> usize {
+    TEST_CONTEXT_PRUNE_VISITS.with(std::cell::Cell::get)
 }
 
 pub(crate) mod code_lenses;
@@ -12303,28 +12311,10 @@ impl Workspace {
         #[cfg(test)]
         TEST_CONTEXT_PRUNES.with(|count| count.set(count.get().saturating_add(1)));
         check_workspace_cancel(cancel)?;
-        let mut used = HashSet::new();
-        used.try_reserve(
-            self.document_contexts
-                .len()
-                .saturating_add(self.open_document_contexts.len()),
-        )
-        .map_err(|error| format!("could not reserve live context keys: {error}"))?;
-        for key in self.document_contexts.values() {
-            check_workspace_cancel(cancel)?;
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            used.insert(key.clone());
-        }
-        for key in self.open_document_contexts.values() {
-            check_workspace_cancel(cancel)?;
-            if let Some(budget) = budget {
-                budget.charge_path_visits(1)?;
-            }
-            used.insert(key.clone());
-        }
-        let mut unused = Vec::new();
+        // Contexts are few and document mappings many: cross each context off
+        // at its first use instead of collecting every mapping's key, so a
+        // prune where all contexts are live stops after a handful of visits.
+        let mut unused = HashSet::new();
         unused
             .try_reserve(self.contexts.len())
             .map_err(|error| format!("could not reserve unused context keys: {error}"))?;
@@ -12333,14 +12323,33 @@ impl Workspace {
             if let Some(budget) = budget {
                 budget.charge_path_visits(1)?;
             }
-            if !used.contains(key) {
-                unused.push(key.clone());
+            unused.insert(key);
+        }
+        for key in self
+            .document_contexts
+            .values()
+            .chain(self.open_document_contexts.values())
+        {
+            if unused.is_empty() {
+                break;
             }
+            check_workspace_cancel(cancel)?;
+            #[cfg(test)]
+            TEST_CONTEXT_PRUNE_VISITS.with(|count| count.set(count.get().saturating_add(1)));
+            if let Some(budget) = budget {
+                budget.charge_path_visits(1)?;
+            }
+            unused.remove(key);
         }
+        let mut unused_keys = Vec::new();
+        unused_keys
+            .try_reserve(unused.len())
+            .map_err(|error| format!("could not reserve unused context keys: {error}"))?;
+        unused_keys.extend(unused.into_iter().cloned());
         if let Some(budget) = budget {
-            budget.charge_path_visits(unused.len())?;
+            budget.charge_path_visits(unused_keys.len())?;
         }
-        for key in unused {
+        for key in unused_keys {
             check_workspace_cancel(cancel)?;
             self.contexts.remove(&key);
         }
@@ -22494,6 +22503,72 @@ BDS = '/fake/37'
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn opening_a_document_prunes_live_contexts_without_scanning_every_document() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let mut documents = Vec::new();
+        for index in 0..65 {
+            let path = temp.path().join(format!("Unit{index}.pas"));
+            let source = format!("unit Unit{index}; interface implementation end.\n");
+            fs::write(&path, &source).expect("unit source");
+            documents.push((Url::from_file_path(&path).expect("unit URI"), source));
+        }
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let (last_uri, last_source) = documents.pop().expect("last document");
+        for (uri, source) in documents {
+            workspace
+                .open_document(uri, source, 1)
+                .expect("open document");
+        }
+
+        super::test_reset_context_prune_count();
+        workspace
+            .open_document(last_uri, last_source, 1)
+            .expect("open last document");
+
+        let prunes = super::test_context_prune_count();
+        let visits = super::test_context_prune_visit_count();
+        assert!(prunes > 0, "opening a document prunes contexts");
+        assert!(
+            visits <= prunes * workspace.contexts.len(),
+            "{prunes} prunes of {} live contexts visited {visits} document mappings",
+            workspace.contexts.len()
+        );
+    }
+
+    #[test]
+    fn context_pruning_removes_only_contexts_without_document_mappings() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let path = temp.path().join("Unit.pas");
+        let source = "unit Unit; interface implementation end.\n";
+        fs::write(&path, source).expect("unit source");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        workspace
+            .open_document(
+                Url::from_file_path(&path).expect("unit URI"),
+                source.to_string(),
+                1,
+            )
+            .expect("open document");
+        let (live, state) = workspace
+            .contexts
+            .iter()
+            .next()
+            .map(|(key, state)| (key.clone(), state.clone()))
+            .expect("live context");
+        let orphan = budget_test_context_key(0);
+        workspace.contexts.insert(orphan.clone(), state);
+
+        workspace
+            .prune_unused_contexts_with_control(None, None)
+            .expect("prune contexts");
+
+        assert!(workspace.contexts.contains_key(&live));
+        assert!(!workspace.contexts.contains_key(&orphan));
     }
 
     #[test]

@@ -1265,13 +1265,19 @@ analysis and diagnostics without restarting the server.
 The LSP closes the absent-define world only for project-compiled files when
 discovery is complete, a `.dproj` is selected, the compiler version is known,
 and both configuration and platform are resolved and valid. Project-compiled
-sources include the project main source, `DCCReference` units, files under the
-project directory, `.dproj` unit-search paths and client/local `sourcePaths`.
+sources include the project main source, `DCCReference` units and
+`uses X in '...'` targets (matched by path, so the file name need not match the
+unit name), files under the project directory, `.dproj` unit-search paths,
+client/local `sourcePaths`, and IDE library-path entries outside the selected
+installation's `$(BDS)`, `$(BDSLIB)`, and `$(BDSCOMMONDIR)` directories. Shared
+code on the library path is therefore evaluated with the defines of the project
+that opened it.
 `.dpr`/`.dpk` projects without a selected `.dproj` receive predefined facts but
 remain open and report `noProject`.
-Installation-library and browsing-path sources are treated as library code:
-they receive caller facts, predefined symbols, and RTL constants, but keep
-undefined names `Unknown` and do not receive the project's `DCC_Define` set.
+Browsing-path sources and library-path entries inside the installation (whose
+RTL/VCL units ship precompiled) are treated as library code: they receive
+caller facts, predefined symbols, and RTL constants, but keep undefined names
+`Unknown` and do not receive the project's `DCC_Define` set.
 Includes inherit the including source's context. Standalone files never close.
 
 Predefined symbols supplement explicit project and client facts. Version symbols

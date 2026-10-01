@@ -922,7 +922,9 @@ pub struct ProjectContext {
     pub conditional_closure: ConditionalClosure,
     /// Caller facts and compiler/RTL predefined facts for library sources.
     pub library_conditional_context: ConditionalContext,
-    /// Project and caller-configured source roots, excluding installation paths.
+    /// Roots whose sources the project compiles with its own defines: the
+    /// project directory, unit search paths, caller source paths, and IDE
+    /// library-path entries outside the selected installation's directories.
     pub project_source_roots: Vec<PathBuf>,
     pub config: Option<String>,
     pub platform: Option<String>,
@@ -1451,23 +1453,18 @@ impl ProjectContext {
             return SourceOrigin::ProjectCompiled;
         }
 
-        let explicit_name = path
-            .file_stem()
-            .map(|stem| canonical_unit_name(&stem.to_string_lossy()))
-            .filter(|name| !name.is_empty());
-        let is_explicit = explicit_name.is_some_and(|name| {
-            self.explicit_unit_entries
-                .get(&name)
-                .is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| project_paths_equal(&entry.path, path))
-                })
-                || self
-                    .explicit_units
-                    .get(&name)
-                    .is_some_and(|units| units.iter().any(|unit| project_paths_equal(unit, path)))
-        });
+        // Explicit references are keyed by unit name, which need not match the
+        // file name (`uses Foo in 'Bar.pas'`), so match them by path.
+        let is_explicit = self
+            .explicit_unit_entries
+            .values()
+            .flatten()
+            .any(|entry| project_paths_equal(&entry.path, path))
+            || self
+                .explicit_units
+                .values()
+                .flatten()
+                .any(|unit| project_paths_equal(unit, path));
         if is_explicit {
             SourceOrigin::ProjectCompiled
         } else {
@@ -3938,6 +3935,20 @@ fn relevant_override_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<Pa
         .cloned()
 }
 
+fn installation_directories(overrides: &EffectiveOverrides) -> Vec<PathBuf> {
+    ["bds", "bdslib", "bdscommondir"]
+        .into_iter()
+        .filter_map(|name| overrides.properties.get(name))
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            overrides
+                .resolve_path(value, Path::new("/"))
+                .map(|resolved| resolved.path)
+                .unwrap_or_else(|_| PathBuf::from(value))
+        })
+        .collect()
+}
+
 fn path_starts_with_ci(path: &Path, root: &Path) -> bool {
     let mut path_components = path.components();
     for root_component in root.components() {
@@ -4161,7 +4172,8 @@ fn build_project_context(
                         .properties
                         .get("platform")
                         .cloned()
-                        .or_else(|| bootstrap_platform.clone());
+                        .or_else(|| bootstrap_platform.clone())
+                        .or_else(|| build_candidates.default_platform.clone());
                 }
                 let installation_roots = ["bds", "appdata", "bdslib", "bdscommondir"]
                     .into_iter()
@@ -4368,7 +4380,21 @@ fn build_project_context(
             ProjectPathProvenance::Configured,
         );
     }
-    let project_source_roots = paths_from_entries(&search_path_entries);
+    // Library-path sources are compiled with the project's defines unless they
+    // ship with the installation, whose RTL/VCL units are precompiled.
+    let installation_dirs = installation_directories(&builder.overrides);
+    let mut project_source_roots = paths_from_entries(&search_path_entries);
+    for entry in &ide_paths.library {
+        if !installation_dirs
+            .iter()
+            .any(|dir| path_starts_with_ci(&entry.path, dir))
+            && !project_source_roots
+                .iter()
+                .any(|root| project_paths_equal(root, &entry.path))
+        {
+            project_source_roots.push(entry.path.clone());
+        }
+    }
     for entry in &ide_paths.library {
         if !search_path_entries
             .iter()

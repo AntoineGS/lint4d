@@ -709,6 +709,175 @@ fn source_origin_uses_the_explicit_path_index_outside_project_roots() {
 }
 
 #[test]
+fn explicit_in_clause_paths_are_project_compiled_when_the_file_name_differs() {
+    let temp = tempdir().expect("temporary directory");
+    let project = temp.path().join("project");
+    write_webquery_fixture(&project);
+    write(
+        &project.join("App.dpr"),
+        "program App; uses SvcMain in 'SvcMain.pas', Foo in '../elsewhere/Bar.pas'; begin end.",
+    );
+    let renamed = temp.path().join("elsewhere/Bar.pas");
+    write(&renamed, "unit Foo; interface implementation end.");
+
+    let context = ProjectContext::discover_with_overrides(
+        &project.join("App.dpr"),
+        &[temp.path().to_path_buf()],
+        &d2010_options(),
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert!(context.conditional_closure.closed);
+    assert_eq!(
+        context.source_origin(&renamed),
+        SourceOrigin::ProjectCompiled
+    );
+    assert_eq!(
+        context.conditional_context_for(&renamed).define("DEBUG"),
+        ConditionalFact::False
+    );
+}
+
+#[test]
+fn inferred_platform_selects_the_platform_conditioned_ide_library_path() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let project = root.join("project");
+    let shared = root.join("shared");
+    let sdk = tempdir().expect("installation directory");
+    let appdata = tempdir().expect("appdata directory");
+    write_webquery_fixture(&project);
+    fs::create_dir_all(&shared).expect("library directory");
+    write(
+        &sdk.path().join("bin/rsvars.bat"),
+        &format!("SET BDS={}\n", sdk.path().display()),
+    );
+    write(
+        &appdata.path().join("EnvOptions.proj"),
+        "<Project><PropertyGroup Condition=\"'$(Platform)'=='Win32'\">\
+             <DelphiLibraryPath>C:\\Shared</DelphiLibraryPath></PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n\
+             [[path_mappings]]\nfrom = 'C:\\\\Shared'\nto = '{}'\n\
+             [projects.\"project/App.dproj\"]\ninstallation='37.0'\n",
+            sdk.path().display(),
+            appdata.path().display(),
+            shared.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &project.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert_eq!(
+        context.platform_selection.selected.as_deref(),
+        Some("Win32")
+    );
+    assert!(
+        context.search_paths.contains(&shared),
+        "warnings: {:?}",
+        context.warnings
+    );
+}
+
+#[test]
+fn ide_library_path_sources_are_project_compiled_except_inside_the_installation() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let project = root.join("project");
+    let shared = root.join("shared");
+    let sdk = tempdir().expect("installation directory");
+    let appdata = tempdir().expect("appdata directory");
+    let installation_source = sdk.path().join("source/rtl");
+    let browsing = sdk.path().join("source/vcl");
+    write_webquery_fixture(&project);
+    let shared_file = shared.join("SharedUnit.pas");
+    write(
+        &shared_file,
+        "unit SharedUnit; interface implementation end.",
+    );
+    let installation_file = installation_source.join("SysUtils.pas");
+    write(
+        &installation_file,
+        "unit SysUtils; interface implementation end.",
+    );
+    let browsing_file = browsing.join("Forms.pas");
+    write(&browsing_file, "unit Forms; interface implementation end.");
+    write(
+        &sdk.path().join("bin/rsvars.bat"),
+        &format!("SET BDS={}\n", sdk.path().display()),
+    );
+    write(
+        &appdata.path().join("EnvOptions.proj"),
+        "<Project><PropertyGroup>\
+             <DelphiLibraryPath>C:\\Shared;$(BDS)/source/rtl</DelphiLibraryPath>\
+             <DelphiBrowsingPath>$(BDS)/source/vcl</DelphiBrowsingPath>\
+             </PropertyGroup></Project>",
+    );
+    write(
+        &root.join(".delphi-tools.local.toml"),
+        &format!(
+            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n\
+             [[path_mappings]]\nfrom = 'C:\\\\Shared'\nto = '{}'\n\
+             [projects.\"project/App.dproj\"]\ninstallation='37.0'\n",
+            sdk.path().display(),
+            appdata.path().display(),
+            shared.display()
+        ),
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &project.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .expect("project discovery");
+
+    assert!(
+        context.conditional_closure.closed,
+        "open reasons: {:?}; warnings: {:?}",
+        context.conditional_closure.open_reasons, context.warnings
+    );
+    assert!(
+        context.search_paths.contains(&shared),
+        "warnings: {:?}",
+        context.warnings
+    );
+    assert!(context.search_paths.contains(&installation_source));
+    assert_eq!(
+        context.source_origin(&shared_file),
+        SourceOrigin::ProjectCompiled
+    );
+    assert_eq!(
+        context
+            .conditional_context_for(&shared_file)
+            .define("DEBUG"),
+        ConditionalFact::False
+    );
+    assert_eq!(
+        context.source_origin(&installation_file),
+        SourceOrigin::Library
+    );
+    assert_eq!(
+        context
+            .conditional_context_for(&installation_file)
+            .define("DEBUG"),
+        ConditionalFact::Unknown
+    );
+    assert_eq!(context.source_origin(&browsing_file), SourceOrigin::Library);
+}
+
+#[test]
 fn project_define_wins_over_a_conflicting_predefined_symbol() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();

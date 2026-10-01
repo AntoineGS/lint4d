@@ -753,6 +753,40 @@ type
         (kEnd)))))
 
 ===
+Subranges with expression bounds
+===
+
+type
+  THelpContext = -MaxLongint..MaxLongint;
+  TShortCut = Low(Word)..High(Word);
+  TBitEnum = 0..BitsPerInt - 1;
+  TMultiPayProcs = sppShift4..sppTenderRetail;
+  TSign = (sgNegative, sgPositive);
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (type (declSubRange
+        (exprUnary (kSub) (identifier))
+        (identifier))))
+    (declType (identifier) (kEq)
+      (type (declSubRange
+        (exprCall (identifier) (exprArgs (identifier)))
+        (exprCall (identifier) (exprArgs (identifier))))))
+    (declType (identifier) (kEq)
+      (type (declSubRange
+        (literalNumber)
+        (exprBinary (identifier) (kSub) (literalNumber)))))
+    (declType (identifier) (kEq)
+      (type (declSubRange (identifier) (identifier))))
+    (declType (identifier) (kEq)
+      (type (declEnum
+        (declEnumValue (identifier))
+        (declEnumValue (identifier)))))))
+
+===
 Routine attribute keywords as variable names
 ===
 
@@ -774,3 +808,20 @@ var
     (declVar (identifier) (type (typeref (identifier)))
       (procAttribute (kCvar))
       (procExternal (kExternal) (identifier)))))
+
+===
+Subrange typed constants keep their value
+===
+
+const
+  X: 0..BitsPerInt - 1 = 5;
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier)
+      (type (declSubRange
+        (literalNumber)
+        (exprBinary (identifier) (kSub) (literalNumber))))
+      (defaultValue (kEq) (literalNumber)))))

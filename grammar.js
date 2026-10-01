@@ -669,15 +669,27 @@ module.exports = grammar({
 		// `TMultiPayProcs = sppShift4 .. sppTenderRetail;`. Bounds are
 		// narrowed (not full `_expr`) so that `type = '(' ident ')'` stays
 		// unambiguous against `declEnum`; in particular we exclude paren-
-		// wrapped expressions so `(` can only start a `declEnum`.
+		// wrapped expressions so `(` can only start a `declEnum`. Bounds are
+		// arithmetic constant expressions such as `-MaxLongint`,
+		// `Low(Word)` or `BitsPerInt - 1`, but never comparisons, so that
+		// `const X: 0..9 = 5;` keeps `= 5` as its value.
 		declSubRange:    $ => prec(1, seq(
 			$._subRangeBound, '..', $._subRangeBound
 		)),
 		_subRangeBound:  $ => choice(
 			$.literalNumber,
-			seq(choice('-', '+'), $.literalNumber),
 			$.literalString,
 			$._typeref,
+			alias($._subRangeCall,   $.exprCall),
+			alias($._subRangeUnary,  $.exprUnary),
+			alias($._subRangeBinary, $.exprBinary),
+		),
+		_subRangeCall:   $ => op.args(5, $.identifier, '(', $.exprArgs, ')'),
+		_subRangeUnary:  $ => op.prefix(4, choice($.kAdd, $.kSub), $._subRangeBound),
+		_subRangeBinary: $ => choice(
+			op.infix(2, $._subRangeBound, choice($.kAdd, $.kSub), $._subRangeBound),
+			op.infix(3, $._subRangeBound,
+				choice($.kMul, $.kDiv, $.kMod, $.kShl, $.kShr), $._subRangeBound),
 		),
 
 		typeref:         $ => seq(

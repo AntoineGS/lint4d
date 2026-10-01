@@ -152,6 +152,7 @@ pub(super) fn subtypes(
             if candidates > MAX_CANDIDATES {
                 return Err("type hierarchy candidate limit exceeded".into());
             }
+            cycle_check.start_candidate();
             if document
                 .conditionals
                 .is_unknown_at(symbol.selection_span.start)
@@ -230,6 +231,12 @@ impl<'a> TypeHierarchyCycleCheck<'a> {
             active: HashSet::new(),
             known_acyclic: HashSet::new(),
         }
+    }
+
+    /// Bound each subtype candidate's ancestry walk independently; the shared
+    /// budget and the candidate cap bound the scan as a whole.
+    fn start_candidate(&mut self) {
+        *self.state = AncestryResolutionState::new();
     }
 
     fn direct_ancestry(
@@ -419,7 +426,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ITEM_BUILDS, prepare, validate_item};
+    use super::{ITEM_BUILDS, prepare, subtypes, validate_item};
     use crate::NavigationIndex;
     use crate::text::offset_to_position;
     use std::sync::atomic::AtomicBool;
@@ -448,5 +455,38 @@ mod tests {
 
         assert_eq!(validated_uri, uri);
         assert_eq!(ITEM_BUILDS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn subtypes_are_found_among_hundreds_of_unrelated_classes() {
+        let mut source = String::from("unit Wide; interface type TBase = class end;\n");
+        for index in 0..300 {
+            source.push_str(&format!("TOther{index} = class end;\n"));
+        }
+        source.push_str("TChild = class(TBase) end;\nimplementation end.");
+        let uri = lsp_types::Url::parse("file:///Wide.pas").expect("type hierarchy URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("type hierarchy source parses");
+        let cancel = AtomicBool::new(false);
+        let position = offset_to_position(&source, source.find("TBase").expect("base type"))
+            .expect("base position");
+        let item = prepare(&index, &uri, position, &cancel)
+            .expect("prepare type hierarchy")
+            .expect("base item")
+            .remove(0);
+
+        let children = subtypes(&index, &item, &cancel)
+            .expect("subtypes within the candidate limit")
+            .expect("proven subtypes");
+
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            ["TChild"]
+        );
     }
 }

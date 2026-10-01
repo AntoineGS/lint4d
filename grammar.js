@@ -349,6 +349,9 @@ module.exports = grammar({
 		[$._definition, $.ppBlock],
 		[$.block, $.blockTr],
 		[$.asm, $.asmTr],
+		// A unit's `begin ... end.` initialization section resembles the block
+		// accepted for recovery in definitions.
+		[$.implementation],
 		[$.exprBrackets, $.rttiAttributes],
 		[$._expr],
 		[$._expr, $.rttiAttributes],
@@ -390,7 +393,12 @@ module.exports = grammar({
 			$.kUnit, $.moduleName, ';',
 			repeat(choice(
 				$.interface,
-				$.implementation,
+				seq(
+					$.implementation,
+					// `begin ... end.` is the legacy form of an initialization
+					// section.
+					optional(alias($._initializationBegin, $.initialization))
+				),
 				$.initialization,
 				$.finalization,
 			)),
@@ -401,6 +409,7 @@ module.exports = grammar({
 		implementation:  $ => seq($.kImplementation, optional($._definitions)),
 		initialization:  $ => seq($.kInitialization, optional(tr($,'_statements'))),
 		finalization:    $ => seq($.kFinalization, optional(tr($,'_statements'))),
+		_initializationBegin: $ => seq($.kBegin, optional(tr($,'_statements'))),
 
 		moduleName:      $ => delimited1($.identifier, $.kDot),
 

@@ -150,8 +150,30 @@
                 "name": "interface"
               },
               {
-                "type": "SYMBOL",
-                "name": "implementation"
+                "type": "SEQ",
+                "members": [
+                  {
+                    "type": "SYMBOL",
+                    "name": "implementation"
+                  },
+                  {
+                    "type": "CHOICE",
+                    "members": [
+                      {
+                        "type": "ALIAS",
+                        "content": {
+                          "type": "SYMBOL",
+                          "name": "_initializationBegin"
+                        },
+                        "named": true,
+                        "value": "initialization"
+                      },
+                      {
+                        "type": "BLANK"
+                      }
+                    ]
+                  }
+                ]
               },
               {
                 "type": "SYMBOL",
@@ -243,6 +265,27 @@
         {
           "type": "SYMBOL",
           "name": "kFinalization"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "_statementsTr"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        }
+      ]
+    },
+    "_initializationBegin": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "kBegin"
         },
         {
           "type": "CHOICE",
@@ -10699,6 +10742,9 @@
     [
       "asm",
       "asmTr"
+    ],
+    [
+      "implementation"
     ],
     [
       "exprBrackets",

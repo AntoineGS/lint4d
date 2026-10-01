@@ -156,6 +156,58 @@ end.
     (kEndDot)))
 
 ===
+Unit 2b - Begin initialization section
+===
+
+unit a;
+interface
+implementation
+procedure b;
+begin
+end;
+begin
+  b;
+  c := 1
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (interface (kInterface))
+    (implementation (kImplementation)
+      (defProc
+        (declProc (kProcedure) (identifier))
+        (block
+          (kBegin)
+          (kEnd))))
+    (initialization (kBegin)
+      (statement (identifier))
+      (assignment (identifier) (kAssign) (literalNumber)))
+    (kEnd)
+    (kEndDot)))
+
+===
+Unit 2c - Empty begin initialization section
+===
+
+unit a;
+interface
+implementation
+begin
+end.
+
+---
+
+(root
+  (unit (kUnit) (moduleName (identifier))
+    (interface (kInterface))
+    (implementation (kImplementation))
+    (initialization (kBegin))
+    (kEnd)
+    (kEndDot)))
+
+===
 Unit 3 - Routines
 ===
 

@@ -1339,7 +1339,15 @@ fn ensure_semantic_tokens_ready(
             "semantic-token document is outside configured workspace roots: {uri}"
         ));
     }
-    if !snapshot.complete || !snapshot.include_errors.is_empty() {
+    // Tokens are advisory: an unsupported directive in a dependency cannot
+    // change how this document parses, at worst misclassifying an identifier
+    // bound through that dependency. Rename and references stay fail-closed.
+    let include_errors_block = snapshot.other_include_errors
+        || snapshot
+            .unsupported_directive_owners
+            .iter()
+            .any(|owner| owner == uri);
+    if !snapshot.complete || (!snapshot.include_errors.is_empty() && include_errors_block) {
         return Ok(SemanticTokenResolutionMode::LexicalOnly);
     }
     Ok(SemanticTokenResolutionMode::Full)

@@ -17405,6 +17405,127 @@ mod tests {
         );
     }
 
+    /// Returns the classified tokens on `Value.Free;` in a `Main` unit whose
+    /// `Run(Value: TProvided)` parameter type comes from a `Provider` unit.
+    fn provider_parameter_body_tokens(
+        main_directive: &str,
+        provider_directive: &str,
+    ) -> Vec<(u32, u32, u32, String)> {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            format!(
+                "unit Main;{main_directive}\ninterface\nuses Provider;\nimplementation\nprocedure Run(Value: TProvided);\nbegin\n  Value.Free;\nend;\nend.\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("Provider.pas"),
+            format!(
+                "unit Provider;\n{provider_directive}\ninterface\ntype\n  TProvided = class\n  end;\nimplementation\nend.\n"
+            ),
+        )
+        .unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let tokens = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(6, 0),
+                lsp_types::Position::new(7, 0),
+            )),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("semantic tokens");
+
+        let legend = crate::NavigationIndex::semantic_tokens_legend();
+        let (mut line, mut character) = (0u32, 0u32);
+        tokens
+            .data
+            .iter()
+            .map(|token| {
+                line += token.delta_line;
+                character = if token.delta_line == 0 {
+                    character + token.delta_start
+                } else {
+                    token.delta_start
+                };
+                (
+                    line,
+                    character,
+                    token.length,
+                    legend.token_types[token.token_type as usize]
+                        .as_str()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn has_parameter_token_for_value(tokens: &[(u32, u32, u32, String)]) -> bool {
+        tokens
+            .iter()
+            .any(|token| *token == (6, 2, 5, "parameter".to_string()))
+    }
+
+    #[test]
+    fn semantic_tokens_resolve_identifiers_when_a_dependency_sets_record_alignment() {
+        let tokens = provider_parameter_body_tokens("", "{$A8}");
+        assert!(has_parameter_token_for_value(&tokens), "{tokens:?}");
+    }
+
+    #[test]
+    fn semantic_tokens_resolve_identifiers_when_a_dependency_has_an_unsupported_directive() {
+        let tokens = provider_parameter_body_tokens("", "{$SCOPEDENUMS ON}");
+        assert!(has_parameter_token_for_value(&tokens), "{tokens:?}");
+    }
+
+    #[test]
+    fn semantic_tokens_stay_lexical_when_the_document_has_an_unsupported_directive() {
+        let tokens = provider_parameter_body_tokens(" {$SCOPEDENUMS ON}", "");
+        assert!(!has_parameter_token_for_value(&tokens), "{tokens:?}");
+        assert!(
+            tokens.iter().all(|(.., kind)| kind == "operator"),
+            "{tokens:?}"
+        );
+    }
+
+    #[test]
+    fn rename_still_fails_closed_when_a_dependency_has_an_unsupported_directive() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run(Value: TProvided);\nbegin\nend;\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\n{$SCOPEDENUMS ON}\ninterface\ntype\n  TProvided = class\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let rename = super::rename::rename_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            lsp_types::Position::new(4, 23),
+            "TRenamed",
+            false,
+            &AtomicBool::new(false),
+        );
+
+        let error = rename.value.expect_err("rename must fail closed");
+        assert!(error.contains("unsupported directive"), "{error}");
+    }
+
     #[test]
     fn document_owners_share_unchanged_context_state() {
         let temp = tempfile::tempdir().expect("workspace root");

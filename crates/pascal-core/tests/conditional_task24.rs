@@ -246,6 +246,69 @@ fn system_pascal_switch_list_accepts_untracked_boolean_options() {
 }
 
 #[test]
+fn record_alignment_directives_are_harmless() {
+    for directive in [
+        "{$A8}",
+        "{$A4}",
+        "{$A16}",
+        "{$A+}",
+        "{$A-}",
+        "{$ALIGN 8}",
+        "{$ALIGN ON}",
+    ] {
+        let analysis = conditional::analyze_with_context(directive, &ConditionalContext::default());
+        assert!(analysis.complete, "directive {directive:?}");
+        assert_ne!(
+            analysis.directives[0].kind,
+            conditional::DirectiveKind::Other,
+            "directive {directive:?}"
+        );
+    }
+}
+
+#[test]
+fn binding_neutral_interop_and_linker_directives_are_harmless() {
+    for directive in [
+        "{$EXTERNALSYM TFoo}",
+        "{$HPPEMIT '#include <foo.h>'}",
+        "{$NODEFINE TDateTimeAlias}",
+        "{$NOINCLUDE Foo}",
+        "{$OBJTYPENAME TFoo 'NFoo'}",
+        "{$WEAKPACKAGEUNIT ON}",
+        "{$DENYPACKAGEUNIT ON}",
+        "{$L foo.obj}",
+        "{$LINK foo.obj}",
+        "{$LINKLIB foo}",
+        "{$MINENUMSIZE 4}",
+        "{$Z4}",
+        "{$Z+}",
+        "{$FINITEFLOAT ON}",
+        "{$STACKFRAMES ON}",
+        "{$IMAGEBASE $00400000}",
+    ] {
+        let analysis = conditional::analyze_with_context(directive, &ConditionalContext::default());
+        assert!(analysis.complete, "directive {directive:?}");
+        assert_ne!(
+            analysis.directives[0].kind,
+            conditional::DirectiveKind::Other,
+            "directive {directive:?}"
+        );
+    }
+}
+
+#[test]
+fn binding_sensitive_directives_remain_unsupported() {
+    for directive in ["{$SCOPEDENUMS ON}", "{$POINTERMATH ON}"] {
+        let analysis = conditional::analyze_with_context(directive, &ConditionalContext::default());
+        assert_eq!(
+            analysis.directives[0].kind,
+            conditional::DirectiveKind::Other,
+            "directive {directive:?}"
+        );
+    }
+}
+
+#[test]
 fn comma_recovery_does_not_treat_message_payload_as_switches() {
     let context = ConditionalContext::default().with_option("R", Truth::True);
     let source = concat!(

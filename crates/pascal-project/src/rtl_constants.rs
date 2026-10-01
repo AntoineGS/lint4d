@@ -25,6 +25,7 @@ pub enum SystemPasScan {
 enum TokenKind {
     Identifier,
     Equals,
+    Colon,
     Semicolon,
     Other,
 }
@@ -49,6 +50,7 @@ pub fn scan_system_pas(source: &str) -> SystemPasScan {
     let mut tokens = Vec::new();
     let mut interface_index = None;
     let mut implementation_index = None;
+    let mut in_interface_section = false;
 
     while cursor < bytes.len() {
         let byte = bytes[cursor];
@@ -70,11 +72,16 @@ pub fn scan_system_pas(source: &str) -> SystemPasScan {
                 return SystemPasScan::Inconclusive("unterminated brace comment".into());
             };
             let end = cursor + 1 + end;
-            if bytes.get(cursor + 1) == Some(&b'$')
-                && let Err(reason) =
-                    apply_directive(&source[cursor + 2..end], &mut conditional_depth)
-            {
-                return SystemPasScan::Inconclusive(reason);
+            if bytes.get(cursor + 1) == Some(&b'$') {
+                let directive = &source[cursor + 2..end];
+                if in_interface_section && is_include_directive(directive) {
+                    return SystemPasScan::Inconclusive(
+                        "interface section contains an unexpanded include".into(),
+                    );
+                }
+                if let Err(reason) = apply_directive(directive, &mut conditional_depth) {
+                    return SystemPasScan::Inconclusive(reason);
+                }
             }
             cursor = end + 1;
             continue;
@@ -85,11 +92,16 @@ pub fn scan_system_pas(source: &str) -> SystemPasScan {
                 return SystemPasScan::Inconclusive("unterminated parenthesized comment".into());
             };
             let end = cursor + 2 + relative_end;
-            if bytes.get(cursor + 2) == Some(&b'$')
-                && let Err(reason) =
-                    apply_directive(&source[cursor + 3..end], &mut conditional_depth)
-            {
-                return SystemPasScan::Inconclusive(reason);
+            if bytes.get(cursor + 2) == Some(&b'$') {
+                let directive = &source[cursor + 3..end];
+                if in_interface_section && is_include_directive(directive) {
+                    return SystemPasScan::Inconclusive(
+                        "interface section contains an unexpanded include".into(),
+                    );
+                }
+                if let Err(reason) = apply_directive(directive, &mut conditional_depth) {
+                    return SystemPasScan::Inconclusive(reason);
+                }
             }
             cursor = end + 2;
             continue;
@@ -141,6 +153,7 @@ pub fn scan_system_pas(source: &str) -> SystemPasScan {
             }
             if interface_index.is_none() && text.eq_ignore_ascii_case("interface") {
                 interface_index = Some(tokens.len());
+                in_interface_section = true;
             }
             tokens.push(Token {
                 text,
@@ -154,6 +167,7 @@ pub fn scan_system_pas(source: &str) -> SystemPasScan {
         cursor += 1;
         let kind = match byte {
             b'=' => TokenKind::Equals,
+            b':' => TokenKind::Colon,
             b';' => TokenKind::Semicolon,
             _ => TokenKind::Other,
         };
@@ -175,24 +189,48 @@ pub fn scan_system_pas(source: &str) -> SystemPasScan {
     let section = &tokens[interface_index + 1..implementation_index];
     let mut declared = Vec::new();
     let mut seen = HashSet::new();
-    for window in section.windows(4) {
-        let [name, equals, value, semicolon] = window else {
-            unreachable!("windows(4) always produces four tokens")
-        };
+    for (index, name) in section.iter().enumerate() {
         if name.kind != TokenKind::Identifier
             || !ConditionalContext::is_rtl_version_constant(name.text)
-            || equals.kind != TokenKind::Equals
-            || value.kind != TokenKind::Identifier
-            || !value.text.eq_ignore_ascii_case("true")
-            || semicolon.kind != TokenKind::Semicolon
         {
             continue;
         }
-        if [name, equals, value, semicolon]
+        let Some(operator) = section.get(index + 1) else {
+            continue;
+        };
+        if !matches!(operator.kind, TokenKind::Equals | TokenKind::Colon) {
+            continue;
+        }
+        if name.conditional_depth != 0 || operator.conditional_depth != 0 {
+            return SystemPasScan::Inconclusive(format!("{} is declared conditionally", name.text));
+        }
+        if operator.kind == TokenKind::Colon {
+            return SystemPasScan::Inconclusive(format!(
+                "{} has an unsupported typed declaration",
+                name.text
+            ));
+        }
+        let (Some(value), Some(semicolon)) = (section.get(index + 2), section.get(index + 3))
+        else {
+            return SystemPasScan::Inconclusive(format!(
+                "{} has an incomplete declaration",
+                name.text
+            ));
+        };
+        if [value, semicolon]
             .iter()
             .any(|token| token.conditional_depth != 0)
         {
             return SystemPasScan::Inconclusive(format!("{} is declared conditionally", name.text));
+        }
+        if value.kind != TokenKind::Identifier
+            || !value.text.eq_ignore_ascii_case("true")
+            || semicolon.kind != TokenKind::Semicolon
+        {
+            return SystemPasScan::Inconclusive(format!(
+                "{} has an unsupported initializer",
+                name.text
+            ));
         }
         if seen.insert(name.text.to_ascii_lowercase()) {
             declared.push(name.text.to_owned());
@@ -293,6 +331,15 @@ fn apply_directive(directive: &str, conditional_depth: &mut usize) -> Result<(),
     Ok(())
 }
 
+fn is_include_directive(directive: &str) -> bool {
+    let directive = directive.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let name_end = directive
+        .bytes()
+        .position(|byte| !is_identifier_continue(byte))
+        .unwrap_or(directive.len());
+    matches_ignore_ascii_case(&directive[..name_end], &["I", "INCLUDE"])
+}
+
 fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
@@ -360,6 +407,36 @@ mod tests {
     }
 
     #[test]
+    fn scanner_is_inconclusive_for_unsupported_rtl_declarations() {
+        for source in [
+            "unit System; interface const RTLVersion111: Boolean = True; implementation end.",
+            "unit System; interface const RTLVersion111 = False; implementation end.",
+            "unit System; interface const RTLVersion111 = 1; implementation end.",
+            "unit System; interface {$IFDEF X} const RTLVersion111: Boolean = False; {$ENDIF} implementation end.",
+        ] {
+            assert!(
+                matches!(scan_system_pas(source), SystemPasScan::Inconclusive(_)),
+                "unsupported declaration was treated as complete: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_is_inconclusive_for_interface_include_directives() {
+        for include in [
+            "{$I updates.inc}",
+            "{$INCLUDE updates.inc}",
+            "(*$I updates.inc*)",
+        ] {
+            let source = format!("unit System; interface {include} implementation end.");
+            assert!(
+                matches!(scan_system_pas(&source), SystemPasScan::Inconclusive(_)),
+                "interface include was treated as a complete declaration set: {include}"
+            );
+        }
+    }
+
+    #[test]
     fn old_rtl_declares_nothing() {
         let source = "unit System; interface const RTLVersion = 21.00; implementation end.";
         assert_eq!(scan_system_pas(source), SystemPasScan::Declared(vec![]));
@@ -375,12 +452,12 @@ mod tests {
     }
 
     #[test]
-    fn scanner_deduplicates_case_insensitively_and_matches_whole_identifiers() {
+    fn scanner_makes_non_true_rtl_initializers_inconclusive() {
         let source = "unit System; interface const RTLVersion111 = True; rtlversion111 = True; PrefixRTLVersion112 = True; RTLVersion113 = False; implementation end.";
-        assert_eq!(
+        assert!(matches!(
             scan_system_pas(source),
-            SystemPasScan::Declared(vec!["RTLVersion111".into()])
-        );
+            SystemPasScan::Inconclusive(_)
+        ));
     }
 
     #[test]

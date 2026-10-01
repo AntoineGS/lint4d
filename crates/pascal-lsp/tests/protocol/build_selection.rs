@@ -175,6 +175,68 @@ fn build_context_and_configuration_selection_use_project_defaults_and_refresh_na
 }
 
 #[test]
+fn configuration_selection_republishes_branch_dependent_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let (project, _, service) = webquery_fixture(root);
+    let source = "unit SvcMain;\ninterface\nimplementation\n{$IFDEF DEBUG}\nconst bad_const = 1;\n{$ENDIF}\nend.\n";
+    write_file(&service, source);
+    write_file(
+        &root.join(".lint4d.toml"),
+        "[rules.naming]\nconstant_style = \"PascalCase\"\n",
+    );
+    let service_uri = uri(&service);
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"compilerVersion": "21.0"}));
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": service_uri,
+            "languageId": "pascal",
+            "version": 1,
+            "text": source
+        }}),
+    );
+    let release_diagnostics = diagnostics_for_uri(&mut server, &service_uri);
+    assert!(
+        !release_diagnostics["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "constant-naming")
+    );
+
+    let id = RequestId::from("select-debug-with-open-diagnostics".to_owned());
+    server.send_request(
+        id.clone(),
+        "pascal/selectBuildConfig",
+        json!({"projectUri": uri(&project), "config": "Debug"}),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "{response:?}");
+    let debug_diagnostics = diagnostics_for_uri_until(
+        &mut server,
+        &service_uri,
+        Duration::from_secs(5),
+        |publication| {
+            publication["diagnostics"]
+                .as_array()
+                .is_some_and(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic["code"] == "constant-naming")
+                })
+        },
+    )
+    .expect("selection republishes the Debug-only lint diagnostic");
+    assert_ne!(
+        release_diagnostics["diagnostics"], debug_diagnostics["diagnostics"],
+        "branch-dependent diagnostic content should change after selecting Debug"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn build_platform_selection_rejects_platforms_not_in_the_project() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -193,5 +255,70 @@ fn build_platform_selection_rejects_platforms_not_in_the_project() {
         response.error.as_ref().map(|error| error.message.as_str()),
         Some("unknown platform `Win64`")
     );
+    server.shutdown();
+}
+
+#[test]
+fn platform_selection_and_reset_preserve_the_independent_config_session_choice() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let (project, _, _) = webquery_fixture(root);
+    let dproj = WEBQUERY_DPROJ
+        .replace("<DCC_Platform>x86</DCC_Platform>", "")
+        .replace(
+            "<Config Condition=\"'$(Config)'==''\">Release</Config>",
+            "<Config Condition=\"'$(Config)'==''\">Release</Config>\
+             <Platform Condition=\"'$(Platform)'==''\">Win32</Platform>",
+        )
+        .replace(
+            "</Project>",
+            "<ProjectExtensions><BorlandProject><Platforms>\
+             <Platform value=\"Win32\">True</Platform><Platform value=\"Win64\">True</Platform>\
+             </Platforms></BorlandProject></ProjectExtensions></Project>",
+        );
+    write_file(&project, &dproj);
+    let mut server = TestServer::launch();
+    server.initialize(root, json!({"compilerVersion": "21.0"}));
+
+    let config_id = RequestId::from("select-debug-before-platform".to_owned());
+    server.send_request(
+        config_id.clone(),
+        "pascal/selectBuildConfig",
+        json!({"projectUri": uri(&project), "config": "Debug"}),
+    );
+    let config = server.response(&config_id);
+    assert!(config.error.is_none(), "{config:?}");
+    assert_eq!(
+        config.result.as_ref().unwrap()["config"]["selected"],
+        "Debug"
+    );
+
+    let platform_id = RequestId::from("select-win64".to_owned());
+    server.send_request(
+        platform_id.clone(),
+        "pascal/selectPlatform",
+        json!({"projectUri": uri(&project), "platform": "Win64"}),
+    );
+    let platform = server.response(&platform_id);
+    assert!(platform.error.is_none(), "{platform:?}");
+    let platform = platform.result.expect("selected platform context");
+    assert_eq!(platform["platform"]["selected"], "Win64");
+    assert_eq!(platform["platform"]["mode"], "session");
+    assert_eq!(platform["config"]["selected"], "Debug");
+    assert_eq!(platform["config"]["mode"], "session");
+
+    let reset_id = RequestId::from("reset-platform".to_owned());
+    server.send_request(
+        reset_id.clone(),
+        "pascal/selectPlatform",
+        json!({"projectUri": uri(&project), "platform": null}),
+    );
+    let reset = server.response(&reset_id);
+    assert!(reset.error.is_none(), "{reset:?}");
+    let reset = reset.result.expect("reset platform context");
+    assert_eq!(reset["platform"]["selected"], "Win32");
+    assert_eq!(reset["platform"]["mode"], "projectDefault");
+    assert_eq!(reset["config"]["selected"], "Debug");
+    assert_eq!(reset["config"]["mode"], "session");
     server.shutdown();
 }

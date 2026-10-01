@@ -59,6 +59,50 @@ fn closed_world_makes_unlisted_defines_false() {
 }
 
 #[test]
+fn compiler_version_symbol_family_is_known_in_open_contexts() {
+    let context = ConditionalContext::default().with_compiler_version(CompilerVersion::new(35, 0));
+    assert_eq!(context.define("VER350"), Truth::True);
+    assert_eq!(context.define("VER380"), Truth::False);
+    assert_eq!(
+        activity(
+            "{$IFDEF VER380}{$DEFINE IFDEF_HIT}{$ENDIF}",
+            "DEFINE IFDEF_HIT",
+            &context,
+        ),
+        Truth::False
+    );
+    assert_eq!(
+        activity(
+            "{$IF defined(VER380)}{$DEFINE DEFINED_HIT}{$IFEND}",
+            "DEFINE DEFINED_HIT",
+            &context,
+        ),
+        Truth::False
+    );
+
+    let unknown_version = ConditionalContext::default();
+    assert_eq!(
+        activity(
+            "{$IFDEF VER380}{$DEFINE UNKNOWN_HIT}{$ENDIF}",
+            "DEFINE UNKNOWN_HIT",
+            &unknown_version,
+        ),
+        Truth::Unknown
+    );
+
+    let mut explicit = context;
+    explicit.set_define("VER380", Truth::True);
+    assert_eq!(
+        activity(
+            "{$IFDEF VER380}{$DEFINE OVERRIDE_HIT}{$ENDIF}",
+            "DEFINE OVERRIDE_HIT",
+            &explicit,
+        ),
+        Truth::True
+    );
+}
+
+#[test]
 fn source_define_and_undef_override_the_absent_default() {
     let context = closed();
     let source = "{$DEFINE LOCAL}{$IFDEF LOCAL}{$DEFINE A}{$ENDIF}{$UNDEF RELEASE}{$IFDEF RELEASE}{$DEFINE B}{$ENDIF}";

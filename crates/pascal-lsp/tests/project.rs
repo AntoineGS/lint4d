@@ -1768,7 +1768,7 @@ fn legacy_project_keeps_release_metadata_and_reference_paths() {
         Some(root.join("Projects/Tools/WebQueryExporter/WebQuery.dpr"))
     );
     assert_eq!(context.defines, ["RELEASE", "NOSF", "CPU386", "WIN32"]);
-    assert_eq!(context.platform.as_deref(), Some("x86"));
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
     assert_eq!(
         context.explicit_units.get("hartlib"),
         Some(&vec![

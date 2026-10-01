@@ -691,12 +691,14 @@ impl Drop for FifoSubstitutionHookGuard {
 
 #[cfg(all(test, target_os = "linux"))]
 fn maybe_substitute_candidate_after_inspection(path: &Path) {
-    let should_substitute = FIFO_SUBSTITUTION_HOOK
+    let mut hook = FIFO_SUBSTITUTION_HOOK
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .expect("FIFO substitution hook lock")
-        .take()
-        .is_some_and(|expected| expected == path);
+        .expect("FIFO substitution hook lock");
+    let should_substitute = hook.as_ref().is_some_and(|expected| expected == path);
+    if should_substitute {
+        hook.take();
+    }
     if !should_substitute {
         return;
     }
@@ -1153,6 +1155,10 @@ mod tests {
         let path = root.path().join("config.toml");
         fs::write(&path, "[properties]\nName = 'value'\n").expect("configuration file");
         let _hook = super::install_fifo_substitution_hook(&path);
+        let unrelated_path = root.path().join("unrelated.toml");
+        fs::write(&unrelated_path, "[properties]\nName = 'unrelated'\n")
+            .expect("unrelated configuration file");
+        assert!(read_override_file_with_budget(&unrelated_path, None).is_ok());
 
         let error = read_override_file_with_budget(&path, None)
             .expect_err("substituted FIFO must not be read");

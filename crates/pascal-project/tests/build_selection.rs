@@ -5,7 +5,7 @@ use pascal_project::delphi_overrides::OverrideSession;
 use pascal_project::rtl_constants::RtlConstantSource;
 use pascal_project::{
     CompilerVersion, ConditionalContext, ConditionalFact, ConstantValue, OpenReason,
-    ProjectContext, ProjectOptions, SourceOrigin,
+    ProjectContext, ProjectOptions, ProjectPathEntry, SourceOrigin,
 };
 use std::fs;
 use std::path::Path;
@@ -122,7 +122,7 @@ fn discovers_webquery_build_selection_with_project_defaults_and_candidate_spelli
         context.config_selection.project_default.as_deref(),
         Some("Release")
     );
-    assert_eq!(context.platform.as_deref(), Some("x86"));
+    assert_eq!(context.platform.as_deref(), Some("Win32"));
     assert_eq!(
         context.platform_selection.selected.as_deref(),
         Some("Win32")
@@ -136,6 +136,59 @@ fn discovers_webquery_build_selection_with_project_defaults_and_candidate_spelli
         context.platform_selection.project_default.as_deref(),
         Some("Win32")
     );
+}
+
+#[test]
+fn inferred_platform_is_the_project_default_before_property_evaluation() {
+    for (project_version, compiler, expected) in [
+        ("23.0", Some("DCC32"), "Win32"),
+        ("23.0", Some("DCC64"), "Win64"),
+        ("12.0", None, "Win32"),
+    ] {
+        let temp = tempdir().expect("temporary directory");
+        let root = temp.path();
+        let compiler_property = compiler.map_or_else(String::new, |compiler| {
+            format!("<DCC_DCCCompiler>{compiler}</DCC_DCCCompiler>")
+        });
+        let dproj = format!(
+            "<Project><PropertyGroup><ProjectVersion>{project_version}</ProjectVersion>\
+             <MainSource>App.dpr</MainSource><Config Condition=\"'$(Config)'==''\">Release</Config>\
+             {compiler_property}</PropertyGroup><ItemGroup><BuildConfiguration Include=\"Release\"/>\
+             </ItemGroup><PropertyGroup Condition=\"'$(Platform)'=='Win32'\">\
+             <DCC_Define>SEEN_WIN32</DCC_Define></PropertyGroup>\
+             <PropertyGroup Condition=\"'$(Platform)'=='Win64'\">\
+             <DCC_Define>SEEN_WIN64</DCC_Define></PropertyGroup></Project>"
+        );
+        write_webquery_fixture_with_dproj(root, &dproj);
+        let options = ProjectOptions {
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(35, 0)),
+            ..ProjectOptions::default()
+        };
+
+        let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+        assert_eq!(context.platform.as_deref(), Some(expected));
+        assert_eq!(
+            context.platform_selection.selected.as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            context.platform_selection.mode,
+            BuildSelectionMode::ProjectDefault
+        );
+        assert_eq!(
+            context
+                .conditional_context_for(&root.join("SvcMain.pas"))
+                .define(if expected == "Win64" {
+                    "SEEN_WIN64"
+                } else {
+                    "SEEN_WIN32"
+                }),
+            ConditionalFact::True,
+            "platform-conditioned property group did not see inferred {expected}"
+        );
+    }
 }
 
 #[test]
@@ -639,6 +692,23 @@ fn caller_source_paths_are_classified_as_project_compiled_roots() {
 }
 
 #[test]
+fn source_origin_uses_the_explicit_path_index_outside_project_roots() {
+    let source = Path::new("/shared/SvcMain.pas");
+    let context = ProjectContext {
+        project_file: Some(Path::new("/project/App.dproj").to_path_buf()),
+        explicit_unit_entries: [(
+            "svcmain".to_owned(),
+            vec![ProjectPathEntry::legacy(source.to_path_buf())],
+        )]
+        .into_iter()
+        .collect(),
+        ..ProjectContext::default()
+    };
+
+    assert_eq!(context.source_origin(source), SourceOrigin::ProjectCompiled);
+}
+
+#[test]
 fn project_define_wins_over_a_conflicting_predefined_symbol() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -711,6 +781,52 @@ fn missing_compiler_version_keeps_project_defines_open() {
 }
 
 #[test]
+fn dpr_and_dpk_projects_keep_absent_defines_unknown_without_a_dproj() {
+    for (extension, source) in [
+        ("dpr", "program App; begin end."),
+        ("dpk", "package App; end."),
+    ] {
+        let temp = tempdir().expect("temporary directory");
+        let root = temp.path();
+        let project = root.join(format!("App.{extension}"));
+        write(&project, source);
+        let options = ProjectOptions {
+            build_config: Some("Release".into()),
+            platform: Some("Win32".into()),
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(35, 0)),
+            ..ProjectOptions::default()
+        };
+
+        let context = ProjectContext::discover_with_overrides(
+            &project,
+            &[root.to_path_buf()],
+            &options,
+            &OverrideSession::new(None),
+        )
+        .expect("Pascal project discovery");
+        let conditionals = context.conditional_context_for(&project);
+
+        assert!(
+            !context.conditional_closure.closed,
+            "{extension} closed the define world"
+        );
+        assert!(
+            context
+                .conditional_closure
+                .open_reasons
+                .contains(&OpenReason::NoProject)
+        );
+        assert_eq!(conditionals.absent_define, ConditionalFact::Unknown);
+        assert_eq!(
+            conditionals.define("UNLISTED_BUILD_DEFINE"),
+            ConditionalFact::Unknown
+        );
+        assert_eq!(conditionals.define("MSWINDOWS"), ConditionalFact::True);
+    }
+}
+
+#[test]
 fn system_pas_rtl_constants_are_tracked_and_added_to_contexts() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -779,6 +895,123 @@ fn system_pas_rtl_constants_are_tracked_and_added_to_contexts() {
 }
 
 #[test]
+fn inconclusive_system_pas_declarations_warn_and_use_the_version_table() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let dproj = WEBQUERY_DPROJ.replace(
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler>",
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler><DCC_UnitSearchPath>rtl</DCC_UnitSearchPath>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+    write(
+        &root.join("rtl/System.pas"),
+        "unit System; interface const RTLVersion999: Boolean = True; implementation end.",
+    );
+    let options = ProjectOptions {
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(35, 0)),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(
+        context.conditional_closure.rtl_source,
+        RtlConstantSource::Table
+    );
+    assert!(
+        context
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("System.pas RTL constant scan was inconclusive") })
+    );
+    let conditionals = context.conditional_context_for(&root.join("SvcMain.pas"));
+    assert_eq!(
+        conditionals.constants.get("RTLVERSION113"),
+        Some(&ConstantValue::Boolean(true))
+    );
+    assert_eq!(
+        conditionals.constants.get("RTLVERSION999"),
+        None,
+        "unsupported declarations must not enter the complete table fallback"
+    );
+    assert!(conditionals.rtl_constants_known);
+}
+
+#[test]
+fn valid_rtl_override_skips_system_pas_search_entirely() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let dproj = WEBQUERY_DPROJ.replace(
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler>",
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler><DCC_UnitSearchPath>missing-rtl</DCC_UnitSearchPath>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+    let config = root.join("config.toml");
+    write(
+        &config,
+        "[installations.\"35.0\"]\nrtlVersionConstants = [\"RTLVersion111\"]\n",
+    );
+    let options = ProjectOptions {
+        installation_selections: [(root.join("App.dproj"), "35.0".into())]
+            .into_iter()
+            .collect(),
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(35, 0)),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(Some(config)));
+
+    assert_eq!(
+        context.conditional_closure.rtl_source,
+        RtlConstantSource::Override
+    );
+    assert!(
+        !context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("for System.pas"))
+    );
+}
+
+#[test]
+fn compiler_before_104_skips_system_pas_search() {
+    let temp = tempdir().expect("temporary directory");
+    let root = temp.path();
+    let dproj = WEBQUERY_DPROJ.replace(
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler>",
+        "<DCC_DCCCompiler>DCC32</DCC_DCCCompiler><DCC_UnitSearchPath>missing-rtl</DCC_UnitSearchPath>",
+    );
+    write_webquery_fixture_with_dproj(root, &dproj);
+    let options = ProjectOptions {
+        conditional_context: ConditionalContext::default()
+            .with_compiler_version(CompilerVersion::new(33, 0)),
+        ..ProjectOptions::default()
+    };
+
+    let context = discover_webquery_at(root, &options, &OverrideSession::new(None));
+
+    assert_eq!(
+        context.conditional_closure.rtl_source,
+        RtlConstantSource::Table
+    );
+    assert!(
+        context
+            .conditional_closure
+            .rtl_constants
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("for System.pas"))
+    );
+}
+
+#[test]
 fn console_predefined_symbol_comes_from_main_source_directive() {
     let temp = tempdir().expect("temporary directory");
     let root = temp.path();
@@ -825,6 +1058,28 @@ fn console_predefined_symbol_ignores_directive_text_in_comments_and_strings() {
             .define("CONSOLE"),
         ConditionalFact::False
     );
+}
+
+#[test]
+fn console_predefined_symbol_recognizes_parenthesized_apptype_directives() {
+    for directive in ["(*$APPTYPE CONSOLE*)", "(*$ apptype   console *)"] {
+        let temp = tempdir().expect("temporary directory");
+        let root = temp.path();
+        write_webquery_fixture(root);
+        write(
+            &root.join("App.dpr"),
+            &format!("program App; {directive} uses SvcMain; begin end."),
+        );
+        let context = discover_webquery_at(root, &d2010_options(), &OverrideSession::new(None));
+
+        assert_eq!(
+            context
+                .conditional_context_for(&root.join("SvcMain.pas"))
+                .define("CONSOLE"),
+            ConditionalFact::True,
+            "failed to recognize {directive}"
+        );
+    }
 }
 
 #[test]
@@ -1002,7 +1257,7 @@ fn configured_value_outside_project_candidates_keeps_conditionals_open() {
 }
 
 #[test]
-fn empty_configuration_candidates_accept_each_selection_source() {
+fn empty_configuration_candidates_leave_each_selection_source_unverified() {
     const NO_CONFIG_CANDIDATES: &str = r#"<Project>
       <PropertyGroup>
         <ProjectVersion>21.0</ProjectVersion>
@@ -1053,16 +1308,23 @@ fn empty_configuration_candidates_accept_each_selection_source() {
                 .contains(&OpenReason::ConfigInvalid)
         );
         assert!(
-            !context
+            context
                 .conditional_closure
                 .open_reasons
                 .contains(&OpenReason::DiscoveryIncomplete)
+        );
+        assert!(!context.conditional_closure.closed);
+        assert_eq!(
+            context
+                .conditional_context_for(&root.join("SvcMain.pas"))
+                .define("UNLISTED_BUILD_DEFINE"),
+            ConditionalFact::Unknown
         );
     }
 }
 
 #[test]
-fn empty_platform_candidates_accept_each_selection_source() {
+fn empty_platform_candidates_leave_each_selection_source_unverified() {
     const NO_PLATFORM_CANDIDATES: &str = r#"<Project>
       <PropertyGroup>
         <MainSource>App.dpr</MainSource>
@@ -1115,11 +1377,92 @@ fn empty_platform_candidates_accept_each_selection_source() {
                 .contains(&OpenReason::PlatformInvalid)
         );
         assert!(
-            !context
+            context
                 .conditional_closure
                 .open_reasons
                 .contains(&OpenReason::DiscoveryIncomplete)
         );
+        assert!(!context.conditional_closure.closed);
+        assert_eq!(
+            context
+                .conditional_context_for(&root.join("SvcMain.pas"))
+                .define("UNLISTED_BUILD_DEFINE"),
+            ConditionalFact::Unknown
+        );
+    }
+}
+
+#[test]
+fn removing_last_build_candidate_keeps_session_and_config_choices_open() {
+    const DPROJ: &str = r#"<Project>
+      <PropertyGroup>
+        <ProjectVersion>12.0</ProjectVersion>
+        <MainSource>App.dpr</MainSource>
+        <Config Condition="'$(Config)'==''">Debug</Config>
+        <Platform Condition="'$(Platform)'==''">Win32</Platform>
+        <DCC_DCCCompiler>DCC32</DCC_DCCCompiler>
+      </PropertyGroup>
+      <ItemGroup>
+        <DelphiCompile Include="App.dpr"><MainSource>MainSource</MainSource></DelphiCompile>
+        <DCCReference Include="SvcMain.pas" />
+        <BuildConfiguration Include="Debug" />
+      </ItemGroup>
+      <ProjectExtensions><BorlandProject><Platforms>
+        <Platform value="Win32">True</Platform>
+      </Platforms></BorlandProject></ProjectExtensions>
+    </Project>"#;
+
+    for is_platform in [false, true] {
+        for origin in [
+            EmptyCandidatesSelection::Session,
+            EmptyCandidatesSelection::ConfigToml,
+        ] {
+            let temp = tempdir().expect("temporary workspace");
+            let root = temp.path();
+            write_webquery_fixture_with_dproj(root, DPROJ);
+            let (options, overrides) = empty_candidate_selection_input(root, origin, is_platform);
+            let before = discover_webquery_at(root, &options, &overrides);
+            assert!(before.conditional_closure.closed);
+
+            let removed_candidate = if is_platform {
+                "<Platform value=\"Win32\">True</Platform>"
+            } else {
+                "<BuildConfiguration Include=\"Debug\" />"
+            };
+            let without_candidate = DPROJ.replace(removed_candidate, "");
+            assert_ne!(without_candidate, DPROJ);
+            fs::write(root.join("App.dproj"), without_candidate)
+                .expect("remove the final declared candidate");
+
+            let after = discover_webquery_at(root, &options, &overrides);
+            let selection = if is_platform {
+                &after.platform_selection
+            } else {
+                &after.config_selection
+            };
+            assert!(selection.candidates.is_empty());
+            assert_eq!(
+                selection.mode,
+                match origin {
+                    EmptyCandidatesSelection::Session => BuildSelectionMode::Session,
+                    EmptyCandidatesSelection::ConfigToml => BuildSelectionMode::Configured,
+                    EmptyCandidatesSelection::Client => unreachable!(),
+                }
+            );
+            assert!(!after.conditional_closure.closed);
+            assert!(
+                after
+                    .conditional_closure
+                    .open_reasons
+                    .contains(&OpenReason::DiscoveryIncomplete)
+            );
+            assert_eq!(
+                after
+                    .conditional_context_for(&root.join("SvcMain.pas"))
+                    .define("UNLISTED_BUILD_DEFINE"),
+                ConditionalFact::Unknown
+            );
+        }
     }
 }
 

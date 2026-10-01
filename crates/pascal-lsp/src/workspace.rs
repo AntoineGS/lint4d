@@ -24,7 +24,7 @@ use pascal_project::{
     ConstantValue, MetadataObservation, PackageMetadata, ProjectCandidateMembership,
     ProjectCandidates, ProjectContext, ProjectDiscovery, ProjectOptions, ProjectPathEntry,
     ProjectPathProvenance, ProjectReadObservation, ProjectReadStamp, ProjectSelections,
-    ProjectWorkBudget, ReadPolicy, discover_with_selections,
+    ProjectWorkBudget, ReadPolicy, SystemPasSearchObservation, discover_with_selections,
     discover_with_selections_and_observations_with_overrides_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_deleted_paths,
     discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths,
@@ -32,7 +32,7 @@ use pascal_project::{
     project_candidate_membership_with_deleted_paths_and_budget,
     project_candidates_with_work_budget_and_deleted_paths,
     read_package_metadata_with_observations_and_work_budget, runtime_project_selection,
-    selected_project_is_current_with_budget_and_deleted_paths,
+    selected_project_is_current_with_budget_and_deleted_paths, system_pas_candidate_in_directory,
 };
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
@@ -1345,6 +1345,7 @@ pub(crate) struct ReconciliationBudget {
     cancel_after_project_path_key_bytes: Cell<Option<usize>>,
     deleted_uris: RefCell<HashSet<Url>>,
     rename_endpoints: RefCell<HashSet<Url>>,
+    system_pas_payload_checks: RefCell<HashMap<MetadataObservation, bool>>,
     recovery_target_reserve: Cell<usize>,
     recovery_byte_reserve: Cell<usize>,
     recovery_visit_reserve: Cell<usize>,
@@ -1369,6 +1370,7 @@ impl ReconciliationBudget {
             cancel_after_project_path_key_bytes: Cell::new(None),
             deleted_uris: RefCell::new(HashSet::new()),
             rename_endpoints: RefCell::new(HashSet::new()),
+            system_pas_payload_checks: RefCell::new(HashMap::new()),
             recovery_target_reserve: Cell::new(0),
             recovery_byte_reserve: Cell::new(0),
             recovery_visit_reserve: Cell::new(0),
@@ -2179,6 +2181,7 @@ pub(crate) struct ContextState {
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
+    system_pas_search_stamps: RefCell<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
 }
 
 impl ContextState {
@@ -2208,6 +2211,12 @@ impl ContextState {
         }
         for observation in &self.project_read_observations {
             observation.visit_recovery_payload(visit)?;
+        }
+        for search in self.system_pas_search_stamps.borrow().keys() {
+            visit(search.directory.as_os_str().len())?;
+            if let Some(path) = &search.selected_path {
+                visit(path.as_os_str().len())?;
+            }
         }
         Ok(())
     }
@@ -2241,6 +2250,16 @@ impl ContextState {
                 .any(|existing| existing == observation)
             {
                 self.context.metadata_observations.push(observation.clone());
+            }
+        }
+        for search in &retained.context.system_pas_searches {
+            if !self
+                .context
+                .system_pas_searches
+                .iter()
+                .any(|existing| existing == search)
+            {
+                self.context.system_pas_searches.push(search.clone());
             }
         }
     }
@@ -9718,6 +9737,7 @@ impl Workspace {
             state.project_read_observations = staged_observations;
             state.watched_paths.extend(staged_watched);
             state.project_candidate_memberships = staged_memberships;
+            state.system_pas_search_stamps.get_mut().clear();
         } else {
             self.contexts.insert(
                 key,
@@ -9726,6 +9746,7 @@ impl Workspace {
                     watched_paths: staged_watched,
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
+                    system_pas_search_stamps: RefCell::new(HashMap::new()),
                 },
             );
         }
@@ -13934,6 +13955,12 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
 
+    for search in &state.context.system_pas_searches {
+        if !system_pas_search_is_current(search, &state.system_pas_search_stamps, cancel, budget)? {
+            return Ok(false);
+        }
+    }
+
     for observation in &state.context.metadata_observations {
         check_workspace_cancel(cancel)?;
         let MetadataObservation::Payload { path, .. } = observation else {
@@ -13966,11 +13993,7 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         } else {
             4 * 1024 * 1024
         };
-        if !metadata_payload_is_current(
-            observation,
-            read_limit,
-            budget.map(|budget| budget as &dyn ProjectWorkBudget),
-        )? {
+        if !metadata_payload_is_current_in_pass(observation, read_limit, budget)? {
             return Ok(false);
         }
     }
@@ -14000,6 +14023,94 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
         }
     }
     Ok(true)
+}
+
+fn system_pas_search_is_current(
+    observation: &SystemPasSearchObservation,
+    checked_stamps: &RefCell<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    cancel: Option<&AtomicBool>,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<bool, String> {
+    check_workspace_cancel(cancel)?;
+    if let Some(budget) = budget {
+        budget.charge_path_visits(1)?;
+    }
+    let directory_stamp = path_stamp(&observation.directory);
+    let unchanged_stamp = checked_stamps
+        .borrow()
+        .get(observation)
+        .is_some_and(|stamp| stamp == &directory_stamp);
+    if unchanged_stamp {
+        return Ok(true);
+    }
+
+    let actual = system_pas_candidate_in_directory(
+        &observation.directory,
+        cancel,
+        budget.map(|budget| budget as &dyn ProjectWorkBudget),
+    );
+    let matches = match actual {
+        Ok(actual) if observation.complete => match (&observation.selected_path, actual) {
+            (Some(expected), Some(actual)) => package_paths_equal(expected, &actual),
+            (None, None) => true,
+            _ => false,
+        },
+        Err(error)
+            if error == CANCELLATION_MESSAGE
+                || budget.is_some_and(|budget| budget.is_transient_error(&error)) =>
+        {
+            return Err(error);
+        }
+        Err(_) if !observation.complete => true,
+        _ => false,
+    };
+    if matches {
+        checked_stamps
+            .borrow_mut()
+            .insert(observation.clone(), directory_stamp);
+    }
+    Ok(matches)
+}
+
+fn metadata_payload_is_current_in_pass(
+    observation: &MetadataObservation,
+    read_limit: u64,
+    budget: Option<&ReconciliationBudget>,
+) -> Result<bool, String> {
+    let is_system_pas = matches!(
+        observation,
+        MetadataObservation::Payload { path, .. }
+            if path.file_name().is_some_and(|name| {
+                name.to_string_lossy().eq_ignore_ascii_case("System.pas")
+            })
+    );
+    if let Some(budget) = budget.filter(|_| is_system_pas) {
+        budget.check_cancelled()?;
+        if let Some(is_current) = budget
+            .system_pas_payload_checks
+            .borrow()
+            .get(observation)
+            .copied()
+        {
+            return Ok(is_current);
+        }
+        let is_current = metadata_payload_is_current(
+            observation,
+            read_limit,
+            Some(budget as &dyn ProjectWorkBudget),
+        )?;
+        budget
+            .system_pas_payload_checks
+            .borrow_mut()
+            .insert(observation.clone(), is_current);
+        return Ok(is_current);
+    }
+
+    metadata_payload_is_current(
+        observation,
+        read_limit,
+        budget.map(|budget| budget as &dyn ProjectWorkBudget),
+    )
 }
 
 pub(crate) fn server_diagnostic(message: &str, severity: DiagnosticSeverity) -> LspDiagnostic {
@@ -17951,6 +18062,7 @@ BDS = '/fake/37'
                 Ok(super::ProjectCandidateMembership::default()),
             )]),
             project_read_observations: Vec::new(),
+            system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
         };
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
         budget
@@ -18001,6 +18113,7 @@ BDS = '/fake/37'
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
+                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
             },
         );
         let changed =
@@ -18198,6 +18311,7 @@ BDS = '/fake/37'
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
+                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
             },
         );
         let incoming = (0..EXISTING)
@@ -18303,6 +18417,7 @@ BDS = '/fake/37'
                 watched_paths: HashMap::new(),
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
+                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
             },
             origin: OwnerOrigin::Explicit,
             needs_revalidation: false,
@@ -20892,11 +21007,122 @@ BDS = '/fake/37'
             watched_paths: HashMap::from([(system_pas.clone(), super::path_stamp(&system_pas))]),
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
+            system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
         };
 
         assert!(
             !context_state_is_fresh_with_cancel(&state, None, None).expect("freshness check"),
             "payload verification must detect a same-size System.pas update even when its current file stamp is already installed"
+        );
+    }
+
+    #[test]
+    fn unrelated_search_directory_entries_do_not_invalidate_system_pas_context() {
+        let temp = tempfile::tempdir().expect("temporary project");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("App.dpr");
+        let system_pas = root.join("rtl/System.pas");
+        fs::create_dir_all(system_pas.parent().expect("RTL directory"))
+            .expect("create RTL directory");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>rtl</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project file");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            &system_pas,
+            "unit System; interface const RTLVersion111 = True; implementation end.",
+        )
+        .expect("System.pas");
+        let options = ProjectOptions {
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(35, 0)),
+            ..ProjectOptions::default()
+        };
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &OverrideSession::new(None),
+        )
+        .expect("project context");
+        let watched_paths = context
+            .metadata_files
+            .iter()
+            .map(|path| (path.clone(), super::path_stamp(path)))
+            .collect();
+        let state = ContextState {
+            context,
+            watched_paths,
+            ..ContextState::default()
+        };
+
+        assert!(context_state_is_fresh_with_cancel(&state, None, None).expect("initial check"));
+        fs::write(root.join("rtl/Unrelated.pas"), "unit Unrelated; end.")
+            .expect("unrelated sibling");
+
+        assert!(
+            context_state_is_fresh_with_cancel(&state, None, None)
+                .expect("freshness check after unrelated sibling creation"),
+            "adding an unrelated source must not invalidate the System.pas search result"
+        );
+    }
+
+    #[test]
+    fn system_pas_payload_is_verified_once_per_reconciliation_pass() {
+        let temp = tempfile::tempdir().expect("temporary project");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("App.dpr");
+        let system_pas = root.join("rtl/System.pas");
+        fs::create_dir_all(system_pas.parent().expect("RTL directory"))
+            .expect("create RTL directory");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>rtl</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project file");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            &system_pas,
+            "unit System; interface const RTLVersion111 = True; implementation end.",
+        )
+        .expect("System.pas");
+        let options = ProjectOptions {
+            conditional_context: ConditionalContext::default()
+                .with_compiler_version(CompilerVersion::new(35, 0)),
+            ..ProjectOptions::default()
+        };
+        let context = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &OverrideSession::new(None),
+        )
+        .expect("project context");
+        let state = ContextState {
+            context,
+            ..ContextState::default()
+        };
+        let budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
+
+        assert!(
+            context_state_is_fresh_with_cancel(&state, None, Some(&budget))
+                .expect("initial freshness check")
+        );
+        let bytes_after_first_check = budget.used.get().file_bytes_read;
+        assert!(bytes_after_first_check > 0);
+        assert!(
+            context_state_is_fresh_with_cancel(&state, None, Some(&budget))
+                .expect("repeated freshness check")
+        );
+
+        assert_eq!(
+            budget.used.get().file_bytes_read,
+            bytes_after_first_check,
+            "a single reconciliation pass should hash the shared System.pas payload once"
         );
     }
 

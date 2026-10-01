@@ -49,6 +49,35 @@ pub fn ver_symbols(version: CompilerVersion) -> Vec<String> {
     symbols
 }
 
+/// Return the fact for any `VER<digits>` symbol when the compiler version is
+/// known, including version symbols outside the historical lookup table.
+pub fn version_symbol_fact(
+    name: &str,
+    version: Option<CompilerVersion>,
+) -> Option<ConditionalFact> {
+    let bytes = name.as_bytes();
+    if bytes.len() <= b"VER".len()
+        || !bytes[..b"VER".len()].eq_ignore_ascii_case(b"VER")
+        || !bytes[b"VER".len()..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+
+    let Some(version) = version.filter(|version| version.numeric_parts().is_some()) else {
+        return Some(ConditionalFact::Unknown);
+    };
+    Some(
+        if ver_symbols(version)
+            .iter()
+            .any(|symbol| symbol.eq_ignore_ascii_case(name))
+        {
+            ConditionalFact::True
+        } else {
+            ConditionalFact::False
+        },
+    )
+}
+
 fn first_fractional_digit(version: CompilerVersion) -> Option<u8> {
     let (mantissa, scale) = version.numeric_parts()?;
     let denominator = 10_u64.checked_pow(u32::from(scale))?;

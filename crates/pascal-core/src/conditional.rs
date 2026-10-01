@@ -1254,9 +1254,13 @@ fn canonical_symbol_ref(symbol: &str) -> Option<&str> {
 }
 
 fn environment_value(environment: &ConditionalEnvironment, symbol: &str) -> Truth {
-    canonical_symbol(symbol)
-        .and_then(|symbol| environment.get(&symbol).copied())
-        .unwrap_or(environment.absent_define)
+    let Some(symbol) = canonical_symbol(symbol) else {
+        return environment.absent_define;
+    };
+    environment.get(&symbol).copied().unwrap_or_else(|| {
+        pascal_project::compiler_defines::version_symbol_fact(&symbol, environment.compiler_version)
+            .unwrap_or(environment.absent_define)
+    })
 }
 
 fn clone_environment(

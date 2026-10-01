@@ -1259,6 +1259,8 @@ discovery is complete, a `.dproj` is selected, the compiler version is known,
 and both configuration and platform are resolved and valid. Project-compiled
 sources include the project main source, `DCCReference` units, files under the
 project directory, `.dproj` unit-search paths and client/local `sourcePaths`.
+`.dpr`/`.dpk` projects without a selected `.dproj` receive predefined facts but
+remain open and report `noProject`.
 Installation-library and browsing-path sources are treated as library code:
 they receive caller facts, predefined symbols, and RTL constants, but keep
 undefined names `Unknown` and do not receive the project's `DCC_Define` set.
@@ -1270,8 +1272,9 @@ include `VERnnn`; `MSWINDOWS` is modeled at versions ≥14.0, `ASSEMBLER` at
 at ≥29.0. `DCC` and `NATIVECODE` are known only at ≥23.0. `CPUINTEL` always
 stays Unknown. Platform-derived symbols are modeled only for Win32 and Win64;
 other or unresolved platforms leave that group Unknown. `CONSOLE` is derived
-from project console-target metadata or the main source's `{$APPTYPE CONSOLE}`;
-standalone files leave it Unknown. The `lint4d` CLI gains only these predefined
+from project console-target metadata or the main source's `{$APPTYPE CONSOLE}`
+or `(*$APPTYPE CONSOLE*)` directive; ordinary comments and strings are ignored.
+Standalone files leave it Unknown. The `lint4d` CLI gains only these predefined
 symbols and deliberately remains open-world.
 
 `RTLVersionNNN` values are constants rather than compiler defines. The declared
@@ -1279,8 +1282,12 @@ set is resolved in this order: the selected installation's `rtlVersionConstants`
 override; a lexical scan of that installation's `System.pas`; the latest-known
 table; then Unknown. The scan is limited to 4 MiB, reads unconditional
 `RTLVersionNNN = True` declarations in the interface section, and skips comments
-and strings. A conditional declaration, unreadable or oversized file, or
-inconclusive scan produces a warning and falls through to the table. The table
+and strings. Typed or non-`True` RTL declarations, conditional RTL declarations,
+and interface include directives make the scan inconclusive. An unreadable or
+oversized file also produces a warning and falls through to the table. The
+search observes directories in precedence order and verifies the winning file's
+payload, so a newly installed or higher-priority `System.pas` invalidates the
+cached context. The table
 currently has no update constants through 33.0, `RTLVersion1041`/`RTLVersion1042`
 for 34.0, `RTLVersion111`–`RTLVersion113` for 35.0,
 `RTLVersion121`–`RTLVersion123` for 36.0, and `RTLVersion131` for 37.0.

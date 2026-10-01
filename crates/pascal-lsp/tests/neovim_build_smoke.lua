@@ -21,6 +21,16 @@ local function run()
       end
       assert(debug_choice, 'build configuration picker did not offer Debug: ' .. vim.inspect(items))
       callback(debug_choice)
+    elseif type(options.prompt) == 'string' and options.prompt:match('^Platform %(') then
+      local win32_choice
+      for _, item in ipairs(items) do
+        if item.value == 'Win32' then
+          win32_choice = item
+          break
+        end
+      end
+      assert(win32_choice, 'platform picker did not offer Win32: ' .. vim.inspect(items))
+      callback(win32_choice)
     elseif type(options.prompt) == 'string' and options.prompt:match('^Pascal project %(') then
       callback(nil)
     else
@@ -90,6 +100,24 @@ local function run()
   end), 'Debug session selection was not reported: ' .. vim.inspect(notifications))
 
   context = request(client, 'pascal/buildContext', { projectUri = project_uri }, bufnr)
+  assert(context.config.selected == 'Debug', vim.inspect(context.config))
+  assert(context.config.mode == 'session', vim.inspect(context.config))
+
+  vim.api.nvim_buf_call(bufnr, function()
+    vim.cmd.PascalPlatform()
+  end)
+  assert(vim.wait(REQUEST_TIMEOUT, function()
+    for _, notification in ipairs(notifications) do
+      if notification.message:find('Platform: Win32 (session)', 1, true) then
+        return true
+      end
+    end
+    return false
+  end), 'Win32 session selection was not reported: ' .. vim.inspect(notifications))
+
+  context = request(client, 'pascal/buildContext', { projectUri = project_uri }, bufnr)
+  assert(context.platform.selected == 'Win32', vim.inspect(context.platform))
+  assert(context.platform.mode == 'session', vim.inspect(context.platform))
   assert(context.config.selected == 'Debug', vim.inspect(context.config))
   assert(context.config.mode == 'session', vim.inspect(context.config))
 

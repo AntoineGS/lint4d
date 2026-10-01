@@ -90,15 +90,10 @@ pub(crate) fn build_selection_values_are_candidates(
         .all(
             |selection| match (selection.mode, selection.selected.as_deref()) {
                 (BuildSelectionMode::Invalid, _) | (_, None) => true,
-                (_, Some(selected)) => {
-                    // Missing candidates cannot prove that a configured value
-                    // is invalid; the other selection field is checked alone.
-                    selection.candidates.is_empty()
-                        || selection
-                            .candidates
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(selected))
-                }
+                (_, Some(selected)) => selection
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(selected)),
             },
         )
 }
@@ -144,7 +139,11 @@ pub(crate) fn source_has_console_apptype(source: &str) -> bool {
             let Some(end) = source[cursor + 2..].find("*)") else {
                 break;
             };
-            cursor += 2 + end + 2;
+            let end = cursor + 2 + end;
+            if bytes.get(cursor + 2) == Some(&b'$') && console_directive(&source[cursor + 2..end]) {
+                return true;
+            }
+            cursor = end + 2;
         } else if bytes[cursor] == b'\'' {
             cursor += 1;
             while cursor < bytes.len() {

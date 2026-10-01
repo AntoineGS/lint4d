@@ -369,9 +369,13 @@ impl ConditionalContext {
     }
 
     pub fn define(&self, name: &str) -> ConditionalFact {
-        canonical_name(name)
-            .and_then(|name| self.defines.get(&name).copied())
-            .unwrap_or(self.absent_define)
+        let Some(name) = canonical_name(name) else {
+            return self.absent_define;
+        };
+        self.defines.get(&name).copied().unwrap_or_else(|| {
+            crate::compiler_defines::version_symbol_fact(&name, self.compiler_version)
+                .unwrap_or(self.absent_define)
+        })
     }
 
     pub fn option(&self, name: &str) -> ConditionalFact {

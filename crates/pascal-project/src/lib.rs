@@ -720,7 +720,7 @@ impl ReadPolicy {
 /// retained for freshness and precedence, but never authorize a later
 /// payload read.  Payload observations carry the exact policy and path entry
 /// that authorized the original read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetadataObservation {
     Stat {
         path: PathBuf,
@@ -732,6 +732,16 @@ pub enum MetadataObservation {
         stamp: Option<ProjectReadStamp>,
         content_hash: u64,
     },
+}
+
+/// The result of looking for `System.pas` in one ordered compiler search
+/// directory. A failed lookup remains distinguishable from a complete miss so
+/// freshness checks do not treat an unreadable directory as proof of absence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SystemPasSearchObservation {
+    pub directory: PathBuf,
+    pub selected_path: Option<PathBuf>,
+    pub complete: bool,
 }
 
 impl MetadataObservation {
@@ -935,6 +945,8 @@ pub struct ProjectContext {
     /// Exact selected installation environment and imported IDE XML files
     /// consumed while constructing this context.
     pub installation_config_files: Vec<PathBuf>,
+    /// Ordered System.pas directory lookups used to derive RTL constants.
+    pub system_pas_searches: Vec<SystemPasSearchObservation>,
     /// The authorization provenance for each metadata observation. A path in
     /// `metadata_files` without a payload observation is stat-only.
     pub metadata_observations: Vec<MetadataObservation>,
@@ -1065,6 +1077,12 @@ impl ProjectContext {
         for path in &self.metadata_files {
             visit(path.as_os_str().len())?;
         }
+        for search in &self.system_pas_searches {
+            visit(search.directory.as_os_str().len())?;
+            if let Some(path) = &search.selected_path {
+                visit(path.as_os_str().len())?;
+            }
+        }
         for observation in &self.metadata_observations {
             observation.visit_recovery_payload(visit)?;
         }
@@ -1127,7 +1145,7 @@ impl ProjectCandidateMembership {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProjectReadStamp {
     pub bytes: u64,
     pub modified: Option<SystemTime>,
@@ -1414,21 +1432,43 @@ impl ProjectContext {
 
     /// Classify a source as project-compiled or external library code.
     pub fn source_origin(&self, path: &Path) -> SourceOrigin {
-        let is_explicit = self
+        if self.project_file.is_none() {
+            return SourceOrigin::Library;
+        }
+        let under_project_root = self
+            .project_source_roots
+            .iter()
+            .any(|root| path_starts_with_ci(path, root));
+        if under_project_root {
+            return SourceOrigin::ProjectCompiled;
+        }
+
+        if self
             .main_source
             .as_deref()
             .is_some_and(|main| project_paths_equal(main, path))
-            || self
-                .explicit_units
-                .values()
-                .flatten()
-                .any(|unit| project_paths_equal(unit, path));
-        let under_project_root = self.project_source_roots.iter().any(|root| {
-            path.parent()
-                .is_some_and(|parent| project_paths_equal(parent, root))
-                || path_starts_with_ci(path, root)
+        {
+            return SourceOrigin::ProjectCompiled;
+        }
+
+        let explicit_name = path
+            .file_stem()
+            .map(|stem| canonical_unit_name(&stem.to_string_lossy()))
+            .filter(|name| !name.is_empty());
+        let is_explicit = explicit_name.is_some_and(|name| {
+            self.explicit_unit_entries
+                .get(&name)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| project_paths_equal(&entry.path, path))
+                })
+                || self
+                    .explicit_units
+                    .get(&name)
+                    .is_some_and(|units| units.iter().any(|unit| project_paths_equal(unit, path)))
         });
-        if self.project_file.is_some() && (is_explicit || under_project_root) {
+        if is_explicit {
             SourceOrigin::ProjectCompiled
         } else {
             SourceOrigin::Library
@@ -3899,19 +3939,20 @@ fn relevant_override_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<Pa
 }
 
 fn path_starts_with_ci(path: &Path, root: &Path) -> bool {
-    let path_components: Vec<String> = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect();
-    let root_components: Vec<String> = root
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect();
-    path_components.len() >= root_components.len()
-        && path_components
-            .iter()
-            .zip(root_components.iter())
-            .all(|(path, root)| path.eq_ignore_ascii_case(root))
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !path_component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&root_component.as_os_str().to_string_lossy())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn fallback_main_source(
@@ -4206,7 +4247,8 @@ fn build_project_context(
         evaluation_options.build_config = bootstrap_config;
     }
     if evaluation_options.platform.is_none() {
-        evaluation_options.platform = bootstrap_platform;
+        evaluation_options.platform =
+            bootstrap_platform.or_else(|| build_candidates.default_platform.clone());
     }
     let mut builder = ProjectBuilder::new(
         &evaluation_options,
@@ -4525,9 +4567,15 @@ fn build_project_context(
         console_target,
     );
     let version = conditional_context.compiler_version;
-    let system_pas = if version.is_some_and(|version| {
-        version.cmp_numeric(CompilerVersion::new(34, 0)) != Some(std::cmp::Ordering::Less)
-    }) {
+    let has_valid_rtl_override = rtl_constants_override.as_deref().is_some_and(|names| {
+        names
+            .iter()
+            .all(|name| ConditionalContext::is_rtl_version_constant(name))
+    });
+    let system_pas = if !has_valid_rtl_override
+        && version.is_some_and(|version| {
+            version.cmp_numeric(CompilerVersion::new(34, 0)) != Some(std::cmp::Ordering::Less)
+        }) {
         scan_system_pas_from_paths(
             &search_path_entries,
             &ide_paths.browsing,
@@ -4627,7 +4675,7 @@ fn build_project_context(
         && ide_path_warnings.is_empty()
         && !project_context_warnings_incomplete(&builder.warnings, explicit);
     let open_reasons = conditional_closure::open_reasons(
-        true,
+        extension_is(&project_file, "dproj"),
         discovery_complete,
         conditional_context.compiler_version.is_some(),
         config.as_deref(),
@@ -4679,6 +4727,7 @@ fn build_project_context(
         packages: package_list(&builder),
         metadata_files,
         installation_config_files,
+        system_pas_searches: builder.system_pas_searches,
         metadata_observations,
         warnings: builder.warnings,
         override_error: None,
@@ -4812,6 +4861,7 @@ fn build_standalone_context(
         packages: Vec::new(),
         metadata_files,
         installation_config_files: Vec::new(),
+        system_pas_searches: Vec::new(),
         metadata_observations,
         warnings,
         override_error: None,
@@ -4950,10 +5000,29 @@ fn scan_system_pas_from_paths(
     cancel: Option<&AtomicBool>,
     metadata_files: &mut Vec<PathBuf>,
 ) -> Result<Option<Result<crate::rtl_constants::SystemPasScan, String>>, String> {
+    let mut seen_directories = HashSet::new();
     for directory in search_paths.iter().chain(browsing_paths) {
         check_project_scan_cancel(cancel)?;
-        let entries = match project_directory_entries(&directory.path, cancel, work_budget) {
-            Ok(entries) => entries,
+        if !seen_directories.insert(directory.clone()) {
+            continue;
+        }
+        let candidate = directory.path.join("System.pas");
+        add_unique_path(metadata_files, candidate.clone());
+        add_metadata_observation(
+            &mut builder.metadata_observations,
+            MetadataObservation::Stat { path: candidate },
+        );
+        let path = match find_system_pas_in_directory(&directory.path, cancel, work_budget) {
+            Ok(path) => {
+                builder
+                    .system_pas_searches
+                    .push(SystemPasSearchObservation {
+                        directory: directory.path.clone(),
+                        selected_path: path.clone(),
+                        complete: true,
+                    });
+                path
+            }
             Err(error)
                 if error == "request cancelled"
                     || work_budget.is_some_and(|budget| budget.is_transient_error(&error)) =>
@@ -4961,6 +5030,13 @@ fn scan_system_pas_from_paths(
                 return Err(error);
             }
             Err(error) => {
+                builder
+                    .system_pas_searches
+                    .push(SystemPasSearchObservation {
+                        directory: directory.path.clone(),
+                        selected_path: None,
+                        complete: false,
+                    });
                 builder.warnings.push(format!(
                     "could not inspect {} for System.pas: {error}",
                     directory.path.display()
@@ -4968,7 +5044,7 @@ fn scan_system_pas_from_paths(
                 continue;
             }
         };
-        let Some(path) = entries.system_pas else {
+        let Some(path) = path else {
             continue;
         };
         add_unique_path(metadata_files, path.clone());
@@ -4994,6 +5070,88 @@ fn scan_system_pas_from_paths(
         ));
     }
     Ok(None)
+}
+
+fn find_system_pas_in_directory(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<Option<PathBuf>, String> {
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+        work_budget.charge_path_visits(1)?;
+    }
+    let exact_path = directory.join("System.pas");
+    match fs::symlink_metadata(&exact_path) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(Some(exact_path)),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not inspect System.pas candidate {}: {error}",
+                exact_path.display()
+            ));
+        }
+    }
+
+    let mut entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "could not inspect project directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let mut visited_entries = 0usize;
+    loop {
+        check_project_scan_cancel(cancel)?;
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+            work_budget.charge_path_visits(1)?;
+        }
+        let Some(entry) = entries.next() else {
+            return Ok(None);
+        };
+        visited_entries = visited_entries.saturating_add(1);
+        if visited_entries > MAX_PROJECT_DIRECTORY_ENTRIES {
+            return Err(format!(
+                "project directory entry limit ({MAX_PROJECT_DIRECTORY_ENTRIES}) reached in {}",
+                directory.display()
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect project directory entry under {}: {error}",
+                directory.display()
+            )
+        })?;
+        if entry
+            .file_type()
+            .map_err(|error| {
+                format!(
+                    "could not inspect project directory entry {}: {error}",
+                    entry.path().display()
+                )
+            })?
+            .is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("System.pas")
+        {
+            return Ok(Some(entry.path()));
+        }
+    }
+}
+
+/// Find a `System.pas` candidate using the same bounded, case-insensitive
+/// lookup as project discovery. Used to revalidate a cached search result when
+/// the directory's entry stamp changes.
+pub fn system_pas_candidate_in_directory(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<Option<PathBuf>, String> {
+    find_system_pas_in_directory(directory, cancel, work_budget)
 }
 
 fn merge_project_conditional_context(
@@ -6623,6 +6781,7 @@ struct ProjectBuilder {
     property_bytes: usize,
     metadata_files: Vec<PathBuf>,
     metadata_observations: Vec<MetadataObservation>,
+    system_pas_searches: Vec<SystemPasSearchObservation>,
     read_policy: ReadPolicy,
 }
 
@@ -6744,6 +6903,7 @@ impl ProjectBuilder {
             property_bytes,
             metadata_files: Vec::new(),
             metadata_observations: Vec::new(),
+            system_pas_searches: Vec::new(),
             read_policy,
         }
     }

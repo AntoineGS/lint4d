@@ -313,17 +313,28 @@ local function run()
   assert(automatic_prompt_count == 1, 'unchanged ambiguity must produce exactly one automatic prompt')
 
   local before_unresolved_version = #pickers
+  local unresolved_message = 'Project selection is unresolved; choose a project with :PascalProject first.'
   vim.api.nvim_buf_call(probe, function()
     vim.cmd.PascalDelphiVersion()
   end)
-  vim.wait(100)
+  assert(
+    vim.wait(REQUEST_TIMEOUT, function()
+      for _, notification in ipairs(notifications) do
+        if notification.message == unresolved_message then
+          return true
+        end
+      end
+      return false
+    end),
+    'unresolved installation selection notification timed out'
+  )
   assert(#pickers == before_unresolved_version, 'installation picker opened for an unresolved project')
   assert(
     vim.tbl_contains(
       vim.tbl_map(function(item)
         return item.message
       end, notifications),
-      'Project selection is unresolved; choose a project with :PascalProject first.'
+      unresolved_message
     ),
     'unresolved installation selection did not direct the user to :PascalProject'
   )

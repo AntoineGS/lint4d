@@ -149,6 +149,91 @@ end.
 }
 
 #[test]
+fn roundtrip_conditional_routine_directives_keep_inner_semicolons() {
+    let source = r#"unit Test;
+
+interface
+
+type
+  T = class
+    function M: Integer; {$IFDEF USE_INLINE} inline; {$ENDIF}
+    procedure N; virtual; {$IFDEF FPC} assembler; nostackframe; {$ELSE} register; {$ENDIF} overload;
+  end;
+
+function F: Integer; {$IFDEF USE_INLINE}inline;{$ENDIF}
+
+implementation
+
+function T.M: Integer;
+begin
+  Result := 0;
+end;
+
+procedure T.N; {$IFDEF X} inline; {$ELSE} {$IFDEF Y} cdecl; {$ENDIF} {$ENDIF}
+begin
+end;
+
+function F: Integer;
+{$IFDEF USE_INLINE} inline; {$ENDIF}
+begin
+  Result := 0;
+end;
+
+end.
+"#;
+    let formatted = format_source(source);
+
+    let mut search_from = 0;
+    for (directive, attributes) in [
+        ("{$IFDEF USE_INLINE}", "inline;"),
+        ("{$IFDEF FPC}", "assembler; nostackframe;"),
+        ("{$ELSE}", "register;"),
+        ("{$IFDEF USE_INLINE}", "inline;"),
+        ("{$IFDEF X}", "inline;"),
+        ("{$IFDEF Y}", "cdecl;"),
+        ("{$IFDEF USE_INLINE}", "inline;"),
+    ] {
+        let start = search_from
+            + formatted[search_from..]
+                .find(directive)
+                .unwrap_or_else(|| panic!("formatted source dropped {directive:?}:\n{formatted}"))
+            + directive.len();
+        let end = start
+            + formatted[start..]
+                .find("{$")
+                .expect("directive must be closed");
+        let inside = formatted[start..end].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            inside.join(" "),
+            attributes,
+            "attributes after {directive:?} must stay inside the directive:\n{formatted}"
+        );
+        search_from = end;
+    }
+    assert!(
+        !formatted.contains("{$ENDIF};"),
+        "formatter must not add a semicolon after a directive:\n{formatted}"
+    );
+
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let (tree_before, diagnostics_before) =
+        pascal_core::parser::parse_file(&info, source.as_bytes()).expect("parse original failed");
+    let (tree_after, diagnostics_after) =
+        pascal_core::parser::parse_file(&info, formatted.as_bytes())
+            .expect("parse formatted failed");
+    assert!(
+        diagnostics_before.is_empty(),
+        "original conditional directives produced diagnostics: {diagnostics_before:?}"
+    );
+    assert!(
+        diagnostics_after.is_empty(),
+        "formatted conditional directives produced diagnostics: {diagnostics_after:?}"
+    );
+    assert!(ast_eq(tree_before.root_node(), tree_after.root_node()));
+    assert_eq!(formatted, format_source(&formatted));
+}
+
+#[test]
 fn roundtrip_conditional_method_attribute_trailing_comment() {
     let source = "unit Test;\ninterface\nprocedure P; {$IFDEF X}reintroduce // comment\n {$ELSE}override{$ENDIF};\nimplementation\nend.\n";
     let formatted = format_source(source);

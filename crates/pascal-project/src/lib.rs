@@ -1978,6 +1978,7 @@ fn discover_context_with_selections(
     work_budget: Option<&dyn ProjectWorkBudget>,
     deleted_paths: &[PathBuf],
 ) -> Result<ProjectDiscovery, String> {
+    let _path_resolution_cache_scope = PathResolutionCacheScope::new();
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -6085,6 +6086,66 @@ fn resolve_existing_path_status(
         };
         lexical_normalize(&current.join(path))
     };
+    #[cfg(test)]
+    if TEST_USE_LEGACY_PATH_RESOLUTION.with(std::cell::Cell::get) {
+        return resolve_existing_path_status_legacy(&absolute, warnings, kind);
+    }
+    // Linux follows intermediate directory symlinks but keeps a final symlink
+    // as an entry, matching the component walk below. This also lets paths
+    // through execute-only directories resolve without requiring a listing.
+    #[cfg(target_os = "linux")]
+    if fs::symlink_metadata(&absolute).is_ok() {
+        return ExistingPathStatus::Found(absolute);
+    }
+    let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+    for component in absolute.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let wanted = component.to_string_lossy();
+        let entries = match path_resolution_directory_listing(&current) {
+            PathResolutionDirectoryListing::Entries(entries) => entries,
+            PathResolutionDirectoryListing::Missing => {
+                return ExistingPathStatus::Missing;
+            }
+            PathResolutionDirectoryListing::Error(error) => {
+                warnings.push(format!(
+                    "could not inspect {kind} path under {}: {error}",
+                    current.display()
+                ));
+                return ExistingPathStatus::Unresolvable;
+            }
+        };
+        let folded_wanted = wanted.to_ascii_lowercase();
+        let Some(matches) = entries.case_insensitive_names.get(&folded_wanted) else {
+            return ExistingPathStatus::Missing;
+        };
+        if let Some(index) = matches
+            .iter()
+            .find(|&&index| entries.names[index].as_os_str() == component)
+        {
+            current.push(&entries.names[*index]);
+            continue;
+        }
+        if matches.len() > 1 {
+            warnings.push(format!(
+                "ambiguous case-insensitive {kind} path component {wanted:?} under {}",
+                current.display()
+            ));
+            return ExistingPathStatus::Unresolvable;
+        }
+        current.push(&entries.names[matches[0]]);
+    }
+    ExistingPathStatus::Found(current)
+}
+
+#[cfg(test)]
+// Keep the former walk available to the ignored benchmark for a same-process baseline.
+fn resolve_existing_path_status_legacy(
+    absolute: &Path,
+    warnings: &mut Vec<String>,
+    kind: &str,
+) -> ExistingPathStatus {
     let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
     for component in absolute.components() {
         let Component::Normal(component) = component else {
@@ -6092,7 +6153,7 @@ fn resolve_existing_path_status(
         };
         let wanted = component.to_string_lossy();
         let mut matches = Vec::new();
-        let entries = match fs::read_dir(&current) {
+        let entries = match read_dir_for_path_resolution(&current) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return ExistingPathStatus::Missing;
@@ -6141,6 +6202,142 @@ fn resolve_existing_path_status(
         current = next;
     }
     ExistingPathStatus::Found(current)
+}
+
+#[derive(Debug, Clone, Default)]
+struct PathResolutionDirectoryEntries {
+    names: Vec<std::ffi::OsString>,
+    case_insensitive_names: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+enum PathResolutionDirectoryListing {
+    // Shared so a cache hit does not copy a large directory per lookup.
+    Entries(Arc<PathResolutionDirectoryEntries>),
+    Missing,
+    Error(String),
+}
+
+thread_local! {
+    static PATH_RESOLUTION_DIRECTORY_CACHE: std::cell::RefCell<Option<HashMap<PathBuf, PathResolutionDirectoryListing>>> = const { std::cell::RefCell::new(None) };
+}
+
+struct PathResolutionCacheScope {
+    previous: Option<HashMap<PathBuf, PathResolutionDirectoryListing>>,
+}
+
+impl PathResolutionCacheScope {
+    fn new() -> Self {
+        let previous =
+            PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| cache.replace(Some(HashMap::new())));
+        Self { previous }
+    }
+}
+
+impl Drop for PathResolutionCacheScope {
+    fn drop(&mut self) {
+        PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
+            cache.replace(self.previous.take());
+        });
+    }
+}
+
+fn path_resolution_directory_listing(path: &Path) -> PathResolutionDirectoryListing {
+    let cached = PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(path))
+            .cloned()
+    });
+    if let Some(cached) = cached {
+        return cached;
+    }
+
+    let listing = match read_dir_for_path_resolution(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            PathResolutionDirectoryListing::Missing
+        }
+        Err(error) => PathResolutionDirectoryListing::Error(error.to_string()),
+        Ok(directory) => {
+            let mut entries = PathResolutionDirectoryEntries::default();
+            let mut error = None;
+            for entry in directory {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(entry_error) => {
+                        error = Some(entry_error.to_string());
+                        break;
+                    }
+                };
+                let name = entry.file_name();
+                let index = entries.names.len();
+                entries
+                    .case_insensitive_names
+                    .entry(name.to_string_lossy().to_ascii_lowercase())
+                    .or_default()
+                    .push(index);
+                entries.names.push(name);
+            }
+            match error {
+                Some(error) => PathResolutionDirectoryListing::Error(error),
+                None => PathResolutionDirectoryListing::Entries(Arc::new(entries)),
+            }
+        }
+    };
+    PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(path.to_path_buf(), listing.clone());
+        }
+    });
+    listing
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PATH_RESOLUTION_READ_DIR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_USE_LEGACY_PATH_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_dir_for_path_resolution(path: &Path) -> io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    TEST_PATH_RESOLUTION_READ_DIR_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    fs::read_dir(path)
+}
+
+#[cfg(test)]
+fn with_path_resolution_read_dir_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    TEST_PATH_RESOLUTION_READ_DIR_CALLS.with(|calls| calls.set(0));
+    let result = run();
+    let count = TEST_PATH_RESOLUTION_READ_DIR_CALLS.with(std::cell::Cell::get);
+    (result, count)
+}
+
+#[cfg(test)]
+struct LegacyPathResolutionGuard {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl LegacyPathResolutionGuard {
+    fn new() -> Self {
+        Self {
+            previous: TEST_USE_LEGACY_PATH_RESOLUTION.with(|legacy| legacy.replace(true)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacyPathResolutionGuard {
+    fn drop(&mut self) {
+        TEST_USE_LEGACY_PATH_RESOLUTION.with(|legacy| legacy.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn with_legacy_path_resolution<T>(run: impl FnOnce() -> T) -> T {
+    let _guard = LegacyPathResolutionGuard::new();
+    run()
 }
 
 fn is_windows_absolute(path: &Path) -> bool {
@@ -8793,12 +8990,14 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectiveOverrides, MAX_OWNERSHIP_CANDIDATES, MAX_OWNERSHIP_SOURCE_BYTES,
-        MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES, MetadataObservation,
-        ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectReadStamp,
-        ProjectReadTracker, ReadPolicy, content_hash_bytes, path_stamp_result,
-        project_candidate_membership, read_bounded_with_tracker, read_package_metadata,
+        EffectiveOverrides, ExistingPathStatus, MAX_OWNERSHIP_CANDIDATES,
+        MAX_OWNERSHIP_SOURCE_BYTES, MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES,
+        MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry,
+        ProjectPathProvenance, ProjectReadStamp, ProjectReadTracker, ReadPolicy,
+        content_hash_bytes, path_stamp_result, project_candidate_membership,
+        read_bounded_with_tracker, read_package_metadata, resolve_existing_path_status,
         test_before_project_read_at, test_cancel_project_scan_after_checks,
+        with_legacy_path_resolution, with_path_resolution_read_dir_count,
     };
     use crate::delphi_overrides::OverrideSession;
     use std::cell::Cell;
@@ -8875,6 +9074,373 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn path_resolution_prefers_an_exact_component_over_case_variants() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let exact = temp.path().join("Foo");
+        fs::create_dir(&exact).expect("exact directory");
+        fs::create_dir(temp.path().join("FOO")).expect("case variant directory");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&exact, &mut warnings, "unit path");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, exact),
+            ExistingPathStatus::Missing => panic!("exact entry should be found"),
+            ExistingPathStatus::Unresolvable => panic!("exact entry should be resolvable"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_returns_on_disk_spelling_for_case_insensitive_matches() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let expected = temp.path().join("Foo").join("BaR.pas");
+        fs::create_dir(temp.path().join("Foo")).expect("directory");
+        fs::write(&expected, b"").expect("unit file");
+        let requested = temp.path().join("foo").join("bar.PAS");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, expected),
+            ExistingPathStatus::Missing => panic!("case-insensitive entry should be found"),
+            ExistingPathStatus::Unresolvable => {
+                panic!("a unique case-insensitive match should resolve")
+            }
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_rejects_ambiguous_case_insensitive_matches() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        fs::create_dir(temp.path().join("Foo")).expect("first case variant");
+        fs::create_dir(temp.path().join("FOO")).expect("second case variant");
+        let requested = temp.path().join("foo");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "ambiguous case-insensitive unit path component \"foo\" under {}",
+                temp.path().display()
+            )]
+        );
+    }
+
+    #[test]
+    fn path_resolution_reports_missing_components_without_a_warning() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let requested = temp.path().join("Missing").join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        assert!(matches!(status, ExistingPathStatus::Missing));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_reports_file_as_directory_as_unresolvable() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let file = temp.path().join("NotADirectory");
+        fs::write(&file, b"").expect("regular file");
+        let requested = file.join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with(&format!(
+            "could not inspect unit path under {}:",
+            file.display()
+        )));
+    }
+
+    #[test]
+    fn path_resolution_joins_relative_paths_to_current_directory() {
+        let current = std::env::current_dir().expect("current directory");
+        let temp = tempfile::Builder::new()
+            .prefix("pascal-project-relative-")
+            .tempdir_in(&current)
+            .expect("temporary directory under current directory");
+        let expected = temp.path().join("Unit.pas");
+        fs::write(&expected, b"").expect("unit file");
+        let requested = expected
+            .strip_prefix(&current)
+            .expect("temporary directory is under the current directory");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(requested, &mut warnings, "unit path");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, expected),
+            ExistingPathStatus::Missing => panic!("relative path should be found"),
+            ExistingPathStatus::Unresolvable => panic!("relative path should be resolvable"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_lexically_normalizes_parent_components() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let expected = temp.path().join("Target").join("Unit.pas");
+        fs::create_dir(temp.path().join("Target")).expect("target directory");
+        fs::write(&expected, b"").expect("unit file");
+        let requested = temp
+            .path()
+            .join("Unused")
+            .join("..")
+            .join("Target")
+            .join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit path");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, expected),
+            ExistingPathStatus::Missing => panic!("normalized path should be found"),
+            ExistingPathStatus::Unresolvable => panic!("normalized path should be resolvable"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_preserves_spelling_through_symlinked_directories() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("Target");
+        let link = temp.path().join("Link");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("Unit.pas"), b"").expect("unit file");
+        symlink(&target, &link).expect("directory symlink");
+        let requested = link.join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, requested),
+            ExistingPathStatus::Missing => panic!("symlinked target should be found"),
+            ExistingPathStatus::Unresolvable => panic!("symlinked target should resolve"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_rejects_windows_absolute_paths_on_linux() {
+        let requested = std::path::Path::new(r"C:\Delphi\Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(requested, &mut warnings, "unit path");
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Windows path in unit path is unavailable on Linux and was omitted: {}",
+                requested.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn path_resolution_does_not_list_directories_for_exact_paths() {
+        const PATHS: usize = 24;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let units = temp.path().join("Source").join("Units");
+        fs::create_dir_all(&units).expect("unit directory");
+        let paths = (0..PATHS)
+            .map(|index| {
+                let path = units.join(format!("Unit{index:02}.pas"));
+                fs::write(&path, b"").expect("unit file");
+                path
+            })
+            .collect::<Vec<_>>();
+        let (statuses, read_dir_calls) = with_path_resolution_read_dir_count(|| {
+            paths
+                .iter()
+                .map(|path| {
+                    let mut warnings = Vec::new();
+                    resolve_existing_path_status(path, &mut warnings, "unit")
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            read_dir_calls, 0,
+            "exact paths should avoid directory listings"
+        );
+        for (path, status) in paths.iter().zip(statuses) {
+            match status {
+                ExistingPathStatus::Found(resolved) => assert_eq!(&resolved, path),
+                ExistingPathStatus::Missing => panic!("exact path should be found"),
+                ExistingPathStatus::Unresolvable => panic!("exact path should be resolvable"),
+            }
+        }
+    }
+
+    #[test]
+    fn project_discovery_reuses_case_insensitive_directory_listings() {
+        const PATHS: usize = 24;
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let shared_parent = root.join("Tools").join("Units");
+        fs::create_dir_all(&shared_parent).expect("shared unit directory");
+        let mut raw_paths = Vec::new();
+        let mut expected_paths = Vec::new();
+        for index in 0..PATHS {
+            let directory = shared_parent.join(format!("Package{index:02}"));
+            fs::create_dir(&directory).expect("package unit directory");
+            raw_paths.push(format!("tools/units/Package{index:02}"));
+            expected_paths.push(directory);
+        }
+        let main = root.join("App.dpr");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join("App.dproj"),
+            format!(
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup></Project>",
+                raw_paths.join(";")
+            ),
+        )
+        .expect("project descriptor");
+
+        let (context, read_dir_calls) = with_path_resolution_read_dir_count(|| {
+            ProjectContext::discover_with_overrides(
+                &main,
+                &[root.to_path_buf()],
+                &ProjectOptions::default(),
+                &OverrideSession::new(None),
+            )
+        });
+        let context = context.expect("discover project");
+
+        for expected in expected_paths {
+            assert!(
+                context.search_paths.contains(&expected),
+                "case-insensitive discovery should retain on-disk spelling for {}",
+                expected.display()
+            );
+        }
+        assert_eq!(
+            read_dir_calls,
+            root.components().count() + 2,
+            "shared case-insensitive prefixes should be listed once"
+        );
+    }
+
+    #[test]
+    fn project_discovery_does_not_reuse_path_listings_across_calls() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("App.dpr");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>tools/units</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+        let options = ProjectOptions::default();
+        let overrides = OverrideSession::new(None);
+        let requested = root.join("tools").join("units");
+        let expected = root.join("Tools").join("Units");
+
+        let first = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &overrides,
+        )
+        .expect("first discovery");
+        assert!(first.search_paths.contains(&requested));
+        fs::create_dir_all(&expected).expect("create directory between discovery calls");
+
+        let second = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &overrides,
+        )
+        .expect("second discovery");
+
+        assert!(
+            second.search_paths.contains(&expected),
+            "a later discovery must observe newly-created entries and their on-disk spelling"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the read-only local multidev Delphi repository"]
+    fn benchmark_real_multidev_project_discovery_path_resolution() {
+        let repository = std::path::Path::new("/home/a.simard@multidev.local/gits/multidev");
+        let candidates = [
+            repository.join("Projects/Tools/WebQueryExporter/WebQuery.dproj"),
+            repository.join("Branches/Chaindrive Versions/5.7.07/Chaindrive/cd2000Light.dproj"),
+            repository.join("Common/AES_Codec.dproj"),
+        ];
+        let projects = candidates
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        assert!(
+            !projects.is_empty(),
+            "no benchmark project files are available"
+        );
+
+        for project in projects {
+            let options = ProjectOptions {
+                project_file: Some(project.clone()),
+                ..ProjectOptions::default()
+            };
+            let ((baseline_result, baseline_elapsed), baseline_reads) =
+                with_path_resolution_read_dir_count(|| {
+                    with_legacy_path_resolution(|| {
+                        let start = std::time::Instant::now();
+                        let result = ProjectContext::discover_with_overrides(
+                            &project,
+                            &[repository.to_path_buf()],
+                            &options,
+                            &OverrideSession::new(None),
+                        );
+                        (result, start.elapsed())
+                    })
+                });
+            baseline_result.expect("legacy discovery should complete");
+            println!(
+                "baseline {}: {:?}, {} path-resolution read_dir calls",
+                project.display(),
+                baseline_elapsed,
+                baseline_reads
+            );
+
+            let ((optimized_result, optimized_elapsed), optimized_reads) =
+                with_path_resolution_read_dir_count(|| {
+                    let start = std::time::Instant::now();
+                    let result = ProjectContext::discover_with_overrides(
+                        &project,
+                        &[repository.to_path_buf()],
+                        &options,
+                        &OverrideSession::new(None),
+                    );
+                    (result, start.elapsed())
+                });
+            optimized_result.expect("optimized discovery should complete");
+            println!(
+                "optimized {}: {:?}, {} path-resolution read_dir calls",
+                project.display(),
+                optimized_elapsed,
+                optimized_reads
+            );
+        }
+    }
 
     #[test]
     fn candidate_membership_reports_directory_read_errors() {

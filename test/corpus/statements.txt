@@ -442,6 +442,34 @@ end;
       (kEnd))))
 
 ===
+asm local labels
+===
+
+procedure Main;
+asm
+@@Loop:
+  DEC EAX
+  JNZ @@Loop
+  JMP @Done
+@Done:
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier)
+        (identifier) (identifier)
+        (identifier) (identifier)
+        (identifier) (identifier)
+        (identifier))
+      (kEnd))))
+
+===
 raise
 ===
 

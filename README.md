@@ -12,6 +12,7 @@ Grammar for Pascal and its dialects Delphi and Freepascal.
 - Extended RTTI attributes
 - FPC PasCocoa extensions
 - Typed/inferred Delphi `for var ... in` iterators
+- Delphi inline constants (`const X = 1;`, `const Y: Integer = 2;`) as `constDef`
 - Delphi conditional expressions (`if ... then ... else ...`), `is not`, and `not in`
 - Custom managed-record operators, including `const [ref]` parameters
 - Binary literals (`%1010`, also in character codes) and FPC `case ... otherwise`
@@ -35,9 +36,7 @@ from language documentation, not copied from AGPL-licensed forks. References:
 Existing syntax-tree shapes and structured preprocessor support are retained.
 Conditional expressions use `exprConditional` with `condition`, `then`, and `else`
 fields. Compound operators retain separate keyword nodes so comments between their
-words remain visible. Inline constants are not supported by this change. Inline
-constants are deferred because the tested implementations
-substantially increased error-recovery time on the large example file.
+words remain visible.
 
 The grammar recognizes syntax, not compiler semantics such as constant-expression
 evaluation, managed-record operator signatures, or type compatibility.

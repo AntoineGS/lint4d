@@ -130,3 +130,82 @@ end;
       (kBegin)
       (kEnd))))
    (kEnd))))
+
+===
+Inline Constants
+===
+procedure Test;
+begin
+  const A = 10;
+  const B: Integer = A * 2;
+  if B > A then
+    Exit;
+  const C = 'last'
+end;
+---
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (constDef
+        (kConst)
+        (identifier)
+        (defaultValue
+          (kEq)
+          (literalNumber)))
+      (constDef
+        (kConst)
+        (identifier)
+        (type
+          (typeref
+            (identifier)))
+        (defaultValue
+          (kEq)
+          (exprBinary
+            (identifier)
+            (kMul)
+            (literalNumber))))
+      (if
+        (kIf)
+        (exprBinary
+          (identifier)
+          (kGt)
+          (identifier))
+        (kThen)
+        (statement
+          (identifier)))
+      (constDef
+        (kConst)
+        (identifier)
+        (defaultValue
+          (kEq)
+          (literalString)))
+      (kEnd))))
+
+===
+Local const section still parses before body
+===
+procedure Test;
+const
+  A = 1;
+begin
+end;
+---
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (declConsts
+      (kConst)
+      (declConst
+        (identifier)
+        (defaultValue
+          (kEq)
+          (literalNumber))))
+    (block
+      (kBegin)
+      (kEnd))))

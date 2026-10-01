@@ -1194,6 +1194,19 @@
           ]
         },
         {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "constDef"
+            },
+            {
+              "type": "STRING",
+              "value": ";"
+            }
+          ]
+        },
+        {
           "type": "ALIAS",
           "content": {
             "type": "SYMBOL",
@@ -2205,6 +2218,15 @@
           ]
         },
         {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "constDef"
+            }
+          ]
+        },
+        {
           "type": "ALIAS",
           "content": {
             "type": "SYMBOL",
@@ -2454,6 +2476,56 @@
           "content": {
             "type": "SYMBOL",
             "name": "typeref"
+          }
+        }
+      ]
+    },
+    "constDef": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "kConst"
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": ":"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "type",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "type"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "FIELD",
+          "name": "defaultValue",
+          "content": {
+            "type": "SYMBOL",
+            "name": "defaultValue"
           }
         }
       ]
@@ -5780,8 +5852,12 @@
                 }
               },
               {
-                "type": "SYMBOL",
-                "name": "declConsts"
+                "type": "PREC_DYNAMIC",
+                "value": 1,
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "declConsts"
+                }
               },
               {
                 "type": "SYMBOL",
@@ -5883,8 +5959,12 @@
                       }
                     },
                     {
-                      "type": "SYMBOL",
-                      "name": "declConsts"
+                      "type": "PREC_DYNAMIC",
+                      "value": 1,
+                      "content": {
+                        "type": "SYMBOL",
+                        "name": "declConsts"
+                      }
                     },
                     {
                       "type": "SYMBOL",
@@ -10717,6 +10797,14 @@
       "varAssignDef",
       "varDef",
       "declVars"
+    ],
+    [
+      "constDef",
+      "declConsts"
+    ],
+    [
+      "constDef",
+      "declConst"
     ],
     [
       "_ref",

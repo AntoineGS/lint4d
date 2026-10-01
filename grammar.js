@@ -279,6 +279,7 @@ function statements(trailing) {
 			...semicolon,
 			seq($.assignment, ...semicolon),
 			seq($.varDef, ...semicolon),
+			...enable_if(delphi, seq($.constDef, ...semicolon)),
 			alias($[rn('statement')], $.statement),
 			alias($[rn('if')],        $.if),
 			alias($[rn('ifElse')],    $.ifElse),
@@ -333,6 +334,8 @@ module.exports = grammar({
 		// ppBlock in declaration contexts causes ambiguity with var/type/const
 		// section keywords that can also start statements or decl items.
 		[$.varAssignDef, $.varDef, $.declVars],
+		[$.constDef, $.declConsts],
+		[$.constDef, $.declConst],
 		[$._ref, $._genericName],
 		[$._ref, $._genericName, $.declConst],
 		// exprTpl's template args are typerefs (not arbitrary expressions)
@@ -434,6 +437,11 @@ module.exports = grammar({
 				field('type', $.typeref)
 			))),
 		varDef:          $ => seq($.kVar, $.identifier, ':', field('type', $.typeref)),
+		constDef:        $ => seq(
+			$.kConst, field('name', $.identifier),
+			optional(seq(':', field('type', $.type))),
+			field('defaultValue', $.defaultValue)
+		),
 		label:           $ => seq($.identifier, ':'),
 		caseLabel:       $ => seq(delimited1(choice($._expr, $.range)), ':'),
 
@@ -798,9 +806,10 @@ module.exports = grammar({
 			// Declaration items
 			$.declType, $.declVar, $.declConst, $.declProc, $.declProp,
 			alias($.declProcFwd, $.declProc), $.declField,
-			// Section-level items. A `var` section outranks an inline variable
-			// statement when both readings fit, e.g. before a routine body.
-			$.declTypes, prec.dynamic(1, $.declVars), $.declConsts, $.defProc,
+			// Section-level items. `var` and `const` sections outrank inline
+			// declarations when both readings fit, e.g. before a routine body.
+			$.declTypes, prec.dynamic(1, $.declVars), prec.dynamic(1, $.declConsts),
+			$.defProc,
 			$.declUses, $.declLabels, $.declExports,
 			// Statement items
 			$._statement,

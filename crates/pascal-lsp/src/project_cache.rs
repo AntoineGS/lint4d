@@ -428,6 +428,19 @@ mod cache_tests {
         Url::parse(&format!("file:///ws/{name}")).unwrap()
     }
 
+    #[test]
+    fn closure_crawl_requests_are_deduplicated_and_drained() {
+        let cache = ProjectCache::new(usize::MAX);
+        cache.request_closure_crawl(&uri("Main.pas"));
+        cache.request_closure_crawl(&uri("Main.pas"));
+        cache.request_closure_crawl(&uri("Other.pas"));
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![uri("Main.pas"), uri("Other.pas")]
+        );
+        assert!(cache.take_closure_crawl_requests().is_empty());
+    }
+
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
     }
@@ -1196,6 +1209,7 @@ mod cache_tests {
 }
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
+const MAX_CLOSURE_CRAWL_REQUESTS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
@@ -1236,7 +1250,6 @@ pub(crate) struct InterfaceBinding {
 
 impl InterfaceBinding {
     /// The bound unit's content hash, which keys its unit entry.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn content_hash(&self) -> u64 {
         match &self.revision {
             pascal_core::SourceRevision::Disk { content_hash, .. }
@@ -1307,6 +1320,7 @@ struct State {
     pins: HashMap<Url, HashSet<(Url, u64)>>,
     watch_counts: HashMap<PathBuf, usize>,
     watcher: Option<Box<dyn DirectoryWatch>>,
+    closure_crawl_requests: Vec<Url>,
 }
 
 impl Default for State {
@@ -1321,6 +1335,7 @@ impl Default for State {
             pins: HashMap::new(),
             watch_counts: HashMap::new(),
             watcher: None,
+            closure_crawl_requests: Vec::new(),
         }
     }
 }
@@ -1929,6 +1944,21 @@ impl ProjectCache {
         }
         drop(state);
         drop(claim); // Removes the slot only when it is still Computing.
+    }
+
+    /// Records that a snapshot for `uri` found part of its interface closure
+    /// uncached. The server drains these into warmer crawls.
+    pub(crate) fn request_closure_crawl(&self, uri: &Url) {
+        let mut state = lock(&self.inner);
+        if state.closure_crawl_requests.len() < MAX_CLOSURE_CRAWL_REQUESTS
+            && !state.closure_crawl_requests.contains(uri)
+        {
+            state.closure_crawl_requests.push(uri.clone());
+        }
+    }
+
+    pub(crate) fn take_closure_crawl_requests(&self) -> Vec<Url> {
+        std::mem::take(&mut lock(&self.inner).closure_crawl_requests)
     }
 
     pub(crate) fn pin(&self, owner: &Url, keys: Vec<(Url, u64)>) {

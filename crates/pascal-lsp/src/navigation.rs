@@ -919,6 +919,34 @@ impl NavigationIndex {
         Ok(())
     }
 
+    /// Inserts an already parsed document without copying its source text.
+    /// Returns `false`, and changes nothing, when `uri` is already indexed or
+    /// `parsed` was built under a different conditional context.
+    pub(crate) fn insert_parsed(
+        &mut self,
+        uri: Url,
+        parsed: Arc<ParsedDocument>,
+        context: &ConditionalContext,
+    ) -> bool {
+        if self.documents.contains_key(&uri) || parsed.conditional_context != *context {
+            return false;
+        }
+        let unit = parsed.unit_name.clone();
+        self.documents.insert(
+            uri.clone(),
+            Document {
+                parsed,
+                import_bindings: None,
+                import_binding_fingerprint: None,
+            },
+        );
+        let urls = self.units.entry(unit).or_default();
+        urls.push(uri);
+        urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        urls.dedup();
+        true
+    }
+
     /// Rebuild this retained semantic snapshot with one physical document
     /// replaced by a transformed source. The original import bindings and
     /// conditional contexts are copied exactly; only declaration/reference
@@ -27580,5 +27608,59 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod insert_parsed_tests {
+    use super::*;
+    use pascal_core::conditional::Truth;
+
+    fn parsed(uri: &Url, context: &ConditionalContext) -> Arc<ParsedDocument> {
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_and_cached_with_cancel(
+                uri.clone(),
+                "unit Base;\ninterface\nimplementation\nend.\n".to_string(),
+                context,
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        index.parsed_document(uri).unwrap()
+    }
+
+    #[test]
+    fn insert_parsed_shares_a_cached_document_without_replacing_one() {
+        let uri = Url::parse("file:///ws/Base.pas").unwrap();
+        let context = ConditionalContext::default();
+        let document = parsed(&uri, &context);
+        let mut index = NavigationIndex::new();
+
+        assert!(index.insert_parsed(uri.clone(), document.clone(), &context));
+        assert!(
+            index
+                .unit_name(&uri)
+                .is_some_and(|name| name.eq_ignore_ascii_case("Base"))
+        );
+        assert!(Arc::ptr_eq(
+            &index.parsed_document(&uri).unwrap(),
+            &document
+        ));
+        assert!(
+            !index.insert_parsed(uri, document, &context),
+            "an indexed document is never replaced"
+        );
+    }
+
+    #[test]
+    fn insert_parsed_rejects_a_different_conditional_context() {
+        let uri = Url::parse("file:///ws/Base.pas").unwrap();
+        let document = parsed(&uri, &ConditionalContext::default());
+        let other = ConditionalContext::default().with_option("R", Truth::True);
+        let mut index = NavigationIndex::new();
+
+        assert!(!index.insert_parsed(uri.clone(), document, &other));
+        assert!(!index.contains(&uri));
     }
 }

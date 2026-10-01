@@ -83,6 +83,7 @@ pub(crate) fn test_context_prune_visit_count() -> usize {
     TEST_CONTEXT_PRUNE_VISITS.with(std::cell::Cell::get)
 }
 
+mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod extract;
@@ -16491,6 +16492,319 @@ mod tests {
 
         assert!(entry.complete);
         assert!(entry.bindings.is_empty());
+    }
+
+    const INHERITED_THROUGH_DEPENDENCY_MAIN: &str = "unit Main;\ninterface\nuses Derived;\nimplementation\nprocedure Run(Db: TDerived);\nbegin\n  Db.Open;\n  Db.Open;\nend;\nend.\n";
+
+    const INHERITED_BASE: &str = "unit Base;\ninterface\ntype\n  TConn = class\n  public\n    procedure Open;\n  end;\nimplementation\nprocedure TConn.Open; begin end;\nend.\n";
+
+    struct InheritedFixture {
+        _temp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        main: Url,
+        derived: Url,
+        base: Url,
+        workspace: Workspace,
+    }
+
+    /// `Main` uses only `Derived`, whose `TDerived` inherits `Open` from
+    /// `TConn` in `Base`. Resolving `Db.Open` needs `Derived`'s own imports.
+    fn inherited_fixture(derived_uses: &str) -> InheritedFixture {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(root.join("Base.pas"), INHERITED_BASE).unwrap();
+        fs::write(
+            root.join("Derived.pas"),
+            format!(
+                "unit Derived;\ninterface\nuses {derived_uses};\ntype\n  TDerived = class(TConn)\n  end;\nimplementation\nend.\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("Main.pas"), INHERITED_THROUGH_DEPENDENCY_MAIN).unwrap();
+        let url = |name: &str| Url::from_file_path(root.join(name)).unwrap();
+        InheritedFixture {
+            main: url("Main.pas"),
+            derived: url("Derived.pas"),
+            base: url("Base.pas"),
+            workspace: test_workspace(vec![root.clone()], Default::default()),
+            root,
+            _temp: temp,
+        }
+    }
+
+    impl InheritedFixture {
+        /// Warms each unit in a worker, filling its unit, import, and
+        /// interface entries the way the warmer's crawl does.
+        fn warm(&self, units: &[&Url]) {
+            for unit in units {
+                worker_view(&self.workspace)
+                    .warm_with_cancel(unit, &AtomicBool::new(false))
+                    .expect("warm");
+            }
+        }
+
+        fn snapshot(&self) -> super::rename::RenameSnapshot {
+            super::rename::build_snapshot(
+                &self.workspace.analysis_input(),
+                std::slice::from_ref(&self.main),
+                &[],
+                super::rename::SnapshotMode::LocalWithImports,
+                None,
+                &[],
+                &AtomicBool::new(false),
+            )
+            .expect("snapshot")
+        }
+    }
+
+    /// Semantic tokens on line 6 (`  Db.Open;`) as `(line, character, type)`.
+    fn body_line_token_kinds(workspace: &Workspace, main_uri: &Url) -> Vec<(u32, u32, String)> {
+        let tokens = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            main_uri,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(6, 0),
+                lsp_types::Position::new(7, 0),
+            )),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("semantic tokens");
+        let legend = crate::NavigationIndex::semantic_tokens_legend();
+        let (mut line, mut character) = (0u32, 0u32);
+        tokens
+            .data
+            .iter()
+            .map(|token| {
+                line += token.delta_line;
+                character = if token.delta_line == 0 {
+                    character + token.delta_start
+                } else {
+                    token.delta_start
+                };
+                (
+                    line,
+                    character,
+                    legend.token_types[token.token_type as usize]
+                        .as_str()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn semantic_tokens_classify_members_inherited_through_a_warm_closure() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn hover_resolves_members_inherited_through_a_warm_closure() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let hover = super::queries::hover_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover")
+        .expect("hover for an inherited member");
+
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Open;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn highlights_resolve_members_reached_through_a_warm_closure() {
+        let fixture = inherited_fixture("Base");
+        // Highlights deliberately skip members reached through an inherited
+        // class owner, so reach `Open` through a field typed from `Base`.
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class\n  public\n    Conn: TConn;\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Main.pas"),
+            INHERITED_THROUGH_DEPENDENCY_MAIN.replace("Db.Open", "Db.Conn.Open"),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let highlights = super::queries::highlights_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 11),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("highlights");
+
+        let mut lines = highlights
+            .iter()
+            .map(|highlight| highlight.range.start.line)
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines, [6, 7], "{highlights:?}");
+    }
+
+    #[test]
+    fn a_cold_closure_answers_immediately_and_requests_a_crawl() {
+        let fixture = inherited_fixture("Base");
+
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+
+        assert!(
+            tokens.contains(&(6, 2, "parameter".to_string())),
+            "{tokens:?}"
+        );
+        assert!(
+            !tokens.contains(&(6, 5, "method".to_string())),
+            "{tokens:?}"
+        );
+        let requests = fixture
+            .workspace
+            .project_cache()
+            .take_closure_crawl_requests();
+        assert!(requests.contains(&fixture.main), "{requests:?}");
+    }
+
+    #[test]
+    fn declaration_providers_skip_the_include_audit_and_completeness_checks() {
+        let fixture = inherited_fixture("Base");
+        // The include audit rejects this directive. A declaration provider
+        // must never reach the audit.
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("unit Base;\n", "unit Base;\n{$SCOPEDENUMS ON}\n"),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let snapshot = fixture.snapshot();
+
+        assert!(
+            snapshot.declaration_providers.contains(&fixture.base),
+            "{:?}",
+            snapshot.declaration_providers
+        );
+        assert!(!snapshot.sources.contains_key(&fixture.base));
+        assert!(
+            !snapshot
+                .include_errors
+                .iter()
+                .any(|error| error.contains("Base.pas")),
+            "{:?}",
+            snapshot.include_errors
+        );
+        assert!(snapshot.complete, "{:?}", snapshot.incomplete_reason);
+    }
+
+    #[test]
+    fn a_changed_declaration_provider_makes_the_result_stale() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        let input = fixture.workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+
+        let tokens =
+            super::queries::semantic_tokens_from_input(input.clone(), &fixture.main, None, &cancel);
+        assert!(tokens.value.is_ok(), "{:?}", tokens.value.err());
+        super::rename::revalidate_input(&input, &tokens.records, &cancel)
+            .expect("unchanged sources revalidate");
+
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace(
+                "procedure Open;\n",
+                "procedure Open;\n    procedure Close;\n",
+            ),
+        )
+        .unwrap();
+        assert!(super::rename::revalidate_input(&input, &tokens.records, &cancel).is_err());
+    }
+
+    #[test]
+    fn the_walk_does_not_continue_past_an_incomplete_import_graph() {
+        let fixture = inherited_fixture("Mid");
+        fs::write(
+            fixture.root.join("Mid.pas"),
+            "unit Mid;\ninterface\nuses Base;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        // Unknown conditional activity makes Derived's import graph incomplete.
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Mid;\n{$IFDEF UNKNOWN_FEATURE}\nconst Flag = 1;\n{$ENDIF}\ntype\n  TDerived = class\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let mid = Url::from_file_path(fixture.root.join("Mid.pas")).unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived, &mid]);
+        assert!(
+            !interface_entry(&fixture.workspace, &fixture.derived)
+                .expect("Derived's interface entry")
+                .complete,
+            "fixture precondition: Derived's import graph is incomplete"
+        );
+
+        let snapshot = fixture.snapshot();
+
+        assert!(snapshot.declaration_providers.contains(&mid));
+        assert!(
+            !snapshot.declaration_providers.contains(&fixture.base),
+            "{:?}",
+            snapshot.declaration_providers
+        );
+    }
+
+    #[test]
+    fn an_open_dependency_in_the_closure_is_not_replaced_by_its_disk_parse() {
+        let mut fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        fixture
+            .workspace
+            .open_document(
+                fixture.base.clone(),
+                INHERITED_BASE.replace("TConn", "TRenamed"),
+                1,
+            )
+            .expect("open Base");
+
+        let snapshot = fixture.snapshot();
+
+        assert!(
+            !snapshot.declaration_providers.contains(&fixture.base),
+            "{:?}",
+            snapshot.declaration_providers
+        );
+    }
+
+    #[test]
+    fn an_interface_cycle_through_the_requested_document_terminates_without_replacing_it() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("interface\n", "interface\nuses Main;\n"),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived, &fixture.base]);
+
+        let snapshot = fixture.snapshot();
+
+        assert!(snapshot.declaration_providers.contains(&fixture.base));
+        assert!(!snapshot.declaration_providers.contains(&fixture.main));
+        assert!(snapshot.records.contains_key(&fixture.main));
     }
 
     fn provider_fixture(root: &std::path::Path) -> (Url, Url) {

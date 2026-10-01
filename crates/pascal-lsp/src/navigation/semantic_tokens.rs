@@ -13,6 +13,7 @@ use lsp_types::{
 use std::cell::Cell;
 use std::cmp::{max, min};
 use std::collections::HashSet;
+use std::ops::Range as ByteRange;
 use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
@@ -237,16 +238,37 @@ pub(crate) fn semantic_tokens_with_mode(
     cancel: &AtomicBool,
     mode: SemanticTokenResolutionMode,
 ) -> Result<SemanticTokens, String> {
+    semantic_tokens_with_projection(index, uri, range, cancel, mode, None)
+}
+
+/// Maps byte spans of an include-expanded document onto the physical file the
+/// client requested tokens for. Spans from included files map to nothing.
+pub(crate) struct PhysicalProjection<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) map: &'a mut dyn FnMut(ByteRange<usize>) -> Result<Vec<ByteRange<usize>>, String>,
+}
+
+pub(crate) fn semantic_tokens_with_projection(
+    index: &NavigationIndex,
+    uri: &lsp_types::Url,
+    range: Option<&Range>,
+    cancel: &AtomicBool,
+    mode: SemanticTokenResolutionMode,
+    mut projection: Option<PhysicalProjection<'_>>,
+) -> Result<SemanticTokens, String> {
     check_semantic_token_cancel(cancel)?;
     let Some(document) = index.documents.get(uri) else {
         return Ok(SemanticTokens::default());
     };
+    let encoded_source = projection
+        .as_ref()
+        .map_or(&*document.source, |projection| projection.source);
 
     let range = if let Some(range) = range {
-        let Some(start) = text::position_to_offset_clamped(&document.source, range.start) else {
+        let Some(start) = text::position_to_offset_clamped(encoded_source, range.start) else {
             return Ok(SemanticTokens::default());
         };
-        let Some(end) = text::position_to_offset_clamped(&document.source, range.end) else {
+        let Some(end) = text::position_to_offset_clamped(encoded_source, range.end) else {
             return Ok(SemanticTokens::default());
         };
         if start >= end {
@@ -256,6 +278,9 @@ pub(crate) fn semantic_tokens_with_mode(
     } else {
         None
     };
+    // A physical range has no single virtual counterpart, so projected
+    // documents are traversed whole and clipped after mapping.
+    let traversal_range = if projection.is_some() { None } else { range };
 
     let mut raw_tokens = Vec::new();
     let mut pending = vec![document.tree.root_node()];
@@ -283,7 +308,9 @@ pub(crate) fn semantic_tokens_with_mode(
         check_semantic_token_cancel(cancel)?;
         #[cfg(test)]
         super::test_record_semantic_node_visit();
-        if range.is_some_and(|(start, end)| node.end_byte() <= start || node.start_byte() >= end) {
+        if traversal_range
+            .is_some_and(|(start, end)| node.end_byte() <= start || node.start_byte() >= end)
+        {
             continue;
         }
         visited = visited.saturating_add(1);
@@ -318,7 +345,7 @@ pub(crate) fn semantic_tokens_with_mode(
             }
         }
 
-        if let Some((start, end)) = range {
+        if let Some((start, end)) = traversal_range {
             pending.extend(children_overlapping_range(node, start, end));
         } else {
             let mut cursor = node.walk();
@@ -326,7 +353,35 @@ pub(crate) fn semantic_tokens_with_mode(
         }
     }
 
-    encode_tokens(&document.source, raw_tokens, range, cancel)
+    if let Some(projection) = projection.as_mut() {
+        raw_tokens = project_raw_tokens(raw_tokens, projection, cancel)?;
+    }
+    encode_tokens(encoded_source, raw_tokens, range, cancel)
+}
+
+fn project_raw_tokens(
+    raw_tokens: Vec<RawToken>,
+    projection: &mut PhysicalProjection<'_>,
+    cancel: &AtomicBool,
+) -> Result<Vec<RawToken>, String> {
+    let mut projected = Vec::with_capacity(raw_tokens.len());
+    for token in raw_tokens {
+        check_semantic_token_cancel(cancel)?;
+        for physical in (projection.map)(token.span.start..token.span.end)? {
+            push_raw_token(
+                &mut projected,
+                Span {
+                    start: physical.start,
+                    end: physical.end,
+                },
+                token.token_type,
+                token.modifiers,
+                token.priority,
+                projection.source,
+            );
+        }
+    }
+    Ok(projected)
 }
 
 fn lexical_token_type(kind: &str) -> Option<u32> {

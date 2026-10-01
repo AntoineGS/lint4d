@@ -1,15 +1,16 @@
 use super::rename::{
-    BindingClassification, CANCELLATION_MESSAGE, RenameSnapshot, SnapshotMode, SnapshotSeed,
-    SourceRecord, WorkspaceInput, auto_import_source_is_relevant, build_snapshot,
-    input_source_is_readable_with_owner, is_cancelled, owner_for_input,
+    BindingClassification, CANCELLATION_MESSAGE, MAX_SNAPSHOT_MAPPING_WORK, RenameSnapshot,
+    SnapshotMode, SnapshotSeed, SourceRecord, WorkspaceInput, auto_import_source_is_relevant,
+    build_snapshot, input_source_is_readable_with_owner, is_cancelled, owner_for_input,
     project_context_and_metadata_for_input, project_context_and_metadata_for_owner,
     query_binding_info_for_input, reference_binding_info_for_input, revalidate_input,
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
 use super::{KnownDocumentOwner, conditional_context_for_uri};
+use crate::include_expansion::{MappingBudget, VirtualMapping};
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
-    SemanticTokenResolutionMode, completion_prefix_at_position,
+    PhysicalProjection, SemanticTokenResolutionMode, completion_prefix_at_position,
 };
 use crate::{NavigationIndex, NavigationTarget};
 #[cfg(test)]
@@ -435,12 +436,43 @@ pub(crate) fn semantic_tokens_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let value = snapshot.index.semantic_tokens_with_resolution_mode(
-        &uri,
-        range.as_ref(),
-        cancel,
-        resolution_mode,
-    );
+    // Include roots are indexed by their expanded text; tokens must be mapped
+    // back onto the physical document before encoding positions.
+    let value = if let Some(expansion) = snapshot.expansions.get(&uri) {
+        let mut budget = MappingBudget::new(cancel, MAX_SNAPSHOT_MAPPING_WORK);
+        let mut map = |virtual_range| {
+            let spans = match expansion
+                .expanded
+                .map_range_with_budget(virtual_range, &mut budget)?
+            {
+                VirtualMapping::Exact(span) => vec![span],
+                VirtualMapping::Many(spans) => spans,
+                VirtualMapping::Unmapped => Vec::new(),
+            };
+            Ok(spans
+                .into_iter()
+                .filter(|span| span.uri == uri)
+                .map(|span| span.range)
+                .collect())
+        };
+        snapshot.index.semantic_tokens_with_physical_projection(
+            &uri,
+            range.as_ref(),
+            cancel,
+            resolution_mode,
+            PhysicalProjection {
+                source: &expansion.physical_source,
+                map: &mut map,
+            },
+        )
+    } else {
+        snapshot.index.semantic_tokens_with_resolution_mode(
+            &uri,
+            range.as_ref(),
+            cancel,
+            resolution_mode,
+        )
+    };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }

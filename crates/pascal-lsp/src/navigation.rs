@@ -29,6 +29,7 @@ mod rename;
 pub(crate) use rename::BindingWorkBudget;
 mod selection;
 mod semantic_tokens;
+pub(crate) use semantic_tokens::PhysicalProjection;
 mod symbols;
 mod type_hierarchy;
 #[cfg(test)]
@@ -693,6 +694,24 @@ impl NavigationIndex {
         mode: SemanticTokenResolutionMode,
     ) -> Result<lsp_types::SemanticTokens, String> {
         semantic_tokens::semantic_tokens_with_mode(self, uri, range, cancel, mode)
+    }
+
+    pub(crate) fn semantic_tokens_with_physical_projection(
+        &self,
+        uri: &Url,
+        range: Option<&Range>,
+        cancel: &std::sync::atomic::AtomicBool,
+        mode: SemanticTokenResolutionMode,
+        projection: PhysicalProjection<'_>,
+    ) -> Result<lsp_types::SemanticTokens, String> {
+        semantic_tokens::semantic_tokens_with_projection(
+            self,
+            uri,
+            range,
+            cancel,
+            mode,
+            Some(projection),
+        )
     }
 
     pub(crate) fn semantic_tokens_legend() -> lsp_types::SemanticTokensLegend {

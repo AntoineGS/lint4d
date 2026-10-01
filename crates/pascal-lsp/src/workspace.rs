@@ -17292,6 +17292,105 @@ mod tests {
     }
 
     #[test]
+    fn semantic_tokens_use_physical_positions_for_an_include_root() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let main_source = "unit Main;\n{$I Defs.inc}\ninterface\nimplementation\nprocedure Run;\nbegin\nend;\nend.\n";
+        fs::write(&main, main_source).unwrap();
+        fs::write(
+            root.join("Defs.inc"),
+            "// first include comment\n// second include comment\n{$DEFINE MAIN_DEFS}\n",
+        )
+        .unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let tokens = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            None,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("semantic tokens");
+
+        let legend = crate::NavigationIndex::semantic_tokens_legend();
+        let (mut line, mut character) = (0u32, 0u32);
+        let mut decoded = Vec::new();
+        for token in &tokens.data {
+            line += token.delta_line;
+            character = if token.delta_line == 0 {
+                character + token.delta_start
+            } else {
+                token.delta_start
+            };
+            let text = main_source
+                .lines()
+                .nth(line as usize)
+                .and_then(|text| text.get(character as usize..(character + token.length) as usize))
+                .unwrap_or("<outside Main.pas>")
+                .to_string();
+            decoded.push((
+                line,
+                character,
+                legend.token_types[token.token_type as usize]
+                    .as_str()
+                    .to_string(),
+                text,
+            ));
+        }
+        assert!(
+            decoded.iter().all(|(_, _, kind, _)| kind != "comment"),
+            "include comments must not be projected onto the root: {decoded:?}"
+        );
+        for expected in [
+            (2, 0, "keyword", "interface"),
+            (4, 0, "keyword", "procedure"),
+            (5, 0, "keyword", "begin"),
+        ] {
+            assert!(
+                decoded.iter().any(|(line, character, kind, text)| {
+                    (*line, *character, kind.as_str(), text.as_str()) == expected
+                }),
+                "missing {expected:?} in {decoded:?}"
+            );
+        }
+        assert!(
+            decoded
+                .iter()
+                .all(|(_, _, _, text)| text != "<outside Main.pas>"),
+            "tokens must stay inside the physical document: {decoded:?}"
+        );
+
+        let ranged = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            &main_uri,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(4, 0),
+                lsp_types::Position::new(5, 0),
+            )),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("ranged semantic tokens");
+        let first = ranged.data.first().expect("procedure keyword in range");
+        assert_eq!(
+            (first.delta_line, first.delta_start, first.length),
+            (4, 0, 9)
+        );
+        assert!(
+            ranged
+                .data
+                .iter()
+                .skip(1)
+                .all(|token| token.delta_line == 0),
+            "ranged tokens must stay on the requested physical line: {:?}",
+            ranged.data
+        );
+    }
+
+    #[test]
     fn document_owners_share_unchanged_context_state() {
         let temp = tempfile::tempdir().expect("workspace root");
         let root = temp.path();

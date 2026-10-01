@@ -77,7 +77,7 @@ const MAX_RENAME_INCLUDE_DEPTH: usize = 64;
 const MAX_RENAME_INCLUDE_OWNER_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_RENAME_INCLUDE_OWNER_DISCOVERY: usize = 256;
 const MAX_SNAPSHOT_PHYSICAL_LOCATIONS: usize = 10_000;
-const MAX_SNAPSHOT_MAPPING_WORK: usize = 1_000_000;
+pub(crate) const MAX_SNAPSHOT_MAPPING_WORK: usize = 1_000_000;
 // A snapshot may evaluate the same source-bearing include through several
 // virtual roots before physical deduplication. Keep semantic materialization
 // bounded without rejecting the existing 10,000-location response boundary.

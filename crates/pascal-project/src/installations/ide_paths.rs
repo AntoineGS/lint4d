@@ -844,6 +844,9 @@ const MAX_RS_VARS_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IdePaths {
     pub library: Vec<ProjectPathEntry>,
+    /// Library-path entries outside the selected installation's BDS, BDSLIB,
+    /// and BDSCOMMONDIR roots; the project compiles their sources.
+    pub compiled_library: Vec<PathBuf>,
     pub browsing: Vec<ProjectPathEntry>,
     pub debug_dcu: Vec<ProjectPathEntry>,
     pub namespaces: Vec<String>,
@@ -1070,7 +1073,9 @@ pub(crate) fn evaluate_ide_paths(
         tracker,
         &mut warnings,
     )?;
-    let browsing = property_paths(
+    let compiled_library = compiled_library_roots(&builder, profile, environment, &library);
+    let library = without_raw_text(library);
+    let browsing = without_raw_text(property_paths(
         &builder,
         browsing_key,
         profile,
@@ -1078,8 +1083,8 @@ pub(crate) fn evaluate_ide_paths(
         policy,
         tracker,
         &mut warnings,
-    )?;
-    let debug_dcu = property_paths(
+    )?);
+    let debug_dcu = without_raw_text(property_paths(
         &builder,
         debug_key,
         profile,
@@ -1087,7 +1092,7 @@ pub(crate) fn evaluate_ide_paths(
         policy,
         tracker,
         &mut warnings,
-    )?;
+    )?);
     let namespaces = builder
         .property_list_with_provenance("delphinamespacesearchpath")
         .into_iter()
@@ -1096,6 +1101,7 @@ pub(crate) fn evaluate_ide_paths(
         .collect();
     Ok(IdePaths {
         library,
+        compiled_library,
         browsing,
         debug_dcu,
         namespaces,
@@ -1254,7 +1260,7 @@ fn property_paths(
     policy: &ReadPolicy,
     tracker: &mut ProjectReadTracker<'_>,
     warnings: &mut Vec<String>,
-) -> Result<Vec<ProjectPathEntry>, String> {
+) -> Result<Vec<(ProjectPathEntry, String)>, String> {
     let mut entries = Vec::new();
     for (raw, _provenance) in builder.property_list_with_provenance(key) {
         let raw = raw.trim();
@@ -1316,16 +1322,77 @@ fn property_paths(
                     ));
                     continue;
                 }
-                if entries.iter().all(|existing: &ProjectPathEntry| {
-                    !crate::project_paths_equal(&existing.path, &entry.path)
-                }) {
-                    entries.push(entry);
+                if entries
+                    .iter()
+                    .all(|(existing, _): &(ProjectPathEntry, String)| {
+                        !crate::project_paths_equal(&existing.path, &entry.path)
+                    })
+                {
+                    entries.push((entry, raw.to_owned()));
                 }
             }
             Err(error) => warnings.push(format!("could not resolve {key} entry `{raw}`: {error}")),
         }
     }
     Ok(entries)
+}
+
+fn without_raw_text(entries: Vec<(ProjectPathEntry, String)>) -> Vec<ProjectPathEntry> {
+    entries.into_iter().map(|(entry, _)| entry).collect()
+}
+
+/// Installation-owned library entries stay library code because the RTL/VCL
+/// ship precompiled. Containment is checked on both the expanded entry text and
+/// the resolved path, so an unmapped root or an imported root still matches;
+/// without any known installation root no entry is promoted.
+fn compiled_library_roots(
+    builder: &ProjectBuilder,
+    profile: &ResolvedInstallation,
+    environment: &InstallationEnvironment,
+    library: &[(ProjectPathEntry, String)],
+) -> Vec<PathBuf> {
+    let mut text_roots = Vec::new();
+    let mut resolved_roots = Vec::new();
+    for name in ["bds", "bdslib", "bdscommondir"] {
+        for (value, _) in builder.property_list_with_provenance(name) {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            text_roots.push(normalized_path_text(value));
+            if let Ok(resolved) = resolve_path_with_inferred(
+                &profile.overrides,
+                &environment.inferred_mappings,
+                value,
+                Path::new("/"),
+            ) {
+                resolved_roots.push(resolved.path);
+            }
+        }
+    }
+    if text_roots.is_empty() {
+        return Vec::new();
+    }
+    library
+        .iter()
+        .filter(|(entry, raw)| {
+            let raw = normalized_path_text(raw);
+            !text_roots
+                .iter()
+                .any(|root| raw == *root || raw.starts_with(&format!("{root}/")))
+                && !resolved_roots
+                    .iter()
+                    .any(|root| crate::project_path_starts_with(&entry.path, root))
+        })
+        .map(|(entry, _)| entry.path.clone())
+        .collect()
+}
+
+fn normalized_path_text(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn reconcile_ide_path(

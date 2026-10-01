@@ -741,49 +741,20 @@ fn explicit_in_clause_paths_are_project_compiled_when_the_file_name_differs() {
 
 #[test]
 fn inferred_platform_selects_the_platform_conditioned_ide_library_path() {
-    let temp = tempdir().expect("temporary directory");
-    let root = temp.path();
-    let project = root.join("project");
-    let shared = root.join("shared");
-    let sdk = tempdir().expect("installation directory");
-    let appdata = tempdir().expect("appdata directory");
-    write_webquery_fixture(&project);
-    fs::create_dir_all(&shared).expect("library directory");
-    write(
-        &sdk.path().join("bin/rsvars.bat"),
-        &format!("SET BDS={}\n", sdk.path().display()),
+    let fixture = IdeLibraryFixture::new();
+    let context = fixture.discover(
+        "<PropertyGroup Condition=\"'$(Platform)'=='Win32'\">\
+         <DelphiLibraryPath>C:\\Shared</DelphiLibraryPath></PropertyGroup>",
+        "",
+        "",
     );
-    write(
-        &appdata.path().join("EnvOptions.proj"),
-        "<Project><PropertyGroup Condition=\"'$(Platform)'=='Win32'\">\
-             <DelphiLibraryPath>C:\\Shared</DelphiLibraryPath></PropertyGroup></Project>",
-    );
-    write(
-        &root.join(".delphi-tools.local.toml"),
-        &format!(
-            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n\
-             [[path_mappings]]\nfrom = 'C:\\\\Shared'\nto = '{}'\n\
-             [projects.\"project/App.dproj\"]\ninstallation='37.0'\n",
-            sdk.path().display(),
-            appdata.path().display(),
-            shared.display()
-        ),
-    );
-
-    let context = ProjectContext::discover_with_overrides(
-        &project.join("App.dpr"),
-        &[root.to_path_buf()],
-        &ProjectOptions::default(),
-        &OverrideSession::new(None),
-    )
-    .expect("project discovery");
 
     assert_eq!(
         context.platform_selection.selected.as_deref(),
         Some("Win32")
     );
     assert!(
-        context.search_paths.contains(&shared),
+        context.search_paths.contains(&fixture.shared),
         "warnings: {:?}",
         context.warnings
     );
@@ -791,90 +762,163 @@ fn inferred_platform_selects_the_platform_conditioned_ide_library_path() {
 
 #[test]
 fn ide_library_path_sources_are_project_compiled_except_inside_the_installation() {
-    let temp = tempdir().expect("temporary directory");
-    let root = temp.path();
-    let project = root.join("project");
-    let shared = root.join("shared");
-    let sdk = tempdir().expect("installation directory");
-    let appdata = tempdir().expect("appdata directory");
-    let installation_source = sdk.path().join("source/rtl");
-    let browsing = sdk.path().join("source/vcl");
-    write_webquery_fixture(&project);
-    let shared_file = shared.join("SharedUnit.pas");
-    write(
-        &shared_file,
-        "unit SharedUnit; interface implementation end.",
+    let fixture = IdeLibraryFixture::new();
+    let shared_file = fixture.unit(&fixture.shared, "SharedUnit");
+    let rtl = fixture.sdk.join("source/rtl");
+    let rtl_file = fixture.unit(&rtl, "SysUtils");
+    let browsing_file = fixture.unit(&fixture.sdk.join("source/vcl"), "Forms");
+    let context = fixture.discover(
+        "<PropertyGroup>\
+         <DelphiLibraryPath>C:\\Shared;$(BDS)/source/rtl</DelphiLibraryPath>\
+         <DelphiBrowsingPath>$(BDS)/source/vcl</DelphiBrowsingPath>\
+         </PropertyGroup>",
+        "",
+        "",
     );
-    let installation_file = installation_source.join("SysUtils.pas");
-    write(
-        &installation_file,
-        "unit SysUtils; interface implementation end.",
-    );
-    let browsing_file = browsing.join("Forms.pas");
-    write(&browsing_file, "unit Forms; interface implementation end.");
-    write(
-        &sdk.path().join("bin/rsvars.bat"),
-        &format!("SET BDS={}\n", sdk.path().display()),
-    );
-    write(
-        &appdata.path().join("EnvOptions.proj"),
-        "<Project><PropertyGroup>\
-             <DelphiLibraryPath>C:\\Shared;$(BDS)/source/rtl</DelphiLibraryPath>\
-             <DelphiBrowsingPath>$(BDS)/source/vcl</DelphiBrowsingPath>\
-             </PropertyGroup></Project>",
-    );
-    write(
-        &root.join(".delphi-tools.local.toml"),
-        &format!(
-            "[installations.\"37.0\".properties]\nBDS='{}'\nAPPDATA='{}'\n\
-             [[path_mappings]]\nfrom = 'C:\\\\Shared'\nto = '{}'\n\
-             [projects.\"project/App.dproj\"]\ninstallation='37.0'\n",
-            sdk.path().display(),
-            appdata.path().display(),
-            shared.display()
-        ),
-    );
-
-    let context = ProjectContext::discover_with_overrides(
-        &project.join("App.dpr"),
-        &[root.to_path_buf()],
-        &ProjectOptions::default(),
-        &OverrideSession::new(None),
-    )
-    .expect("project discovery");
 
     assert!(
         context.conditional_closure.closed,
         "open reasons: {:?}; warnings: {:?}",
         context.conditional_closure.open_reasons, context.warnings
     );
+    assert!(context.search_paths.contains(&fixture.shared));
+    assert!(context.search_paths.contains(&rtl));
+    assert_project_compiled(&context, &shared_file);
+    assert_library(&context, &rtl_file);
+    assert_library(&context, &browsing_file);
+}
+
+#[test]
+fn library_path_under_an_imported_bdscommondir_stays_library_code() {
+    let fixture = IdeLibraryFixture::new();
+    let common = fixture.root.join("common");
+    let common_file = fixture.unit(&common.join("Dcp"), "CommonUnit");
+    let context = fixture.discover(
+        "<PropertyGroup>\
+         <DelphiLibraryPath>C:\\Shared;$(BDSCOMMONDIR)\\Dcp</DelphiLibraryPath>\
+         </PropertyGroup>",
+        "SET BDSCOMMONDIR=C:\\Common\n",
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\\\Common'\nto = '{}'\n",
+            common.display()
+        ),
+    );
+
     assert!(
-        context.search_paths.contains(&shared),
+        context.search_paths.contains(&common.join("Dcp")),
         "warnings: {:?}",
         context.warnings
     );
-    assert!(context.search_paths.contains(&installation_source));
-    assert_eq!(
-        context.source_origin(&shared_file),
-        SourceOrigin::ProjectCompiled
+    assert_library(&context, &common_file);
+}
+
+#[test]
+fn library_path_under_an_unmapped_installation_root_stays_library_code() {
+    let fixture = IdeLibraryFixture::new();
+    let mapped_source = fixture.root.join("mapped-sdk-source");
+    let source_file = fixture.unit(&mapped_source, "SysUtils");
+    let context = fixture.discover_with_bds(
+        "C:\\SDK",
+        "<PropertyGroup>\
+         <DelphiLibraryPath>C:\\Shared;C:\\SDK\\source</DelphiLibraryPath>\
+         </PropertyGroup>",
+        &format!(
+            "[[path_mappings]]\nfrom = 'C:\\\\SDK\\\\source'\nto = '{}'\n",
+            mapped_source.display()
+        ),
     );
+
+    assert!(
+        context.search_paths.contains(&mapped_source),
+        "warnings: {:?}",
+        context.warnings
+    );
+    assert_library(&context, &source_file);
+}
+
+struct IdeLibraryFixture {
+    _temp: tempfile::TempDir,
+    root: std::path::PathBuf,
+    project: std::path::PathBuf,
+    shared: std::path::PathBuf,
+    sdk: std::path::PathBuf,
+    appdata: std::path::PathBuf,
+}
+
+impl IdeLibraryFixture {
+    fn new() -> Self {
+        let temp = tempdir().expect("temporary directory");
+        let root = temp.path().to_path_buf();
+        let fixture = Self {
+            project: root.join("project"),
+            shared: root.join("shared"),
+            sdk: root.join("sdk"),
+            appdata: root.join("appdata"),
+            root,
+            _temp: temp,
+        };
+        write_webquery_fixture(&fixture.project);
+        fs::create_dir_all(&fixture.shared).expect("library directory");
+        fixture
+    }
+
+    fn unit(&self, directory: &Path, name: &str) -> std::path::PathBuf {
+        let file = directory.join(format!("{name}.pas"));
+        write(
+            &file,
+            &format!("unit {name}; interface implementation end."),
+        );
+        file
+    }
+
+    fn discover(&self, env_options: &str, rsvars_extra: &str, toml_extra: &str) -> ProjectContext {
+        write(
+            &self.sdk.join("bin/rsvars.bat"),
+            &format!("SET BDS={}\n{rsvars_extra}", self.sdk.display()),
+        );
+        let bds = self.sdk.display().to_string();
+        self.discover_with_bds(&bds, env_options, toml_extra)
+    }
+
+    fn discover_with_bds(&self, bds: &str, env_options: &str, toml_extra: &str) -> ProjectContext {
+        write(
+            &self.appdata.join("EnvOptions.proj"),
+            &format!("<Project>{env_options}</Project>"),
+        );
+        write(
+            &self.root.join(".delphi-tools.local.toml"),
+            &format!(
+                "[installations.\"37.0\".properties]\nBDS='{bds}'\nAPPDATA='{}'\n\
+                 [[path_mappings]]\nfrom = 'C:\\\\Shared'\nto = '{}'\n{toml_extra}\
+                 [projects.\"project/App.dproj\"]\ninstallation='37.0'\n",
+                self.appdata.display(),
+                self.shared.display()
+            ),
+        );
+        ProjectContext::discover_with_overrides(
+            &self.project.join("App.dpr"),
+            std::slice::from_ref(&self.root),
+            &ProjectOptions::default(),
+            &OverrideSession::new(None),
+        )
+        .expect("project discovery")
+    }
+}
+
+fn assert_project_compiled(context: &ProjectContext, file: &Path) {
+    assert_eq!(context.source_origin(file), SourceOrigin::ProjectCompiled);
     assert_eq!(
-        context
-            .conditional_context_for(&shared_file)
-            .define("DEBUG"),
+        context.conditional_context_for(file).define("DEBUG"),
         ConditionalFact::False
     );
+}
+
+fn assert_library(context: &ProjectContext, file: &Path) {
+    assert_eq!(context.source_origin(file), SourceOrigin::Library);
     assert_eq!(
-        context.source_origin(&installation_file),
-        SourceOrigin::Library
-    );
-    assert_eq!(
-        context
-            .conditional_context_for(&installation_file)
-            .define("DEBUG"),
+        context.conditional_context_for(file).define("DEBUG"),
         ConditionalFact::Unknown
     );
-    assert_eq!(context.source_origin(&browsing_file), SourceOrigin::Library);
 }
 
 #[test]

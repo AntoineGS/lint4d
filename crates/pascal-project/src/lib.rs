@@ -3935,20 +3935,6 @@ fn relevant_override_workspace_root(file: &Path, roots: &[PathBuf]) -> Option<Pa
         .cloned()
 }
 
-fn installation_directories(overrides: &EffectiveOverrides) -> Vec<PathBuf> {
-    ["bds", "bdslib", "bdscommondir"]
-        .into_iter()
-        .filter_map(|name| overrides.properties.get(name))
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            overrides
-                .resolve_path(value, Path::new("/"))
-                .map(|resolved| resolved.path)
-                .unwrap_or_else(|_| PathBuf::from(value))
-        })
-        .collect()
-}
-
 fn path_starts_with_ci(path: &Path, root: &Path) -> bool {
     let mut path_components = path.components();
     for root_component in root.components() {
@@ -4380,19 +4366,13 @@ fn build_project_context(
             ProjectPathProvenance::Configured,
         );
     }
-    // Library-path sources are compiled with the project's defines unless they
-    // ship with the installation, whose RTL/VCL units are precompiled.
-    let installation_dirs = installation_directories(&builder.overrides);
     let mut project_source_roots = paths_from_entries(&search_path_entries);
-    for entry in &ide_paths.library {
-        if !installation_dirs
+    for path in &ide_paths.compiled_library {
+        if !project_source_roots
             .iter()
-            .any(|dir| path_starts_with_ci(&entry.path, dir))
-            && !project_source_roots
-                .iter()
-                .any(|root| project_paths_equal(root, &entry.path))
+            .any(|root| project_paths_equal(root, path))
         {
-            project_source_roots.push(entry.path.clone());
+            project_source_roots.push(path.clone());
         }
     }
     for entry in &ide_paths.library {

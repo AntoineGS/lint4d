@@ -16229,6 +16229,125 @@ mod tests {
     }
 
     #[test]
+    fn interface_parameter_queries_and_rename_stay_in_the_declaring_document() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let unit_path = temp.path().join("U.pas");
+        let sibling_path = temp.path().join("Unrelated.pas");
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "procedure StartTransaction(aDatabase: TIBDatabase; aTransaction: TIBTransaction);\n",
+            "implementation\n",
+            "uses Unrelated;\n",
+            "procedure StartTransaction(aDatabase: TIBDatabase; aTransaction: TIBTransaction);\n",
+            "begin aTransaction.StartTransaction; end;\n",
+            "end.\n",
+        );
+        fs::write(&unit_path, source).expect("unit source");
+        fs::write(
+            &sibling_path,
+            "unit Unrelated;\ninterface\nvar aTransaction: Integer;\nimplementation\nend.\n",
+        )
+        .expect("unrelated sibling source with a colliding public name");
+        let uri = Url::from_file_path(&unit_path).expect("unit URI");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let input = workspace.analysis_input();
+        let parameter_offset = source
+            .match_indices("aTransaction")
+            .nth(2)
+            .expect("body parameter reference")
+            .0;
+        let prefix = &source[..parameter_offset];
+        let position = Position::new(
+            prefix.matches('\n').count() as u32,
+            prefix.rsplit('\n').next().expect("source line").len() as u32,
+        );
+        let cancel = AtomicBool::new(false);
+
+        super::resolver::reset_test_source_loads();
+        let references =
+            super::queries::references_from_input(input.clone(), &uri, position, true, &cancel);
+        let references = references
+            .value
+            .expect("same-document parameter references");
+        assert_eq!(references.len(), 3, "declaration headings and body use");
+        assert!(references.iter().all(|location| location.uri == uri));
+        assert!(
+            references
+                .iter()
+                .any(|location| location.range.start.line == 2),
+            "references should include the interface heading parameter"
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "references must not load an unrelated sibling unit"
+        );
+
+        super::resolver::reset_test_source_loads();
+        let highlights =
+            super::queries::highlights_from_input(input.clone(), &uri, position, &cancel);
+        assert!(
+            highlights.value.is_ok(),
+            "documentHighlight should succeed: {:?}",
+            highlights.value.err()
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "documentHighlight must not load an unrelated sibling unit"
+        );
+
+        super::resolver::reset_test_source_loads();
+        let prepared = super::rename::prepare_from_input(input.clone(), &uri, position, &cancel);
+        assert!(
+            prepared.value.is_ok(),
+            "prepareRename should succeed: {:?}",
+            prepared.value.err()
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "prepareRename must not load an unrelated sibling unit"
+        );
+
+        super::resolver::reset_test_source_loads();
+        let rename = super::rename::rename_from_input(
+            input,
+            &uri,
+            position,
+            "aNewTransaction",
+            false,
+            &cancel,
+        );
+        let edit = rename.value.expect("parameter rename edit");
+        let edits = edit
+            .changes
+            .expect("legacy changes edit")
+            .remove(&uri)
+            .expect("declaring document edits");
+        assert_eq!(
+            edits.len(),
+            3,
+            "both headings and the body occurrence rename"
+        );
+        assert!(edits.iter().all(|edit| edit.new_text == "aNewTransaction"));
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.range.start.line)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([2, 5, 6]),
+            "rename edits should cover the interface heading, implementation heading, and body"
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "rename must not load an unrelated sibling unit"
+        );
+    }
+
+    #[test]
     fn warming_a_file_caches_it_and_its_direct_imports() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, provider_uri) = provider_fixture(temp.path());

@@ -817,8 +817,6 @@ impl NavigationIndex {
         let local = !binding.members.is_empty()
             && binding.members.iter().all(|member| {
                 member.uri == *uri
-                    && member.scope != ROOT_SCOPE
-                    && member.owner_type.is_none()
                     && matches!(
                         member.kind,
                         SymbolKind::Variable
@@ -826,6 +824,17 @@ impl NavigationIndex {
                             | SymbolKind::Parameter
                             | SymbolKind::Label
                     )
+                    && ((member.scope != ROOT_SCOPE && member.owner_type.is_none())
+                        || self
+                            .documents
+                            .get(&member.uri)
+                            .and_then(|document| {
+                                document
+                                    .symbols
+                                    .iter()
+                                    .find(|symbol| symbol_id(&member.uri, symbol) == *member)
+                            })
+                            .is_some_and(|symbol| symbol.local_only))
             });
         let unit_provider_uri = if binding.kind == SymbolKind::Unit {
             let mut declarations = binding

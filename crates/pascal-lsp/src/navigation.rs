@@ -21404,6 +21404,141 @@ mod tests {
         (locations.len(), root_lookups)
     }
 
+    fn position_of_occurrence(source: &str, name: &str, occurrence: usize) -> Position {
+        let offset = source
+            .match_indices(name)
+            .nth(occurrence)
+            .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {name}"))
+            .0;
+        let prefix = &source[..offset];
+        Position::new(
+            prefix.matches('\n').count() as u32,
+            prefix.rsplit('\n').next().expect("line prefix").len() as u32,
+        )
+    }
+
+    fn rename_info_for_occurrence(
+        source: &str,
+        name: &str,
+        occurrence: usize,
+    ) -> (NavigationIndex, Url, crate::navigation::RenameBindingInfo) {
+        let uri = Url::parse("file:///tmp/interface-parameter-local.pas").expect("fixture URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("fixture parses");
+        let cancel = AtomicBool::new(false);
+        let info = index
+            .rename_binding_info_with_cancel(
+                &uri,
+                position_of_occurrence(source, name, occurrence),
+                &cancel,
+            )
+            .expect("rename binding classification");
+        (index, uri, info)
+    }
+
+    #[test]
+    fn interface_parameter_with_repeated_implementation_heading_is_local() {
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "procedure StartTransaction(aDatabase: TIBDatabase; aTransaction: TIBTransaction);\n",
+            "implementation\n",
+            "procedure StartTransaction(aDatabase: TIBDatabase; aTransaction: TIBTransaction);\n",
+            "begin aTransaction.StartTransaction; end;\n",
+            "end.\n",
+        );
+        let (_, _, info) = rename_info_for_occurrence(source, "aTransaction", 0);
+
+        assert!(info.local, "interface-declared parameter should be local");
+    }
+
+    #[test]
+    fn interface_parameter_without_repeated_implementation_heading_is_local() {
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "procedure Pub(aValue: Integer);\n",
+            "implementation\n",
+            "procedure Pub; begin aValue := 1; end;\n",
+            "end.\n",
+        );
+        let (_, _, info) = rename_info_for_occurrence(source, "aValue", 0);
+
+        assert!(info.local, "interface-declared parameter should be local");
+    }
+
+    #[test]
+    fn forward_declaration_parameter_is_local() {
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure F(x: Integer); forward;\n",
+            "end.\n",
+        );
+        let (_, _, info) = rename_info_for_occurrence(source, "x", 0);
+
+        assert!(info.local, "forward-declared parameter should be local");
+    }
+
+    #[test]
+    fn class_method_parameter_is_local_and_has_local_only_metadata() {
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "type TFoo = class\n",
+            "  procedure Bar(aX: Integer);\n",
+            "end;\n",
+            "implementation\n",
+            "procedure TFoo.Bar(aX: Integer); begin WriteLn(aX); end;\n",
+            "end.\n",
+        );
+        let (index, uri, info) = rename_info_for_occurrence(source, "aX", 0);
+        let parameter_metadata = index.documents[&uri]
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "aX")
+            .map(|symbol| (symbol.owner_type.is_some(), symbol.local_only))
+            .collect::<Vec<_>>();
+
+        assert!(
+            info.local,
+            "class method parameter should be local; symbols: {parameter_metadata:?}"
+        );
+        assert!(
+            parameter_metadata.len() == 2
+                && parameter_metadata.contains(&(true, true))
+                && parameter_metadata.contains(&(false, false)),
+            "the type declaration parameter is owner-type/local-only, while its implementation parameter is lexical: {parameter_metadata:?}"
+        );
+    }
+
+    #[test]
+    fn unit_level_variable_and_routine_are_not_local() {
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "var UnitValue: Integer;\n",
+            "procedure PublicRoutine;\n",
+            "implementation\n",
+            "procedure PublicRoutine; begin UnitValue := 1; end;\n",
+            "end.\n",
+        );
+        let (_, _, variable_info) = rename_info_for_occurrence(source, "UnitValue", 0);
+        let (_, _, routine_info) = rename_info_for_occurrence(source, "PublicRoutine", 0);
+
+        assert!(
+            !variable_info.local,
+            "unit-level variable should not be local"
+        );
+        assert!(
+            !routine_info.local,
+            "unit-level routine should not be local"
+        );
+    }
+
     fn duplicate_provider_rebind_fixture(
         bound_provider: Option<usize>,
     ) -> (NavigationIndex, Url, Url, Url, String) {

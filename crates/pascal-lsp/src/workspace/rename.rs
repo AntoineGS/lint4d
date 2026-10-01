@@ -1120,13 +1120,17 @@ impl Enumeration {
         }
     }
 
-    fn retain_context(&mut self, key: ContextKey, state: ContextState) {
+    fn retain_context(&mut self, key: ContextKey, state: &ContextState) {
         match self.contexts.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(state);
+                entry.insert(state.clone());
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
-                if !evaluated_contexts_equal(&entry.get().context, &state.context) {
+                // Most sources revisit an unchanged context; only differing
+                // contexts need the observation-insensitive comparison.
+                if entry.get().context != state.context
+                    && !evaluated_contexts_equal(&entry.get().context, &state.context)
+                {
                     self.complete = false;
                     self.reason.get_or_insert_with(|| {
                         "project context changed while building the workspace snapshot".to_string()
@@ -2521,7 +2525,7 @@ pub(crate) fn owner_for_input(
         .ok_or_else(|| format!("project context was not retained for {uri}"))?;
     Ok(KnownDocumentOwner {
         key: key.clone(),
-        state,
+        state: Arc::new(state),
         origin: owner_origin.unwrap_or_else(|| workspace.owner_origin_for_context_key(&key)),
         needs_revalidation: false,
         follow_current_project_file: false,
@@ -5196,7 +5200,7 @@ fn snapshot_context_for_uri(
         {
             loader
                 .contexts
-                .insert(owner.key.clone(), owner.state.clone());
+                .insert(owner.key.clone(), ContextState::clone(&owner.state));
             loader
                 .document_contexts
                 .insert(uri.clone(), owner.key.clone());
@@ -5299,7 +5303,7 @@ fn discover_enumerated_contexts(
     let mut deferred_context_pruning = false;
     context_keys.extend(project_contexts.iter().cloned());
     for context_key in context_keys.clone() {
-        if let Some(state) = loader.contexts.get(&context_key).cloned() {
+        if let Some(state) = loader.contexts.get(&context_key) {
             enumeration.retain_context(context_key, state);
         }
     }
@@ -5309,7 +5313,7 @@ fn discover_enumerated_contexts(
         }
         let path = enumeration.paths[index].path.clone();
         let owner = if let Some(owner) = enumeration.paths[index].owner.clone() {
-            if let Some(state) = loader.contexts.get(&owner).cloned() {
+            if let Some(state) = loader.contexts.get(&owner) {
                 enumeration.retain_context(owner.clone(), state);
             } else {
                 let state = input
@@ -5327,8 +5331,10 @@ fn discover_enumerated_contexts(
                     });
                     continue;
                 };
-                loader.contexts.insert(owner.clone(), state.clone());
-                enumeration.retain_context(owner.clone(), state);
+                loader
+                    .contexts
+                    .insert(owner.clone(), ContextState::clone(&state));
+                enumeration.retain_context(owner.clone(), &state);
             }
             owner
         } else {
@@ -5394,7 +5400,7 @@ fn discover_enumerated_contexts(
             {
                 reusable_directory_contexts.insert(directory.clone(), owner.clone());
             }
-            let Some(state) = loader.contexts.get(&owner).cloned() else {
+            let Some(state) = loader.contexts.get(&owner) else {
                 enumeration.complete = false;
                 enumeration.reason.get_or_insert_with(|| {
                     format!("source {path:?} has an owner context that was not retained")
@@ -5489,7 +5495,7 @@ fn discover_project_metadata_contexts(
                 "project context was not retained for {descriptor:?}"
             ));
         };
-        enumeration.retain_context(key.clone(), state);
+        enumeration.retain_context(key.clone(), &state);
         contexts.insert(key);
     }
     Ok(contexts)
@@ -5743,7 +5749,7 @@ fn enumerate_external_overlays(
         workspace
             .contexts
             .entry(owner.key.clone())
-            .or_insert_with(|| owner.state.clone());
+            .or_insert_with(|| ContextState::clone(&owner.state));
         let Some(state) = workspace.contexts.get(&owner.key) else {
             continue;
         };
@@ -10895,8 +10901,8 @@ mod tests {
             ..Enumeration::default()
         };
 
-        enumeration.retain_context(key.clone(), old);
-        enumeration.retain_context(key, new);
+        enumeration.retain_context(key.clone(), &old);
+        enumeration.retain_context(key, &new);
 
         assert!(!enumeration.complete);
         assert!(
@@ -11389,7 +11395,7 @@ mod tests {
             overlay_uri,
             super::super::KnownDocumentOwner {
                 key: key.clone(),
-                state,
+                state: Arc::new(state),
                 origin: super::super::OwnerOrigin::Inherited,
                 needs_revalidation: false,
                 follow_current_project_file: false,

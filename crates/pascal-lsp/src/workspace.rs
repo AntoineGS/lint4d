@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
@@ -2186,13 +2186,40 @@ pub(crate) struct LegacyRouteProof {
     context: ContextKey,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ContextState {
     context: ProjectContext,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
-    system_pas_search_stamps: RefCell<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    system_pas_search_stamps: Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Clone for ContextState {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            watched_paths: self.watched_paths.clone(),
+            project_candidate_memberships: self.project_candidate_memberships.clone(),
+            project_read_observations: self.project_read_observations.clone(),
+            system_pas_search_stamps: Mutex::new(lock(&self.system_pas_search_stamps).clone()),
+        }
+    }
+}
+
+impl PartialEq for ContextState {
+    /// `system_pas_search_stamps` only memoizes successful freshness checks
+    /// against the current directory stamp, so it does not distinguish states.
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.watched_paths == other.watched_paths
+            && self.project_candidate_memberships == other.project_candidate_memberships
+            && self.project_read_observations == other.project_read_observations
+    }
 }
 
 impl ContextState {
@@ -2223,7 +2250,7 @@ impl ContextState {
         for observation in &self.project_read_observations {
             observation.visit_recovery_payload(visit)?;
         }
-        for search in self.system_pas_search_stamps.borrow().keys() {
+        for search in lock(&self.system_pas_search_stamps).keys() {
             visit(search.directory.as_os_str().len())?;
             if let Some(path) = &search.selected_path {
                 visit(path.as_os_str().len())?;
@@ -2398,7 +2425,7 @@ enum OwnerOrigin {
 #[derive(Debug, Clone)]
 pub(crate) struct KnownDocumentOwner {
     key: ContextKey,
-    state: ContextState,
+    state: Arc<ContextState>,
     origin: OwnerOrigin,
     needs_revalidation: bool,
     follow_current_project_file: bool,
@@ -2664,6 +2691,7 @@ pub struct Workspace {
     compiled_provider_bindings: Vec<CompiledProviderBinding>,
     compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
+    shared_owner_states: HashMap<ContextKey, Arc<ContextState>>,
     project_selections: ProjectSelections,
     installation_selections: HashMap<PathBuf, String>,
     build_selections: HashMap<PathBuf, BuildChoice>,
@@ -8823,7 +8851,8 @@ impl Workspace {
                 // explicitly opened legacy source has lost its backing file.
                 // Once project candidates change, freshness fails and normal
                 // automatic discovery is allowed to reconsider the owner.
-                self.contexts.insert(owner.key.clone(), owner.state.clone());
+                self.contexts
+                    .insert(owner.key.clone(), ContextState::clone(&owner.state));
                 self.select_document_context_with_pruning(
                     uri,
                     &owner.key,
@@ -8910,7 +8939,8 @@ impl Workspace {
         if !owner.needs_revalidation
             && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
         {
-            self.contexts.insert(owner.key.clone(), owner.state.clone());
+            self.contexts
+                .insert(owner.key.clone(), ContextState::clone(&owner.state));
             self.select_document_context_with_pruning(
                 uri,
                 &owner.key,
@@ -9322,8 +9352,18 @@ impl Workspace {
         key: &ContextKey,
         origin: OwnerOrigin,
     ) {
-        let Some(state) = self.contexts.get(key).cloned() else {
+        let Some(current) = self.contexts.get(key) else {
             return;
+        };
+        // Thousands of sources share a few contexts, and each state can be
+        // hundreds of kilobytes, so owners share one copy while it is current.
+        let state = match self.shared_owner_states.get(key) {
+            Some(shared) if **shared == *current => shared.clone(),
+            _ => {
+                let shared = Arc::new(current.clone());
+                self.shared_owner_states.insert(key.clone(), shared.clone());
+                shared
+            }
         };
         let legacy_route = self.document_owners.get(uri).and_then(|owner| {
             (owner.key == *key)
@@ -9369,6 +9409,8 @@ impl Workspace {
         let Some(state) = self.contexts.get(key).cloned() else {
             return;
         };
+        let state = Arc::new(state);
+        self.shared_owner_states.insert(key.clone(), state.clone());
         for owner in self.document_owners.values_mut() {
             if owner.key == *key {
                 owner.state = state.clone();
@@ -9377,6 +9419,7 @@ impl Workspace {
     }
 
     fn trim_document_owners(&mut self) {
+        let mut evicted = false;
         while self.document_owners.len() > MAX_DOCUMENT_OWNERS {
             let Some(victim) = self
                 .document_owners
@@ -9389,6 +9432,11 @@ impl Workspace {
             };
             self.document_owners.remove(&victim);
             self.owner_last_used.remove(&victim);
+            evicted = true;
+        }
+        if evicted {
+            self.shared_owner_states
+                .retain(|_, state| Arc::strong_count(state) > 1);
         }
     }
 
@@ -9745,7 +9793,11 @@ impl Workspace {
             state.project_read_observations = staged_observations;
             state.watched_paths.extend(staged_watched);
             state.project_candidate_memberships = staged_memberships;
-            state.system_pas_search_stamps.get_mut().clear();
+            state
+                .system_pas_search_stamps
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
         } else {
             self.contexts.insert(
                 key,
@@ -9754,7 +9806,7 @@ impl Workspace {
                     watched_paths: staged_watched,
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
-                    system_pas_search_stamps: RefCell::new(HashMap::new()),
+                    system_pas_search_stamps: Mutex::new(HashMap::new()),
                 },
             );
         }
@@ -12144,7 +12196,7 @@ impl Workspace {
             if self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)? {
                 self.contexts
                     .entry(owner.key.clone())
-                    .or_insert_with(|| owner.state.clone());
+                    .or_insert_with(|| ContextState::clone(&owner.state));
                 owner.key.clone()
             } else {
                 if let Some(current_owner) = self.document_owners.get_mut(uri) {
@@ -14059,7 +14111,7 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
 
 fn system_pas_search_is_current(
     observation: &SystemPasSearchObservation,
-    checked_stamps: &RefCell<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    checked_stamps: &Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
     cancel: Option<&AtomicBool>,
     budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
@@ -14068,8 +14120,7 @@ fn system_pas_search_is_current(
         budget.charge_path_visits(1)?;
     }
     let directory_stamp = path_stamp(&observation.directory);
-    let unchanged_stamp = checked_stamps
-        .borrow()
+    let unchanged_stamp = lock(checked_stamps)
         .get(observation)
         .is_some_and(|stamp| stamp == &directory_stamp);
     if unchanged_stamp {
@@ -14097,9 +14148,7 @@ fn system_pas_search_is_current(
         _ => false,
     };
     if matches {
-        checked_stamps
-            .borrow_mut()
-            .insert(observation.clone(), directory_stamp);
+        lock(checked_stamps).insert(observation.clone(), directory_stamp);
     }
     Ok(matches)
 }
@@ -15416,7 +15465,7 @@ mod tests {
                 uri.clone(),
                 super::KnownDocumentOwner {
                     key: context_key.clone(),
-                    state: super::ContextState::default(),
+                    state: Arc::new(super::ContextState::default()),
                     origin: super::OwnerOrigin::Automatic,
                     needs_revalidation: false,
                     follow_current_project_file: false,
@@ -17189,6 +17238,112 @@ mod tests {
     }
 
     #[test]
+    fn document_owners_share_unchanged_context_state() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("App.dpr"), "program App; begin end.").unwrap();
+        let uris = (0..4)
+            .map(|index| {
+                let path = root.join(format!("Unit{index}.pas"));
+                fs::write(
+                    &path,
+                    format!("unit Unit{index}; interface implementation end."),
+                )
+                .unwrap();
+                Url::from_file_path(path).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let key = workspace.context_for_uri(&uris[0]).unwrap();
+        for uri in &uris[1..3] {
+            assert_eq!(workspace.context_for_uri(uri).unwrap(), key);
+        }
+
+        let first = &workspace.document_owners[&uris[0]];
+        for uri in &uris[1..3] {
+            assert!(
+                std::ptr::eq(
+                    &first.state.context,
+                    &workspace.document_owners[uri].state.context
+                ),
+                "owners of one unchanged context must share its state"
+            );
+        }
+
+        let changed = PathBuf::from("/changed/after/first/owners");
+        workspace
+            .contexts
+            .get_mut(&key)
+            .unwrap()
+            .watched_paths
+            .insert(changed.clone(), None);
+        workspace.remember_document_owner_with_origin(&uris[3], &key, OwnerOrigin::Automatic);
+        let latest = &workspace.document_owners[&uris[3]];
+        assert!(
+            latest.state.watched_paths.contains_key(&changed),
+            "a changed context must not be served from a stale shared state"
+        );
+        assert!(!std::ptr::eq(
+            &workspace.document_owners[&uris[0]].state.context,
+            &latest.state.context
+        ));
+    }
+
+    #[test]
+    fn shared_owner_states_are_released_with_their_last_owner() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let source = temp.path().join("Unit.pas");
+        fs::write(&source, "unit Unit; interface implementation end.").unwrap();
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let discovered = workspace
+            .context_for_uri(&Url::from_file_path(&source).unwrap())
+            .unwrap();
+        workspace.document_owners.clear();
+        workspace.shared_owner_states.clear();
+        let evicted_key = ContextKey {
+            project_scope: Some(PathBuf::from("/evicted")),
+            ..discovered.clone()
+        };
+        let retained_key = ContextKey {
+            project_scope: Some(PathBuf::from("/retained")),
+            ..discovered
+        };
+        for key in [&evicted_key, &retained_key] {
+            workspace
+                .contexts
+                .insert(key.clone(), ContextState::default());
+        }
+        let uri = |index: usize| Url::parse(&format!("file:///workspace/Unit{index}.pas")).unwrap();
+        workspace.remember_document_owner_with_origin(
+            &uri(0),
+            &evicted_key,
+            OwnerOrigin::Automatic,
+        );
+        assert!(workspace.shared_owner_states.contains_key(&evicted_key));
+
+        for index in 1..=super::MAX_DOCUMENT_OWNERS {
+            workspace.remember_document_owner_with_origin(
+                &uri(index),
+                &retained_key,
+                OwnerOrigin::Automatic,
+            );
+        }
+
+        assert!(!workspace.document_owners.contains_key(&uri(0)));
+        assert!(
+            !workspace.shared_owner_states.contains_key(&evicted_key),
+            "a shared state without owners must not stay cached"
+        );
+        assert!(workspace.shared_owner_states.contains_key(&retained_key));
+    }
+
+    #[test]
     fn second_navigation_skips_import_resolution() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, _) = provider_fixture(temp.path());
@@ -18901,7 +19056,7 @@ BDS = '/fake/37'
                 Ok(super::ProjectCandidateMembership::default()),
             )]),
             project_read_observations: Vec::new(),
-            system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+            system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
         };
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
         budget
@@ -18952,7 +19107,7 @@ BDS = '/fake/37'
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
-                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+                system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
             },
         );
         let changed =
@@ -19150,7 +19305,7 @@ BDS = '/fake/37'
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
-                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+                system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
             },
         );
         let incoming = (0..EXISTING)
@@ -19251,13 +19406,13 @@ BDS = '/fake/37'
         };
         let owner = KnownDocumentOwner {
             key,
-            state: ContextState {
+            state: Arc::new(ContextState {
                 context: ProjectContext::default(),
                 watched_paths: HashMap::new(),
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
-                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
-            },
+                system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+            }),
             origin: OwnerOrigin::Explicit,
             needs_revalidation: false,
             follow_current_project_file: false,
@@ -21409,7 +21564,7 @@ BDS = '/fake/37'
         };
         let mut owner = super::KnownDocumentOwner {
             key: key.clone(),
-            state: ContextState::default(),
+            state: Arc::new(ContextState::default()),
             origin: super::OwnerOrigin::Inherited,
             needs_revalidation: false,
             follow_current_project_file: false,
@@ -21447,7 +21602,7 @@ BDS = '/fake/37'
         };
         let owner = super::KnownDocumentOwner {
             key: key.clone(),
-            state: ContextState::default(),
+            state: Arc::new(ContextState::default()),
             origin: super::OwnerOrigin::Inherited,
             needs_revalidation: false,
             follow_current_project_file: false,
@@ -21846,7 +22001,7 @@ BDS = '/fake/37'
             watched_paths: HashMap::from([(system_pas.clone(), super::path_stamp(&system_pas))]),
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
-            system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+            system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
         };
 
         assert!(

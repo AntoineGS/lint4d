@@ -240,6 +240,132 @@ type
         (kEnd)))))
 
 ===
+Conditional method attributes with inner semicolons
+===
+
+unit U;
+
+interface
+
+type
+  T = class
+    function M: Integer; {$IFDEF USE_INLINE} inline; {$ENDIF}
+    procedure N; virtual; {$IFDEF FPC} assembler; nostackframe; {$ELSE} register; {$ENDIF} overload;
+    procedure O; {$IFDEF A}reintroduce{$ENDIF}; {$IFDEF B}inline;{$ENDIF}
+  end;
+
+function F: Integer; {$IFDEF USE_INLINE}inline;{$ENDIF}
+
+implementation
+
+function F: Integer;
+{$IFDEF USE_INLINE} inline; {$ENDIF}
+begin
+end;
+
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declTypes
+        (kType)
+        (declType
+          (identifier)
+          (kEq)
+          (declClass
+            (kClass)
+            (declProc
+              (kFunction)
+              (identifier)
+              (typeref
+                (identifier))
+              (ppIf)
+              (procAttribute (kInline))
+              (ppEndIf))
+            (declProc
+              (kProcedure)
+              (identifier)
+              (procAttribute (kVirtual))
+              (ppIf)
+              (procAttribute (kAssembler))
+              (procAttribute (kNostackframe))
+              (ppElse)
+              (procAttribute (kRegister))
+              (ppEndIf)
+              (procAttribute (kOverload)))
+            (declProc
+              (kProcedure)
+              (identifier)
+              (ppIf)
+              (procAttribute (kReintroduce))
+              (ppEndIf)
+              (ppIf)
+              (procAttribute (kInline))
+              (ppEndIf))
+            (kEnd))))
+      (declProc
+        (kFunction)
+        (identifier)
+        (typeref
+          (identifier))
+        (ppIf)
+        (procAttribute (kInline))
+        (ppEndIf)))
+    (implementation
+      (kImplementation)
+      (defProc
+        (declProc
+          (kFunction)
+          (identifier)
+          (typeref
+            (identifier))
+          (ppIf)
+          (procAttribute (kInline))
+          (ppEndIf))
+        (block
+          (kBegin)
+          (kEnd))))
+    (kEnd)
+    (kEndDot)))
+
+===
+Nested conditional method attributes
+===
+
+procedure D; {$IFDEF X}
+  inline;
+{$ELSE}
+  {$IFDEF Y} cdecl; {$ENDIF}
+{$ENDIF}
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier)
+      (ppIf)
+      (procAttribute (kInline))
+      (ppElse)
+      (ppIf)
+      (procAttribute (kCdecl))
+      (ppEndIf)
+      (ppEndIf))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
 Conditional method attributes do not accept arbitrary expressions
 ===
 

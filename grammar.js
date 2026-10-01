@@ -1124,9 +1124,17 @@ module.exports = grammar({
 		)/*)*/,
 		_procAttributeNoExt: $ => choice(
 			seq(ppAttribute($, field('attribute', $.procAttribute)), ';'),
+			...enable_if(use_pp, $._procAttributesPp),
 			// FPC-specific syntax, e.g. procedure myproc; [public; alias:'bla'; cdecl];
 			...enable_if(fpc, seq('[', delimited(field('attribute', choice($.procAttribute)), ';'), ']', ';'))
 		),
+
+		// e.g. procedure myproc; {$IFDEF USE_INLINE} inline; {$ENDIF}
+		// Outranks reading the same text as a ppBlock of statements.
+		_procAttributesPp: $ => prec.dynamic(2, ppIn($,
+			seq(field('attribute', $.procAttribute), ';'),
+			$._procAttributesPp
+		)),
 
 		procAttribute:   $ => choice(
 			$.kStatic, $.kVirtual, $.kDynamic, $.kAbstract, $.kOverride,

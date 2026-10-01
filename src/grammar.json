@@ -9244,6 +9244,10 @@
           ]
         },
         {
+          "type": "SYMBOL",
+          "name": "_procAttributesPp"
+        },
+        {
           "type": "SEQ",
           "members": [
             {
@@ -9324,6 +9328,108 @@
           ]
         }
       ]
+    },
+    "_procAttributesPp": {
+      "type": "PREC_DYNAMIC",
+      "value": 2,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "ALIAS",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_ppIf"
+            },
+            "named": true,
+            "value": "ppIf"
+          },
+          {
+            "type": "REPEAT",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "FIELD",
+                      "name": "attribute",
+                      "content": {
+                        "type": "SYMBOL",
+                        "name": "procAttribute"
+                      }
+                    },
+                    {
+                      "type": "STRING",
+                      "value": ";"
+                    }
+                  ]
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "_procAttributesPp"
+                }
+              ]
+            }
+          },
+          {
+            "type": "REPEAT",
+            "content": {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_ppElse"
+                  },
+                  "named": true,
+                  "value": "ppElse"
+                },
+                {
+                  "type": "REPEAT",
+                  "content": {
+                    "type": "CHOICE",
+                    "members": [
+                      {
+                        "type": "SEQ",
+                        "members": [
+                          {
+                            "type": "FIELD",
+                            "name": "attribute",
+                            "content": {
+                              "type": "SYMBOL",
+                              "name": "procAttribute"
+                            }
+                          },
+                          {
+                            "type": "STRING",
+                            "value": ";"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "SYMBOL",
+                        "name": "_procAttributesPp"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "type": "ALIAS",
+            "content": {
+              "type": "SYMBOL",
+              "name": "_ppEndIf"
+            },
+            "named": true,
+            "value": "ppEndIf"
+          }
+        ]
+      }
     },
     "procAttribute": {
       "type": "CHOICE",

@@ -1418,13 +1418,10 @@ end;
         (kFunction)
         (identifier)
         (typeref
-          (identifier)))
-      (ppBlock
+          (identifier))
         (ppIf)
-        (statement
-          (identifier))
-        (statement
-          (identifier))
+        (procAttribute (kAssembler))
+        (procAttribute (kNostackframe))
         (ppEndIf))
       (asm
         (kAsm)

@@ -1416,9 +1416,10 @@ cycle refuses the result. An incomplete direct-parent list is never published;
 an independently proven immediate edge remains visible when only a more distant
 ancestor is unresolved.
 
-Traversal reuses the navigation resolver's 100,000-work/8 MiB budget, examines
-at most 4,096 subtype candidates and 256 ancestry entries per request, returns
-at most 2,048 items, and reserves a 2 MiB result-construction budget.
+Traversal reuses the navigation resolver's 100,000-work/8 MiB budget across
+the request, examines at most 4,096 subtype candidates and 256 ancestry entries
+per candidate, returns at most 2,048 items, and reserves a 2 MiB
+result-construction budget.
 Cancellation, work/output exhaustion, forged or stale identity, and changed
 source/project read sets fail closed without publishing partial results. This
 deliberately conservative subset is not a complete model of Delphi inheritance,

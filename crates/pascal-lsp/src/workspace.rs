@@ -16,9 +16,7 @@ use lsp_types::{
 use pascal_core::node_kind as K;
 use pascal_core::{FileInfo, Severity, parser};
 pub(crate) use pascal_project::content_hash_bytes;
-use pascal_project::delphi_overrides::{
-    EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, user_config_path,
-};
+use pascal_project::delphi_overrides::{EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession};
 use pascal_project::{
     BuildChoice, BuildSelectionMode, CompilerVersion, ConditionalContext, ConditionalFact,
     ConstantValue, MetadataObservation, PackageMetadata, ProjectCandidateMembership,
@@ -2647,10 +2645,18 @@ fn is_windows_absolute_source_path(path: &str) -> bool {
         || path.trim().starts_with("\\\\")
 }
 
+// Unit tests must not depend on the developer's user configuration; protocol
+// tests isolate the spawned server through HOME and XDG_CONFIG_HOME instead.
+#[cfg(test)]
+fn production_override_session() -> (OverrideSession, Vec<String>) {
+    (OverrideSession::new(None), Vec::new())
+}
+
+#[cfg(not(test))]
 fn production_override_session() -> (OverrideSession, Vec<String>) {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    match user_config_path(xdg.as_deref(), home.as_deref()) {
+    match pascal_project::delphi_overrides::user_config_path(xdg.as_deref(), home.as_deref()) {
         Ok(path) => (OverrideSession::new(Some(path)), Vec::new()),
         Err(error) => (OverrideSession::new(None), vec![error]),
     }
@@ -22488,6 +22494,40 @@ BDS = '/fake/37'
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn unit_test_workspaces_ignore_the_developer_user_configuration() {
+        if std::env::var_os("LINT4D_USER_CONFIGURATION_CHILD").is_some() {
+            let temp = tempfile::tempdir().expect("temporary workspace");
+            let workspace =
+                Workspace::new(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+            assert!(
+                workspace.warnings().is_empty(),
+                "unit-test workspace consulted the user configuration: {:?}",
+                workspace.warnings()
+            );
+            return;
+        }
+
+        // An unusable HOME makes any user-configuration lookup warn, so a clean
+        // child proves unit tests never read the developer's configuration.
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "workspace::tests::unit_test_workspaces_ignore_the_developer_user_configuration",
+                "--nocapture",
+            ])
+            .env("LINT4D_USER_CONFIGURATION_CHILD", "1")
+            .env("HOME", "")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .expect("run user configuration child");
+        assert!(
+            output.status.success(),
+            "user configuration child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]

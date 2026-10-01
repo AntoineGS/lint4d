@@ -118,6 +118,8 @@ fn utf16_before(source: &str, offset: usize) -> usize {
 /// UTF-16 code units. Offsets in the middle of a UTF-8 scalar or CRLF pair are
 /// rejected.
 pub fn offset_to_position(source: &str, offset: usize) -> Option<Position> {
+    #[cfg(test)]
+    SOURCE_SCAN_CONVERSIONS.with(|scans| scans.set(scans.get().saturating_add(1)));
     if offset > source.len() || !source.is_char_boundary(offset) {
         return None;
     }
@@ -155,6 +157,9 @@ pub(crate) struct PositionIndex {
 #[cfg(test)]
 thread_local! {
     static POSITION_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Conversions that rescan the source prefix through [`offset_to_position`].
+    pub(crate) static SOURCE_SCAN_CONVERSIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone)]

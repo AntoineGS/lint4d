@@ -1,7 +1,7 @@
 use super::{
     AncestryResolutionState, AssistanceBudget, NavigationIndex, Span, Symbol, SymbolKind, TypeKind,
 };
-use crate::text;
+use crate::text::{self, PositionIndex};
 use lsp_types::{Position, Range, TypeHierarchyItem, Url};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -51,7 +51,8 @@ pub(super) fn prepare(
     if entries.len() != 1 || entries[0].kind != symbol.type_kind {
         return Ok(None);
     }
-    let Some(item) = item_for_symbol(uri, document, symbol) else {
+    let positions = position_index(document, cancel)?;
+    let Some(item) = item_for_symbol(uri, document, &positions, symbol) else {
         return Ok(None);
     };
     Ok(Some(vec![item]))
@@ -105,8 +106,13 @@ pub(super) fn supertypes(
         if indices.len() != 1 {
             return Ok(None);
         }
-        let Some(parent) = item_for_symbol(&parent_uri, document, &document.symbols[indices[0]])
-        else {
+        let positions = position_index(document, cancel)?;
+        let Some(parent) = item_for_symbol(
+            &parent_uri,
+            document,
+            &positions,
+            &document.symbols[indices[0]],
+        ) else {
             return Ok(None);
         };
         charge_result(&mut bytes, &parent)?;
@@ -143,6 +149,7 @@ pub(super) fn subtypes(
         return Ok(None);
     }
     for (uri, document) in &index.documents {
+        let mut positions = None;
         for symbol in document.symbols.iter().filter(|symbol| {
             symbol.kind == SymbolKind::Type
                 && matches!(symbol.type_kind, TypeKind::Class | TypeKind::Interface)
@@ -152,6 +159,7 @@ pub(super) fn subtypes(
             if candidates > MAX_CANDIDATES {
                 return Err("type hierarchy candidate limit exceeded".into());
             }
+            cycle_check.start_candidate();
             if document
                 .conditionals
                 .is_unknown_at(symbol.selection_span.start)
@@ -189,7 +197,11 @@ pub(super) fn subtypes(
             }) {
                 continue;
             }
-            let Some(child) = item_for_symbol(uri, document, symbol) else {
+            let positions = match positions.as_mut() {
+                Some(positions) => positions,
+                None => positions.insert(position_index(document, cancel)?),
+            };
+            let Some(child) = item_for_symbol(uri, document, positions, symbol) else {
                 continue;
             };
             charge_result(&mut bytes, &child)?;
@@ -230,6 +242,12 @@ impl<'a> TypeHierarchyCycleCheck<'a> {
             active: HashSet::new(),
             known_acyclic: HashSet::new(),
         }
+    }
+
+    /// Bound each subtype candidate's ancestry walk independently; the shared
+    /// budget and the candidate cap bound the scan as a whole.
+    fn start_candidate(&mut self) {
+        *self.state = AncestryResolutionState::new();
     }
 
     fn direct_ancestry(
@@ -319,10 +337,14 @@ fn validate_item(
         .get(&item.uri)
         .ok_or_else(|| "type hierarchy source is not selected".to_string())?;
     let mut found = None;
+    let mut positions = None;
     for (i, symbol) in document.symbols.iter().enumerate().filter(|(_, s)| {
-        s.kind == SymbolKind::Type && matches!(s.type_kind, TypeKind::Class | TypeKind::Interface)
+        s.kind == SymbolKind::Type
+            && matches!(s.type_kind, TypeKind::Class | TypeKind::Interface)
+            && s.name == item.name
     }) {
-        let Some(candidate) = item_for_symbol(&item.uri, document, symbol) else {
+        let positions = positions.get_or_insert_with(|| PositionIndex::new(&document.source));
+        let Some(candidate) = item_for_symbol(&item.uri, document, positions, symbol) else {
             continue;
         };
         let matches = candidate.name == item.name
@@ -342,13 +364,21 @@ fn validate_item(
         .ok_or_else(|| "stale or forged type hierarchy item".into())
 }
 
+#[cfg(test)]
+thread_local! {
+    static ITEM_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn item_for_symbol(
     uri: &Url,
     document: &super::ParsedDocument,
+    positions: &PositionIndex,
     symbol: &Symbol,
 ) -> Option<TypeHierarchyItem> {
-    let range = byte_range(&document.source, symbol.declaration_span)?;
-    let selection_range = byte_range(&document.source, symbol.selection_span)?;
+    #[cfg(test)]
+    ITEM_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
+    let range = byte_range(positions, &document.source, symbol.declaration_span)?;
+    let selection_range = byte_range(positions, &document.source, symbol.selection_span)?;
     let kind = match symbol.type_kind {
         TypeKind::Class => lsp_types::SymbolKind::CLASS,
         TypeKind::Interface => lsp_types::SymbolKind::INTERFACE,
@@ -374,11 +404,19 @@ fn item_for_symbol(
     })
 }
 
-fn byte_range(source: &str, span: Span) -> Option<Range> {
+fn byte_range(positions: &PositionIndex, source: &str, span: Span) -> Option<Range> {
     Some(Range {
-        start: text::offset_to_position(source, span.start)?,
-        end: text::offset_to_position(source, span.end)?,
+        start: positions.offset_to_position(source, span.start)?,
+        end: positions.offset_to_position(source, span.end)?,
     })
+}
+
+fn position_index(
+    document: &super::ParsedDocument,
+    cancel: &AtomicBool,
+) -> Result<PositionIndex, String> {
+    PositionIndex::new_with_cancel(&document.source, cancel)
+        .map_err(|()| "type hierarchy cancelled".to_string())
 }
 
 fn canonical(name: &str) -> String {
@@ -405,5 +443,101 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
         Err("type hierarchy cancelled".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ITEM_BUILDS, prepare, subtypes, validate_item};
+    use crate::NavigationIndex;
+    use crate::text::{SOURCE_SCAN_CONVERSIONS, offset_to_position};
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn item_validation_builds_only_same_named_candidates() {
+        let mut source = String::from("unit ManyTypes; interface type TBase = class end;\n");
+        for index in 0..64 {
+            source.push_str(&format!("TChild{index} = class(TBase) end;\n"));
+        }
+        source.push_str("implementation end.");
+        let uri = lsp_types::Url::parse("file:///ManyTypes.pas").expect("type hierarchy URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("type hierarchy source parses");
+        let position = offset_to_position(&source, source.find("TBase").expect("base type"))
+            .expect("base position");
+        let item = prepare(&index, &uri, position, &AtomicBool::new(false))
+            .expect("prepare type hierarchy")
+            .expect("base item")
+            .remove(0);
+
+        ITEM_BUILDS.with(|builds| builds.set(0));
+        let (validated_uri, _) = validate_item(&index, &item).expect("validated item");
+
+        assert_eq!(validated_uri, uri);
+        assert_eq!(ITEM_BUILDS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn subtype_items_do_not_rescan_the_source_per_child() {
+        let mut source = String::from("unit ManyTypes; interface type TBase = class end;\n");
+        for index in 0..64 {
+            source.push_str(&format!("TChild{index} = class(TBase) end;\n"));
+        }
+        source.push_str("implementation end.");
+        let uri = lsp_types::Url::parse("file:///ManyTypes.pas").expect("type hierarchy URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("type hierarchy source parses");
+        let cancel = AtomicBool::new(false);
+        let position = offset_to_position(&source, source.find("TBase").expect("base type"))
+            .expect("base position");
+        let item = prepare(&index, &uri, position, &cancel)
+            .expect("prepare type hierarchy")
+            .expect("base item")
+            .remove(0);
+
+        SOURCE_SCAN_CONVERSIONS.with(|scans| scans.set(0));
+        let children = subtypes(&index, &item, &cancel)
+            .expect("subtypes")
+            .expect("proven subtypes");
+
+        assert_eq!(children.len(), 64);
+        assert_eq!(SOURCE_SCAN_CONVERSIONS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn subtypes_are_found_among_hundreds_of_unrelated_classes() {
+        let mut source = String::from("unit Wide; interface type TBase = class end;\n");
+        for index in 0..300 {
+            source.push_str(&format!("TOther{index} = class end;\n"));
+        }
+        source.push_str("TChild = class(TBase) end;\nimplementation end.");
+        let uri = lsp_types::Url::parse("file:///Wide.pas").expect("type hierarchy URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("type hierarchy source parses");
+        let cancel = AtomicBool::new(false);
+        let position = offset_to_position(&source, source.find("TBase").expect("base type"))
+            .expect("base position");
+        let item = prepare(&index, &uri, position, &cancel)
+            .expect("prepare type hierarchy")
+            .expect("base item")
+            .remove(0);
+
+        let children = subtypes(&index, &item, &cancel)
+            .expect("subtypes within the candidate limit")
+            .expect("proven subtypes");
+
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            ["TChild"]
+        );
     }
 }

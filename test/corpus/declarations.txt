@@ -751,3 +751,26 @@ type
         (declField (identifier)
           (type (declString (kString) (kDeprecated) (literalString))))
         (kEnd)))))
+
+===
+Routine attribute keywords as variable names
+===
+
+var
+  Value: Longint;
+  Default: LongInt;
+  Local: Integer;
+  Message, Inline: string;
+  a: b; cvar; external c;
+
+---
+
+(root
+  (declVars (kVar)
+    (declVar (identifier) (type (typeref (identifier))))
+    (declVar (identifier) (type (typeref (identifier))))
+    (declVar (identifier) (type (typeref (identifier))))
+    (declVar (identifier) (identifier) (type (declString (kString))))
+    (declVar (identifier) (type (typeref (identifier)))
+      (procAttribute (kCvar))
+      (procExternal (kExternal) (identifier)))))

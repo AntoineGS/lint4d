@@ -53,6 +53,36 @@ function delimited(rule, delimiter = ',') {
 	return optional(delimited1(rule, delimiter));
 }
 
+// After `a: b;` a routine attribute keyword may start `a`'s attribute list
+// (`cvar;`) or name the next variable (`Default: Integer;`). Only the following
+// `;` or `:`/`,` tells them apart. `external` is left out because a
+// preprocessor block could not tell `procExternal` from a variable after a
+// routine header. This is inlined rather than a rule so that a plain
+// identifier is shifted exactly as in `declConst` and `declField`.
+function varName($) {
+	return choice(
+		$.identifier,
+		...[
+			$.kStatic, $.kVirtual, $.kDynamic, $.kAbstract, $.kOverride,
+			$.kOverload, $.kReintroduce, $.kInline, $.kStdcall,
+			$.kCdecl, $.kPascal, $.kRegister, $.kSafecall, $.kAssembler,
+			$.kNoreturn, $.kLocal, $.kFar, $.kNear,
+			$.kDefault, $.kNodefault, $.kDeprecated, $.kExperimental,
+			$.kMessage,
+			...enable_if(fpc,
+				$.kPlatform, $.kUnimplemented,
+				$.kCppdecl, $.kCvar, $.kMwpascal, $.kNostackframe,
+				$.kInterrupt, $.kIocheck, $.kHardfloat,
+				$.kSoftfloat, $.kMs_abi_default, $.kMs_abi_cdecl,
+				$.kSaveregisters, $.kSysv_abi_default, $.kSysv_abi_cdecl,
+				$.kVectorcall, $.kVarargs, $.kWinapi, $.kExport,
+				...enable_if(public_name, $.kPublic),
+			),
+			...enable_if(delphi, $.kDispId),
+		].map(keyword => alias(keyword, $.identifier)),
+	);
+}
+
 // Preprocessor wrapper: `if[def] ... [else[if] ...]* endif` around a rule.
 // It is inteded for code like this:
 //
@@ -866,7 +896,7 @@ module.exports = grammar({
 
 		declVar:         $ => seq(
 			...enable_if(rtti, optional($.rttiAttributes)),
-			field('name', delimited1($.identifier)),
+			field('name', delimited1(varName($))),
 			':',
 			field('type', $.type),
 			optional(choice(

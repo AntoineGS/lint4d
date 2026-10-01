@@ -265,7 +265,10 @@ function statements(trailing) {
 
 		[rn('raise'),       $ => seq(
 			$.kRaise,
-			field('exception', optional($._expr)),
+			optional(seq(
+				field('exception', $._expr),
+				optional(seq($.kRaiseAt, field('address', $._expr))),
+			)),
 			...semicolon
 		)],
 
@@ -1308,6 +1311,7 @@ module.exports = grammar({
 		kExcept:           $ => /except/i,
 		kFinally:          $ => /finally/i,
 		kRaise:            $ => /raise/i,
+		kRaiseAt:          $ => /at/i,
 		kOn:               $ => /on/i,
 		kCase:             $ => /case/i,
 		kWith:             $ => /with/i,

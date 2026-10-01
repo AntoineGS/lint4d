@@ -27,9 +27,14 @@ enum Insertion {
 /// members inherited through a dependency's own imports resolve. Only verified
 /// cache entries are used: nothing is resolved, read, or parsed. A missing
 /// entry leaves its unit fenced and marks the walk incomplete.
+///
+/// `owned` are the snapshot's own indexed sources. The snapshot already bound
+/// (or deliberately emptied) their imports, so the walk never roots at, binds,
+/// or fences them: its interface-only bindings would replace the full ones.
 pub(super) fn walk_interface_closure(
     loader: &mut Workspace,
     dependencies: &[Url],
+    owned: &HashSet<Url>,
     cancel: &AtomicBool,
 ) -> Result<ClosureWalk, String> {
     let overlays = loader.overlay_inputs();
@@ -37,6 +42,9 @@ pub(super) fn walk_interface_closure(
     let mut queue = VecDeque::new();
     let mut seen = HashSet::new();
     for uri in dependencies {
+        if owned.contains(uri) {
+            continue;
+        }
         let (Some(hash), Some(context_key)) = (
             loader.indexed_content_hashes.get(uri).copied(),
             loader.document_contexts.get(uri).cloned(),

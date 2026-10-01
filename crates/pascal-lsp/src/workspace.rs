@@ -16768,6 +16768,107 @@ mod tests {
         );
     }
 
+    struct OwnedDependencyFixture {
+        _temp: tempfile::TempDir,
+        zeta: Url,
+        helper: Url,
+        workspace: Workspace,
+        main: Url,
+    }
+
+    /// `Zeta` is both a workspace source and a direct dependency of the
+    /// snapshot. It sorts after `Alpha`, which loads it, and its include makes
+    /// that load re-index it, so the snapshot's own pass binds it last. It imports
+    /// `Extra` in its interface and `Helper` in its implementation.
+    fn owned_dependency_fixture() -> OwnedDependencyFixture {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let write = |name: &str, text: &str| fs::write(root.join(name), text).unwrap();
+        write(
+            "Main.pas",
+            "unit Main;\ninterface\nuses Alpha;\nimplementation\n// TZeta\nend.\n",
+        );
+        write(
+            "Alpha.pas",
+            "unit Alpha;\ninterface\nuses Zeta;\ntype\n  TAlpha = TZeta;\nimplementation\nend.\n",
+        );
+        write(
+            "Zeta.pas",
+            "unit Zeta;\ninterface\nuses Extra;\n{$I Types.inc}\ntype\n  TZeta = class\n  end;\nimplementation\nuses Helper;\nend.\n",
+        );
+        write("Types.inc", "const Answer = 42;\n");
+        write(
+            "Helper.pas",
+            "unit Helper;\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            "Extra.pas",
+            "unit Extra;\ninterface\nimplementation\nend.\n",
+        );
+        let url = |name: &str| Url::from_file_path(root.join(name)).unwrap();
+        let fixture = OwnedDependencyFixture {
+            main: url("Main.pas"),
+            zeta: url("Zeta.pas"),
+            helper: url("Helper.pas"),
+            workspace: test_workspace(vec![root.clone()], Default::default()),
+            _temp: temp,
+        };
+        for name in ["Main.pas", "Alpha.pas", "Zeta.pas"] {
+            worker_view(&fixture.workspace)
+                .warm_with_cancel(&url(name), &AtomicBool::new(false))
+                .expect("warm");
+        }
+        fixture
+    }
+
+    fn workspace_snapshot(
+        fixture: &OwnedDependencyFixture,
+        skip_imports_for: &[Url],
+    ) -> super::rename::RenameSnapshot {
+        super::rename::build_snapshot(
+            &fixture.workspace.analysis_input(),
+            std::slice::from_ref(&fixture.main),
+            &["TZeta".to_string()],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            skip_imports_for,
+            &AtomicBool::new(false),
+        )
+        .expect("snapshot")
+    }
+
+    #[test]
+    fn the_walk_keeps_full_bindings_of_the_snapshots_own_sources() {
+        let fixture = owned_dependency_fixture();
+
+        let snapshot = workspace_snapshot(&fixture, &[]);
+
+        assert!(snapshot.sources.contains_key(&fixture.zeta));
+        assert_eq!(
+            snapshot.index.import_provider_uri(&fixture.zeta, "Helper"),
+            Some(&fixture.helper)
+        );
+        assert!(
+            snapshot
+                .index
+                .import_provider_uri(&fixture.zeta, "Extra")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_walk_keeps_the_empty_binding_of_a_skipped_source() {
+        let fixture = owned_dependency_fixture();
+
+        let snapshot = workspace_snapshot(&fixture, std::slice::from_ref(&fixture.zeta));
+
+        assert!(snapshot.sources.contains_key(&fixture.zeta));
+        assert_eq!(
+            snapshot.index.import_provider_uri(&fixture.zeta, "Extra"),
+            None
+        );
+    }
+
     #[test]
     fn an_open_dependency_in_the_closure_is_not_replaced_by_its_disk_parse() {
         let mut fixture = inherited_fixture("Base");

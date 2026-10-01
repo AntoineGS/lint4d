@@ -6670,6 +6670,7 @@ fn build_snapshot_with_policy(
 
     let mut uris: Vec<Url> = indexed_uris.iter().cloned().collect();
     uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let owned_sources: HashSet<Url> = uris.iter().cloned().collect();
     let mut pins: HashSet<Url> = indexed_uris;
     let mut direct_dependencies = Vec::new();
     let mut declaration_providers = HashSet::new();
@@ -6714,8 +6715,12 @@ fn build_snapshot_with_policy(
                     .bind_imports(&uri, std::iter::empty::<(String, Url)>());
             }
         }
-        let closure =
-            super::closure::walk_interface_closure(&mut loader, &direct_dependencies, cancel)?;
+        let closure = super::closure::walk_interface_closure(
+            &mut loader,
+            &direct_dependencies,
+            &owned_sources,
+            cancel,
+        )?;
         if closure.incomplete {
             for root in &priority {
                 loader.project_cache.request_closure_crawl(root);

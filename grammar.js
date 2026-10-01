@@ -698,7 +698,7 @@ module.exports = grammar({
 			token.immediate(/\$[a-fA-F0-9]+/),
 			...enable_if(fpc, token.immediate(/%[01]+/))
 		),
-		_literalFloat:   $ => prec(10, /[-+]?[0-9]*\.?[0-9]+(e[+-]?[0-9]+)?/),
+		_literalFloat:   $ => prec(10, /[-+]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?/),
 
 		range:           $ => seq(
 			$._expr, '..', $._expr

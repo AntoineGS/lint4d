@@ -10174,7 +10174,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
     case 103:
       ACCEPT_TOKEN(aux_sym__literalInt_token1);
       if (lookahead == '.') ADVANCE(71);
-      if (lookahead == 'e') ADVANCE(69);
+      if (lookahead == 'E' ||
+          lookahead == 'e') ADVANCE(69);
       if (('0' <= lookahead && lookahead <= '9')) ADVANCE(103);
       END_STATE();
     case 104:
@@ -10194,7 +10195,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       END_STATE();
     case 107:
       ACCEPT_TOKEN(aux_sym__literalFloat_token1);
-      if (lookahead == 'e') ADVANCE(69);
+      if (lookahead == 'E' ||
+          lookahead == 'e') ADVANCE(69);
       if (('0' <= lookahead && lookahead <= '9')) ADVANCE(107);
       END_STATE();
     case 108:

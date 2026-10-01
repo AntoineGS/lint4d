@@ -51,6 +51,26 @@ const
       (defaultValue (kEq) (literalNumber)))))
 
 ===
+Uppercase exponents
+===
+
+const
+  a = 1.5E10;
+  b = 1E5;
+  c = 2.5E-3;
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))))
+
+===
 Strings
 ===
 

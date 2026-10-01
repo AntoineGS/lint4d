@@ -43,11 +43,14 @@ use crate::installations::{
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +73,51 @@ const MAX_OWNERSHIP_SOURCE_FILES: usize = 256;
 const MAX_OWNERSHIP_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_OWNERSHIP_WARNING_BYTES: usize = 256 * 1024;
 const UNRESOLVED_MARKER: char = '\u{1}';
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_PROJECT_DISCOVERY_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static TEST_PROJECT_DIRECTORY_LISTING_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_project_discovery_counts() -> (usize, usize) {
+    TEST_PROJECT_DISCOVERY_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_reset_project_discovery_counts() {
+    TEST_PROJECT_DISCOVERY_COUNTS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_record_project_discovery(build: bool) {
+    TEST_PROJECT_DISCOVERY_COUNTS.with(|counts| {
+        let (discoveries, builds) = counts.get();
+        counts.set((
+            discoveries + usize::from(!build),
+            builds + usize::from(build),
+        ));
+    });
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_project_directory_listing_counts() -> (usize, usize) {
+    TEST_PROJECT_DIRECTORY_LISTING_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_reset_project_directory_listing_counts() {
+    TEST_PROJECT_DIRECTORY_LISTING_COUNTS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_record_project_directory_listing(read: bool) {
+    TEST_PROJECT_DIRECTORY_LISTING_COUNTS.with(|counts| {
+        let (reads, stamp_checks) = counts.get();
+        counts.set((reads + usize::from(read), stamp_checks + usize::from(!read)));
+    });
+}
 
 /// Options supplied by a caller for project selection and evaluation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -867,12 +915,289 @@ fn open_payload_file(path: &Path) -> io::Result<fs::File> {
     fs::File::open(path)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ProjectDirectoryEntries {
     dproj: Vec<PathBuf>,
     dpr_or_dpk: Vec<PathBuf>,
     system_pas: Option<PathBuf>,
     candidate_overflow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectDirectoryStamp {
+    bytes: u64,
+    modified: Option<SystemTime>,
+    // Directory mtime precision varies by filesystem. On Unix, include ctime
+    // and identity so same-tick membership changes still invalidate a listing.
+    // Other platforms use the strongest portable std::fs metadata available.
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProjectDirectoryEntries {
+    entries: ProjectDirectoryEntries,
+    stamp: ProjectDirectoryStamp,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectDiscoveryCacheStats {
+    pub discoveries: usize,
+    pub project_context_builds: usize,
+    pub project_context_cache_hits: usize,
+    pub directory_listing_reads: usize,
+    pub directory_listing_hits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProjectOptionsCacheKey {
+    project_file: Option<PathBuf>,
+    installation_selections: Vec<(PathBuf, String)>,
+    build_config: Option<String>,
+    platform: Option<String>,
+    source_paths: Vec<String>,
+    conditional_context: ConditionalContext,
+}
+
+impl From<&ProjectOptions> for ProjectOptionsCacheKey {
+    fn from(options: &ProjectOptions) -> Self {
+        let mut installation_selections = options
+            .installation_selections
+            .iter()
+            .map(|(path, selection)| (path.clone(), selection.clone()))
+            .collect::<Vec<_>>();
+        installation_selections.sort_by(|left, right| {
+            left.0
+                .to_string_lossy()
+                .cmp(&right.0.to_string_lossy())
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        Self {
+            project_file: options.project_file.clone(),
+            installation_selections,
+            build_config: options.build_config.clone(),
+            platform: options.platform.clone(),
+            source_paths: options.source_paths.clone(),
+            conditional_context: options.conditional_context.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProjectContextBuildCacheKey {
+    project_file: PathBuf,
+    roots: Vec<PathBuf>,
+    deleted_paths: Vec<PathBuf>,
+    option_base: PathBuf,
+    options: ProjectOptionsCacheKey,
+    overrides: EffectiveOverrides,
+    exclusions: Vec<String>,
+    warnings: Vec<String>,
+    explicit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProjectContext {
+    context: ProjectContext,
+    observations: Vec<ProjectReadObservation>,
+    metadata_paths: Vec<PathBuf>,
+    metadata_observations: Vec<MetadataObservation>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectDiscoveryCache {
+    directory_entries: HashMap<PathBuf, CachedProjectDirectoryEntries>,
+    project_contexts: HashMap<ProjectContextBuildCacheKey, CachedProjectContext>,
+    stats: ProjectDiscoveryCacheStats,
+}
+
+thread_local! {
+    static PROJECT_DISCOVERY_CACHE: RefCell<Option<ProjectDiscoveryCache>> = const { RefCell::new(None) };
+}
+
+/// A request-local cache for repeated Pascal project discovery work.
+///
+/// The cache deliberately has no process-wide lifetime: callers hold this
+/// scope for one immutable workspace snapshot, then all parsed contexts and
+/// directory listings are discarded.
+#[doc(hidden)]
+pub struct ProjectDiscoveryCacheScope {
+    previous: Option<ProjectDiscoveryCache>,
+}
+
+impl ProjectDiscoveryCacheScope {
+    pub fn new() -> Self {
+        let previous = PROJECT_DISCOVERY_CACHE
+            .with(|cache| cache.replace(Some(ProjectDiscoveryCache::default())));
+        Self { previous }
+    }
+
+    pub fn stats(&self) -> ProjectDiscoveryCacheStats {
+        PROJECT_DISCOVERY_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .map_or_else(ProjectDiscoveryCacheStats::default, |cache| {
+                    cache.stats.clone()
+                })
+        })
+    }
+}
+
+impl Default for ProjectDiscoveryCacheScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ProjectDiscoveryCacheScope {
+    fn drop(&mut self) {
+        PROJECT_DISCOVERY_CACHE.with(|cache| {
+            cache.replace(self.previous.take());
+        });
+    }
+}
+
+fn with_project_discovery_cache<T>(
+    operation: impl FnOnce(&mut ProjectDiscoveryCache) -> T,
+) -> Option<T> {
+    PROJECT_DISCOVERY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.as_mut().map(operation)
+    })
+}
+
+fn record_project_discovery_cache_discovery() {
+    let _ = with_project_discovery_cache(|cache| {
+        cache.stats.discoveries = cache.stats.discoveries.saturating_add(1);
+    });
+}
+
+fn record_project_discovery_cache_build() {
+    let _ = with_project_discovery_cache(|cache| {
+        cache.stats.project_context_builds = cache.stats.project_context_builds.saturating_add(1);
+    });
+}
+
+fn cache_path_list(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = paths.to_vec();
+    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    paths.dedup_by(|left, right| project_paths_equal(left, right));
+    paths
+}
+
+fn project_context_cache_get(
+    key: &ProjectContextBuildCacheKey,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<Option<CachedProjectContext>, String> {
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+    }
+    let cached =
+        with_project_discovery_cache(|cache| cache.project_contexts.get(key).cloned()).flatten();
+    if let Some(cached) = &cached {
+        if !project_context_cache_is_current(cached, cancel, work_budget)? {
+            let _ = with_project_discovery_cache(|cache| {
+                cache.project_contexts.remove(key);
+            });
+            return Ok(None);
+        }
+        let _ = with_project_discovery_cache(|cache| {
+            cache.stats.project_context_cache_hits =
+                cache.stats.project_context_cache_hits.saturating_add(1);
+        });
+        if let Some(work_budget) = work_budget {
+            let visits = cached
+                .observations
+                .len()
+                .saturating_add(cached.metadata_paths.len())
+                .saturating_add(cached.metadata_observations.len());
+            work_budget.charge_path_visits(visits)?;
+        }
+    }
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+    }
+    Ok(cached)
+}
+
+fn project_context_cache_is_current(
+    cached: &CachedProjectContext,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<bool, String> {
+    for observation in &cached.observations {
+        check_project_scan_cancel(cancel)?;
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+            work_budget.charge_path_visits(1)?;
+            work_budget.charge_path_bytes(observation.path.as_os_str().len())?;
+        }
+        let current = path_stamp_result(&observation.path).unwrap_or(None);
+        if current.as_ref() != Some(&observation.stamp) {
+            return Ok(false);
+        }
+    }
+    for observation in &cached.context.metadata_observations {
+        check_project_scan_cancel(cancel)?;
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+            work_budget.charge_path_visits(1)?;
+            work_budget.charge_path_bytes(observation.path().as_os_str().len())?;
+        }
+        match observation {
+            MetadataObservation::Payload { path, .. } => {
+                let current = metadata_payload_is_current(
+                    observation,
+                    project_metadata_read_limit(path),
+                    work_budget,
+                )?;
+                check_project_scan_cancel(cancel)?;
+                if !current {
+                    return Ok(false);
+                }
+            }
+            MetadataObservation::Stat { path } => {
+                let has_read_observation = cached
+                    .observations
+                    .iter()
+                    .any(|read| project_paths_equal(&read.path, path));
+                if !has_read_observation && path_stamp_result(path).unwrap_or(None).is_some() {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+    }
+    Ok(true)
+}
+
+fn project_metadata_read_limit(path: &Path) -> u64 {
+    if extension_is(path, "json") {
+        MAX_LOCAL_PROJECT_CONFIG_BYTES
+    } else if extension_is(path, "pas") || extension_is(path, "dpr") || extension_is(path, "dpk") {
+        MAX_MAIN_SOURCE_BYTES
+    } else {
+        MAX_PROJECT_BYTES
+    }
+}
+
+fn project_context_cache_insert(key: ProjectContextBuildCacheKey, context: CachedProjectContext) {
+    let _ = with_project_discovery_cache(|cache| {
+        cache.project_contexts.entry(key).or_insert(context);
+    });
 }
 
 /// Metadata used to resolve units without eagerly parsing the repository.
@@ -1160,6 +1485,10 @@ pub struct ProjectDiscovery {
     pub context: ProjectContext,
     pub observations: Vec<ProjectReadObservation>,
     pub candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
+    /// Runtime project selection resolved while evaluating this source path.
+    pub project_selection: Option<(PathBuf, PathBuf)>,
+    /// Nearest project-selection scope observed during discovery.
+    pub project_scope: Option<PathBuf>,
 }
 
 /// Work/cancellation accounting supplied by a caller such as the LSP's
@@ -1252,7 +1581,71 @@ impl<'a> ProjectReadTracker<'a> {
         self.candidate_memberships.insert(path, membership);
     }
 
-    fn into_discovery(self, mut context: ProjectContext) -> ProjectDiscovery {
+    fn merge_project_context_reads(
+        &mut self,
+        cached: &CachedProjectContext,
+        cancel: Option<&AtomicBool>,
+        work_budget: Option<&dyn ProjectWorkBudget>,
+    ) -> Result<(), String> {
+        for path in &cached.metadata_paths {
+            check_project_scan_cancel(cancel)?;
+            if let Some(work_budget) = work_budget {
+                work_budget.check_cancelled()?;
+            }
+            self.record_metadata_path(path.clone());
+        }
+        for observation in &cached.metadata_observations {
+            check_project_scan_cancel(cancel)?;
+            if let Some(work_budget) = work_budget {
+                work_budget.check_cancelled()?;
+            }
+            self.record_metadata_observation(observation.clone());
+        }
+        for observation in &cached.observations {
+            check_project_scan_cancel(cancel)?;
+            if let Some(work_budget) = work_budget {
+                work_budget.check_cancelled()?;
+            }
+            self.record_project_read_observation(observation.clone());
+        }
+        Ok(())
+    }
+
+    fn record_project_read_observation(&mut self, observation: ProjectReadObservation) {
+        if self
+            .observations
+            .iter()
+            .any(|existing| project_paths_equal(&existing.path, &observation.path))
+        {
+            return;
+        }
+        self.observations.push(observation);
+    }
+
+    fn into_discovery(
+        self,
+        mut context: ProjectContext,
+        project_selection: Option<(PathBuf, PathBuf)>,
+    ) -> ProjectDiscovery {
+        let project_scope = context
+            .project_file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| project_selection.as_ref().map(|(scope, _)| scope.clone()))
+            .or_else(|| {
+                self.candidate_memberships
+                    .iter()
+                    .filter_map(|(directory, membership)| {
+                        let membership = membership.as_ref().ok()?;
+                        membership
+                            .paths
+                            .iter()
+                            .any(|path| extension_is(path, "dproj"))
+                            .then(|| directory.clone())
+                    })
+                    .max_by_key(|directory| directory.components().count())
+            });
         for path in &self.metadata_paths {
             if !context
                 .metadata_files
@@ -1269,6 +1662,8 @@ impl<'a> ProjectReadTracker<'a> {
             context,
             observations: self.observations,
             candidate_memberships: self.candidate_memberships,
+            project_selection,
+            project_scope,
         }
     }
 }
@@ -1975,6 +2370,10 @@ fn discover_context_with_selections(
     work_budget: Option<&dyn ProjectWorkBudget>,
     deleted_paths: &[PathBuf],
 ) -> Result<ProjectDiscovery, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    test_record_project_discovery(false);
+    record_project_discovery_cache_discovery();
+    let _path_resolution_cache_scope = PathResolutionCacheScope::new();
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -2112,7 +2511,7 @@ fn discover_context_with_selections(
                 if let Some(work_budget) = work_budget {
                     work_budget.check_cancelled()?;
                 }
-                return Ok(read_tracker.into_discovery(context));
+                return Ok(read_tracker.into_discovery(context, None));
             }
         };
         runtime_project_selection(&file_path, &candidates, selections).map(|(scope, requested)| {
@@ -2124,6 +2523,9 @@ fn discover_context_with_selections(
             (scope, requested, selected, candidates.files)
         })
     };
+    let discovery_selection = runtime_selection
+        .as_ref()
+        .map(|(scope, requested, _, _)| (scope.clone(), requested.clone()));
 
     let mut selected_project =
         if let Some((scope, requested, selected, candidates)) = runtime_selection {
@@ -2147,7 +2549,7 @@ fn discover_context_with_selections(
                 if let Some(work_budget) = work_budget {
                     work_budget.check_cancelled()?;
                 }
-                return Ok(read_tracker.into_discovery(context));
+                return Ok(read_tracker.into_discovery(context, discovery_selection.clone()));
             };
             ProjectSelection::Selected {
                 path: project_file,
@@ -2213,6 +2615,14 @@ fn discover_context_with_selections(
                     Ok(overrides) => overrides,
                     Err(error) => {
                         warnings.push(error.clone());
+                        for path in &metadata_files {
+                            read_tracker.record_metadata_path(path.clone());
+                        }
+                        for observation in &metadata_observations {
+                            read_tracker.record_metadata_observation(observation.clone());
+                        }
+                        let mut build_tracker =
+                            ProjectReadTracker::with_budget(work_budget, deleted_paths);
                         let mut context = build_project_context(
                             project_file,
                             &file_path,
@@ -2222,39 +2632,91 @@ fn discover_context_with_selections(
                             EffectiveOverrides::default(),
                             warnings,
                             explicit,
-                            metadata_files,
-                            metadata_observations.clone(),
+                            Vec::new(),
+                            Vec::new(),
                             exclusions,
-                            &mut read_tracker,
+                            &mut build_tracker,
                             cancel,
+                        )?;
+                        read_tracker.merge_project_context_reads(
+                            &CachedProjectContext {
+                                context: context.clone(),
+                                observations: build_tracker.observations,
+                                metadata_paths: build_tracker.metadata_paths,
+                                metadata_observations: build_tracker.metadata_observations,
+                            },
+                            cancel,
+                            work_budget,
                         )?;
                         if let Some(work_budget) = work_budget {
                             work_budget.check_cancelled()?;
                         }
                         context.discovery_complete = false;
                         context.override_error = Some(error);
-                        return Ok(read_tracker.into_discovery(context));
+                        return Ok(
+                            read_tracker.into_discovery(context, discovery_selection.clone())
+                        );
                     }
                 };
-            let context = build_project_context(
-                project_file,
-                &file_path,
-                &roots,
-                &options,
-                installation_config,
-                effective_overrides,
-                warnings,
+            for path in &metadata_files {
+                read_tracker.record_metadata_path(path.clone());
+            }
+            for observation in &metadata_observations {
+                read_tracker.record_metadata_observation(observation.clone());
+            }
+            let option_base = relevant_workspace_root(&file_path, &roots)
+                .or_else(|| file_path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| {
+                    project_file
+                        .parent()
+                        .map_or_else(PathBuf::new, Path::to_path_buf)
+                });
+            let cache_key = ProjectContextBuildCacheKey {
+                project_file: project_file.clone(),
+                roots: roots.clone(),
+                deleted_paths: cache_path_list(deleted_paths),
+                option_base,
+                options: ProjectOptionsCacheKey::from(&options),
+                overrides: effective_overrides.clone(),
+                exclusions: exclusions.to_vec(),
+                warnings: warnings.clone(),
                 explicit,
-                metadata_files,
-                metadata_observations,
-                exclusions,
-                &mut read_tracker,
-                cancel,
-            )?;
+            };
+            let cached = project_context_cache_get(&cache_key, cancel, work_budget)?;
+            let context = if let Some(cached) = cached {
+                read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
+                cached.context
+            } else {
+                let mut build_tracker = ProjectReadTracker::with_budget(work_budget, deleted_paths);
+                let context = build_project_context(
+                    project_file,
+                    &file_path,
+                    &roots,
+                    &options,
+                    installation_config,
+                    effective_overrides,
+                    warnings,
+                    explicit,
+                    Vec::new(),
+                    Vec::new(),
+                    exclusions,
+                    &mut build_tracker,
+                    cancel,
+                )?;
+                let cached = CachedProjectContext {
+                    context: context.clone(),
+                    observations: build_tracker.observations,
+                    metadata_paths: build_tracker.metadata_paths,
+                    metadata_observations: build_tracker.metadata_observations,
+                };
+                read_tracker.merge_project_context_reads(&cached, cancel, work_budget)?;
+                project_context_cache_insert(cache_key, cached);
+                context
+            };
             if let Some(work_budget) = work_budget {
                 work_budget.check_cancelled()?;
             }
-            Ok(read_tracker.into_discovery(context))
+            Ok(read_tracker.into_discovery(context, discovery_selection.clone()))
         }
         ProjectSelection::Standalone {
             metadata_files,
@@ -2274,7 +2736,7 @@ fn discover_context_with_selections(
             if let Some(work_budget) = work_budget {
                 work_budget.check_cancelled()?;
             }
-            Ok(read_tracker.into_discovery(context))
+            Ok(read_tracker.into_discovery(context, discovery_selection.clone()))
         }
         ProjectSelection::Incomplete {
             metadata_files,
@@ -2295,7 +2757,7 @@ fn discover_context_with_selections(
             if override_error.is_some() {
                 context.override_error = override_error;
             }
-            Ok(read_tracker.into_discovery(context))
+            Ok(read_tracker.into_discovery(context, discovery_selection.clone()))
         }
     }
 }
@@ -2749,6 +3211,107 @@ fn project_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
 }
 
 fn project_directory_entries(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<ProjectDirectoryEntries, String> {
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+    }
+    let (cache_active, cached) = PROJECT_DISCOVERY_CACHE.with(|cache| {
+        cache.borrow().as_ref().map_or((false, None), |cache| {
+            (true, cache.directory_entries.get(directory).cloned())
+        })
+    });
+    if !cache_active {
+        #[cfg(any(test, feature = "test-support"))]
+        test_record_project_directory_listing(true);
+        return read_project_directory_entries(directory, cancel, work_budget);
+    }
+    if let Some(cached) = cached {
+        let current_stamp = project_directory_stamp(directory, cancel, work_budget)?;
+        if current_stamp.as_ref() == Some(&cached.stamp) {
+            if let Some(work_budget) = work_budget {
+                work_budget.charge_path_visits(
+                    1usize
+                        .saturating_add(cached.entries.dproj.len())
+                        .saturating_add(cached.entries.dpr_or_dpk.len()),
+                )?;
+            }
+            let _ = with_project_discovery_cache(|cache| {
+                cache.stats.directory_listing_hits =
+                    cache.stats.directory_listing_hits.saturating_add(1);
+            });
+            check_project_scan_cancel(cancel)?;
+            return Ok(cached.entries);
+        }
+        let _ = with_project_discovery_cache(|cache| {
+            cache.directory_entries.remove(directory);
+        });
+    }
+
+    let before_stamp = project_directory_stamp(directory, cancel, work_budget)?;
+    #[cfg(any(test, feature = "test-support"))]
+    test_record_project_directory_listing(true);
+    let result = read_project_directory_entries(directory, cancel, work_budget);
+    if let Ok(entries) = &result {
+        let after_stamp = project_directory_stamp(directory, cancel, work_budget)?;
+        let _ = with_project_discovery_cache(|cache| {
+            cache.stats.directory_listing_reads =
+                cache.stats.directory_listing_reads.saturating_add(1);
+            if let (Some(before), Some(after)) = (before_stamp, after_stamp)
+                && before == after
+            {
+                cache.directory_entries.insert(
+                    directory.to_path_buf(),
+                    CachedProjectDirectoryEntries {
+                        entries: entries.clone(),
+                        stamp: after,
+                    },
+                );
+            }
+        });
+    }
+    result
+}
+
+fn project_directory_stamp(
+    directory: &Path,
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+) -> Result<Option<ProjectDirectoryStamp>, String> {
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+        work_budget.charge_path_visits(1)?;
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    test_record_project_directory_listing(false);
+    let stamp = match fs::metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => Some(ProjectDirectoryStamp {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }),
+        Ok(_) => None,
+        Err(_) => None,
+    };
+    check_project_scan_cancel(cancel)?;
+    if let Some(work_budget) = work_budget {
+        work_budget.check_cancelled()?;
+    }
+    Ok(stamp)
+}
+
+fn read_project_directory_entries(
     directory: &Path,
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
@@ -4028,6 +4591,9 @@ fn build_project_context(
     cancel: Option<&AtomicBool>,
 ) -> Result<ProjectContext, String> {
     check_project_scan_cancel(cancel)?;
+    #[cfg(any(test, feature = "test-support"))]
+    test_record_project_discovery(true);
+    record_project_discovery_cache_build();
     let project_dir = project_file
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
@@ -6091,6 +6657,66 @@ fn resolve_existing_path_status(
         };
         lexical_normalize(&current.join(path))
     };
+    #[cfg(test)]
+    if TEST_USE_LEGACY_PATH_RESOLUTION.with(std::cell::Cell::get) {
+        return resolve_existing_path_status_legacy(&absolute, warnings, kind);
+    }
+    // Linux follows intermediate directory symlinks but keeps a final symlink
+    // as an entry, matching the component walk below. This also lets paths
+    // through execute-only directories resolve without requiring a listing.
+    #[cfg(target_os = "linux")]
+    if fs::symlink_metadata(&absolute).is_ok() {
+        return ExistingPathStatus::Found(absolute);
+    }
+    let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+    for component in absolute.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let wanted = component.to_string_lossy();
+        let entries = match path_resolution_directory_listing(&current) {
+            PathResolutionDirectoryListing::Entries(entries) => entries,
+            PathResolutionDirectoryListing::Missing => {
+                return ExistingPathStatus::Missing;
+            }
+            PathResolutionDirectoryListing::Error(error) => {
+                warnings.push(format!(
+                    "could not inspect {kind} path under {}: {error}",
+                    current.display()
+                ));
+                return ExistingPathStatus::Unresolvable;
+            }
+        };
+        let folded_wanted = wanted.to_ascii_lowercase();
+        let Some(matches) = entries.case_insensitive_names.get(&folded_wanted) else {
+            return ExistingPathStatus::Missing;
+        };
+        if let Some(index) = matches
+            .iter()
+            .find(|&&index| entries.names[index].as_os_str() == component)
+        {
+            current.push(&entries.names[*index]);
+            continue;
+        }
+        if matches.len() > 1 {
+            warnings.push(format!(
+                "ambiguous case-insensitive {kind} path component {wanted:?} under {}",
+                current.display()
+            ));
+            return ExistingPathStatus::Unresolvable;
+        }
+        current.push(&entries.names[matches[0]]);
+    }
+    ExistingPathStatus::Found(current)
+}
+
+#[cfg(test)]
+// Keep the former walk available to the ignored benchmark for a same-process baseline.
+fn resolve_existing_path_status_legacy(
+    absolute: &Path,
+    warnings: &mut Vec<String>,
+    kind: &str,
+) -> ExistingPathStatus {
     let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
     for component in absolute.components() {
         let Component::Normal(component) = component else {
@@ -6098,7 +6724,7 @@ fn resolve_existing_path_status(
         };
         let wanted = component.to_string_lossy();
         let mut matches = Vec::new();
-        let entries = match fs::read_dir(&current) {
+        let entries = match read_dir_for_path_resolution(&current) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return ExistingPathStatus::Missing;
@@ -6147,6 +6773,142 @@ fn resolve_existing_path_status(
         current = next;
     }
     ExistingPathStatus::Found(current)
+}
+
+#[derive(Debug, Clone, Default)]
+struct PathResolutionDirectoryEntries {
+    names: Vec<std::ffi::OsString>,
+    case_insensitive_names: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+enum PathResolutionDirectoryListing {
+    // Shared so a cache hit does not copy a large directory per lookup.
+    Entries(Arc<PathResolutionDirectoryEntries>),
+    Missing,
+    Error(String),
+}
+
+thread_local! {
+    static PATH_RESOLUTION_DIRECTORY_CACHE: std::cell::RefCell<Option<HashMap<PathBuf, PathResolutionDirectoryListing>>> = const { std::cell::RefCell::new(None) };
+}
+
+struct PathResolutionCacheScope {
+    previous: Option<HashMap<PathBuf, PathResolutionDirectoryListing>>,
+}
+
+impl PathResolutionCacheScope {
+    fn new() -> Self {
+        let previous =
+            PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| cache.replace(Some(HashMap::new())));
+        Self { previous }
+    }
+}
+
+impl Drop for PathResolutionCacheScope {
+    fn drop(&mut self) {
+        PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
+            cache.replace(self.previous.take());
+        });
+    }
+}
+
+fn path_resolution_directory_listing(path: &Path) -> PathResolutionDirectoryListing {
+    let cached = PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(path))
+            .cloned()
+    });
+    if let Some(cached) = cached {
+        return cached;
+    }
+
+    let listing = match read_dir_for_path_resolution(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            PathResolutionDirectoryListing::Missing
+        }
+        Err(error) => PathResolutionDirectoryListing::Error(error.to_string()),
+        Ok(directory) => {
+            let mut entries = PathResolutionDirectoryEntries::default();
+            let mut error = None;
+            for entry in directory {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(entry_error) => {
+                        error = Some(entry_error.to_string());
+                        break;
+                    }
+                };
+                let name = entry.file_name();
+                let index = entries.names.len();
+                entries
+                    .case_insensitive_names
+                    .entry(name.to_string_lossy().to_ascii_lowercase())
+                    .or_default()
+                    .push(index);
+                entries.names.push(name);
+            }
+            match error {
+                Some(error) => PathResolutionDirectoryListing::Error(error),
+                None => PathResolutionDirectoryListing::Entries(Arc::new(entries)),
+            }
+        }
+    };
+    PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(path.to_path_buf(), listing.clone());
+        }
+    });
+    listing
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PATH_RESOLUTION_READ_DIR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_USE_LEGACY_PATH_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_dir_for_path_resolution(path: &Path) -> io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    TEST_PATH_RESOLUTION_READ_DIR_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    fs::read_dir(path)
+}
+
+#[cfg(test)]
+fn with_path_resolution_read_dir_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    TEST_PATH_RESOLUTION_READ_DIR_CALLS.with(|calls| calls.set(0));
+    let result = run();
+    let count = TEST_PATH_RESOLUTION_READ_DIR_CALLS.with(std::cell::Cell::get);
+    (result, count)
+}
+
+#[cfg(test)]
+struct LegacyPathResolutionGuard {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl LegacyPathResolutionGuard {
+    fn new() -> Self {
+        Self {
+            previous: TEST_USE_LEGACY_PATH_RESOLUTION.with(|legacy| legacy.replace(true)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacyPathResolutionGuard {
+    fn drop(&mut self) {
+        TEST_USE_LEGACY_PATH_RESOLUTION.with(|legacy| legacy.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn with_legacy_path_resolution<T>(run: impl FnOnce() -> T) -> T {
+    let _guard = LegacyPathResolutionGuard::new();
+    run()
 }
 
 fn is_windows_absolute(path: &Path) -> bool {
@@ -8799,12 +9561,14 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectiveOverrides, MAX_OWNERSHIP_CANDIDATES, MAX_OWNERSHIP_SOURCE_BYTES,
-        MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES, MetadataObservation,
-        ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectReadStamp,
-        ProjectReadTracker, ReadPolicy, content_hash_bytes, path_stamp_result,
-        project_candidate_membership, read_bounded_with_tracker, read_package_metadata,
+        EffectiveOverrides, ExistingPathStatus, MAX_OWNERSHIP_CANDIDATES,
+        MAX_OWNERSHIP_SOURCE_BYTES, MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES,
+        MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry,
+        ProjectPathProvenance, ProjectReadStamp, ProjectReadTracker, ReadPolicy,
+        content_hash_bytes, path_stamp_result, project_candidate_membership,
+        read_bounded_with_tracker, read_package_metadata, resolve_existing_path_status,
         test_before_project_read_at, test_cancel_project_scan_after_checks,
+        with_legacy_path_resolution, with_path_resolution_read_dir_count,
     };
     use crate::delphi_overrides::OverrideSession;
     use std::cell::Cell;
@@ -8881,6 +9645,373 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn path_resolution_prefers_an_exact_component_over_case_variants() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let exact = temp.path().join("Foo");
+        fs::create_dir(&exact).expect("exact directory");
+        fs::create_dir(temp.path().join("FOO")).expect("case variant directory");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&exact, &mut warnings, "unit path");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, exact),
+            ExistingPathStatus::Missing => panic!("exact entry should be found"),
+            ExistingPathStatus::Unresolvable => panic!("exact entry should be resolvable"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_returns_on_disk_spelling_for_case_insensitive_matches() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let expected = temp.path().join("Foo").join("BaR.pas");
+        fs::create_dir(temp.path().join("Foo")).expect("directory");
+        fs::write(&expected, b"").expect("unit file");
+        let requested = temp.path().join("foo").join("bar.PAS");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, expected),
+            ExistingPathStatus::Missing => panic!("case-insensitive entry should be found"),
+            ExistingPathStatus::Unresolvable => {
+                panic!("a unique case-insensitive match should resolve")
+            }
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_rejects_ambiguous_case_insensitive_matches() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        fs::create_dir(temp.path().join("Foo")).expect("first case variant");
+        fs::create_dir(temp.path().join("FOO")).expect("second case variant");
+        let requested = temp.path().join("foo");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "ambiguous case-insensitive unit path component \"foo\" under {}",
+                temp.path().display()
+            )]
+        );
+    }
+
+    #[test]
+    fn path_resolution_reports_missing_components_without_a_warning() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let requested = temp.path().join("Missing").join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        assert!(matches!(status, ExistingPathStatus::Missing));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_reports_file_as_directory_as_unresolvable() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let file = temp.path().join("NotADirectory");
+        fs::write(&file, b"").expect("regular file");
+        let requested = file.join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with(&format!(
+            "could not inspect unit path under {}:",
+            file.display()
+        )));
+    }
+
+    #[test]
+    fn path_resolution_joins_relative_paths_to_current_directory() {
+        let current = std::env::current_dir().expect("current directory");
+        let temp = tempfile::Builder::new()
+            .prefix("pascal-project-relative-")
+            .tempdir_in(&current)
+            .expect("temporary directory under current directory");
+        let expected = temp.path().join("Unit.pas");
+        fs::write(&expected, b"").expect("unit file");
+        let requested = expected
+            .strip_prefix(&current)
+            .expect("temporary directory is under the current directory");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(requested, &mut warnings, "unit path");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, expected),
+            ExistingPathStatus::Missing => panic!("relative path should be found"),
+            ExistingPathStatus::Unresolvable => panic!("relative path should be resolvable"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_lexically_normalizes_parent_components() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let expected = temp.path().join("Target").join("Unit.pas");
+        fs::create_dir(temp.path().join("Target")).expect("target directory");
+        fs::write(&expected, b"").expect("unit file");
+        let requested = temp
+            .path()
+            .join("Unused")
+            .join("..")
+            .join("Target")
+            .join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit path");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, expected),
+            ExistingPathStatus::Missing => panic!("normalized path should be found"),
+            ExistingPathStatus::Unresolvable => panic!("normalized path should be resolvable"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_preserves_spelling_through_symlinked_directories() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("Target");
+        let link = temp.path().join("Link");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("Unit.pas"), b"").expect("unit file");
+        symlink(&target, &link).expect("directory symlink");
+        let requested = link.join("Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+
+        match status {
+            ExistingPathStatus::Found(path) => assert_eq!(path, requested),
+            ExistingPathStatus::Missing => panic!("symlinked target should be found"),
+            ExistingPathStatus::Unresolvable => panic!("symlinked target should resolve"),
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_rejects_windows_absolute_paths_on_linux() {
+        let requested = std::path::Path::new(r"C:\Delphi\Unit.pas");
+        let mut warnings = Vec::new();
+
+        let status = resolve_existing_path_status(requested, &mut warnings, "unit path");
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Windows path in unit path is unavailable on Linux and was omitted: {}",
+                requested.display()
+            )]
+        );
+    }
+
+    #[test]
+    fn path_resolution_does_not_list_directories_for_exact_paths() {
+        const PATHS: usize = 24;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let units = temp.path().join("Source").join("Units");
+        fs::create_dir_all(&units).expect("unit directory");
+        let paths = (0..PATHS)
+            .map(|index| {
+                let path = units.join(format!("Unit{index:02}.pas"));
+                fs::write(&path, b"").expect("unit file");
+                path
+            })
+            .collect::<Vec<_>>();
+        let (statuses, read_dir_calls) = with_path_resolution_read_dir_count(|| {
+            paths
+                .iter()
+                .map(|path| {
+                    let mut warnings = Vec::new();
+                    resolve_existing_path_status(path, &mut warnings, "unit")
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            read_dir_calls, 0,
+            "exact paths should avoid directory listings"
+        );
+        for (path, status) in paths.iter().zip(statuses) {
+            match status {
+                ExistingPathStatus::Found(resolved) => assert_eq!(&resolved, path),
+                ExistingPathStatus::Missing => panic!("exact path should be found"),
+                ExistingPathStatus::Unresolvable => panic!("exact path should be resolvable"),
+            }
+        }
+    }
+
+    #[test]
+    fn project_discovery_reuses_case_insensitive_directory_listings() {
+        const PATHS: usize = 24;
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let shared_parent = root.join("Tools").join("Units");
+        fs::create_dir_all(&shared_parent).expect("shared unit directory");
+        let mut raw_paths = Vec::new();
+        let mut expected_paths = Vec::new();
+        for index in 0..PATHS {
+            let directory = shared_parent.join(format!("Package{index:02}"));
+            fs::create_dir(&directory).expect("package unit directory");
+            raw_paths.push(format!("tools/units/Package{index:02}"));
+            expected_paths.push(directory);
+        }
+        let main = root.join("App.dpr");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join("App.dproj"),
+            format!(
+                "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>{}</DCC_UnitSearchPath></PropertyGroup></Project>",
+                raw_paths.join(";")
+            ),
+        )
+        .expect("project descriptor");
+
+        let (context, read_dir_calls) = with_path_resolution_read_dir_count(|| {
+            ProjectContext::discover_with_overrides(
+                &main,
+                &[root.to_path_buf()],
+                &ProjectOptions::default(),
+                &OverrideSession::new(None),
+            )
+        });
+        let context = context.expect("discover project");
+
+        for expected in expected_paths {
+            assert!(
+                context.search_paths.contains(&expected),
+                "case-insensitive discovery should retain on-disk spelling for {}",
+                expected.display()
+            );
+        }
+        assert_eq!(
+            read_dir_calls,
+            root.components().count() + 2,
+            "shared case-insensitive prefixes should be listed once"
+        );
+    }
+
+    #[test]
+    fn project_discovery_does_not_reuse_path_listings_across_calls() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path();
+        let main = root.join("App.dpr");
+        fs::write(&main, "program App; begin end.").expect("main source");
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource><DCC_UnitSearchPath>tools/units</DCC_UnitSearchPath></PropertyGroup></Project>",
+        )
+        .expect("project descriptor");
+        let options = ProjectOptions::default();
+        let overrides = OverrideSession::new(None);
+        let requested = root.join("tools").join("units");
+        let expected = root.join("Tools").join("Units");
+
+        let first = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &overrides,
+        )
+        .expect("first discovery");
+        assert!(first.search_paths.contains(&requested));
+        fs::create_dir_all(&expected).expect("create directory between discovery calls");
+
+        let second = ProjectContext::discover_with_overrides(
+            &main,
+            &[root.to_path_buf()],
+            &options,
+            &overrides,
+        )
+        .expect("second discovery");
+
+        assert!(
+            second.search_paths.contains(&expected),
+            "a later discovery must observe newly-created entries and their on-disk spelling"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the read-only local multidev Delphi repository"]
+    fn benchmark_real_multidev_project_discovery_path_resolution() {
+        let repository = std::path::Path::new("/home/a.simard@multidev.local/gits/multidev");
+        let candidates = [
+            repository.join("Projects/Tools/WebQueryExporter/WebQuery.dproj"),
+            repository.join("Branches/Chaindrive Versions/5.7.07/Chaindrive/cd2000Light.dproj"),
+            repository.join("Common/AES_Codec.dproj"),
+        ];
+        let projects = candidates
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        assert!(
+            !projects.is_empty(),
+            "no benchmark project files are available"
+        );
+
+        for project in projects {
+            let options = ProjectOptions {
+                project_file: Some(project.clone()),
+                ..ProjectOptions::default()
+            };
+            let ((baseline_result, baseline_elapsed), baseline_reads) =
+                with_path_resolution_read_dir_count(|| {
+                    with_legacy_path_resolution(|| {
+                        let start = std::time::Instant::now();
+                        let result = ProjectContext::discover_with_overrides(
+                            &project,
+                            &[repository.to_path_buf()],
+                            &options,
+                            &OverrideSession::new(None),
+                        );
+                        (result, start.elapsed())
+                    })
+                });
+            baseline_result.expect("legacy discovery should complete");
+            println!(
+                "baseline {}: {:?}, {} path-resolution read_dir calls",
+                project.display(),
+                baseline_elapsed,
+                baseline_reads
+            );
+
+            let ((optimized_result, optimized_elapsed), optimized_reads) =
+                with_path_resolution_read_dir_count(|| {
+                    let start = std::time::Instant::now();
+                    let result = ProjectContext::discover_with_overrides(
+                        &project,
+                        &[repository.to_path_buf()],
+                        &options,
+                        &OverrideSession::new(None),
+                    );
+                    (result, start.elapsed())
+                });
+            optimized_result.expect("optimized discovery should complete");
+            println!(
+                "optimized {}: {:?}, {} path-resolution read_dir calls",
+                project.display(),
+                optimized_elapsed,
+                optimized_reads
+            );
+        }
+    }
 
     #[test]
     fn candidate_membership_reports_directory_read_errors() {
@@ -9080,7 +10211,7 @@ mod tests {
         tracker.record(&path, first_stamp.clone(), b"first");
         tracker.record(&path, second_stamp, b"second");
 
-        let discovery = tracker.into_discovery(ProjectContext::default());
+        let discovery = tracker.into_discovery(ProjectContext::default(), None);
         assert_eq!(discovery.observations.len(), 1);
         assert_eq!(discovery.observations[0].stamp, first_stamp);
         assert_eq!(

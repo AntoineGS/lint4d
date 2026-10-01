@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
@@ -54,6 +54,7 @@ use pascal_core::resolver::{
 #[cfg(test)]
 thread_local! {
     static TEST_IMPORT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_CONTEXT_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -64,6 +65,16 @@ pub(crate) fn test_import_resolution_count() -> usize {
 #[cfg(test)]
 pub(crate) fn test_reset_import_resolution_count() {
     TEST_IMPORT_RESOLUTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_context_prune_count() -> usize {
+    TEST_CONTEXT_PRUNES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_context_prune_count() {
+    TEST_CONTEXT_PRUNES.with(|count| count.set(0));
 }
 
 pub(crate) mod code_lenses;
@@ -2175,13 +2186,40 @@ pub(crate) struct LegacyRouteProof {
     context: ContextKey,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ContextState {
     context: ProjectContext,
     watched_paths: HashMap<PathBuf, Option<PathStamp>>,
     project_candidate_memberships: HashMap<PathBuf, Result<ProjectCandidateMembership, String>>,
     project_read_observations: Vec<ProjectReadObservation>,
-    system_pas_search_stamps: RefCell<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    system_pas_search_stamps: Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Clone for ContextState {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            watched_paths: self.watched_paths.clone(),
+            project_candidate_memberships: self.project_candidate_memberships.clone(),
+            project_read_observations: self.project_read_observations.clone(),
+            system_pas_search_stamps: Mutex::new(lock(&self.system_pas_search_stamps).clone()),
+        }
+    }
+}
+
+impl PartialEq for ContextState {
+    /// `system_pas_search_stamps` only memoizes successful freshness checks
+    /// against the current directory stamp, so it does not distinguish states.
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.watched_paths == other.watched_paths
+            && self.project_candidate_memberships == other.project_candidate_memberships
+            && self.project_read_observations == other.project_read_observations
+    }
 }
 
 impl ContextState {
@@ -2212,7 +2250,7 @@ impl ContextState {
         for observation in &self.project_read_observations {
             observation.visit_recovery_payload(visit)?;
         }
-        for search in self.system_pas_search_stamps.borrow().keys() {
+        for search in lock(&self.system_pas_search_stamps).keys() {
             visit(search.directory.as_os_str().len())?;
             if let Some(path) = &search.selected_path {
                 visit(path.as_os_str().len())?;
@@ -2387,7 +2425,7 @@ enum OwnerOrigin {
 #[derive(Debug, Clone)]
 pub(crate) struct KnownDocumentOwner {
     key: ContextKey,
-    state: ContextState,
+    state: Arc<ContextState>,
     origin: OwnerOrigin,
     needs_revalidation: bool,
     follow_current_project_file: bool,
@@ -2566,6 +2604,12 @@ impl WorkspaceRoot {
         let config_root = path.clone();
         let mut source_roots = vec![path.clone()];
         for source in &options.source_paths {
+            // A Windows path is not absolute on other hosts, but it is not
+            // workspace-relative either. Project discovery maps it per
+            // installation and the mapped roots are walked per context.
+            if !cfg!(windows) && is_windows_absolute_source_path(source) {
+                continue;
+            }
             let source_path = PathBuf::from(source);
             let source_path = if source_path.is_absolute() {
                 source_path
@@ -2595,6 +2639,12 @@ impl WorkspaceRoot {
                 && !self.excludes.is_excluded(&path, source_root)
         })
     }
+}
+
+fn is_windows_absolute_source_path(path: &str) -> bool {
+    let bytes = path.trim().as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        || path.trim().starts_with("\\\\")
 }
 
 fn production_override_session() -> (OverrideSession, Vec<String>) {
@@ -2653,6 +2703,7 @@ pub struct Workspace {
     compiled_provider_bindings: Vec<CompiledProviderBinding>,
     compiled_units: HashMap<Url, AuthorizedCompiledUnit>,
     owner_last_used: HashMap<Url, u64>,
+    shared_owner_states: HashMap<ContextKey, Arc<ContextState>>,
     project_selections: ProjectSelections,
     installation_selections: HashMap<PathBuf, String>,
     build_selections: HashMap<PathBuf, BuildChoice>,
@@ -8685,7 +8736,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
-        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, false)
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, false, false)
     }
 
     pub(crate) fn context_for_project_protocol_anchor_with_control(
@@ -8694,7 +8745,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<ContextKey, String> {
-        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, true)
+        self.context_for_uri_with_cancel_and_budget_anchor_policy(uri, cancel, budget, true, false)
     }
 
     fn context_for_uri_with_cancel_and_budget_anchor_policy(
@@ -8703,6 +8754,7 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
         allow_project_anchor: bool,
+        defer_context_pruning: bool,
     ) -> Result<ContextKey, String> {
         let path = uri
             .to_file_path()
@@ -8792,6 +8844,7 @@ impl Workspace {
                         &project_options,
                         cancel,
                         budget,
+                        defer_context_pruning,
                     )
                     .map_err(|error| {
                         if error == CANCELLATION_MESSAGE {
@@ -8810,8 +8863,16 @@ impl Workspace {
                 // explicitly opened legacy source has lost its backing file.
                 // Once project candidates change, freshness fails and normal
                 // automatic discovery is allowed to reconsider the owner.
-                self.contexts.insert(owner.key.clone(), owner.state.clone());
-                self.select_document_context(uri, &owner.key, owner.origin, cancel, budget)?;
+                self.contexts
+                    .insert(owner.key.clone(), ContextState::clone(&owner.state));
+                self.select_document_context_with_pruning(
+                    uri,
+                    &owner.key,
+                    owner.origin,
+                    cancel,
+                    budget,
+                    !defer_context_pruning,
+                )?;
                 return Ok(owner.key);
             }
         }
@@ -8842,11 +8903,19 @@ impl Workspace {
             context,
             observations,
             candidate_memberships,
+            project_selection,
+            project_scope,
         } = discovery;
         for warning in context.warnings.iter().cloned() {
             self.warn(warning);
         }
-        let key = self.context_key_for_path_with_cancel(&path, Some(&context), cancel)?;
+        let key = self.context_key_for_project_discovery(
+            &path,
+            &context,
+            project_selection,
+            project_scope,
+            cancel,
+        )?;
         self.install_context(
             key.clone(),
             context,
@@ -8856,12 +8925,13 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.select_document_context(
+        self.select_document_context_with_pruning(
             uri,
             &key,
             self.owner_origin_for_context_key(&key),
             cancel,
             budget,
+            !defer_context_pruning,
         )?;
         Ok(key)
     }
@@ -8876,12 +8946,21 @@ impl Workspace {
         project_options: &ProjectOptions,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
+        defer_context_pruning: bool,
     ) -> Result<ContextKey, String> {
         if !owner.needs_revalidation
             && self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)?
         {
-            self.contexts.insert(owner.key.clone(), owner.state.clone());
-            self.select_document_context(uri, &owner.key, owner.origin, cancel, budget)?;
+            self.contexts
+                .insert(owner.key.clone(), ContextState::clone(&owner.state));
+            self.select_document_context_with_pruning(
+                uri,
+                &owner.key,
+                owner.origin,
+                cancel,
+                budget,
+                !defer_context_pruning,
+            )?;
             return Ok(owner.key.clone());
         }
 
@@ -8899,7 +8978,14 @@ impl Workspace {
             cancel,
             budget,
         )?;
-        self.select_document_context(uri, &key, owner.origin, cancel, budget)?;
+        self.select_document_context_with_pruning(
+            uri,
+            &key,
+            owner.origin,
+            cancel,
+            budget,
+            !defer_context_pruning,
+        )?;
         Ok(key)
     }
 
@@ -8947,6 +9033,8 @@ impl Workspace {
                     },
                     observations: Vec::new(),
                     candidate_memberships: HashMap::new(),
+                    project_selection: Some((scope.to_path_buf(), selected.to_path_buf())),
+                    project_scope: Some(scope.to_path_buf()),
                 };
                 let mut key = owner.key.clone();
                 key.project_file = None;
@@ -9276,8 +9364,18 @@ impl Workspace {
         key: &ContextKey,
         origin: OwnerOrigin,
     ) {
-        let Some(state) = self.contexts.get(key).cloned() else {
+        let Some(current) = self.contexts.get(key) else {
             return;
+        };
+        // Thousands of sources share a few contexts, and each state can be
+        // hundreds of kilobytes, so owners share one copy while it is current.
+        let state = match self.shared_owner_states.get(key) {
+            Some(shared) if **shared == *current => shared.clone(),
+            _ => {
+                let shared = Arc::new(current.clone());
+                self.shared_owner_states.insert(key.clone(), shared.clone());
+                shared
+            }
         };
         let legacy_route = self.document_owners.get(uri).and_then(|owner| {
             (owner.key == *key)
@@ -9323,6 +9421,8 @@ impl Workspace {
         let Some(state) = self.contexts.get(key).cloned() else {
             return;
         };
+        let state = Arc::new(state);
+        self.shared_owner_states.insert(key.clone(), state.clone());
         for owner in self.document_owners.values_mut() {
             if owner.key == *key {
                 owner.state = state.clone();
@@ -9331,6 +9431,7 @@ impl Workspace {
     }
 
     fn trim_document_owners(&mut self) {
+        let mut evicted = false;
         while self.document_owners.len() > MAX_DOCUMENT_OWNERS {
             let Some(victim) = self
                 .document_owners
@@ -9343,6 +9444,11 @@ impl Workspace {
             };
             self.document_owners.remove(&victim);
             self.owner_last_used.remove(&victim);
+            evicted = true;
+        }
+        if evicted {
+            self.shared_owner_states
+                .retain(|_, state| Arc::strong_count(state) > 1);
         }
     }
 
@@ -9374,48 +9480,40 @@ impl Workspace {
         }
     }
 
-    fn context_key_for_path_with_cancel(
+    fn context_key_for_project_discovery(
         &self,
         path: &Path,
-        context: Option<&ProjectContext>,
+        context: &ProjectContext,
+        selection: Option<(PathBuf, PathBuf)>,
+        discovered_scope: Option<PathBuf>,
         cancel: Option<&AtomicBool>,
     ) -> Result<ContextKey, String> {
-        let selection = self.runtime_selection_for_path_with_cancel(
-            path,
-            &self.workspace_root_paths(),
-            cancel,
-        )?;
-        let project_scope = if let Some(scope) = context
-            .and_then(|context| context.project_file.as_deref())
-            .and_then(Path::parent)
-        {
-            Some(scope.to_path_buf())
-        } else {
-            self.project_scope_for_path_with_cancel(path, context, cancel)?
-        };
+        check_workspace_cancel(cancel)?;
+        let project_scope = discovered_scope.or_else(|| {
+            context
+                .project_file
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        });
         Ok(ContextKey {
-            project_file: context.and_then(|context| context.project_file.clone()),
-            installation_id: context.and_then(selected_installation_id),
+            project_file: context.project_file.clone(),
+            installation_id: selected_installation_id(context),
             workspace_root: self.root_for_path(path),
             project_scope,
             selection_scope: selection.as_ref().map(|(scope, _)| scope.clone()),
             selection_project: selection.map(|(_, project)| project),
-            config: context.and_then(|context| context.config.clone()),
-            platform: context.and_then(|context| context.platform.clone()),
-            build_selection_modes: context.map(|context| {
-                (
-                    context.config_selection.mode,
-                    context.platform_selection.mode,
-                )
-            }),
-            conditional_context: context
-                .map(|context| conditional_context_for_path(context, path))
-                .unwrap_or_default(),
-            context_fingerprint: context
-                .map(crate::navigation::compiled_dcu::project_context_fingerprint),
-            overrides: context
-                .map(|context| context.overrides.clone())
-                .unwrap_or_default(),
+            config: context.config.clone(),
+            platform: context.platform.clone(),
+            build_selection_modes: Some((
+                context.config_selection.mode,
+                context.platform_selection.mode,
+            )),
+            conditional_context: conditional_context_for_path(context, path),
+            context_fingerprint: Some(
+                crate::navigation::compiled_dcu::project_context_fingerprint(context),
+            ),
+            overrides: context.overrides.clone(),
         })
     }
 
@@ -9454,15 +9552,6 @@ impl Workspace {
             budget.map(|budget| budget as &dyn ProjectWorkBudget),
             &deleted_paths,
         )
-    }
-
-    fn runtime_selection_for_path_with_cancel(
-        &self,
-        path: &Path,
-        roots: &[PathBuf],
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-        self.runtime_selection_for_path_with_cancel_and_budget(path, roots, cancel, None)
     }
 
     fn runtime_selection_for_path_with_cancel_and_budget(
@@ -9512,27 +9601,6 @@ impl Workspace {
         runtime_project_selection(path, &candidates, &self.project_selections)
             .map(|(scope, _)| scope)
             .or(candidates.directory)
-    }
-
-    fn project_scope_for_path_with_cancel(
-        &self,
-        path: &Path,
-        context: Option<&ProjectContext>,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Option<PathBuf>, String> {
-        if let Some(scope) = context
-            .and_then(|context| context.project_file.as_deref())
-            .and_then(Path::parent)
-        {
-            return Ok(Some(scope.to_path_buf()));
-        }
-        let roots = self.workspace_root_paths();
-        let candidates = self.project_candidates_with_deleted_paths(path, &roots, cancel)?;
-        Ok(
-            runtime_project_selection(path, &candidates, &self.project_selections)
-                .map(|(scope, _)| scope)
-                .or(candidates.directory),
-        )
     }
 
     fn root_for_path(&self, path: &Path) -> Option<PathBuf> {
@@ -9737,7 +9805,11 @@ impl Workspace {
             state.project_read_observations = staged_observations;
             state.watched_paths.extend(staged_watched);
             state.project_candidate_memberships = staged_memberships;
-            state.system_pas_search_stamps.get_mut().clear();
+            state
+                .system_pas_search_stamps
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
         } else {
             self.contexts.insert(
                 key,
@@ -9746,7 +9818,7 @@ impl Workspace {
                     watched_paths: staged_watched,
                     project_candidate_memberships: staged_memberships,
                     project_read_observations: staged_observations,
-                    system_pas_search_stamps: RefCell::new(HashMap::new()),
+                    system_pas_search_stamps: Mutex::new(HashMap::new()),
                 },
             );
         }
@@ -12136,7 +12208,7 @@ impl Workspace {
             if self.context_state_is_fresh_with_open_documents(&owner.state, cancel, budget)? {
                 self.contexts
                     .entry(owner.key.clone())
-                    .or_insert_with(|| owner.state.clone());
+                    .or_insert_with(|| ContextState::clone(&owner.state));
                 owner.key.clone()
             } else {
                 if let Some(current_owner) = self.document_owners.get_mut(uri) {
@@ -12222,6 +12294,8 @@ impl Workspace {
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        TEST_CONTEXT_PRUNES.with(|count| count.set(count.get().saturating_add(1)));
         check_workspace_cancel(cancel)?;
         let mut used = HashSet::new();
         used.try_reserve(
@@ -12271,13 +12345,25 @@ impl Workspace {
         Ok(())
     }
 
-    fn select_document_context(
+    fn select_document_context_deferred(
         &mut self,
         uri: &Url,
         context_key: &ContextKey,
         origin: OwnerOrigin,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
+    ) -> Result<(), String> {
+        self.select_document_context_with_pruning(uri, context_key, origin, cancel, budget, false)
+    }
+
+    fn select_document_context_with_pruning(
+        &mut self,
+        uri: &Url,
+        context_key: &ContextKey,
+        origin: OwnerOrigin,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+        prune_unused: bool,
     ) -> Result<(), String> {
         check_workspace_cancel(cancel)?;
         if let Some(budget) = budget {
@@ -12290,7 +12376,15 @@ impl Workspace {
         self.document_contexts
             .insert(uri.clone(), context_key.clone());
         self.remember_document_owner_with_origin(uri, context_key, origin);
-        self.prune_unused_contexts_with_control(cancel, budget)
+        if prune_unused {
+            self.prune_unused_contexts_with_control(cancel, budget)
+        } else {
+            check_workspace_cancel(cancel)?;
+            if let Some(budget) = budget {
+                budget.check_cancelled()?;
+            }
+            Ok(())
+        }
     }
 
     fn remember_deleted(&mut self, uri: &Url) {
@@ -14029,7 +14123,7 @@ fn context_state_is_fresh_with_cancel_ignoring_paths(
 
 fn system_pas_search_is_current(
     observation: &SystemPasSearchObservation,
-    checked_stamps: &RefCell<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
+    checked_stamps: &Mutex<HashMap<SystemPasSearchObservation, Option<PathStamp>>>,
     cancel: Option<&AtomicBool>,
     budget: Option<&ReconciliationBudget>,
 ) -> Result<bool, String> {
@@ -14038,8 +14132,7 @@ fn system_pas_search_is_current(
         budget.charge_path_visits(1)?;
     }
     let directory_stamp = path_stamp(&observation.directory);
-    let unchanged_stamp = checked_stamps
-        .borrow()
+    let unchanged_stamp = lock(checked_stamps)
         .get(observation)
         .is_some_and(|stamp| stamp == &directory_stamp);
     if unchanged_stamp {
@@ -14067,9 +14160,7 @@ fn system_pas_search_is_current(
         _ => false,
     };
     if matches {
-        checked_stamps
-            .borrow_mut()
-            .insert(observation.clone(), directory_stamp);
+        lock(checked_stamps).insert(observation.clone(), directory_stamp);
     }
     Ok(matches)
 }
@@ -15386,7 +15477,7 @@ mod tests {
                 uri.clone(),
                 super::KnownDocumentOwner {
                     key: context_key.clone(),
-                    state: super::ContextState::default(),
+                    state: Arc::new(super::ContextState::default()),
                     origin: super::OwnerOrigin::Automatic,
                     needs_revalidation: false,
                     follow_current_project_file: false,
@@ -16229,6 +16320,715 @@ mod tests {
     }
 
     #[test]
+    fn workspace_contexts_keep_project_and_source_specific_inputs() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let left = root.join("Left");
+        let nested = left.join("Nested");
+        let right = root.join("Right");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&right).unwrap();
+
+        let left_project = left.join("Left.dproj");
+        let left_source = left.join("Left.dpr");
+        let nested_source = nested.join("Nested.pas");
+        let right_project = right.join("Right.dproj");
+        let right_source = right.join("Right.dpr");
+        let shared_source = root.join("Shared.pas");
+        fs::write(
+            &left_project,
+            "<Project><PropertyGroup><MainSource>Left.dpr</MainSource><DCCReference Include=\"../Shared.pas\"/></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&left_source, "program Left; begin end.").unwrap();
+        fs::write(&nested_source, "unit Nested; interface implementation end.").unwrap();
+        fs::write(
+            &right_project,
+            "<Project><PropertyGroup><MainSource>Right.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&right_source, "program Right; begin end.").unwrap();
+        fs::write(&shared_source, "unit Shared; interface implementation end.").unwrap();
+        fs::write(
+            nested.join(".delphilsp.json"),
+            r#"{"version":1,"defines":["NESTED_ONLY"]}"#,
+        )
+        .unwrap();
+
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let left_uri = Url::from_file_path(&left_source).unwrap();
+        let nested_uri = Url::from_file_path(&nested_source).unwrap();
+        let right_uri = Url::from_file_path(&right_source).unwrap();
+        let left_key = workspace.context_for_uri(&left_uri).unwrap();
+        let nested_key = workspace.context_for_uri(&nested_uri).unwrap();
+        let right_key = workspace.context_for_uri(&right_uri).unwrap();
+
+        let left_context = &workspace.contexts[&left_key].context;
+        let nested_context = &workspace.contexts[&nested_key].context;
+        let right_context = &workspace.contexts[&right_key].context;
+        assert_eq!(
+            left_context.project_file.as_deref(),
+            Some(left_project.as_path())
+        );
+        assert_eq!(
+            right_context.project_file.as_deref(),
+            Some(right_project.as_path())
+        );
+        assert_ne!(left_key, right_key);
+        assert!(
+            !left_context
+                .effective_conditional_context()
+                .defines
+                .contains_key("NESTED_ONLY")
+        );
+        assert_eq!(
+            nested_context
+                .effective_conditional_context()
+                .defines
+                .get("NESTED_ONLY"),
+            Some(&ConditionalFact::True)
+        );
+        assert!(
+            left_context
+                .explicit_units
+                .get("shared")
+                .is_some_and(|paths| paths.iter().any(|path| path == &shared_source))
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_revalidates_project_changes_and_deletions() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        let first = root.join("First.pas");
+        let second = root.join("Second.pas");
+        let original_project =
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>";
+        fs::write(&project, original_project).unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        fs::write(&first, "unit First; interface implementation end.").unwrap();
+        fs::write(&second, "unit Second; interface implementation end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let cancel = AtomicBool::new(false);
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("workspace snapshot");
+        let records = super::rename::snapshot_records(&snapshot);
+
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource><DCC_Define>CHANGED</DCC_Define></PropertyGroup></Project>",
+        )
+        .unwrap();
+        assert!(super::rename::revalidate_input(&input, &records, &cancel).is_err());
+
+        fs::write(&project, original_project).unwrap();
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("second workspace snapshot");
+        let records = super::rename::snapshot_records(&snapshot);
+        fs::remove_file(&project).unwrap();
+        assert!(super::rename::revalidate_input(&input, &records, &cancel).is_err());
+    }
+
+    #[test]
+    fn workspace_snapshot_discovery_checks_cancellation_between_sources() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        for index in 0..8 {
+            fs::write(
+                root.join(format!("Unit{index}.pas")),
+                format!("unit Unit{index}; interface implementation end."),
+            )
+            .unwrap();
+        }
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let cancel = AtomicBool::new(false);
+        let _cancel_after_first = super::rename::test_cancel_enumerated_contexts_after(1);
+        let result = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        );
+
+        assert_eq!(result.err().as_deref(), Some("request cancelled"));
+    }
+
+    #[test]
+    fn workspace_snapshot_reuses_project_context_builds() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        fs::write(
+            &project,
+            "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        for directory in 0..4 {
+            let source_dir = root.join(format!("Units{directory}"));
+            fs::create_dir_all(&source_dir).unwrap();
+            for source in 0..5 {
+                let unit = format!("Unit{directory}_{source}");
+                fs::write(
+                    source_dir.join(format!("{unit}.pas")),
+                    format!("unit {unit}; interface implementation end."),
+                )
+                .unwrap();
+            }
+        }
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let cancel = AtomicBool::new(false);
+        pascal_project::test_reset_project_discovery_counts();
+        pascal_project::test_reset_project_directory_listing_counts();
+        super::rename::test_reset_sibling_context_reuse_checks();
+        super::test_reset_context_prune_count();
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            std::slice::from_ref(&main_uri),
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("workspace snapshot");
+        let (discoveries, context_builds) = pascal_project::test_project_discovery_counts();
+        let (directory_listing_reads, directory_listing_stamp_checks) =
+            pascal_project::test_project_directory_listing_counts();
+        let (freshness_checks, selection_checks) =
+            super::rename::test_sibling_context_reuse_checks();
+
+        assert_eq!(
+            super::test_context_prune_count(),
+            2,
+            "priority plus one enumeration prune"
+        );
+        assert_eq!(discoveries, 5, "one discovery per exact source directory");
+        assert_eq!(context_builds, 1, "one project has one context build");
+        assert_eq!((freshness_checks, selection_checks), (16, 16));
+        assert!(
+            directory_listing_stamp_checks >= freshness_checks,
+            "cached project listings are stat-validated during sibling freshness checks"
+        );
+        assert!(
+            directory_listing_reads < freshness_checks,
+            "unchanged sibling reuse must validate cached listings without re-listing each time"
+        );
+        assert_eq!(snapshot.sources.len(), 21);
+    }
+
+    #[test]
+    fn workspace_snapshot_rechecks_directory_membership_before_sibling_reuse() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let legacy_project = root.join("Main.dpr");
+        let project = root.join("App.dproj");
+        let first = root.join("A.pas");
+        let second = root.join("B.pas");
+        fs::write(&legacy_project, "program Main; begin end.").unwrap();
+        fs::write(&first, "unit A; interface implementation end.").unwrap();
+        fs::write(&second, "unit B; interface implementation end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook_seen = Arc::clone(&seen);
+        let hook_project = project.clone();
+        let _hook = super::rename::test_after_enumerated_context(
+            move |processed, path, context| {
+                hook_seen
+                    .lock()
+                    .expect("context observations")
+                    .push((path.to_path_buf(), context.project_file.clone()));
+                if processed == 1 {
+                    fs::write(
+                        &hook_project,
+                        "<Project><PropertyGroup><MainSource>Main.dpr</MainSource></PropertyGroup></Project>",
+                    )
+                    .expect("create a nearer project after the first sibling discovery");
+                }
+            },
+        );
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .expect("workspace snapshot");
+        let seen = seen.lock().expect("context observations");
+        let first_project = seen
+            .iter()
+            .find(|(path, _)| path == &first)
+            .map(|(_, project)| project.as_deref());
+        let second_project = seen
+            .iter()
+            .find(|(path, _)| path == &second)
+            .map(|(_, project)| project.as_deref());
+
+        assert!(
+            snapshot
+                .sources
+                .contains_key(&Url::from_file_path(&second).unwrap())
+        );
+        assert_ne!(first_project.flatten(), Some(project.as_path()));
+        assert_eq!(second_project.flatten(), Some(project.as_path()));
+    }
+
+    #[test]
+    fn workspace_snapshot_rechecks_project_metadata_before_sibling_reuse() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let project = root.join("App.dproj");
+        let main = root.join("Main.dpr");
+        let first = root.join("A.pas");
+        let second = root.join("B.pas");
+        let project_text = |define: &str| {
+            format!(
+                "<Project><PropertyGroup><MainSource>Main.dpr</MainSource><DCC_Define>{define}</DCC_Define></PropertyGroup></Project>"
+            )
+        };
+        fs::write(&project, project_text("OLD_FLAG")).unwrap();
+        fs::write(&main, "program Main; begin end.").unwrap();
+        fs::write(&first, "unit A; interface implementation end.").unwrap();
+        fs::write(&second, "unit B; interface implementation end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hook_seen = Arc::clone(&seen);
+        let replacement = project_text("NEW_FLAG");
+        let _hook =
+            super::rename::test_after_enumerated_context(move |processed, path, context| {
+                let defines = &context.effective_conditional_context().defines;
+                hook_seen.lock().expect("context observations").push((
+                    path.to_path_buf(),
+                    defines.contains_key("OLD_FLAG"),
+                    defines.contains_key("NEW_FLAG"),
+                ));
+                if processed == 1 {
+                    fs::write(&project, &replacement)
+                        .expect("change project metadata after the first sibling discovery");
+                }
+            });
+        super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .expect("workspace snapshot");
+        let seen = seen.lock().expect("context observations");
+        let first_defines = seen
+            .iter()
+            .find(|(path, _, _)| path == &first)
+            .map(|(_, old, new)| (*old, *new));
+        let second_defines = seen
+            .iter()
+            .find(|(path, _, _)| path == &second)
+            .map(|(_, old, new)| (*old, *new));
+
+        assert_eq!(first_defines, Some((true, false)));
+        assert_eq!(second_defines, Some((false, true)));
+    }
+
+    #[test]
+    fn workspace_snapshot_assigns_every_source_its_own_discovered_context_key() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let app = root.join("App");
+        let units = app.join("Units");
+        let configured = units.join("Configured");
+        let shared = root.join("Shared");
+        for directory in [&units, &configured, &shared] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            app.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"..\\Shared\\Listed.pas\"/></ItemGroup></Project>",
+        )
+        .unwrap();
+        fs::write(
+            app.join("App.dpr"),
+            "program App; uses Listed in '..\\Shared\\Listed.pas'; begin end.",
+        )
+        .unwrap();
+        fs::write(
+            configured.join(".delphilsp.json"),
+            r#"{"version":1,"defines":["CONFIGURED_ONLY"]}"#,
+        )
+        .unwrap();
+        let mut sources = Vec::new();
+        for (directory, names) in [
+            (&app, &["First", "Second"][..]),
+            (&units, &["Third", "Fourth"][..]),
+            (&configured, &["Fifth", "Sixth"][..]),
+            (&shared, &["Listed", "Unlisted"][..]),
+        ] {
+            for name in names {
+                let path = directory.join(format!("{name}.pas"));
+                fs::write(&path, format!("unit {name}; interface implementation end.")).unwrap();
+                sources.push(path);
+            }
+        }
+
+        let mut fresh = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let expected = sources
+            .iter()
+            .map(|path| {
+                let key = fresh
+                    .context_for_uri(&Url::from_file_path(path).unwrap())
+                    .unwrap();
+                (path.clone(), key)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let _ = super::rename::test_take_enumerated_owners();
+        super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .expect("workspace snapshot");
+        let assigned = super::rename::test_take_enumerated_owners()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        for path in &sources {
+            assert_eq!(
+                assigned.get(path),
+                Some(&expected[path]),
+                "{} must get the context key that its own discovery yields",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn workspace_walk_does_not_join_windows_source_paths_onto_the_root() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        fs::create_dir_all(root.join("Lib")).unwrap();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main; interface implementation end.",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Lib").join("LibUnit.pas"),
+            "unit LibUnit; interface implementation end.",
+        )
+        .unwrap();
+        let options = WorkspaceOptions {
+            source_paths: vec![
+                "C:/DelphiSources/rtl/sys".to_string(),
+                "C:\\DelphiSources\\vcl".to_string(),
+                "\\\\server\\share\\source".to_string(),
+                "Lib".to_string(),
+            ],
+            ..Default::default()
+        };
+        let workspace = test_workspace(vec![root.to_path_buf()], options);
+        let root = super::absolute_path(root.to_path_buf());
+        assert_eq!(
+            workspace.roots[0].source_roots,
+            vec![root.clone(), root.join("Lib")]
+        );
+
+        let computed = super::queries::workspace_diagnostics_from_input(
+            workspace.analysis_input(),
+            &AtomicBool::new(false),
+        );
+
+        if let Err(error) = computed.value {
+            panic!("Windows source paths must not make the workspace walk fail: {error}");
+        }
+    }
+
+    #[test]
+    fn workspace_diagnostics_stop_discovery_at_the_first_incomplete_context() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let ambiguous = root.join("Ambiguous");
+        let clean = root.join("Clean");
+        fs::create_dir_all(&ambiguous).unwrap();
+        fs::create_dir_all(&clean).unwrap();
+        for name in ["First", "Second"] {
+            fs::write(
+                ambiguous.join(format!("{name}.dproj")),
+                format!("<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"),
+            )
+            .unwrap();
+        }
+        let mut ambiguous_sources = Vec::new();
+        for index in 0..5 {
+            let path = ambiguous.join(format!("Unit{index}.pas"));
+            fs::write(
+                &path,
+                format!("unit Unit{index}; interface implementation end."),
+            )
+            .unwrap();
+            ambiguous_sources.push(path);
+        }
+        let clean_source = clean.join("Clean.pas");
+        fs::write(&clean_source, "unit Clean; interface implementation end.").unwrap();
+
+        let mut fresh = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let discovery_complete = |workspace: &mut Workspace, path: &Path| {
+            let key = workspace
+                .context_for_uri(&Url::from_file_path(path).unwrap())
+                .unwrap();
+            workspace.contexts[&key].context.discovery_complete
+        };
+        assert!(
+            discovery_complete(&mut fresh, &clean_source),
+            "fixture precondition: the clean source has a complete context"
+        );
+        assert!(
+            !discovery_complete(&mut fresh, &ambiguous_sources[0]),
+            "fixture precondition: two project files make the context incomplete"
+        );
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let _ = super::rename::test_take_enumerated_owners();
+        let computed = super::queries::workspace_diagnostics_from_input(
+            workspace.analysis_input(),
+            &AtomicBool::new(false),
+        );
+        let discovered = super::rename::test_take_enumerated_owners();
+
+        let Err(error) = computed.value else {
+            panic!("an incomplete workspace scan must fail");
+        };
+        assert!(
+            error.starts_with("workspace diagnostic scan incomplete:"),
+            "{error}"
+        );
+        assert!(
+            discovered.len() < ambiguous_sources.len(),
+            "discovery must stop at the first incomplete context, not visit all {} sources: {:?}",
+            ambiguous_sources.len() + 1,
+            discovered.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        );
+        let discovered = discovered
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        let (last, earlier) = discovered.split_last().expect("at least one source");
+        assert!(ambiguous_sources.contains(last), "{discovered:?}");
+        assert!(
+            earlier.iter().all(|path| path == &clean_source),
+            "{discovered:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_keeps_ambiguous_dpr_ownership_source_specific() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        let first = root.join("First.dpr");
+        let second = root.join("Second.dpr");
+        fs::write(&first, "program First; begin end.").unwrap();
+        fs::write(&second, "program Second; begin end.").unwrap();
+
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let input = workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+        pascal_project::test_reset_project_discovery_counts();
+        let snapshot = super::rename::build_snapshot(
+            &input,
+            &[],
+            &[],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            &[],
+            &cancel,
+        )
+        .expect("workspace snapshot");
+        let (discoveries, _) = pascal_project::test_project_discovery_counts();
+
+        let first_uri = Url::from_file_path(first).unwrap();
+        let second_uri = Url::from_file_path(second).unwrap();
+        assert!(snapshot.sources.contains_key(&first_uri));
+        assert!(snapshot.sources.contains_key(&second_uri));
+        assert_eq!(
+            discoveries, 2,
+            "ambiguous sibling candidates need per-source discovery"
+        );
+    }
+
+    #[test]
+    fn interface_parameter_queries_and_rename_stay_in_the_declaring_document() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let unit_path = temp.path().join("U.pas");
+        let sibling_path = temp.path().join("Unrelated.pas");
+        let source = concat!(
+            "unit U;\n",
+            "interface\n",
+            "procedure StartTransaction(aDatabase: TIBDatabase; aTransaction: TIBTransaction);\n",
+            "implementation\n",
+            "uses Unrelated;\n",
+            "procedure StartTransaction(aDatabase: TIBDatabase; aTransaction: TIBTransaction);\n",
+            "begin aTransaction.StartTransaction; end;\n",
+            "end.\n",
+        );
+        fs::write(&unit_path, source).expect("unit source");
+        fs::write(
+            &sibling_path,
+            "unit Unrelated;\ninterface\nvar aTransaction: Integer;\nimplementation\nend.\n",
+        )
+        .expect("unrelated sibling source with a colliding public name");
+        let uri = Url::from_file_path(&unit_path).expect("unit URI");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let input = workspace.analysis_input();
+        let parameter_offset = source
+            .match_indices("aTransaction")
+            .nth(2)
+            .expect("body parameter reference")
+            .0;
+        let prefix = &source[..parameter_offset];
+        let position = Position::new(
+            prefix.matches('\n').count() as u32,
+            prefix.rsplit('\n').next().expect("source line").len() as u32,
+        );
+        let cancel = AtomicBool::new(false);
+
+        super::resolver::reset_test_source_loads();
+        let references =
+            super::queries::references_from_input(input.clone(), &uri, position, true, &cancel);
+        let references = references
+            .value
+            .expect("same-document parameter references");
+        assert_eq!(references.len(), 3, "declaration headings and body use");
+        assert!(references.iter().all(|location| location.uri == uri));
+        assert!(
+            references
+                .iter()
+                .any(|location| location.range.start.line == 2),
+            "references should include the interface heading parameter"
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "references must not load an unrelated sibling unit"
+        );
+
+        super::resolver::reset_test_source_loads();
+        let highlights =
+            super::queries::highlights_from_input(input.clone(), &uri, position, &cancel);
+        assert!(
+            highlights.value.is_ok(),
+            "documentHighlight should succeed: {:?}",
+            highlights.value.err()
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "documentHighlight must not load an unrelated sibling unit"
+        );
+
+        super::resolver::reset_test_source_loads();
+        let prepared = super::rename::prepare_from_input(input.clone(), &uri, position, &cancel);
+        assert!(
+            prepared.value.is_ok(),
+            "prepareRename should succeed: {:?}",
+            prepared.value.err()
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "prepareRename must not load an unrelated sibling unit"
+        );
+
+        super::resolver::reset_test_source_loads();
+        let rename = super::rename::rename_from_input(
+            input,
+            &uri,
+            position,
+            "aNewTransaction",
+            false,
+            &cancel,
+        );
+        let edit = rename.value.expect("parameter rename edit");
+        let edits = edit
+            .changes
+            .expect("legacy changes edit")
+            .remove(&uri)
+            .expect("declaring document edits");
+        assert_eq!(
+            edits.len(),
+            3,
+            "both headings and the body occurrence rename"
+        );
+        assert!(edits.iter().all(|edit| edit.new_text == "aNewTransaction"));
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.range.start.line)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([2, 5, 6]),
+            "rename edits should cover the interface heading, implementation heading, and body"
+        );
+        assert_eq!(
+            super::resolver::test_source_load_count(&sibling_path),
+            0,
+            "rename must not load an unrelated sibling unit"
+        );
+    }
+
+    #[test]
     fn warming_a_file_caches_it_and_its_direct_imports() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, provider_uri) = provider_fixture(temp.path());
@@ -16489,6 +17289,112 @@ mod tests {
             super::rename::revalidate_input(&input, &tokens.records, &cancel).is_err(),
             "a changed physical dependency must still invalidate the result"
         );
+    }
+
+    #[test]
+    fn document_owners_share_unchanged_context_state() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        fs::write(
+            root.join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(root.join("App.dpr"), "program App; begin end.").unwrap();
+        let uris = (0..4)
+            .map(|index| {
+                let path = root.join(format!("Unit{index}.pas"));
+                fs::write(
+                    &path,
+                    format!("unit Unit{index}; interface implementation end."),
+                )
+                .unwrap();
+                Url::from_file_path(path).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let key = workspace.context_for_uri(&uris[0]).unwrap();
+        for uri in &uris[1..3] {
+            assert_eq!(workspace.context_for_uri(uri).unwrap(), key);
+        }
+
+        let first = &workspace.document_owners[&uris[0]];
+        for uri in &uris[1..3] {
+            assert!(
+                std::ptr::eq(
+                    &first.state.context,
+                    &workspace.document_owners[uri].state.context
+                ),
+                "owners of one unchanged context must share its state"
+            );
+        }
+
+        let changed = PathBuf::from("/changed/after/first/owners");
+        workspace
+            .contexts
+            .get_mut(&key)
+            .unwrap()
+            .watched_paths
+            .insert(changed.clone(), None);
+        workspace.remember_document_owner_with_origin(&uris[3], &key, OwnerOrigin::Automatic);
+        let latest = &workspace.document_owners[&uris[3]];
+        assert!(
+            latest.state.watched_paths.contains_key(&changed),
+            "a changed context must not be served from a stale shared state"
+        );
+        assert!(!std::ptr::eq(
+            &workspace.document_owners[&uris[0]].state.context,
+            &latest.state.context
+        ));
+    }
+
+    #[test]
+    fn shared_owner_states_are_released_with_their_last_owner() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let source = temp.path().join("Unit.pas");
+        fs::write(&source, "unit Unit; interface implementation end.").unwrap();
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let discovered = workspace
+            .context_for_uri(&Url::from_file_path(&source).unwrap())
+            .unwrap();
+        workspace.document_owners.clear();
+        workspace.shared_owner_states.clear();
+        let evicted_key = ContextKey {
+            project_scope: Some(PathBuf::from("/evicted")),
+            ..discovered.clone()
+        };
+        let retained_key = ContextKey {
+            project_scope: Some(PathBuf::from("/retained")),
+            ..discovered
+        };
+        for key in [&evicted_key, &retained_key] {
+            workspace
+                .contexts
+                .insert(key.clone(), ContextState::default());
+        }
+        let uri = |index: usize| Url::parse(&format!("file:///workspace/Unit{index}.pas")).unwrap();
+        workspace.remember_document_owner_with_origin(
+            &uri(0),
+            &evicted_key,
+            OwnerOrigin::Automatic,
+        );
+        assert!(workspace.shared_owner_states.contains_key(&evicted_key));
+
+        for index in 1..=super::MAX_DOCUMENT_OWNERS {
+            workspace.remember_document_owner_with_origin(
+                &uri(index),
+                &retained_key,
+                OwnerOrigin::Automatic,
+            );
+        }
+
+        assert!(!workspace.document_owners.contains_key(&uri(0)));
+        assert!(
+            !workspace.shared_owner_states.contains_key(&evicted_key),
+            "a shared state without owners must not stay cached"
+        );
+        assert!(workspace.shared_owner_states.contains_key(&retained_key));
     }
 
     #[test]
@@ -18204,7 +19110,7 @@ BDS = '/fake/37'
                 Ok(super::ProjectCandidateMembership::default()),
             )]),
             project_read_observations: Vec::new(),
-            system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+            system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
         };
         let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
         budget
@@ -18255,7 +19161,7 @@ BDS = '/fake/37'
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
-                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+                system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
             },
         );
         let changed =
@@ -18453,7 +19359,7 @@ BDS = '/fake/37'
                 watched_paths,
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
-                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+                system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
             },
         );
         let incoming = (0..EXISTING)
@@ -18554,13 +19460,13 @@ BDS = '/fake/37'
         };
         let owner = KnownDocumentOwner {
             key,
-            state: ContextState {
+            state: Arc::new(ContextState {
                 context: ProjectContext::default(),
                 watched_paths: HashMap::new(),
                 project_candidate_memberships: HashMap::new(),
                 project_read_observations: Vec::new(),
-                system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
-            },
+                system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
+            }),
             origin: OwnerOrigin::Explicit,
             needs_revalidation: false,
             follow_current_project_file: false,
@@ -20712,7 +21618,7 @@ BDS = '/fake/37'
         };
         let mut owner = super::KnownDocumentOwner {
             key: key.clone(),
-            state: ContextState::default(),
+            state: Arc::new(ContextState::default()),
             origin: super::OwnerOrigin::Inherited,
             needs_revalidation: false,
             follow_current_project_file: false,
@@ -20750,7 +21656,7 @@ BDS = '/fake/37'
         };
         let owner = super::KnownDocumentOwner {
             key: key.clone(),
-            state: ContextState::default(),
+            state: Arc::new(ContextState::default()),
             origin: super::OwnerOrigin::Inherited,
             needs_revalidation: false,
             follow_current_project_file: false,
@@ -21149,7 +22055,7 @@ BDS = '/fake/37'
             watched_paths: HashMap::from([(system_pas.clone(), super::path_stamp(&system_pas))]),
             project_candidate_memberships: HashMap::new(),
             project_read_observations: Vec::new(),
-            system_pas_search_stamps: std::cell::RefCell::new(HashMap::new()),
+            system_pas_search_stamps: std::sync::Mutex::new(HashMap::new()),
         };
 
         assert!(

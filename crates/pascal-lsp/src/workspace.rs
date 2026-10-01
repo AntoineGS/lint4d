@@ -2604,6 +2604,12 @@ impl WorkspaceRoot {
         let config_root = path.clone();
         let mut source_roots = vec![path.clone()];
         for source in &options.source_paths {
+            // A Windows path is not absolute on other hosts, but it is not
+            // workspace-relative either. Project discovery maps it per
+            // installation and the mapped roots are walked per context.
+            if !cfg!(windows) && is_windows_absolute_source_path(source) {
+                continue;
+            }
             let source_path = PathBuf::from(source);
             let source_path = if source_path.is_absolute() {
                 source_path
@@ -2633,6 +2639,12 @@ impl WorkspaceRoot {
                 && !self.excludes.is_excluded(&path, source_root)
         })
     }
+}
+
+fn is_windows_absolute_source_path(path: &str) -> bool {
+    let bytes = path.trim().as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        || path.trim().starts_with("\\\\")
 }
 
 fn production_override_session() -> (OverrideSession, Vec<String>) {
@@ -16740,6 +16752,48 @@ mod tests {
                 "{} must get the context key that its own discovery yields",
                 path.display()
             );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn workspace_walk_does_not_join_windows_source_paths_onto_the_root() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path();
+        fs::create_dir_all(root.join("Lib")).unwrap();
+        fs::write(
+            root.join("Main.pas"),
+            "unit Main; interface implementation end.",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Lib").join("LibUnit.pas"),
+            "unit LibUnit; interface implementation end.",
+        )
+        .unwrap();
+        let options = WorkspaceOptions {
+            source_paths: vec![
+                "C:/DelphiSources/rtl/sys".to_string(),
+                "C:\\DelphiSources\\vcl".to_string(),
+                "\\\\server\\share\\source".to_string(),
+                "Lib".to_string(),
+            ],
+            ..Default::default()
+        };
+        let workspace = test_workspace(vec![root.to_path_buf()], options);
+        let root = super::absolute_path(root.to_path_buf());
+        assert_eq!(
+            workspace.roots[0].source_roots,
+            vec![root.clone(), root.join("Lib")]
+        );
+
+        let computed = super::queries::workspace_diagnostics_from_input(
+            workspace.analysis_input(),
+            &AtomicBool::new(false),
+        );
+
+        if let Err(error) = computed.value {
+            panic!("Windows source paths must not make the workspace walk fail: {error}");
         }
     }
 

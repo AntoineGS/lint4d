@@ -523,6 +523,11 @@ pub(crate) struct RenameSnapshot {
     pub(crate) complete: bool,
     pub(crate) incomplete_reason: Option<String>,
     pub(crate) include_errors: Vec<String>,
+    /// Include owners rejected only for a potentially active unsupported
+    /// directive. Their errors are also listed in `include_errors`.
+    pub(crate) unsupported_directive_owners: Vec<Url>,
+    /// Whether `include_errors` has failures besides unsupported directives.
+    pub(crate) other_include_errors: bool,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
 }
@@ -6037,6 +6042,8 @@ fn build_snapshot_with_policy(
                     complete: false,
                     incomplete_reason: enumeration.reason,
                     include_errors: Vec::new(),
+                    unsupported_directive_owners: Vec::new(),
+                    other_include_errors: false,
                     baseline_records: Vec::new(),
                     mode,
                 });
@@ -6144,6 +6151,8 @@ fn build_snapshot_with_policy(
         &[]
     };
     let mut include_errors = Vec::new();
+    let mut unsupported_directive_owners = Vec::new();
+    let mut other_include_errors = false;
     let candidate_names_are_ascii = candidate_names
         .iter()
         .all(|name| name.trim_start_matches('&').is_ascii());
@@ -6928,6 +6937,8 @@ fn build_snapshot_with_policy(
             result: IncludeAuditResult::default(),
         })?;
         include_errors.extend(include_audit.errors);
+        unsupported_directive_owners = include_audit.unsupported_directive_owners;
+        other_include_errors = include_audit.other_errors;
         if let Some(reason) = include_audit.incomplete_reason {
             complete = false;
             incomplete_reason.get_or_insert(reason);
@@ -6999,6 +7010,8 @@ fn build_snapshot_with_policy(
         complete,
         incomplete_reason,
         include_errors,
+        unsupported_directive_owners,
+        other_include_errors,
         baseline_records,
         mode,
     })
@@ -8130,6 +8143,8 @@ pub(crate) fn check_includes(
 #[derive(Debug, Default)]
 struct IncludeAuditResult {
     errors: Vec<String>,
+    unsupported_directive_owners: Vec<Url>,
+    other_errors: bool,
     incomplete_reason: Option<String>,
 }
 
@@ -8380,11 +8395,12 @@ fn audit_includes(mut auditor: IncludeAuditor<'_>) -> Result<IncludeAuditResult,
         if conditional.directives.iter().any(|directive| {
             directive.potentially_active() && directive.kind == ConditionalDirectiveKind::Other
         }) {
-            auditor.record_error(format!(
+            // Keep auditing: advisory consumers may tolerate this owner when
+            // it is only a dependency, so later owners still need a verdict.
+            auditor.push_error(format!(
                 "rename cannot prove completeness because include owner {uri} contains an unsupported directive"
             ));
-            auditor.stopped = true;
-            break;
+            auditor.result.unsupported_directive_owners.push(uri);
         }
     }
 
@@ -9044,6 +9060,11 @@ impl IncludeAuditor<'_> {
     }
 
     fn record_error(&mut self, error: String) {
+        self.result.other_errors = true;
+        self.push_error(error);
+    }
+
+    fn push_error(&mut self, error: String) {
         match self.result.errors.len().cmp(&MAX_RENAME_INCLUDE_ERRORS) {
             std::cmp::Ordering::Less => self.result.errors.push(error),
             std::cmp::Ordering::Equal => self.result.errors.push(format!(

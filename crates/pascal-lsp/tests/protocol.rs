@@ -3920,9 +3920,14 @@ fn type_hierarchy_refuses_conditionally_unknown_direct_parent_reference() {
 fn type_hierarchy_candidate_cap_refuses_partial_subtypes() {
     let root = tempfile::tempdir().expect("workspace");
     let path = root.path().join("ManyTypes.pas");
+    // Proven children stay under the result limit while the candidates exceed
+    // the candidate limit, so only the candidate cap can refuse them.
     let mut source = String::from("unit ManyTypes; interface type TBase = class end;\n");
-    for index in 0..4_100 {
+    for index in 0..1_000 {
         source.push_str(&format!("TChild{index} = class(TBase) end;\n"));
+    }
+    for index in 0..3_100 {
+        source.push_str(&format!("TOther{index} = class end;\n"));
     }
     source.push_str("implementation end.");
     write_file(&path, &source);
@@ -3947,7 +3952,10 @@ fn type_hierarchy_candidate_cap_refuses_partial_subtypes() {
     );
     let response = server.response(&request);
     assert!(
-        response.error.is_some(),
+        response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("candidate limit")),
         "candidate limit must fail closed: {response:?}"
     );
     assert!(

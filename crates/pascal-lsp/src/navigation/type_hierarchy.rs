@@ -320,7 +320,9 @@ fn validate_item(
         .ok_or_else(|| "type hierarchy source is not selected".to_string())?;
     let mut found = None;
     for (i, symbol) in document.symbols.iter().enumerate().filter(|(_, s)| {
-        s.kind == SymbolKind::Type && matches!(s.type_kind, TypeKind::Class | TypeKind::Interface)
+        s.kind == SymbolKind::Type
+            && matches!(s.type_kind, TypeKind::Class | TypeKind::Interface)
+            && s.name == item.name
     }) {
         let Some(candidate) = item_for_symbol(&item.uri, document, symbol) else {
             continue;
@@ -342,11 +344,18 @@ fn validate_item(
         .ok_or_else(|| "stale or forged type hierarchy item".into())
 }
 
+#[cfg(test)]
+thread_local! {
+    static ITEM_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn item_for_symbol(
     uri: &Url,
     document: &super::ParsedDocument,
     symbol: &Symbol,
 ) -> Option<TypeHierarchyItem> {
+    #[cfg(test)]
+    ITEM_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
     let range = byte_range(&document.source, symbol.declaration_span)?;
     let selection_range = byte_range(&document.source, symbol.selection_span)?;
     let kind = match symbol.type_kind {
@@ -405,5 +414,39 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
         Err("type hierarchy cancelled".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ITEM_BUILDS, prepare, validate_item};
+    use crate::NavigationIndex;
+    use crate::text::offset_to_position;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn item_validation_builds_only_same_named_candidates() {
+        let mut source = String::from("unit ManyTypes; interface type TBase = class end;\n");
+        for index in 0..64 {
+            source.push_str(&format!("TChild{index} = class(TBase) end;\n"));
+        }
+        source.push_str("implementation end.");
+        let uri = lsp_types::Url::parse("file:///ManyTypes.pas").expect("type hierarchy URI");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("type hierarchy source parses");
+        let position = offset_to_position(&source, source.find("TBase").expect("base type"))
+            .expect("base position");
+        let item = prepare(&index, &uri, position, &AtomicBool::new(false))
+            .expect("prepare type hierarchy")
+            .expect("base item")
+            .remove(0);
+
+        ITEM_BUILDS.with(|builds| builds.set(0));
+        let (validated_uri, _) = validate_item(&index, &item).expect("validated item");
+
+        assert_eq!(validated_uri, uri);
+        assert_eq!(ITEM_BUILDS.with(std::cell::Cell::get), 1);
     }
 }

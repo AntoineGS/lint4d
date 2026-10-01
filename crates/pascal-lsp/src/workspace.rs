@@ -2741,10 +2741,47 @@ pub struct Workspace {
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
     include_parents: HashMap<Url, HashSet<Url>>,
+    /// The content hash each indexed source was cached under.
+    indexed_content_hashes: HashMap<Url, u64>,
+    /// Interface-import targets and graph completeness from the latest import
+    /// loading for each unit, for the warmer's closure crawl.
+    interface_import_summaries: HashMap<Url, InterfaceImportSummary>,
+    /// Interface entries this workspace stored that were new or changed.
+    interface_entries_stored: usize,
 }
 
 pub(crate) type DependencyHook =
     Arc<dyn Fn(&Url, usize, usize) -> Result<(), String> + Send + Sync>;
+
+/// Interface-section bindings that resolved to a loaded source unit.
+fn interface_bindings(
+    bindings: &[pascal_core::ResolvedImport],
+    resolved_urls: &HashMap<pascal_core::SourceId, Url>,
+    resolved_revisions: &HashMap<Url, pascal_core::SourceRevision>,
+) -> Vec<crate::project_cache::InterfaceBinding> {
+    bindings
+        .iter()
+        .filter(|import| import.site.section == ImportSection::Interface)
+        .filter_map(|import| {
+            let ResolutionTarget::Found(source_id) = &import.target else {
+                return None;
+            };
+            let uri = resolved_urls.get(source_id)?;
+            Some(crate::project_cache::InterfaceBinding {
+                name: import.site.requested_name.clone(),
+                uri: uri.clone(),
+                revision: resolved_revisions.get(uri)?.clone(),
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct InterfaceImportSummary {
+    targets: Vec<Url>,
+    complete: bool,
+}
 
 pub(crate) struct WarmOutcome {
     pub(crate) fingerprint: Option<u64>,
@@ -3152,6 +3189,8 @@ impl Workspace {
         self.index = NavigationIndex::new();
         self.indexed_files.clear();
         self.indexed_sizes.clear();
+        self.indexed_content_hashes.clear();
+        self.interface_import_summaries.clear();
         self.indexed_bytes = 0;
         self.disk_stamps.clear();
         self.last_used.clear();
@@ -4852,6 +4891,8 @@ impl Workspace {
         clear_recovery_map!(self.pending_unit_file_renames);
         clear_recovery_map!(self.indexed_files);
         clear_recovery_map!(self.indexed_sizes);
+        self.indexed_content_hashes.clear();
+        self.interface_import_summaries.clear();
         clear_recovery_map!(self.disk_stamps);
         clear_recovery_map!(self.last_used);
         clear_recovery_map!(self.pending_diagnostics);
@@ -6677,6 +6718,7 @@ impl Workspace {
         let mut bindings = HashMap::new();
         if imports.is_empty() {
             self.index.bind_imports(uri, bindings);
+            self.store_interface_imports(uri, &context, Vec::new(), true, Vec::new());
             return Ok(Vec::new());
         }
         if context.project_file.is_none() {
@@ -6732,7 +6774,7 @@ impl Workspace {
             .map(|import| ImportSite {
                 byte_range: import.span.start..import.span.end,
                 requested_name: import.name,
-                section: ImportSection::Module,
+                section: import.section,
             })
             .collect::<Vec<_>>();
         // Compile candidates are validated before core lookup so a valid DCU
@@ -6771,67 +6813,72 @@ impl Workspace {
             self.cache_epoch,
             lookup_cancel,
         );
-        let (resolved, cached_report, import_claim, mut resolver) = match import_lookup {
-            crate::project_cache::Lookup::Hit(hit) => {
-                (hit.resolved.clone(), Some(hit.report.clone()), None, None)
-            }
-            crate::project_cache::Lookup::Compute(claim) => {
-                let input = self.analysis_input();
-                let mut resolver = resolver::resolver_for_context_with_session_cache(
-                    context.clone(),
-                    input.roots.clone(),
-                    &input,
-                    resolver_session_cache,
-                );
-                let root = match resolver.load_source(
-                    &path,
-                    legacy_route.as_ref(),
-                    SourceKind::Unit,
-                    resolver_cancel,
-                ) {
-                    Ok(root) => root,
-                    Err(error) => {
-                        let report = resolver.finish();
-                        self.merge_resolution_report(&effective_context_key, &report);
-                        if matches!(error, pascal_core::ResolverError::Cancelled) {
-                            return Err(CANCELLATION_MESSAGE.to_string());
-                        }
-                        self.warn(format!("could not load indexed source {uri}: {error}"));
-                        self.index.bind_imports(uri, bindings);
-                        return Ok(Vec::new());
-                    }
-                };
-                let root = pascal_core::ResolvedUnit {
-                    requested_name: unit_name,
-                    declared_name: self
-                        .index
-                        .unit_name(uri)
-                        .expect("indexed source unit name remains available"),
-                    source: root,
-                };
-                #[cfg(test)]
-                TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-                let resolved = resolver
-                    .resolve_imports_with_text_skipping_browsing(
-                        &root,
-                        &sites,
-                        &indexed_text,
-                        &validated_compiled_names,
+        let (resolved, cached_report, cached_probes, import_claim, mut resolver) =
+            match import_lookup {
+                crate::project_cache::Lookup::Hit(hit) => (
+                    hit.resolved.clone(),
+                    Some(hit.report.clone()),
+                    Some(hit.probes.clone()),
+                    None,
+                    None,
+                ),
+                crate::project_cache::Lookup::Compute(claim) => {
+                    let input = self.analysis_input();
+                    let mut resolver = resolver::resolver_for_context_with_session_cache(
+                        context.clone(),
+                        input.roots.clone(),
+                        &input,
+                        resolver_session_cache,
+                    );
+                    let root = match resolver.load_source(
+                        &path,
+                        legacy_route.as_ref(),
+                        SourceKind::Unit,
                         resolver_cancel,
-                    )
-                    .map_err(|error| {
-                        if matches!(error, pascal_core::ResolverError::Cancelled) {
-                            CANCELLATION_MESSAGE.to_string()
-                        } else {
-                            error.to_string()
+                    ) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            let report = resolver.finish();
+                            self.merge_resolution_report(&effective_context_key, &report);
+                            if matches!(error, pascal_core::ResolverError::Cancelled) {
+                                return Err(CANCELLATION_MESSAGE.to_string());
+                            }
+                            self.warn(format!("could not load indexed source {uri}: {error}"));
+                            self.index.bind_imports(uri, bindings);
+                            return Ok(Vec::new());
                         }
-                    })?;
-                (resolved, None, Some(claim), Some(resolver))
-            }
-            crate::project_cache::Lookup::Cancelled => {
-                return Err(CANCELLATION_MESSAGE.to_string());
-            }
-        };
+                    };
+                    let root = pascal_core::ResolvedUnit {
+                        requested_name: unit_name,
+                        declared_name: self
+                            .index
+                            .unit_name(uri)
+                            .expect("indexed source unit name remains available"),
+                        source: root,
+                    };
+                    #[cfg(test)]
+                    TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+                    let resolved = resolver
+                        .resolve_imports_with_text_skipping_browsing(
+                            &root,
+                            &sites,
+                            &indexed_text,
+                            &validated_compiled_names,
+                            resolver_cancel,
+                        )
+                        .map_err(|error| {
+                            if matches!(error, pascal_core::ResolverError::Cancelled) {
+                                CANCELLATION_MESSAGE.to_string()
+                            } else {
+                                error.to_string()
+                            }
+                        })?;
+                    (resolved, None, None, Some(claim), Some(resolver))
+                }
+                crate::project_cache::Lookup::Cancelled => {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+            };
         let resolved_for_cache = import_claim.as_ref().map(|_| resolved.clone());
         let import_bytes = resolved_for_cache
             .as_ref()
@@ -6855,6 +6902,7 @@ impl Workspace {
             }
         }
         let mut resolved_urls = HashMap::new();
+        let mut resolved_revisions = HashMap::new();
         let mut dependencies = Vec::new();
         for (index, dependency) in dependency_units.into_iter().enumerate() {
             check_workspace_cancel(cancel)?;
@@ -6916,6 +6964,8 @@ impl Workspace {
                     }
                     pinned.insert(dependency_uri.clone());
                     resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
+                    resolved_revisions
+                        .insert(dependency_uri.clone(), dependency.source.revision.clone());
                     let dependency_is_legacy = match &dependency.source.revision {
                         pascal_core::SourceRevision::Disk { path_entry, .. } => {
                             matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative)
@@ -6972,7 +7022,7 @@ impl Workspace {
         if let Some(reason) = rejected_dependency {
             return Err(format!("required dependency was rejected: {reason}"));
         }
-        if report.complete
+        let graph_complete = report.complete
             && !report.observations.iter().any(|observation| {
                 matches!(
                     observation,
@@ -6981,8 +7031,18 @@ impl Workspace {
                         ..
                     }
                 )
-            })
-        {
+            });
+        let interface_probes = cached_probes.or_else(|| {
+            resolved_for_cache
+                .as_ref()
+                .map(|resolved| crate::project_cache::report_probes(&report, resolved).0)
+        });
+        if let Some(probes) = interface_probes {
+            let bindings =
+                interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
+            self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
+        }
+        if graph_complete {
             if let (Some(claim), Some(resolved), Some(bytes)) =
                 (import_claim, resolved_for_cache, import_bytes)
             {
@@ -7076,6 +7136,40 @@ impl Workspace {
         }
         self.index.bind_imports(uri, bindings);
         Ok(dependencies)
+    }
+
+    fn store_interface_imports(
+        &mut self,
+        uri: &Url,
+        context: &ProjectContext,
+        bindings: Vec<crate::project_cache::InterfaceBinding>,
+        complete: bool,
+        probes: Vec<crate::project_cache::Probe>,
+    ) {
+        self.interface_import_summaries.insert(
+            uri.clone(),
+            InterfaceImportSummary {
+                targets: bindings.iter().map(|binding| binding.uri.clone()).collect(),
+                complete,
+            },
+        );
+        let Some(content_hash) = self.indexed_content_hashes.get(uri).copied() else {
+            return;
+        };
+        let value = crate::project_cache::InterfaceImportsValue {
+            bindings,
+            complete,
+            probes,
+        };
+        if self.project_cache.put_interface_imports(
+            uri,
+            context,
+            content_hash,
+            value,
+            self.cache_epoch,
+        ) {
+            self.interface_entries_stored += 1;
+        }
     }
 
     pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
@@ -7595,6 +7689,7 @@ impl Workspace {
             self.indexed_files.insert(uri.clone());
         }
         self.indexed_bytes = self.indexed_bytes.saturating_add(indexed_source.len());
+        self.indexed_content_hashes.insert(uri.clone(), source_hash);
         if let Err(error) = self.set_document_context_with_control(uri, context_key, cancel, budget)
         {
             if budget.is_some_and(|budget| budget.is_exhausted()) || error == CANCELLATION_MESSAGE {
@@ -10344,6 +10439,8 @@ impl Workspace {
             self.document_contexts.remove(uri);
             self.index.clear_import_bindings(uri);
             self.disk_stamps.remove(uri);
+            self.indexed_content_hashes.remove(uri);
+            self.interface_import_summaries.remove(uri);
             if let Some(size) = self.indexed_sizes.remove(uri) {
                 self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
             }
@@ -10508,6 +10605,8 @@ impl Workspace {
             self.document_contexts.remove(uri);
             self.index.clear_import_bindings(uri);
             self.disk_stamps.remove(uri);
+            self.indexed_content_hashes.remove(uri);
+            self.interface_import_summaries.remove(uri);
             if let Some(size) = self.indexed_sizes.remove(uri) {
                 self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
             }
@@ -12159,6 +12258,8 @@ impl Workspace {
         self.document_contexts.remove(uri);
         self.index.clear_import_bindings(uri);
         self.disk_stamps.remove(uri);
+        self.indexed_content_hashes.remove(uri);
+        self.interface_import_summaries.remove(uri);
         if let Some(size) = self.indexed_sizes.remove(uri) {
             self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
         }
@@ -13372,7 +13473,7 @@ impl Workspace {
             .map(|import| ImportSite {
                 byte_range: import.span.start..import.span.end,
                 requested_name: import.name,
-                section: ImportSection::Module,
+                section: import.section,
             })
             .collect::<Vec<_>>();
         let legacy_route = self.legacy_route_for_resolver(uri, path, context_key, context);
@@ -16321,6 +16422,75 @@ mod tests {
 
     fn worker_view(main: &Workspace) -> Workspace {
         Workspace::from_analysis_input(&main.analysis_input())
+    }
+
+    /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
+    fn interface_entry(
+        workspace: &Workspace,
+        uri: &Url,
+    ) -> Option<std::sync::Arc<crate::project_cache::InterfaceImportsValue>> {
+        let mut worker = worker_view(workspace);
+        worker
+            .warm_with_cancel(uri, &AtomicBool::new(false))
+            .expect("warm");
+        let context_key = worker.document_contexts.get(uri).cloned()?;
+        let context = worker.contexts.get(&context_key)?.context.clone();
+        let hash = *worker.indexed_content_hashes.get(uri)?;
+        workspace
+            .project_cache()
+            .peek_interface_imports(uri, &context, hash, &HashMap::new())
+    }
+
+    #[test]
+    fn loading_imports_caches_only_interface_imports() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(
+            root.join("Base.pas"),
+            "unit Base;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Helper.pas"),
+            "unit Helper;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let derived = root.join("Derived.pas");
+        fs::write(
+            &derived,
+            "unit Derived;\ninterface\nuses Base;\nimplementation\nuses Helper;\nend.\n",
+        )
+        .unwrap();
+        let derived_uri = Url::from_file_path(&derived).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let entry = interface_entry(&workspace, &derived_uri).expect("interface entry");
+
+        assert!(entry.complete);
+        let names = entry
+            .bindings
+            .iter()
+            .map(|binding| binding.name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["base"]);
+        assert_eq!(
+            entry.bindings[0].uri,
+            Url::from_file_path(root.join("Base.pas")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_unit_without_imports_caches_an_empty_complete_interface_entry() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let base = temp.path().join("Base.pas");
+        fs::write(&base, "unit Base;\ninterface\nimplementation\nend.\n").unwrap();
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+
+        let entry = interface_entry(&workspace, &Url::from_file_path(&base).unwrap())
+            .expect("interface entry");
+
+        assert!(entry.complete);
+        assert!(entry.bindings.is_empty());
     }
 
     fn provider_fixture(root: &std::path::Path) -> (Url, Url) {

@@ -16854,3 +16854,43 @@ end.
         position_of(source, "ProtectedField", 0),
     );
 }
+
+#[test]
+fn imports_record_their_uses_section() {
+    use pascal_core::ImportSection;
+
+    let unit_uri = uri("Sections");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            unit_uri.clone(),
+            "unit Sections;\ninterface\nuses Alpha;\nimplementation\nuses Beta;\nend.\n".to_owned(),
+        )
+        .expect("unit parses");
+    let sections = index
+        .imports(&unit_uri)
+        .into_iter()
+        .map(|import| (import.name.to_ascii_lowercase(), import.section))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sections,
+        [
+            ("alpha".to_string(), ImportSection::Interface),
+            ("beta".to_string(), ImportSection::Implementation),
+        ]
+    );
+
+    let program_uri = uri("Program");
+    index
+        .update(
+            program_uri.clone(),
+            "program Program;\nuses Alpha;\nbegin\nend.\n".to_owned(),
+        )
+        .expect("program parses");
+    assert!(
+        index
+            .imports(&program_uri)
+            .iter()
+            .all(|import| import.section == ImportSection::Module)
+    );
+}

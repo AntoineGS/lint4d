@@ -520,6 +520,9 @@ const MAX_QUALIFIED_IMPORT_ALIAS_PATH_NODES: usize = 128;
 pub struct ImportMetadata {
     pub name: String,
     pub span: SourceSpan,
+    /// The `uses` clause's section. Program, library, and package files use
+    /// `Module`.
+    pub section: pascal_core::ImportSection,
 }
 
 /// The source span of one parsed `uses` declaration.  The span includes the
@@ -16072,14 +16075,20 @@ impl Document {
             if name.is_empty() || name.eq_ignore_ascii_case("in") {
                 continue;
             }
+            let region = region_for_node(*module_name);
             imports.push(ImportMetadata {
                 name: name.clone(),
                 span: SourceSpan {
                     start: module_name.start_byte(),
                     end: module_name.end_byte(),
                 },
+                section: match region {
+                    Region::Interface => pascal_core::ImportSection::Interface,
+                    Region::Implementation => pascal_core::ImportSection::Implementation,
+                    Region::Other => pascal_core::ImportSection::Module,
+                },
             });
-            match region_for_node(*module_name) {
+            match region {
                 Region::Interface => interface_uses.push(name),
                 Region::Implementation => implementation_uses.push(name),
                 Region::Other => implementation_uses.push(name),

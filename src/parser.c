@@ -10174,34 +10174,40 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
     case 103:
       ACCEPT_TOKEN(aux_sym__literalInt_token1);
       if (lookahead == '.') ADVANCE(71);
+      if (lookahead == '_') ADVANCE(103);
       if (lookahead == 'E' ||
           lookahead == 'e') ADVANCE(69);
       if (('0' <= lookahead && lookahead <= '9')) ADVANCE(103);
       END_STATE();
     case 104:
       ACCEPT_TOKEN(aux_sym__literalInt_token1);
-      if (('0' <= lookahead && lookahead <= '9')) ADVANCE(104);
+      if (('0' <= lookahead && lookahead <= '9') ||
+          lookahead == '_') ADVANCE(104);
       END_STATE();
     case 105:
       ACCEPT_TOKEN(aux_sym__literalInt_token2);
       if (('0' <= lookahead && lookahead <= '9') ||
           ('A' <= lookahead && lookahead <= 'F') ||
+          lookahead == '_' ||
           ('a' <= lookahead && lookahead <= 'f')) ADVANCE(105);
       END_STATE();
     case 106:
       ACCEPT_TOKEN(aux_sym__literalInt_token3);
       if (lookahead == '0' ||
-          lookahead == '1') ADVANCE(106);
+          lookahead == '1' ||
+          lookahead == '_') ADVANCE(106);
       END_STATE();
     case 107:
       ACCEPT_TOKEN(aux_sym__literalFloat_token1);
       if (lookahead == 'E' ||
           lookahead == 'e') ADVANCE(69);
-      if (('0' <= lookahead && lookahead <= '9')) ADVANCE(107);
+      if (('0' <= lookahead && lookahead <= '9') ||
+          lookahead == '_') ADVANCE(107);
       END_STATE();
     case 108:
       ACCEPT_TOKEN(aux_sym__literalFloat_token1);
-      if (('0' <= lookahead && lookahead <= '9')) ADVANCE(108);
+      if (('0' <= lookahead && lookahead <= '9') ||
+          lookahead == '_') ADVANCE(108);
       END_STATE();
     case 109:
       ACCEPT_TOKEN(aux_sym_ppUsesBlock_token1);

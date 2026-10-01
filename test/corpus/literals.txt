@@ -71,6 +71,54 @@ const
       (defaultValue (kEq) (literalNumber)))))
 
 ===
+Digit separators
+===
+
+const
+  a = 1_000_000;
+  b = $FFFF_FFFF;
+  c = %1010_0101;
+  d = 1_000.000_1;
+  e = 1_000E1_0;
+  f = #1_0;
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString (literalChar))))))
+
+===
+Identifiers after numbers and ranges
+===
+
+type
+  a = 1_0..2_0;
+const
+  _b = 3;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (type (declSubRange (literalNumber) (literalNumber)))))
+  (declConsts (kConst)
+    (declConst (identifier)
+      (defaultValue (kEq) (literalNumber)))))
+
+===
 Strings
 ===
 

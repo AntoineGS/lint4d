@@ -693,12 +693,15 @@ module.exports = grammar({
 		_literalString:  $ => choice(/'[^']*'/, $.literalChar),
 		literalChar:     $ => seq('#', $._literalInt),
 		literalNumber:   $ => choice($._literalInt, $._literalFloat),
+		// Delphi 11 allows `_` as a digit separator after the first digit.
 		_literalInt:     $ => choice(
-			token.immediate(/[-+]?[0-9]+/),
-			token.immediate(/\$[a-fA-F0-9]+/),
-			...enable_if(fpc, token.immediate(/%[01]+/))
+			token.immediate(/[-+]?[0-9][0-9_]*/),
+			token.immediate(/\$[a-fA-F0-9][a-fA-F0-9_]*/),
+			...enable_if(fpc || delphi, token.immediate(/%[01][01_]*/))
 		),
-		_literalFloat:   $ => prec(10, /[-+]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?/),
+		_literalFloat:   $ => prec(10,
+			/[-+]?([0-9][0-9_]*)?\.?[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?/
+		),
 
 		range:           $ => seq(
 			$._expr, '..', $._expr

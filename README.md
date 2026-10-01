@@ -16,6 +16,7 @@ Grammar for Pascal and its dialects Delphi and Freepascal.
 - Custom managed-record operators, including `const [ref]` parameters
 - Binary literals (`%1010`, also in character codes) and FPC `case ... otherwise`
 - Delphi digit separators (`1_000_000`, `$FFFF_FFFF`, `%1010_0101`)
+- Delphi 12 multiline strings (`'''` or a longer odd run of quotes)
 
 ### Modern syntax and licensing
 
@@ -28,6 +29,7 @@ from language documentation, not copied from AGPL-licensed forks. References:
 - [Custom managed records](https://blogs.embarcadero.com/custom-managed-records-coming-to-delphi-10-4/)
 - [FPC numeric literals](https://www.freepascal.org/docs-html/current/ref/refse6.html)
 - [Delphi numerals and digit separators](https://docwiki.embarcadero.com/RADStudio/Florence/en/Fundamental_Syntactic_Elements_(Delphi))
+- [Delphi multiline strings](https://blogs.embarcadero.com/yukon-beta-blog-delphi-language-modernizing-string-literals)
 - [FPC case statements](https://www.freepascal.org/docs-html/ref/refsu56.html)
 
 Existing syntax-tree shapes and structured preprocessor support are retained.

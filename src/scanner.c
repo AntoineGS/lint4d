@@ -8,6 +8,10 @@
 // Returns false (letting the regex-based lexer handle the input) when
 // the directive is followed by whitespace/newline — that's the
 // block-level form handled by ppBlock / pp().
+//
+// Also recognizes Delphi 12 multiline strings: an odd run of at least three
+// quotes ending its line, closed by the same run at the start of a later
+// line (after optional indentation).
 
 #include "tree_sitter/parser.h"
 #include <ctype.h>
@@ -18,6 +22,7 @@
 typedef enum {
     PP_FRAGMENT_EXPR,
     PP_FRAGMENT_STMT,
+    LITERAL_STRING_MULTILINE,
 } TokenType;
 
 static inline bool is_ascii_letter(int32_t c) {
@@ -52,6 +57,52 @@ static bool skip_to_close_brace(TSLexer *lexer) {
     return false;
 }
 
+static inline bool is_blank(int32_t c) {
+    return c == ' ' || c == '\t';
+}
+
+static unsigned count_quotes(TSLexer *lexer) {
+    unsigned count = 0;
+    while (lexer->lookahead == '\'') {
+        count++;
+        lexer->advance(lexer, false);
+    }
+    return count;
+}
+
+static bool scan_multiline_string(TSLexer *lexer) {
+    unsigned delimiter = count_quotes(lexer);
+    if (delimiter < 3 || delimiter % 2 == 0) {
+        return false;
+    }
+    while (is_blank(lexer->lookahead)) {
+        lexer->advance(lexer, false);
+    }
+    if (lexer->lookahead != '\r' && lexer->lookahead != '\n') {
+        return false;
+    }
+
+    for (;;) {
+        // Consume the rest of the current line, including its line break.
+        while (lexer->lookahead != '\n') {
+            if (lexer->eof(lexer)) {
+                return false;
+            }
+            lexer->advance(lexer, false);
+        }
+        lexer->advance(lexer, false);
+
+        while (is_blank(lexer->lookahead)) {
+            lexer->advance(lexer, false);
+        }
+        if (count_quotes(lexer) == delimiter) {
+            lexer->mark_end(lexer);
+            lexer->result_symbol = LITERAL_STRING_MULTILINE;
+            return true;
+        }
+    }
+}
+
 void *tree_sitter_pascal_external_scanner_create(void) {
     return NULL;
 }
@@ -82,6 +133,10 @@ bool tree_sitter_pascal_external_scanner_scan(
     const bool *valid_symbols
 ) {
     (void)payload;
+
+    if (valid_symbols[LITERAL_STRING_MULTILINE] && lexer->lookahead == '\'') {
+        return scan_multiline_string(lexer);
+    }
 
     if (!valid_symbols[PP_FRAGMENT_EXPR] && !valid_symbols[PP_FRAGMENT_STMT]) {
         return false;

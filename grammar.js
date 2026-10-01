@@ -301,7 +301,7 @@ function statements(trailing) {
 module.exports = grammar({
 	name: "pascal",
 
-	externals: $ => [$.ppFragmentExpr, $.ppFragmentStmt],
+	externals: $ => [$.ppFragmentExpr, $.ppFragmentStmt, $._literalStringMultiline],
 
 	extras: $ => [$._space, $.comment, $.ppDirective],
 
@@ -690,7 +690,7 @@ module.exports = grammar({
 			$.kNil, $.kTrue, $.kFalse
 		),
 		literalString:   $ => repeat1($._literalString),
-		_literalString:  $ => choice(/'[^']*'/, $.literalChar),
+		_literalString:  $ => choice(/'[^']*'/, $.literalChar, $._literalStringMultiline),
 		literalChar:     $ => seq('#', $._literalInt),
 		literalNumber:   $ => choice($._literalInt, $._literalFloat),
 		// Delphi 11 allows `_` as a digit separator after the first digit.

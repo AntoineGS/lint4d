@@ -4915,6 +4915,10 @@
         {
           "type": "SYMBOL",
           "name": "literalChar"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_literalStringMultiline"
         }
       ]
     },
@@ -10797,6 +10801,10 @@
     {
       "type": "SYMBOL",
       "name": "ppFragmentStmt"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "_literalStringMultiline"
     }
   ],
   "inline": [],

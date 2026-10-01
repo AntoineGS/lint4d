@@ -130,6 +130,83 @@ const
   e = 'Hello'#$0c#$0a'World'#13#10;
 
 ===
+Multiline strings
+===
+
+const
+  a = '''
+    Hello 'World'
+    It's ''quoted''
+    ''';
+  b = '''''
+    Contains ''' inside
+    ''''';
+  c = '''
+''' + 'tail';
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString)))
+    (declConst (identifier)
+      (defaultValue (kEq)
+        (exprBinary (literalString) (kAdd) (literalString))))))
+
+===
+Multiline string as call argument
+===
+
+begin
+  Query.SQL.Text := '''
+    SELECT *
+    FROM Users
+    ''';
+  Foo('''
+    a
+    ''', 1);
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (assignment
+      (exprDot (exprDot (identifier) (kDot) (identifier)) (kDot) (identifier))
+      (kAssign)
+      (literalString))
+    (statement
+      (exprCall (identifier)
+        (exprArgs (literalString) (literalNumber))))
+    (kEnd)))
+
+===
+Quote-heavy single-line strings
+===
+
+const
+  a = '''';
+  b = 'it''s';
+  c = '''x''';
+  d = '''''';
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString)))
+    (declConst (identifier)
+      (defaultValue (kEq) (literalString)))))
+
+===
 Array initializer
 ===
 

@@ -4234,16 +4234,8 @@
             {
               "type": "ALIAS",
               "content": {
-                "type": "TOKEN",
-                "content": {
-                  "type": "PREC",
-                  "value": 5,
-                  "content": {
-                    "type": "PATTERN",
-                    "value": "\\{\\$if[^}]*\\}",
-                    "flags": "i"
-                  }
-                }
+                "type": "SYMBOL",
+                "name": "_ppIf"
               },
               "named": true,
               "value": "ppIf"
@@ -4297,16 +4289,8 @@
                   {
                     "type": "ALIAS",
                     "content": {
-                      "type": "TOKEN",
-                      "content": {
-                        "type": "PREC",
-                        "value": 5,
-                        "content": {
-                          "type": "PATTERN",
-                          "value": "\\{\\$else[^}]*\\}",
-                          "flags": "i"
-                        }
-                      }
+                      "type": "SYMBOL",
+                      "name": "_ppElse"
                     },
                     "named": true,
                     "value": "ppElse"
@@ -4358,16 +4342,8 @@
             {
               "type": "ALIAS",
               "content": {
-                "type": "TOKEN",
-                "content": {
-                  "type": "PREC",
-                  "value": 5,
-                  "content": {
-                    "type": "PATTERN",
-                    "value": "\\{\\$(endif|ifend)[^}]*\\}",
-                    "flags": "i"
-                  }
-                }
+                "type": "SYMBOL",
+                "name": "_ppEndIf"
               },
               "named": true,
               "value": "ppEndIf"
@@ -5041,14 +5017,6 @@
       "type": "SEQ",
       "members": [
         {
-          "type": "FIELD",
-          "name": "header",
-          "content": {
-            "type": "SYMBOL",
-            "name": "declProc"
-          }
-        },
-        {
           "type": "CHOICE",
           "members": [
             {
@@ -5056,50 +5024,11 @@
               "members": [
                 {
                   "type": "FIELD",
-                  "name": "local",
+                  "name": "header",
                   "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "SYMBOL",
-                        "name": "_definitions"
-                      },
-                      {
-                        "type": "BLANK"
-                      }
-                    ]
+                    "type": "SYMBOL",
+                    "name": "declProc"
                   }
-                },
-                {
-                  "type": "FIELD",
-                  "name": "body",
-                  "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "ALIAS",
-                        "content": {
-                          "type": "SYMBOL",
-                          "name": "blockTr"
-                        },
-                        "named": true,
-                        "value": "block"
-                      },
-                      {
-                        "type": "ALIAS",
-                        "content": {
-                          "type": "SYMBOL",
-                          "name": "asmTr"
-                        },
-                        "named": true,
-                        "value": "asm"
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "STRING",
-                  "value": ";"
                 }
               ]
             },
@@ -5109,66 +5038,19 @@
                 {
                   "type": "ALIAS",
                   "content": {
-                    "type": "TOKEN",
-                    "content": {
-                      "type": "PREC",
-                      "value": 5,
-                      "content": {
-                        "type": "PATTERN",
-                        "value": "\\{\\$if[^}]*\\}",
-                        "flags": "i"
-                      }
-                    }
+                    "type": "SYMBOL",
+                    "name": "_ppIf"
                   },
                   "named": true,
                   "value": "ppIf"
                 },
                 {
                   "type": "FIELD",
-                  "name": "local",
+                  "name": "header",
                   "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "SYMBOL",
-                        "name": "_definitions"
-                      },
-                      {
-                        "type": "BLANK"
-                      }
-                    ]
+                    "type": "SYMBOL",
+                    "name": "declProc"
                   }
-                },
-                {
-                  "type": "FIELD",
-                  "name": "body",
-                  "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "ALIAS",
-                        "content": {
-                          "type": "SYMBOL",
-                          "name": "blockTr"
-                        },
-                        "named": true,
-                        "value": "block"
-                      },
-                      {
-                        "type": "ALIAS",
-                        "content": {
-                          "type": "SYMBOL",
-                          "name": "asmTr"
-                        },
-                        "named": true,
-                        "value": "asm"
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "STRING",
-                  "value": ";"
                 },
                 {
                   "type": "REPEAT",
@@ -5178,66 +5060,19 @@
                       {
                         "type": "ALIAS",
                         "content": {
-                          "type": "TOKEN",
-                          "content": {
-                            "type": "PREC",
-                            "value": 5,
-                            "content": {
-                              "type": "PATTERN",
-                              "value": "\\{\\$else[^}]*\\}",
-                              "flags": "i"
-                            }
-                          }
+                          "type": "SYMBOL",
+                          "name": "_ppElse"
                         },
                         "named": true,
                         "value": "ppElse"
                       },
                       {
                         "type": "FIELD",
-                        "name": "local",
+                        "name": "header",
                         "content": {
-                          "type": "CHOICE",
-                          "members": [
-                            {
-                              "type": "SYMBOL",
-                              "name": "_definitions"
-                            },
-                            {
-                              "type": "BLANK"
-                            }
-                          ]
+                          "type": "SYMBOL",
+                          "name": "declProc"
                         }
-                      },
-                      {
-                        "type": "FIELD",
-                        "name": "body",
-                        "content": {
-                          "type": "CHOICE",
-                          "members": [
-                            {
-                              "type": "ALIAS",
-                              "content": {
-                                "type": "SYMBOL",
-                                "name": "blockTr"
-                              },
-                              "named": true,
-                              "value": "block"
-                            },
-                            {
-                              "type": "ALIAS",
-                              "content": {
-                                "type": "SYMBOL",
-                                "name": "asmTr"
-                              },
-                              "named": true,
-                              "value": "asm"
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "type": "STRING",
-                        "value": ";"
                       }
                     ]
                   }
@@ -5245,21 +5080,131 @@
                 {
                   "type": "ALIAS",
                   "content": {
-                    "type": "TOKEN",
-                    "content": {
-                      "type": "PREC",
-                      "value": 5,
-                      "content": {
-                        "type": "PATTERN",
-                        "value": "\\{\\$(endif|ifend)[^}]*\\}",
-                        "flags": "i"
-                      }
-                    }
+                    "type": "SYMBOL",
+                    "name": "_ppEndIf"
                   },
                   "named": true,
                   "value": "ppEndIf"
                 }
               ]
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_defProcImpl"
+        }
+      ]
+    },
+    "_defProcImpl": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "local",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "_definitions"
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          }
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_defProcBody"
+        }
+      ]
+    },
+    "_defProcBody": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "body",
+              "content": {
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "blockTr"
+                    },
+                    "named": true,
+                    "value": "block"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "asmTr"
+                    },
+                    "named": true,
+                    "value": "asm"
+                  }
+                ]
+              }
+            },
+            {
+              "type": "STRING",
+              "value": ";"
+            }
+          ]
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "ALIAS",
+              "content": {
+                "type": "SYMBOL",
+                "name": "_ppIf"
+              },
+              "named": true,
+              "value": "ppIf"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_defProcImpl"
+            },
+            {
+              "type": "REPEAT",
+              "content": {
+                "type": "SEQ",
+                "members": [
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "_ppElse"
+                    },
+                    "named": true,
+                    "value": "ppElse"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "_defProcImpl"
+                  }
+                ]
+              }
+            },
+            {
+              "type": "ALIAS",
+              "content": {
+                "type": "SYMBOL",
+                "name": "_ppEndIf"
+              },
+              "named": true,
+              "value": "ppEndIf"
             }
           ]
         }
@@ -5780,8 +5725,12 @@
                 "name": "declTypes"
               },
               {
-                "type": "SYMBOL",
-                "name": "declVars"
+                "type": "PREC_DYNAMIC",
+                "value": 1,
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "declVars"
+                }
               },
               {
                 "type": "SYMBOL",
@@ -5879,8 +5828,12 @@
                       "name": "declTypes"
                     },
                     {
-                      "type": "SYMBOL",
-                      "name": "declVars"
+                      "type": "PREC_DYNAMIC",
+                      "value": 1,
+                      "content": {
+                        "type": "SYMBOL",
+                        "name": "declVars"
+                      }
                     },
                     {
                       "type": "SYMBOL",
@@ -10734,6 +10687,18 @@
     [
       "defProc",
       "ppBlock"
+    ],
+    [
+      "_definition",
+      "ppBlock"
+    ],
+    [
+      "block",
+      "blockTr"
+    ],
+    [
+      "asm",
+      "asmTr"
     ],
     [
       "exprBrackets",

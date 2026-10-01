@@ -1072,3 +1072,327 @@ end.
       (kImplementation))
     (kEnd)
     (kEndDot)))
+
+===
+ppBlock wrapping the first local declaration section
+===
+
+procedure Foo;
+{$IFDEF DEBUG}
+var
+  X: Integer;
+{$ENDIF}
+begin
+end;
+
+procedure Bar;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppBlock
+      (ppIf)
+      (declVars
+        (kVar)
+        (declVar
+          (identifier)
+          (type
+            (typeref
+              (identifier)))))
+      (ppEndIf))
+    (block
+      (kBegin)
+      (kEnd)))
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+ppBlock with else branch before routine body
+===
+
+procedure Foo;
+{$IFDEF DEBUG}
+var
+  X: Integer;
+{$ELSE}
+const
+  Y = 1;
+{$ENDIF}
+var
+  Z: Integer;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppBlock
+      (ppIf)
+      (declVars
+        (kVar)
+        (declVar
+          (identifier)
+          (type
+            (typeref
+              (identifier)))))
+      (ppElse)
+      (declConsts
+        (kConst)
+        (declConst
+          (identifier)
+          (defaultValue
+            (kEq)
+            (literalNumber))))
+      (ppEndIf))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Directive-wrapped routine body after local declarations
+===
+
+procedure Foo;
+var
+  X: Integer;
+{$IFDEF ASM}
+asm
+  nop
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (ppIf)
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier))
+      (kEnd))
+    (ppElse)
+    (block
+      (kBegin)
+      (kEnd))
+    (ppEndIf)))
+
+===
+Nested directive-wrapped routine bodies
+===
+
+procedure Foo;
+{$IFDEF ASM}
+{$IFDEF CPUX86}
+asm
+  nop
+end;
+{$ELSE}
+var
+  X: Integer;
+asm
+  nop
+end;
+{$ENDIF}
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+procedure Bar;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppIf)
+    (ppIf)
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier))
+      (kEnd))
+    (ppElse)
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier))
+      (kEnd))
+    (ppEndIf)
+    (ppElse)
+    (block
+      (kBegin)
+      (kEnd))
+    (ppEndIf))
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Directive-wrapped routine headers
+===
+
+{$IFDEF UNICODE}
+function Foo(const S: string): Integer;
+{$ELSE}
+function Foo(const S: WideString): Integer;
+{$ENDIF}
+var
+  X: Integer;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (ppIf)
+    (declProc
+      (kFunction)
+      (identifier)
+      (declArgs
+        (declArg
+          (kConst)
+          (identifier)
+          (type
+            (declString
+              (kString)))))
+      (typeref
+        (identifier)))
+    (ppElse)
+    (declProc
+      (kFunction)
+      (identifier)
+      (declArgs
+        (declArg
+          (kConst)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))))
+      (typeref
+        (identifier)))
+    (ppEndIf)
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Directive-wrapped interface headers stay declarations
+===
+
+unit U;
+interface
+{$IFDEF UNICODE}
+function Foo(const S: string): Integer;
+{$ELSE}
+function Foo(const S: WideString): Integer;
+{$ENDIF}
+function Bar: Integer;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (ppBlock
+        (ppIf)
+        (declProc
+          (kFunction)
+          (identifier)
+          (declArgs
+            (declArg
+              (kConst)
+              (identifier)
+              (type
+                (declString
+                  (kString)))))
+          (typeref
+            (identifier)))
+        (ppElse)
+        (declProc
+          (kFunction)
+          (identifier)
+          (declArgs
+            (declArg
+              (kConst)
+              (identifier)
+              (type
+                (typeref
+                  (identifier)))))
+          (typeref
+            (identifier)))
+        (ppEndIf))
+      (declProc
+        (kFunction)
+        (identifier)
+        (typeref
+          (identifier))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))

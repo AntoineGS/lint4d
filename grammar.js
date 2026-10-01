@@ -53,8 +53,7 @@ function delimited(rule, delimiter = ',') {
 	return optional(delimited1(rule, delimiter));
 }
 
-// Preprocessor wrapper.
-// This just supports a single `if[def] ... [else[if] ...]* endif` right now.
+// Preprocessor wrapper: `if[def] ... [else[if] ...]* endif` around a rule.
 // It is inteded for code like this:
 //
 //   procedure foo;
@@ -71,10 +70,11 @@ function delimited(rule, delimiter = ',') {
 //   {$endif}
 //
 // If we don't handle this case explicitly, tree-sitter produces a completely
-// broken AST, which severely messes up the syntax highlighting.
+// broken AST, which severely messes up the syntax highlighting. Wrapping a
+// recursive rule supports nested directives.
 //
-// Ideally, we would want to support nested ifdefs as well, but that will be
-// more complex.
+// It shares terminals with ppBlock, so a directive after a routine header can
+// start either a wrapped routine body or a local declaration block.
 //
 // A word of caution: It is tempting to sprinkle this macro in many more
 // places, but unfortunately tihs results in a significant performance penalty.
@@ -85,19 +85,18 @@ function delimited(rule, delimiter = ',') {
 function pp($, ...rule) {
 	if (!use_pp)
 		return seq(...rule);
-	return (
-		choice(
-			seq(...rule),
-			seq(
-				alias(token(prec(5, /\{\$if[^}]*\}/i)), $.ppIf),
-				...rule,
-				repeat(seq(
-					alias(token(prec(5, /\{\$else[^}]*\}/i)), $.ppElse),
-					...rule
-				)),
-				alias(token(prec(5, /\{\$(endif|ifend)[^}]*\}/i)), $.ppEndIf)
-			),
-		)
+	return choice(seq(...rule), ppWrap($, ...rule));
+}
+
+function ppWrap($, ...rule) {
+	return seq(
+		alias($._ppIf, $.ppIf),
+		...rule,
+		repeat(seq(
+			alias($._ppElse, $.ppElse),
+			...rule
+		)),
+		alias($._ppEndIf, $.ppEndIf)
 	);
 }
 
@@ -345,6 +344,11 @@ module.exports = grammar({
 		// conflict is needed because both accept ppFragmentExpr.
 		[$._ref, $._typeref],
 		[$.defProc, $.ppBlock],
+		// A directive after a routine header may wrap the routine body or only
+		// its first local declarations, where a body-like block is a statement.
+		[$._definition, $.ppBlock],
+		[$.block, $.blockTr],
+		[$.asm, $.asmTr],
 		[$.exprBrackets, $.rttiAttributes],
 		[$._expr],
 		[$._expr, $.rttiAttributes],
@@ -705,13 +709,18 @@ module.exports = grammar({
 		),
 
 		defProc:         $ => seq(
-			/*pp($,*/ field('header', $.declProc)/*)*/,
-			pp(
-			 	$,
-				field('local', optional($._definitions)),
-				field('body', choice(tr($, 'block'), tr($, 'asm'))),
-				';'
-			)
+			pp($, field('header', $.declProc)),
+			$._defProcImpl
+		),
+
+		_defProcImpl:    $ => seq(
+			field('local', optional($._definitions)),
+			$._defProcBody
+		),
+
+		_defProcBody:    $ => choice(
+			seq(field('body', choice(tr($, 'block'), tr($, 'asm'))), ';'),
+			...enable_if(use_pp, ppWrap($, $._defProcImpl))
 		),
 
 		declProcFwd:     $ => seq(
@@ -777,8 +786,9 @@ module.exports = grammar({
 			// Declaration items
 			$.declType, $.declVar, $.declConst, $.declProc, $.declProp,
 			alias($.declProcFwd, $.declProc), $.declField,
-			// Section-level items
-			$.declTypes, $.declVars, $.declConsts, $.defProc,
+			// Section-level items. A `var` section outranks an inline variable
+			// statement when both readings fit, e.g. before a routine body.
+			$.declTypes, prec.dynamic(1, $.declVars), $.declConsts, $.defProc,
 			$.declUses, $.declLabels, $.declExports,
 			// Statement items
 			$._statement,

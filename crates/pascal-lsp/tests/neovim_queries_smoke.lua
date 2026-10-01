@@ -177,7 +177,9 @@ local function run()
 	assert(workspace_symbols[3].name == "UnsavedOnly", vim.inspect(workspace_symbols))
 	assert(workspace_symbols[3].containerName == "Provider", vim.inspect(workspace_symbols[3]))
 	assert_location(workspace_symbols[3].location, provider_uri, 12, 2, 12, 18)
-	assert(vim.fn.bufnr(consumer_path) == -1, "workspace symbol search opened the consumer")
+	-- Workspace diagnostics may register an unloaded buffer for the consumer
+	-- (vim.uri_to_bufnr), so check that nothing loaded it.
+	assert(vim.fn.bufloaded(consumer_path) == 0, "workspace symbol search opened the consumer")
 
 	local workspace_list = standard_list(
 		"workspace_symbol",
@@ -190,7 +192,7 @@ local function run()
 		end
 	)
 	assert(#workspace_list.items == 3, vim.inspect(workspace_list.items))
-	assert(vim.fn.bufnr(consumer_path) == -1, "workspace symbol picker opened the consumer")
+	assert(vim.fn.bufloaded(consumer_path) == 0, "workspace symbol picker opened the consumer")
 
 	local shared_position = { line = 11, character = 2 }
 	local references_params = {

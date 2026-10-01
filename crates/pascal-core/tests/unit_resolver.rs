@@ -1071,6 +1071,59 @@ fn rtl_switch_list_does_not_make_unit_resolution_unsupported() {
     assert!(resolver.finish().complete);
 }
 
+fn resolve_project_importing_classes(directive: &str) -> pascal_core::ResolvedProject {
+    let mut store = MemoryStore::default();
+    store.add(
+        "/workspace/Main.pas",
+        "unit Main; interface uses Classes; implementation end.",
+    );
+    store.add(
+        "/workspace/Classes.pas",
+        &format!("unit Classes; {directive} interface implementation end."),
+    );
+    resolve_memory_project(fixture_context(), store, Default::default())
+}
+
+#[test]
+fn rtl_cbuilder_and_linker_directives_do_not_make_project_resolution_unsupported() {
+    // Forms used by the Delphi 2010 Win32 RTL (Classes.pas, Windows.pas, ...).
+    for directive in [
+        "(*$NOINCLUDE ActiveX*)",
+        "{$EXTERNALSYM HWND}",
+        "{$NODEFINE TPoint}",
+        "{$HPPEMIT '#include <windows.h>'}",
+        "{$HPPEMIT '#include <oledb.h>\"}",
+        "(*$HPPEMIT '    };'*)",
+        "{$OBJTYPENAME TPoint 'NTPoint'}",
+        "{$WEAKPACKAGEUNIT}",
+        "{$WEAKPACKAGEUNIT ON}",
+        "{$DENYPACKAGEUNIT ON}",
+        "{$IMAGEBASE $00400000}",
+        "{$RESOURCE Classes.res}",
+        "{$L cpuid.obj}",
+        "{$ALIGN 8}",
+        "{$A-}",
+        "{$A1}",
+        "{$MINENUMSIZE 4}",
+        "{$Z4}",
+        "{$STACKFRAMES ON}",
+        "{$VARPROPSETTER ON}",
+    ] {
+        let project = resolve_project_importing_classes(directive);
+
+        assert!(project.complete, "{directive}");
+    }
+}
+
+#[test]
+fn binding_relevant_rtl_directives_stay_unsupported() {
+    for directive in ["{$SCOPEDENUMS ON}", "{$POINTERMATH ON}"] {
+        let project = resolve_project_importing_classes(directive);
+
+        assert!(!project.complete, "{directive}");
+    }
+}
+
 #[test]
 fn comma_switch_effects_flow_through_resolved_includes() {
     let mut store = MemoryStore::default();

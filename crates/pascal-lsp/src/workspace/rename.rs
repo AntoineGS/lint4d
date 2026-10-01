@@ -29,6 +29,7 @@ use lsp_types::{
 };
 use pascal_core::conditional::{
     self, ConditionalDirective, DirectiveKind as ConditionalDirectiveKind,
+    is_harmless_directive_keyword,
 };
 use pascal_core::decode_bytes;
 use pascal_core::resolver::{
@@ -10408,46 +10409,6 @@ fn split_directive_parts(body: &str) -> Vec<&str> {
     parts
 }
 
-fn is_harmless_directive_keyword(keyword: &str) -> bool {
-    let keyword = keyword
-        .trim()
-        .trim_end_matches(['+', '-'])
-        .to_ascii_lowercase();
-    matches!(
-        keyword.as_str(),
-        "apptype"
-            | "asmmode"
-            | "assertions"
-            | "booleval"
-            | "debug"
-            | "debugsymbols"
-            | "endregion"
-            | "excessprecision"
-            | "extendedsyntax"
-            | "h"
-            | "hints"
-            | "longstrings"
-            | "m"
-            | "message"
-            | "mode"
-            | "objexportall"
-            | "optimization"
-            | "overflowchecks"
-            | "q"
-            | "r"
-            | "rangechecks"
-            | "region"
-            | "rtti"
-            | "stronglinktypes"
-            | "t"
-            | "typedaddress"
-            | "warn"
-            | "warnings"
-            | "writeableconst"
-            | "x"
-    )
-}
-
 fn skip_string(bytes: &[u8], index: &mut usize) {
     *index += 1;
     while *index < bytes.len() {
@@ -12582,6 +12543,33 @@ mod tests {
                 DirectiveKind::Harmless,
                 "{body} must not make an unrelated include owner unsafe"
             );
+        }
+    }
+
+    #[test]
+    fn cbuilder_and_linker_directives_are_harmless() {
+        for body in [
+            "NOINCLUDE ActiveX",
+            "EXTERNALSYM HWND",
+            "NODEFINE TPoint",
+            "HPPEMIT '#include <windows.h>'",
+            "OBJTYPENAME TPoint 'NTPoint'",
+            "WEAKPACKAGEUNIT",
+            "DENYPACKAGEUNIT ON",
+            "IMAGEBASE $00400000",
+            "RESOURCE Classes.res",
+            "L cpuid.obj",
+            "ALIGN 8",
+            "A1",
+            "MINENUMSIZE 4",
+            "Z4",
+            "STACKFRAMES ON",
+            "VARPROPSETTER ON",
+        ] {
+            assert_eq!(directive_kind(body), DirectiveKind::Harmless, "{body}");
+        }
+        for body in ["SCOPEDENUMS ON", "POINTERMATH ON"] {
+            assert_eq!(directive_kind(body), DirectiveKind::Other, "{body}");
         }
     }
 

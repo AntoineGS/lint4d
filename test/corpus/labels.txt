@@ -1,0 +1,54 @@
+===
+Numeric labels
+===
+
+procedure NumericLabels;
+label 0007;
+begin
+  goto 7;
+7:
+  Target;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (declLabels (kLabel) (declLabel (labelNumber)))
+    (block
+      (kBegin)
+      (goto (kGoto) (labelNumber))
+      (label (labelNumber))
+      (statement (identifier))
+      (kEnd))))
+
+===
+Integer literals are not numeric labels
+===
+
+procedure P;
+begin
+  X := 10;
+  case X of
+    1: Foo;
+    1_000: Bar;
+  end;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block
+      (kBegin)
+      (assignment (identifier) (kAssign) (literalNumber))
+      (case
+        (kCase)
+        (identifier)
+        (kOf)
+        (caseCase (caseLabel (literalNumber)) (statement (identifier)))
+        (caseCase (caseLabel (literalNumber)) (statement (identifier)))
+        (kEnd))
+      (kEnd))))

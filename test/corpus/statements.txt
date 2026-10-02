@@ -489,6 +489,25 @@ end;
       (kEnd))))
 
 ===
+bare raise
+===
+
+procedure Main;
+begin
+  raise;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block
+      (kBegin)
+      (raise (kRaise))
+      (kEnd))))
+
+===
 raise at
 ===
 

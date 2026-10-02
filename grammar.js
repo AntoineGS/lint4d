@@ -177,7 +177,10 @@ function enable_if(cond, ...args) {
 // Generate rules for trailing & non-trailing statements
 function statements(trailing) {
 	let rn            = x => trailing ? x + 'Tr' : x
-	let lastStatement = $ => trailing ? optional(tr($,'_statement')) : $._statement;
+	let labeledBody   = $ => trailing ? optional(tr($,'_statement')) : $._statement;
+	let lastStatement = $ => trailing
+		? optional(choice(tr($,'_statement'), tr($,'labeledStatement')))
+		: choice($._statement, $.labeledStatement);
 	let lastStatement1= $ => trailing ? tr($,'_statement') : $._statement;
 	let semicolon     = trailing ? [] : [';'];
 
@@ -191,7 +194,11 @@ function statements(trailing) {
 
 		[rn('ifElse'),      $ => prec.right(1, seq(
 			$.kIf, field('condition', $._expr), $.kThen,
-			field('then', optional(choice(tr($,'_statement'), $.if))),
+			field('then', optional(choice(
+				tr($,'_statement'),
+				tr($,'labeledStatement'),
+				$.if
+			))),
 			$.kElse,
 			field('else', lastStatement($))
 		))],
@@ -231,7 +238,7 @@ function statements(trailing) {
 		)],
 
 		[rn('exceptionElse'), $ => seq(
-			$.kElse, repeat($._statement), lastStatement($)
+			$.kElse, repeat(choice($._statement, $.label)), lastStatement($)
 		)],
 
 		[rn('_exceptionHandlers'), $ => seq(
@@ -306,7 +313,17 @@ function statements(trailing) {
 			seq($._expr, ...semicolon),
 		)],
 
-		[rn('goto'),        $ => seq($.kGoto, $.identifier, ...semicolon)],
+		[rn('goto'),        $ => seq(
+			$.kGoto,
+			choice($.identifier, $.labelNumber),
+			...semicolon
+		)],
+
+		[rn('labeledStatement'), $ => seq(
+			$.label,
+			repeat($.label),
+			labeledBody($)
+		)],
 
 		[rn('_statement'),   $ => choice(
 			...semicolon,
@@ -342,6 +359,8 @@ module.exports = grammar({
 	word: $ => $.identifier,
 
 	conflicts: $ => [
+		[$._statementsTr],
+		[$.exceptionElse, $.labeledStatement],
 		// The following conflict rules are only needed because "public" can be
 		// a visibility or an attribute. *sigh*
 		// TODO: We would probably avoid this by having separate decl* clauses
@@ -364,6 +383,7 @@ module.exports = grammar({
 		// ppBlock can appear in statement contexts; `;` inside ppBlock is
 		// ambiguous with the `;` that separates statements.
 		[$._statement, $.ppBlock],
+		[$._statement, $._ppStatementBlock],
 		// ppBlock in declaration contexts causes ambiguity with var/type/const
 		// section keywords that can also start statements or decl items.
 		[$.varAssignDef, $.varDef, $.declVars],
@@ -475,13 +495,31 @@ module.exports = grammar({
 			optional(seq(':', field('type', $.type))),
 			field('defaultValue', $.defaultValue)
 		),
-		label:           $ => seq($.identifier, ':'),
+		label:           $ => seq(choice($.identifier, $.labelNumber), ':'),
 		caseLabel:       $ => seq(delimited1(choice($._expr, $.range)), ':'),
 
-		_statements:     $ => repeat1(choice($.varDef, $._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
-		_statementsTr:   $ => seq(
-			repeat(choice($._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
-			choice(tr($,'_statement'), $._statement, $.ppBlock, $.ppFragmentStmt)
+		_statements:     $ => repeat1(choice(
+			$.varDef, $._statement, $.label,
+			alias($._ppStatementBlock, $.ppBlock), $.ppFragmentStmt
+		)),
+		_statementsTr:   $ => choice(
+			seq(
+				repeat(choice(
+					$._statement, $.label,
+					alias($._ppStatementBlock, $.ppBlock), $.ppFragmentStmt
+				)),
+				choice(
+					tr($,'_statement'), $._statement,
+					alias($._ppStatementBlock, $.ppBlock), $.ppFragmentStmt
+				)
+			),
+			seq(
+				repeat(choice(
+					$._statement, $.label,
+					alias($._ppStatementBlock, $.ppBlock), $.ppFragmentStmt
+				)),
+				repeat1($.label)
+			)
 		),
 
 		statements:      $ => $._statements,
@@ -863,6 +901,16 @@ module.exports = grammar({
 			// Punctuation between items
 			';', ','
 		),
+		// Keep statement-context pp blocks separate from declaration pp blocks:
+		// an identifier followed by ':' is a label here, but can be a variable
+		// declaration in a declaration context.
+		_ppStatementBlock: $ => ppIn($,
+			$._statement,
+			$.label,
+			alias($._ppStatementBlock, $.ppBlock),
+			$.ppFragmentStmt,
+			';', ','
+		),
 		declExports:     $ => seq($.kExports, delimited($.declExport), ';'),
 
 		declTypes:       $ => seq(
@@ -929,7 +977,7 @@ module.exports = grammar({
 		),
 
 		declLabels:      $ => seq($.kLabel, delimited1($.declLabel), ';'),
-		declLabel:       $ => field('name', $.identifier),
+		declLabel:       $ => field('name', choice($.identifier, $.labelNumber)),
 
 		declExport:      $ => seq($._genericName, repeat(seq(choice($.kName, $.kIndex), $._expr))),
 
@@ -1430,6 +1478,7 @@ module.exports = grammar({
 		kFalse:            $ => /false/i,
 
 		identifier:        $ => /[&]?[a-zA-Z_]+[0-9_a-zA-Z$]*/,
+		labelNumber:       $ => token(prec(1, /[0-9]+/)),
 
 	  	_space:            $ => /[\s\r\n\t]+/,
 		ppDirective:       $ => token(prec(-1, /\{\$[^}]*\}/)),

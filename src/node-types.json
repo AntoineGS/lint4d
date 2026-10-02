@@ -774,6 +774,10 @@
             "named": true
           },
           {
+            "type": "labeledStatement",
+            "named": true
+          },
+          {
             "type": "raise",
             "named": true
           },
@@ -1877,6 +1881,10 @@
         "types": [
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "labelNumber",
             "named": true
           }
         ]
@@ -3534,6 +3542,14 @@
           "named": true
         },
         {
+          "type": "label",
+          "named": true
+        },
+        {
+          "type": "labeledStatement",
+          "named": true
+        },
+        {
           "type": "raise",
           "named": true
         },
@@ -3614,6 +3630,10 @@
           },
           {
             "type": "ifElse",
+            "named": true
+          },
+          {
+            "type": "labeledStatement",
             "named": true
           },
           {
@@ -5271,6 +5291,10 @@
             "named": true
           },
           {
+            "type": "labeledStatement",
+            "named": true
+          },
+          {
             "type": "raise",
             "named": true
           },
@@ -5466,6 +5490,10 @@
           },
           {
             "type": "ifElse",
+            "named": true
+          },
+          {
+            "type": "labeledStatement",
             "named": true
           },
           {
@@ -5864,6 +5892,10 @@
         {
           "type": "kGoto",
           "named": true
+        },
+        {
+          "type": "labelNumber",
+          "named": true
         }
       ]
     }
@@ -6086,6 +6118,10 @@
             "named": true
           },
           {
+            "type": "labeledStatement",
+            "named": true
+          },
+          {
             "type": "raise",
             "named": true
           },
@@ -6266,6 +6302,10 @@
             "named": true
           },
           {
+            "type": "labeledStatement",
+            "named": true
+          },
+          {
             "type": "raise",
             "named": true
           },
@@ -6337,6 +6377,10 @@
           },
           {
             "type": "ifElse",
+            "named": true
+          },
+          {
+            "type": "labeledStatement",
             "named": true
           },
           {
@@ -6633,6 +6677,93 @@
       "types": [
         {
           "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "labelNumber",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "labeledStatement",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "asm",
+          "named": true
+        },
+        {
+          "type": "assignment",
+          "named": true
+        },
+        {
+          "type": "block",
+          "named": true
+        },
+        {
+          "type": "case",
+          "named": true
+        },
+        {
+          "type": "constDef",
+          "named": true
+        },
+        {
+          "type": "for",
+          "named": true
+        },
+        {
+          "type": "foreach",
+          "named": true
+        },
+        {
+          "type": "goto",
+          "named": true
+        },
+        {
+          "type": "if",
+          "named": true
+        },
+        {
+          "type": "ifElse",
+          "named": true
+        },
+        {
+          "type": "label",
+          "named": true
+        },
+        {
+          "type": "raise",
+          "named": true
+        },
+        {
+          "type": "repeat",
+          "named": true
+        },
+        {
+          "type": "statement",
+          "named": true
+        },
+        {
+          "type": "try",
+          "named": true
+        },
+        {
+          "type": "varDef",
+          "named": true
+        },
+        {
+          "type": "while",
+          "named": true
+        },
+        {
+          "type": "with",
           "named": true
         }
       ]
@@ -7136,6 +7267,10 @@
           "named": true
         },
         {
+          "type": "label",
+          "named": true
+        },
+        {
           "type": "ppBlock",
           "named": true
         },
@@ -7145,6 +7280,10 @@
         },
         {
           "type": "ppEndIf",
+          "named": true
+        },
+        {
+          "type": "ppFragmentStmt",
           "named": true
         },
         {
@@ -9279,6 +9418,10 @@
             "named": true
           },
           {
+            "type": "labeledStatement",
+            "named": true
+          },
+          {
             "type": "raise",
             "named": true
           },
@@ -9456,6 +9599,10 @@
           },
           {
             "type": "ifElse",
+            "named": true
+          },
+          {
+            "type": "labeledStatement",
             "named": true
           },
           {
@@ -10260,6 +10407,10 @@
   },
   {
     "type": "kXor",
+    "named": true
+  },
+  {
+    "type": "labelNumber",
     "named": true
   },
   {

@@ -12508,7 +12508,10 @@ mod tests {
                 provenance: ProjectPathProvenance::Configured,
             };
             let cancel = AtomicBool::new(false);
-            for _ in 0..100_000 {
+            // Bounded by time, not iterations: a reader that blocks on the FIFO
+            // never returns, so only a real block outlasts the parent's deadline.
+            let until = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < until {
                 let _ = read_exact_file_bytes(&target, &read_policy, &path_entry, &cancel);
                 let _ = file_content_hash(&target, &read_policy, &path_entry, &cancel);
                 let _ = super::read_scan_source(&target, &read_policy, &path_entry, &cancel);
@@ -12546,7 +12549,9 @@ mod tests {
             }
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Generous: the child reads for 2 s, and process startup or a loaded
+        // machine must not be mistaken for a blocked reader.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = child.try_wait().expect("poll FIFO reader child") {
                 break status;

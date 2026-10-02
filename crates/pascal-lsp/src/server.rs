@@ -845,6 +845,25 @@ impl ProtocolConnection {
             .and_then(|receiver| receiver.try_recv().ok())
     }
 
+    /// Waits on both lanes: a control frame can reach the priority lane after
+    /// it was last polled, and the ordinary lane alone would never wake for it.
+    fn recv_timeout(&self, timeout: Duration) -> Result<Message, RecvTimeoutError> {
+        let Some(priority) = self.priority_receiver.as_ref() else {
+            return self.receiver().recv_timeout(timeout);
+        };
+        crossbeam_channel::select_biased! {
+            recv(priority) -> message => match message {
+                Ok(message) => Ok(message),
+                // No priority sender remains, so only the ordinary lane can wake.
+                Err(_) => self.receiver().recv_timeout(timeout),
+            },
+            recv(self.receiver()) -> message => {
+                message.map_err(|_| RecvTimeoutError::Disconnected)
+            }
+            default(timeout) => Err(RecvTimeoutError::Timeout),
+        }
+    }
+
     fn flush(&self) -> Result<(), OutputError> {
         self.outbound.borrow_mut().flush(&self.connection.sender)
     }
@@ -1890,6 +1909,7 @@ fn compact_completion_records(
             missing_provider_candidate: record.missing_provider_candidate,
             document_link_missing_candidate: record.document_link_missing_candidate,
             directory_observation: record.directory_observation,
+            document_link_ancestor: record.document_link_ancestor,
             missing_provider_scope: record.missing_provider_scope.clone(),
             auto_import_provider_observation: record.auto_import_provider_observation,
             auto_import_scopes: record.auto_import_scopes.clone(),
@@ -2508,6 +2528,7 @@ fn compact_diagnostic_records(records: &[SourceRecord]) -> Result<Vec<SourceReco
             missing_provider_candidate: record.missing_provider_candidate,
             document_link_missing_candidate: record.document_link_missing_candidate,
             directory_observation: record.directory_observation,
+            document_link_ancestor: record.document_link_ancestor,
             missing_provider_scope: record.missing_provider_scope.clone(),
             auto_import_provider_observation: record.auto_import_provider_observation,
             auto_import_scopes: record.auto_import_scopes.clone(),
@@ -2534,6 +2555,7 @@ fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
     record.missing_provider_candidate.hash(&mut hasher);
     record.document_link_missing_candidate.hash(&mut hasher);
     record.directory_observation.hash(&mut hasher);
+    record.document_link_ancestor.hash(&mut hasher);
     record.auto_import_provider_observation.hash(&mut hasher);
     hash_debug(&mut hasher, &record.candidate_membership);
     hash_debug(&mut hasher, &record.candidate_observations);
@@ -11037,7 +11059,7 @@ fn event_loop(
                 Some(DeferredConfigurationMessage::Notification(notification)) => {
                     Message::Notification(notification)
                 }
-                None => match connection.receiver().recv_timeout(timeout) {
+                None => match connection.recv_timeout(timeout) {
                     Ok(message) => message,
                     Err(RecvTimeoutError::Timeout) => {
                         drain_watch_events(workspace, &watch_events, &mut rewarm);
@@ -11083,7 +11105,7 @@ fn event_loop(
                 },
             }
         } else {
-            match connection.receiver().recv_timeout(timeout) {
+            match connection.recv_timeout(timeout) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     drain_watch_events(workspace, &watch_events, &mut rewarm);
@@ -17169,6 +17191,36 @@ mod tests {
     }
 
     #[test]
+    fn blocking_receive_wakes_for_a_priority_message() {
+        // The reader diverts control frames to the priority lane whenever the
+        // event loop is not already parked in a receive, which includes the gap
+        // between polling that lane and blocking on the ordinary one.
+        let (server, _client) = Connection::memory();
+        let (priority_sender, priority_receiver) = crossbeam_channel::unbounded();
+        let protocol = super::ProtocolConnection::new(
+            server,
+            priority_receiver,
+            &TestBarrierConfig::disabled(),
+        );
+        priority_sender
+            .send(Message::Request(Request::new(
+                RequestId::from("shutdown".to_string()),
+                "shutdown".to_string(),
+                serde_json::json!(null),
+            )))
+            .expect("queue priority shutdown");
+
+        let started = Instant::now();
+        let received = protocol.recv_timeout(Duration::from_secs(2));
+
+        assert!(
+            matches!(&received, Ok(Message::Request(request)) if request.method == "shutdown"),
+            "expected the priority shutdown, got {received:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn priority_messages_do_not_consume_deferred_workspace_messages_or_overflow() {
         let deferred_change = Message::Notification(Notification::new(
             "textDocument/didChange".to_string(),
@@ -17517,6 +17569,7 @@ mod tests {
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -17720,6 +17773,7 @@ mod tests {
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),

@@ -40,8 +40,8 @@ use crate::delphi_overrides::{
 use crate::installations::{
     IdePaths, InstallationEvidence, evaluate_ide_paths, load_installation, select_installation,
 };
-use quick_xml::Reader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -8407,8 +8407,9 @@ struct XmlFrame {
 }
 
 fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>, String> {
+    // Text is trimmed once per element: trimming each event would drop the
+    // spaces around entity references, which arrive as separate events.
     let mut reader = Reader::from_str(contents);
-    reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let mut operations = Vec::new();
     let mut frames: Vec<XmlFrame> = Vec::new();
@@ -8420,7 +8421,7 @@ fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>
         match event {
             Event::Start(start) => {
                 let name = local_name(start.name().as_ref());
-                let attributes = xml_attributes(&start, reader.decoder())?;
+                let attributes = xml_attributes(&start)?;
                 let parent_condition = frames
                     .last()
                     .and_then(|frame| frame.kind.condition().map(ToOwned::to_owned));
@@ -8536,7 +8537,7 @@ fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>
             }
             Event::Empty(empty) => {
                 let name = local_name(empty.name().as_ref());
-                let attributes = xml_attributes(&empty, reader.decoder())?;
+                let attributes = xml_attributes(&empty)?;
                 let parent_condition = frames
                     .last()
                     .and_then(|frame| frame.kind.condition().map(ToOwned::to_owned));
@@ -8598,17 +8599,24 @@ fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>
                 if let Some(frame) = frames.last_mut()
                     && matches!(frame.kind, FrameKind::Property { .. })
                 {
-                    let decoded = text.unescape().map_err(|error| {
+                    frame.text.push_str(&text);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(frame) = frames.last_mut()
+                    && matches!(frame.kind, FrameKind::Property { .. })
+                {
+                    let resolved = xml_reference_text(&reference).map_err(|error| {
                         format!("invalid XML text in {}: {error}", path.display())
                     })?;
-                    frame.text.push_str(&decoded);
+                    frame.text.push_str(&resolved);
                 }
             }
             Event::CData(text) => {
                 if let Some(frame) = frames.last_mut()
                     && matches!(frame.kind, FrameKind::Property { .. })
                 {
-                    frame.text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                    frame.text.push_str(&text);
                 }
             }
             Event::End(_) => {
@@ -8642,21 +8650,30 @@ fn push_property(operations: &mut [XmlOperation], operation: usize, entry: Prope
     }
 }
 
-fn local_name(name: &[u8]) -> String {
-    let name = String::from_utf8_lossy(name);
+fn local_name(name: &str) -> String {
     name.rsplit(':').next().unwrap_or_default().to_string()
 }
 
-fn xml_attributes(
-    start: &BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
-) -> Result<HashMap<String, String>, String> {
+/// The text an XML entity or character reference stands for.
+fn xml_reference_text(reference: &BytesRef<'_>) -> Result<String, String> {
+    if let Some(character) = reference
+        .resolve_char_ref()
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(character.to_string());
+    }
+    quick_xml::escape::resolve_predefined_entity(reference)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("unknown XML entity `&{};`", &**reference))
+}
+
+fn xml_attributes(start: &BytesStart<'_>) -> Result<HashMap<String, String>, String> {
     let mut attributes = HashMap::new();
     for attribute in start.attributes().with_checks(false) {
         let attribute = attribute.map_err(|error| format!("invalid XML attribute: {error}"))?;
         let name = local_name(attribute.key.as_ref()).to_ascii_lowercase();
         let value = attribute
-            .decode_and_unescape_value(decoder)
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| format!("invalid XML attribute value: {error}"))?;
         attributes.insert(name, value.into_owned());
     }
@@ -9595,23 +9612,44 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_package_metadata;
     use super::{
         EffectiveOverrides, ExistingPathStatus, MAX_OWNERSHIP_CANDIDATES,
         MAX_OWNERSHIP_SOURCE_BYTES, MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES,
         MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry,
         ProjectPathProvenance, ProjectReadStamp, ProjectReadTracker, ReadPolicy,
         content_hash_bytes, path_stamp_result, project_candidate_membership,
-        read_bounded_with_tracker, read_package_metadata, resolve_existing_path_status,
-        test_before_project_read_at, test_cancel_project_scan_after_checks,
-        with_legacy_path_resolution, with_path_resolution_read_dir_count,
+        read_bounded_with_tracker, resolve_existing_path_status, test_before_project_read_at,
+        test_cancel_project_scan_after_checks, with_legacy_path_resolution,
+        with_path_resolution_read_dir_count,
     };
     use crate::delphi_overrides::OverrideSession;
     use std::cell::Cell;
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write;
     #[cfg(unix)]
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn xml_property_text_resolves_entities_without_losing_spaces() {
+        let xml = r#"<Project><PropertyGroup Condition="'$(Config)'=='R &amp; D'"><DCC_UnitSearchPath>C:\R &amp; D\lib;&#36;(BDS)</DCC_UnitSearchPath></PropertyGroup></Project>"#;
+        let operations = super::parse_xml_operations(xml, std::path::Path::new("Entities.dproj"))
+            .expect("well-formed XML");
+        let Some(super::XmlOperation::PropertyGroup(group)) = operations.first() else {
+            panic!("expected a property group, got {operations:?}");
+        };
+        assert_eq!(group.condition.as_deref(), Some("'$(Config)'=='R & D'"));
+        assert_eq!(group.properties[0].value, r"C:\R & D\lib;$(BDS)");
+    }
+
+    #[test]
+    fn xml_property_text_rejects_unknown_entities() {
+        let xml = "<Project><PropertyGroup><Define>A&bogus;B</Define></PropertyGroup></Project>";
+        assert!(super::parse_xml_operations(xml, std::path::Path::new("Unknown.dproj")).is_err());
+    }
 
     struct TestProjectWorkBudget {
         remaining_visits: Cell<usize>,

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+publish.workspace = true
 description = "An opinionated Delphi/Object Pascal code formatter"
 keywords = ["delphi", "pascal", "formatter", "lint", "cli"]
 categories = ["command-line-utilities", "development-tools"]

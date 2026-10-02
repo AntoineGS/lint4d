@@ -8255,6 +8255,7 @@ impl Workspace {
                 missing_provider_candidate: !observation.present,
                 document_link_missing_candidate: document_link_candidate && !observation.present,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -8665,6 +8666,7 @@ impl Workspace {
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -8707,6 +8709,7 @@ impl Workspace {
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -8892,6 +8895,7 @@ impl Workspace {
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -11931,6 +11935,7 @@ impl Workspace {
                         missing_provider_candidate: true,
                         document_link_missing_candidate: false,
                         directory_observation: false,
+                        document_link_ancestor: false,
                         missing_provider_scope: None,
                         auto_import_provider_observation: false,
                         auto_import_scopes: Vec::new(),
@@ -11988,6 +11993,7 @@ impl Workspace {
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: Some(scope),
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -15345,13 +15351,15 @@ fn is_immutable_override_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::scan_external_units;
     use super::{
         ContextKey, ContextState, DiagnosticLineIndex, DiagnosticPublicationCursorStep,
         DiagnosticPublicationUriCursor, FileChange, KnownDocumentOwner,
         MAX_OPEN_DOCUMENT_URI_BYTES, MAX_OPEN_DOCUMENTS, MAX_REJECTED_OPEN_FENCE_URIS,
         MAX_SOURCE_CHANGE_OBSERVATIONS, OpenDocument, OwnerOrigin, PackageLookup,
         ReconciliationBudget, ResourceLimits, RuntimeOptionsOverride, Workspace, WorkspaceOptions,
-        context_state_is_fresh_with_cancel, normalize_line_endings, scan_external_units,
+        context_state_is_fresh_with_cancel, normalize_line_endings,
     };
     use crate::NavigationTarget;
     use crate::include_expansion::ExpandedSource;
@@ -15367,7 +15375,6 @@ mod tests {
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fs;
-    #[cfg(unix)]
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
@@ -16358,6 +16365,7 @@ mod tests {
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -16446,6 +16454,7 @@ mod tests {
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -19433,6 +19442,7 @@ BDS = '/fake/37'
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -21929,6 +21939,7 @@ BDS = '/fake/37'
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -24060,7 +24071,9 @@ BDS = '/fake/37'
             selection_project: None,
             config: None,
             platform: None,
+            build_selection_modes: None,
             conditional_context: Default::default(),
+            context_fingerprint: None,
             overrides: EffectiveOverrides {
                 path_mappings: vec![PathMapping {
                     from: "c:/sdk".to_owned(),

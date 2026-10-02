@@ -19,6 +19,7 @@ fn list_projects_is_on_demand_and_advertised() {
         true
     );
     let id = RequestId::from("list-projects".to_owned());
+    #[cfg(target_os = "linux")]
     let mut result = Value::Null;
     #[cfg(target_os = "linux")]
     let (opened, config_opened) = {
@@ -46,7 +47,7 @@ fn list_projects_is_on_demand_and_advertised() {
         (opened, config_opened)
     };
     #[cfg(not(target_os = "linux"))]
-    {
+    let result = {
         server.send_request(
             id.clone(),
             "pascal/listProjects",
@@ -54,8 +55,8 @@ fn list_projects_is_on_demand_and_advertised() {
         );
         let response = server.response(&id);
         assert!(response.error.is_none(), "{response:?}");
-        result = response.result.unwrap();
-    }
+        response.result.unwrap()
+    };
     #[cfg(target_os = "linux")]
     assert!(!opened, "enumeration must not open .dproj contents");
     #[cfg(target_os = "linux")]

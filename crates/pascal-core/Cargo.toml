@@ -7,18 +7,19 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+publish.workspace = true
 description = "Shared parsing and discovery infrastructure for Delphi/Object Pascal tools"
 
 [dependencies]
 pascal-project = { path = "../pascal-project" }
 tree-sitter = "0.24"
-tree-sitter-pascal.workspace = true
+tree-sitter-pascal = { git = "https://github.com/AntoineGS/tree-sitter-pascal.git", rev = "22cf861dc87bde0dd0b0d6397dd85dbef375006e" }
 tree-sitter-language = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 globset = "0.4"
 walkdir = "2"
-quick-xml = "0.37"
+quick-xml = "0.42"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

@@ -39,3 +39,16 @@ fn project_version_returns_none_when_missing() {
     let version = parse_project_version(&dproj).unwrap();
     assert_eq!(version, None);
 }
+
+#[test]
+fn project_version_resolves_character_references() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let dproj = dir.path().join("Escaped.dproj");
+    std::fs::write(
+        &dproj,
+        r#"<Project><PropertyGroup><ProjectVersion>20&#46;1</ProjectVersion></PropertyGroup></Project>"#,
+    )
+    .unwrap();
+    let version = parse_project_version(&dproj).unwrap();
+    assert_eq!(version, Some("20.1".to_string()));
+}

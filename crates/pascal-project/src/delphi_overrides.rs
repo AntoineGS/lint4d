@@ -982,7 +982,9 @@ fn is_valid_property_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fs, read_override_file_with_budget};
+    use super::fs;
+    #[cfg(target_os = "linux")]
+    use super::read_override_file_with_budget;
     use std::cell::Cell;
 
     struct RecordingBudget {

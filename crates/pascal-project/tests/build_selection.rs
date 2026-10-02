@@ -1839,3 +1839,22 @@ fn write(path: &Path, contents: &str) {
     }
     fs::write(path, contents).expect("fixture file");
 }
+
+#[test]
+fn entity_references_keep_the_spaces_around_them() {
+    let xml = r#"<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+      <PropertyGroup>
+        <Config Condition="'$(Config)'==''">R &amp; D</Config>
+        <Platform Condition="'$(Platform)'==''">Win32</Platform>
+      </PropertyGroup>
+      <ItemGroup>
+        <BuildConfiguration Include="Base"/>
+        <BuildConfiguration Include="R &amp; D"/>
+      </ItemGroup>
+    </Project>"#;
+
+    let candidates = parse_build_candidates(xml);
+
+    assert_eq!(candidates.configs, ["R & D"]);
+    assert_eq!(candidates.default_config.as_deref(), Some("R & D"));
+}

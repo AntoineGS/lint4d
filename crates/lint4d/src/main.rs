@@ -241,7 +241,7 @@ fn exit_err(msg: &str, code: i32) -> ! {
 }
 
 fn real_main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // --init: create default config and exit
     if cli.init {
@@ -262,6 +262,12 @@ fn real_main() {
     }
 
     let threshold = validate_cli(&cli);
+    // Project reads refuse symlinked path components. The path the user chose
+    // is trusted, so resolve its symlinks (e.g. macOS /var -> /private/var)
+    // once here; a missing file keeps its name for the error reported later.
+    if let Some(project) = cli.project.take() {
+        cli.project = Some(std::fs::canonicalize(&project).unwrap_or(project));
+    }
 
     // Discover config: start from the .dproj directory when --project is given,
     // so that a .lint4d.toml next to the project file is found automatically.

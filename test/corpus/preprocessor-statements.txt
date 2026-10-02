@@ -1,0 +1,278 @@
+===
+conditional preprocessor block preserves numeric labeled statement
+===
+program P;
+label 10;
+begin
+  {$IFDEF FOO}
+  10: Work;
+  {$ENDIF}
+end.
+
+---
+
+(root
+  (program
+    (kProgram)
+    (moduleName
+      (identifier))
+    (declLabels
+      (kLabel)
+      (declLabel
+        (labelNumber)))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (label
+          (labelNumber))
+        (statement
+          (identifier))
+        (ppEndIf))
+      (kEnd))
+    (kEndDot)))
+
+===
+conditional block preserves trailing numeric label
+===
+program P;
+label 10;
+begin
+  {$IFDEF FOO}
+  Work;
+  10:
+  {$ENDIF}
+end.
+
+---
+
+(root
+  (program
+    (kProgram)
+    (moduleName
+      (identifier))
+    (declLabels
+      (kLabel)
+      (declLabel
+        (labelNumber)))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (statement
+          (identifier))
+        (label
+          (labelNumber))
+        (ppEndIf))
+      (kEnd))
+    (kEndDot)))
+
+===
+conditional block preserves named labeled statement
+===
+program P;
+begin
+  {$IFDEF FOO}
+  L: Work;
+  {$ENDIF}
+end.
+
+---
+
+(root
+  (program
+    (kProgram)
+    (moduleName
+      (identifier))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (label
+          (identifier))
+        (statement
+          (identifier))
+        (ppEndIf))
+      (kEnd))
+    (kEndDot)))
+
+===
+conditional block preserves trailing empty numeric label
+===
+program P;
+label 10;
+begin
+  {$IFDEF FOO}
+  10:
+  {$ENDIF}
+end.
+
+---
+
+(root
+  (program
+    (kProgram)
+    (moduleName
+      (identifier))
+    (declLabels
+      (kLabel)
+      (declLabel
+        (labelNumber)))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (label
+          (labelNumber))
+        (ppEndIf))
+      (kEnd))
+    (kEndDot)))
+
+===
+conditional block preserves trailing empty named label
+===
+program P;
+begin
+  {$IFDEF FOO}
+  L:
+  {$ENDIF}
+end.
+
+---
+
+(root
+  (program
+    (kProgram)
+    (moduleName
+      (identifier))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (label
+          (identifier))
+        (ppEndIf))
+      (kEnd))
+    (kEndDot)))
+
+===
+conditional block rejects missing label separator
+===
+program P;
+begin
+  {$IFDEF FOO}
+  Work L:
+  {$ENDIF}
+end.
+
+---
+
+(root
+  (program
+    (kProgram)
+    (moduleName
+      (identifier))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (label
+          (identifier)
+          (ERROR
+            (identifier)))
+        (ppEndIf))
+      (kEnd))
+    (kEndDot)))
+
+===
+conditional unit implementation preserves procedure definition
+===
+unit U;
+interface
+implementation
+{$IFDEF FOO}
+procedure P;
+begin
+  Work;
+end;
+{$ENDIF}
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface))
+    (implementation
+      (kImplementation)
+      (ppBlock
+        (ppIf)
+        (defProc
+          (declProc
+            (kProcedure)
+            (identifier))
+          (block
+            (kBegin)
+            (statement
+              (identifier))
+            (kEnd)))
+        (ppEndIf)))
+    (kEnd)
+    (kEndDot)))
+
+===
+Inline var inside a conditional statement block
+===
+
+procedure P;
+begin
+  {$IFDEF X}
+  var I: Integer := 0;
+  {$ENDIF}
+  Foo;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (assignment
+          (varAssignDef (kVar) (identifier) (typeref (identifier)))
+          (kAssign)
+          (literalNumber))
+        (ppEndIf))
+      (statement (identifier))
+      (kEnd))))
+
+===
+Conditional declarations keep declaration parsing
+===
+
+procedure P;
+{$IFDEF X}
+var I: Integer;
+{$ENDIF}
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc (kProcedure) (identifier))
+    (ppBlock
+      (ppIf)
+      (declVars (kVar) (declVar (identifier) (type (typeref (identifier)))))
+      (ppEndIf))
+    (block
+      (kBegin)
+      (kEnd))))

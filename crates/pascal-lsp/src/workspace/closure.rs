@@ -14,6 +14,8 @@ pub(super) struct ClosureWalk {
     pub(super) providers: HashSet<Url>,
     /// Whether part of the closure was not cached.
     pub(super) incomplete: bool,
+    /// Units whose interface or unit entry was not cached.
+    pub(super) missed: HashSet<Url>,
 }
 
 enum Insertion {
@@ -71,6 +73,9 @@ pub(super) fn walk_interface_closure(
             .get(&context_key)
             .map(|state| state.context.clone())
         else {
+            walk.incomplete = true;
+            walk.missed.insert(uri.clone());
+            loader.index.clear_import_bindings(&uri);
             continue;
         };
         let Some(interface) = loader
@@ -78,6 +83,7 @@ pub(super) fn walk_interface_closure(
             .peek_interface_imports(&uri, &context, hash, &overlays)
         else {
             walk.incomplete = true;
+            walk.missed.insert(uri.clone());
             loader.index.clear_import_bindings(&uri);
             continue;
         };
@@ -99,7 +105,10 @@ pub(super) fn walk_interface_closure(
                         ));
                     }
                 }
-                Insertion::Missing => walk.incomplete = true,
+                Insertion::Missing => {
+                    walk.incomplete = true;
+                    walk.missed.insert(binding.uri.clone());
+                }
                 Insertion::Skipped => {}
             }
         }

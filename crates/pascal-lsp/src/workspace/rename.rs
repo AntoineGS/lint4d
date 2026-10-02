@@ -6721,10 +6721,10 @@ fn build_snapshot_with_policy(
             &owned_sources,
             cancel,
         )?;
-        if closure.incomplete {
-            for root in &priority {
-                loader.project_cache.request_closure_crawl(root);
-            }
+        for root in &priority {
+            loader
+                .project_cache
+                .report_closure_misses(root, closure.missed.clone());
         }
         declaration_providers = closure.providers;
     }

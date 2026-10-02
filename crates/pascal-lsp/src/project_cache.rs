@@ -441,6 +441,37 @@ mod cache_tests {
         assert!(cache.take_closure_crawl_requests().is_empty());
     }
 
+    #[test]
+    fn closure_misses_request_a_crawl_only_when_a_new_unit_misses() {
+        let cache = ProjectCache::new(usize::MAX);
+        let main = uri("Main.pas");
+        let misses = |names: &[&str]| names.iter().map(|name| uri(name)).collect::<HashSet<_>>();
+
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "a persistent miss must not request another crawl"
+        );
+
+        cache.report_closure_misses(&main, misses(&["Sync.pas", "Sibling.pas"]));
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "a shrinking miss set must not request another crawl"
+        );
+
+        cache.report_closure_misses(&main, misses(&[]));
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![main],
+            "a miss that returns after a complete walk is new again"
+        );
+    }
+
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
     }
@@ -1210,6 +1241,7 @@ mod cache_tests {
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
 const MAX_CLOSURE_CRAWL_REQUESTS: usize = 1024;
+const MAX_CLOSURE_MISS_ROOTS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
@@ -1321,6 +1353,8 @@ struct State {
     watch_counts: HashMap<PathBuf, usize>,
     watcher: Option<Box<dyn DirectoryWatch>>,
     closure_crawl_requests: Vec<Url>,
+    /// Each root's uncached closure units at its last snapshot walk.
+    closure_misses: HashMap<Url, HashSet<Url>>,
 }
 
 impl Default for State {
@@ -1336,6 +1370,7 @@ impl Default for State {
             watch_counts: HashMap::new(),
             watcher: None,
             closure_crawl_requests: Vec::new(),
+            closure_misses: HashMap::new(),
         }
     }
 }
@@ -1366,6 +1401,19 @@ impl std::fmt::Debug for ProjectCache {
 
 #[cfg(test)]
 impl ProjectCache {
+    /// The layers (`"Unit"`, `"Import"`, `"Interface"`) with a ready entry for `uri`.
+    pub(crate) fn ready_layers(&self, uri: &Url) -> Vec<String> {
+        let state = lock(&self.inner);
+        let mut layers = state
+            .slots
+            .iter()
+            .filter(|(key, slot)| &key.uri == uri && matches!(slot, Slot::Ready(_)))
+            .map(|(key, _)| format!("{:?}", key.layer))
+            .collect::<Vec<_>>();
+        layers.sort();
+        layers
+    }
+
     fn set_validation_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.inner.validation_hook.lock().unwrap() = Some(Box::new(hook));
     }
@@ -1948,12 +1996,34 @@ impl ProjectCache {
 
     /// Records that a snapshot for `uri` found part of its interface closure
     /// uncached. The server drains these into warmer crawls.
-    pub(crate) fn request_closure_crawl(&self, uri: &Url) {
+    fn request_closure_crawl(&self, uri: &Url) {
         let mut state = lock(&self.inner);
         if state.closure_crawl_requests.len() < MAX_CLOSURE_CRAWL_REQUESTS
             && !state.closure_crawl_requests.contains(uri)
         {
             state.closure_crawl_requests.push(uri.clone());
+        }
+    }
+
+    /// Records the units a snapshot walk for `root` found uncached, and
+    /// requests a crawl only when one of them was not missed by the root's
+    /// previous walk. A unit that can never be cached then stops requesting
+    /// crawls, while one evicted since the last walk requests another.
+    pub(crate) fn report_closure_misses(&self, root: &Url, missed: HashSet<Url>) {
+        let mut state = lock(&self.inner);
+        let new_miss = match state.closure_misses.get(root) {
+            Some(previous) => missed.iter().any(|uri| !previous.contains(uri)),
+            None => !missed.is_empty(),
+        };
+        if state.closure_misses.len() >= MAX_CLOSURE_MISS_ROOTS
+            && !state.closure_misses.contains_key(root)
+        {
+            state.closure_misses.clear();
+        }
+        state.closure_misses.insert(root.clone(), missed);
+        drop(state);
+        if new_miss {
+            self.request_closure_crawl(root);
         }
     }
 

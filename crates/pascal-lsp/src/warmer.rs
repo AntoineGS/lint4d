@@ -471,11 +471,16 @@ impl Warmer {
     }
 
     /// Re-crawls an open file whose snapshot found part of its interface
-    /// closure uncached, unless it was already crawled since the cache was
-    /// last invalidated. Otherwise a unit that can never be cached would
-    /// trigger a crawl on every request.
+    /// closure uncached, unless it was already crawled, or a crawl is in
+    /// flight, since the cache was last invalidated. Otherwise a unit that can
+    /// never be cached would trigger a crawl on every request.
     pub(crate) fn request_closure_crawl(&mut self, uri: Url, invalidation_epoch: u64) {
-        if self.crawled_epochs.get(&uri) == Some(&invalidation_epoch) {
+        let in_flight = self
+            .busy_attempt
+            .as_ref()
+            .is_some_and(|(busy_uri, _)| busy_uri == &uri)
+            && self.dispatched_epochs.get(&uri) == Some(&invalidation_epoch);
+        if in_flight || self.crawled_epochs.get(&uri) == Some(&invalidation_epoch) {
             return;
         }
         self.rewarm(uri);
@@ -909,6 +914,31 @@ mod tests {
             !warmer.queue.is_empty(),
             "a newer epoch allows another crawl"
         );
+    }
+
+    #[test]
+    fn closure_crawl_requests_are_ignored_while_that_crawl_is_in_flight() {
+        let (_temp, workspace, main) = fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main.clone());
+        warmer.poll(&workspace);
+        assert!(warmer.queue.is_empty(), "the crawl was dispatched");
+        let epoch = workspace.project_cache().invalidation_epoch();
+
+        warmer.request_closure_crawl(main.clone(), epoch);
+        assert!(
+            warmer.queue.is_empty(),
+            "the in-flight crawl already covers this epoch"
+        );
+
+        warmer.request_closure_crawl(main, epoch + 1);
+        assert!(
+            !warmer.queue.is_empty(),
+            "a newer epoch allows another crawl"
+        );
+        gate.set(0);
     }
 
     #[test]

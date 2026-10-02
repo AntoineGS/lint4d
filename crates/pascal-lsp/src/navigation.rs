@@ -1896,6 +1896,14 @@ impl NavigationIndex {
         }
     }
 
+    /// Whether `uri`'s imports are bound or fenced rather than resolved by name.
+    #[cfg(test)]
+    pub(crate) fn has_import_bindings(&self, uri: &Url) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|document| document.import_bindings.is_some())
+    }
+
     pub(crate) fn rename_bound_unit_provider(
         &mut self,
         old_uri: &Url,

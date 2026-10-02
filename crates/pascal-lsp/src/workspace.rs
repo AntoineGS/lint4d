@@ -4155,8 +4155,14 @@ impl Workspace {
                 "open document tracking limit ({MAX_OPEN_DOCUMENTS}) reached"
             ));
         }
+        // Overlays are part of directory listings, so only replacing an
+        // existing overlay's text leaves the parent's listing unchanged.
+        let had_overlay = self
+            .open_documents
+            .get(&uri)
+            .is_some_and(|document| document.text.is_some());
         self.bump_source_generation();
-        self.mark_source_change(&uri, false);
+        self.mark_source_change(&uri, !had_overlay);
         let text_len = text.len();
         let source_for_index = text.clone();
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -4204,7 +4210,8 @@ impl Workspace {
             return;
         }
         self.bump_source_generation();
-        self.mark_source_change(&uri, false);
+        // Rejection removes any overlay from its directory listing.
+        self.mark_source_change(&uri, true);
         if let Some(previous) = self.open_documents.get(&uri) {
             if let Some(previous_text) = &previous.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
@@ -4338,7 +4345,8 @@ impl Workspace {
         }
         if !override_changed {
             self.bump_source_generation();
-            diagnostic_uris.extend(self.mark_source_change_with_control(uri, cancel, budget)?);
+            diagnostic_uris
+                .extend(self.mark_source_change_with_control(uri, true, cancel, budget)?);
         }
         let configuration_changed = is_configuration_path(uri);
         if configuration_changed || (override_changed && budget.is_some()) {
@@ -12937,19 +12945,28 @@ impl Workspace {
         self.configuration_generation = self.configuration_generation.wrapping_add(1);
     }
 
-    fn mark_source_change(&mut self, uri: &Url, _include_parent: bool) -> Vec<Url> {
-        self.mark_source_change_with_control(uri, None, None)
+    /// `include_parent` is false for a change that leaves the parent's
+    /// directory listing (including its open overlays) unchanged, which keeps
+    /// cache entries that only observed that listing.
+    fn mark_source_change(&mut self, uri: &Url, include_parent: bool) -> Vec<Url> {
+        self.mark_source_change_with_control(uri, include_parent, None, None)
             .unwrap_or_default()
     }
 
     fn mark_source_change_with_control(
         &mut self,
         uri: &Url,
+        include_parent: bool,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Url>, String> {
         if let Ok(path) = uri.to_file_path() {
-            self.project_cache.invalidate_path(&absolute_path(path));
+            let path = absolute_path(path);
+            if include_parent {
+                self.project_cache.invalidate_path(&path);
+            } else {
+                self.project_cache.invalidate_file_contents(&path);
+            }
         }
         let dependent_diagnostics =
             self.invalidate_expansion_dependents_with_control(uri, cancel, budget)?;
@@ -16944,6 +16961,152 @@ mod tests {
             .project_cache()
             .take_closure_crawl_requests();
         assert!(requests.contains(&fixture.main), "{requests:?}");
+    }
+
+    #[test]
+    fn a_persistent_closure_miss_requests_one_crawl_until_a_new_unit_misses() {
+        let fixture = inherited_fixture("Base");
+        let cache = fixture.workspace.project_cache().clone();
+
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![fixture.main.clone()]
+        );
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "the same misses must not request another crawl"
+        );
+
+        fixture.warm(&[&fixture.main]);
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(cache.take_closure_crawl_requests().is_empty());
+        cache.invalidate_file_contents(&fixture.base.to_file_path().unwrap());
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![fixture.main.clone()],
+            "an evicted unit is a new miss"
+        );
+    }
+
+    #[test]
+    fn editing_the_open_document_after_warm_up_requests_no_crawl() {
+        let mut fixture = inherited_fixture("Base");
+        fixture
+            .workspace
+            .open_document(
+                fixture.main.clone(),
+                INHERITED_THROUGH_DEPENDENCY_MAIN.to_string(),
+                1,
+            )
+            .expect("open Main");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(cache.take_closure_crawl_requests().is_empty());
+
+        fixture
+            .workspace
+            .change_document(
+                fixture.main.clone(),
+                INHERITED_THROUGH_DEPENDENCY_MAIN.replace("end.", "end.\n"),
+                2,
+            )
+            .expect("edit Main");
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+        assert!(cache.take_closure_crawl_requests().is_empty());
+    }
+
+    #[test]
+    fn a_walked_unit_without_a_context_is_fenced() {
+        let fixture = inherited_fixture("Base");
+        let mut warmed = worker_view(&fixture.workspace);
+        warmed
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm");
+        let context_key = warmed.document_contexts[&fixture.main].clone();
+
+        let mut loader = worker_view(&fixture.workspace);
+        loader.contexts.remove(&context_key);
+        let derived_text = fs::read_to_string(fixture.derived.to_file_path().unwrap()).unwrap();
+        loader
+            .index
+            .update(fixture.derived.clone(), derived_text)
+            .unwrap();
+        loader
+            .index
+            .update(fixture.base.clone(), INHERITED_BASE.to_string())
+            .unwrap();
+        loader
+            .indexed_content_hashes
+            .insert(fixture.derived.clone(), 1);
+        loader
+            .document_contexts
+            .insert(fixture.derived.clone(), context_key);
+        assert!(!loader.index.has_import_bindings(&fixture.derived));
+
+        let walk = super::closure::walk_interface_closure(
+            &mut loader,
+            std::slice::from_ref(&fixture.derived),
+            &HashSet::new(),
+            &AtomicBool::new(false),
+        )
+        .expect("walk");
+
+        assert!(walk.incomplete);
+        assert!(walk.missed.contains(&fixture.derived), "{:?}", walk.missed);
+        assert!(
+            loader.index.has_import_bindings(&fixture.derived),
+            "an unwalked unit must not fall back to name-based imports"
+        );
+    }
+
+    #[test]
+    fn an_overlay_edit_keeps_sibling_entries_and_evicts_its_dependents() {
+        let mut fixture = inherited_fixture("Base");
+        fixture
+            .workspace
+            .open_document(fixture.base.clone(), INHERITED_BASE.to_string(), 1)
+            .expect("open Base");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        let main_layers = cache.ready_layers(&fixture.main);
+        assert!(
+            main_layers.contains(&"Interface".to_string())
+                && main_layers.contains(&"Unit".to_string()),
+            "{main_layers:?}"
+        );
+        assert!(
+            cache
+                .ready_layers(&fixture.derived)
+                .contains(&"Interface".to_string()),
+            "Derived's interface entry depends on Base's overlay"
+        );
+
+        fixture
+            .workspace
+            .change_document(
+                fixture.base.clone(),
+                INHERITED_BASE.replace("procedure Open;", "procedure Open; "),
+                2,
+            )
+            .expect("edit Base");
+
+        assert_eq!(
+            cache.ready_layers(&fixture.main),
+            main_layers,
+            "a text edit leaves the directory listing unchanged"
+        );
+        assert!(
+            !cache
+                .ready_layers(&fixture.derived)
+                .contains(&"Interface".to_string()),
+            "entries that observed Base's overlay must be evicted"
+        );
     }
 
     #[test]

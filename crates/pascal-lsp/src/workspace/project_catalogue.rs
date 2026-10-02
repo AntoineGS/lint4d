@@ -461,7 +461,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // macOS filesystems reject file names that are not valid UTF-8.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn labels_preserve_unix_component_identity() {
         use std::ffi::OsString;

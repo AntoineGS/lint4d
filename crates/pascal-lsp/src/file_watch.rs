@@ -187,18 +187,22 @@ mod tests {
         let mut watcher = NotifyWatcher::start(sender).expect("watcher");
         assert!(watcher.watch(temp.path()));
         std::fs::write(temp.path().join("New.pas"), "unit New;").unwrap();
-        let event = events
-            .receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("event");
-        match event {
-            WatchEvent::Modified(paths) | WatchEvent::Changed(paths) => {
-                assert!(
-                    paths.iter().any(|path| path.ends_with("New.pas")),
-                    "{paths:?}"
-                );
+        // Other events may come first: FSEvents on macOS can still report the
+        // temporary directory's own creation.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.receiver.recv_timeout(remaining) {
+                Ok(WatchEvent::Modified(paths) | WatchEvent::Changed(paths)) => {
+                    if paths.iter().any(|path| path.ends_with("New.pas")) {
+                        return;
+                    }
+                    seen.extend(paths);
+                }
+                Ok(WatchEvent::Overflow) => return,
+                Err(_) => panic!("no event for New.pas; saw {seen:?}"),
             }
-            WatchEvent::Overflow => {}
         }
     }
 

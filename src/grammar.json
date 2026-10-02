@@ -1181,8 +1181,17 @@
           "name": "kGoto"
         },
         {
-          "type": "SYMBOL",
-          "name": "identifier"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "labelNumber"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -2251,8 +2260,17 @@
           "name": "kGoto"
         },
         {
-          "type": "SYMBOL",
-          "name": "identifier"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "labelNumber"
+            }
+          ]
         }
       ]
     },
@@ -2594,8 +2612,17 @@
       "type": "SEQ",
       "members": [
         {
-          "type": "SYMBOL",
-          "name": "identifier"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "identifier"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "labelNumber"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -7605,8 +7632,17 @@
       "type": "FIELD",
       "name": "name",
       "content": {
-        "type": "SYMBOL",
-        "name": "identifier"
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "SYMBOL",
+            "name": "identifier"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "labelNumber"
+          }
+        ]
       }
     },
     "declExport": {
@@ -11831,6 +11867,17 @@
     "identifier": {
       "type": "PATTERN",
       "value": "[&]?[a-zA-Z_]+[0-9_a-zA-Z$]*"
+    },
+    "labelNumber": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "[0-9]+"
+        }
+      }
     },
     "_space": {
       "type": "PATTERN",

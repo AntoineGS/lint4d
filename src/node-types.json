@@ -1878,6 +1878,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "labelNumber",
+            "named": true
           }
         ]
       }
@@ -5864,6 +5868,10 @@
         {
           "type": "kGoto",
           "named": true
+        },
+        {
+          "type": "labelNumber",
+          "named": true
         }
       ]
     }
@@ -6633,6 +6641,10 @@
       "types": [
         {
           "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "labelNumber",
           "named": true
         }
       ]
@@ -10260,6 +10272,10 @@
   },
   {
     "type": "kXor",
+    "named": true
+  },
+  {
+    "type": "labelNumber",
     "named": true
   },
   {

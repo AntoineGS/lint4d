@@ -306,7 +306,11 @@ function statements(trailing) {
 			seq($._expr, ...semicolon),
 		)],
 
-		[rn('goto'),        $ => seq($.kGoto, $.identifier, ...semicolon)],
+		[rn('goto'),        $ => seq(
+			$.kGoto,
+			choice($.identifier, $.labelNumber),
+			...semicolon
+		)],
 
 		[rn('_statement'),   $ => choice(
 			...semicolon,
@@ -475,7 +479,7 @@ module.exports = grammar({
 			optional(seq(':', field('type', $.type))),
 			field('defaultValue', $.defaultValue)
 		),
-		label:           $ => seq($.identifier, ':'),
+		label:           $ => seq(choice($.identifier, $.labelNumber), ':'),
 		caseLabel:       $ => seq(delimited1(choice($._expr, $.range)), ':'),
 
 		_statements:     $ => repeat1(choice($.varDef, $._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
@@ -929,7 +933,7 @@ module.exports = grammar({
 		),
 
 		declLabels:      $ => seq($.kLabel, delimited1($.declLabel), ';'),
-		declLabel:       $ => field('name', $.identifier),
+		declLabel:       $ => field('name', choice($.identifier, $.labelNumber)),
 
 		declExport:      $ => seq($._genericName, repeat(seq(choice($.kName, $.kIndex), $._expr))),
 
@@ -1430,6 +1434,7 @@ module.exports = grammar({
 		kFalse:            $ => /false/i,
 
 		identifier:        $ => /[&]?[a-zA-Z_]+[0-9_a-zA-Z$]*/,
+		labelNumber:       $ => token(prec(1, /[0-9]+/)),
 
 	  	_space:            $ => /[\s\r\n\t]+/,
 		ppDirective:       $ => token(prec(-1, /\{\$[^}]*\}/)),

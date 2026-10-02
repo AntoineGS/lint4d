@@ -18,7 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 rayon = "1"
-cfg-pascal = { git = "https://github.com/AntoineGS/cfg-pascal.git", rev = "e78c6d3e30f581fde8f4b42b5cff7302d7c02c92" }
+cfg-pascal = { git = "https://github.com/AntoineGS/cfg-pascal.git", rev = "dd64c7587cabf2bd3c4d4b3bed10e30743defcfc" }
 # cfg-core is intentionally not a direct dependency: lint4d uses the
 # cfg-pascal public re-export for all cfg-core types, preserving one crate
 # identity. Cargo.lock pins the transitive git revision.

@@ -41,6 +41,11 @@ jobs:
           lfs: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Project reads refuse symlinked path components, and macOS reaches its
+      # temporary directory through one (/var -> /private/var).
+      - name: Resolve TMPDIR symlinks
+        if: runner.os == 'macOS'
+        run: echo "TMPDIR=$(cd "$TMPDIR" && pwd -P)/" >> "$GITHUB_ENV"
       - run: cargo test --workspace
 
   clippy:

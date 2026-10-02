@@ -9616,6 +9616,26 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
+    #[test]
+    fn xml_property_text_resolves_entities_without_losing_spaces() {
+        let xml = r#"<Project><PropertyGroup Condition="'$(Config)'=='R &amp; D'"><DCC_UnitSearchPath>C:\R &amp; D\lib;&#36;(BDS)</DCC_UnitSearchPath></PropertyGroup></Project>"#;
+        let operations = super::parse_xml_operations(xml, std::path::Path::new("Entities.dproj"))
+            .expect("well-formed XML");
+        let Some(super::XmlOperation::PropertyGroup(group)) = operations.first() else {
+            panic!("expected a property group, got {operations:?}");
+        };
+        assert_eq!(group.condition.as_deref(), Some("'$(Config)'=='R & D'"));
+        assert_eq!(group.properties[0].value, r"C:\R & D\lib;$(BDS)");
+    }
+
+    #[test]
+    fn xml_property_text_rejects_unknown_entities() {
+        let xml = "<Project><PropertyGroup><Define>A&bogus;B</Define></PropertyGroup></Project>";
+        assert!(
+            super::parse_xml_operations(xml, std::path::Path::new("Unknown.dproj")).is_err()
+        );
+    }
+
     struct TestProjectWorkBudget {
         remaining_visits: Cell<usize>,
         path_visits: Cell<usize>,

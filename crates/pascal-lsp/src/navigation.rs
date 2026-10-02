@@ -520,6 +520,9 @@ const MAX_QUALIFIED_IMPORT_ALIAS_PATH_NODES: usize = 128;
 pub struct ImportMetadata {
     pub name: String,
     pub span: SourceSpan,
+    /// The `uses` clause's section. Program, library, and package files use
+    /// `Module`.
+    pub section: pascal_core::ImportSection,
 }
 
 /// The source span of one parsed `uses` declaration.  The span includes the
@@ -914,6 +917,34 @@ impl NavigationIndex {
         urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         urls.dedup();
         Ok(())
+    }
+
+    /// Inserts an already parsed document without copying its source text.
+    /// Returns `false`, and changes nothing, when `uri` is already indexed or
+    /// `parsed` was built under a different conditional context.
+    pub(crate) fn insert_parsed(
+        &mut self,
+        uri: Url,
+        parsed: Arc<ParsedDocument>,
+        context: &ConditionalContext,
+    ) -> bool {
+        if self.documents.contains_key(&uri) || parsed.conditional_context != *context {
+            return false;
+        }
+        let unit = parsed.unit_name.clone();
+        self.documents.insert(
+            uri.clone(),
+            Document {
+                parsed,
+                import_bindings: None,
+                import_binding_fingerprint: None,
+            },
+        );
+        let urls = self.units.entry(unit).or_default();
+        urls.push(uri);
+        urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        urls.dedup();
+        true
     }
 
     /// Rebuild this retained semantic snapshot with one physical document
@@ -1863,6 +1894,14 @@ impl NavigationIndex {
             ));
             document.import_bindings = Some(HashMap::new());
         }
+    }
+
+    /// Whether `uri`'s imports are bound or fenced rather than resolved by name.
+    #[cfg(test)]
+    pub(crate) fn has_import_bindings(&self, uri: &Url) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|document| document.import_bindings.is_some())
     }
 
     pub(crate) fn rename_bound_unit_provider(
@@ -12795,7 +12834,7 @@ impl NavigationIndex {
         };
         entries.len() == 1
             && entries[0].kind == TypeKind::Class
-            && !entries[0].parent_declared
+            && (!entries[0].parent_declared || superclass_is_tobject(&entries[0]))
             && is_implicit_tobject_member(member_key)
     }
 
@@ -12894,6 +12933,13 @@ impl NavigationIndex {
                 entry.name_span.start,
                 &parent.path,
             ));
+            if candidates.is_empty()
+                && entry.kind == TypeKind::Class
+                && is_tobject_path(&parent.path)
+            {
+                // Without a visible System, `class(TObject)` is the implicit root.
+                continue;
+            }
             if candidates.len() != 1
                 || candidates
                     .iter()
@@ -13194,6 +13240,13 @@ impl NavigationIndex {
                 budget,
             )?);
             budget.require_work(candidates.len(), cancel)?;
+            if candidates.is_empty()
+                && entry.kind == TypeKind::Class
+                && is_tobject_path(&parent.path)
+            {
+                // Without a visible System, `class(TObject)` is the implicit root.
+                continue;
+            }
             if candidates.len() != 1
                 || candidates
                     .iter()
@@ -16072,14 +16125,20 @@ impl Document {
             if name.is_empty() || name.eq_ignore_ascii_case("in") {
                 continue;
             }
+            let region = region_for_node(*module_name);
             imports.push(ImportMetadata {
                 name: name.clone(),
                 span: SourceSpan {
                     start: module_name.start_byte(),
                     end: module_name.end_byte(),
                 },
+                section: match region {
+                    Region::Interface => pascal_core::ImportSection::Interface,
+                    Region::Implementation => pascal_core::ImportSection::Implementation,
+                    Region::Other => pascal_core::ImportSection::Module,
+                },
             });
-            match region_for_node(*module_name) {
+            match region {
                 Region::Interface => interface_uses.push(name),
                 Region::Implementation => implementation_uses.push(name),
                 Region::Other => implementation_uses.push(name),
@@ -16170,7 +16229,7 @@ impl Document {
         let conditional_unknown_symbols =
             conditional_unknown_symbols(root, &conditionals, &symbols);
         let helpers = collect_helpers(root, &source);
-        let type_ancestry = collect_type_ancestry(root, &source);
+        let (type_ancestry, superseded_forward_types) = collect_type_ancestry(root, &source);
         let method_resolutions = collect_method_resolutions(root, &source);
         let interface_delegations = collect_interface_delegations(root, &source);
         let unknown_class_owners = symbols
@@ -16275,6 +16334,7 @@ impl Document {
                 && symbol.scope == ROOT_SCOPE
                 && symbol.owner_type.is_none()
                 && symbol.generic_parameter.is_none()
+                && !superseded_forward_types.contains(&symbol.span)
             {
                 type_symbol_indices
                     .entry(symbol.key.clone())
@@ -17931,8 +17991,14 @@ fn target_instances_match(
         && (unspecialized_target || resolved.substitution == target.substitution)
 }
 
-fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<TypeAncestry>> {
+/// Collects the ancestry of each top-level type, and the name spans of forward
+/// declarations superseded by a full declaration in the same unit.
+fn collect_type_ancestry(
+    root: Node<'_>,
+    source: &str,
+) -> (HashMap<String, Vec<TypeAncestry>>, HashSet<Span>) {
     let mut ancestry = HashMap::new();
+    let mut forward_spans = HashSet::new();
     for declaration in collect_nodes_matching(root, "declType") {
         if enclosing_type(declaration, source).is_some() {
             continue;
@@ -17965,6 +18031,12 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                 .collect::<Vec<_>>()
         };
         let parent_declared = !parent_fields.is_empty();
+        if !parent_declared
+            && matches!(type_kind, TypeKind::Class | TypeKind::Interface)
+            && !has_direct_child_kind(shape, "kEnd")
+        {
+            forward_spans.insert(Span::from_node(name));
+        }
         let mut parent_spans = HashSet::new();
         let mut parents = Vec::new();
         let mut parent_position = 0usize;
@@ -18020,7 +18092,30 @@ fn collect_type_ancestry(root: Node<'_>, source: &str) -> HashMap<String, Vec<Ty
                 parents,
             });
     }
-    ancestry
+
+    // Delphi completes a forward declaration in the same type section, so the
+    // full declaration alone describes the type. A forward declaration that
+    // is never completed has an unknown heritage, not an implicit root.
+    let mut superseded = HashSet::new();
+    for entries in ancestry.values_mut() {
+        if entries
+            .iter()
+            .any(|entry| !forward_spans.contains(&entry.name_span))
+        {
+            entries.retain(|entry| {
+                let forward = forward_spans.contains(&entry.name_span);
+                if forward {
+                    superseded.insert(entry.name_span);
+                }
+                !forward
+            });
+        } else {
+            for entry in entries.iter_mut() {
+                entry.parent_declared = true;
+            }
+        }
+    }
+    (ancestry, superseded)
 }
 
 fn collect_method_resolutions(root: Node<'_>, source: &str) -> Vec<MethodResolution> {
@@ -21258,6 +21353,21 @@ fn is_implicit_or_intrinsic_name(name: &str) -> bool {
         name,
         "self" | "result" | "inherited" | "exit" | "break" | "continue" | "raise"
     )
+}
+
+/// Whether a class names `TObject` or `System.TObject` as its superclass.
+fn superclass_is_tobject(entry: &TypeAncestry) -> bool {
+    entry.parents.iter().any(|parent| {
+        parent.relation == ParentRelation::Superclass && is_tobject_path(&parent.path)
+    })
+}
+
+fn is_tobject_path(path: &[String]) -> bool {
+    match path {
+        [name] => name == "tobject",
+        [unit, name] => unit == "system" && name == "tobject",
+        _ => false,
+    }
 }
 
 fn is_implicit_tobject_member(name: &str) -> bool {
@@ -27571,5 +27681,59 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod insert_parsed_tests {
+    use super::*;
+    use pascal_core::conditional::Truth;
+
+    fn parsed(uri: &Url, context: &ConditionalContext) -> Arc<ParsedDocument> {
+        let mut index = NavigationIndex::new();
+        index
+            .update_with_context_and_cached_with_cancel(
+                uri.clone(),
+                "unit Base;\ninterface\nimplementation\nend.\n".to_string(),
+                context,
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        index.parsed_document(uri).unwrap()
+    }
+
+    #[test]
+    fn insert_parsed_shares_a_cached_document_without_replacing_one() {
+        let uri = Url::parse("file:///ws/Base.pas").unwrap();
+        let context = ConditionalContext::default();
+        let document = parsed(&uri, &context);
+        let mut index = NavigationIndex::new();
+
+        assert!(index.insert_parsed(uri.clone(), document.clone(), &context));
+        assert!(
+            index
+                .unit_name(&uri)
+                .is_some_and(|name| name.eq_ignore_ascii_case("Base"))
+        );
+        assert!(Arc::ptr_eq(
+            &index.parsed_document(&uri).unwrap(),
+            &document
+        ));
+        assert!(
+            !index.insert_parsed(uri, document, &context),
+            "an indexed document is never replaced"
+        );
+    }
+
+    #[test]
+    fn insert_parsed_rejects_a_different_conditional_context() {
+        let uri = Url::parse("file:///ws/Base.pas").unwrap();
+        let document = parsed(&uri, &ConditionalContext::default());
+        let other = ConditionalContext::default().with_option("R", Truth::True);
+        let mut index = NavigationIndex::new();
+
+        assert!(!index.insert_parsed(uri.clone(), document, &other));
+        assert!(!index.contains(&uri));
     }
 }

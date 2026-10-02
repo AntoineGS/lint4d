@@ -147,6 +147,7 @@ const MAX_AUTOMATIC_PROMPT_ANSWERS: usize = 32;
 const PROGRESS_CREATE_REQUEST_PREFIX: &str = "pascal-lsp-progress-create-";
 const PROGRESS_TOKEN_PREFIX: &str = "pascal-lsp-progress-";
 const DIAGNOSTIC_REFRESH_REQUEST_PREFIX: &str = "pascal-lsp-diagnostic-refresh-";
+const SEMANTIC_TOKENS_REFRESH_REQUEST_PREFIX: &str = "pascal-lsp-semantic-tokens-refresh-";
 /// Partial results are delivered one bounded notification at a time.  Keeping
 /// this separate from work-done progress prevents a large result from becoming
 /// an unbounded protocol-loop operation or from being confused with lifecycle
@@ -3358,18 +3359,22 @@ impl DiagnosticNotificationEffect {
 }
 
 #[derive(Debug, Default)]
-struct DiagnosticRefreshRequests {
+struct RefreshRequests {
     supported: bool,
+    method: &'static str,
+    prefix: &'static str,
     pending: bool,
     in_flight: Option<RequestId>,
     retired: VecDeque<RequestId>,
     next_id: u64,
 }
 
-impl DiagnosticRefreshRequests {
-    fn new(supported: bool) -> Self {
+impl RefreshRequests {
+    fn new(supported: bool, method: &'static str, prefix: &'static str) -> Self {
         Self {
             supported,
+            method,
+            prefix,
             ..Self::default()
         }
     }
@@ -3379,13 +3384,10 @@ impl DiagnosticRefreshRequests {
         connection: &dyn ProtocolSender,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.next_id = self.next_id.wrapping_add(1);
-        let id = RequestId::from(format!(
-            "{DIAGNOSTIC_REFRESH_REQUEST_PREFIX}{}",
-            self.next_id
-        ));
+        let id = RequestId::from(format!("{}{}", self.prefix, self.next_id));
         connection.send_control(Message::Request(Request::new(
             id.clone(),
-            "workspace/diagnostic/refresh".to_string(),
+            self.method.to_string(),
             Value::Null,
         )))?;
         self.in_flight = Some(id);
@@ -10395,6 +10397,8 @@ fn run_connection(
     let pull_related_diagnostics_supported = supports_related_diagnostics(&initialize.capabilities);
     let diagnostic_refresh_supported =
         supports_diagnostic_refresh(&initialize.capabilities, &initialize_value);
+    let semantic_tokens_refresh_supported =
+        supports_semantic_tokens_refresh(&initialize.capabilities);
     let workspace_diagnostics_supported = supports_workspace_diagnostic_reports(&initialize_value);
     let capabilities =
         server_capabilities(&initialize.capabilities, workspace_diagnostics_supported);
@@ -10439,6 +10443,7 @@ fn run_connection(
         pull_diagnostics_supported,
         pull_related_diagnostics_supported,
         diagnostic_refresh_supported,
+        semantic_tokens_refresh_supported,
         &mut configuration,
         watcher_registration,
         watch_events,
@@ -10704,6 +10709,7 @@ fn event_loop(
     pull_diagnostics_supported: bool,
     pull_related_diagnostics_supported: bool,
     diagnostic_refresh_supported: bool,
+    semantic_tokens_refresh_supported: bool,
     configuration: &mut ConfigurationCoordinator,
     mut watcher_registration: Option<FileWatcherRegistration>,
     watch_events: crate::file_watch::WatchEvents,
@@ -10716,7 +10722,16 @@ fn event_loop(
     let mut deferred_workspace_message_bytes = 0usize;
     let mut deferred_workspace_overflow: Option<Message> = None;
     let mut file_notification_worker: Option<WorkspaceFileNotificationWorker> = None;
-    let mut diagnostic_refresh = DiagnosticRefreshRequests::new(diagnostic_refresh_supported);
+    let mut diagnostic_refresh = RefreshRequests::new(
+        diagnostic_refresh_supported,
+        "workspace/diagnostic/refresh",
+        DIAGNOSTIC_REFRESH_REQUEST_PREFIX,
+    );
+    let mut semantic_tokens_refresh = RefreshRequests::new(
+        semantic_tokens_refresh_supported,
+        "workspace/semanticTokens/refresh",
+        SEMANTIC_TOKENS_REFRESH_REQUEST_PREFIX,
+    );
     let mut pending_diagnostic_clears = PendingDiagnosticClears::default();
     let mut rewarm = Vec::new();
     let mut warmer = crate::warmer::Warmer::start(jobs.interactive_gate.clone());
@@ -10916,6 +10931,7 @@ fn event_loop(
                 &mut sweep_pending,
                 &mut swept_fingerprints,
                 &mut budget_warned,
+                &mut semantic_tokens_refresh,
             )?;
         }
         if !workspace_busy {
@@ -10958,6 +10974,7 @@ fn event_loop(
                 &mut sweep_pending,
                 &mut swept_fingerprints,
                 &mut budget_warned,
+                &mut semantic_tokens_refresh,
             )?;
         }
         if !workspace_busy
@@ -11047,6 +11064,7 @@ fn event_loop(
                                 &mut sweep_pending,
                                 &mut swept_fingerprints,
                                 &mut budget_warned,
+                                &mut semantic_tokens_refresh,
                             )?;
                         }
                         if !workspace_busy
@@ -11071,6 +11089,7 @@ fn event_loop(
                         jobs.shutdown();
                         configuration.shutdown();
                         diagnostic_refresh.shutdown();
+                        semantic_tokens_refresh.shutdown();
                         return Ok(true);
                     }
                 },
@@ -11091,6 +11110,7 @@ fn event_loop(
                             &mut sweep_pending,
                             &mut swept_fingerprints,
                             &mut budget_warned,
+                            &mut semantic_tokens_refresh,
                         )?;
                     }
                     if !workspace_busy
@@ -11114,6 +11134,7 @@ fn event_loop(
                     jobs.shutdown();
                     configuration.shutdown();
                     diagnostic_refresh.shutdown();
+                    semantic_tokens_refresh.shutdown();
                     return Ok(true);
                 }
             }
@@ -11129,6 +11150,7 @@ fn event_loop(
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
+                semantic_tokens_refresh.shutdown();
                 for deferred in deferred_configuration_messages.drain(..) {
                     if let DeferredConfigurationMessage::Request(deferred) = deferred {
                         send_error(
@@ -11294,6 +11316,7 @@ fn event_loop(
                 jobs.shutdown_with_connection(connection)?;
                 configuration.shutdown();
                 diagnostic_refresh.shutdown();
+                semantic_tokens_refresh.shutdown();
                 return Ok(shutdown_received);
             }
             Message::Notification(notification)
@@ -11622,7 +11645,9 @@ fn event_loop(
                     }
                     continue;
                 }
-                if diagnostic_refresh.handle_response(connection, &response)? {
+                if semantic_tokens_refresh.handle_response(connection, &response)? {
+                    // Nothing to act on: the client re-requests tokens itself.
+                } else if diagnostic_refresh.handle_response(connection, &response)? {
                     // Refresh responses are deliberately non-blocking. A
                     // pending coalesced refresh, if any, was sent by the
                     // coordinator above.
@@ -11703,6 +11728,7 @@ fn event_loop(
                 &mut sweep_pending,
                 &mut swept_fingerprints,
                 &mut budget_warned,
+                &mut semantic_tokens_refresh,
             )?;
         }
     }
@@ -11730,6 +11756,7 @@ fn maintain_warmer(
     sweep_pending: &mut bool,
     swept_fingerprints: &mut HashSet<u64>,
     budget_warned: &mut bool,
+    semantic_tokens_refresh: &mut RefreshRequests,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let cache = workspace.project_cache();
     let configuration_generation = workspace.configuration_generation();
@@ -11752,7 +11779,17 @@ fn maintain_warmer(
             warmer.rewarm(uri);
         }
     }
+    for uri in cache.take_closure_crawl_requests() {
+        if workspace.is_open(&uri) {
+            warmer.request_closure_crawl(uri, cache.invalidation_epoch());
+        }
+    }
     for event in warmer.poll(workspace) {
+        if let crate::warmer::WarmEvent::ClosureStored { uri, .. } = &event {
+            if workspace.is_open(uri) {
+                semantic_tokens_refresh.request(connection)?;
+            }
+        }
         if let crate::warmer::WarmEvent::End {
             uri,
             fingerprint,
@@ -15181,6 +15218,15 @@ fn supports_diagnostic_refresh(client: &ClientCapabilities, raw_initialize: &Val
         })
 }
 
+fn supports_semantic_tokens_refresh(client: &ClientCapabilities) -> bool {
+    client
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.semantic_tokens.as_ref())
+        .and_then(|semantic_tokens| semantic_tokens.refresh_support)
+        .unwrap_or(false)
+}
+
 fn is_affected_neovim_document_pull_client(raw_initialize: &Value) -> bool {
     raw_initialize
         .pointer("/clientInfo/name")
@@ -16369,6 +16415,7 @@ mod tests {
             &mut workspace,
             false,
             symbol_client_features(),
+            false,
             false,
             false,
             false,

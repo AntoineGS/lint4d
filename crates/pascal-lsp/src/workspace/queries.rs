@@ -1239,6 +1239,21 @@ fn build_binding_snapshot(
     )
 }
 
+/// The include error that blocks a read-only feature on `uri`. An unsupported
+/// directive in a unit the document only imports cannot change how the
+/// document parses, and at worst misclassifies an identifier bound through
+/// that unit. One in the document itself, or any other include error, still
+/// blocks. Rename, references, and code actions stay fail-closed.
+fn blocking_include_error<'a>(snapshot: &'a RenameSnapshot, uri: &Url) -> Option<&'a str> {
+    let first = snapshot.include_errors.first()?;
+    let blocks = snapshot.other_include_errors
+        || snapshot
+            .unsupported_directive_owners
+            .iter()
+            .any(|owner| owner == uri);
+    blocks.then_some(first.as_str())
+}
+
 fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
     if !snapshot.records.contains_key(uri) {
         return Err(format!(
@@ -1287,7 +1302,7 @@ fn ensure_document_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), Str
         snapshot.mode,
         SnapshotMode::LocalWithImports | SnapshotMode::Assistance
     ) {
-        if let Some(error) = snapshot.include_errors.first() {
+        if let Some(error) = blocking_include_error(snapshot, uri) {
             return Err(format!("highlight dependency scan incomplete: {error}"));
         }
         if !snapshot.complete {
@@ -1312,7 +1327,7 @@ fn ensure_assistance_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), S
             "assistance document is outside configured workspace roots: {uri}"
         ));
     }
-    if let Some(error) = snapshot.include_errors.first() {
+    if let Some(error) = blocking_include_error(snapshot, uri) {
         return Err(format!("assistance dependency scan incomplete: {error}"));
     }
     if !snapshot.complete {
@@ -1339,15 +1354,7 @@ fn ensure_semantic_tokens_ready(
             "semantic-token document is outside configured workspace roots: {uri}"
         ));
     }
-    // Tokens are advisory: an unsupported directive in a dependency cannot
-    // change how this document parses, at worst misclassifying an identifier
-    // bound through that dependency. Rename and references stay fail-closed.
-    let include_errors_block = snapshot.other_include_errors
-        || snapshot
-            .unsupported_directive_owners
-            .iter()
-            .any(|owner| owner == uri);
-    if !snapshot.complete || (!snapshot.include_errors.is_empty() && include_errors_block) {
+    if !snapshot.complete || blocking_include_error(snapshot, uri).is_some() {
         return Ok(SemanticTokenResolutionMode::LexicalOnly);
     }
     Ok(SemanticTokenResolutionMode::Full)

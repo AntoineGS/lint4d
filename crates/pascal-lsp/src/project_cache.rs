@@ -428,8 +428,303 @@ mod cache_tests {
         Url::parse(&format!("file:///ws/{name}")).unwrap()
     }
 
+    #[test]
+    fn closure_crawl_requests_are_deduplicated_and_drained() {
+        let cache = ProjectCache::new(usize::MAX);
+        cache.request_closure_crawl(&uri("Main.pas"));
+        cache.request_closure_crawl(&uri("Main.pas"));
+        cache.request_closure_crawl(&uri("Other.pas"));
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![uri("Main.pas"), uri("Other.pas")]
+        );
+        assert!(cache.take_closure_crawl_requests().is_empty());
+    }
+
+    #[test]
+    fn closure_misses_request_a_crawl_only_when_a_new_unit_misses() {
+        let cache = ProjectCache::new(usize::MAX);
+        let main = uri("Main.pas");
+        let misses = |names: &[&str]| names.iter().map(|name| uri(name)).collect::<HashSet<_>>();
+
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "a persistent miss must not request another crawl"
+        );
+
+        cache.report_closure_misses(&main, misses(&["Sync.pas", "Sibling.pas"]));
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "a shrinking miss set must not request another crawl"
+        );
+
+        cache.report_closure_misses(&main, misses(&[]));
+        cache.report_closure_misses(&main, misses(&["Sync.pas"]));
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![main],
+            "a miss that returns after a complete walk is new again"
+        );
+    }
+
+    #[test]
+    fn an_overflow_forgets_closure_misses() {
+        let cache = ProjectCache::new(usize::MAX);
+        let main = uri("Main.pas");
+        let misses = || HashSet::from([uri("Sync.pas")]);
+        cache.report_closure_misses(&main, misses());
+        cache.report_closure_misses(&main, misses());
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+
+        cache.invalidate_after_overflow();
+        cache.report_closure_misses(&main, misses());
+
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![main],
+            "an overflow discarded what the last crawl stored"
+        );
+    }
+
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    fn parsed_unit(name: &str) -> Arc<crate::navigation::ParsedDocument> {
+        let mut index = crate::navigation::NavigationIndex::new();
+        let unit = name.trim_end_matches(".pas");
+        index
+            .update(
+                uri(name),
+                format!("unit {unit};\ninterface\nimplementation\nend.\n"),
+            )
+            .unwrap();
+        index.parsed_document(&uri(name)).unwrap()
+    }
+
+    fn fill_unit(
+        cache: &ProjectCache,
+        name: &str,
+        ctx: &ProjectContext,
+        hash: u64,
+        probes: Vec<Probe>,
+    ) {
+        match cache.unit(&uri(name), ctx, hash, &HashMap::new(), &no_cancel()) {
+            Lookup::Compute(claim) => cache.store_unit(
+                claim,
+                UnitValue {
+                    parsed: parsed_unit(name),
+                    expansion: None,
+                    probes,
+                },
+                1,
+                &no_cancel(),
+            ),
+            _ => panic!("expected a miss for {name}"),
+        }
+    }
+
+    fn interface_value(targets: &[(&str, u64)], complete: bool) -> InterfaceImportsValue {
+        InterfaceImportsValue {
+            bindings: targets
+                .iter()
+                .map(|(name, hash)| InterfaceBinding {
+                    name: name.trim_end_matches(".pas").to_ascii_lowercase(),
+                    uri: uri(name),
+                    revision: pascal_core::SourceRevision::Overlay {
+                        version: 1,
+                        content_hash: *hash,
+                    },
+                })
+                .collect(),
+            complete,
+            probes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn peek_unit_returns_verified_entries_for_the_same_project_and_content() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        fill_unit(&cache, "Base.pas", &ctx, 7, vec![]);
+
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())
+                .is_some()
+        );
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &ctx, 8, &HashMap::new())
+                .is_none()
+        );
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &context("B.dproj"), 7, &HashMap::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peek_unit_misses_when_a_probe_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("Defs.inc");
+        std::fs::write(&include, "{$DEFINE A}").unwrap();
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        fill_unit(
+            &cache,
+            "Base.pas",
+            &ctx,
+            7,
+            vec![Probe::Content {
+                path: include.clone(),
+                stamp: pascal_project::path_stamp_result(&include).ok().flatten(),
+                content_hash: pascal_project::content_hash_bytes(b"{$DEFINE A}"),
+            }],
+        );
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())
+                .is_some()
+        );
+
+        std::fs::write(&include, "{$DEFINE B}").unwrap();
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peek_never_claims_or_waits() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())
+                .is_none()
+        );
+
+        // The miss left no computing slot behind, so a normal lookup claims.
+        let Lookup::Compute(claim) =
+            cache.unit(&uri("Base.pas"), &ctx, 7, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a claim");
+        };
+        // While the claim is held, peeking returns at once instead of waiting.
+        let started = std::time::Instant::now();
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())
+                .is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        drop(claim);
+    }
+
+    #[test]
+    fn interface_entries_report_whether_they_are_new_or_changed() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        let derived = uri("Derived.pas");
+
+        assert!(cache.put_interface_imports(
+            &derived,
+            &ctx,
+            3,
+            interface_value(&[("Base.pas", 7)], true),
+            None
+        ));
+        assert!(
+            !cache.put_interface_imports(
+                &derived,
+                &ctx,
+                3,
+                interface_value(&[("Base.pas", 7)], true),
+                None
+            ),
+            "an identical entry is not new"
+        );
+        assert!(
+            cache.put_interface_imports(
+                &derived,
+                &ctx,
+                3,
+                interface_value(&[("Base.pas", 9)], true),
+                None
+            ),
+            "a changed binding is new"
+        );
+
+        let entry = cache
+            .peek_interface_imports(&derived, &ctx, 3, &HashMap::new())
+            .expect("stored entry");
+        assert_eq!(entry.bindings[0].uri, uri("Base.pas"));
+        assert_eq!(entry.bindings[0].content_hash(), 9);
+        assert!(
+            cache
+                .peek_interface_imports(&derived, &ctx, 4, &HashMap::new())
+                .is_none()
+        );
+        assert_eq!(
+            cache.stats().imports,
+            0,
+            "interface entries are a separate layer"
+        );
+    }
+
+    #[test]
+    fn interface_entries_from_before_an_invalidation_are_dropped() {
+        let cache = ProjectCache::new(usize::MAX);
+        let epoch = cache.invalidation_epoch();
+        cache.invalidate_path(Path::new("/ws/Other.pas"));
+        assert!(!cache.put_interface_imports(
+            &uri("Derived.pas"),
+            &context("A.dproj"),
+            3,
+            interface_value(&[], true),
+            Some(epoch),
+        ));
+        assert!(
+            cache
+                .peek_interface_imports(
+                    &uri("Derived.pas"),
+                    &context("A.dproj"),
+                    3,
+                    &HashMap::new()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interface_entries_are_invalidated_with_their_dependency_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("Base.pas");
+        std::fs::write(&base, "unit Base;").unwrap();
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        let mut value = interface_value(&[], true);
+        value.probes = vec![Probe::Content {
+            path: base.clone(),
+            stamp: pascal_project::path_stamp_result(&base).ok().flatten(),
+            content_hash: pascal_project::content_hash_bytes(b"unit Base;"),
+        }];
+        cache.put_interface_imports(&uri("Derived.pas"), &ctx, 3, value, None);
+
+        cache.invalidate_file_contents(&base);
+        assert!(
+            cache
+                .peek_interface_imports(&uri("Derived.pas"), &ctx, 3, &HashMap::new())
+                .is_none()
+        );
     }
 
     #[test]
@@ -964,11 +1259,14 @@ mod cache_tests {
 }
 
 const WAIT_SLICE: Duration = Duration::from_millis(20);
+const MAX_CLOSURE_CRAWL_REQUESTS: usize = 1024;
+const MAX_CLOSURE_MISS_ROOTS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
     Unit,
     Import,
+    Interface,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -993,6 +1291,46 @@ pub(crate) struct ImportValue {
     pub(crate) watch_dirs: Vec<PathBuf>,
 }
 
+/// One interface `uses` name of a unit, resolved to a source unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceBinding {
+    pub(crate) name: String,
+    pub(crate) uri: Url,
+    pub(crate) revision: pascal_core::SourceRevision,
+}
+
+impl InterfaceBinding {
+    /// The bound unit's content hash, which keys its unit entry.
+    pub(crate) fn content_hash(&self) -> u64 {
+        match &self.revision {
+            pascal_core::SourceRevision::Disk { content_hash, .. }
+            | pascal_core::SourceRevision::Overlay { content_hash, .. } => *content_hash,
+        }
+    }
+}
+
+/// A unit's interface-section imports. Snapshots use these to bind members
+/// inherited through their dependencies' imports without resolving anything.
+#[derive(Debug)]
+pub(crate) struct InterfaceImportsValue {
+    pub(crate) bindings: Vec<InterfaceBinding>,
+    /// Whether the unit's import graph resolved completely. Walks do not
+    /// continue past an incomplete one.
+    pub(crate) complete: bool,
+    /// Copied from the unit's import entry. They include a content probe for
+    /// every dependency, so a bound unit's hash is verified before use.
+    pub(crate) probes: Vec<Probe>,
+}
+
+fn interface_value_bytes(value: &InterfaceImportsValue) -> usize {
+    value.bindings.iter().fold(256usize, |total, binding| {
+        total
+            .saturating_add(128)
+            .saturating_add(binding.name.len())
+            .saturating_add(binding.uri.as_str().len())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
     layer: Layer,
@@ -1005,6 +1343,7 @@ struct Key {
 enum Value {
     Unit(Arc<UnitValue>),
     Import(Arc<ImportValue>),
+    Interface(Arc<InterfaceImportsValue>),
 }
 
 #[derive(Debug)]
@@ -1032,6 +1371,9 @@ struct State {
     pins: HashMap<Url, HashSet<(Url, u64)>>,
     watch_counts: HashMap<PathBuf, usize>,
     watcher: Option<Box<dyn DirectoryWatch>>,
+    closure_crawl_requests: Vec<Url>,
+    /// Each root's uncached closure units at its last snapshot walk.
+    closure_misses: HashMap<Url, HashSet<Url>>,
 }
 
 impl Default for State {
@@ -1046,6 +1388,8 @@ impl Default for State {
             pins: HashMap::new(),
             watch_counts: HashMap::new(),
             watcher: None,
+            closure_crawl_requests: Vec::new(),
+            closure_misses: HashMap::new(),
         }
     }
 }
@@ -1076,6 +1420,19 @@ impl std::fmt::Debug for ProjectCache {
 
 #[cfg(test)]
 impl ProjectCache {
+    /// The layers (`"Unit"`, `"Import"`, `"Interface"`) with a ready entry for `uri`.
+    pub(crate) fn ready_layers(&self, uri: &Url) -> Vec<String> {
+        let state = lock(&self.inner);
+        let mut layers = state
+            .slots
+            .iter()
+            .filter(|(key, slot)| &key.uri == uri && matches!(slot, Slot::Ready(_)))
+            .map(|(key, _)| format!("{:?}", key.layer))
+            .collect::<Vec<_>>();
+        layers.sort();
+        layers
+    }
+
     fn set_validation_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.inner.validation_hook.lock().unwrap() = Some(Box::new(hook));
     }
@@ -1232,9 +1589,144 @@ impl ProjectCache {
             cancel,
             |value| match value {
                 Value::Unit(unit) => Some((unit.clone(), unit.probes.clone())),
-                Value::Import(_) => None,
+                _ => None,
             },
         )
+    }
+
+    /// A verified unit entry, or `None`. Never claims a slot and never waits
+    /// on a computation, so callers on the request path cannot stall.
+    pub(crate) fn peek_unit(
+        &self,
+        uri: &Url,
+        context: &ProjectContext,
+        content_hash: u64,
+        overlays: &HashMap<Url, OverlayInput>,
+    ) -> Option<Arc<UnitValue>> {
+        self.peek(
+            Layer::Unit,
+            uri,
+            context,
+            content_hash,
+            overlays,
+            |value| match value {
+                Value::Unit(unit) => Some((unit.clone(), unit.probes.clone())),
+                _ => None,
+            },
+        )
+    }
+
+    /// A verified interface-imports entry, or `None`, under the same rules as
+    /// `peek_unit`.
+    pub(crate) fn peek_interface_imports(
+        &self,
+        uri: &Url,
+        context: &ProjectContext,
+        content_hash: u64,
+        overlays: &HashMap<Url, OverlayInput>,
+    ) -> Option<Arc<InterfaceImportsValue>> {
+        self.peek(
+            Layer::Interface,
+            uri,
+            context,
+            content_hash,
+            overlays,
+            |value| match value {
+                Value::Interface(interface) => Some((interface.clone(), interface.probes.clone())),
+                _ => None,
+            },
+        )
+    }
+
+    /// Stores a unit's interface imports without a compute claim. Their
+    /// probes protect every use, so a late store cannot serve stale bindings.
+    /// Returns whether the entry is new or changed, so crawls know whether a
+    /// semantic-token refresh is worthwhile. Results computed before an
+    /// invalidation are dropped.
+    pub(crate) fn put_interface_imports(
+        &self,
+        uri: &Url,
+        context: &ProjectContext,
+        content_hash: u64,
+        value: InterfaceImportsValue,
+        snapshot_epoch: Option<u64>,
+    ) -> bool {
+        let key = Key {
+            layer: Layer::Interface,
+            uri: uri.clone(),
+            fingerprint: project_context_fingerprint(context),
+        };
+        let mut state = lock(&self.inner);
+        if snapshot_epoch.is_some_and(|epoch| epoch != state.invalidation_epoch) {
+            return false;
+        }
+        let unchanged = matches!(
+            state.slots.get(&key),
+            Some(Slot::Ready(Entry {
+                value: Value::Interface(old),
+                context: old_context,
+                input_hash,
+                ..
+            })) if old_context.as_ref() == context
+                && *input_hash == content_hash
+                && old.bindings == value.bindings
+                && old.complete == value.complete
+        );
+        let bytes = interface_value_bytes(&value);
+        state.clock += 1;
+        let entry = Entry {
+            value: Value::Interface(Arc::new(value)),
+            context: Arc::new(context.clone()),
+            input_hash: content_hash,
+            bytes,
+            last_used: state.clock,
+        };
+        // Replace even an unchanged entry: its probes may be fresher.
+        if let Some(Slot::Ready(old)) = state.slots.insert(key, Slot::Ready(entry)) {
+            state.bytes = state.bytes.saturating_sub(old.bytes);
+        }
+        state.bytes = state.bytes.saturating_add(bytes);
+        evict_to_budget(&mut state);
+        !unchanged
+    }
+
+    fn peek<V>(
+        &self,
+        layer: Layer,
+        uri: &Url,
+        context: &ProjectContext,
+        input_hash: u64,
+        overlays: &HashMap<Url, OverlayInput>,
+        extract: impl Fn(&Value) -> Option<(Arc<V>, Vec<Probe>)>,
+    ) -> Option<Arc<V>> {
+        let key = Key {
+            layer,
+            uri: uri.clone(),
+            fingerprint: project_context_fingerprint(context),
+        };
+        let (value, probes) = {
+            let state = lock(&self.inner);
+            match state.slots.get(&key) {
+                Some(Slot::Ready(entry))
+                    if entry.context.as_ref() == context && entry.input_hash == input_hash =>
+                {
+                    extract(&entry.value)?
+                }
+                _ => return None,
+            }
+        };
+        if !probes_hold(&probes, overlays) {
+            return None;
+        }
+        let mut state = lock(&self.inner);
+        state.clock += 1;
+        let clock = state.clock;
+        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key) {
+            if extract(&entry.value).is_some_and(|(current, _)| Arc::ptr_eq(&current, &value)) {
+                entry.last_used = clock;
+            }
+        }
+        Some(value)
     }
 
     /// Declared unit name of a cached parse of exactly these bytes, under any
@@ -1304,7 +1796,7 @@ impl ProjectCache {
             cancel,
             |value| match value {
                 Value::Import(imports) => Some((imports.clone(), imports.probes.clone())),
-                Value::Unit(_) => None,
+                _ => None,
             },
         )
     }
@@ -1521,6 +2013,49 @@ impl ProjectCache {
         drop(claim); // Removes the slot only when it is still Computing.
     }
 
+    /// Records that a snapshot for `uri` found part of its interface closure
+    /// uncached. The server drains these into warmer crawls.
+    fn request_closure_crawl(&self, uri: &Url) {
+        let mut state = lock(&self.inner);
+        if state.closure_crawl_requests.len() < MAX_CLOSURE_CRAWL_REQUESTS
+            && !state.closure_crawl_requests.contains(uri)
+        {
+            state.closure_crawl_requests.push(uri.clone());
+        }
+    }
+
+    /// Records the units a snapshot walk for `root` found uncached, and
+    /// requests a crawl only when one of them was not missed by the root's
+    /// previous walk. A unit that can never be cached then stops requesting
+    /// crawls, while one evicted since the last walk requests another.
+    pub(crate) fn report_closure_misses(&self, root: &Url, missed: HashSet<Url>) {
+        let mut state = lock(&self.inner);
+        let new_miss = match state.closure_misses.get(root) {
+            Some(previous) => missed.iter().any(|uri| !previous.contains(uri)),
+            None => !missed.is_empty(),
+        };
+        if state.closure_misses.len() >= MAX_CLOSURE_MISS_ROOTS
+            && !state.closure_misses.contains_key(root)
+        {
+            state.closure_misses.clear();
+        }
+        state.closure_misses.insert(root.clone(), missed);
+        drop(state);
+        if new_miss {
+            self.request_closure_crawl(root);
+        }
+    }
+
+    /// Makes the root's next walk with misses request a crawl, because the
+    /// crawl that followed its last report did not settle the closure.
+    pub(crate) fn forget_closure_misses(&self, root: &Url) {
+        lock(&self.inner).closure_misses.remove(root);
+    }
+
+    pub(crate) fn take_closure_crawl_requests(&self) -> Vec<Url> {
+        std::mem::take(&mut lock(&self.inner).closure_crawl_requests)
+    }
+
     pub(crate) fn pin(&self, owner: &Url, keys: Vec<(Url, u64)>) {
         lock(&self.inner)
             .pins
@@ -1565,6 +2100,7 @@ impl ProjectCache {
                 let probes = match &entry.value {
                     Value::Unit(unit) => &unit.probes,
                     Value::Import(imports) => &imports.probes,
+                    Value::Interface(interface) => &interface.probes,
                 };
                 let own_path = key.uri.to_file_path().ok();
                 let hit = own_path.as_deref() == Some(path)
@@ -1611,6 +2147,7 @@ impl ProjectCache {
                 release_watches(&mut state, &entry);
             }
         }
+        state.closure_misses.clear();
         drop(state);
         self.inner.changed.notify_all();
     }

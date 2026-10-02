@@ -16854,3 +16854,86 @@ end.
         position_of(source, "ProtectedField", 0),
     );
 }
+
+#[test]
+fn imports_record_their_uses_section() {
+    use pascal_core::ImportSection;
+
+    let unit_uri = uri("Sections");
+    let mut index = NavigationIndex::new();
+    index
+        .update(
+            unit_uri.clone(),
+            "unit Sections;\ninterface\nuses Alpha;\nimplementation\nuses Beta;\nend.\n".to_owned(),
+        )
+        .expect("unit parses");
+    let sections = index
+        .imports(&unit_uri)
+        .into_iter()
+        .map(|import| (import.name.to_ascii_lowercase(), import.section))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sections,
+        [
+            ("alpha".to_string(), ImportSection::Interface),
+            ("beta".to_string(), ImportSection::Implementation),
+        ]
+    );
+
+    let program_uri = uri("Program");
+    index
+        .update(
+            program_uri.clone(),
+            "program Program;\nuses Alpha;\nbegin\nend.\n".to_owned(),
+        )
+        .expect("program parses");
+    assert!(
+        index
+            .imports(&program_uri)
+            .iter()
+            .all(|import| import.section == ImportSection::Module)
+    );
+}
+
+#[test]
+fn inherited_routines_resolve_through_forward_class_declarations() {
+    let base = r#"unit ForwardBase;
+interface
+type
+  TConn = class;
+  TDerived = class;
+  TDerived = class(TConn)
+  end;
+  TConn = class
+  public
+    procedure Open;
+  end;
+implementation
+procedure TConn.Open; begin end;
+end.
+"#;
+    let main = r#"unit ForwardMain;
+interface
+uses ForwardBase;
+implementation
+procedure Run(Db: TDerived);
+begin
+  Db.Open;
+end;
+end.
+"#;
+    let base_uri = uri("ForwardBase");
+    let main_uri = uri("ForwardMain");
+    let mut index = NavigationIndex::new();
+    index
+        .update(base_uri, base.to_owned())
+        .expect("forward base parses");
+    index
+        .update(main_uri.clone(), main.to_owned())
+        .expect("forward main parses");
+
+    let hover = index
+        .hover(&main_uri, position_of(main, "Open", 0))
+        .expect("hover for an inherited routine");
+    assert!(hover_text(&hover).contains("procedure Open;"), "{hover:?}");
+}

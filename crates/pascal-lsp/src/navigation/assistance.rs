@@ -25,6 +25,11 @@ const CANCELLATION_MESSAGE: &str = "request cancelled";
 const MAX_HOVER_CANDIDATES: usize = 128;
 const MAX_HOVER_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_HOVER_VALUE_BYTES: usize = 64 * 1024;
+// Hover and type definitions resolve one identifier, so they get the same
+// resolution allowance semantic tokens use for a whole document. Their output
+// limits above are enforced separately.
+const MAX_HOVER_RESOLUTION_WORK: usize = super::semantic_tokens::MAX_SEMANTIC_RESOLUTION_WORK;
+const MAX_HOVER_RESOLUTION_BYTES: usize = super::semantic_tokens::MAX_SEMANTIC_RESOLUTION_BYTES;
 const MAX_COMPLETION_ITEMS: usize = 256;
 const MAX_MISSING_UNIT_CANDIDATES: usize = 32;
 const MAX_COMPLETION_SCANNED_SYMBOLS: usize = 100_000;
@@ -2436,8 +2441,8 @@ impl NavigationIndex {
         cancel: &AtomicBool,
     ) -> Result<Vec<Location>, String> {
         let mut budget = AssistanceBudget::new(
-            MAX_COMPLETION_CONTEXT_NODES + MAX_HOVER_CANDIDATES,
-            MAX_HOVER_VALUE_BYTES + MAX_HOVER_EXCERPT_BYTES,
+            MAX_HOVER_RESOLUTION_WORK,
+            MAX_HOVER_RESOLUTION_BYTES,
             "type definition",
         );
         self.type_definitions_with_budget(uri, position, cancel, &mut budget)
@@ -3062,8 +3067,8 @@ impl NavigationIndex {
     ) -> Result<Option<Hover>, String> {
         check_cancel(cancel)?;
         let mut budget = AssistanceBudget::new(
-            MAX_COMPLETION_CONTEXT_NODES + MAX_HOVER_CANDIDATES,
-            MAX_HOVER_VALUE_BYTES + MAX_HOVER_EXCERPT_BYTES,
+            MAX_HOVER_RESOLUTION_WORK,
+            MAX_HOVER_RESOLUTION_BYTES,
             "hover",
         );
         let Some(document) = self.documents.get(uri) else {
@@ -7001,6 +7006,53 @@ mod tests {
         assert!(
             render_displays(&[display(overflowing_excerpt)], MarkupKind::Markdown).is_err(),
             "Markdown delimiter overhead must not exceed the combined bound"
+        );
+    }
+
+    #[test]
+    fn hover_still_refuses_values_over_its_output_limit() {
+        let uri = Url::parse("file:///HoverOutputLimit.pas").expect("uri");
+        let parameters = (0..1_000)
+            .map(|index| format!("A{index:04}: Integer"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut source = String::from("unit HoverOutputLimit;\ninterface\n");
+        for tag in [
+            "Integer", "string", "Boolean", "Char", "Double", "Byte", "Word", "Cardinal",
+        ] {
+            writeln!(
+                &mut source,
+                "procedure Run(Tag: {tag}; {parameters}); overload;"
+            )
+            .expect("write overload");
+        }
+        source.push_str(
+            "implementation\nprocedure Caller;\nvar\n  P: Pointer;\nbegin\n  P := @Run;\nend;\nend.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("hover output limit source parses");
+
+        let offset = source.find("@Run").expect("Run use") + 1;
+        let result = index.hover_with_cancel(
+            &uri,
+            text::offset_to_position(&source, offset).expect("Run position"),
+            MarkupKind::PlainText,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+
+        assert_eq!(
+            result.as_ref().err(),
+            Some(&format!(
+                "hover result exceeds the {MAX_HOVER_VALUE_BYTES}-byte limit"
+            )),
+            "{:?}",
+            result
+                .as_ref()
+                .map(|hover| hover
+                    .as_ref()
+                    .map(|hover| format!("{:?}", hover.contents).len()))
         );
     }
 

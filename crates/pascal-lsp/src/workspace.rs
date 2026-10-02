@@ -83,6 +83,7 @@ pub(crate) fn test_context_prune_visit_count() -> usize {
     TEST_CONTEXT_PRUNE_VISITS.with(std::cell::Cell::get)
 }
 
+mod closure;
 pub(crate) mod code_lenses;
 pub(crate) mod codeactions;
 pub(crate) mod extract;
@@ -2741,14 +2742,52 @@ pub struct Workspace {
     dependency_hook: Option<DependencyHook>,
     expansions: HashMap<Url, ExpansionRecord>,
     include_parents: HashMap<Url, HashSet<Url>>,
+    /// The content hash each indexed source was cached under.
+    indexed_content_hashes: HashMap<Url, u64>,
+    /// Interface-import targets and graph completeness from the latest import
+    /// loading for each unit, for the warmer's closure crawl.
+    interface_import_summaries: HashMap<Url, InterfaceImportSummary>,
+    /// Interface entries this workspace stored that were new or changed.
+    interface_entries_stored: usize,
 }
 
 pub(crate) type DependencyHook =
     Arc<dyn Fn(&Url, usize, usize) -> Result<(), String> + Send + Sync>;
 
+/// Interface-section bindings that resolved to a loaded source unit.
+fn interface_bindings(
+    bindings: &[pascal_core::ResolvedImport],
+    resolved_urls: &HashMap<pascal_core::SourceId, Url>,
+    resolved_revisions: &HashMap<Url, pascal_core::SourceRevision>,
+) -> Vec<crate::project_cache::InterfaceBinding> {
+    bindings
+        .iter()
+        .filter(|import| import.site.section == ImportSection::Interface)
+        .filter_map(|import| {
+            let ResolutionTarget::Found(source_id) = &import.target else {
+                return None;
+            };
+            let uri = resolved_urls.get(source_id)?;
+            Some(crate::project_cache::InterfaceBinding {
+                name: import.site.requested_name.clone(),
+                uri: uri.clone(),
+                revision: resolved_revisions.get(uri)?.clone(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Default)]
+struct InterfaceImportSummary {
+    targets: Vec<Url>,
+    complete: bool,
+}
+
 pub(crate) struct WarmOutcome {
     pub(crate) fingerprint: Option<u64>,
     pub(crate) dependencies: Vec<Url>,
+    /// Units reached through interface imports beyond `dependencies`.
+    pub(crate) closure: Vec<Url>,
 }
 
 fn build_workspace_roots(
@@ -3152,6 +3191,8 @@ impl Workspace {
         self.index = NavigationIndex::new();
         self.indexed_files.clear();
         self.indexed_sizes.clear();
+        self.indexed_content_hashes.clear();
+        self.interface_import_summaries.clear();
         self.indexed_bytes = 0;
         self.disk_stamps.clear();
         self.last_used.clear();
@@ -4114,8 +4155,14 @@ impl Workspace {
                 "open document tracking limit ({MAX_OPEN_DOCUMENTS}) reached"
             ));
         }
+        // Overlays are part of directory listings, so only replacing an
+        // existing overlay's text leaves the parent's listing unchanged.
+        let had_overlay = self
+            .open_documents
+            .get(&uri)
+            .is_some_and(|document| document.text.is_some());
         self.bump_source_generation();
-        self.mark_source_change(&uri, false);
+        self.mark_source_change(&uri, !had_overlay);
         let text_len = text.len();
         let source_for_index = text.clone();
         if let Some(previous) = self.open_documents.get(&uri) {
@@ -4163,7 +4210,8 @@ impl Workspace {
             return;
         }
         self.bump_source_generation();
-        self.mark_source_change(&uri, false);
+        // Rejection removes any overlay from its directory listing.
+        self.mark_source_change(&uri, true);
         if let Some(previous) = self.open_documents.get(&uri) {
             if let Some(previous_text) = &previous.text {
                 self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
@@ -4297,7 +4345,8 @@ impl Workspace {
         }
         if !override_changed {
             self.bump_source_generation();
-            diagnostic_uris.extend(self.mark_source_change_with_control(uri, cancel, budget)?);
+            diagnostic_uris
+                .extend(self.mark_source_change_with_control(uri, true, cancel, budget)?);
         }
         let configuration_changed = is_configuration_path(uri);
         if configuration_changed || (override_changed && budget.is_some()) {
@@ -4852,6 +4901,8 @@ impl Workspace {
         clear_recovery_map!(self.pending_unit_file_renames);
         clear_recovery_map!(self.indexed_files);
         clear_recovery_map!(self.indexed_sizes);
+        self.indexed_content_hashes.clear();
+        self.interface_import_summaries.clear();
         clear_recovery_map!(self.disk_stamps);
         clear_recovery_map!(self.last_used);
         clear_recovery_map!(self.pending_diagnostics);
@@ -6677,6 +6728,7 @@ impl Workspace {
         let mut bindings = HashMap::new();
         if imports.is_empty() {
             self.index.bind_imports(uri, bindings);
+            self.store_interface_imports(uri, &context, Vec::new(), true, Vec::new());
             return Ok(Vec::new());
         }
         if context.project_file.is_none() {
@@ -6732,7 +6784,7 @@ impl Workspace {
             .map(|import| ImportSite {
                 byte_range: import.span.start..import.span.end,
                 requested_name: import.name,
-                section: ImportSection::Module,
+                section: import.section,
             })
             .collect::<Vec<_>>();
         // Compile candidates are validated before core lookup so a valid DCU
@@ -6771,67 +6823,72 @@ impl Workspace {
             self.cache_epoch,
             lookup_cancel,
         );
-        let (resolved, cached_report, import_claim, mut resolver) = match import_lookup {
-            crate::project_cache::Lookup::Hit(hit) => {
-                (hit.resolved.clone(), Some(hit.report.clone()), None, None)
-            }
-            crate::project_cache::Lookup::Compute(claim) => {
-                let input = self.analysis_input();
-                let mut resolver = resolver::resolver_for_context_with_session_cache(
-                    context.clone(),
-                    input.roots.clone(),
-                    &input,
-                    resolver_session_cache,
-                );
-                let root = match resolver.load_source(
-                    &path,
-                    legacy_route.as_ref(),
-                    SourceKind::Unit,
-                    resolver_cancel,
-                ) {
-                    Ok(root) => root,
-                    Err(error) => {
-                        let report = resolver.finish();
-                        self.merge_resolution_report(&effective_context_key, &report);
-                        if matches!(error, pascal_core::ResolverError::Cancelled) {
-                            return Err(CANCELLATION_MESSAGE.to_string());
-                        }
-                        self.warn(format!("could not load indexed source {uri}: {error}"));
-                        self.index.bind_imports(uri, bindings);
-                        return Ok(Vec::new());
-                    }
-                };
-                let root = pascal_core::ResolvedUnit {
-                    requested_name: unit_name,
-                    declared_name: self
-                        .index
-                        .unit_name(uri)
-                        .expect("indexed source unit name remains available"),
-                    source: root,
-                };
-                #[cfg(test)]
-                TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-                let resolved = resolver
-                    .resolve_imports_with_text_skipping_browsing(
-                        &root,
-                        &sites,
-                        &indexed_text,
-                        &validated_compiled_names,
+        let (resolved, cached_report, cached_probes, import_claim, mut resolver) =
+            match import_lookup {
+                crate::project_cache::Lookup::Hit(hit) => (
+                    hit.resolved.clone(),
+                    Some(hit.report.clone()),
+                    Some(hit.probes.clone()),
+                    None,
+                    None,
+                ),
+                crate::project_cache::Lookup::Compute(claim) => {
+                    let input = self.analysis_input();
+                    let mut resolver = resolver::resolver_for_context_with_session_cache(
+                        context.clone(),
+                        input.roots.clone(),
+                        &input,
+                        resolver_session_cache,
+                    );
+                    let root = match resolver.load_source(
+                        &path,
+                        legacy_route.as_ref(),
+                        SourceKind::Unit,
                         resolver_cancel,
-                    )
-                    .map_err(|error| {
-                        if matches!(error, pascal_core::ResolverError::Cancelled) {
-                            CANCELLATION_MESSAGE.to_string()
-                        } else {
-                            error.to_string()
+                    ) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            let report = resolver.finish();
+                            self.merge_resolution_report(&effective_context_key, &report);
+                            if matches!(error, pascal_core::ResolverError::Cancelled) {
+                                return Err(CANCELLATION_MESSAGE.to_string());
+                            }
+                            self.warn(format!("could not load indexed source {uri}: {error}"));
+                            self.index.bind_imports(uri, bindings);
+                            return Ok(Vec::new());
                         }
-                    })?;
-                (resolved, None, Some(claim), Some(resolver))
-            }
-            crate::project_cache::Lookup::Cancelled => {
-                return Err(CANCELLATION_MESSAGE.to_string());
-            }
-        };
+                    };
+                    let root = pascal_core::ResolvedUnit {
+                        requested_name: unit_name,
+                        declared_name: self
+                            .index
+                            .unit_name(uri)
+                            .expect("indexed source unit name remains available"),
+                        source: root,
+                    };
+                    #[cfg(test)]
+                    TEST_IMPORT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+                    let resolved = resolver
+                        .resolve_imports_with_text_skipping_browsing(
+                            &root,
+                            &sites,
+                            &indexed_text,
+                            &validated_compiled_names,
+                            resolver_cancel,
+                        )
+                        .map_err(|error| {
+                            if matches!(error, pascal_core::ResolverError::Cancelled) {
+                                CANCELLATION_MESSAGE.to_string()
+                            } else {
+                                error.to_string()
+                            }
+                        })?;
+                    (resolved, None, None, Some(claim), Some(resolver))
+                }
+                crate::project_cache::Lookup::Cancelled => {
+                    return Err(CANCELLATION_MESSAGE.to_string());
+                }
+            };
         let resolved_for_cache = import_claim.as_ref().map(|_| resolved.clone());
         let import_bytes = resolved_for_cache
             .as_ref()
@@ -6855,6 +6912,7 @@ impl Workspace {
             }
         }
         let mut resolved_urls = HashMap::new();
+        let mut resolved_revisions = HashMap::new();
         let mut dependencies = Vec::new();
         for (index, dependency) in dependency_units.into_iter().enumerate() {
             check_workspace_cancel(cancel)?;
@@ -6916,6 +6974,8 @@ impl Workspace {
                     }
                     pinned.insert(dependency_uri.clone());
                     resolved_urls.insert(dependency.source.id.clone(), dependency_uri.clone());
+                    resolved_revisions
+                        .insert(dependency_uri.clone(), dependency.source.revision.clone());
                     let dependency_is_legacy = match &dependency.source.revision {
                         pascal_core::SourceRevision::Disk { path_entry, .. } => {
                             matches!(path_entry.provenance, ProjectPathProvenance::LegacyNative)
@@ -6972,7 +7032,7 @@ impl Workspace {
         if let Some(reason) = rejected_dependency {
             return Err(format!("required dependency was rejected: {reason}"));
         }
-        if report.complete
+        let graph_complete = report.complete
             && !report.observations.iter().any(|observation| {
                 matches!(
                     observation,
@@ -6981,8 +7041,18 @@ impl Workspace {
                         ..
                     }
                 )
-            })
-        {
+            });
+        let interface_probes = cached_probes.or_else(|| {
+            resolved_for_cache
+                .as_ref()
+                .map(|resolved| crate::project_cache::report_probes(&report, resolved).0)
+        });
+        if let Some(probes) = interface_probes {
+            let bindings =
+                interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
+            self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
+        }
+        if graph_complete {
             if let (Some(claim), Some(resolved), Some(bytes)) =
                 (import_claim, resolved_for_cache, import_bytes)
             {
@@ -7078,6 +7148,45 @@ impl Workspace {
         Ok(dependencies)
     }
 
+    fn store_interface_imports(
+        &mut self,
+        uri: &Url,
+        context: &ProjectContext,
+        bindings: Vec<crate::project_cache::InterfaceBinding>,
+        complete: bool,
+        probes: Vec<crate::project_cache::Probe>,
+    ) {
+        self.interface_import_summaries.insert(
+            uri.clone(),
+            InterfaceImportSummary {
+                targets: bindings.iter().map(|binding| binding.uri.clone()).collect(),
+                complete,
+            },
+        );
+        let Some(content_hash) = self.indexed_content_hashes.get(uri).copied() else {
+            return;
+        };
+        let value = crate::project_cache::InterfaceImportsValue {
+            bindings,
+            complete,
+            probes,
+        };
+        if self.project_cache.put_interface_imports(
+            uri,
+            context,
+            content_hash,
+            value,
+            self.cache_epoch,
+        ) {
+            self.interface_entries_stored += 1;
+        }
+    }
+
+    /// Interface entries this workspace stored that were new or changed.
+    pub(crate) fn interface_entries_stored(&self) -> usize {
+        self.interface_entries_stored
+    }
+
     pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
         self.dependency_hook = Some(hook);
     }
@@ -7096,20 +7205,93 @@ impl Workspace {
             return Ok(WarmOutcome {
                 fingerprint,
                 dependencies: Vec::new(),
+                closure: Vec::new(),
             });
         }
         let mut pinned = HashSet::from([uri.clone()]);
+        let session_cache = ResolverSessionCache::default();
         let dependencies = self.load_imports_with_session_cache(
             uri,
             &context_key,
             &mut pinned,
             Some(cancel),
-            &ResolverSessionCache::default(),
+            &session_cache,
+        )?;
+        let closure = self.warm_interface_closure(
+            uri,
+            &dependencies,
+            &context_key,
+            &mut pinned,
+            cancel,
+            &session_cache,
         )?;
         Ok(WarmOutcome {
             fingerprint,
             dependencies,
+            closure,
         })
+    }
+
+    /// Loads the interface closure of `dependencies` into the shared cache, so
+    /// snapshots can bind members inherited through types their imports
+    /// declare. Follows only interface `uses`, does not continue past an
+    /// incomplete import graph, and reports cumulative progress through the
+    /// dependency hook between units, where it may also pause.
+    fn warm_interface_closure(
+        &mut self,
+        root: &Url,
+        dependencies: &[Url],
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: &AtomicBool,
+        session_cache: &ResolverSessionCache,
+    ) -> Result<Vec<Url>, String> {
+        let mut visited = std::iter::once(root.clone())
+            .chain(dependencies.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut frontier = dependencies.iter().cloned().collect::<VecDeque<_>>();
+        let mut closure = Vec::new();
+        let mut done = 0usize;
+        while let Some(unit) = frontier.pop_front() {
+            check_workspace_cancel(Some(cancel))?;
+            if done >= MAX_DEPENDENCY_WORK {
+                break;
+            }
+            if let Some(hook) = self.dependency_hook.clone() {
+                let finished = dependencies.len() + done;
+                hook(&unit, finished, finished + frontier.len() + 1)?;
+            }
+            done += 1;
+            // Each load reports its own dependencies through the hook; keep
+            // one progress sequence for the whole crawl.
+            let hook = self.dependency_hook.take();
+            let loaded = self.load_imports_with_session_cache(
+                &unit,
+                context_key,
+                pinned,
+                Some(cancel),
+                session_cache,
+            );
+            self.dependency_hook = hook;
+            match loaded {
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(_) => continue,
+                Ok(_) => {}
+            }
+            let Some(summary) = self.interface_import_summaries.get(&unit).cloned() else {
+                continue;
+            };
+            if !summary.complete {
+                continue;
+            }
+            for target in summary.targets {
+                if visited.insert(target.clone()) {
+                    closure.push(target.clone());
+                    frontier.push_back(target);
+                }
+            }
+        }
+        Ok(closure)
     }
 
     #[allow(dead_code)]
@@ -7595,6 +7777,7 @@ impl Workspace {
             self.indexed_files.insert(uri.clone());
         }
         self.indexed_bytes = self.indexed_bytes.saturating_add(indexed_source.len());
+        self.indexed_content_hashes.insert(uri.clone(), source_hash);
         if let Err(error) = self.set_document_context_with_control(uri, context_key, cancel, budget)
         {
             if budget.is_some_and(|budget| budget.is_exhausted()) || error == CANCELLATION_MESSAGE {
@@ -10344,6 +10527,8 @@ impl Workspace {
             self.document_contexts.remove(uri);
             self.index.clear_import_bindings(uri);
             self.disk_stamps.remove(uri);
+            self.indexed_content_hashes.remove(uri);
+            self.interface_import_summaries.remove(uri);
             if let Some(size) = self.indexed_sizes.remove(uri) {
                 self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
             }
@@ -10508,6 +10693,8 @@ impl Workspace {
             self.document_contexts.remove(uri);
             self.index.clear_import_bindings(uri);
             self.disk_stamps.remove(uri);
+            self.indexed_content_hashes.remove(uri);
+            self.interface_import_summaries.remove(uri);
             if let Some(size) = self.indexed_sizes.remove(uri) {
                 self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
             }
@@ -12159,6 +12346,8 @@ impl Workspace {
         self.document_contexts.remove(uri);
         self.index.clear_import_bindings(uri);
         self.disk_stamps.remove(uri);
+        self.indexed_content_hashes.remove(uri);
+        self.interface_import_summaries.remove(uri);
         if let Some(size) = self.indexed_sizes.remove(uri) {
             self.indexed_bytes = self.indexed_bytes.saturating_sub(size);
         }
@@ -12756,19 +12945,28 @@ impl Workspace {
         self.configuration_generation = self.configuration_generation.wrapping_add(1);
     }
 
-    fn mark_source_change(&mut self, uri: &Url, _include_parent: bool) -> Vec<Url> {
-        self.mark_source_change_with_control(uri, None, None)
+    /// `include_parent` is false for a change that leaves the parent's
+    /// directory listing (including its open overlays) unchanged, which keeps
+    /// cache entries that only observed that listing.
+    fn mark_source_change(&mut self, uri: &Url, include_parent: bool) -> Vec<Url> {
+        self.mark_source_change_with_control(uri, include_parent, None, None)
             .unwrap_or_default()
     }
 
     fn mark_source_change_with_control(
         &mut self,
         uri: &Url,
+        include_parent: bool,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Url>, String> {
         if let Ok(path) = uri.to_file_path() {
-            self.project_cache.invalidate_path(&absolute_path(path));
+            let path = absolute_path(path);
+            if include_parent {
+                self.project_cache.invalidate_path(&path);
+            } else {
+                self.project_cache.invalidate_file_contents(&path);
+            }
         }
         let dependent_diagnostics =
             self.invalidate_expansion_dependents_with_control(uri, cancel, budget)?;
@@ -13372,7 +13570,7 @@ impl Workspace {
             .map(|import| ImportSite {
                 byte_range: import.span.start..import.span.end,
                 requested_name: import.name,
-                section: ImportSection::Module,
+                section: import.section,
             })
             .collect::<Vec<_>>();
         let legacy_route = self.legacy_route_for_resolver(uri, path, context_key, context);
@@ -16323,6 +16521,862 @@ mod tests {
         Workspace::from_analysis_input(&main.analysis_input())
     }
 
+    /// Warms `uri` in a worker, then returns its interface entry from the shared cache.
+    fn interface_entry(
+        workspace: &Workspace,
+        uri: &Url,
+    ) -> Option<std::sync::Arc<crate::project_cache::InterfaceImportsValue>> {
+        let mut worker = worker_view(workspace);
+        worker
+            .warm_with_cancel(uri, &AtomicBool::new(false))
+            .expect("warm");
+        let context_key = worker.document_contexts.get(uri).cloned()?;
+        let context = worker.contexts.get(&context_key)?.context.clone();
+        let hash = *worker.indexed_content_hashes.get(uri)?;
+        workspace
+            .project_cache()
+            .peek_interface_imports(uri, &context, hash, &HashMap::new())
+    }
+
+    #[test]
+    fn loading_imports_caches_only_interface_imports() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(
+            root.join("Base.pas"),
+            "unit Base;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Helper.pas"),
+            "unit Helper;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let derived = root.join("Derived.pas");
+        fs::write(
+            &derived,
+            "unit Derived;\ninterface\nuses Base;\nimplementation\nuses Helper;\nend.\n",
+        )
+        .unwrap();
+        let derived_uri = Url::from_file_path(&derived).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+
+        let entry = interface_entry(&workspace, &derived_uri).expect("interface entry");
+
+        assert!(entry.complete);
+        let names = entry
+            .bindings
+            .iter()
+            .map(|binding| binding.name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["base"]);
+        assert_eq!(
+            entry.bindings[0].uri,
+            Url::from_file_path(root.join("Base.pas")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_unit_without_imports_caches_an_empty_complete_interface_entry() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let base = temp.path().join("Base.pas");
+        fs::write(&base, "unit Base;\ninterface\nimplementation\nend.\n").unwrap();
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+
+        let entry = interface_entry(&workspace, &Url::from_file_path(&base).unwrap())
+            .expect("interface entry");
+
+        assert!(entry.complete);
+        assert!(entry.bindings.is_empty());
+    }
+
+    const INHERITED_THROUGH_DEPENDENCY_MAIN: &str = "unit Main;\ninterface\nuses Derived;\nimplementation\nprocedure Run(Db: TDerived);\nbegin\n  Db.Open;\n  Db.Open;\nend;\nend.\n";
+
+    const INHERITED_BASE: &str = "unit Base;\ninterface\ntype\n  TConn = class\n  public\n    procedure Open;\n  end;\nimplementation\nprocedure TConn.Open; begin end;\nend.\n";
+
+    struct InheritedFixture {
+        _temp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        main: Url,
+        derived: Url,
+        base: Url,
+        workspace: Workspace,
+    }
+
+    /// `Main` uses only `Derived`, whose `TDerived` inherits `Open` from
+    /// `TConn` in `Base`. Resolving `Db.Open` needs `Derived`'s own imports.
+    fn inherited_fixture(derived_uses: &str) -> InheritedFixture {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        fs::write(root.join("Base.pas"), INHERITED_BASE).unwrap();
+        fs::write(
+            root.join("Derived.pas"),
+            format!(
+                "unit Derived;\ninterface\nuses {derived_uses};\ntype\n  TDerived = class(TConn)\n  end;\nimplementation\nend.\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("Main.pas"), INHERITED_THROUGH_DEPENDENCY_MAIN).unwrap();
+        let url = |name: &str| Url::from_file_path(root.join(name)).unwrap();
+        InheritedFixture {
+            main: url("Main.pas"),
+            derived: url("Derived.pas"),
+            base: url("Base.pas"),
+            workspace: test_workspace(vec![root.clone()], Default::default()),
+            root,
+            _temp: temp,
+        }
+    }
+
+    impl InheritedFixture {
+        /// Warms each unit in a worker, filling its unit, import, and
+        /// interface entries the way the warmer's crawl does.
+        fn warm(&self, units: &[&Url]) {
+            for unit in units {
+                worker_view(&self.workspace)
+                    .warm_with_cancel(unit, &AtomicBool::new(false))
+                    .expect("warm");
+            }
+        }
+
+        fn snapshot(&self) -> super::rename::RenameSnapshot {
+            super::rename::build_snapshot(
+                &self.workspace.analysis_input(),
+                std::slice::from_ref(&self.main),
+                &[],
+                super::rename::SnapshotMode::LocalWithImports,
+                None,
+                &[],
+                &AtomicBool::new(false),
+            )
+            .expect("snapshot")
+        }
+    }
+
+    /// Semantic tokens on line 6 (`  Db.Open;`) as `(line, character, type)`.
+    fn body_line_token_kinds(workspace: &Workspace, main_uri: &Url) -> Vec<(u32, u32, String)> {
+        let tokens = super::queries::semantic_tokens_from_input(
+            workspace.analysis_input(),
+            main_uri,
+            Some(lsp_types::Range::new(
+                lsp_types::Position::new(6, 0),
+                lsp_types::Position::new(7, 0),
+            )),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("semantic tokens");
+        let legend = crate::NavigationIndex::semantic_tokens_legend();
+        let (mut line, mut character) = (0u32, 0u32);
+        tokens
+            .data
+            .iter()
+            .map(|token| {
+                line += token.delta_line;
+                character = if token.delta_line == 0 {
+                    character + token.delta_start
+                } else {
+                    token.delta_start
+                };
+                (
+                    line,
+                    character,
+                    legend.token_types[token.token_type as usize]
+                        .as_str()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn semantic_tokens_classify_members_inherited_through_a_warm_closure() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn hover_resolves_members_inherited_through_a_warm_closure() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let hover = super::queries::hover_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover")
+        .expect("hover for an inherited member");
+
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Open;"),
+            "{hover:?}"
+        );
+    }
+
+    /// `main` with enough routines appended that one scan of its symbol keys
+    /// and names, which each unqualified lookup charges, costs about 40 KiB.
+    fn with_many_symbols(main: &str) -> String {
+        let padding = (0..3000)
+            .map(|index| format!("procedure Pad{index:04}; begin end;\n"))
+            .collect::<String>();
+        main.replacen("end.\n", &format!("{padding}end.\n"), 1)
+    }
+
+    #[test]
+    fn hover_resolves_inherited_members_from_a_document_with_many_symbols() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Main.pas"),
+            with_many_symbols(INHERITED_THROUGH_DEPENDENCY_MAIN),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let hover = super::queries::hover_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover")
+        .expect("hover for an inherited member");
+
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Open;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn type_definition_resolves_inherited_fields_from_a_document_with_many_symbols() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("  public\n", "  public\n    Peer: TConn;\n"),
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Main.pas"),
+            with_many_symbols(
+                &INHERITED_THROUGH_DEPENDENCY_MAIN.replace("Db.Open", "Db.Peer.Open"),
+            ),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let locations = super::queries::type_definitions_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("type definition");
+
+        assert_eq!(
+            locations
+                .iter()
+                .map(|location| (&location.uri, location.range.start.line))
+                .collect::<Vec<_>>(),
+            [(&fixture.base, 3)],
+            "{locations:?}"
+        );
+    }
+
+    /// Warms `Main` and `Derived`, then returns the tokens on `  Db.Open;`.
+    fn warm_body_line_token_kinds(fixture: &InheritedFixture) -> Vec<(u32, u32, String)> {
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        body_line_token_kinds(&fixture.workspace, &fixture.main)
+    }
+
+    #[test]
+    fn a_forward_declaration_of_the_receiver_class_keeps_inherited_members() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class;\n  TDerived = class(TConn)\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn a_forward_declaration_of_the_ancestor_keeps_inherited_members() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("  TConn = class\n", "  TConn = class;\n  TConn = class\n"),
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn an_explicit_tobject_ancestor_without_system_is_the_implicit_root() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("TConn = class\n", "TConn = class(TObject)\n"),
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+        let hover = super::queries::hover_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover")
+        .expect("hover for an inherited member");
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Open;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_members_resolve_through_a_classes_style_chain() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Classes.pas"),
+            "unit Classes;\ninterface\ntype\n  TComponent = class;\n  TPersistent = class(TObject)\n  public\n    procedure Assign;\n  end;\n  TComponent = class(TPersistent)\n  public\n    procedure Open;\n  end;\nimplementation\nprocedure TPersistent.Assign; begin end;\nprocedure TComponent.Open; begin end;\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Base.pas"),
+            "unit Base;\ninterface\nuses Classes;\ntype\n  TConn = class(TComponent)\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn an_ancestor_with_only_a_forward_declaration_stays_unknown() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace(
+                "  TConn = class\n",
+                "  TLonely = class;\n  TConn = class(TLonely)\n",
+            ),
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(
+            !tokens.contains(&(6, 5, "method".to_string())),
+            "{tokens:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_source_tobject_still_supplies_inherited_members() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            "unit Base;\ninterface\ntype\n  TObject = class\n  public\n    procedure Open;\n  end;\n  TConn = class(TObject)\n  end;\nimplementation\nprocedure TObject.Open; begin end;\nend.\n",
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn highlights_resolve_members_reached_through_a_warm_closure() {
+        let fixture = inherited_fixture("Base");
+        // Highlights deliberately skip members reached through an inherited
+        // class owner, so reach `Open` through a field typed from `Base`.
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class\n  public\n    Conn: TConn;\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Main.pas"),
+            INHERITED_THROUGH_DEPENDENCY_MAIN.replace("Db.Open", "Db.Conn.Open"),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let highlights = super::queries::highlights_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 11),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("highlights");
+
+        let mut lines = highlights
+            .iter()
+            .map(|highlight| highlight.range.start.line)
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines, [6, 7], "{highlights:?}");
+    }
+
+    #[test]
+    fn a_cold_closure_answers_immediately_and_requests_a_crawl() {
+        let fixture = inherited_fixture("Base");
+
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+
+        assert!(
+            tokens.contains(&(6, 2, "parameter".to_string())),
+            "{tokens:?}"
+        );
+        assert!(
+            !tokens.contains(&(6, 5, "method".to_string())),
+            "{tokens:?}"
+        );
+        let requests = fixture
+            .workspace
+            .project_cache()
+            .take_closure_crawl_requests();
+        assert!(requests.contains(&fixture.main), "{requests:?}");
+    }
+
+    #[test]
+    fn a_persistent_closure_miss_requests_one_crawl_until_a_new_unit_misses() {
+        let fixture = inherited_fixture("Base");
+        let cache = fixture.workspace.project_cache().clone();
+
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![fixture.main.clone()]
+        );
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "the same misses must not request another crawl"
+        );
+
+        fixture.warm(&[&fixture.main]);
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(cache.take_closure_crawl_requests().is_empty());
+        cache.invalidate_file_contents(&fixture.base.to_file_path().unwrap());
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![fixture.main.clone()],
+            "an evicted unit is a new miss"
+        );
+    }
+
+    #[test]
+    fn editing_the_open_document_after_warm_up_requests_no_crawl() {
+        let mut fixture = inherited_fixture("Base");
+        fixture
+            .workspace
+            .open_document(
+                fixture.main.clone(),
+                INHERITED_THROUGH_DEPENDENCY_MAIN.to_string(),
+                1,
+            )
+            .expect("open Main");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(cache.take_closure_crawl_requests().is_empty());
+
+        fixture
+            .workspace
+            .change_document(
+                fixture.main.clone(),
+                INHERITED_THROUGH_DEPENDENCY_MAIN.replace("end.", "end.\n"),
+                2,
+            )
+            .expect("edit Main");
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+        assert!(cache.take_closure_crawl_requests().is_empty());
+    }
+
+    #[test]
+    fn a_walked_unit_without_a_context_is_fenced() {
+        let fixture = inherited_fixture("Base");
+        let mut warmed = worker_view(&fixture.workspace);
+        warmed
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm");
+        let context_key = warmed.document_contexts[&fixture.main].clone();
+
+        let mut loader = worker_view(&fixture.workspace);
+        loader.contexts.remove(&context_key);
+        let derived_text = fs::read_to_string(fixture.derived.to_file_path().unwrap()).unwrap();
+        loader
+            .index
+            .update(fixture.derived.clone(), derived_text)
+            .unwrap();
+        loader
+            .index
+            .update(fixture.base.clone(), INHERITED_BASE.to_string())
+            .unwrap();
+        loader
+            .indexed_content_hashes
+            .insert(fixture.derived.clone(), 1);
+        loader
+            .document_contexts
+            .insert(fixture.derived.clone(), context_key);
+        assert!(!loader.index.has_import_bindings(&fixture.derived));
+
+        let walk = super::closure::walk_interface_closure(
+            &mut loader,
+            std::slice::from_ref(&fixture.derived),
+            &HashSet::new(),
+            &AtomicBool::new(false),
+        )
+        .expect("walk");
+
+        assert!(walk.incomplete);
+        assert!(walk.missed.contains(&fixture.derived), "{:?}", walk.missed);
+        assert!(
+            loader.index.has_import_bindings(&fixture.derived),
+            "an unwalked unit must not fall back to name-based imports"
+        );
+    }
+
+    #[test]
+    fn an_overlay_edit_keeps_sibling_entries_and_evicts_its_dependents() {
+        let mut fixture = inherited_fixture("Base");
+        fixture
+            .workspace
+            .open_document(fixture.base.clone(), INHERITED_BASE.to_string(), 1)
+            .expect("open Base");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        let main_layers = cache.ready_layers(&fixture.main);
+        assert!(
+            main_layers.contains(&"Interface".to_string())
+                && main_layers.contains(&"Unit".to_string()),
+            "{main_layers:?}"
+        );
+        assert!(
+            cache
+                .ready_layers(&fixture.derived)
+                .contains(&"Interface".to_string()),
+            "Derived's interface entry depends on Base's overlay"
+        );
+
+        fixture
+            .workspace
+            .change_document(
+                fixture.base.clone(),
+                INHERITED_BASE.replace("procedure Open;", "procedure Open; "),
+                2,
+            )
+            .expect("edit Base");
+
+        assert_eq!(
+            cache.ready_layers(&fixture.main),
+            main_layers,
+            "a text edit leaves the directory listing unchanged"
+        );
+        assert!(
+            !cache
+                .ready_layers(&fixture.derived)
+                .contains(&"Interface".to_string()),
+            "entries that observed Base's overlay must be evicted"
+        );
+    }
+
+    #[test]
+    fn warming_a_file_caches_and_reports_its_interface_closure() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class(TConn)\n  end;\nimplementation\nuses Helper;\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Helper.pas"),
+            "unit Helper;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+
+        let mut worker = worker_view(&fixture.workspace);
+        let outcome = worker
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm");
+
+        assert_eq!(outcome.dependencies, vec![fixture.derived.clone()]);
+        assert_eq!(
+            outcome.closure,
+            vec![fixture.base.clone()],
+            "only interface imports are followed"
+        );
+        assert!(worker.interface_entries_stored() > 0);
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+
+        let mut again = worker_view(&fixture.workspace);
+        again
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm again");
+        assert_eq!(
+            again.interface_entries_stored(),
+            0,
+            "an unchanged closure stores nothing new"
+        );
+    }
+
+    #[test]
+    fn declaration_providers_skip_the_include_audit_and_completeness_checks() {
+        let fixture = inherited_fixture("Base");
+        // The include audit rejects this directive. A declaration provider
+        // must never reach the audit.
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("unit Base;\n", "unit Base;\n{$SCOPEDENUMS ON}\n"),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let snapshot = fixture.snapshot();
+
+        assert!(
+            snapshot.declaration_providers.contains(&fixture.base),
+            "{:?}",
+            snapshot.declaration_providers
+        );
+        assert!(!snapshot.sources.contains_key(&fixture.base));
+        assert!(
+            !snapshot
+                .include_errors
+                .iter()
+                .any(|error| error.contains("Base.pas")),
+            "{:?}",
+            snapshot.include_errors
+        );
+        assert!(snapshot.complete, "{:?}", snapshot.incomplete_reason);
+    }
+
+    #[test]
+    fn a_changed_declaration_provider_makes_the_result_stale() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        let input = fixture.workspace.analysis_input();
+        let cancel = AtomicBool::new(false);
+
+        let tokens =
+            super::queries::semantic_tokens_from_input(input.clone(), &fixture.main, None, &cancel);
+        assert!(tokens.value.is_ok(), "{:?}", tokens.value.err());
+        super::rename::revalidate_input(&input, &tokens.records, &cancel)
+            .expect("unchanged sources revalidate");
+
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace(
+                "procedure Open;\n",
+                "procedure Open;\n    procedure Close;\n",
+            ),
+        )
+        .unwrap();
+        assert!(super::rename::revalidate_input(&input, &tokens.records, &cancel).is_err());
+    }
+
+    #[test]
+    fn the_walk_does_not_continue_past_an_incomplete_import_graph() {
+        let fixture = inherited_fixture("Mid");
+        fs::write(
+            fixture.root.join("Mid.pas"),
+            "unit Mid;\ninterface\nuses Base;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        // Unknown conditional activity makes Derived's import graph incomplete.
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Mid;\n{$IFDEF UNKNOWN_FEATURE}\nconst Flag = 1;\n{$ENDIF}\ntype\n  TDerived = class\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let mid = Url::from_file_path(fixture.root.join("Mid.pas")).unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived, &mid]);
+        assert!(
+            !interface_entry(&fixture.workspace, &fixture.derived)
+                .expect("Derived's interface entry")
+                .complete,
+            "fixture precondition: Derived's import graph is incomplete"
+        );
+
+        let snapshot = fixture.snapshot();
+
+        assert!(snapshot.declaration_providers.contains(&mid));
+        assert!(
+            !snapshot.declaration_providers.contains(&fixture.base),
+            "{:?}",
+            snapshot.declaration_providers
+        );
+    }
+
+    struct OwnedDependencyFixture {
+        _temp: tempfile::TempDir,
+        zeta: Url,
+        helper: Url,
+        workspace: Workspace,
+        main: Url,
+    }
+
+    /// `Zeta` is both a workspace source and a direct dependency of the
+    /// snapshot. It sorts after `Alpha`, which loads it, and its include makes
+    /// that load re-index it, so the snapshot's own pass binds it last. It imports
+    /// `Extra` in its interface and `Helper` in its implementation.
+    fn owned_dependency_fixture() -> OwnedDependencyFixture {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let write = |name: &str, text: &str| fs::write(root.join(name), text).unwrap();
+        write(
+            "Main.pas",
+            "unit Main;\ninterface\nuses Alpha;\nimplementation\n// TZeta\nend.\n",
+        );
+        write(
+            "Alpha.pas",
+            "unit Alpha;\ninterface\nuses Zeta;\ntype\n  TAlpha = TZeta;\nimplementation\nend.\n",
+        );
+        write(
+            "Zeta.pas",
+            "unit Zeta;\ninterface\nuses Extra;\n{$I Types.inc}\ntype\n  TZeta = class\n  end;\nimplementation\nuses Helper;\nend.\n",
+        );
+        write("Types.inc", "const Answer = 42;\n");
+        write(
+            "Helper.pas",
+            "unit Helper;\ninterface\nimplementation\nend.\n",
+        );
+        write(
+            "Extra.pas",
+            "unit Extra;\ninterface\nimplementation\nend.\n",
+        );
+        let url = |name: &str| Url::from_file_path(root.join(name)).unwrap();
+        let fixture = OwnedDependencyFixture {
+            main: url("Main.pas"),
+            zeta: url("Zeta.pas"),
+            helper: url("Helper.pas"),
+            workspace: test_workspace(vec![root.clone()], Default::default()),
+            _temp: temp,
+        };
+        for name in ["Main.pas", "Alpha.pas", "Zeta.pas"] {
+            worker_view(&fixture.workspace)
+                .warm_with_cancel(&url(name), &AtomicBool::new(false))
+                .expect("warm");
+        }
+        fixture
+    }
+
+    fn workspace_snapshot(
+        fixture: &OwnedDependencyFixture,
+        skip_imports_for: &[Url],
+    ) -> super::rename::RenameSnapshot {
+        super::rename::build_snapshot(
+            &fixture.workspace.analysis_input(),
+            std::slice::from_ref(&fixture.main),
+            &["TZeta".to_string()],
+            super::rename::SnapshotMode::Workspace,
+            None,
+            skip_imports_for,
+            &AtomicBool::new(false),
+        )
+        .expect("snapshot")
+    }
+
+    #[test]
+    fn the_walk_keeps_full_bindings_of_the_snapshots_own_sources() {
+        let fixture = owned_dependency_fixture();
+
+        let snapshot = workspace_snapshot(&fixture, &[]);
+
+        assert!(snapshot.sources.contains_key(&fixture.zeta));
+        assert_eq!(
+            snapshot.index.import_provider_uri(&fixture.zeta, "Helper"),
+            Some(&fixture.helper)
+        );
+        assert!(
+            snapshot
+                .index
+                .import_provider_uri(&fixture.zeta, "Extra")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_walk_keeps_the_empty_binding_of_a_skipped_source() {
+        let fixture = owned_dependency_fixture();
+
+        let snapshot = workspace_snapshot(&fixture, std::slice::from_ref(&fixture.zeta));
+
+        assert!(snapshot.sources.contains_key(&fixture.zeta));
+        assert_eq!(
+            snapshot.index.import_provider_uri(&fixture.zeta, "Extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_open_dependency_in_the_closure_is_not_replaced_by_its_disk_parse() {
+        let mut fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        fixture
+            .workspace
+            .open_document(
+                fixture.base.clone(),
+                INHERITED_BASE.replace("TConn", "TRenamed"),
+                1,
+            )
+            .expect("open Base");
+
+        let snapshot = fixture.snapshot();
+
+        assert!(
+            !snapshot.declaration_providers.contains(&fixture.base),
+            "{:?}",
+            snapshot.declaration_providers
+        );
+    }
+
+    #[test]
+    fn an_interface_cycle_through_the_requested_document_terminates_without_replacing_it() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("interface\n", "interface\nuses Main;\n"),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived, &fixture.base]);
+
+        let snapshot = fixture.snapshot();
+
+        assert!(snapshot.declaration_providers.contains(&fixture.base));
+        assert!(!snapshot.declaration_providers.contains(&fixture.main));
+        assert!(snapshot.records.contains_key(&fixture.main));
+    }
+
     fn provider_fixture(root: &std::path::Path) -> (Url, Url) {
         let main = root.join("Main.pas");
         let provider = root.join("Provider.pas");
@@ -17129,17 +18183,17 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .expect("warm");
+        let local = Url::from_file_path(root.join("Local.pas")).unwrap();
+        let lib_unit = Url::from_file_path(lib.join("LibUnit.pas")).unwrap();
         assert_eq!(
             *order.lock().unwrap(),
-            vec![
-                Url::from_file_path(root.join("Local.pas")).unwrap(),
-                Url::from_file_path(lib.join("LibUnit.pas")).unwrap(),
-            ]
+            vec![local.clone(), lib_unit.clone(), local, lib_unit],
+            "the closure crawl revisits the dependencies in the same order"
         );
         assert_eq!(
             *progress.lock().unwrap(),
-            vec![(0, 2), (1, 2), (2, 2)],
-            "progress begins at zero and reaches total after the final completed unit"
+            vec![(0, 2), (1, 2), (2, 2), (2, 4), (3, 4)],
+            "dependency progress reaches its total, then the closure crawl continues the sequence"
         );
     }
 
@@ -17523,6 +18577,109 @@ mod tests {
         );
 
         let error = rename.value.expect_err("rename must fail closed");
+        assert!(error.contains("unsupported directive"), "{error}");
+    }
+
+    /// `Main` calls `Value.Hello` on a `TProvided` from `Provider`, whose
+    /// `{$SCOPEDENUMS ON}` the include audit rejects. `main_directive` follows
+    /// `unit Main;` on line 0, so positions do not shift.
+    fn unsupported_provider_fixture(
+        main_directive: &str,
+        body: &str,
+    ) -> (tempfile::TempDir, Url, Workspace) {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path();
+        fs::write(
+            root.join("Provider.pas"),
+            "unit Provider;\n{$SCOPEDENUMS ON}\ninterface\ntype\n  TProvided = class\n  public\n    procedure Hello;\n  end;\nimplementation\nprocedure TProvided.Hello; begin end;\nend.\n",
+        )
+        .unwrap();
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            format!(
+                "unit Main;{main_directive}\ninterface\nuses Provider;\nimplementation\nprocedure Run(Value: TProvided);\nbegin\n  {body}\nend;\nend.\n"
+            ),
+        )
+        .unwrap();
+        let main_uri = Url::from_file_path(&main).unwrap();
+        let workspace = test_workspace(vec![root.to_path_buf()], Default::default());
+        (temp, main_uri, workspace)
+    }
+
+    #[test]
+    fn hover_tolerates_an_unsupported_directive_in_an_imported_unit() {
+        let (_temp, main, workspace) = unsupported_provider_fixture("", "Value.Hello;");
+
+        let hover = super::queries::hover_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(6, 9),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover is not blocked")
+        .expect("hover for Hello");
+
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Hello;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn completion_tolerates_an_unsupported_directive_in_an_imported_unit() {
+        let (_temp, main, workspace) = unsupported_provider_fixture("", "Value.;");
+
+        let completion = super::queries::completion_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(6, 8),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("completion is not blocked");
+
+        assert!(
+            completion.items.iter().any(|item| item.label == "Hello"),
+            "{:?}",
+            completion.items
+        );
+    }
+
+    #[test]
+    fn hover_still_fails_closed_on_an_unsupported_directive_in_the_document() {
+        let (_temp, main, workspace) =
+            unsupported_provider_fixture(" {$SCOPEDENUMS ON}", "Value.Hello;");
+
+        let hover = super::queries::hover_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(6, 9),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        );
+
+        let error = hover
+            .value
+            .expect_err("the document's own directive blocks");
+        assert!(error.contains("unsupported directive"), "{error}");
+    }
+
+    #[test]
+    fn references_still_fail_closed_on_an_unsupported_directive_in_an_imported_unit() {
+        let (_temp, main, workspace) = unsupported_provider_fixture("", "Value.Hello;");
+
+        let references = super::queries::references_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(4, 23),
+            true,
+            &AtomicBool::new(false),
+        );
+
+        let error = references.value.expect_err("references fail closed");
         assert!(error.contains("unsupported directive"), "{error}");
     }
 

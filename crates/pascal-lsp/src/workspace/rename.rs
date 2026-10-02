@@ -528,6 +528,11 @@ pub(crate) struct RenameSnapshot {
     pub(crate) unsupported_directive_owners: Vec<Url>,
     /// Whether `include_errors` has failures besides unsupported directives.
     pub(crate) other_include_errors: bool,
+    /// Units inserted from the cached interface closure. They supply
+    /// declarations only: they are never audited, never sources, and never
+    /// queried.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) declaration_providers: HashSet<Url>,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
 }
@@ -6044,6 +6049,7 @@ fn build_snapshot_with_policy(
                     include_errors: Vec::new(),
                     unsupported_directive_owners: Vec::new(),
                     other_include_errors: false,
+                    declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
                     mode,
                 });
@@ -6664,7 +6670,10 @@ fn build_snapshot_with_policy(
 
     let mut uris: Vec<Url> = indexed_uris.iter().cloned().collect();
     uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let owned_sources: HashSet<Url> = uris.iter().cloned().collect();
     let mut pins: HashSet<Url> = indexed_uris;
+    let mut direct_dependencies = Vec::new();
+    let mut declaration_providers = HashSet::new();
     if mode != SnapshotMode::WorkspaceSymbols {
         for uri in uris {
             if is_cancelled(cancel) {
@@ -6683,7 +6692,12 @@ fn build_snapshot_with_policy(
                 // bind to one provider do not look incomplete merely because
                 // their dependency URI is shared.
                 let imports = loader.index.imports(&uri);
-                loader.load_imports_with_cancel(&uri, &context_key, &mut pins, Some(cancel))?;
+                direct_dependencies.extend(loader.load_imports_with_cancel(
+                    &uri,
+                    &context_key,
+                    &mut pins,
+                    Some(cancel),
+                )?);
                 if imports.iter().any(|import| {
                     loader
                         .index
@@ -6701,6 +6715,18 @@ fn build_snapshot_with_policy(
                     .bind_imports(&uri, std::iter::empty::<(String, Url)>());
             }
         }
+        let closure = super::closure::walk_interface_closure(
+            &mut loader,
+            &direct_dependencies,
+            &owned_sources,
+            cancel,
+        )?;
+        for root in &priority {
+            loader
+                .project_cache
+                .report_closure_misses(root, closure.missed.clone());
+        }
+        declaration_providers = closure.providers;
     }
 
     if mode != SnapshotMode::WorkspaceSymbols {
@@ -7012,6 +7038,7 @@ fn build_snapshot_with_policy(
         include_errors,
         unsupported_directive_owners,
         other_include_errors,
+        declaration_providers,
         baseline_records,
         mode,
     })

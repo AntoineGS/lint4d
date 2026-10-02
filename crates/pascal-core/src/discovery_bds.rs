@@ -176,12 +176,11 @@ pub fn discover_bds_root(
     }
 
     // 2. Registry lookup using project version
-    if let Some(pv) = project_version {
-        if let Some(info) = bds_version_for_project(pv) {
-            if let Some(root) = find_bds_root(info.bds_version) {
-                return Some(root);
-            }
-        }
+    if let Some(pv) = project_version
+        && let Some(info) = bds_version_for_project(pv)
+        && let Some(root) = find_bds_root(info.bds_version)
+    {
+        return Some(root);
     }
 
     // 3. Registry fallback: any BDS installation

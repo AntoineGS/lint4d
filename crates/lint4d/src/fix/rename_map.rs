@@ -237,13 +237,10 @@ fn check_constant_naming(
     let style = config.constant_style();
 
     let conforms = if style == "PascalCase" {
-        let ok = name.chars().next().is_some_and(|c| c.is_uppercase());
-        ok
+        name.chars().next().is_some_and(|c| c.is_uppercase())
     } else {
-        let ok = name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        ok
+        name.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     };
 
     if conforms {

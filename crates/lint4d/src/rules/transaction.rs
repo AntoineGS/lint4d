@@ -146,10 +146,10 @@ fn collect_guards_recursive(
     out: &mut Vec<GuardBinding>,
 ) {
     // Look for assignment: guardVar := not receiver.InTransaction
-    if node.kind() == K::ASSIGNMENT {
-        if let Some(binding) = try_parse_guard_assignment(node, source, var_types, project, uses) {
-            out.push(binding);
-        }
+    if node.kind() == K::ASSIGNMENT
+        && let Some(binding) = try_parse_guard_assignment(node, source, var_types, project, uses)
+    {
+        out.push(binding);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -232,14 +232,12 @@ fn condition_is_guard(
                 inner_expr = Some(child);
             }
         }
-        if found_not {
-            if let Some(inner) = inner_expr {
-                if let Some(TransactionCallKind::InTransaction { .. }) =
-                    classify_transaction_call(inner, source, var_types, project, uses)
-                {
-                    return true;
-                }
-            }
+        if found_not
+            && let Some(inner) = inner_expr
+            && let Some(TransactionCallKind::InTransaction { .. }) =
+                classify_transaction_call(inner, source, var_types, project, uses)
+        {
+            return true;
         }
     }
     false
@@ -277,10 +275,8 @@ fn collect_protected_ranges_recursive(node: Node, out: &mut Vec<Range<usize>>) {
             match child.kind() {
                 K::K_EXCEPT | K::K_FINALLY => {
                     // Flush any previous section that didn't find its end yet
-                    if in_section {
-                        if let (Some(start), Some(end)) = (section_start, end_byte) {
-                            out.push(start..end);
-                        }
+                    if in_section && let (Some(start), Some(end)) = (section_start, end_byte) {
+                        out.push(start..end);
                     }
                     section_start = Some(child.start_byte());
                     in_section = true;
@@ -364,44 +360,43 @@ fn collect_ops_recursive(
     }
 
     // Check for `if guardVar then` — children on the then-branch are guarded
-    if node.kind() == K::IF_ELSE || node.kind() == K::IF {
-        if let Some(cond) = node
+    if (node.kind() == K::IF_ELSE || node.kind() == K::IF)
+        && let Some(cond) = node
             .child_by_field_name("cond")
             .or_else(|| node.child_by_field_name("condition"))
-        {
-            let cond_is_guard = condition_is_guard(
-                cond,
-                ctx.source,
-                ctx.guards,
-                ctx.var_types,
-                ctx.project,
-                ctx.uses,
-            );
+    {
+        let cond_is_guard = condition_is_guard(
+            cond,
+            ctx.source,
+            ctx.guards,
+            ctx.var_types,
+            ctx.project,
+            ctx.uses,
+        );
 
-            let mut cursor = node.walk();
-            let mut saw_cond = false;
-            let mut in_then = false;
-            for child in node.children(&mut cursor) {
-                if child.id() == cond.id() {
-                    saw_cond = true;
-                    continue;
-                }
-                if saw_cond && child.kind() == K::K_THEN {
-                    in_then = true;
-                    continue;
-                }
-                if child.kind() == K::K_ELSE {
-                    in_then = false;
-                }
-                let child_guarded = if cond_is_guard && in_then {
-                    true
-                } else {
-                    is_guarded
-                };
-                collect_ops_recursive(child, child_guarded, ctx, out);
+        let mut cursor = node.walk();
+        let mut saw_cond = false;
+        let mut in_then = false;
+        for child in node.children(&mut cursor) {
+            if child.id() == cond.id() {
+                saw_cond = true;
+                continue;
             }
-            return;
+            if saw_cond && child.kind() == K::K_THEN {
+                in_then = true;
+                continue;
+            }
+            if child.kind() == K::K_ELSE {
+                in_then = false;
+            }
+            let child_guarded = if cond_is_guard && in_then {
+                true
+            } else {
+                is_guarded
+            };
+            collect_ops_recursive(child, child_guarded, ctx, out);
         }
+        return;
     }
 
     // Default: recurse into children
@@ -659,12 +654,11 @@ fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
 /// Find defProc nodes in the AST and match them to CFGs by proc_name.
 fn find_proc_node_for_cfg<'a>(tree: &'a Tree, source: &[u8], cfg: &Cfg) -> Option<Node<'a>> {
     fn walk<'a>(node: Node<'a>, source: &[u8], target_name: &str) -> Option<Node<'a>> {
-        if node.kind() == K::DEF_PROC {
-            if let Some(name) = extract_defproc_name(node, source) {
-                if name.eq_ignore_ascii_case(target_name) {
-                    return Some(node);
-                }
-            }
+        if node.kind() == K::DEF_PROC
+            && let Some(name) = extract_defproc_name(node, source)
+            && name.eq_ignore_ascii_case(target_name)
+        {
+            return Some(node);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {

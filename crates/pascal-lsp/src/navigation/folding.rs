@@ -327,21 +327,21 @@ fn collect_region_candidates(
                 start: directive.start,
                 end: directive.end,
             });
-        } else if keyword.eq_ignore_ascii_case("endregion") {
-            if let Some(open) = open_regions.pop() {
-                push_candidate(
-                    candidates,
-                    Candidate {
-                        span: Span {
-                            start: open.start,
-                            end: directive.end,
-                        },
-                        category: CandidateCategory::Region,
-                        source_order: *source_order,
+        } else if keyword.eq_ignore_ascii_case("endregion")
+            && let Some(open) = open_regions.pop()
+        {
+            push_candidate(
+                candidates,
+                Candidate {
+                    span: Span {
+                        start: open.start,
+                        end: directive.end,
                     },
-                )?;
-                *source_order = source_order.saturating_add(1);
-            }
+                    category: CandidateCategory::Region,
+                    source_order: *source_order,
+                },
+            )?;
+            *source_order = source_order.saturating_add(1);
         }
     }
     Ok(())
@@ -360,14 +360,13 @@ fn visible_ranges(
         if !safe_span(document, candidate.span) {
             continue;
         }
-        if let Some(mask) = options.kind_value_set {
-            if candidate
+        if let Some(mask) = options.kind_value_set
+            && candidate
                 .category
                 .kind_bit()
                 .is_some_and(|kind| mask & kind == 0)
-            {
-                continue;
-            }
+        {
+            continue;
         }
         let Some(start) = positions.offset_to_position(&document.source, candidate.span.start)
         else {
@@ -438,10 +437,7 @@ fn reconcile_ranges(
 
         let current_end = range_end(&current.range);
         let mut keep_current = true;
-        loop {
-            let Some(&parent_index) = active.last() else {
-                break;
-            };
+        while let Some(&parent_index) = active.last() {
             let parent_end = {
                 let parent = retained[parent_index]
                     .as_ref()

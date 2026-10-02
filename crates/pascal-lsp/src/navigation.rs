@@ -1063,12 +1063,12 @@ impl NavigationIndex {
 
     /// Remove a document and all symbols contributed by it.
     pub fn remove(&mut self, uri: &Url) {
-        if self.compiled_unit_uris.remove(uri) {
-            if let Some(document) = self.documents.get(uri) {
-                self.compiled_unit_bytes = self
-                    .compiled_unit_bytes
-                    .saturating_sub(document.source.len());
-            }
+        if self.compiled_unit_uris.remove(uri)
+            && let Some(document) = self.documents.get(uri)
+        {
+            self.compiled_unit_bytes = self
+                .compiled_unit_bytes
+                .saturating_sub(document.source.len());
         }
         if let Some(document) = self.documents.remove(uri) {
             self.remove_uri_from_unit(&document.unit_name, uri);
@@ -3342,19 +3342,16 @@ impl NavigationIndex {
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Option<TypeInstance>, String> {
-        if let Some(document) = self.documents.get(owner_uri) {
-            if document
+        if let Some(document) = self.documents.get(owner_uri)
+            && document
                 .type_symbol_indices
                 .get("tobject")
                 .is_some_and(|indices| !indices.is_empty())
-            {
-                if !self
-                    .contract_document_complete_with_budget(owner_uri, ancestry, cancel, budget)?
-                {
-                    return Ok(None);
-                }
-                return self.validated_tobject_instance_in_document(owner_uri, cancel, budget);
+        {
+            if !self.contract_document_complete_with_budget(owner_uri, ancestry, cancel, budget)? {
+                return Ok(None);
             }
+            return self.validated_tobject_instance_in_document(owner_uri, cancel, budget);
         }
         let Some(urls) = self.units.get("system") else {
             // A standalone source file may use Delphi's compiler-provided
@@ -6635,11 +6632,11 @@ impl NavigationIndex {
         offset: usize,
         _cancel: Option<&AtomicBool>,
     ) -> Option<Span> {
-        if let Some(module_name) = enclosing_module_name(identifier) {
-            if is_unit_declaration_module(module_name) || has_ancestor_kind(module_name, "declUses")
-            {
-                return Some(Span::from_node(module_name));
-            }
+        if let Some(module_name) = enclosing_module_name(identifier)
+            && (is_unit_declaration_module(module_name)
+                || has_ancestor_kind(module_name, "declUses"))
+        {
+            return Some(Span::from_node(module_name));
         }
 
         let (path_node, parts, cursor_index) = qualified_path_at(identifier, &document.source)?;
@@ -6696,41 +6693,38 @@ impl NavigationIndex {
                 }
             } else if matches!(node.kind(), "exprDot" | "genericDot" | "typerefDot")
                 && !is_nested_qualified_identifier_node(node)
-            {
-                if let Some(parts) =
+                && let Some(parts) =
                     qualified_name_parts_with_budget(node, &document.source, cancel, budget)?
                         .filter(|parts| parts.len() > 1)
+                && let Some((prefix_len, _)) = self.longest_visible_unit_prefix_with_budget(
+                    uri,
+                    document,
+                    node.start_byte(),
+                    &parts,
+                    cancel,
+                    budget,
+                )?
+            {
+                let identifiers = identifier_nodes_with_budget(node, cancel, budget)?;
+                if prefix_len <= identifiers.len()
+                    && let (Some(first), Some(last)) = (
+                        identifiers.first(),
+                        identifiers.get(prefix_len.saturating_sub(1)),
+                    )
                 {
-                    if let Some((prefix_len, _)) = self.longest_visible_unit_prefix_with_budget(
-                        uri,
-                        document,
-                        node.start_byte(),
-                        &parts,
+                    let span = Span {
+                        start: first.start_byte(),
+                        end: last.end_byte(),
+                    };
+                    budget.require_bytes(
+                        prefix_len.saturating_mul(std::mem::size_of::<(Span, Span)>()),
                         cancel,
-                        budget,
-                    )? {
-                        let identifiers = identifier_nodes_with_budget(node, cancel, budget)?;
-                        if prefix_len <= identifiers.len() {
-                            if let (Some(first), Some(last)) = (
-                                identifiers.first(),
-                                identifiers.get(prefix_len.saturating_sub(1)),
-                            ) {
-                                let span = Span {
-                                    start: first.start_byte(),
-                                    end: last.end_byte(),
-                                };
-                                budget.require_bytes(
-                                    prefix_len.saturating_mul(std::mem::size_of::<(Span, Span)>()),
-                                    cancel,
-                                )?;
-                                for identifier in identifiers.into_iter().take(prefix_len) {
-                                    #[cfg(test)]
-                                    test_record_unit_path_nodes(1, cancel);
-                                    check_navigation_cancel(cancel)?;
-                                    spans.insert(Span::from_node(identifier), span);
-                                }
-                            }
-                        }
+                    )?;
+                    for identifier in identifiers.into_iter().take(prefix_len) {
+                        #[cfg(test)]
+                        test_record_unit_path_nodes(1, cancel);
+                        check_navigation_cancel(cancel)?;
+                        spans.insert(Span::from_node(identifier), span);
                     }
                 }
             }
@@ -6914,17 +6908,16 @@ impl NavigationIndex {
                 continue;
             };
             if symbol.kind == SymbolKind::Routine {
-                if let Some(routine_key) = &symbol.routine_key {
-                    if let Some(candidate_indices) =
+                if let Some(routine_key) = &symbol.routine_key
+                    && let Some(candidate_indices) =
                         document.routine_symbol_indices.get(routine_key)
-                    {
-                        for candidate_index in candidate_indices {
-                            check_navigation_cancel(cancel)?;
-                            references.push(Candidate {
-                                uri: uri.clone(),
-                                index: *candidate_index,
-                            });
-                        }
+                {
+                    for candidate_index in candidate_indices {
+                        check_navigation_cancel(cancel)?;
+                        references.push(Candidate {
+                            uri: uri.clone(),
+                            index: *candidate_index,
+                        });
                     }
                 }
             } else {
@@ -7894,10 +7887,9 @@ impl NavigationIndex {
                     .generic_parameters
                     .iter()
                     .any(|parameter| parameter.name == key)
+                && let Some(routine_key) = symbol.routine_key.as_ref()
             {
-                if let Some(routine_key) = symbol.routine_key.as_ref() {
-                    routine_keys.insert(routine_key.clone());
-                }
+                routine_keys.insert(routine_key.clone());
             }
         }
         if routine_keys.is_empty() {
@@ -9156,10 +9148,10 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
-        if receivers.is_empty() {
-            if let Some(builtin) = overload::builtin_type(&parts.join(".")) {
-                return Ok(vec![Receiver::Builtin(builtin)]);
-            }
+        if receivers.is_empty()
+            && let Some(builtin) = overload::builtin_type(&parts.join("."))
+        {
+            return Ok(vec![Receiver::Builtin(builtin)]);
         }
         Ok(receivers)
     }
@@ -9798,10 +9790,10 @@ impl NavigationIndex {
             cancel,
             budget,
         )?;
-        if receivers.is_empty() {
-            if let Some(builtin) = overload::builtin_type(path) {
-                return Ok(vec![Receiver::Builtin(builtin)]);
-            }
+        if receivers.is_empty()
+            && let Some(builtin) = overload::builtin_type(path)
+        {
+            return Ok(vec![Receiver::Builtin(builtin)]);
         }
         Ok(receivers)
     }
@@ -9859,10 +9851,10 @@ impl NavigationIndex {
             cancel,
         )?;
         budget.require_bytes(type_ref.display().len(), cancel)?;
-        if type_ref.path.len() == 1 {
-            if let Some(resolved) = substitution.get(&type_ref.path[0]) {
-                return Ok(resolved.clone().into_receiver().into_iter().collect());
-            }
+        if type_ref.path.len() == 1
+            && let Some(resolved) = substitution.get(&type_ref.path[0])
+        {
+            return Ok(resolved.clone().into_receiver().into_iter().collect());
         }
         let bases = self.type_receivers_for_parts_with_budget(
             current_uri,
@@ -9928,10 +9920,11 @@ impl NavigationIndex {
             }
             result.push(Receiver::Type(instance));
         }
-        if result.is_empty() && type_ref.args.is_empty() {
-            if let Some(builtin) = overload::builtin_type(&type_ref.display()) {
-                result.push(Receiver::Builtin(builtin));
-            }
+        if result.is_empty()
+            && type_ref.args.is_empty()
+            && let Some(builtin) = overload::builtin_type(&type_ref.display())
+        {
+            result.push(Receiver::Builtin(builtin));
         }
         Ok(result)
     }
@@ -10027,10 +10020,10 @@ impl NavigationIndex {
         substitution: &GenericSubstitution,
         state: &mut ResolutionState,
     ) -> Vec<Receiver> {
-        if type_ref.path.len() == 1 {
-            if let Some(resolved) = substitution.get(&type_ref.path[0]) {
-                return resolved.clone().into_receiver().into_iter().collect();
-            }
+        if type_ref.path.len() == 1
+            && let Some(resolved) = substitution.get(&type_ref.path[0])
+        {
+            return resolved.clone().into_receiver().into_iter().collect();
         }
         let bases = self.type_receivers_for_parts(
             current_uri,
@@ -10086,10 +10079,11 @@ impl NavigationIndex {
             }
             result.push(Receiver::Type(instance));
         }
-        if result.is_empty() && type_ref.args.is_empty() {
-            if let Some(builtin) = overload::builtin_type(&type_ref.display()) {
-                result.push(Receiver::Builtin(builtin));
-            }
+        if result.is_empty()
+            && type_ref.args.is_empty()
+            && let Some(builtin) = overload::builtin_type(&type_ref.display())
+        {
+            result.push(Receiver::Builtin(builtin));
         }
         result
     }
@@ -10224,10 +10218,10 @@ impl NavigationIndex {
                 let Some(symbol) = self.symbol(&candidate) else {
                     continue;
                 };
-                if symbol.kind == SymbolKind::Type {
-                    if let Some(receiver) = self.type_receiver_for_candidate(&candidate) {
-                        result.push(receiver);
-                    }
+                if symbol.kind == SymbolKind::Type
+                    && let Some(receiver) = self.type_receiver_for_candidate(&candidate)
+                {
+                    result.push(receiver);
                 }
             }
             return Ok(result);
@@ -10483,21 +10477,21 @@ impl NavigationIndex {
         let Some(symbol) = self.symbol(candidate) else {
             return Ok(None);
         };
-        if owner_instances.is_empty() {
-            if let Some(substitutions) = state.with_member_substitutions.get(&(
+        if owner_instances.is_empty()
+            && let Some(substitutions) = state.with_member_substitutions.get(&(
                 current_uri.clone(),
                 offset,
                 candidate.clone(),
-            )) {
-                if substitutions.len() != 1 {
-                    return Ok(None);
-                }
-                let mut result = substitutions[0].clone();
-                for parameter in &symbol.generic_parameters {
-                    result.remove(&parameter.name);
-                }
-                return Ok(Some(result));
+            ))
+        {
+            if substitutions.len() != 1 {
+                return Ok(None);
             }
+            let mut result = substitutions[0].clone();
+            for parameter in &symbol.generic_parameters {
+                result.remove(&parameter.name);
+            }
+            return Ok(Some(result));
         }
         let Some(owner_key) = symbol.owner_type.as_deref() else {
             let mut result = fallback.clone();
@@ -10920,10 +10914,10 @@ impl NavigationIndex {
             scope_override,
             state,
         );
-        if receivers.is_empty() {
-            if let Some(builtin) = overload::builtin_type(path) {
-                return vec![Receiver::Builtin(builtin)];
-            }
+        if receivers.is_empty()
+            && let Some(builtin) = overload::builtin_type(path)
+        {
+            return vec![Receiver::Builtin(builtin)];
         }
         receivers
     }
@@ -12169,19 +12163,17 @@ impl NavigationIndex {
             substitution: substitution.clone(),
             helper_owner: None,
         };
-        if let Some(document) = self.documents.get(uri) {
-            if let Some(indices) = document.type_symbol_indices.get(key) {
-                if indices.len() == 1 {
-                    if let Some(symbol) = document.symbols.get(indices[0]) {
-                        instance.parameter_names = symbol
-                            .generic_parameters
-                            .iter()
-                            .map(|parameter| parameter.name.clone())
-                            .collect();
-                        instance.kind = symbol.type_kind;
-                    }
-                }
-            }
+        if let Some(document) = self.documents.get(uri)
+            && let Some(indices) = document.type_symbol_indices.get(key)
+            && indices.len() == 1
+            && let Some(symbol) = document.symbols.get(indices[0])
+        {
+            instance.parameter_names = symbol
+                .generic_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect();
+            instance.kind = symbol.type_kind;
         }
         instance
     }
@@ -13513,10 +13505,10 @@ impl NavigationIndex {
             }
             if ambiguous {
                 ambiguous_names.insert(key);
-            } else if !ambiguous_names.contains(&key) {
-                if let Some(selected) = selected {
-                    result.extend(selected);
-                }
+            } else if !ambiguous_names.contains(&key)
+                && let Some(selected) = selected
+            {
+                result.extend(selected);
             }
         }
         if ambiguous_names.is_empty() {
@@ -14240,6 +14232,7 @@ struct HelperOwner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 enum ResolvedType {
     Builtin(BuiltinType),
     IntegerLiteral(i128),
@@ -14343,20 +14336,20 @@ impl SourceIntervalIndex {
         let mut event_index = 0;
         while event_index < events.len() {
             let offset = events[event_index].0;
-            if previous < offset {
-                if let Some(&active_index) = active.last() {
-                    let value = intervals[active_index].value;
-                    match ranges.last_mut() {
-                        Some(last) if last.end == previous && last.value == value => {
-                            last.end = offset;
-                        }
-                        _ => {
-                            ranges.push(IndexedInterval {
-                                start: previous,
-                                end: offset,
-                                value,
-                            });
-                        }
+            if previous < offset
+                && let Some(&active_index) = active.last()
+            {
+                let value = intervals[active_index].value;
+                match ranges.last_mut() {
+                    Some(last) if last.end == previous && last.value == value => {
+                        last.end = offset;
+                    }
+                    _ => {
+                        ranges.push(IndexedInterval {
+                            start: previous,
+                            end: offset,
+                            value,
+                        });
                     }
                 }
             }
@@ -14786,6 +14779,7 @@ impl ContractTypeResolution {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum ContractParentResolution {
     Resolved(Option<TypeInstance>),
     Unknown,
@@ -15086,6 +15080,7 @@ enum HelperSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 enum OwnerHelperLookup {
     None,
     Selected(TypeInstance),
@@ -15990,19 +15985,18 @@ impl Document {
         cancel: &AtomicBool,
         previous: Option<Arc<ParsedDocument>>,
     ) -> Result<Self, String> {
-        if let Some(previous) = previous.as_ref() {
-            if previous.source.as_ref() == source.as_str()
-                && previous.conditional_context == *context
-            {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("request cancelled".to_string());
-                }
-                return Ok(Self {
-                    parsed: previous.clone(),
-                    import_bindings: None,
-                    import_binding_fingerprint: None,
-                });
+        if let Some(previous) = previous.as_ref()
+            && previous.source.as_ref() == source.as_str()
+            && previous.conditional_context == *context
+        {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("request cancelled".to_string());
             }
+            return Ok(Self {
+                parsed: previous.clone(),
+                import_bindings: None,
+                import_binding_fingerprint: None,
+            });
         }
         #[cfg(test)]
         TEST_DOCUMENT_PARSE_CALLS.with(|value| value.set(value.get().saturating_add(1)));
@@ -16321,13 +16315,12 @@ impl Document {
                 if symbol.kind == SymbolKind::Routine
                     && symbol.origin == Origin::Declaration
                     && symbol.region == Region::Interface
+                    && let Some(routine_key) = &symbol.routine_key
                 {
-                    if let Some(routine_key) = &symbol.routine_key {
-                        interface_member_routine_keys
-                            .entry(owner_type.clone())
-                            .or_default()
-                            .insert(routine_key.clone());
-                    }
+                    interface_member_routine_keys
+                        .entry(owner_type.clone())
+                        .or_default()
+                        .insert(routine_key.clone());
                 }
             }
             if symbol.kind == SymbolKind::Type
@@ -16761,10 +16754,10 @@ fn inherit_member_routine_visibility(symbols: &mut [Symbol]) {
             && symbol.origin == Origin::Definition
             && symbol.owner_type.is_some()
     }) {
-        if let Some(routine_key) = &symbol.routine_key {
-            if let Some(visibility) = declarations.get(routine_key) {
-                symbol.visibility = *visibility;
-            }
+        if let Some(routine_key) = &symbol.routine_key
+            && let Some(visibility) = declarations.get(routine_key)
+        {
+            symbol.visibility = *visibility;
         }
     }
 }
@@ -17170,13 +17163,14 @@ fn pair_abbreviated_definitions(
 
     let mut declarations_by_routine_key: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, symbol) in symbols.iter().enumerate() {
-        if symbol.kind == SymbolKind::Routine && symbol.origin == Origin::Declaration {
-            if let Some(routine_key) = symbol.routine_key.as_ref() {
-                declarations_by_routine_key
-                    .entry(routine_key.clone())
-                    .or_default()
-                    .push(index);
-            }
+        if symbol.kind == SymbolKind::Routine
+            && symbol.origin == Origin::Declaration
+            && let Some(routine_key) = symbol.routine_key.as_ref()
+        {
+            declarations_by_routine_key
+                .entry(routine_key.clone())
+                .or_default()
+                .push(index);
         }
     }
     let definition_indices: Vec<usize> = symbols
@@ -17930,23 +17924,22 @@ fn helper_type_pattern_matches(
     generic_parameters: &[GenericParameter],
     bindings: &mut GenericSubstitution,
 ) -> bool {
-    if let ResolvedType::Named(instance) = pattern {
-        if instance.uri == *helper_uri
-            && instance.kind == TypeKind::Other
-            && instance.parameter_names.is_empty()
-            && instance.substitution.0.is_empty()
-            && generic_parameters
-                .iter()
-                .any(|parameter| parameter.name == instance.key)
-        {
-            return match bindings.get(&instance.key) {
-                Some(bound) => bound == actual,
-                None => {
-                    bindings.insert(&instance.key, actual.clone());
-                    true
-                }
-            };
-        }
+    if let ResolvedType::Named(instance) = pattern
+        && instance.uri == *helper_uri
+        && instance.kind == TypeKind::Other
+        && instance.parameter_names.is_empty()
+        && instance.substitution.0.is_empty()
+        && generic_parameters
+            .iter()
+            .any(|parameter| parameter.name == instance.key)
+    {
+        return match bindings.get(&instance.key) {
+            Some(bound) => bound == actual,
+            None => {
+                bindings.insert(&instance.key, actual.clone());
+                true
+            }
+        };
     }
 
     match (pattern, actual) {
@@ -18472,8 +18465,7 @@ fn type_shape_from_node(node: Node<'_>, source: &str) -> Option<TypeShape> {
                 .any(|child| child.kind() == "range");
             let element = (0..type_node.named_child_count())
                 .filter_map(|index| type_node.named_child(index))
-                .filter(|child| child.kind() == "type")
-                .next_back()
+                .rfind(|child| child.kind() == "type")
                 .and_then(|element| type_shape_from_node(element, source))?;
             Some(TypeShape::Array {
                 element: Box::new(element),
@@ -18983,10 +18975,9 @@ fn conditional_unknown_symbols(
         if matches!(
             node.kind(),
             "declVar" | "varDef" | "varAssignDef" | "declArg" | "declField" | "declProp"
-        ) {
-            if let Some(type_node) = node.child_by_field_name("type") {
-                declaration_type_spans.insert(Span::from_node(node), Span::from_node(type_node));
-            }
+        ) && let Some(type_node) = node.child_by_field_name("type")
+        {
+            declaration_type_spans.insert(Span::from_node(node), Span::from_node(type_node));
         }
     });
 
@@ -20526,11 +20517,11 @@ fn method_implementation_insertion_offset(
             if !budget.take_work(1, cancel)? {
                 return Ok(None);
             }
-            if let Some(child) = root.named_child(index) {
-                if child.kind() == "unit" {
-                    unit = Some(child);
-                    break;
-                }
+            if let Some(child) = root.named_child(index)
+                && child.kind() == "unit"
+            {
+                unit = Some(child);
+                break;
             }
         }
         let Some(unit) = unit else {
@@ -20681,25 +20672,25 @@ fn append_specialized_routine_replacements(
         }
     }
     if let (Some(span), Some(type_ref)) = (symbol.result_type_span, symbol.result_type_ref.as_ref())
+        && span.start >= header_start
+        && span.end <= header_end
     {
-        if span.start >= header_start && span.end <= header_end {
-            match assistance::specialized_type_text(
-                index,
-                symbol,
-                source,
-                Some(source_uri),
-                Some(destination_uri),
-                Some(type_ref),
-                substitution,
-                cancel,
-                budget,
-            )? {
-                assistance::SpecializedTypeText::Unchanged => {}
-                assistance::SpecializedTypeText::Replaced(text) => {
-                    replacements.push((span.start, span.end, text));
-                }
-                assistance::SpecializedTypeText::Unsupported => return Ok(false),
+        match assistance::specialized_type_text(
+            index,
+            symbol,
+            source,
+            Some(source_uri),
+            Some(destination_uri),
+            Some(type_ref),
+            substitution,
+            cancel,
+            budget,
+        )? {
+            assistance::SpecializedTypeText::Unchanged => {}
+            assistance::SpecializedTypeText::Replaced(text) => {
+                replacements.push((span.start, span.end, text));
             }
+            assistance::SpecializedTypeText::Unsupported => return Ok(false),
         }
     }
     let _ = source;

@@ -55,14 +55,12 @@ pub(crate) fn relocate_environment(
         if configured.properties.contains_key(name) {
             continue;
         }
-        if is_windows_absolute(value) {
-            if let Ok(resolved) =
+        if is_windows_absolute(value)
+            && let Ok(resolved) =
                 resolve_path_with_inferred(configured, &inferred_mappings, value, Path::new("/"))
-            {
-                if !resolved.path.as_os_str().is_empty() {
-                    properties.insert(name.clone(), resolved.path.to_string_lossy().into_owned());
-                }
-            }
+            && !resolved.path.as_os_str().is_empty()
+        {
+            properties.insert(name.clone(), resolved.path.to_string_lossy().into_owned());
         }
     }
     // Explicit profile properties are authoritative and remain a separate tier

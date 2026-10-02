@@ -247,20 +247,20 @@ fn resolve_and_emit(
     // Step 1: Check local rename (innermost matching enclosing procedure).
     // A rename keyed to (rps, rpe) applies if this proc context is contained
     // within that range. Prefer the smallest (innermost) containing range.
-    if let Some(ctx) = proc_ctx {
-        if let Some(new_name) = ctx.local_renames.get(&lower) {
-            if text != *new_name {
-                push_text_edit(
-                    edits,
-                    node.start_byte(),
-                    node.end_byte(),
-                    new_name,
-                    budget,
-                    cancel,
-                )?;
-            }
-            return Ok(()); // local rename found — don't fall through
+    if let Some(ctx) = proc_ctx
+        && let Some(new_name) = ctx.local_renames.get(&lower)
+    {
+        if text != *new_name {
+            push_text_edit(
+                edits,
+                node.start_byte(),
+                node.end_byte(),
+                new_name,
+                budget,
+                cancel,
+            )?;
         }
+        return Ok(()); // local rename found — don't fall through
     }
 
     // Step 2: Check file-scoped rename
@@ -296,17 +296,17 @@ fn resolve_and_emit(
         })
         .or_else(|| scopes.file.get(&lower));
 
-    if let Some(declared_name) = declared {
-        if text != *declared_name {
-            push_text_edit(
-                edits,
-                node.start_byte(),
-                node.end_byte(),
-                declared_name,
-                budget,
-                cancel,
-            )?;
-        }
+    if let Some(declared_name) = declared
+        && text != *declared_name
+    {
+        push_text_edit(
+            edits,
+            node.start_byte(),
+            node.end_byte(),
+            declared_name,
+            budget,
+            cancel,
+        )?;
     }
     Ok(())
 }
@@ -349,8 +349,8 @@ fn charge_string_usize_map_clone(
     charge_owned_budget(
         budget,
         cancel,
-        map.iter()
-            .map(|(key, _)| key.len())
+        map.keys()
+            .map(|key| key.len())
             .sum::<usize>()
             .saturating_add(map.len().saturating_mul(std::mem::size_of::<usize>())),
     )
@@ -457,7 +457,7 @@ pub(crate) fn apply_edits(
     }
 
     // Sort descending by start_byte for bottom-up application
-    edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start_byte));
 
     // Validate no overlapping edits
     for window in edits.windows(2) {

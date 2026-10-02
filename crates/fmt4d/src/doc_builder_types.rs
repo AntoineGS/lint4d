@@ -140,10 +140,10 @@ impl<'a> DocBuilder<'a> {
 
         for child in body_children {
             if child.kind() == K::DECL_SECTION || child.kind() == K::PP_DECL_SECTION {
-                if let Some(prev_end) = prev_body_end_row {
-                    if self.has_blank_line_between(prev_end, child.start_position().row) {
-                        body_parts.push(Doc::BlankLine);
-                    }
+                if let Some(prev_end) = prev_body_end_row
+                    && self.has_blank_line_between(prev_end, child.start_position().row)
+                {
+                    body_parts.push(Doc::BlankLine);
                 }
                 body_parts.push(self.doc_for_node(*child));
                 prev_body_kind = child.kind();

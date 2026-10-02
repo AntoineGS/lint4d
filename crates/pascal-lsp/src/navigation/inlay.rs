@@ -329,11 +329,11 @@ fn exclusion_spans(document: &Document, cancel: &AtomicBool) -> Result<Vec<Span>
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
     for span in spans {
         check_cancel(cancel)?;
-        if let Some(previous) = merged.last_mut() {
-            if span.start <= previous.end {
-                previous.end = previous.end.max(span.end);
-                continue;
-            }
+        if let Some(previous) = merged.last_mut()
+            && span.start <= previous.end
+        {
+            previous.end = previous.end.max(span.end);
+            continue;
         }
         merged.push(span);
     }

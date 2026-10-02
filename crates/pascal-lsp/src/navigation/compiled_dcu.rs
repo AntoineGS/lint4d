@@ -440,16 +440,18 @@ pub fn discover_compiled_units(
                             source_exists = true;
                         }
                     }
-                    Some(extension) if extension.eq_ignore_ascii_case("dcu") => {
-                        if context
-                            .read_policy
-                            .entry_for_path(&path)
-                            .is_some_and(|entry| context.read_policy.allows_location(&entry))
-                        {
-                            candidates.push(path);
-                            if candidates.len() > 1 {
-                                break;
-                            }
+                    Some(extension)
+                        if extension.eq_ignore_ascii_case("dcu")
+                            && context
+                                .read_policy
+                                .entry_for_path(&path)
+                                .is_some_and(|entry| {
+                                    context.read_policy.allows_location(&entry)
+                                }) =>
+                    {
+                        candidates.push(path);
+                        if candidates.len() > 1 {
+                            break;
                         }
                     }
                     _ => {}

@@ -41,10 +41,10 @@ fn statement_is_direct_inherited(node: Node) -> bool {
     let first_child = node
         .children(&mut cursor)
         .find(|c| c.is_named() && !c.is_extra());
-    if let Some(child) = first_child {
-        if child.kind() == K::INHERITED {
-            return true;
-        }
+    if let Some(child) = first_child
+        && child.kind() == K::INHERITED
+    {
+        return true;
     }
     false
 }

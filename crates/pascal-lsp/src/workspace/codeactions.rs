@@ -3369,21 +3369,20 @@ fn organize_clause_edits(
             .saturating_add(provider.uri.as_str().len());
         budget.require_bytes(key_bytes.saturating_mul(2), cancel)?;
         let key = (entry.path.clone(), provider.uri.clone());
-        if let Some(previous_index) = seen.get(&key).copied() {
-            if dedup_context_safe
-                && duplicate_occurrence_is_safe(
-                    clause,
-                    navigation_index,
-                    target_uri,
-                    &clause.entries[previous_index],
-                    entry,
-                    provider.as_ref(),
-                    cancel,
-                    budget,
-                )?
-            {
-                removed.insert(entry_index);
-            }
+        if let Some(previous_index) = seen.get(&key).copied()
+            && dedup_context_safe
+            && duplicate_occurrence_is_safe(
+                clause,
+                navigation_index,
+                target_uri,
+                &clause.entries[previous_index],
+                entry,
+                provider.as_ref(),
+                cancel,
+                budget,
+            )?
+        {
+            removed.insert(entry_index);
         }
         seen.insert(key, entry_index);
     }
@@ -5601,35 +5600,37 @@ fn naming_candidates_bounded(
         context,
     };
     let mut candidates = Vec::new();
-    if rules.contains(&CONSTANT_RULE) && !rule_is_off(config, CONSTANT_RULE) {
-        if let Err(error) = collect_constants_bounded(
+    if rules.contains(&CONSTANT_RULE)
+        && !rule_is_off(config, CONSTANT_RULE)
+        && let Err(error) = collect_constants_bounded(
             tree.root_node(),
             config.constant_style(),
             &request,
             &mut candidates,
             budget,
             cancel,
-        ) {
-            if error == FIX_ALL_CANDIDATE_LIMIT {
-                return Ok(None);
-            }
-            return Err(error);
+        )
+    {
+        if error == FIX_ALL_CANDIDATE_LIMIT {
+            return Ok(None);
         }
+        return Err(error);
     }
-    if rules.contains(&LOCAL_RULE) && !rule_is_off(config, LOCAL_RULE) {
-        if let Err(error) = collect_locals_bounded(
+    if rules.contains(&LOCAL_RULE)
+        && !rule_is_off(config, LOCAL_RULE)
+        && let Err(error) = collect_locals_bounded(
             tree.root_node(),
             config.local_variable_style(),
             &request,
             &mut candidates,
             budget,
             cancel,
-        ) {
-            if error == FIX_ALL_CANDIDATE_LIMIT {
-                return Ok(None);
-            }
-            return Err(error);
+        )
+    {
+        if error == FIX_ALL_CANDIDATE_LIMIT {
+            return Ok(None);
         }
+        return Err(error);
     }
     if candidates.len() > MAX_FIX_ALL_CANDIDATES {
         return Ok(None);

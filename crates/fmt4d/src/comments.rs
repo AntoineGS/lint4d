@@ -44,20 +44,20 @@ impl CommentMap {
 
             // Check if there is a non-comment token on the same line before
             // the comment — that makes it a trailing comment.
-            if let Some(prev) = find_prev_leaf_in(&leaves, *comment_node) {
-                if prev.end_position().row == comment_line {
-                    let gap = comment_node.start_byte().saturating_sub(prev.end_byte());
-                    trailing
-                        .entry(prev.id())
-                        .or_default()
-                        .push(AttachedComment {
-                            text: text.clone(),
-                            trailing: true,
-                            source_row: comment_line,
-                            gap,
-                        });
-                    continue;
-                }
+            if let Some(prev) = find_prev_leaf_in(&leaves, *comment_node)
+                && prev.end_position().row == comment_line
+            {
+                let gap = comment_node.start_byte().saturating_sub(prev.end_byte());
+                trailing
+                    .entry(prev.id())
+                    .or_default()
+                    .push(AttachedComment {
+                        text: text.clone(),
+                        trailing: true,
+                        source_row: comment_line,
+                        gap,
+                    });
+                continue;
             }
 
             // Otherwise it is a leading comment for the next non-comment node.

@@ -2425,10 +2425,11 @@ fn discover_context_with_selections(
         let requester_has_project_selection = selections
             .keys()
             .any(|scope| project_path_starts_with(&file_path, scope));
-        if options.project_file.is_none() && !requester_has_project_selection {
-            if let Some(project) = configured_project {
-                options.project_file = Some(project);
-            }
+        if options.project_file.is_none()
+            && !requester_has_project_selection
+            && let Some(project) = configured_project
+        {
+            options.project_file = Some(project);
         }
         for source_path in config.source_paths {
             validate_local_config_path(&source_path)?;
@@ -2573,18 +2574,18 @@ fn discover_context_with_selections(
                 deleted_paths,
             )
         };
-    if let ProjectSelection::Selected { path, .. } = &selected_project {
-        if is_deleted_path(path, deleted_paths) {
-            warnings.push(format!(
-                "selected project {} is tombstoned by a delete notification",
-                path.display()
-            ));
-            selected_project = ProjectSelection::Incomplete {
-                metadata_files: vec![path.clone()],
-                metadata_observations: Vec::new(),
-                override_error: None,
-            };
-        }
+    if let ProjectSelection::Selected { path, .. } = &selected_project
+        && is_deleted_path(path, deleted_paths)
+    {
+        warnings.push(format!(
+            "selected project {} is tombstoned by a delete notification",
+            path.display()
+        ));
+        selected_project = ProjectSelection::Incomplete {
+            metadata_files: vec![path.clone()],
+            metadata_observations: Vec::new(),
+            override_error: None,
+        };
     }
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
@@ -2926,14 +2927,13 @@ fn record_candidate_memberships(
                     })
                 }
             });
-        if let Err(error) = &membership {
-            if error == "request cancelled"
+        if let Err(error) = &membership
+            && (error == "request cancelled"
                 || tracker
                     .work_budget
-                    .is_some_and(|budget| budget.is_transient_error(error))
-            {
-                return Err(error.clone());
-            }
+                    .is_some_and(|budget| budget.is_transient_error(error)))
+        {
+            return Err(error.clone());
         }
         tracker.record_candidate_membership(directory.clone(), membership);
         if boundary.is_some_and(|root| paths_equal_ci(&directory, root)) {
@@ -3436,10 +3436,8 @@ fn check_project_scan_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> 
             None => false,
         });
     #[cfg(any(test, feature = "test-support"))]
-    if force_cancel {
-        if let Some(cancel) = cancel {
-            cancel.store(true, Ordering::Relaxed);
-        }
+    if force_cancel && let Some(cancel) = cancel {
+        cancel.store(true, Ordering::Relaxed);
     }
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
         Err("request cancelled".to_string())
@@ -4241,10 +4239,10 @@ fn inspect_source_membership_impl(
             }
         };
         add_metadata_observation(&mut inspection.metadata_observations, observation);
-        if let Some(tracker) = tracker.as_deref_mut() {
-            if let Ok(stamp) = project_read_stamp(source_path) {
-                tracker.record(source_path, stamp, contents.as_bytes());
-            }
+        if let Some(tracker) = tracker.as_deref_mut()
+            && let Ok(stamp) = project_read_stamp(source_path)
+        {
+            tracker.record(source_path, stamp, contents.as_bytes());
         }
         let parsed = parse_unit_membership(&contents);
         if !parsed.exhaustive {
@@ -4413,18 +4411,18 @@ fn build_standalone_context_with_overrides(
         }
     };
     let mut options = options.clone();
-    if override_error.is_none() {
-        if let Some(installation) = containing_installation(file, roots, session) {
-            effective_overrides = merge_effective_overrides(
-                installation.overrides,
-                &effective_overrides,
-                relevant_override_workspace_root(file, roots).as_deref(),
-                file.parent().unwrap_or(file),
-            );
-            if options.conditional_context.compiler_version.is_none() {
-                options.conditional_context.compiler_version =
-                    crate::installations::compiler_version_for_installation(&installation.id);
-            }
+    if override_error.is_none()
+        && let Some(installation) = containing_installation(file, roots, session)
+    {
+        effective_overrides = merge_effective_overrides(
+            installation.overrides,
+            &effective_overrides,
+            relevant_override_workspace_root(file, roots).as_deref(),
+            file.parent().unwrap_or(file),
+        );
+        if options.conditional_context.compiler_version.is_none() {
+            options.conditional_context.compiler_version =
+                crate::installations::compiler_version_for_installation(&installation.id);
         }
     }
     let mut context = build_standalone_context(
@@ -4836,12 +4834,10 @@ fn build_project_context(
                     .conditional_context
                     .compiler_version
                     .is_none()
-                {
-                    if let Some(version) =
+                    && let Some(version) =
                         crate::installations::compiler_version_for_installation(id)
-                    {
-                        evaluation_options.conditional_context.compiler_version = Some(version);
-                    }
+                {
+                    evaluation_options.conditional_context.compiler_version = Some(version);
                 }
             }
             Err(error) => {
@@ -4936,14 +4932,14 @@ fn build_project_context(
         ));
     }
 
-    if let Some(main_source_entry) = &main_source_entry {
-        if !builder.read_policy.allows_entry(main_source_entry) {
-            builder.incomplete = true;
-            builder.warnings.push(format!(
-                "ignored main source outside authorized read roots: {}",
-                main_source_entry.path.display()
-            ));
-        }
+    if let Some(main_source_entry) = &main_source_entry
+        && !builder.read_policy.allows_entry(main_source_entry)
+    {
+        builder.incomplete = true;
+        builder.warnings.push(format!(
+            "ignored main source outside authorized read roots: {}",
+            main_source_entry.path.display()
+        ));
     }
 
     let mut search_path_entries = vec![ProjectPathEntry::legacy(project_dir.clone())];
@@ -5010,8 +5006,8 @@ fn build_project_context(
 
     let mut explicit_units = HashMap::new();
     let mut explicit_unit_entries = HashMap::new();
-    if let Some(main_source) = &main_source_entry {
-        if let Some(observation) = add_explicit_units_from_source(
+    if let Some(main_source) = &main_source_entry
+        && let Some(observation) = add_explicit_units_from_source(
             main_source,
             &mut explicit_units,
             &mut explicit_unit_entries,
@@ -5019,9 +5015,9 @@ fn build_project_context(
             &builder.overrides,
             &builder.read_policy,
             tracker,
-        ) {
-            add_metadata_observation(&mut builder.metadata_observations, observation);
-        }
+        )
+    {
+        add_metadata_observation(&mut builder.metadata_observations, observation);
     }
     for reference in &builder.references {
         check_project_scan_cancel(cancel)?;
@@ -5120,10 +5116,10 @@ fn build_project_context(
     if !metadata_files.iter().any(|path| path == &project_file) {
         metadata_files.push(project_file.clone());
     }
-    if let Some(main_source) = &main_source {
-        if !metadata_files.iter().any(|path| path == main_source) {
-            metadata_files.push(main_source.clone());
-        }
+    if let Some(main_source) = &main_source
+        && !metadata_files.iter().any(|path| path == main_source)
+    {
+        metadata_files.push(main_source.clone());
     }
     for metadata_file in consulted_metadata_files {
         check_project_scan_cancel(cancel)?;
@@ -5364,18 +5360,15 @@ fn build_standalone_context(
     check_project_scan_cancel(cancel)?;
     let read_policy = ReadPolicy::new(roots, &options.source_paths, exclusions, &overrides);
     let mut search_path_entries = Vec::new();
-    if let Some(parent) = file.parent() {
-        if let Some(actual) = resolve_existing_path(parent, &mut warnings, "source directory") {
-            add_unique_project_path_entry(
-                &mut search_path_entries,
-                ProjectPathEntry::legacy(actual),
-            );
-        }
+    if let Some(parent) = file.parent()
+        && let Some(actual) = resolve_existing_path(parent, &mut warnings, "source directory")
+    {
+        add_unique_project_path_entry(&mut search_path_entries, ProjectPathEntry::legacy(actual));
     }
-    if let Some(root) = relevant_workspace_root(file, roots) {
-        if root.is_dir() {
-            add_unique_project_path_entry(&mut search_path_entries, ProjectPathEntry::legacy(root));
-        }
+    if let Some(root) = relevant_workspace_root(file, roots)
+        && root.is_dir()
+    {
+        add_unique_project_path_entry(&mut search_path_entries, ProjectPathEntry::legacy(root));
     }
     let option_base = relevant_workspace_root(file, roots)
         .or_else(|| file.parent().map(Path::to_path_buf))
@@ -6615,13 +6608,13 @@ fn resolve_existing_path_status_with_provenance(
 ) -> ExistingPathStatus {
     let warning_start = warnings.len();
     let status = resolve_existing_path_status(path, warnings, kind);
-    if matches!(status, ExistingPathStatus::Unresolvable) {
-        if let Some(mapping) = resolved.mapping.as_ref() {
-            let provenance = mapping_provenance_suffix(raw, mapping);
-            for warning in warnings.iter_mut().skip(warning_start) {
-                if !warning.ends_with(&provenance) {
-                    warning.push_str(&provenance);
-                }
+    if matches!(status, ExistingPathStatus::Unresolvable)
+        && let Some(mapping) = resolved.mapping.as_ref()
+    {
+        let provenance = mapping_provenance_suffix(raw, mapping);
+        for warning in warnings.iter_mut().skip(warning_start) {
+            if !warning.ends_with(&provenance) {
+                warning.push_str(&provenance);
             }
         }
     }
@@ -8602,20 +8595,20 @@ fn parse_xml_operations(contents: &str, path: &Path) -> Result<Vec<XmlOperation>
                 }
             }
             Event::Text(text) => {
-                if let Some(frame) = frames.last_mut() {
-                    if matches!(frame.kind, FrameKind::Property { .. }) {
-                        let decoded = text.unescape().map_err(|error| {
-                            format!("invalid XML text in {}: {error}", path.display())
-                        })?;
-                        frame.text.push_str(&decoded);
-                    }
+                if let Some(frame) = frames.last_mut()
+                    && matches!(frame.kind, FrameKind::Property { .. })
+                {
+                    let decoded = text.unescape().map_err(|error| {
+                        format!("invalid XML text in {}: {error}", path.display())
+                    })?;
+                    frame.text.push_str(&decoded);
                 }
             }
             Event::CData(text) => {
-                if let Some(frame) = frames.last_mut() {
-                    if matches!(frame.kind, FrameKind::Property { .. }) {
-                        frame.text.push_str(&String::from_utf8_lossy(text.as_ref()));
-                    }
+                if let Some(frame) = frames.last_mut()
+                    && matches!(frame.kind, FrameKind::Property { .. })
+                {
+                    frame.text.push_str(&String::from_utf8_lossy(text.as_ref()));
                 }
             }
             Event::End(_) => {

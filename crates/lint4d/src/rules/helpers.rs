@@ -92,8 +92,8 @@ pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
             if let Some(entity) = node.child_by_field_name("entity") {
                 // Check for FreeAndNil(variable)
                 let entity_text = node_text(entity, source);
-                if entity_text.eq_ignore_ascii_case("freeandnil") {
-                    if let Some(args) = node.child_by_field_name("args") {
+                if entity_text.eq_ignore_ascii_case("freeandnil")
+                    && let Some(args) = node.child_by_field_name("args") {
                         let mut cursor = args.walk();
                         for child in args.children(&mut cursor) {
                             if child.kind() == K::IDENTIFIER {
@@ -104,19 +104,17 @@ pub fn ast_frees_variable(node: Node, source: &[u8], var_name: &str) -> bool {
                             }
                         }
                     }
-                }
                 // Check for variable.Free() / variable.Destroy()
                 if is_free_or_destroy_call(entity, source, var_name) {
                     return true;
                 }
             }
         }
-        K::EXPR_DOT => {
+        K::EXPR_DOT
             // Check for variable.Free / variable.Destroy (statement form without parens)
-            if is_free_or_destroy_call(node, source, var_name) {
+            if is_free_or_destroy_call(node, source, var_name) => {
                 return true;
             }
-        }
         _ => {}
     }
 
@@ -372,11 +370,11 @@ fn collect_ast_class_fields_recursive(
     source: &[u8],
     out: &mut HashMap<String, Vec<String>>,
 ) {
-    if node.kind() == K::DECL_TYPE {
-        if let Some((class_name, fields)) = parse_class_fields(node, source) {
-            out.insert(class_name.to_lowercase(), fields);
-            return;
-        }
+    if node.kind() == K::DECL_TYPE
+        && let Some((class_name, fields)) = parse_class_fields(node, source)
+    {
+        out.insert(class_name.to_lowercase(), fields);
+        return;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -401,10 +399,10 @@ pub fn parse_class_fields(node: Node, source: &[u8]) -> Option<(String, Vec<Stri
     for section in effective_children(decl_class) {
         if section.kind() == K::DECL_SECTION {
             for item in effective_children(section) {
-                if item.kind() == K::DECL_FIELD {
-                    if let Some(id_node) = first_identifier(item) {
-                        fields.push(node_text(id_node, source));
-                    }
+                if item.kind() == K::DECL_FIELD
+                    && let Some(id_node) = first_identifier(item)
+                {
+                    fields.push(node_text(id_node, source));
                 }
             }
         }

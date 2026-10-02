@@ -2210,13 +2210,13 @@ fn callable_types_bind_to_builtins(
         }
     }
     let mut type_nodes = Vec::with_capacity(2);
-    if let Some(args) = callable.child_by_field_name("args") {
-        if let Some(parameter) = args.named_child(0) {
-            let Some(ty) = parameter.child_by_field_name("type") else {
-                return Ok(false);
-            };
-            type_nodes.push(ty);
-        }
+    if let Some(args) = callable.child_by_field_name("args")
+        && let Some(parameter) = args.named_child(0)
+    {
+        let Some(ty) = parameter.child_by_field_name("type") else {
+            return Ok(false);
+        };
+        type_nodes.push(ty);
     }
     if let Some(result) = callable.child_by_field_name("type") {
         type_nodes.push(result);
@@ -2454,7 +2454,8 @@ fn subscript_storage_provenance(
     if element.default_property {
         return (Writability::Unknown, StorageProvenance::Property);
     }
-    let result = match type_identity_kind(base.ty.as_ref()) {
+
+    match type_identity_kind(base.ty.as_ref()) {
         Some(TypeKind::DynamicArray) => match base.storage {
             StorageProvenance::Direct
             | StorageProvenance::Addressed
@@ -2475,8 +2476,7 @@ fn subscript_storage_provenance(
             (Writability::Unknown, StorageProvenance::Unknown)
         }
         _ => (Writability::Unknown, StorageProvenance::Unknown),
-    };
-    result
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3733,19 +3733,16 @@ fn upcast_distance(
             {
                 return Ok(Upcast::No);
             }
-            if uri == expected_uri && key != expected_key {
-                if let Some(expected_document) = index.documents.get(expected_uri) {
-                    if !expected_is_implicit_root
-                        && expected_document
-                            .type_ancestry
-                            .get(expected_key)
-                            .is_some_and(|entries| {
-                                entries.len() == 1 && entries[0].kind == TypeKind::Class
-                            })
-                    {
-                        return Ok(Upcast::No);
-                    }
-                }
+            if uri == expected_uri
+                && key != expected_key
+                && let Some(expected_document) = index.documents.get(expected_uri)
+                && !expected_is_implicit_root
+                && expected_document
+                    .type_ancestry
+                    .get(expected_key)
+                    .is_some_and(|entries| entries.len() == 1 && entries[0].kind == TypeKind::Class)
+            {
+                return Ok(Upcast::No);
             }
             let Some(parent) = implicit_parent else {
                 return Ok(Upcast::Unknown);

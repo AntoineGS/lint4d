@@ -402,10 +402,10 @@ fn try_has_except(node: Node) -> bool {
 
 /// Check if an ERROR node represents a bare `raise;`.
 fn is_bare_raise(node: Node) -> bool {
-    if node.child_count() == 1 {
-        if let Some(child) = node.child(0) {
-            return child.kind() == K::K_RAISE;
-        }
+    if node.child_count() == 1
+        && let Some(child) = node.child(0)
+    {
+        return child.kind() == K::K_RAISE;
     }
     false
 }

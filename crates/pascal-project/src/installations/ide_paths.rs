@@ -903,59 +903,57 @@ pub(crate) fn load_installation(
         "environmentsettings",
         appdata.as_deref(),
         "environment.proj",
+    )? && let Some(contents) = read_installation_file(
+        &path,
+        true,
+        MAX_INSTALLATION_XML_BYTES,
+        policy,
+        tracker,
+        &mut observations,
+        &mut metadata_files,
+        &mut warnings,
     )? {
-        if let Some(contents) = read_installation_file(
-            &path,
-            true,
-            MAX_INSTALLATION_XML_BYTES,
+        let environment_profile = environment_input_profile(profile);
+        let mut builder = installation_builder(
+            &environment_profile,
+            config,
+            platform,
             policy,
+            &path,
+            warnings.clone(),
+        );
+        builder.seed_installation_properties(&imported);
+        match builder.process_installation_file(
+            &contents,
+            &path,
             tracker,
-            &mut observations,
-            &mut metadata_files,
-            &mut warnings,
-        )? {
-            let environment_profile = environment_input_profile(profile);
-            let mut builder = installation_builder(
-                &environment_profile,
-                config,
-                platform,
-                policy,
-                &path,
-                warnings.clone(),
-            );
-            builder.seed_installation_properties(&imported);
-            match builder.process_installation_file(
-                &contents,
-                &path,
-                tracker,
-                &ProjectPathProvenance::Configured,
-            ) {
-                Ok(()) => {
-                    imported = builder
-                        .properties
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    if let Some(original_bds) = original_bds.as_ref() {
-                        imported.insert("bds".to_owned(), original_bds.clone());
-                    }
-                    warnings = builder.warnings;
+            &ProjectPathProvenance::Configured,
+        ) {
+            Ok(()) => {
+                imported = builder
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if let Some(original_bds) = original_bds.as_ref() {
+                    imported.insert("bds".to_owned(), original_bds.clone());
                 }
-                Err(error) => {
-                    if tracker
-                        .work_budget
-                        .is_some_and(|budget| budget.is_transient_error(&error))
-                        || !error.starts_with("malformed installation XML:")
-                    {
-                        return Err(error);
-                    }
-                    warnings.push(format!(
-                        "malformed environment settings {}: {error}",
-                        path.display()
-                    ));
-                    // A present but malformed file cannot safely supply any of its properties.
-                    observations.push(MetadataObservation::Stat { path: path.clone() });
+                warnings = builder.warnings;
+            }
+            Err(error) => {
+                if tracker
+                    .work_budget
+                    .is_some_and(|budget| budget.is_transient_error(&error))
+                    || !error.starts_with("malformed installation XML:")
+                {
+                    return Err(error);
                 }
+                warnings.push(format!(
+                    "malformed environment settings {}: {error}",
+                    path.display()
+                ));
+                // A present but malformed file cannot safely supply any of its properties.
+                observations.push(MetadataObservation::Stat { path: path.clone() });
             }
         }
     }

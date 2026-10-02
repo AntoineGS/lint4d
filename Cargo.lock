@@ -1465,6 +1465,7 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 [[package]]
 name = "tree-sitter-pascal"
 version = "0.11.0"
+source = "git+https://github.com/AntoineGS/tree-sitter-pascal.git?rev=2167e95ca744d3d1e7fb1f638824c2fa64414031#2167e95ca744d3d1e7fb1f638824c2fa64414031"
 dependencies = [
  "cc",
  "tree-sitter-language",

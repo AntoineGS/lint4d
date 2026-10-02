@@ -415,11 +415,11 @@ impl ConditionalEnvironment {
     }
 
     fn replace_fact_bytes(&mut self, key: &str, new_bytes: usize) {
-        let old_bytes = self
-            .values
-            .contains_key(key)
-            .then(|| self.value_entry_size(key))
-            .unwrap_or(0);
+        let old_bytes = if self.values.contains_key(key) {
+            self.value_entry_size(key)
+        } else {
+            0
+        };
         self.bytes = self
             .bytes
             .saturating_sub(old_bytes)
@@ -427,11 +427,11 @@ impl ConditionalEnvironment {
     }
 
     fn replace_option_bytes(&mut self, key: &str, new_bytes: usize) {
-        let old_bytes = self
-            .options
-            .contains_key(key)
-            .then(|| self.value_entry_size(key))
-            .unwrap_or(0);
+        let old_bytes = if self.options.contains_key(key) {
+            self.value_entry_size(key)
+        } else {
+            0
+        };
         self.bytes = self
             .bytes
             .saturating_sub(old_bytes)
@@ -1462,16 +1462,16 @@ fn apply_option_directive(
     let malformed_suffix = name.ends_with(['+', '-']);
     let normalized_name = name.trim_end_matches(['+', '-']);
     let Some(canonical_name) = supported_option_name(normalized_name) else {
-        if suffix_value.is_some() || state_value_word(argument) {
-            if let Some(canonical_name) = canonical_option_name(normalized_name) {
-                return apply_option_fact(
-                    environment,
-                    &canonical_name,
-                    Truth::Unknown,
-                    activity,
-                    budget,
-                );
-            }
+        if (suffix_value.is_some() || state_value_word(argument))
+            && let Some(canonical_name) = canonical_option_name(normalized_name)
+        {
+            return apply_option_fact(
+                environment,
+                &canonical_name,
+                Truth::Unknown,
+                activity,
+                budget,
+            );
         }
         // Many harmless compiler directives carry a directive-specific value
         // rather than an on/off switch (for example `WARN SYMBOL_DEPRECATED
@@ -1955,15 +1955,14 @@ fn merge_environment(
     }
     for key in &constant_keys {
         if let (Some(left), Some(right)) = (current.constants.get(key), incoming.constants.get(key))
+            && left == right
         {
-            if left == right {
-                let Some(bytes) = merged_bytes.checked_add(current.constant_entry_size(key, left))
-                else {
-                    budget.exhausted = true;
-                    return false;
-                };
-                merged_bytes = bytes;
-            }
+            let Some(bytes) = merged_bytes.checked_add(current.constant_entry_size(key, left))
+            else {
+                budget.exhausted = true;
+                return false;
+            };
+            merged_bytes = bytes;
         }
     }
     for name in &current.source_constants {

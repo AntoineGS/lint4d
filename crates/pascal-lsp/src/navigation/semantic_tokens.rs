@@ -330,19 +330,17 @@ pub(crate) fn semantic_tokens_with_projection(
             && !conditional_unknown.contains_offset(node.start_byte())
             && !parser_recovery.overlaps(span)
             && !opaque_ranges.contains(span)
-        {
-            if let Some((token_type, modifiers)) =
+            && let Some((token_type, modifiers)) =
                 resolved_identifier_type(index, uri, document, node, cancel, &mut budget)?
-            {
-                push_raw_token(
-                    &mut raw_tokens,
-                    span,
-                    token_type,
-                    modifiers,
-                    1,
-                    &document.source,
-                );
-            }
+        {
+            push_raw_token(
+                &mut raw_tokens,
+                span,
+                token_type,
+                modifiers,
+                1,
+                &document.source,
+            );
         }
 
         if let Some((start, end)) = traversal_range {

@@ -644,18 +644,17 @@ fn expand_file<R: IncludeResolver>(
             match resolver.resolve_include(&uri, &directive.body, state.cancel) {
                 Ok(resolved) => {
                     let actual_size = resolved.text.len();
-                    if size_hint.is_none() {
-                        if let Err(error) = state.charge_work(actual_size) {
-                            state.incomplete(error);
-                            include_results.push(None);
-                            return transition;
-                        }
-                    } else if size_hint.is_some_and(|hint| actual_size > hint) {
-                        if let Err(error) = state.charge_work(actual_size - size_hint.unwrap()) {
-                            state.incomplete(error);
-                            include_results.push(None);
-                            return transition;
-                        }
+                    let unreserved = match size_hint {
+                        None => Some(actual_size),
+                        Some(hint) if actual_size > hint => Some(actual_size - hint),
+                        Some(_) => None,
+                    };
+                    if let Some(unreserved) = unreserved
+                        && let Err(error) = state.charge_work(unreserved)
+                    {
+                        state.incomplete(error);
+                        include_results.push(None);
+                        return transition;
                     }
                     if state
                         .expanded_bytes

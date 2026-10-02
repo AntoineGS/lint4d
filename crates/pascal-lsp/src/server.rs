@@ -2308,6 +2308,7 @@ fn progress_title(request: &AnalysisRequest) -> &'static str {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum AnalysisResultValue {
     ProjectOperation(Result<ProjectOperationResponse, String>),
     CompiledContent(Result<Option<String>, String>),
@@ -3586,10 +3587,10 @@ impl ConfigurationPreparationJobs {
         if let Some(pending) = self.pending.take() {
             let _ = pending.handle.join();
         }
-        if let Some(request) = self.queued.take() {
-            if let Err(error) = self.spawn(request) {
-                eprintln!("pascal-lsp: configuration worker failed to start: {error}");
-            }
+        if let Some(request) = self.queued.take()
+            && let Err(error) = self.spawn(request)
+        {
+            eprintln!("pascal-lsp: configuration worker failed to start: {error}");
         }
         Some(result)
     }
@@ -4200,12 +4201,12 @@ impl PartialDeliveryValidation {
             )),
         }?;
         self.receiver = None;
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                return Some(Err(
-                    "partial result freshness validation worker panicked".to_string()
-                ));
-            }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            return Some(Err(
+                "partial result freshness validation worker panicked".to_string()
+            ));
         }
         Some(result)
     }
@@ -4589,12 +4590,11 @@ impl ProgressTracker {
         };
         let mut first_error = None;
         for entry in entries {
-            if entry.begun {
-                if let Some(connection) = connection {
-                    if let Err(error) = send_progress_end(connection, &entry.token, message) {
-                        first_error.get_or_insert(error);
-                    }
-                }
+            if entry.begun
+                && let Some(connection) = connection
+                && let Err(error) = send_progress_end(connection, &entry.token, message)
+            {
+                first_error.get_or_insert(error);
             }
             if let Some(create_id) = entry.create_id {
                 self.creates.remove(&create_id);
@@ -5081,6 +5081,7 @@ struct QueuedDiagnostic {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum QueuedAnalysis {
     Client(QueuedClientAnalysis),
     Diagnostic(QueuedDiagnostic),
@@ -7221,14 +7222,14 @@ impl AnalysisJobs {
                         &recipient,
                         &title,
                     )?;
-                    if state == ClientAnalysisState::Running {
-                        if let Some(connection) = connection {
-                            self.progress.report_started_recipient(
-                                connection,
-                                AnalysisJobId::Client(primary_id),
-                                &recipient.id,
-                            )?;
-                        }
+                    if state == ClientAnalysisState::Running
+                        && let Some(connection) = connection
+                    {
+                        self.progress.report_started_recipient(
+                            connection,
+                            AnalysisJobId::Client(primary_id),
+                            &recipient.id,
+                        )?;
                     }
                     return Ok(());
                 }
@@ -7290,11 +7291,11 @@ impl AnalysisJobs {
         primary_id: &AnalysisComputationId,
         recipient: ClientRecipient,
     ) -> Option<ClientAnalysisState> {
-        if let Some(job) = self.pending.get_mut(primary_id) {
-            if !job.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                job.recipients.push(recipient);
-                return Some(ClientAnalysisState::Running);
-            }
+        if let Some(job) = self.pending.get_mut(primary_id)
+            && !job.cancellation.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            job.recipients.push(recipient);
+            return Some(ClientAnalysisState::Running);
         }
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
@@ -7361,14 +7362,13 @@ impl AnalysisJobs {
         key: Option<&ObservationKey>,
         primary_id: &AnalysisComputationId,
     ) {
-        if let Some(key) = key {
-            if self
+        if let Some(key) = key
+            && self
                 .observation_jobs
                 .get(key)
                 .is_some_and(|job_id| job_id == primary_id)
-            {
-                self.observation_jobs.remove(key);
-            }
+        {
+            self.observation_jobs.remove(key);
         }
     }
 
@@ -7469,17 +7469,15 @@ impl AnalysisJobs {
         let mut cancelled_recipient = None;
         if let Some(QueuedAnalysis::Client(job)) = self.queue.find_mut(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
-        ) {
-            if let Some(position) = job
-                .recipients
-                .iter()
-                .position(|recipient| &recipient.id == id)
-            {
-                cancelled_recipient = job.recipients.get(position).cloned();
-                job.recipients.remove(position);
-                queued_empty = job.recipients.is_empty();
-                found_queued = true;
-            }
+        ) && let Some(position) = job
+            .recipients
+            .iter()
+            .position(|recipient| &recipient.id == id)
+        {
+            cancelled_recipient = job.recipients.get(position).cloned();
+            job.recipients.remove(position);
+            queued_empty = job.recipients.is_empty();
+            found_queued = true;
         }
         if found_queued {
             self.remove_client_mapping(id, &primary_id);
@@ -7498,13 +7496,13 @@ impl AnalysisJobs {
             if let Some(recipient) = cancelled_recipient.as_ref() {
                 self.release_partial_token(recipient);
             }
-            if queued_empty {
-                if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
+            if queued_empty
+                && let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
                     |queued| matches!(queued, QueuedAnalysis::Client(job) if job.id == primary_id),
-                ) {
-                    self.compiled_content_payload_budget.release(&primary_id);
-                    self.remove_observation(job.key.as_ref(), &primary_id);
-                }
+                )
+            {
+                self.compiled_content_payload_budget.release(&primary_id);
+                self.remove_observation(job.key.as_ref(), &primary_id);
             }
             self.publish_interactive_load();
             return Ok(());
@@ -7514,21 +7512,20 @@ impl AnalysisJobs {
         let mut cancel_worker = false;
         let mut key = None;
         let mut cancelled_recipient = None;
-        if let Some(job) = self.pending.get_mut(&primary_id) {
-            if let Some(position) = job
+        if let Some(job) = self.pending.get_mut(&primary_id)
+            && let Some(position) = job
                 .recipients
                 .iter()
                 .position(|recipient| &recipient.id == id)
-            {
-                cancelled_recipient = job.recipients.get(position).cloned();
-                job.recipients.remove(position);
-                cancel_worker = job.recipients.is_empty();
-                key = job.key.clone();
-                found_running = true;
-                if cancel_worker {
-                    job.cancellation
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+        {
+            cancelled_recipient = job.recipients.get(position).cloned();
+            job.recipients.remove(position);
+            cancel_worker = job.recipients.is_empty();
+            key = job.key.clone();
+            found_running = true;
+            if cancel_worker {
+                job.cancellation
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if found_running {
@@ -7784,18 +7781,17 @@ impl AnalysisJobs {
                             analysis.key = job.key;
                             analysis.priority = priority;
                             self.pending.insert(primary_id, analysis);
-                            if let Some(connection) = connection {
-                                if let Err(error) = self
+                            if let Some(connection) = connection
+                                && let Err(error) = self
                                     .progress
                                     .report_started(connection, AnalysisJobId::Client(primary_id))
-                                {
-                                    failures.push(DispatchFailure {
-                                        recipients: Vec::new(),
-                                        client_job: Some(primary_id),
-                                        diagnostic: None,
-                                        message: error,
-                                    });
-                                }
+                            {
+                                failures.push(DispatchFailure {
+                                    recipients: Vec::new(),
+                                    client_job: Some(primary_id),
+                                    diagnostic: None,
+                                    message: error,
+                                });
                             }
                         }
                         Err(message) => {
@@ -7825,20 +7821,20 @@ impl AnalysisJobs {
                         diagnostic_features(),
                     ) {
                         Ok(analysis) => {
-                            if let Some(connection) = connection {
-                                if let Err(error) = self.progress.start_server(
+                            if let Some(connection) = connection
+                                && let Err(error) = self.progress.start_server(
                                     connection,
                                     AnalysisJobId::Diagnostic(id),
                                     "Indexing workspace",
                                     &self.partial_tokens,
-                                ) {
-                                    failures.push(DispatchFailure {
-                                        recipients: Vec::new(),
-                                        client_job: None,
-                                        diagnostic: None,
-                                        message: error,
-                                    });
-                                }
+                                )
+                            {
+                                failures.push(DispatchFailure {
+                                    recipients: Vec::new(),
+                                    client_job: None,
+                                    diagnostic: None,
+                                    message: error,
+                                });
                             }
                             self.diagnostics
                                 .insert(id, PendingDiagnostic { uri, analysis });
@@ -7867,15 +7863,16 @@ impl AnalysisJobs {
     ) -> Result<(), String> {
         let mut first_error = None;
         for failure in failures {
-            if let Some(diagnostic) = failure.diagnostic {
-                if !self.shutting_down && self.queue.len() < MAX_ANALYSIS_QUEUE {
-                    self.diagnostic_jobs
-                        .insert(diagnostic.uri.clone(), diagnostic.id);
-                    self.queue.push(
-                        AnalysisPriority::Diagnostics,
-                        QueuedAnalysis::Diagnostic(diagnostic),
-                    );
-                }
+            if let Some(diagnostic) = failure.diagnostic
+                && !self.shutting_down
+                && self.queue.len() < MAX_ANALYSIS_QUEUE
+            {
+                self.diagnostic_jobs
+                    .insert(diagnostic.uri.clone(), diagnostic.id);
+                self.queue.push(
+                    AnalysisPriority::Diagnostics,
+                    QueuedAnalysis::Diagnostic(diagnostic),
+                );
             }
             if let Some(connection) = connection {
                 for recipient in &failure.recipients {
@@ -8716,35 +8713,25 @@ impl AnalysisJobs {
                                     result.clone(),
                                     Some(recipient.id.clone()),
                                 )?;
-                                if selection_committed {
-                                    if let Some(intent) = &manual_intent {
-                                        match intent {
-                                            ManualSelectionIntent::Project => {
-                                                if let AnalysisResultValue::ProjectOperation(Ok(
-                                                    ProjectOperationResponse::SelectProject {
-                                                        prepared,
-                                                    },
-                                                )) = &result.value
-                                                {
-                                                    if let Some(scope) =
-                                                        prepared.context.info.scope_uri.as_ref()
-                                                    {
-                                                        self.fence_automatic_answers_for_scope(
-                                                            scope,
-                                                        );
-                                                    }
-                                                }
+                                if selection_committed && let Some(intent) = &manual_intent {
+                                    match intent {
+                                        ManualSelectionIntent::Project => {
+                                            if let AnalysisResultValue::ProjectOperation(Ok(
+                                                ProjectOperationResponse::SelectProject {
+                                                    prepared,
+                                                },
+                                            )) = &result.value
+                                                && let Some(scope) =
+                                                    prepared.context.info.scope_uri.as_ref()
+                                            {
+                                                self.fence_automatic_answers_for_scope(scope);
                                             }
-                                            ManualSelectionIntent::Installation { project_uri } => {
-                                                self.fence_automatic_answers_for_project(
-                                                    project_uri,
-                                                );
-                                            }
-                                            ManualSelectionIntent::Build { project_uri } => {
-                                                self.fence_automatic_answers_for_project(
-                                                    project_uri,
-                                                );
-                                            }
+                                        }
+                                        ManualSelectionIntent::Installation { project_uri } => {
+                                            self.fence_automatic_answers_for_project(project_uri);
+                                        }
+                                        ManualSelectionIntent::Build { project_uri } => {
+                                            self.fence_automatic_answers_for_project(project_uri);
                                         }
                                     }
                                 }
@@ -8764,12 +8751,11 @@ impl AnalysisJobs {
                             if project_context_result {
                                 self.configuration_watch_sync_pending = true;
                             }
-                            if selected_project_successfully {
-                                if let Some(uri) = automatic_apply_uri {
-                                    queue_automatic_project_discovery(
-                                        connection, workspace, self, uri, false, false,
-                                    )?;
-                                }
+                            if selected_project_successfully && let Some(uri) = automatic_apply_uri
+                            {
+                                queue_automatic_project_discovery(
+                                    connection, workspace, self, uri, false, false,
+                                )?;
                             }
                         }
                     }
@@ -9238,10 +9224,10 @@ fn deliver_analysis_result_with_store(
     if let AnalysisResultValue::DocumentDiagnostics(Ok(diagnostics)) = &result.value {
         workspace.record_diagnostic_dependencies(diagnostics.uri.clone(), result.records.clone());
     }
-    if let AnalysisResultValue::Navigation(navigation) = &mut result.value {
-        if let Some(state) = navigation.state.take() {
-            workspace.apply_navigation_state(state);
-        }
+    if let AnalysisResultValue::Navigation(navigation) = &mut result.value
+        && let Some(state) = navigation.state.take()
+    {
+        workspace.apply_navigation_state(state);
     }
     let mut selection_committed = false;
     match result.value {
@@ -9739,8 +9725,8 @@ fn send_document_diagnostics(
             "items": entry.diagnostics.clone(),
         })
     };
-    let related_publications = related_document_support
-        .then(|| {
+    let related_publications = if related_document_support {
+        {
             publications
                 .into_iter()
                 .filter(|publication| publication.uri != entry.uri)
@@ -9749,8 +9735,10 @@ fn send_document_diagnostics(
                     (publication.uri, publication.diagnostics, dependency)
                 })
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        }
+    } else {
+        Default::default()
+    };
     let reconciliation = diagnostic_results.reconcile_related_owners(invalid_related_owners);
     let owner_transaction = match diagnostic_results.prepare_related_owner(
         &uri,
@@ -9788,10 +9776,10 @@ fn send_document_diagnostics(
             );
             entries.push(related_entry);
         }
-        if !related.is_empty() {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("relatedDocuments".to_string(), Value::Object(related));
-            }
+        if !related.is_empty()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("relatedDocuments".to_string(), Value::Object(related));
         }
     }
     let fallback_id = client_id.clone();
@@ -10991,10 +10979,10 @@ fn event_loop(
                 &mut diagnostic_publication_budget,
                 pending_diagnostic_clears.is_empty(),
             )?;
-            if jobs.take_configuration_watch_sync_pending() {
-                if let Some(registration) = watcher_registration.as_mut() {
-                    sync_file_watcher(connection, workspace, registration)?;
-                }
+            if jobs.take_configuration_watch_sync_pending()
+                && let Some(registration) = watcher_registration.as_mut()
+            {
+                sync_file_watcher(connection, workspace, registration)?;
             }
         }
         if !pull_diagnostics_supported
@@ -11504,11 +11492,11 @@ fn event_loop(
                             )?;
                             jobs.remove_prompts_for_closed_source(&closed_uri);
                         }
-                        if !pull_diagnostics_supported {
-                            if let Some(cursor) = effect.clear_publication_cursor {
-                                pending_diagnostic_clears
-                                    .enqueue_cursor(cursor, effect.cleanup_rejected_uri);
-                            }
+                        if !pull_diagnostics_supported
+                            && let Some(cursor) = effect.clear_publication_cursor
+                        {
+                            pending_diagnostic_clears
+                                .enqueue_cursor(cursor, effect.cleanup_rejected_uri);
                         }
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
@@ -11696,13 +11684,11 @@ fn event_loop(
                         .as_mut()
                         .and_then(|registration| registration.handle_response(&response));
                     if let Some(accepted) = watcher_response {
-                        if !accepted {
-                            if let Some(error) = &response.error {
-                                eprintln!(
-                                    "pascal-lsp: watcher registration {} rejected ({}): {}",
-                                    response.id, error.code, error.message
-                                );
-                            }
+                        if !accepted && let Some(error) = &response.error {
+                            eprintln!(
+                                "pascal-lsp: watcher registration {} rejected ({}): {}",
+                                response.id, error.code, error.message
+                            );
                         }
                         if let Some(registration) = watcher_registration.as_mut() {
                             sync_file_watcher(connection, workspace, registration)?;
@@ -11785,10 +11771,10 @@ fn maintain_warmer(
         }
     }
     for event in warmer.poll(workspace) {
-        if let crate::warmer::WarmEvent::ClosureStored { uri, .. } = &event {
-            if workspace.is_open(uri) {
-                semantic_tokens_refresh.request(connection)?;
-            }
+        if let crate::warmer::WarmEvent::ClosureStored { uri, .. } = &event
+            && workspace.is_open(uri)
+        {
+            semantic_tokens_refresh.request(connection)?;
         }
         if let crate::warmer::WarmEvent::End {
             uri,
@@ -11796,12 +11782,11 @@ fn maintain_warmer(
             pins,
             ..
         } = &event
+            && workspace.is_open(uri)
         {
-            if workspace.is_open(uri) {
-                cache.pin(uri, pins.clone());
-                if let Some(fingerprint) = fingerprint {
-                    swept_fingerprints.insert(*fingerprint);
-                }
+            cache.pin(uri, pins.clone());
+            if let Some(fingerprint) = fingerprint {
+                swept_fingerprints.insert(*fingerprint);
             }
         }
         let paused_will_retry = match &event {
@@ -12574,10 +12559,10 @@ fn handle_request(
                 client_features,
                 None,
             )?;
-            if jobs.request_to_job.contains_key(&request_id) {
-                if let Some(intent) = manual_intent {
-                    jobs.manual_selection_requests.insert(request_id, intent);
-                }
+            if jobs.request_to_job.contains_key(&request_id)
+                && let Some(intent) = manual_intent
+            {
+                jobs.manual_selection_requests.insert(request_id, intent);
             }
         }
         "pascal/selectBuildConfig" => {
@@ -12622,10 +12607,10 @@ fn handle_request(
                 client_features,
                 None,
             )?;
-            if jobs.request_to_job.contains_key(&request_id) {
-                if let Some(intent) = manual_intent {
-                    jobs.manual_selection_requests.insert(request_id, intent);
-                }
+            if jobs.request_to_job.contains_key(&request_id)
+                && let Some(intent) = manual_intent
+            {
+                jobs.manual_selection_requests.insert(request_id, intent);
             }
         }
         "pascal/selectPlatform" => {
@@ -12670,10 +12655,10 @@ fn handle_request(
                 client_features,
                 None,
             )?;
-            if jobs.request_to_job.contains_key(&request_id) {
-                if let Some(intent) = manual_intent {
-                    jobs.manual_selection_requests.insert(request_id, intent);
-                }
+            if jobs.request_to_job.contains_key(&request_id)
+                && let Some(intent) = manual_intent
+            {
+                jobs.manual_selection_requests.insert(request_id, intent);
             }
         }
         "pascal/selectProject" => {
@@ -12719,10 +12704,10 @@ fn handle_request(
                 client_features,
                 None,
             )?;
-            if jobs.request_to_job.contains_key(&request_id) {
-                if let Some(intent) = manual_intent {
-                    jobs.manual_selection_requests.insert(request_id, intent);
-                }
+            if jobs.request_to_job.contains_key(&request_id)
+                && let Some(intent) = manual_intent
+            {
+                jobs.manual_selection_requests.insert(request_id, intent);
             }
         }
         "textDocument/hover" => {
@@ -13873,21 +13858,21 @@ fn handle_notification_with_control_inner(
             let params: DidChangeTextDocumentParams = match parse_notification(&notification) {
                 Ok(params) => params,
                 Err(error) => {
-                    if let Some((uri, version)) = malformed_did_change_attribution(&notification) {
-                        if workspace.reject_malformed_change(
+                    if let Some((uri, version)) = malformed_did_change_attribution(&notification)
+                        && workspace.reject_malformed_change(
                             &uri,
                             version,
                             format!("{error}; a full-document replacement is required"),
-                        ) {
-                            mark_publication_root_stale(connection, workspace, &uri);
-                            let mut effect = DiagnosticNotificationEffect::default();
-                            effect.cancel_uri_with_budget(uri.clone(), budget)?;
-                            effect.refresh_uri_with_budget(uri.clone(), budget)?;
-                            effect.refresh_dependents_with_control(
-                                workspace, &uri, false, cancel, budget,
-                            )?;
-                            return Ok(effect);
-                        }
+                        )
+                    {
+                        mark_publication_root_stale(connection, workspace, &uri);
+                        let mut effect = DiagnosticNotificationEffect::default();
+                        effect.cancel_uri_with_budget(uri.clone(), budget)?;
+                        effect.refresh_uri_with_budget(uri.clone(), budget)?;
+                        effect.refresh_dependents_with_control(
+                            workspace, &uri, false, cancel, budget,
+                        )?;
+                        return Ok(effect);
                     }
                     return Err(error);
                 }
@@ -15269,12 +15254,11 @@ fn supports_workspace_diagnostic_reports(raw_initialize: &Value) -> bool {
 }
 
 fn supports_configuration(client: &ClientCapabilities) -> bool {
-    let supported = client
+    client
         .workspace
         .as_ref()
         .and_then(|workspace| workspace.configuration)
-        .unwrap_or(false);
-    supported
+        .unwrap_or(false)
 }
 
 fn supports_watched_file_registration(client: &ClientCapabilities) -> bool {
@@ -15297,21 +15281,21 @@ fn supports_relative_pattern(client: &ClientCapabilities) -> bool {
 
 #[allow(deprecated)]
 fn workspace_roots(initialize: &InitializeParams) -> Vec<PathBuf> {
-    if let Some(folders) = &initialize.workspace_folders {
-        if !folders.is_empty() {
-            let paths: Vec<PathBuf> = folders
-                .iter()
-                .filter_map(|folder: &WorkspaceFolder| folder.uri.to_file_path().ok())
-                .collect();
-            if !paths.is_empty() {
-                return paths;
-            }
+    if let Some(folders) = &initialize.workspace_folders
+        && !folders.is_empty()
+    {
+        let paths: Vec<PathBuf> = folders
+            .iter()
+            .filter_map(|folder: &WorkspaceFolder| folder.uri.to_file_path().ok())
+            .collect();
+        if !paths.is_empty() {
+            return paths;
         }
     }
-    if let Some(uri) = &initialize.root_uri {
-        if let Ok(path) = uri.to_file_path() {
-            return vec![path];
-        }
+    if let Some(uri) = &initialize.root_uri
+        && let Ok(path) = uri.to_file_path()
+    {
+        return vec![path];
     }
     if let Some(path) = &initialize.root_path {
         return vec![PathBuf::from(path)];

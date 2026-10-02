@@ -28,9 +28,11 @@ fn report(complete: bool) -> ResolutionReport {
         observations: Vec::new(),
         warnings: Vec::new(),
         complete,
-        incomplete_reasons: (!complete)
-            .then(|| vec!["fixture incomplete".to_string()])
-            .unwrap_or_default(),
+        incomplete_reasons: if !complete {
+            vec!["fixture incomplete".to_string()]
+        } else {
+            Default::default()
+        },
     }
 }
 

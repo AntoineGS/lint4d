@@ -237,7 +237,7 @@ fn decimal_mantissa(major: u32, minor: u32, scale: u8) -> Option<u64> {
 }
 
 fn normalize_decimal(mut mantissa: u64, mut scale: u8) -> (u64, u8) {
-    while scale > 0 && mantissa % 10 == 0 {
+    while scale > 0 && mantissa.is_multiple_of(10) {
         mantissa /= 10;
         scale -= 1;
     }

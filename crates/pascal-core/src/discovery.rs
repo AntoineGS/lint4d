@@ -23,20 +23,20 @@ pub fn discover_files(
     for path in paths {
         // Reject symlinks passed directly as positional args. Same reason as
         // the walkdir case below. Use symlink_metadata so we don't follow.
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                eprintln!("pascal-core: skipping symlink {}", path.display());
-                continue;
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            eprintln!("pascal-core: skipping symlink {}", path.display());
+            continue;
         }
         if path.is_file() {
-            if let Some(ft) = file_type_for_path(path) {
-                if !is_excluded(path, path.parent().unwrap_or(path), &excludes) {
-                    results.push(FileInfo {
-                        path: path.clone(),
-                        file_type: ft,
-                    });
-                }
+            if let Some(ft) = file_type_for_path(path)
+                && !is_excluded(path, path.parent().unwrap_or(path), &excludes)
+            {
+                results.push(FileInfo {
+                    path: path.clone(),
+                    file_type: ft,
+                });
             }
         } else if path.is_dir() {
             let base = path.as_path();
@@ -55,13 +55,13 @@ pub fn discover_files(
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                if let Some(ft) = file_type_for_path(entry_path) {
-                    if !is_excluded(entry_path, base, &excludes) {
-                        results.push(FileInfo {
-                            path: entry_path.to_path_buf(),
-                            file_type: ft,
-                        });
-                    }
+                if let Some(ft) = file_type_for_path(entry_path)
+                    && !is_excluded(entry_path, base, &excludes)
+                {
+                    results.push(FileInfo {
+                        path: entry_path.to_path_buf(),
+                        file_type: ft,
+                    });
                 }
             }
         }
@@ -99,10 +99,10 @@ fn is_excluded(file_path: &std::path::Path, base: &std::path::Path, excludes: &G
         return false;
     }
     // Try relative path first.
-    if let Ok(rel) = file_path.strip_prefix(base) {
-        if excludes.is_match(rel) {
-            return true;
-        }
+    if let Ok(rel) = file_path.strip_prefix(base)
+        && excludes.is_match(rel)
+    {
+        return true;
     }
     // Fallback: absolute path.
     excludes.is_match(file_path)

@@ -70,11 +70,10 @@ impl Documentation {
         if let Some(summary) = self.summary.render(format.clone(), cancel)? {
             append_rendered_section(&mut result, &summary, cancel)?;
         }
-        if !self.remarks.is_empty() {
-            if let Some(section) = render_section("Remarks", &self.remarks, format.clone(), cancel)?
-            {
-                append_rendered_section(&mut result, &section, cancel)?;
-            }
+        if !self.remarks.is_empty()
+            && let Some(section) = render_section("Remarks", &self.remarks, format.clone(), cancel)?
+        {
+            append_rendered_section(&mut result, &section, cancel)?;
         }
         if include_parameters && !self.parameters.is_empty() {
             check_cancel(cancel)?;
@@ -118,10 +117,10 @@ impl Documentation {
                 append_rendered_section(&mut result, &parameter_section, cancel)?;
             }
         }
-        if !self.returns.is_empty() {
-            if let Some(section) = render_section("Returns", &self.returns, format, cancel)? {
-                append_rendered_section(&mut result, &section, cancel)?;
-            }
+        if !self.returns.is_empty()
+            && let Some(section) = render_section("Returns", &self.returns, format, cancel)?
+        {
+            append_rendered_section(&mut result, &section, cancel)?;
         }
         Ok((!result.trim().is_empty()).then_some(result))
     }
@@ -468,7 +467,7 @@ impl<'a> MarkupParser<'a> {
         if value.is_empty() || names.is_empty() {
             return Ok(true);
         }
-        let content_bytes = value.len().checked_mul(names.len()).unwrap_or(usize::MAX);
+        let content_bytes = value.len().saturating_mul(names.len());
         let mut required_bytes = content_bytes;
         for (index, name) in names.iter().enumerate() {
             self.budget.check_cancel_at(index)?;

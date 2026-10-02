@@ -139,10 +139,10 @@ impl DocBuilder<'_> {
             }
             _ => {
                 // Check for blank line preservation
-                if let Some(prev_end) = prev_end_row {
-                    if self.has_blank_line_between(prev_end, child.start_position().row) {
-                        body_parts.push(Doc::BlankLine);
-                    }
+                if let Some(prev_end) = prev_end_row
+                    && self.has_blank_line_between(prev_end, child.start_position().row)
+                {
+                    body_parts.push(Doc::BlankLine);
                 }
                 // Add Hardline before each statement (except the first)
                 if !body_parts.is_empty() {

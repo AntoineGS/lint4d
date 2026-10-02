@@ -16,10 +16,10 @@ pub fn find_config_file(start_dir: &Path, filename: &str) -> Option<(String, Pat
     };
     loop {
         let config_path = dir.join(filename);
-        if config_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                return Some((content, dir));
-            }
+        if config_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&config_path)
+        {
+            return Some((content, dir));
         }
         if !dir.pop() {
             break;

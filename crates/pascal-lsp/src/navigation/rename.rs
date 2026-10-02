@@ -188,10 +188,8 @@ fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), String> {
             None => false,
         });
     #[cfg(test)]
-    if force_cancel {
-        if let Some(cancel) = cancel {
-            cancel.store(true, Ordering::Relaxed);
-        }
+    if force_cancel && let Some(cancel) = cancel {
+        cancel.store(true, Ordering::Relaxed);
     }
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         Err(CANCELLATION_MESSAGE.to_string())
@@ -205,10 +203,11 @@ fn check_cancel_at_phase(
     cancel: Option<&AtomicBool>,
     phase: TestCancellationPhase,
 ) -> Result<(), String> {
-    if cancel.is_some() && TEST_CANCEL_PHASE.with(|current| current.get() == Some(phase)) {
-        if let Some(cancel) = cancel {
-            cancel.store(true, Ordering::Relaxed);
-        }
+    if cancel.is_some()
+        && TEST_CANCEL_PHASE.with(|current| current.get() == Some(phase))
+        && let Some(cancel) = cancel
+    {
+        cancel.store(true, Ordering::Relaxed);
     }
     check_cancel(cancel)
 }
@@ -1711,15 +1710,15 @@ impl NavigationIndex {
                     | super::Receiver::IntegerLiteral(_) => None,
                 })
                 .collect::<Vec<_>>();
-            if let Some(lexical_candidates) = implicit_candidates.as_ref() {
-                if !lexical_candidates.iter().any(|candidate| {
+            if let Some(lexical_candidates) = implicit_candidates.as_ref()
+                && !lexical_candidates.iter().any(|candidate| {
                     candidates.contains(candidate)
                         && self
                             .symbol(candidate)
                             .is_some_and(|symbol| symbol.kind == SymbolKind::Routine)
-                }) {
-                    return Ok::<(), String>(());
-                }
+                })
+            {
+                return Ok::<(), String>(());
             }
             let selection = super::overload::select(
                 self,
@@ -2074,20 +2073,21 @@ impl NavigationIndex {
                         continue;
                     }
                 }
-                if matching > 0 && binding_has_class_owner && !is_direct_declaration {
-                    if let Some(dot) = member_expression {
-                        if self.member_reference_uses_inherited_class_owner(
-                            binding, uri, document, span.start, dot,
-                        ) {
-                            if !options.strict_resolution && !is_binding_member {
-                                continue;
-                            }
-                            return Err(format!(
-                                "rename does not support inherited class lookup at {}:{}",
-                                uri, span.start
-                            ));
-                        }
+                if matching > 0
+                    && binding_has_class_owner
+                    && !is_direct_declaration
+                    && let Some(dot) = member_expression
+                    && self.member_reference_uses_inherited_class_owner(
+                        binding, uri, document, span.start, dot,
+                    )
+                {
+                    if !options.strict_resolution && !is_binding_member {
+                        continue;
                     }
+                    return Err(format!(
+                        "rename does not support inherited class lookup at {}:{}",
+                        uri, span.start
+                    ));
                 }
                 if matching > 0 {
                     if matching != candidates.len() {
@@ -3644,10 +3644,10 @@ fn proven_override_slot_path(
             }
             matching_parent = Some(parent_candidate);
         }
-        if let Some(parent_symbol) = matching_parent {
-            if !parent_symbol.routine_directives.override_ {
-                return Ok(false);
-            }
+        if let Some(parent_symbol) = matching_parent
+            && !parent_symbol.routine_directives.override_
+        {
+            return Ok(false);
         }
         active.remove(&identity);
         current_uri = parent_uri;

@@ -58,10 +58,10 @@ fn collect_field_creations_with_nodes_recursive<'a>(
     fields: &[String],
     out: &mut Vec<FieldCreationWithNode<'a>>,
 ) {
-    if node.kind() == K::ASSIGNMENT {
-        if let Some(creation) = parse_field_creation(node, source, fields) {
-            out.push(FieldCreationWithNode { creation, node });
-        }
+    if node.kind() == K::ASSIGNMENT
+        && let Some(creation) = parse_field_creation(node, source, fields)
+    {
+        out.push(FieldCreationWithNode { creation, node });
     }
 
     let mut cursor = node.walk();
@@ -115,12 +115,12 @@ fn analyze_class(class: &ClassInfo, def_procs: &[DefProcInfo], source: &[u8]) ->
     // Collect fields freed in the destructor
     let mut destructor_frees = HashSet::new();
     for proc_info in &class_procs {
-        if proc_info.is_destructor {
-            if let Some(block) = proc_info.block {
-                for field in &class.fields {
-                    if ast_frees_variable(block, source, field) {
-                        destructor_frees.insert(field.to_lowercase());
-                    }
+        if proc_info.is_destructor
+            && let Some(block) = proc_info.block
+        {
+            for field in &class.fields {
+                if ast_frees_variable(block, source, field) {
+                    destructor_frees.insert(field.to_lowercase());
                 }
             }
         }
@@ -191,10 +191,10 @@ pub(crate) fn parse_def_proc(
 /// Find the `block` child of a `defProc` node.
 pub(crate) fn get_method_block(def_proc: Node) -> Option<Node> {
     let mut cursor = def_proc.walk();
-    let result = def_proc
+
+    def_proc
         .children(&mut cursor)
-        .find(|c| c.kind() == K::BLOCK);
-    result
+        .find(|c| c.kind() == K::BLOCK)
 }
 
 /// Collect all field-creation assignments in a block.
@@ -214,10 +214,10 @@ fn collect_field_creations_recursive(
     fields: &[String],
     out: &mut Vec<FieldCreation>,
 ) {
-    if node.kind() == K::ASSIGNMENT {
-        if let Some(creation) = parse_field_creation(node, source, fields) {
-            out.push(creation);
-        }
+    if node.kind() == K::ASSIGNMENT
+        && let Some(creation) = parse_field_creation(node, source, fields)
+    {
+        out.push(creation);
     }
 
     let mut cursor = node.walk();
@@ -302,10 +302,10 @@ fn branch_id(node: Node) -> Option<(usize, BranchSide)> {
     while let Some(parent) = current {
         if parent.kind() == K::IF_ELSE {
             // Check if child is in the "then" field or "else" field.
-            if let Some(then_node) = parent.child_by_field_name("then") {
-                if then_node.id() == child.id() || is_ancestor_of(then_node, child) {
-                    return Some((parent.id(), BranchSide::Then));
-                }
+            if let Some(then_node) = parent.child_by_field_name("then")
+                && (then_node.id() == child.id() || is_ancestor_of(then_node, child))
+            {
+                return Some((parent.id(), BranchSide::Then));
             }
             // else field: can have multiple children
             let mut cursor = parent.walk();
@@ -751,20 +751,19 @@ fn collect_def_procs<'a>(root: Node<'a>, source: &[u8]) -> Vec<DefProcInfo<'a>> 
 }
 
 fn collect_def_procs_recursive<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<DefProcInfo<'a>>) {
-    if node.kind() == K::DEF_PROC {
-        if let Some((class_name, method_name, is_constructor, is_destructor)) =
+    if node.kind() == K::DEF_PROC
+        && let Some((class_name, method_name, is_constructor, is_destructor)) =
             parse_def_proc(node, source)
-        {
-            let block = get_method_block(node);
-            out.push(DefProcInfo {
-                class_name,
-                method_name,
-                is_constructor,
-                is_destructor,
-                block,
-            });
-            return; // Don't recurse inside defProc (avoid nested proc confusion)
-        }
+    {
+        let block = get_method_block(node);
+        out.push(DefProcInfo {
+            class_name,
+            method_name,
+            is_constructor,
+            is_destructor,
+            block,
+        });
+        return; // Don't recurse inside defProc (avoid nested proc confusion)
     }
 
     let mut cursor = node.walk();

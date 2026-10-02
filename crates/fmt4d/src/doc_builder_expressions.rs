@@ -365,13 +365,14 @@ impl<'a> DocBuilder<'a> {
                 prev_had_line_comment = self.has_trailing_line_comment(*n);
             }
             // Trailing: attach the *next* segment's operator to the first operand.
-            if trailing && segments.len() > 1 {
-                if let Some(op) = segments[1].operator {
-                    if prev_had_line_comment {
-                        first_parts.push(Doc::Hardline);
-                    }
-                    first_parts.push(self.doc_for_node(op));
+            if trailing
+                && segments.len() > 1
+                && let Some(op) = segments[1].operator
+            {
+                if prev_had_line_comment {
+                    first_parts.push(Doc::Hardline);
                 }
+                first_parts.push(self.doc_for_node(op));
             }
         }
 
@@ -432,13 +433,13 @@ impl<'a> DocBuilder<'a> {
                     item.push(self.doc_for_node(*n));
                     prev_had_line_comment = self.has_trailing_line_comment(*n);
                 }
-                if i + 1 < segments.len() {
-                    if let Some(op) = segments[i + 1].operator {
-                        if prev_had_line_comment {
-                            item.push(Doc::Hardline);
-                        }
-                        item.push(self.doc_for_node(op));
+                if i + 1 < segments.len()
+                    && let Some(op) = segments[i + 1].operator
+                {
+                    if prev_had_line_comment {
+                        item.push(Doc::Hardline);
                     }
+                    item.push(self.doc_for_node(op));
                 }
             } else {
                 // Leading: operator first, then operand.
@@ -540,13 +541,13 @@ fn flatten_binary_chain_inner<'a>(
         let left = children[0];
         let op = children[1];
         let right = children[2];
-        if let Some(allowed) = only_ops {
-            if !allowed.contains(&op.kind()) {
-                // Operator filtered out — emit the whole subtree as one
-                // operand, then drain any pending outer segments.
-                emit_leaf_and_drain(node, &mut pending, segments);
-                break;
-            }
+        if let Some(allowed) = only_ops
+            && !allowed.contains(&op.kind())
+        {
+            // Operator filtered out — emit the whole subtree as one
+            // operand, then drain any pending outer segments.
+            emit_leaf_and_drain(node, &mut pending, segments);
+            break;
         }
         pending.push((op, right));
         if left.kind() == K::EXPR_BINARY {

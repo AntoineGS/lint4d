@@ -435,13 +435,11 @@ impl OverrideSession {
             .lock()
             .map_err(|_| capture_store_poisoned())?
             .contains(&path);
-        if !dirty {
-            if let Some(result) = captured.get(&path) {
-                return match result {
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(error.clone()),
-                };
-            }
+        if !dirty && let Some(result) = captured.get(&path) {
+            return match result {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.clone()),
+            };
         }
 
         let (result, source_stamp) = read_override_file_with_stamp_and_budget(&path, budget);

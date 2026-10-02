@@ -133,7 +133,7 @@ pub(crate) fn plan(
     let literal = &source[rhs.start_byte()..rhs.end_byte()];
     if !literal.bytes().all(|byte| byte.is_ascii_digit())
         || literal.parse::<i32>().is_err()
-        || source[assignment.end_byte()..].as_bytes().first() != Some(&b';')
+        || source.as_bytes()[assignment.end_byte()..].first() != Some(&b';')
     {
         return Ok(Vec::new());
     }

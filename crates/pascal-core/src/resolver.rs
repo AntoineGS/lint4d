@@ -1098,10 +1098,8 @@ impl<S: SourceStore> UnitResolver<S> {
             request.requested_name,
             request.legacy_route,
         );
-        if !skip_browsing {
-            if let Some(unit) = self.unit_cache.get(&key).cloned() {
-                return Ok(Resolution::Found(unit));
-            }
+        if !skip_browsing && let Some(unit) = self.unit_cache.get(&key).cloned() {
+            return Ok(Resolution::Found(unit));
         }
         let route = request.legacy_route.cloned();
         let result = self.resolve_unit_inner(request, skip_browsing, cancel)?;
@@ -1211,8 +1209,8 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
 
-        if let Some(directory) = request.importer_path.parent() {
-            if let Some(result) = self.resolve_directory(
+        if let Some(directory) = request.importer_path.parent()
+            && let Some(result) = self.resolve_directory(
                 directory,
                 &lookup,
                 &self.context.unit_namespaces.clone(),
@@ -1220,9 +1218,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 cancel,
                 None,
                 requested,
-            )? {
-                return Ok(result);
-            }
+            )?
+        {
+            return Ok(result);
         }
         let search_entries = if self.context.search_path_entries.is_empty() {
             self.context
@@ -1564,7 +1562,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 })))
             }
             _ => {
-                valid.sort_by(|left, right| path_key(&left.0.path).cmp(&path_key(&right.0.path)));
+                valid.sort_by_key(|left| path_key(&left.0.path));
                 let candidates = valid.into_iter().map(|(_, candidate)| candidate).collect();
                 self.warn(format!(
                     "ambiguous unit {requested}: multiple valid candidates"
@@ -1618,7 +1616,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 ));
             }
         }
-        paths.sort_by(|left, right| path_key(&left.0).cmp(&path_key(&right.0)));
+        paths.sort_by_key(|left| path_key(&left.0));
         paths
     }
 
@@ -1786,17 +1784,14 @@ impl<S: SourceStore> UnitResolver<S> {
             });
         }
         let mut entries = self.context.include_search_entries(request.including_path);
-        if let Some(owner_directory) = request.including_path.parent() {
-            if let Some(owner_entry) =
+        if let Some(owner_directory) = request.including_path.parent()
+            && let Some(owner_entry) =
                 self.legacy_entry_for_directory(owner_directory, request.legacy_route)
-            {
-                if !entries
-                    .iter()
-                    .any(|entry| path_equivalent(&entry.path, &owner_entry.path))
-                {
-                    entries.insert(0, owner_entry);
-                }
-            }
+            && !entries
+                .iter()
+                .any(|entry| path_equivalent(&entry.path, &owner_entry.path))
+        {
+            entries.insert(0, owner_entry);
         }
         let mut candidates = Vec::new();
         let mut saw_incomplete = false;
@@ -1907,7 +1902,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 break;
             }
         }
-        candidates.sort_by(|left, right| path_key(&left.path).cmp(&path_key(&right.path)));
+        candidates.sort_by_key(|left| path_key(&left.path));
         candidates.dedup_by(|left, right| left.id == right.id);
         match candidates.len() {
             1 => Ok(Resolution::Found(
@@ -2230,21 +2225,21 @@ impl<S: SourceStore> UnitResolver<S> {
             }));
         }
         self.package_catalogue_count += 1;
-        if let Some(session_cache) = &self.session_cache {
-            if let Some(cached) = session_cache.get(&root) {
-                for observation in cached.observations.iter().cloned() {
-                    self.record_observation(observation);
-                }
-                for warning in cached.warnings.iter().cloned() {
-                    self.warn(warning);
-                }
-                for reason in cached.incomplete_reasons.iter().cloned() {
-                    self.mark_incomplete(reason);
-                }
-                self.package_catalogues
-                    .insert(root, Arc::clone(&cached.catalogue));
-                return Ok(cached.catalogue);
+        if let Some(session_cache) = &self.session_cache
+            && let Some(cached) = session_cache.get(&root)
+        {
+            for observation in cached.observations.iter().cloned() {
+                self.record_observation(observation);
             }
+            for warning in cached.warnings.iter().cloned() {
+                self.warn(warning);
+            }
+            for reason in cached.incomplete_reasons.iter().cloned() {
+                self.mark_incomplete(reason);
+            }
+            self.package_catalogues
+                .insert(root, Arc::clone(&cached.catalogue));
+            return Ok(cached.catalogue);
         }
         let observations_before = self.report.observations.len();
         let warnings_before = self.report.warnings.len();
@@ -2519,8 +2514,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
             }
         }
-        package_candidates
-            .sort_by(|left, right| path_key(&left.0.path).cmp(&path_key(&right.0.path)));
+        package_candidates.sort_by_key(|left| path_key(&left.0.path));
         package_candidates.dedup_by(|left, right| left.0.id == right.0.id);
         match package_candidates.len() {
             0 => Ok(Resolution::Unavailable {
@@ -2859,12 +2853,11 @@ impl<S: SourceStore> UnitResolver<S> {
     ) {
         *complete &= result.complete;
         for include in result.includes {
-            if let ResolutionTarget::Found(id) = &include.target {
-                if let Some(source) = self.loaded.get(id).cloned() {
-                    if !include_sources.iter().any(|existing| existing.id == *id) {
-                        include_sources.push(source);
-                    }
-                }
+            if let ResolutionTarget::Found(id) = &include.target
+                && let Some(source) = self.loaded.get(id).cloned()
+                && !include_sources.iter().any(|existing| existing.id == *id)
+            {
+                include_sources.push(source);
             }
             self.project_includes.push(include);
         }
@@ -3177,13 +3170,12 @@ fn qualifiers_for_found(requested: &str, lookup: &str, declared: &str) -> Vec<St
         short_unit_name(lookup),
         short_unit_name(declared),
     ] {
-        if let Some(spelling) = spelling.filter(|spelling| !spelling.trim().is_empty()) {
-            if !qualifiers
+        if let Some(spelling) = spelling.filter(|spelling| !spelling.trim().is_empty())
+            && !qualifiers
                 .iter()
                 .any(|existing: &String| existing.eq_ignore_ascii_case(spelling))
-            {
-                qualifiers.push(spelling.to_string());
-            }
+        {
+            qualifiers.push(spelling.to_string());
         }
     }
     qualifiers
@@ -3195,13 +3187,12 @@ fn qualifiers_for_unresolved(requested: &str, lookup: &str) -> Vec<String> {
         Some(requested),
         (!lookup.eq_ignore_ascii_case(requested)).then_some(lookup),
     ] {
-        if let Some(spelling) = spelling.filter(|spelling| !spelling.trim().is_empty()) {
-            if !qualifiers
+        if let Some(spelling) = spelling.filter(|spelling| !spelling.trim().is_empty())
+            && !qualifiers
                 .iter()
                 .any(|existing: &String| existing.eq_ignore_ascii_case(spelling))
-            {
-                qualifiers.push(spelling.to_string());
-            }
+        {
+            qualifiers.push(spelling.to_string());
         }
     }
     qualifiers
@@ -3305,7 +3296,7 @@ fn dedup_paths(paths: Vec<(PathBuf, ProjectPathEntry)>) -> Vec<(PathBuf, Project
             result.push((path, entry));
         }
     }
-    result.sort_by(|left, right| path_key(&left.0).cmp(&path_key(&right.0)));
+    result.sort_by_key(|left| path_key(&left.0));
     result
 }
 
@@ -3322,10 +3313,9 @@ fn push_warning(report: &mut ResolutionReport, warning: String, maximum: usize) 
         .warnings
         .last()
         .is_none_or(|last| last != "resolution warning limit reached")
+        && let Some(last) = report.warnings.last_mut()
     {
-        if let Some(last) = report.warnings.last_mut() {
-            *last = "resolution warning limit reached".to_string();
-        }
+        *last = "resolution warning limit reached".to_string();
     }
 }
 

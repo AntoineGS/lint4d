@@ -190,7 +190,7 @@ fn collect_formatting_tokens(
             return Err("range formatting token mapping exceeds its work limit".to_string());
         }
         budget.nodes -= 1;
-        if visits % 256 == 0 {
+        if visits.is_multiple_of(256) {
             check_workspace_cancel(Some(cancel))?;
         }
         if current.child_count() == 0 {
@@ -300,7 +300,7 @@ fn collect_formatting_statements<'tree>(
         if visits > MAX_RANGE_MAPPING_NODES {
             return Err("range formatting syntax mapping exceeds its work limit".to_string());
         }
-        if visits % 256 == 0 {
+        if visits.is_multiple_of(256) {
             check_workspace_cancel(Some(cancel))?;
         }
         if is_supported_range_statement(node.kind()) {
@@ -480,18 +480,13 @@ pub struct WorkspaceOptions {
     pub limits: ResourceLimits,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum RuntimeOption<T> {
+    #[default]
     Absent,
     Reset,
     Value(T),
     Invalid(String),
-}
-
-impl<T> Default for RuntimeOption<T> {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1980,10 +1975,10 @@ impl DiagnosticPublicationUriCursor {
         }
         if !self.open_stream_added {
             self.open_stream_added = true;
-            if let Some(stream) = self.open_documents.as_mut() {
-                if let Some(uri) = stream.next() {
-                    self.frontier.push(Reverse((uri, usize::MAX)));
-                }
+            if let Some(stream) = self.open_documents.as_mut()
+                && let Some(uri) = stream.next()
+            {
+                self.frontier.push(Reverse((uri, usize::MAX)));
             }
             return DiagnosticPublicationCursorStep::Skipped;
         }
@@ -3724,12 +3719,11 @@ impl Workspace {
                 if paths_equal_ci(&path, &include_path) {
                     continue;
                 }
-                if let Ok(uri) = Url::from_file_path(path) {
-                    if candidates.insert(canonical_file_uri(&uri))
-                        && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY
-                    {
-                        return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
-                    }
+                if let Ok(uri) = Url::from_file_path(path)
+                    && candidates.insert(canonical_file_uri(&uri))
+                    && candidates.len() > MAX_INCLUDE_OWNER_DISCOVERY
+                {
+                    return Ok(IncludeOwnerDiscoveryOutcome::Incomplete);
                 }
             }
         }
@@ -3817,14 +3811,14 @@ impl Workspace {
                 "document is outside configured source paths: {uri}"
             ));
         }
-        if let Some(previous) = self.open_documents.get(&uri) {
-            if version <= previous.version {
-                eprintln!(
-                    "pascal-lsp: warning: ignored non-monotonic version {} for {} (current {})",
-                    version, uri, previous.version
-                );
-                return Ok(());
-            }
+        if let Some(previous) = self.open_documents.get(&uri)
+            && version <= previous.version
+        {
+            eprintln!(
+                "pascal-lsp: warning: ignored non-monotonic version {} for {} (current {})",
+                version, uri, previous.version
+            );
+            return Ok(());
         }
         if let Err(reason) = self.validate_open_text(&uri, &text) {
             self.reject_open_document(uri, version, reason);
@@ -4097,16 +4091,14 @@ impl Workspace {
         if let (Some(pending), Some(document)) = (
             self.pending_unit_file_renames.get_mut(uri),
             self.open_documents.get(uri),
-        ) {
-            if pending.expected_text.as_deref().is_some_and(|expected| {
-                document.text.as_deref() == Some(expected) && document.rejection.is_none()
-            }) && pending.original_identity_generation == Some(document.identity_generation)
-                && pending
-                    .original_version
-                    .is_some_and(|version| document.version > version)
-            {
-                pending.closed_verified_version = Some(document.version);
-            }
+        ) && pending.expected_text.as_deref().is_some_and(|expected| {
+            document.text.as_deref() == Some(expected) && document.rejection.is_none()
+        }) && pending.original_identity_generation == Some(document.identity_generation)
+            && pending
+                .original_version
+                .is_some_and(|version| document.version > version)
+        {
+            pending.closed_verified_version = Some(document.version);
         }
         let retained_context = self.document_contexts.get(uri).cloned();
         let was_open = if let Some(document) = self.open_documents.remove(uri) {
@@ -4165,10 +4157,10 @@ impl Workspace {
         self.mark_source_change(&uri, !had_overlay);
         let text_len = text.len();
         let source_for_index = text.clone();
-        if let Some(previous) = self.open_documents.get(&uri) {
-            if let Some(previous_text) = &previous.text {
-                self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
-            }
+        if let Some(previous) = self.open_documents.get(&uri)
+            && let Some(previous_text) = &previous.text
+        {
+            self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
         }
         self.open_text_bytes = self.open_text_bytes.saturating_add(text_len);
         let identity_generation = if preserve_identity {
@@ -4212,10 +4204,10 @@ impl Workspace {
         self.bump_source_generation();
         // Rejection removes any overlay from its directory listing.
         self.mark_source_change(&uri, true);
-        if let Some(previous) = self.open_documents.get(&uri) {
-            if let Some(previous_text) = &previous.text {
-                self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
-            }
+        if let Some(previous) = self.open_documents.get(&uri)
+            && let Some(previous_text) = &previous.text
+        {
+            self.open_text_bytes = self.open_text_bytes.saturating_sub(previous_text.len());
         }
         self.remove_indexed(&uri);
         self.open_document_contexts.remove(&uri);
@@ -4338,10 +4330,8 @@ impl Workspace {
         let override_changed = uri
             .to_file_path()
             .is_ok_and(|path| is_immutable_override_file(&path));
-        if override_changed {
-            if let Ok(path) = uri.to_file_path() {
-                self.project_cache.invalidate_path(&absolute_path(path));
-            }
+        if override_changed && let Ok(path) = uri.to_file_path() {
+            self.project_cache.invalidate_path(&absolute_path(path));
         }
         if !override_changed {
             self.bump_source_generation();
@@ -4367,14 +4357,12 @@ impl Workspace {
         if Self::fail_file_event_after_mutation_for_test(uri) {
             return Err("injected file-event failure after workspace mutation".into());
         }
-        if override_changed {
-            if let Ok(path) = uri.to_file_path() {
-                match change {
-                    FileChange::Deleted => self.overrides.remove_path(&path)?,
-                    FileChange::Created | FileChange::Changed => {
-                        if let Some(budget) = budget {
-                            self.overrides.refresh_path_with_budget(&path, budget)?;
-                        }
+        if override_changed && let Ok(path) = uri.to_file_path() {
+            match change {
+                FileChange::Deleted => self.overrides.remove_path(&path)?,
+                FileChange::Created | FileChange::Changed => {
+                    if let Some(budget) = budget {
+                        self.overrides.refresh_path_with_budget(&path, budget)?;
                     }
                 }
             }
@@ -4483,12 +4471,11 @@ impl Workspace {
                 budget.recovery_refused.set(true);
                 return Err("rename recovery URI exceeds the admitted document URI cap".into());
             }
-            if seen_endpoints.insert(uri.clone()) {
-                if let Some(document) = self.open_documents.get(uri) {
-                    if document.text.is_some() {
-                        staged_endpoints.insert(uri.clone(), document.version);
-                    }
-                }
+            if seen_endpoints.insert(uri.clone())
+                && let Some(document) = self.open_documents.get(uri)
+                && document.text.is_some()
+            {
+                staged_endpoints.insert(uri.clone(), document.version);
             }
             Ok(())
         };
@@ -4942,10 +4929,11 @@ impl Workspace {
         let source_generation = self.source_generation;
         for (uri, document) in &mut self.open_documents {
             budget.charge_recovery_work(1, uri.as_str().len())?;
-            if let Some(expected_version) = plan.rename_rejections.get(uri) {
-                if document.text.is_some() && document.version != *expected_version {
-                    return Err("rename endpoint changed after recovery preflight".into());
-                }
+            if let Some(expected_version) = plan.rename_rejections.get(uri)
+                && document.text.is_some()
+                && document.version != *expected_version
+            {
+                return Err("rename endpoint changed after recovery preflight".into());
             }
             if rejected_rename_uris.contains(uri) && document.text.is_some() {
                 if let Some(text) = document.text.take() {
@@ -5148,12 +5136,11 @@ impl Workspace {
             .pending_unit_file_renames
             .get(&old_uri)
             .is_some_and(|pending| pending.new_uri == new_uri)
+            && let Some(pending) = self.pending_unit_file_renames.remove(&old_uri)
         {
-            if let Some(pending) = self.pending_unit_file_renames.remove(&old_uri) {
-                self.pending_unit_file_rename_bytes = self
-                    .pending_unit_file_rename_bytes
-                    .saturating_sub(pending.expected_text.as_ref().map_or(0, String::len));
-            }
+            self.pending_unit_file_rename_bytes = self
+                .pending_unit_file_rename_bytes
+                .saturating_sub(pending.expected_text.as_ref().map_or(0, String::len));
         }
     }
 
@@ -6906,10 +6893,10 @@ impl Workspace {
                 .sort_by_key(|unit| !roots.iter().any(|root| unit.source.path.starts_with(root)));
         }
         let total = dependency_units.len();
-        if total > 0 {
-            if let Some(hook) = &self.dependency_hook {
-                hook(uri, 0, total)?;
-            }
+        if total > 0
+            && let Some(hook) = &self.dependency_hook
+        {
+            hook(uri, 0, total)?;
         }
         let mut resolved_urls = HashMap::new();
         let mut resolved_revisions = HashMap::new();
@@ -7009,10 +6996,10 @@ impl Workspace {
             }
         }
         for import in &resolved.bindings {
-            if let ResolutionTarget::Found(source_id) = &import.target {
-                if let Some(dependency_uri) = resolved_urls.get(source_id) {
-                    bindings.insert(import.site.requested_name.clone(), dependency_uri.clone());
-                }
+            if let ResolutionTarget::Found(source_id) = &import.target
+                && let Some(dependency_uri) = resolved_urls.get(source_id)
+            {
+                bindings.insert(import.site.requested_name.clone(), dependency_uri.clone());
             }
         }
         check_workspace_cancel(cancel)?;
@@ -7052,23 +7039,22 @@ impl Workspace {
                 interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
             self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
         }
-        if graph_complete {
-            if let (Some(claim), Some(resolved), Some(bytes)) =
+        if graph_complete
+            && let (Some(claim), Some(resolved), Some(bytes)) =
                 (import_claim, resolved_for_cache, import_bytes)
-            {
-                let (probes, watch_dirs) = crate::project_cache::report_probes(&report, &resolved);
-                self.project_cache.store_imports(
-                    claim,
-                    crate::project_cache::ImportValue {
-                        resolved,
-                        report: report.clone(),
-                        probes,
-                        watch_dirs,
-                    },
-                    bytes,
-                    cancel.unwrap_or(&no_cancel),
-                );
-            }
+        {
+            let (probes, watch_dirs) = crate::project_cache::report_probes(&report, &resolved);
+            self.project_cache.store_imports(
+                claim,
+                crate::project_cache::ImportValue {
+                    resolved,
+                    report: report.clone(),
+                    probes,
+                    watch_dirs,
+                },
+                bytes,
+                cancel.unwrap_or(&no_cancel),
+            );
         }
 
         // Source providers resolved above always win. Only unresolved imports
@@ -8108,10 +8094,10 @@ impl Workspace {
                 &context.read_policy,
                 &entry,
             );
-            if let Some(records) = self.analysis_records.as_mut() {
-                if let Some(record) = records.get_mut(&uri) {
-                    record.include_payload = true;
-                }
+            if let Some(records) = self.analysis_records.as_mut()
+                && let Some(record) = records.get_mut(&uri)
+            {
+                record.include_payload = true;
             }
         }
         Ok(())
@@ -8386,10 +8372,10 @@ impl Workspace {
     }
 
     fn source_text_for_mapping(&self, uri: &Url) -> Option<String> {
-        if let Some(document) = self.open_documents.get(uri) {
-            if let Some(text) = &document.text {
-                return Some(text.clone());
-            }
+        if let Some(document) = self.open_documents.get(uri)
+            && let Some(text) = &document.text
+        {
+            return Some(text.clone());
         }
         if let Some(expansion) = self.expansions.get(uri) {
             return Some(expansion.physical_source.clone());
@@ -8794,10 +8780,10 @@ impl Workspace {
                     .find(|existing| package_paths_equal(existing, path))
                     .cloned();
                 if let Some(existing) = existing {
-                    if let Some(current) = state.watched_paths.get_mut(&existing) {
-                        if current.is_none() {
-                            *current = stamp.clone();
-                        }
+                    if let Some(current) = state.watched_paths.get_mut(&existing)
+                        && current.is_none()
+                    {
+                        *current = stamp.clone();
                     }
                 } else {
                     state.watched_paths.insert(path.to_path_buf(), stamp);
@@ -8989,25 +8975,24 @@ impl Workspace {
             rediscover_open_context = true;
         }
 
-        if !rediscover_open_context {
-            if let Some(existing) = self.document_contexts.get(uri).cloned() {
-                if self.contexts.contains_key(&existing) {
-                    self.extend_context_watch_paths(&existing, &path, cancel, budget)?;
-                    if self.context_is_fresh_with_cancel(&existing, cancel, budget)?
-                        && self.context_matches_current_selection_with_cancel_and_budget(
-                            &path, &existing, cancel, budget,
-                        )?
-                    {
-                        self.remember_document_owner(uri, &existing);
-                        return Ok(existing);
-                    }
-                    self.invalidate_contexts_with_control(
-                        &HashSet::from([existing.clone()]),
-                        cancel,
-                        budget,
-                    )?;
-                }
+        if !rediscover_open_context
+            && let Some(existing) = self.document_contexts.get(uri).cloned()
+            && self.contexts.contains_key(&existing)
+        {
+            self.extend_context_watch_paths(&existing, &path, cancel, budget)?;
+            if self.context_is_fresh_with_cancel(&existing, cancel, budget)?
+                && self.context_matches_current_selection_with_cancel_and_budget(
+                    &path, &existing, cancel, budget,
+                )?
+            {
+                self.remember_document_owner(uri, &existing);
+                return Ok(existing);
             }
+            self.invalidate_contexts_with_control(
+                &HashSet::from([existing.clone()]),
+                cancel,
+                budget,
+            )?;
         }
 
         let roots = self
@@ -9208,10 +9193,10 @@ impl Workspace {
                 budget.map(|budget| budget as &dyn ProjectWorkBudget),
                 &deleted_paths,
             );
-            if let Err(error) = &candidate_status {
-                if error == CANCELLATION_MESSAGE {
-                    return Err(error.clone());
-                }
+            if let Err(error) = &candidate_status
+                && error == CANCELLATION_MESSAGE
+            {
+                return Err(error.clone());
             }
             if !matches!(candidate_status, Ok(true)) {
                 let mut warnings = vec![format!(
@@ -9354,20 +9339,19 @@ impl Workspace {
         roots: &[PathBuf],
         project_options: &ProjectOptions,
     ) -> Result<(ContextKey, ProjectContext), String> {
-        if let Some(owner) = self.document_owners.get(uri) {
-            if owner.origin != OwnerOrigin::Automatic
-                && !owner.follow_current_project_file
-                && self.known_owner_selection_is_current(path, owner)
+        if let Some(owner) = self.document_owners.get(uri)
+            && owner.origin != OwnerOrigin::Automatic
+            && !owner.follow_current_project_file
+            && self.known_owner_selection_is_current(path, owner)
+        {
+            if !owner.needs_revalidation
+                && self.context_state_is_fresh_with_open_documents(&owner.state, None, None)?
             {
-                if !owner.needs_revalidation
-                    && self.context_state_is_fresh_with_open_documents(&owner.state, None, None)?
-                {
-                    return Ok((owner.key.clone(), owner.state.context.clone()));
-                }
-                let discovery =
-                    self.rediscover_known_owner(path, owner, roots, project_options, None, None)?;
-                return Ok((discovery.0, discovery.1.context));
+                return Ok((owner.key.clone(), owner.state.context.clone()));
             }
+            let discovery =
+                self.rediscover_known_owner(path, owner, roots, project_options, None, None)?;
+            return Ok((discovery.0, discovery.1.context));
         }
         let context = discover_with_selections(
             path,
@@ -9413,10 +9397,9 @@ impl Workspace {
             if let (Some(scope), Some(project_file)) = (
                 owner.key.project_scope.as_deref(),
                 owner.key.project_file.as_deref(),
-            ) {
-                if let Some(selected) = self.project_selections.get(scope) {
-                    return Ok(paths_equal_ci(selected, project_file));
-                }
+            ) && let Some(selected) = self.project_selections.get(scope)
+            {
+                return Ok(paths_equal_ci(selected, project_file));
             }
             // A startup-project owner is retained until a runtime directory
             // selection becomes applicable to this document. Inherited owners
@@ -9881,12 +9864,11 @@ impl Workspace {
                         budget.map(|budget| budget as &dyn ProjectWorkBudget),
                     )
                 });
-            if let Err(error) = &membership {
-                if error == CANCELLATION_MESSAGE
-                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
-                {
-                    return Err(error.clone());
-                }
+            if let Err(error) = &membership
+                && (error == CANCELLATION_MESSAGE
+                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED)
+            {
+                return Err(error.clone());
             }
             project_candidate_memberships.insert(directory, membership);
         }
@@ -10060,12 +10042,11 @@ impl Workspace {
                 &deleted_paths,
                 budget.map(|budget| budget as &dyn ProjectWorkBudget),
             );
-            if let Err(error) = &membership {
-                if error == CANCELLATION_MESSAGE
-                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED
-                {
-                    return Err(error.clone());
-                }
+            if let Err(error) = &membership
+                && (error == CANCELLATION_MESSAGE
+                    || error == NOTIFICATION_RECONCILIATION_BUDGET_EXCEEDED)
+            {
+                return Err(error.clone());
             }
             prepared.push((path, membership));
         }
@@ -12052,12 +12033,11 @@ impl Workspace {
             .directory_catalogues
             .get(&directory)
             .is_some_and(|catalogue| catalogue.stamp == stamp)
+            && let Some(catalogue) = self.directory_catalogues.get_mut(&directory)
         {
-            if let Some(catalogue) = self.directory_catalogues.get_mut(&directory) {
-                self.use_clock = self.use_clock.saturating_add(1);
-                catalogue.last_used = self.use_clock;
-                return catalogue.entries.clone();
-            }
+            self.use_clock = self.use_clock.saturating_add(1);
+            catalogue.last_used = self.use_clock;
+            return catalogue.entries.clone();
         }
 
         let entries = fs::read_dir(&directory)

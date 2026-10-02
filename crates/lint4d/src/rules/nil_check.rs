@@ -320,10 +320,8 @@ fn analyze_cfg(
                             propagated.insert(cmp.var_name.clone(), true);
                         }
                     }
-                    EdgeKind::ConditionalFalse => {
-                        if !cmp.is_not_nil {
-                            propagated.insert(cmp.var_name.clone(), true);
-                        }
+                    EdgeKind::ConditionalFalse if !cmp.is_not_nil => {
+                        propagated.insert(cmp.var_name.clone(), true);
                     }
                     _ => {}
                 }
@@ -604,16 +602,16 @@ fn analyze_return_nil(cfg: &Cfg, source: &[u8]) -> bool {
             let text = pascal_core::decode_bytes(&source[start..end]);
             let lower = text.trim().to_lowercase();
 
-            if let Some((var, rhs)) = parse_assignment_parts(&lower) {
-                if var == "result" {
-                    let rhs_trimmed = rhs.trim().trim_end_matches(';').trim();
-                    if rhs_trimmed == "nil" {
-                        state = false;
-                    } else if is_constructor_pattern(rhs_trimmed) {
-                        state = true;
-                    } else {
-                        state = true; // Other assignments conservatively non-nil
-                    }
+            if let Some((var, rhs)) = parse_assignment_parts(&lower)
+                && var == "result"
+            {
+                let rhs_trimmed = rhs.trim().trim_end_matches(';').trim();
+                if rhs_trimmed == "nil" {
+                    state = false;
+                } else if is_constructor_pattern(rhs_trimmed) {
+                    state = true;
+                } else {
+                    state = true; // Other assignments conservatively non-nil
                 }
             }
         }
@@ -656,14 +654,14 @@ fn parse_nil_comparison(text: &str) -> Option<NilComparison> {
         .trim_end_matches(" then")
         .trim();
 
-    if let Some(inner) = extract_assigned_arg(lower) {
-        if is_identifier(&inner) {
-            let is_negated = lower.trim_start().starts_with("not ");
-            return Some(NilComparison {
-                var_name: inner,
-                is_not_nil: !is_negated,
-            });
-        }
+    if let Some(inner) = extract_assigned_arg(lower)
+        && is_identifier(&inner)
+    {
+        let is_negated = lower.trim_start().starts_with("not ");
+        return Some(NilComparison {
+            var_name: inner,
+            is_not_nil: !is_negated,
+        });
     }
 
     if let Some(var) = extract_nil_compare(lower, "<>") {

@@ -76,19 +76,19 @@ fn collect_node(
                 scopes.file.insert(file_key.clone(), name);
 
                 // If the type is a class/record, collect its fields.
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    if type_node.kind() == K::DECL_CLASS || type_node.kind() == K::DECL_RECORD {
-                        let class_key_bytes = file_key.len();
-                        charge_scope_entry(
-                            &mut *budget,
-                            cancel,
-                            &scopes.classes,
-                            class_key_bytes,
-                            std::mem::size_of::<HashMap<String, String>>(),
-                        )?;
-                        let fields = scopes.classes.entry(file_key).or_default();
-                        collect_class_fields_bounded(type_node, source, fields, budget, cancel)?;
-                    }
+                if let Some(type_node) = node.child_by_field_name("type")
+                    && (type_node.kind() == K::DECL_CLASS || type_node.kind() == K::DECL_RECORD)
+                {
+                    let class_key_bytes = file_key.len();
+                    charge_scope_entry(
+                        &mut *budget,
+                        cancel,
+                        &scopes.classes,
+                        class_key_bytes,
+                        std::mem::size_of::<HashMap<String, String>>(),
+                    )?;
+                    let fields = scopes.classes.entry(file_key).or_default();
+                    collect_class_fields_bounded(type_node, source, fields, budget, cancel)?;
                 }
             }
             // Don't recurse further — class body is handled above.
@@ -128,18 +128,18 @@ fn collect_node(
             // Standalone procedure declaration (not class-qualified).
             // A class-qualified one has a genericDot name: `TFoo.DoWork`.
             // We add the simple name to file scope.
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if name_node.kind() == K::IDENTIFIER {
-                    // Simple name — file-level procedure
-                    let name_bytes = name_node.end_byte().saturating_sub(name_node.start_byte());
-                    charge_owned_budget(budget, cancel, decoded_text_capacity(name_bytes))?;
-                    let name = node_text(name_node, source);
-                    let key_bytes = lowercase_utf8_len(&name);
-                    charge_scope_entry(&mut *budget, cancel, &scopes.file, key_bytes, name.len())?;
-                    scopes.file.insert(name.to_lowercase(), name);
-                }
-                // genericDot means class method — skip for file scope.
+            if let Some(name_node) = node.child_by_field_name("name")
+                && name_node.kind() == K::IDENTIFIER
+            {
+                // Simple name — file-level procedure
+                let name_bytes = name_node.end_byte().saturating_sub(name_node.start_byte());
+                charge_owned_budget(budget, cancel, decoded_text_capacity(name_bytes))?;
+                let name = node_text(name_node, source);
+                let key_bytes = lowercase_utf8_len(&name);
+                charge_scope_entry(&mut *budget, cancel, &scopes.file, key_bytes, name.len())?;
+                scopes.file.insert(name.to_lowercase(), name);
             }
+            // genericDot means class method — skip for file scope.
             return Ok(());
         }
         _ => {}

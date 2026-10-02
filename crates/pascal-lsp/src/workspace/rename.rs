@@ -89,11 +89,13 @@ const INCLUDE_BYTE_BUDGET_ERROR: &str =
     "include byte limit would be exceeded before reading the file";
 
 #[cfg(test)]
+type EnumeratedContextHook = Box<dyn FnMut(usize, &Path, &ProjectContext)>;
+
+#[cfg(test)]
 thread_local! {
     static TEST_CANCEL_INCLUDE_ANALYSIS: Cell<bool> = const { Cell::new(false) };
     static TEST_CANCEL_ENUMERATED_CONTEXTS_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
-    static TEST_ENUMERATED_CONTEXT_HOOK:
-        std::cell::RefCell<Option<Box<dyn FnMut(usize, &Path, &ProjectContext)>>> =
+    static TEST_ENUMERATED_CONTEXT_HOOK: std::cell::RefCell<Option<EnumeratedContextHook>> =
         std::cell::RefCell::new(None);
     static TEST_SIBLING_CONTEXT_REUSE_CHECKS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static TEST_ENUMERATED_OWNERS: std::cell::RefCell<Vec<(PathBuf, ContextKey)>> =
@@ -145,9 +147,7 @@ fn cancel_after_enumerated_contexts(processed: usize, cancel: &AtomicBool) {
 }
 
 #[cfg(test)]
-pub(crate) struct TestEnumeratedContextHookGuard(
-    Option<Box<dyn FnMut(usize, &Path, &ProjectContext)>>,
-);
+pub(crate) struct TestEnumeratedContextHookGuard(Option<EnumeratedContextHook>);
 
 #[cfg(test)]
 pub(crate) fn test_after_enumerated_context(
@@ -2930,8 +2930,8 @@ pub(crate) fn consumed_context_records(
                 ));
             }
         };
-        if seen.insert(path_key(directory)) {
-            if let Some(record) = path_record_at(
+        if seen.insert(path_key(directory))
+            && let Some(record) = path_record_at(
                 directory.clone(),
                 None,
                 None,
@@ -2940,9 +2940,9 @@ pub(crate) fn consumed_context_records(
                 None,
                 None,
                 false,
-            ) {
-                records.push(record);
-            }
+            )
+        {
+            records.push(record);
         }
     }
 
@@ -3579,28 +3579,27 @@ pub(crate) fn symbol_rename_from_input(
     if selected_binding
         .as_ref()
         .is_none_or(|binding| binding.unit && binding.unit_provider_uri.is_none())
+        && let Ok(classification) = binding_classification
     {
-        if let Ok(classification) = binding_classification {
-            match complete_binding_info_for_input(
-                &input,
-                uri,
-                position,
-                &classification,
-                new_name,
-                cancel,
-            ) {
-                Ok(Some(binding)) => selected_binding = Some(binding),
-                Ok(None) => {}
-                Err(error) => {
-                    return (
-                        failed(
-                            input.source_generation,
-                            input.configuration_generation,
-                            error,
-                        ),
-                        None,
-                    );
-                }
+        match complete_binding_info_for_input(
+            &input,
+            uri,
+            position,
+            &classification,
+            new_name,
+            cancel,
+        ) {
+            Ok(Some(binding)) => selected_binding = Some(binding),
+            Ok(None) => {}
+            Err(error) => {
+                return (
+                    failed(
+                        input.source_generation,
+                        input.configuration_generation,
+                        error,
+                    ),
+                    None,
+                );
             }
         }
     }
@@ -4218,7 +4217,7 @@ fn skip_pascal_trivia(source: &str, cursor: &mut usize, cancel: &AtomicBool) -> 
     let bytes = source.as_bytes();
     loop {
         while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
-            if *cursor % 1024 == 0 && is_cancelled(cancel) {
+            if (*cursor).is_multiple_of(1024) && is_cancelled(cancel) {
                 return Err(CANCELLATION_MESSAGE.to_string());
             }
             *cursor += 1;
@@ -4229,7 +4228,7 @@ fn skip_pascal_trivia(source: &str, cursor: &mut usize, cancel: &AtomicBool) -> 
                 .get(*cursor)
                 .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
             {
-                if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                if (*cursor).is_multiple_of(1024) && is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
                 *cursor += 1;
@@ -4240,7 +4239,7 @@ fn skip_pascal_trivia(source: &str, cursor: &mut usize, cancel: &AtomicBool) -> 
             let start = *cursor;
             *cursor += 1;
             while bytes.get(*cursor).is_some_and(|byte| *byte != b'}') {
-                if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                if (*cursor).is_multiple_of(1024) && is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
                 *cursor += 1;
@@ -4258,7 +4257,7 @@ fn skip_pascal_trivia(source: &str, cursor: &mut usize, cancel: &AtomicBool) -> 
             *cursor += 2;
             let mut depth = 1usize;
             while depth > 0 {
-                if *cursor % 1024 == 0 && is_cancelled(cancel) {
+                if (*cursor).is_multiple_of(1024) && is_cancelled(cancel) {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
                 match bytes.get(*cursor..*cursor + 2) {
@@ -4313,7 +4312,7 @@ fn explicit_uses_path_after(
     let mut decoded_path = String::new();
     let mut raw_starts = Vec::new();
     loop {
-        if cursor % 1024 == 0 && is_cancelled(cancel) {
+        if cursor.is_multiple_of(1024) && is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         let Some(character) = source.get(cursor..).and_then(|tail| tail.chars().next()) else {
@@ -4341,7 +4340,7 @@ fn explicit_uses_path_after(
     let basename_index = decoded_path
         .char_indices()
         .filter_map(|(index, character)| matches!(character, '/' | '\\').then_some(index + 1))
-        .last()
+        .next_back()
         .unwrap_or(0);
     let basename_char_index = decoded_path[..basename_index].chars().count();
     let total_chars = decoded_path.chars().count();
@@ -5200,22 +5199,21 @@ fn snapshot_context_for_uri(
     cancel: &AtomicBool,
     defer_context_pruning: bool,
 ) -> Result<ContextKey, String> {
-    if let Some(owner) = loader.document_owners.get(uri).cloned() {
-        if loader.context_has_open_legacy_overlay(&owner.state)
+    if let Some(owner) = loader.document_owners.get(uri).cloned()
+        && (loader.context_has_open_legacy_overlay(&owner.state)
             || (!super::context_state_is_fresh_with_cancel(&owner.state, Some(cancel), None)?
                 && loader.context_state_is_fresh_with_open_documents(
                     &owner.state,
                     Some(cancel),
                     None,
-                )?)
-        {
-            loader
-                .contexts
-                .insert(owner.key.clone(), ContextState::clone(&owner.state));
-            loader
-                .document_contexts
-                .insert(uri.clone(), owner.key.clone());
-        }
+                )?))
+    {
+        loader
+            .contexts
+            .insert(owner.key.clone(), ContextState::clone(&owner.state));
+        loader
+            .document_contexts
+            .insert(uri.clone(), owner.key.clone());
     }
     loader.context_for_uri_with_cancel_and_budget_anchor_policy(
         uri,
@@ -6360,13 +6358,15 @@ fn build_snapshot_with_policy(
                 scan.bytes,
             )
         };
-        if mode == SnapshotMode::Assistance && !is_priority && !auto_import_provider_recorded {
-            if let Some(unit_name) = source_unit_name(&source, cancel)? {
-                auto_import_unit_providers
-                    .entry(unit_name)
-                    .or_default()
-                    .push(uri.clone());
-            }
+        if mode == SnapshotMode::Assistance
+            && !is_priority
+            && !auto_import_provider_recorded
+            && let Some(unit_name) = source_unit_name(&source, cancel)?
+        {
+            auto_import_unit_providers
+                .entry(unit_name)
+                .or_default()
+                .push(uri.clone());
         }
         if !record.open {
             baseline.set_payload_dependency(&path, read_policy.clone(), path_entry.clone());
@@ -6420,28 +6420,28 @@ fn build_snapshot_with_policy(
                         || contains_any_identifier(&indexed_source, candidate_names)
                         || (mode == SnapshotMode::Assistance
                             && contains_any_identifier_prefix(&indexed_source, candidate_names));
-                    if expanded_source_contains_candidate {
-                        if let Some(expansion) = loader.expansions.get(&uri).cloned() {
-                            retain_expansion_dependencies(
-                                &mut loader,
-                                input,
-                                &uri,
-                                &source_context_key,
-                                &expansion,
-                                &mut sources,
-                                &mut records,
-                                &mut readable,
-                                &mut editable,
-                                &mut contexts,
-                                &mut baseline,
-                                &mut baseline_content_hashes,
-                                &mut retained_files,
-                                &mut retained_bytes,
-                                &mut complete,
-                                &mut incomplete_reason,
-                                cancel,
-                            )?;
-                        }
+                    if expanded_source_contains_candidate
+                        && let Some(expansion) = loader.expansions.get(&uri).cloned()
+                    {
+                        retain_expansion_dependencies(
+                            &mut loader,
+                            input,
+                            &uri,
+                            &source_context_key,
+                            &expansion,
+                            &mut sources,
+                            &mut records,
+                            &mut readable,
+                            &mut editable,
+                            &mut contexts,
+                            &mut baseline,
+                            &mut baseline_content_hashes,
+                            &mut retained_files,
+                            &mut retained_bytes,
+                            &mut complete,
+                            &mut incomplete_reason,
+                            cancel,
+                        )?;
                     }
                 }
                 Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
@@ -6729,52 +6729,49 @@ fn build_snapshot_with_policy(
         declaration_providers = closure.providers;
     }
 
-    if mode != SnapshotMode::WorkspaceSymbols {
-        if let Some(evicted_uri) = pins.iter().find(|uri| !loader.indexed_files.contains(*uri)) {
-            complete = false;
-            incomplete_reason.get_or_insert_with(|| {
-                format!(
-                    "retained rename source was evicted before binding completed: {evicted_uri}"
-                )
-            });
-        }
+    if mode != SnapshotMode::WorkspaceSymbols
+        && let Some(evicted_uri) = pins.iter().find(|uri| !loader.indexed_files.contains(*uri))
+    {
+        complete = false;
+        incomplete_reason.get_or_insert_with(|| {
+            format!("retained rename source was evicted before binding completed: {evicted_uri}")
+        });
     }
-    if mode == SnapshotMode::Assistance {
-        if let Some(current_uri) = priority.first() {
-            let Some(context_key) = priority_contexts.get(current_uri).cloned() else {
-                auto_import_unit_providers.clear();
-                loader
-                    .index
-                    .set_auto_import_unit_providers(auto_import_unit_providers.clone());
-                return Err(format!(
-                    "auto-import provider context was not retained for {current_uri}"
-                ));
-            };
-            retain_resolvable_auto_import_providers(
-                &mut loader,
-                current_uri,
-                &context_key,
-                &mut auto_import_unit_providers,
-                &mut pins,
-                candidate_names,
-                cancel,
-            )?;
+    if mode == SnapshotMode::Assistance
+        && let Some(current_uri) = priority.first()
+    {
+        let Some(context_key) = priority_contexts.get(current_uri).cloned() else {
+            auto_import_unit_providers.clear();
             loader
                 .index
                 .set_auto_import_unit_providers(auto_import_unit_providers.clone());
-        }
+            return Err(format!(
+                "auto-import provider context was not retained for {current_uri}"
+            ));
+        };
+        retain_resolvable_auto_import_providers(
+            &mut loader,
+            current_uri,
+            &context_key,
+            &mut auto_import_unit_providers,
+            &mut pins,
+            candidate_names,
+            cancel,
+        )?;
+        loader
+            .index
+            .set_auto_import_unit_providers(auto_import_unit_providers.clone());
     }
-    if mode == SnapshotMode::Assistance {
-        if let Some(current_uri) = priority.first() {
-            if let Some(record) = records.get_mut(current_uri) {
-                record.auto_import_scopes = assistance_auto_import_scopes(
-                    &loader,
-                    &priority_contexts,
-                    &auto_import_unit_providers,
-                    candidate_names,
-                );
-            }
-        }
+    if mode == SnapshotMode::Assistance
+        && let Some(current_uri) = priority.first()
+        && let Some(record) = records.get_mut(current_uri)
+    {
+        record.auto_import_scopes = assistance_auto_import_scopes(
+            &loader,
+            &priority_contexts,
+            &auto_import_unit_providers,
+            candidate_names,
+        );
     }
     let auto_import_context = if mode == SnapshotMode::Assistance {
         match (
@@ -7744,7 +7741,7 @@ fn enumerate_assistance_provider_sources(
                 };
                 overlay_paths.push((absolute_path(path), overlay.text.len()));
             }
-            overlay_paths.sort_by(|left, right| path_key(&left.0).cmp(&path_key(&right.0)));
+            overlay_paths.sort_by_key(|left| path_key(&left.0));
             overlay_paths.dedup_by(|left, right| paths_equal_ci(&left.0, &right.0));
             for (path, overlay_bytes) in overlay_paths {
                 if is_cancelled(cancel) {

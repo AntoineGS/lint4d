@@ -484,20 +484,20 @@ impl<'a> DocBuilder<'a> {
             }
             match child.kind() {
                 K::PP_IF | K::PP_ELSE | K::PP_END_IF => {
-                    if let Some(prev) = prev_end_row {
-                        if self.has_blank_line_between(prev, child.start_position().row) {
-                            parts.push(Doc::BlankLine);
-                        }
+                    if let Some(prev) = prev_end_row
+                        && self.has_blank_line_between(prev, child.start_position().row)
+                    {
+                        parts.push(Doc::BlankLine);
                     }
                     parts.push(Doc::Hardline);
                     parts.push(doc::token(self.node_text(child), child.kind(), ""));
                     prev_end_row = Some(child.end_position().row);
                 }
                 _ => {
-                    if let Some(prev) = prev_end_row {
-                        if self.has_blank_line_between(prev, child.start_position().row) {
-                            parts.push(Doc::BlankLine);
-                        }
+                    if let Some(prev) = prev_end_row
+                        && self.has_blank_line_between(prev, child.start_position().row)
+                    {
+                        parts.push(Doc::BlankLine);
                     }
                     let child_doc = self.doc_for_node(child);
                     if !starts_with_hardline(&child_doc) {

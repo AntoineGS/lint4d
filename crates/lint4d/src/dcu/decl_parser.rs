@@ -282,10 +282,10 @@ fn read_decl_list_inner(
                             .iter()
                             .filter(|(root_handle, _)| *root_handle == handle)
                             .map(|(_, type_index)| *type_index);
-                        if let (Some(type_index), None) = (matches.next(), matches.next()) {
-                            if let Some(indices) = class_definition_type_indices.as_deref_mut() {
-                                indices.push(type_index);
-                            }
+                        if let (Some(type_index), None) = (matches.next(), matches.next())
+                            && let Some(indices) = class_definition_type_indices.as_deref_mut()
+                        {
+                            indices.push(type_index);
                         }
                     }
                     // Provider shells intentionally discard decoded members:
@@ -294,12 +294,11 @@ fn read_decl_list_inner(
                     // Associate within this declaration scope. Shared vectors may
                     // contain nested routine-local types that are not the current
                     // scope's declaration.
-                    if let Some(type_index) = last_type_index {
-                        if unit_root {
-                            if let Some(indices) = class_definition_type_indices.as_deref_mut() {
-                                indices.push(type_index);
-                            }
-                        }
+                    if let Some(type_index) = last_type_index
+                        && unit_root
+                        && let Some(indices) = class_definition_type_indices.as_deref_mut()
+                    {
+                        indices.push(type_index);
                     }
                     if let Some(last_type) = last_type_index.and_then(|index| types.get_mut(index))
                     {
@@ -493,26 +492,26 @@ pub(crate) fn associate_proc_with_class(proc_name: &str, types: &mut [TypeInfo])
     if let Some(dot_pos) = proc_name.find('.') {
         let class_name = &proc_name[..dot_pos];
         let method_name = &proc_name[dot_pos + 1..];
-        if !method_name.is_empty() && !method_name.starts_with(':') {
-            if let Some(ti) = types
+        if !method_name.is_empty()
+            && !method_name.starts_with(':')
+            && let Some(ti) = types
                 .iter_mut()
                 .find(|t| t.name.eq_ignore_ascii_case(class_name))
-            {
-                ti.kind = TypeKind::Class;
-                let kind = if method_name == "Create" {
-                    MethodKind::Constructor
-                } else if method_name == "Destroy" {
-                    MethodKind::Destructor
-                } else {
-                    MethodKind::Procedure
-                };
-                ti.methods.push(MethodInfo {
-                    name: method_name.to_string(),
-                    kind,
-                    params: Vec::new(),
-                    return_type: None,
-                });
-            }
+        {
+            ti.kind = TypeKind::Class;
+            let kind = if method_name == "Create" {
+                MethodKind::Constructor
+            } else if method_name == "Destroy" {
+                MethodKind::Destructor
+            } else {
+                MethodKind::Procedure
+            };
+            ti.methods.push(MethodInfo {
+                name: method_name.to_string(),
+                kind,
+                params: Vec::new(),
+                return_type: None,
+            });
         }
     }
 }

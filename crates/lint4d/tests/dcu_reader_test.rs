@@ -137,7 +137,7 @@ fn read_name_long_format() {
 #[test]
 fn read_name_0xff_pre_xe2_is_literal_length() {
     let mut data = vec![0xFF];
-    data.extend(std::iter::repeat(b'A').take(255));
+    data.extend(std::iter::repeat_n(b'A', 255));
     let mut r = DcuReader::new(&data, DcuVersion::D2010);
     let name = r.read_name().unwrap();
     assert_eq!(name.len(), 255);

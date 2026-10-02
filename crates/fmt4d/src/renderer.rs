@@ -430,13 +430,13 @@ impl Renderer {
                             let before_len = self.output.len();
                             self.render_doc_inline(cell.content, indent);
                             let rendered_width = self.output.len() - before_len;
-                            if cell.pad {
-                                if let Some(&target_width) = col_widths.get(col_idx) {
-                                    let pad = target_width.saturating_sub(rendered_width);
-                                    if pad > 0 {
-                                        self.output.push_str(&" ".repeat(pad));
-                                        self.current_column += pad;
-                                    }
+                            if cell.pad
+                                && let Some(&target_width) = col_widths.get(col_idx)
+                            {
+                                let pad = target_width.saturating_sub(rendered_width);
+                                if pad > 0 {
+                                    self.output.push_str(&" ".repeat(pad));
+                                    self.current_column += pad;
                                 }
                             }
                         }

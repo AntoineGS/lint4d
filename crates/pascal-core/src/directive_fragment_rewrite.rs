@@ -481,16 +481,18 @@ fn trim_trailing_comment(body: &[u8], end: usize) -> usize {
         return end;
     }
     // `{ ... }` trailing comment
-    if body[end - 1] == b'}' {
-        if let Some(open) = find_matching_open_brace_comment(body, end - 1) {
-            return open;
-        }
+    if body[end - 1] == b'}'
+        && let Some(open) = find_matching_open_brace_comment(body, end - 1)
+    {
+        return open;
     }
     // `(* ... *)` trailing comment
-    if end >= 2 && body[end - 2] == b'*' && body[end - 1] == b')' {
-        if let Some(open) = find_matching_paren_star(body, end - 2) {
-            return open;
-        }
+    if end >= 2
+        && body[end - 2] == b'*'
+        && body[end - 1] == b')'
+        && let Some(open) = find_matching_paren_star(body, end - 2)
+    {
+        return open;
     }
     end
 }

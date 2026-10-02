@@ -293,10 +293,10 @@ fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
                     state = BranchState::ElseIf;
                 } else {
                     // It's a plain {$ELSE}
-                    if state == BranchState::ElseIf {
-                        if let Some(branch) = current_elseif.take() {
-                            else_if_branches.push(branch);
-                        }
+                    if state == BranchState::ElseIf
+                        && let Some(branch) = current_elseif.take()
+                    {
+                        else_if_branches.push(branch);
                     }
                     else_branch = Some(Vec::new());
                     state = BranchState::Else;
@@ -304,10 +304,10 @@ fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
             }
             k if k == K::PP_END_IF => {
                 // Flush any pending elseif
-                if state == BranchState::ElseIf {
-                    if let Some(branch) = current_elseif.take() {
-                        else_if_branches.push(branch);
-                    }
+                if state == BranchState::ElseIf
+                    && let Some(branch) = current_elseif.take()
+                {
+                    else_if_branches.push(branch);
                 }
                 endif = node_text(child, source);
             }
@@ -646,12 +646,11 @@ pub fn scan_external_paths(project_root: &Path, external_paths: &[String]) -> Ha
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext.eq_ignore_ascii_case("pas") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        units.insert(stem.to_lowercase());
-                    }
-                }
+            if let Some(ext) = path.extension()
+                && ext.eq_ignore_ascii_case("pas")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                units.insert(stem.to_lowercase());
             }
         }
     }

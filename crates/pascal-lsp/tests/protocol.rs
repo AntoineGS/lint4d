@@ -1858,7 +1858,7 @@ fn decoded_semantic_tokens(
     let mut line = 0;
     let mut character = 0;
     let mut tokens = Vec::with_capacity(data.len() / 5);
-    for chunk in data.chunks_exact(5) {
+    for chunk in data.as_chunks::<5>().0 {
         let delta_line = chunk[0].as_u64().expect("delta line") as u32;
         let delta_start = chunk[1].as_u64().expect("delta start") as u32;
         line += delta_line;
@@ -13552,13 +13552,15 @@ fn assert_folding_ranges_non_crossing(ranges: &[Value], include_characters: bool
         let line = range[format!("{prefix}Line")]
             .as_u64()
             .expect("folding range line");
-        let character = include_characters
-            .then(|| {
+        let character = if include_characters {
+            {
                 range[format!("{prefix}Character")]
                     .as_u64()
                     .expect("character-mode folding range character")
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            Default::default()
+        };
         (line, character)
     };
 
@@ -43103,7 +43105,7 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
                 let noise = distinct_long_file_operation_uris(root.path(), 60);
                 let bytes: usize = noise.iter().map(|uri| uri.as_str().len()).sum();
                 assert!(bytes > 32 * 1024, "fixture must exceed the admission cap");
-                for pair in noise.chunks_exact(2) {
+                for pair in noise.as_chunks::<2>().0 {
                     rename_files.push(json!({"oldUri":pair[0],"newUri":pair[1]}));
                 }
             }
@@ -51066,24 +51068,16 @@ fn code_action_withholds_abstract_external_forward_conditional_and_include_sourc
         server.shutdown();
     };
 
-    let abstract_source = concat!(
-        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Abstracted; abstract;\n  end;\nimplementation\nend.\n",
-    );
+    let abstract_source = "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Abstracted; abstract;\n  end;\nimplementation\nend.\n";
     run_case(abstract_source, "Abstracted", false, "abstract-method");
 
-    let external_source = concat!(
-        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Externalized; external;\n  end;\nimplementation\nend.\n",
-    );
+    let external_source = "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Externalized; external;\n  end;\nimplementation\nend.\n";
     run_case(external_source, "Externalized", false, "external-method");
 
-    let forward_source = concat!(
-        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Forwarded; forward;\n  end;\nimplementation\nend.\n",
-    );
+    let forward_source = "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure Forwarded; forward;\n  end;\nimplementation\nend.\n";
     run_case(forward_source, "Forwarded", false, "forward-method");
 
-    let conditional_source = concat!(
-        "unit Widget;\ninterface\n{$IF UnknownFlag}\ntype\n  TWidget = class\n  public\n    procedure Conditional;\n  end;\n{$ENDIF}\nimplementation\nend.\n",
-    );
+    let conditional_source = "unit Widget;\ninterface\n{$IF UnknownFlag}\ntype\n  TWidget = class\n  public\n    procedure Conditional;\n  end;\n{$ENDIF}\nimplementation\nend.\n";
     run_case(
         conditional_source,
         "Conditional",
@@ -51091,9 +51085,7 @@ fn code_action_withholds_abstract_external_forward_conditional_and_include_sourc
         "conditional-method",
     );
 
-    let conditional_definition_source = concat!(
-        "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure ConditionalDefinition;\n  end;\nimplementation\n{$IF UnknownFlag}\nprocedure TWidget.ConditionalDefinition; begin end;\n{$ENDIF}\nend.\n",
-    );
+    let conditional_definition_source = "unit Widget;\ninterface\ntype\n  TWidget = class\n  public\n    procedure ConditionalDefinition;\n  end;\nimplementation\n{$IF UnknownFlag}\nprocedure TWidget.ConditionalDefinition; begin end;\n{$ENDIF}\nend.\n";
     run_case(
         conditional_definition_source,
         "ConditionalDefinition",
@@ -51101,9 +51093,7 @@ fn code_action_withholds_abstract_external_forward_conditional_and_include_sourc
         "conditional-definition-method",
     );
 
-    let include_source = concat!(
-        "unit Widget;\ninterface\n{$I other.inc}\ntype\n  TWidget = class\n  public\n    procedure IncludedContext;\n  end;\nimplementation\nend.\n",
-    );
+    let include_source = "unit Widget;\ninterface\n{$I other.inc}\ntype\n  TWidget = class\n  public\n    procedure IncludedContext;\n  end;\nimplementation\nend.\n";
     run_case(include_source, "IncludedContext", true, "include-method");
 }
 

@@ -186,7 +186,7 @@ fn local_delphi_installations_resolve_configured_roots() {
     )).unwrap();
     let chain = ProjectContext::discover_with_overrides(
         &project_file,
-        &[multidev.clone()],
+        std::slice::from_ref(&multidev),
         &ProjectOptions {
             project_file: Some(project_file.clone()),
             installation_selections: [(project_file.clone(), "37.0".to_string())]

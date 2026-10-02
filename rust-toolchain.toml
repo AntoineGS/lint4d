@@ -2,6 +2,6 @@
 # Pinned for reproducible builds.
 # Bumping this version should be a dedicated commit with CI run on the
 # new version first, so regressions are traceable.
-channel = "1.85.0"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

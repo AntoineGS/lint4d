@@ -227,18 +227,18 @@ fn run_lint_with_cfg_project_mode(
     // single-file, origin-bearing mapping is safe to publish.  Anything that
     // crosses an include boundary, points at synthetic bytes, or belongs to a
     // different source reruns through the raw file-local path.
-    if let Some(map) = prepared_map {
-        if !map_diagnostics_to_original(&mut ctx.diagnostics, &map, source) {
-            return run_lint_with_cfg_project_mode(
-                file,
-                source,
-                config,
-                project,
-                None,
-                registry,
-                run_cfg_rules,
-            );
-        }
+    if let Some(map) = prepared_map
+        && !map_diagnostics_to_original(&mut ctx.diagnostics, &map, source)
+    {
+        return run_lint_with_cfg_project_mode(
+            file,
+            source,
+            config,
+            project,
+            None,
+            registry,
+            run_cfg_rules,
+        );
     }
 
     // Merge parse-error diagnostics with rule diagnostics.
@@ -494,14 +494,14 @@ fn collect_proc_scopes(root: tree_sitter::Node, source: &[u8]) -> Vec<ProcScope>
 }
 
 fn collect_proc_scopes_recursive(node: tree_sitter::Node, source: &[u8], out: &mut Vec<ProcScope>) {
-    if node.kind() == K::DEF_PROC {
-        if let Some(name) = extract_proc_display_name(node, source) {
-            out.push(ProcScope {
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
-                name,
-            });
-        }
+    if node.kind() == K::DEF_PROC
+        && let Some(name) = extract_proc_display_name(node, source)
+    {
+        out.push(ProcScope {
+            start_line: node.start_position().row + 1,
+            end_line: node.end_position().row + 1,
+            name,
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

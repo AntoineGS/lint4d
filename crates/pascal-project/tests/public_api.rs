@@ -373,7 +373,7 @@ fn local_project_selection_is_scoped_to_the_current_requester() {
     let overrides = OverrideSession::new(None);
     let selected = discover_with_selections_and_observations_with_cancel_and_overrides(
         &source_a,
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &ProjectOptions::default(),
         &selections,
         &overrides,

@@ -159,12 +159,12 @@ impl ProjectContext {
                 for entry in std::fs::read_dir(path).map_err(DcuError::Io)? {
                     let entry = entry.map_err(DcuError::Io)?;
                     let p = entry.path();
-                    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcu")) {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            let key = stem.to_lowercase();
-                            // First path wins (mimics Delphi search order)
-                            index.entry(key).or_insert_with(|| p.clone());
-                        }
+                    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcu"))
+                        && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                    {
+                        let key = stem.to_lowercase();
+                        // First path wins (mimics Delphi search order)
+                        index.entry(key).or_insert_with(|| p.clone());
                     }
                 }
             }
@@ -286,9 +286,9 @@ impl ProjectContext {
                     if parent_name.eq_ignore_ascii_case(ancestor_name) {
                         return Some(true);
                     }
-                    match self.resolve_type(parent_name, uses) {
-                        Some(parent_type) => current = parent_type,
-                        None => return None, // Parent not in loaded DCUs.
+                    {
+                        let parent_type = self.resolve_type(parent_name, uses)?;
+                        current = parent_type
                     }
                 }
                 _ => return Some(false), // No parent or unresolved — end of chain.

@@ -430,10 +430,10 @@ fn check_block_no_try(
         let next_stmt = children[(i + 1)..]
             .iter()
             .find(|n| n.is_named() && !n.is_extra() && n.kind() != K::K_END);
-        if let Some(next) = next_stmt {
-            if helpers::ast_frees_variable(*next, source, &var_name) {
-                continue;
-            }
+        if let Some(next) = next_stmt
+            && helpers::ast_frees_variable(*next, source, &var_name)
+        {
+            continue;
         }
 
         // Look ahead for any try block (finally or except) that frees this variable.
@@ -682,15 +682,14 @@ fn collect_ast_interface_types(root: Node, source: &[u8]) -> HashSet<String> {
 }
 
 fn collect_ast_interface_types_recursive(node: Node, source: &[u8], out: &mut HashSet<String>) {
-    if node.kind() == K::DECL_TYPE {
-        if let Some(type_node) = node.child_by_field_name("type") {
-            if type_node.kind() == K::DECL_INTF {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    out.insert(node_text(name_node, source));
-                } else if let Some(id) = first_identifier(node) {
-                    out.insert(node_text(id, source));
-                }
-            }
+    if node.kind() == K::DECL_TYPE
+        && let Some(type_node) = node.child_by_field_name("type")
+        && type_node.kind() == K::DECL_INTF
+    {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            out.insert(node_text(name_node, source));
+        } else if let Some(id) = first_identifier(node) {
+            out.insert(node_text(id, source));
         }
     }
     let mut cursor = node.walk();

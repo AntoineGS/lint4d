@@ -183,39 +183,39 @@ impl<'a> DocBuilder<'a> {
                 K::K_THEN | K::K_DO => {
                     parts.push(self.doc_for_node(child));
                     // Single statement after then/do → indented on next line
-                    if let Some(next) = children.get(i + 1) {
-                        if next.kind() != K::BLOCK && next.kind() != K::K_ELSE {
-                            let next_doc = self.doc_for_node(*next);
-                            let mut inner = Vec::new();
-                            if !crate::doc_builder::starts_with_hardline(&next_doc) {
-                                inner.push(Doc::Hardline);
-                            }
-                            inner.push(next_doc);
-                            parts.push(doc::indent(doc::concat(inner)));
-                            i += 2;
-                            continue;
+                    if let Some(next) = children.get(i + 1)
+                        && next.kind() != K::BLOCK
+                        && next.kind() != K::K_ELSE
+                    {
+                        let next_doc = self.doc_for_node(*next);
+                        let mut inner = Vec::new();
+                        if !crate::doc_builder::starts_with_hardline(&next_doc) {
+                            inner.push(Doc::Hardline);
                         }
+                        inner.push(next_doc);
+                        parts.push(doc::indent(doc::concat(inner)));
+                        i += 2;
+                        continue;
                     }
                 }
                 K::K_ELSE => {
                     parts.push(Doc::Hardline);
                     parts.push(self.doc_for_node(child));
                     // Single statement after else → indented on next line
-                    if let Some(next) = children.get(i + 1) {
-                        if next.kind() != K::BLOCK
-                            && next.kind() != K::IF
-                            && next.kind() != K::IF_ELSE
-                        {
-                            let next_doc = self.doc_for_node(*next);
-                            let mut inner = Vec::new();
-                            if !crate::doc_builder::starts_with_hardline(&next_doc) {
-                                inner.push(Doc::Hardline);
-                            }
-                            inner.push(next_doc);
-                            parts.push(doc::indent(doc::concat(inner)));
-                            i += 2;
-                            continue;
+                    if let Some(next) = children.get(i + 1)
+                        && next.kind() != K::BLOCK
+                        && next.kind() != K::IF
+                        && next.kind() != K::IF_ELSE
+                    {
+                        let next_doc = self.doc_for_node(*next);
+                        let mut inner = Vec::new();
+                        if !crate::doc_builder::starts_with_hardline(&next_doc) {
+                            inner.push(Doc::Hardline);
                         }
+                        inner.push(next_doc);
+                        parts.push(doc::indent(doc::concat(inner)));
+                        i += 2;
+                        continue;
                     }
                 }
                 _ => {
@@ -237,18 +237,18 @@ impl<'a> DocBuilder<'a> {
             match child.kind() {
                 K::K_DO => {
                     parts.push(self.doc_for_node(child));
-                    if let Some(next) = children.get(i + 1) {
-                        if next.kind() != K::BLOCK {
-                            let next_doc = self.doc_for_node(*next);
-                            let mut inner = Vec::new();
-                            if !crate::doc_builder::starts_with_hardline(&next_doc) {
-                                inner.push(Doc::Hardline);
-                            }
-                            inner.push(next_doc);
-                            parts.push(doc::indent(doc::concat(inner)));
-                            i += 2;
-                            continue;
+                    if let Some(next) = children.get(i + 1)
+                        && next.kind() != K::BLOCK
+                    {
+                        let next_doc = self.doc_for_node(*next);
+                        let mut inner = Vec::new();
+                        if !crate::doc_builder::starts_with_hardline(&next_doc) {
+                            inner.push(Doc::Hardline);
                         }
+                        inner.push(next_doc);
+                        parts.push(doc::indent(doc::concat(inner)));
+                        i += 2;
+                        continue;
                     }
                 }
                 _ => {

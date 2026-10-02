@@ -332,10 +332,10 @@ fn visit_node(root: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
 /// current exception). The ERROR node in this case contains a single
 /// `kRaise` child.
 fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
-    if node.child_count() == 1 {
-        if let Some(child) = node.child(0) {
-            return child.kind() == crate::node_kind::K_RAISE;
-        }
+    if node.child_count() == 1
+        && let Some(child) = node.child(0)
+    {
+        return child.kind() == crate::node_kind::K_RAISE;
     }
     false
 }

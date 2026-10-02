@@ -95,14 +95,14 @@ fn main() -> ExitCode {
     } else {
         // Auto-detect .dproj files passed as positional args
         let mut cli = cli;
-        if cli.project.is_none() {
-            if let Some(pos) = cli.paths.iter().position(|p| {
+        if cli.project.is_none()
+            && let Some(pos) = cli.paths.iter().position(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("dproj"))
-            }) {
-                cli.project = Some(cli.paths.remove(pos));
-            }
+            })
+        {
+            cli.project = Some(cli.paths.remove(pos));
         }
         run_files(&cli)
     };

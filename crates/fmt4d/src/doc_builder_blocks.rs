@@ -115,13 +115,12 @@ impl<'a> DocBuilder<'a> {
                     if in_block {
                         // Check for preserved blank lines between statements
                         let skip_blank = is_block_opener(prev_kind) || is_block_closer(kind);
-                        if !skip_blank && !prev_kind.is_empty() {
-                            if let Some(prev_end) = prev_end_row {
-                                if self.has_blank_line_between(prev_end, child.start_position().row)
-                                {
-                                    body.push(Doc::BlankLine);
-                                }
-                            }
+                        if !skip_blank
+                            && !prev_kind.is_empty()
+                            && let Some(prev_end) = prev_end_row
+                            && self.has_blank_line_between(prev_end, child.start_position().row)
+                        {
+                            body.push(Doc::BlankLine);
                         }
                         // Build the child doc first, then check if it already
                         // starts with a Hardline (e.g. from leading comments
@@ -137,13 +136,11 @@ impl<'a> DocBuilder<'a> {
                         let skip_blank = prev_kind.is_empty()
                             || is_block_opener(prev_kind)
                             || is_block_closer(kind);
-                        if !skip_blank {
-                            if let Some(prev_end) = prev_end_row {
-                                if self.has_blank_line_between(prev_end, child.start_position().row)
-                                {
-                                    parts.push(Doc::BlankLine);
-                                }
-                            }
+                        if !skip_blank
+                            && let Some(prev_end) = prev_end_row
+                            && self.has_blank_line_between(prev_end, child.start_position().row)
+                        {
+                            parts.push(Doc::BlankLine);
                         }
                         parts.push(self.doc_for_node(*child));
                     }

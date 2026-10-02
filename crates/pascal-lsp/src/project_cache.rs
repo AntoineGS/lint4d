@@ -1721,10 +1721,10 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         state.clock += 1;
         let clock = state.clock;
-        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key) {
-            if extract(&entry.value).is_some_and(|(current, _)| Arc::ptr_eq(&current, &value)) {
-                entry.last_used = clock;
-            }
+        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key)
+            && extract(&entry.value).is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
+        {
+            entry.last_used = clock;
         }
         Some(value)
     }
@@ -1953,10 +1953,10 @@ fn acquire_watch(state: &mut State, directory: &Path) {
         .entry(directory.to_path_buf())
         .or_insert(0);
     *count += 1;
-    if *count == 1 {
-        if let Some(watcher) = state.watcher.as_mut() {
-            let _ = watcher.watch(directory);
-        }
+    if *count == 1
+        && let Some(watcher) = state.watcher.as_mut()
+    {
+        let _ = watcher.watch(directory);
     }
 }
 

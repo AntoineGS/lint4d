@@ -355,10 +355,10 @@ impl<'a> DocBuilder<'a> {
             // Fix alias keyword misparse: if a declVar has a procAttribute
             // child whose first child is kAlias, the parser incorrectly
             // merged two declarations.  Split them onto separate lines.
-            if node.kind() == K::DECL_VAR {
-                if let Some(doc) = self.build_alias_misparse_split(node, &children) {
-                    return doc;
-                }
+            if node.kind() == K::DECL_VAR
+                && let Some(doc) = self.build_alias_misparse_split(node, &children)
+            {
+                return doc;
             }
             return self.build_children(node);
         }
@@ -468,10 +468,10 @@ impl<'a> DocBuilder<'a> {
                 alias_parts.push(self.doc_for_node(*c));
             }
             // Add the semicolon that follows the procAttribute.
-            if let Some(semi) = children.get(proc_attr_idx + 1) {
-                if semi.kind() == K::SEMICOLON {
-                    alias_parts.push(self.doc_for_node(*semi));
-                }
+            if let Some(semi) = children.get(proc_attr_idx + 1)
+                && semi.kind() == K::SEMICOLON
+            {
+                alias_parts.push(self.doc_for_node(*semi));
             }
             parts.push(Doc::Hardline);
             parts.push(doc::concat(alias_parts));

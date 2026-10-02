@@ -52,12 +52,11 @@ impl Rule for TypePrefixRule {
 
 fn visit_type_prefix(node: Node, source: &[u8], ctx: &mut LintContext) {
     // Look for declType nodes whose type child is a declClass (class or record).
-    if node.kind() == K::DECL_TYPE {
-        if let Some(type_node) = node.child_by_field_name("type") {
-            if type_node.kind() == K::DECL_CLASS {
-                check_type_name(node, source, ctx);
-            }
-        }
+    if node.kind() == K::DECL_TYPE
+        && let Some(type_node) = node.child_by_field_name("type")
+        && type_node.kind() == K::DECL_CLASS
+    {
+        check_type_name(node, source, ctx);
     }
 
     for child in node.children(&mut node.walk()) {
@@ -145,12 +144,11 @@ impl Rule for InterfacePrefixRule {
 
 fn visit_interface_prefix(node: Node, source: &[u8], ctx: &mut LintContext) {
     // Look for declType nodes whose type child is a declIntf.
-    if node.kind() == K::DECL_TYPE {
-        if let Some(type_node) = node.child_by_field_name("type") {
-            if type_node.kind() == K::DECL_INTF {
-                check_interface_name(node, source, ctx);
-            }
-        }
+    if node.kind() == K::DECL_TYPE
+        && let Some(type_node) = node.child_by_field_name("type")
+        && type_node.kind() == K::DECL_INTF
+    {
+        check_interface_name(node, source, ctx);
     }
 
     for child in node.children(&mut node.walk()) {
@@ -299,10 +297,10 @@ pub fn to_upper_snake_case(name: &str) -> String {
             } else if prev.is_ascii_uppercase() {
                 // Consecutive uppercase: check if next char is lowercase
                 // to detect end of acronym: `HTTPPort` → `HTTP_PORT`
-                if let Some(&next) = chars.get(i + 1) {
-                    if next.is_ascii_lowercase() {
-                        result.push('_');
-                    }
+                if let Some(&next) = chars.get(i + 1)
+                    && next.is_ascii_lowercase()
+                {
+                    result.push('_');
                 }
             }
         }

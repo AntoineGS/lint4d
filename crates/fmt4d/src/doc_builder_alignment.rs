@@ -243,10 +243,8 @@ impl<'a> DocBuilder<'a> {
             };
 
             // Trailing comment only on the last row.
-            if is_last {
-                if let Some(ref comment_cell) = trailing_comment {
-                    cells.push(comment_cell.clone());
-                }
+            if is_last && let Some(ref comment_cell) = trailing_comment {
+                cells.push(comment_cell.clone());
             }
 
             rows.push(cells);
@@ -322,10 +320,10 @@ impl<'a> DocBuilder<'a> {
                 .map(|c| self.doc_for_node(*c))
                 .collect();
             // Add the semicolon that follows the procAttribute.
-            if let Some(semi) = children.get(proc_attr_idx + 1) {
-                if semi.kind() == K::SEMICOLON {
-                    type_cell_parts.push(self.doc_for_node(*semi));
-                }
+            if let Some(semi) = children.get(proc_attr_idx + 1)
+                && semi.kind() == K::SEMICOLON
+            {
+                type_cell_parts.push(self.doc_for_node(*semi));
             }
             rows.push(vec![
                 doc::align_cell(name_doc, true),
@@ -626,75 +624,77 @@ impl<'a> DocBuilder<'a> {
 
             // Expand multi-identifier var declarations (e.g. `I, J, K: Integer;`)
             // into one row per identifier before trying normal decomposition.
-            if section_kind == K::DECL_VARS && kind == K::DECL_VAR {
-                if let Some(expanded) = self.expand_comma_var_rows(*child) {
-                    // Leading comments/directives only on first row.
-                    let mut leading = self.leading_comments_doc(*child);
-                    if matches!(leading, Doc::Empty) {
-                        let ch = self.code_children(*child);
-                        if let Some(first) = ch.first() {
-                            leading = self.leading_comments_doc(*first);
-                        }
+            if section_kind == K::DECL_VARS
+                && kind == K::DECL_VAR
+                && let Some(expanded) = self.expand_comma_var_rows(*child)
+            {
+                // Leading comments/directives only on first row.
+                let mut leading = self.leading_comments_doc(*child);
+                if matches!(leading, Doc::Empty) {
+                    let ch = self.code_children(*child);
+                    if let Some(first) = ch.first() {
+                        leading = self.leading_comments_doc(*first);
                     }
-                    if !matches!(leading, Doc::Empty) {
-                        group_items.push(leading);
-                    }
-                    let leading_dir = self.leading_directives_doc(*child);
-                    if !matches!(leading_dir, Doc::Empty) {
-                        group_items.push(leading_dir);
-                    }
-
-                    let trailing_dir = self.trailing_directives_doc(*child);
-                    let expanded_len = expanded.len();
-                    for (i, cells) in expanded.into_iter().enumerate() {
-                        let is_last = i == expanded_len.saturating_sub(1);
-                        if !is_last || matches!(trailing_dir, Doc::Empty) {
-                            group_items.push(doc::align_row(cells));
-                        } else {
-                            let mut cells = cells;
-                            if let Some(last) = cells.last_mut() {
-                                last.content =
-                                    doc::concat(vec![last.content.clone(), trailing_dir.clone()]);
-                            }
-                            group_items.push(doc::align_row(cells));
-                        }
-                    }
-
-                    prev_child_kind = kind;
-                    prev_single_line = single_line;
-                    prev_end = Some(child.end_position().row);
-                    continue;
                 }
+                if !matches!(leading, Doc::Empty) {
+                    group_items.push(leading);
+                }
+                let leading_dir = self.leading_directives_doc(*child);
+                if !matches!(leading_dir, Doc::Empty) {
+                    group_items.push(leading_dir);
+                }
+
+                let trailing_dir = self.trailing_directives_doc(*child);
+                let expanded_len = expanded.len();
+                for (i, cells) in expanded.into_iter().enumerate() {
+                    let is_last = i == expanded_len.saturating_sub(1);
+                    if !is_last || matches!(trailing_dir, Doc::Empty) {
+                        group_items.push(doc::align_row(cells));
+                    } else {
+                        let mut cells = cells;
+                        if let Some(last) = cells.last_mut() {
+                            last.content =
+                                doc::concat(vec![last.content.clone(), trailing_dir.clone()]);
+                        }
+                        group_items.push(doc::align_row(cells));
+                    }
+                }
+
+                prev_child_kind = kind;
+                prev_single_line = single_line;
+                prev_end = Some(child.end_position().row);
+                continue;
             }
 
             // Fix alias keyword misparse: `Alias: T;` parsed as a
             // procAttribute on the preceding declVar.
-            if section_kind == K::DECL_VARS && kind == K::DECL_VAR {
-                if let Some(expanded) = self.expand_alias_misparse(*child) {
-                    let mut leading = self.leading_comments_doc(*child);
-                    if matches!(leading, Doc::Empty) {
-                        let ch = self.code_children(*child);
-                        if let Some(first) = ch.first() {
-                            leading = self.leading_comments_doc(*first);
-                        }
+            if section_kind == K::DECL_VARS
+                && kind == K::DECL_VAR
+                && let Some(expanded) = self.expand_alias_misparse(*child)
+            {
+                let mut leading = self.leading_comments_doc(*child);
+                if matches!(leading, Doc::Empty) {
+                    let ch = self.code_children(*child);
+                    if let Some(first) = ch.first() {
+                        leading = self.leading_comments_doc(*first);
                     }
-                    if !matches!(leading, Doc::Empty) {
-                        group_items.push(leading);
-                    }
-                    let leading_dir = self.leading_directives_doc(*child);
-                    if !matches!(leading_dir, Doc::Empty) {
-                        group_items.push(leading_dir);
-                    }
-
-                    for cells in expanded {
-                        group_items.push(doc::align_row(cells));
-                    }
-
-                    prev_child_kind = kind;
-                    prev_single_line = single_line;
-                    prev_end = Some(child.end_position().row);
-                    continue;
                 }
+                if !matches!(leading, Doc::Empty) {
+                    group_items.push(leading);
+                }
+                let leading_dir = self.leading_directives_doc(*child);
+                if !matches!(leading_dir, Doc::Empty) {
+                    group_items.push(leading_dir);
+                }
+
+                for cells in expanded {
+                    group_items.push(doc::align_row(cells));
+                }
+
+                prev_child_kind = kind;
+                prev_single_line = single_line;
+                prev_end = Some(child.end_position().row);
+                continue;
             }
 
             // Try to decompose as an aligned row.

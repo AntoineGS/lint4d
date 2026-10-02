@@ -74,7 +74,7 @@ impl FixConfig {
     }
 
     pub(crate) fn for_rules(config: &Config, rules: &[&str]) -> Self {
-        let selected = |rule: &str| rules.iter().any(|candidate| *candidate == rule);
+        let selected = |rule: &str| rules.contains(&rule);
         Self {
             type_prefix: selected("type-prefix")
                 && !matches!(

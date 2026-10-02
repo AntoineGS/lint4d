@@ -575,15 +575,13 @@ impl Warmer {
                 self.busy_attempt = None;
                 let accepted = *generation == self.generation
                     && self.open_epochs.get(uri).copied() == Some(*open_epoch);
-                if accepted {
-                    if let Some(epoch) = self.dispatched_epochs.remove(uri) {
-                        if epoch == cache.invalidation_epoch() {
-                            self.crawled_epochs.insert(uri.clone(), epoch);
-                        } else {
-                            // The cache rejected this crawl's stores once it
-                            // was invalidated, so the closure is not settled.
-                            cache.forget_closure_misses(uri);
-                        }
+                if accepted && let Some(epoch) = self.dispatched_epochs.remove(uri) {
+                    if epoch == cache.invalidation_epoch() {
+                        self.crawled_epochs.insert(uri.clone(), epoch);
+                    } else {
+                        // The cache rejected this crawl's stores once it
+                        // was invalidated, so the closure is not settled.
+                        cache.forget_closure_misses(uri);
                     }
                 }
                 accepted

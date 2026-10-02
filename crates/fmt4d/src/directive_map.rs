@@ -131,19 +131,19 @@ fn attach_one(
     leading: &mut HashMap<usize, Vec<AttachedDirective>>,
     trailing: &mut HashMap<usize, Vec<AttachedDirective>>,
 ) {
-    if let Some(prev) = find_prev_leaf_at(leaves, dir_start) {
-        if prev.end_position().row == dir_row {
-            let gap = dir_start.saturating_sub(prev.end_byte());
-            trailing
-                .entry(prev.id())
-                .or_default()
-                .push(AttachedDirective {
-                    text,
-                    trailing: true,
-                    gap,
-                });
-            return;
-        }
+    if let Some(prev) = find_prev_leaf_at(leaves, dir_start)
+        && prev.end_position().row == dir_row
+    {
+        let gap = dir_start.saturating_sub(prev.end_byte());
+        trailing
+            .entry(prev.id())
+            .or_default()
+            .push(AttachedDirective {
+                text,
+                trailing: true,
+                gap,
+            });
+        return;
     }
     if let Some(next) = find_next_leaf_at(leaves, dir_end) {
         leading

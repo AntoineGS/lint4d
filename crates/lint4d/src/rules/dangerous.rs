@@ -51,28 +51,27 @@ impl Rule for WithStatementRule {
 }
 
 fn visit_with(node: Node, ctx: &mut LintContext) {
-    if node.kind() == K::WITH {
-        if let Some(kw) = node
+    if node.kind() == K::WITH
+        && let Some(kw) = node
             .children(&mut node.walk())
             .find(|c| c.kind() == K::K_WITH)
-        {
-            let start = kw.start_position();
-            let end = kw.end_position();
-            ctx.report(Diagnostic {
-                rule_id: "with-statement".to_string(),
-                severity: Severity::Warning,
-                message: "'with' statement obscures scope and can cause subtle bugs.".to_string(),
-                line: start.row + 1,
-                column: start.column + 1,
-                end_line: end.row + 1,
-                end_column: end.column + 1,
-                help: Some(
-                    "Use explicit qualified access (e.g., 'obj.Field') instead of 'with obj do'."
-                        .to_string(),
-                ),
-                scope: None,
-            });
-        }
+    {
+        let start = kw.start_position();
+        let end = kw.end_position();
+        ctx.report(Diagnostic {
+            rule_id: "with-statement".to_string(),
+            severity: Severity::Warning,
+            message: "'with' statement obscures scope and can cause subtle bugs.".to_string(),
+            line: start.row + 1,
+            column: start.column + 1,
+            end_line: end.row + 1,
+            end_column: end.column + 1,
+            help: Some(
+                "Use explicit qualified access (e.g., 'obj.Field') instead of 'with obj do'."
+                    .to_string(),
+            ),
+            scope: None,
+        });
     }
 
     for child in node.children(&mut node.walk()) {

@@ -189,24 +189,24 @@ fn check_identifier_usage(
         .or_else(|| class_fields.and_then(|cf| cf.get(&used_lower)))
         .or_else(|| scopes.file.get(&used_lower));
 
-    if let Some(declared_name) = declared {
-        if *declared_name != used {
-            let start = node.start_position();
-            let end = node.end_position();
-            ctx.report(Diagnostic {
-                rule_id: "identifier-casing".to_string(),
-                severity: Severity::Hint,
-                message: format!(
-                    "Identifier '{}' was declared as '{}' but used with different casing.",
-                    used, declared_name
-                ),
-                line: start.row + 1,
-                column: start.column + 1,
-                end_line: end.row + 1,
-                end_column: end.column + 1,
-                help: Some(format!("Rename usage to '{}'.", declared_name)),
-                scope: None,
-            });
-        }
+    if let Some(declared_name) = declared
+        && *declared_name != used
+    {
+        let start = node.start_position();
+        let end = node.end_position();
+        ctx.report(Diagnostic {
+            rule_id: "identifier-casing".to_string(),
+            severity: Severity::Hint,
+            message: format!(
+                "Identifier '{}' was declared as '{}' but used with different casing.",
+                used, declared_name
+            ),
+            line: start.row + 1,
+            column: start.column + 1,
+            end_line: end.row + 1,
+            end_column: end.column + 1,
+            help: Some(format!("Rename usage to '{}'.", declared_name)),
+            scope: None,
+        });
     }
 }

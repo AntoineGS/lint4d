@@ -454,10 +454,10 @@ impl NavigationIndex {
                 identifier.start_byte() <= offset && offset <= identifier.end_byte()
             })
             .map_or(offset, |identifier| identifier.end_byte());
-        if let Some(identifier) = identifier {
-            if unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)? {
-                return Ok(empty_completion_result());
-            }
+        if let Some(identifier) = identifier
+            && unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)?
+        {
+            return Ok(empty_completion_result());
         }
         let member = member_expression_for_completion(
             document,
@@ -661,10 +661,10 @@ impl NavigationIndex {
             &mut budget,
             "completion context",
         )?);
-        if let Some(identifier) = identifier {
-            if unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)? {
-                return Ok(false);
-            }
+        if let Some(identifier) = identifier
+            && unsupported_hover_context_with_budget(document, identifier, cancel, &mut budget)?
+        {
+            return Ok(false);
         }
         let member = member_expression_for_completion(
             document,
@@ -1464,61 +1464,60 @@ impl NavigationIndex {
                 }
             }
 
-            if !with_lookup_blocks && !accumulator.exhausted {
-                if let Some(owner_type) = current_document
+            if !with_lookup_blocks
+                && !accumulator.exhausted
+                && let Some(owner_type) = current_document
                     .owner_type_at(offset)
                     .filter(|_| !current_document.offset_is_in_helper_declaration(offset))
-                {
-                    let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
-                        self.helper_target_for_owner_with_budget(
-                            current_uri,
-                            current_document,
-                            &owner_type,
-                            cancel,
-                            accumulator.budget,
-                        )?
-                        .map_or_else(
-                            || {
-                                (
-                                    current_uri.clone(),
-                                    owner_type.clone(),
-                                    super::ROOT_SCOPE,
-                                    super::GenericSubstitution::empty(),
-                                    None,
-                                )
-                            },
-                            |target| {
-                                (
-                                    target.uri,
-                                    target.key,
-                                    target.scope,
-                                    target.substitution,
-                                    target.helper_owner,
-                                )
-                            },
-                        );
-                    let (ancestry_known, has_ambiguous_names) = self
-                        .add_member_completion_candidates(
-                            &mut accumulator,
-                            &member_uri,
-                            &member_type,
-                            member_scope,
-                            &member_substitution,
-                            helper_owner.as_ref(),
-                            current_uri,
-                            &mut private_spans,
-                            precedence,
-                            offset,
-                            cancel,
-                        )?;
-                    if !ancestry_known || has_ambiguous_names {
-                        accumulator.is_incomplete = true;
-                        if unqualified {
-                            suppress_unqualified_globals = true;
-                        }
+            {
+                let (member_uri, member_type, member_scope, member_substitution, helper_owner) =
+                    self.helper_target_for_owner_with_budget(
+                        current_uri,
+                        current_document,
+                        &owner_type,
+                        cancel,
+                        accumulator.budget,
+                    )?
+                    .map_or_else(
+                        || {
+                            (
+                                current_uri.clone(),
+                                owner_type.clone(),
+                                super::ROOT_SCOPE,
+                                super::GenericSubstitution::empty(),
+                                None,
+                            )
+                        },
+                        |target| {
+                            (
+                                target.uri,
+                                target.key,
+                                target.scope,
+                                target.substitution,
+                                target.helper_owner,
+                            )
+                        },
+                    );
+                let (ancestry_known, has_ambiguous_names) = self.add_member_completion_candidates(
+                    &mut accumulator,
+                    &member_uri,
+                    &member_type,
+                    member_scope,
+                    &member_substitution,
+                    helper_owner.as_ref(),
+                    current_uri,
+                    &mut private_spans,
+                    precedence,
+                    offset,
+                    cancel,
+                )?;
+                if !ancestry_known || has_ambiguous_names {
+                    accumulator.is_incomplete = true;
+                    if unqualified {
+                        suppress_unqualified_globals = true;
                     }
-                    precedence += 1;
                 }
+                precedence += 1;
             }
 
             if !suppress_unqualified_globals {
@@ -1577,8 +1576,8 @@ impl NavigationIndex {
                             offset,
                             cancel,
                         )?;
-                        if let Some(document) = self.documents.get(&unit_uri) {
-                            if let Some(index) = document
+                        if let Some(document) = self.documents.get(&unit_uri)
+                            && let Some(index) = document
                                 .symbol_indices_by_scope_key
                                 .get(&(super::ROOT_SCOPE, document.unit_name.clone()))
                                 .into_iter()
@@ -1590,24 +1589,23 @@ impl NavigationIndex {
                                         .get(*index)
                                         .is_some_and(|symbol| symbol.kind == SymbolKind::Unit)
                                 })
-                            {
-                                if !accumulator.take_scan_slot(cancel)? {
-                                    break;
-                                }
-                                self.add_completion_candidate(
-                                    &mut accumulator,
-                                    Candidate {
-                                        uri: unit_uri.clone(),
-                                        index,
-                                    },
-                                    current_uri,
-                                    false,
-                                    &mut private_spans,
-                                    precedence.saturating_add(1),
-                                    offset,
-                                    cancel,
-                                )?;
+                        {
+                            if !accumulator.take_scan_slot(cancel)? {
+                                break;
                             }
+                            self.add_completion_candidate(
+                                &mut accumulator,
+                                Candidate {
+                                    uri: unit_uri.clone(),
+                                    index,
+                                },
+                                current_uri,
+                                false,
+                                &mut private_spans,
+                                precedence.saturating_add(1),
+                                offset,
+                                cancel,
+                            )?;
                         }
                         if accumulator.exhausted {
                             break;
@@ -2236,10 +2234,10 @@ impl NavigationIndex {
             {
                 continue;
             }
-            if symbol.kind == SymbolKind::Routine {
-                if let Some(key) = &symbol.routine_key {
-                    routine_keys.insert(key.clone());
-                }
+            if symbol.kind == SymbolKind::Routine
+                && let Some(key) = &symbol.routine_key
+            {
+                routine_keys.insert(key.clone());
             }
             self.add_completion_candidate_with_substitution(
                 accumulator,
@@ -2624,69 +2622,67 @@ impl NavigationIndex {
                     }
                     if let Some(dot) = super::member_expression_at(identifier)
                         .filter(|dot| super::is_right_hand_member(*dot, identifier))
+                        && let Some(lhs) = dot.child_by_field_name("lhs")
                     {
-                        if let Some(lhs) = dot.child_by_field_name("lhs") {
-                            let receivers = self.resolve_receivers_with_state_and_budget(
-                                uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
-                            )?;
-                            let receiver_is_known = !receivers.is_empty();
-                            for receiver in receivers {
-                                let super::Receiver::Type(instance) = receiver else {
-                                    continue;
-                                };
-                                let owner_key =
-                                    symbol.owner_type.as_deref().unwrap_or(&instance.key);
-                                let Some(member_substitution) = self
-                                    .member_owner_substitution_with_budget(
-                                        &instance.uri,
-                                        &instance.key,
-                                        &instance.substitution,
-                                        &reference.uri,
-                                        owner_key,
-                                        &mut state,
-                                        cancel,
-                                        budget,
-                                    )?
-                                else {
-                                    continue;
-                                };
-                                let Some(lookup_identifier) = identifier_at_with_budget(
-                                    declaration_document.tree.root_node(),
-                                    symbol.span.start,
-                                    cancel,
-                                    budget,
-                                    "type definition",
-                                )?
-                                else {
-                                    continue;
-                                };
-                                let specialized = self.type_receivers_for_symbol_type_with_budget(
+                        let receivers = self.resolve_receivers_with_state_and_budget(
+                            uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
+                        )?;
+                        let receiver_is_known = !receivers.is_empty();
+                        for receiver in receivers {
+                            let super::Receiver::Type(instance) = receiver else {
+                                continue;
+                            };
+                            let owner_key = symbol.owner_type.as_deref().unwrap_or(&instance.key);
+                            let Some(member_substitution) = self
+                                .member_owner_substitution_with_budget(
+                                    &instance.uri,
+                                    &instance.key,
+                                    &instance.substitution,
                                     &reference.uri,
-                                    declaration_document,
-                                    symbol,
-                                    lookup_identifier,
-                                    None,
-                                    &member_substitution,
+                                    owner_key,
                                     &mut state,
                                     cancel,
                                     budget,
-                                )?;
-                                for specialized in specialized {
-                                    let super::Receiver::Type(instance) = specialized else {
-                                        continue;
-                                    };
-                                    targets.extend(self.type_candidates_in_unit_with_budget(
-                                        &instance.uri,
-                                        &instance.key,
-                                        instance.uri == *uri,
-                                        cancel,
-                                        budget,
-                                    )?);
-                                }
-                            }
-                            if receiver_is_known {
+                                )?
+                            else {
                                 continue;
+                            };
+                            let Some(lookup_identifier) = identifier_at_with_budget(
+                                declaration_document.tree.root_node(),
+                                symbol.span.start,
+                                cancel,
+                                budget,
+                                "type definition",
+                            )?
+                            else {
+                                continue;
+                            };
+                            let specialized = self.type_receivers_for_symbol_type_with_budget(
+                                &reference.uri,
+                                declaration_document,
+                                symbol,
+                                lookup_identifier,
+                                None,
+                                &member_substitution,
+                                &mut state,
+                                cancel,
+                                budget,
+                            )?;
+                            for specialized in specialized {
+                                let super::Receiver::Type(instance) = specialized else {
+                                    continue;
+                                };
+                                targets.extend(self.type_candidates_in_unit_with_budget(
+                                    &instance.uri,
+                                    &instance.key,
+                                    instance.uri == *uri,
+                                    cancel,
+                                    budget,
+                                )?);
                             }
+                        }
+                        if receiver_is_known {
+                            continue;
                         }
                     }
                     let Some(type_name) = named_type_path_for_symbol(declaration_document, symbol)
@@ -2739,97 +2735,95 @@ impl NavigationIndex {
                     if !is_constructor {
                         if let Some(dot) = super::member_expression_at(identifier)
                             .filter(|dot| super::is_right_hand_member(*dot, identifier))
+                            && let Some(lhs) = dot.child_by_field_name("lhs")
                         {
-                            if let Some(lhs) = dot.child_by_field_name("lhs") {
-                                let receivers = self.resolve_receivers_with_state_and_budget(
-                                    uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
-                                )?;
-                                let mut specialized_targets = Vec::new();
-                                let mut receiver_is_known = false;
-                                for receiver in receivers {
-                                    let super::Receiver::Type(instance) = receiver else {
-                                        continue;
-                                    };
-                                    receiver_is_known = true;
-                                    let owner_key =
-                                        symbol.owner_type.as_deref().unwrap_or(&instance.key);
-                                    let Some(member_substitution) = self
-                                        .member_owner_substitution_with_budget(
-                                            &instance.uri,
-                                            &instance.key,
-                                            &instance.substitution,
-                                            &reference.uri,
-                                            owner_key,
-                                            &mut state,
-                                            cancel,
-                                            budget,
-                                        )?
-                                    else {
-                                        continue;
-                                    };
-                                    let mut member_substitution = member_substitution;
-                                    for parameter in &symbol.generic_parameters {
-                                        member_substitution.remove(&parameter.name);
-                                    }
-                                    let result_substitution = call_selection
-                                        .as_ref()
-                                        .and_then(|(group, substitution)| {
-                                            group.as_ref().and_then(|group| {
-                                                super::overload::candidate_in_group(
-                                                    self, &reference, group,
-                                                )
-                                                .then_some(substitution.as_ref())
-                                                .flatten()
-                                            })
-                                        })
-                                        .unwrap_or(&member_substitution);
-                                    let Some(annotation) = symbol.result_type_annotation() else {
-                                        continue;
-                                    };
-                                    let Some(lookup_identifier) = identifier_at_with_budget(
-                                        declaration_document.tree.root_node(),
-                                        annotation.offset,
+                            let receivers = self.resolve_receivers_with_state_and_budget(
+                                uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
+                            )?;
+                            let mut specialized_targets = Vec::new();
+                            let mut receiver_is_known = false;
+                            for receiver in receivers {
+                                let super::Receiver::Type(instance) = receiver else {
+                                    continue;
+                                };
+                                receiver_is_known = true;
+                                let owner_key =
+                                    symbol.owner_type.as_deref().unwrap_or(&instance.key);
+                                let Some(member_substitution) = self
+                                    .member_owner_substitution_with_budget(
+                                        &instance.uri,
+                                        &instance.key,
+                                        &instance.substitution,
+                                        &reference.uri,
+                                        owner_key,
+                                        &mut state,
                                         cancel,
                                         budget,
-                                        "type definition",
                                     )?
+                                else {
+                                    continue;
+                                };
+                                let mut member_substitution = member_substitution;
+                                for parameter in &symbol.generic_parameters {
+                                    member_substitution.remove(&parameter.name);
+                                }
+                                let result_substitution = call_selection
+                                    .as_ref()
+                                    .and_then(|(group, substitution)| {
+                                        group.as_ref().and_then(|group| {
+                                            super::overload::candidate_in_group(
+                                                self, &reference, group,
+                                            )
+                                            .then_some(substitution.as_ref())
+                                            .flatten()
+                                        })
+                                    })
+                                    .unwrap_or(&member_substitution);
+                                let Some(annotation) = symbol.result_type_annotation() else {
+                                    continue;
+                                };
+                                let Some(lookup_identifier) = identifier_at_with_budget(
+                                    declaration_document.tree.root_node(),
+                                    annotation.offset,
+                                    cancel,
+                                    budget,
+                                    "type definition",
+                                )?
+                                else {
+                                    continue;
+                                };
+                                let result_receivers = self
+                                    .type_receivers_for_type_ref_with_budget(
+                                        &reference.uri,
+                                        declaration_document,
+                                        annotation.offset,
+                                        &annotation.type_ref,
+                                        lookup_identifier,
+                                        Some(annotation.scope),
+                                        result_substitution,
+                                        &mut state,
+                                        cancel,
+                                        budget,
+                                    )?;
+                                for result_receiver in result_receivers {
+                                    let super::Receiver::Type(result_instance) = result_receiver
                                     else {
                                         continue;
                                     };
-                                    let result_receivers = self
-                                        .type_receivers_for_type_ref_with_budget(
-                                            &reference.uri,
-                                            declaration_document,
-                                            annotation.offset,
-                                            &annotation.type_ref,
-                                            lookup_identifier,
-                                            Some(annotation.scope),
-                                            result_substitution,
-                                            &mut state,
+                                    specialized_targets.extend(
+                                        self.type_candidates_in_unit_with_budget(
+                                            &result_instance.uri,
+                                            &result_instance.key,
+                                            result_instance.uri == *uri,
                                             cancel,
                                             budget,
-                                        )?;
-                                    for result_receiver in result_receivers {
-                                        let super::Receiver::Type(result_instance) =
-                                            result_receiver
-                                        else {
-                                            continue;
-                                        };
-                                        specialized_targets.extend(
-                                            self.type_candidates_in_unit_with_budget(
-                                                &result_instance.uri,
-                                                &result_instance.key,
-                                                result_instance.uri == *uri,
-                                                cancel,
-                                                budget,
-                                            )?,
-                                        );
-                                    }
+                                        )?,
+                                    );
                                 }
-                                if receiver_is_known {
-                                    targets.extend(specialized_targets);
-                                    continue;
-                                }
+                            }
+                            if receiver_is_known {
+                                targets.extend(specialized_targets);
+                                continue;
                             }
                         }
                         if let Some(result_substitution) = selected_call_substitution {
@@ -2879,34 +2873,30 @@ impl NavigationIndex {
                             }
                         }
                     }
-                    if is_constructor {
-                        if let Some(dot) = super::member_expression_at(identifier)
+                    if is_constructor
+                        && let Some(dot) = super::member_expression_at(identifier)
                             .filter(|dot| super::is_right_hand_member(*dot, identifier))
-                        {
-                            if let Some(lhs) = dot.child_by_field_name("lhs") {
-                                let receivers = self.resolve_receivers_with_state_and_budget(
-                                    uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
-                                )?;
-                                let mut constructed_targets = Vec::new();
-                                for receiver in receivers {
-                                    let super::Receiver::Type(instance) = receiver else {
-                                        continue;
-                                    };
-                                    constructed_targets.extend(
-                                        self.type_candidates_in_unit_with_budget(
-                                            &instance.uri,
-                                            &instance.key,
-                                            instance.uri == *uri,
-                                            cancel,
-                                            budget,
-                                        )?,
-                                    );
-                                }
-                                if !constructed_targets.is_empty() {
-                                    targets.extend(constructed_targets);
-                                    continue;
-                                }
-                            }
+                        && let Some(lhs) = dot.child_by_field_name("lhs")
+                    {
+                        let receivers = self.resolve_receivers_with_state_and_budget(
+                            uri, document, offset, lhs, lhs, &mut state, cancel, budget, 0,
+                        )?;
+                        let mut constructed_targets = Vec::new();
+                        for receiver in receivers {
+                            let super::Receiver::Type(instance) = receiver else {
+                                continue;
+                            };
+                            constructed_targets.extend(self.type_candidates_in_unit_with_budget(
+                                &instance.uri,
+                                &instance.key,
+                                instance.uri == *uri,
+                                cancel,
+                                budget,
+                            )?);
+                        }
+                        if !constructed_targets.is_empty() {
+                            targets.extend(constructed_targets);
+                            continue;
                         }
                     }
                     let type_offset = if is_constructor {
@@ -3452,12 +3442,11 @@ fn member_expression_for_completion<'a>(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<CompletionMember<'a>, String> {
-    if let Some(identifier) = identifier {
-        if let Some(dot) = super::member_expression_at(identifier) {
-            if super::is_right_hand_member(dot, identifier) {
-                return Ok(CompletionMember::Node(dot));
-            }
-        }
+    if let Some(identifier) = identifier
+        && let Some(dot) = super::member_expression_at(identifier)
+        && super::is_right_hand_member(dot, identifier)
+    {
+        return Ok(CompletionMember::Node(dot));
     }
 
     if let Some((path, end)) =
@@ -3491,21 +3480,21 @@ fn member_expression_for_completion<'a>(
         {
             result = Some(CompletionMember::Expression(node));
         }
-        if result.is_none() && matches!(node.kind(), "exprDot" | "genericDot") {
-            if let Some(operator) = node.child_by_field_name("operator") {
-                if operator.end_byte() <= prefix_start {
-                    let between = document
-                        .source
-                        .get(operator.end_byte()..prefix_start)
-                        .unwrap_or_default();
-                    if between.chars().all(char::is_whitespace) {
-                        let end = node
-                            .child_by_field_name("rhs")
-                            .map_or(operator.end_byte(), |rhs| rhs.end_byte());
-                        if prefix_start >= operator.end_byte() && offset >= end {
-                            result = Some(CompletionMember::Node(node));
-                        }
-                    }
+        if result.is_none()
+            && matches!(node.kind(), "exprDot" | "genericDot")
+            && let Some(operator) = node.child_by_field_name("operator")
+            && operator.end_byte() <= prefix_start
+        {
+            let between = document
+                .source
+                .get(operator.end_byte()..prefix_start)
+                .unwrap_or_default();
+            if between.chars().all(char::is_whitespace) {
+                let end = node
+                    .child_by_field_name("rhs")
+                    .map_or(operator.end_byte(), |rhs| rhs.end_byte());
+                if prefix_start >= operator.end_byte() && offset >= end {
+                    result = Some(CompletionMember::Node(node));
                 }
             }
         }
@@ -3516,21 +3505,20 @@ fn member_expression_for_completion<'a>(
                 .source
                 .get(node.start_byte()..node.end_byte())
                 .is_some_and(|text| text == ".")
+            && let Some(parent) = node.parent()
         {
-            if let Some(parent) = node.parent() {
-                budget.require_work(parent.named_child_count(), cancel)?;
-                let mut receiver = None;
-                for index in 0..parent.named_child_count() {
-                    let Some(candidate) = parent.named_child(index) else {
-                        continue;
-                    };
-                    if candidate.end_byte() <= node.start_byte() {
-                        receiver = Some(candidate);
-                    }
+            budget.require_work(parent.named_child_count(), cancel)?;
+            let mut receiver = None;
+            for index in 0..parent.named_child_count() {
+                let Some(candidate) = parent.named_child(index) else {
+                    continue;
+                };
+                if candidate.end_byte() <= node.start_byte() {
+                    receiver = Some(candidate);
                 }
-                if let Some(receiver) = receiver {
-                    result = Some(CompletionMember::Expression(receiver));
-                }
+            }
+            if let Some(receiver) = receiver {
+                result = Some(CompletionMember::Expression(receiver));
             }
         }
         if result.is_some() {
@@ -3632,14 +3620,11 @@ fn completion_call_context(
                     Span::from_node(entity).contains(target_span)
                         || Span::from_node(entity).contains_offset(target_span.start)
                 })
+            && let Some(entity) = ancestor.child_by_field_name("entity")
+            && source_open_paren(document, entity, ancestor, cancel, budget)?
+                .is_some_and(|open| open >= replacement_end)
         {
-            if let Some(entity) = ancestor.child_by_field_name("entity") {
-                if source_open_paren(document, entity, ancestor, cancel, budget)?
-                    .is_some_and(|open| open >= replacement_end)
-                {
-                    return Ok(CompletionCallContext::ExistingCall);
-                }
-            }
+            return Ok(CompletionCallContext::ExistingCall);
         }
         if ancestor.kind() == "assignment" {
             let Some(lhs) = ancestor.child_by_field_name("lhs") else {
@@ -5330,14 +5315,12 @@ fn call_at_offset<'a>(
         if !node_contains_cursor(current, offset) {
             break;
         }
-        if current.kind() == "exprCall" {
-            if let Some(entity) = current.child_by_field_name("entity") {
-                if let Some(open) = source_open_paren(document, entity, current, cancel, budget)? {
-                    if offset >= open.saturating_add(1) {
-                        calls.push((current, open));
-                    }
-                }
-            }
+        if current.kind() == "exprCall"
+            && let Some(entity) = current.child_by_field_name("entity")
+            && let Some(open) = source_open_paren(document, entity, current, cancel, budget)?
+            && offset >= open.saturating_add(1)
+        {
+            calls.push((current, open));
         }
 
         let mut child = None;
@@ -6853,13 +6836,13 @@ fn render_displays_with_budget(
                 rendered.push_str(&display.excerpt);
             }
         }
-        if let Some(documentation) = display.documentation.as_ref() {
-            if let Some(documentation) = documentation.render(format.clone(), cancel)? {
-                if !rendered.is_empty() {
-                    rendered.push_str("\n\n");
-                }
-                rendered.push_str(&documentation);
+        if let Some(documentation) = display.documentation.as_ref()
+            && let Some(documentation) = documentation.render(format.clone(), cancel)?
+        {
+            if !rendered.is_empty() {
+                rendered.push_str("\n\n");
             }
+            rendered.push_str(&documentation);
         }
         budget.require_bytes(rendered.len(), cancel)?;
         value.push_str(&rendered);

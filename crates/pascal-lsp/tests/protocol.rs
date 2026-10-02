@@ -153,6 +153,18 @@ fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
     assert_eq!(result, 0, "utimensat failed for {}", path.display());
 }
 
+// Only Linux observes file opens in these tests, so elsewhere the file may be
+// opened to set its timestamp.
+#[cfg(not(target_os = "linux"))]
+fn restore_mtime(path: &Path, metadata: &fs::Metadata) {
+    let modified = metadata.modified().expect("modification time");
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(modified))
+        .unwrap_or_else(|error| panic!("restore mtime for {}: {error}", path.display()));
+}
+
 // The serial protocol suite starts many real server processes. Allow for
 // scheduler stalls on loaded hosts without weakening the short, explicit
 // negative-assertion timeouts used below.

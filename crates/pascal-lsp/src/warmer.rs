@@ -113,6 +113,13 @@ pub(crate) enum WarmEvent {
         generation: u64,
         open_epoch: u64,
     },
+    /// The crawl stored new or changed interface entries, so semantic tokens
+    /// computed earlier may now resolve more members.
+    ClosureStored {
+        uri: Url,
+        generation: u64,
+        open_epoch: u64,
+    },
 }
 
 pub(crate) const WARM_CREATE_PREFIX: &str = "pascal-lsp-warm-create-";
@@ -266,6 +273,7 @@ impl WarmProgress {
                     None => Ok(()),
                 }
             }
+            WarmEvent::ClosureStored { .. } => Ok(()),
             WarmEvent::Paused { .. } if paused_will_retry => Ok(()),
             WarmEvent::Paused { uri, .. } => self.close(connection, uri),
         }
@@ -367,6 +375,10 @@ pub(crate) struct Warmer {
     open_epochs: HashMap<Url, u64>,
     busy: bool,
     busy_attempt: Option<(Url, u64)>,
+    /// Cache invalidation epoch at which each in-flight crawl started.
+    dispatched_epochs: HashMap<Url, u64>,
+    /// Invalidation epoch of each open file's last completed crawl.
+    crawled_epochs: HashMap<Url, u64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -394,6 +406,8 @@ impl Warmer {
             open_epochs: HashMap::new(),
             busy: false,
             busy_attempt: None,
+            dispatched_epochs: HashMap::new(),
+            crawled_epochs: HashMap::new(),
             thread: Some(thread),
         }
     }
@@ -436,8 +450,21 @@ impl Warmer {
         self.queue.push_front(uri);
     }
 
+    /// Re-crawls an open file whose snapshot found part of its interface
+    /// closure uncached, unless it was already crawled since the cache was
+    /// last invalidated. Otherwise a unit that can never be cached would
+    /// trigger a crawl on every request.
+    pub(crate) fn request_closure_crawl(&mut self, uri: Url, invalidation_epoch: u64) {
+        if self.crawled_epochs.get(&uri) == Some(&invalidation_epoch) {
+            return;
+        }
+        self.rewarm(uri);
+    }
+
     pub(crate) fn close(&mut self, uri: &Url, cache: &crate::project_cache::ProjectCache) {
         self.queue.remove(uri);
+        self.dispatched_epochs.remove(uri);
+        self.crawled_epochs.remove(uri);
         self.open_order.retain(|opened| opened != uri);
         self.open_epochs.remove(uri);
         cache.unpin(uri);
@@ -454,6 +481,8 @@ impl Warmer {
         self.cancel = Arc::new(AtomicBool::new(false));
         self.generation = self.generation.wrapping_add(1);
         self.queue.clear();
+        self.dispatched_epochs.clear();
+        self.crawled_epochs.clear();
         let open = open.into_iter().collect::<HashSet<_>>();
         self.open_order.retain(|uri| open.contains(uri));
         self.open_epochs.retain(|uri, _| open.contains(uri));
@@ -479,6 +508,10 @@ impl Warmer {
                     continue;
                 };
                 let busy_uri = uri.clone();
+                self.dispatched_epochs.insert(
+                    busy_uri.clone(),
+                    workspace.project_cache().invalidation_epoch(),
+                );
                 let job = WarmJob {
                     uri,
                     input: workspace.analysis_input(),
@@ -510,8 +543,14 @@ impl Warmer {
             } => {
                 self.busy = false;
                 self.busy_attempt = None;
-                *generation == self.generation
-                    && self.open_epochs.get(uri).copied() == Some(*open_epoch)
+                let accepted = *generation == self.generation
+                    && self.open_epochs.get(uri).copied() == Some(*open_epoch);
+                if accepted {
+                    if let Some(epoch) = self.dispatched_epochs.remove(uri) {
+                        self.crawled_epochs.insert(uri.clone(), epoch);
+                    }
+                }
+                accepted
             }
             WarmEvent::Paused {
                 uri,
@@ -539,6 +578,11 @@ impl Warmer {
                 generation,
                 open_epoch,
                 ..
+            }
+            | WarmEvent::ClosureStored {
+                uri,
+                generation,
+                open_epoch,
             } => {
                 *generation == self.generation
                     && self.open_epochs.get(uri).copied() == Some(*open_epoch)
@@ -640,11 +684,19 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     }));
     match workspace.warm_with_cancel(&job.uri, &job.cancel) {
         Ok(outcome) => {
+            if outcome.interface_entries_stored > 0 {
+                let _ = events.send(WarmEvent::ClosureStored {
+                    uri: job.uri.clone(),
+                    generation: job.generation,
+                    open_epoch: job.open_epoch,
+                });
+            }
             let pins = outcome
                 .fingerprint
                 .map(|fingerprint| {
                     std::iter::once(job.uri.clone())
                         .chain(outcome.dependencies)
+                        .chain(outcome.closure)
                         .map(|uri| (uri, fingerprint))
                         .collect()
                 })
@@ -722,6 +774,83 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("warmer did not finish: {events:?}");
+    }
+
+    /// `Main` uses `Provider`, whose interface uses `Base`.
+    fn closure_fixture() -> (tempfile::TempDir, crate::workspace::Workspace, Url, Url) {
+        let temp = tempfile::tempdir().unwrap();
+        let main_text = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n".to_string();
+        std::fs::write(temp.path().join("Main.pas"), &main_text).unwrap();
+        std::fs::write(
+            temp.path().join("Provider.pas"),
+            "unit Provider;\ninterface\nuses Base;\nimplementation\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("Base.pas"),
+            "unit Base;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+        let mut workspace = crate::workspace::Workspace::with_override_session(
+            vec![temp.path().to_path_buf()],
+            Default::default(),
+            pascal_project::delphi_overrides::OverrideSession::new(None),
+        );
+        let main = Url::from_file_path(temp.path().join("Main.pas")).unwrap();
+        let base = Url::from_file_path(temp.path().join("Base.pas")).unwrap();
+        workspace
+            .open_document(main.clone(), main_text, 1)
+            .expect("open main unit");
+        (temp, workspace, main, base)
+    }
+
+    #[test]
+    fn a_crawl_that_stores_new_interface_entries_reports_them_once() {
+        let (_temp, workspace, main, base) = closure_fixture();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+
+        let first = run_until_end(&mut warmer, &workspace);
+        assert!(
+            first
+                .iter()
+                .any(|event| matches!(event, WarmEvent::ClosureStored { .. })),
+            "{first:?}"
+        );
+        let Some(WarmEvent::End { pins, .. }) = first.last() else {
+            panic!("{first:?}")
+        };
+        assert!(
+            pins.iter().any(|(uri, _)| uri == &base),
+            "closure units are pinned: {pins:?}"
+        );
+
+        warmer.rewarm(main);
+        let second = run_until_end(&mut warmer, &workspace);
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event, WarmEvent::ClosureStored { .. })),
+            "{second:?}"
+        );
+    }
+
+    #[test]
+    fn closure_crawl_requests_are_ignored_until_the_cache_is_invalidated() {
+        let (_temp, workspace, main) = fixture();
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        run_until_end(&mut warmer, &workspace);
+        let epoch = workspace.project_cache().invalidation_epoch();
+
+        warmer.request_closure_crawl(main.clone(), epoch);
+        assert!(warmer.queue.is_empty(), "this epoch was already crawled");
+
+        warmer.request_closure_crawl(main, epoch + 1);
+        assert!(
+            !warmer.queue.is_empty(),
+            "a newer epoch allows another crawl"
+        );
     }
 
     #[test]

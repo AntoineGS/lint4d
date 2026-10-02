@@ -2777,7 +2777,6 @@ fn interface_bindings(
         .collect()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct InterfaceImportSummary {
     targets: Vec<Url>,
@@ -2787,6 +2786,10 @@ struct InterfaceImportSummary {
 pub(crate) struct WarmOutcome {
     pub(crate) fingerprint: Option<u64>,
     pub(crate) dependencies: Vec<Url>,
+    /// Units reached through interface imports beyond `dependencies`.
+    pub(crate) closure: Vec<Url>,
+    /// Interface entries this warm stored that were new or changed.
+    pub(crate) interface_entries_stored: usize,
 }
 
 fn build_workspace_roots(
@@ -7191,20 +7194,96 @@ impl Workspace {
             return Ok(WarmOutcome {
                 fingerprint,
                 dependencies: Vec::new(),
+                closure: Vec::new(),
+                interface_entries_stored: 0,
             });
         }
         let mut pinned = HashSet::from([uri.clone()]);
+        let session_cache = ResolverSessionCache::default();
+        let stored_before = self.interface_entries_stored;
         let dependencies = self.load_imports_with_session_cache(
             uri,
             &context_key,
             &mut pinned,
             Some(cancel),
-            &ResolverSessionCache::default(),
+            &session_cache,
+        )?;
+        let closure = self.warm_interface_closure(
+            uri,
+            &dependencies,
+            &context_key,
+            &mut pinned,
+            cancel,
+            &session_cache,
         )?;
         Ok(WarmOutcome {
             fingerprint,
             dependencies,
+            closure,
+            interface_entries_stored: self.interface_entries_stored - stored_before,
         })
+    }
+
+    /// Loads the interface closure of `dependencies` into the shared cache, so
+    /// snapshots can bind members inherited through types their imports
+    /// declare. Follows only interface `uses`, does not continue past an
+    /// incomplete import graph, and reports cumulative progress through the
+    /// dependency hook between units, where it may also pause.
+    fn warm_interface_closure(
+        &mut self,
+        root: &Url,
+        dependencies: &[Url],
+        context_key: &ContextKey,
+        pinned: &mut HashSet<Url>,
+        cancel: &AtomicBool,
+        session_cache: &ResolverSessionCache,
+    ) -> Result<Vec<Url>, String> {
+        let mut visited = std::iter::once(root.clone())
+            .chain(dependencies.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut frontier = dependencies.iter().cloned().collect::<VecDeque<_>>();
+        let mut closure = Vec::new();
+        let mut done = 0usize;
+        while let Some(unit) = frontier.pop_front() {
+            check_workspace_cancel(Some(cancel))?;
+            if done >= MAX_DEPENDENCY_WORK {
+                break;
+            }
+            if let Some(hook) = self.dependency_hook.clone() {
+                let finished = dependencies.len() + done;
+                hook(&unit, finished, finished + frontier.len() + 1)?;
+            }
+            done += 1;
+            // Each load reports its own dependencies through the hook; keep
+            // one progress sequence for the whole crawl.
+            let hook = self.dependency_hook.take();
+            let loaded = self.load_imports_with_session_cache(
+                &unit,
+                context_key,
+                pinned,
+                Some(cancel),
+                session_cache,
+            );
+            self.dependency_hook = hook;
+            match loaded {
+                Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
+                Err(_) => continue,
+                Ok(_) => {}
+            }
+            let Some(summary) = self.interface_import_summaries.get(&unit).cloned() else {
+                continue;
+            };
+            if !summary.complete {
+                continue;
+            }
+            for target in summary.targets {
+                if visited.insert(target.clone()) {
+                    closure.push(target.clone());
+                    frontier.push_back(target);
+                }
+            }
+        }
+        Ok(closure)
     }
 
     #[allow(dead_code)]
@@ -16681,6 +16760,43 @@ mod tests {
     }
 
     #[test]
+    fn warming_a_file_caches_and_reports_its_interface_closure() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class(TConn)\n  end;\nimplementation\nuses Helper;\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Helper.pas"),
+            "unit Helper;\ninterface\nimplementation\nend.\n",
+        )
+        .unwrap();
+
+        let outcome = worker_view(&fixture.workspace)
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm");
+
+        assert_eq!(outcome.dependencies, vec![fixture.derived.clone()]);
+        assert_eq!(
+            outcome.closure,
+            vec![fixture.base.clone()],
+            "only interface imports are followed"
+        );
+        assert!(outcome.interface_entries_stored > 0);
+        let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+
+        let again = worker_view(&fixture.workspace)
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm again");
+        assert_eq!(
+            again.interface_entries_stored, 0,
+            "an unchanged closure stores nothing new"
+        );
+    }
+
+    #[test]
     fn declaration_providers_skip_the_include_audit_and_completeness_checks() {
         let fixture = inherited_fixture("Base");
         // The include audit rejects this directive. A declaration provider
@@ -17714,17 +17830,17 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .expect("warm");
+        let local = Url::from_file_path(root.join("Local.pas")).unwrap();
+        let lib_unit = Url::from_file_path(lib.join("LibUnit.pas")).unwrap();
         assert_eq!(
             *order.lock().unwrap(),
-            vec![
-                Url::from_file_path(root.join("Local.pas")).unwrap(),
-                Url::from_file_path(lib.join("LibUnit.pas")).unwrap(),
-            ]
+            vec![local.clone(), lib_unit.clone(), local, lib_unit],
+            "the closure crawl revisits the dependencies in the same order"
         );
         assert_eq!(
             *progress.lock().unwrap(),
-            vec![(0, 2), (1, 2), (2, 2)],
-            "progress begins at zero and reaches total after the final completed unit"
+            vec![(0, 2), (1, 2), (2, 2), (2, 4), (3, 4)],
+            "dependency progress reaches its total, then the closure crawl continues the sequence"
         );
     }
 

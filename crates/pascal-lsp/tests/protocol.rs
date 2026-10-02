@@ -60146,3 +60146,125 @@ mod workspace_selection;
 
 #[path = "protocol/build_selection.rs"]
 mod build_selection;
+
+fn write_inherited_closure(root: &Path) -> (PathBuf, &'static str) {
+    write_file(
+        &root.join("Base.pas"),
+        "unit Base;\ninterface\ntype\n  TConn = class\n  public\n    procedure Open;\n  end;\nimplementation\nprocedure TConn.Open; begin end;\nend.\n",
+    );
+    write_file(
+        &root.join("Derived.pas"),
+        "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class(TConn)\n  end;\nimplementation\nend.\n",
+    );
+    let main = root.join("Main.pas");
+    let text = "unit Main;\ninterface\nuses Derived;\nimplementation\nprocedure Run(Db: TDerived);\nbegin\n  Db.Open;\nend;\nend.\n";
+    write_file(&main, text);
+    (main, text)
+}
+
+fn initialize_with_semantic_tokens_refresh(
+    server: &mut TestServer,
+    root: &Path,
+    refresh_support: bool,
+) -> Vec<String> {
+    let id = RequestId::from("semantic-refresh-initialize".to_string());
+    server.send_request(
+        id.clone(),
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri(root),
+            "capabilities": {"workspace": {"semanticTokens": {"refreshSupport": refresh_support}}}
+        }),
+    );
+    let response = server.response(&id);
+    assert!(response.error.is_none(), "initialize failed: {response:?}");
+    server.send_notification("initialized", json!({}));
+    response.result.expect("initialize result")["capabilities"]["semanticTokensProvider"]["legend"]
+        ["tokenTypes"]
+        .as_array()
+        .expect("token types")
+        .iter()
+        .map(|kind| kind.as_str().expect("token type").to_string())
+        .collect()
+}
+
+fn open_main(server: &mut TestServer, main: &Path, text: &str) {
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri(main), "languageId": "pascal", "version": 1, "text": text}}),
+    );
+}
+
+fn full_tokens(
+    server: &mut TestServer,
+    main: &Path,
+    token_types: &[String],
+    id: &str,
+) -> Vec<(u32, u32, u32, String, u32)> {
+    let request_id = RequestId::from(id.to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/semanticTokens/full",
+        json!({"textDocument": {"uri": uri(main)}}),
+    );
+    let response = server.response(&request_id);
+    let types = token_types.iter().map(String::as_str).collect::<Vec<_>>();
+    response
+        .result
+        .map(|result| decoded_semantic_tokens(&result, &types))
+        .unwrap_or_default()
+}
+
+#[test]
+fn semantic_tokens_refresh_follows_a_crawl_of_the_interface_closure() {
+    let root = tempfile::tempdir().expect("workspace");
+    let (main, text) = write_inherited_closure(root.path());
+    let mut server = TestServer::launch();
+    let token_types = initialize_with_semantic_tokens_refresh(&mut server, root.path(), true);
+    open_main(&mut server, &main, text);
+
+    let refresh = server.request("workspace/semanticTokens/refresh");
+    server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+    let tokens = full_tokens(&mut server, &main, &token_types, "tokens-after-refresh");
+    assert!(
+        tokens.contains(&(6, 5, 4, "method".to_string(), 0)),
+        "{tokens:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn semantic_tokens_refresh_is_not_sent_without_client_support() {
+    let root = tempfile::tempdir().expect("workspace");
+    let (main, text) = write_inherited_closure(root.path());
+    let mut server = TestServer::launch();
+    let token_types = initialize_with_semantic_tokens_refresh(&mut server, root.path(), false);
+    open_main(&mut server, &main, text);
+
+    let mut warmed = false;
+    for attempt in 0..50 {
+        let tokens = full_tokens(
+            &mut server,
+            &main,
+            &token_types,
+            &format!("tokens-{attempt}"),
+        );
+        if tokens.contains(&(6, 5, 4, "method".to_string(), 0)) {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(warmed, "the closure crawl did not finish");
+    assert!(
+        server
+            .request_with_timeout(
+                "workspace/semanticTokens/refresh",
+                Duration::from_millis(200)
+            )
+            .is_none()
+    );
+    server.shutdown();
+}

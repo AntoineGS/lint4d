@@ -266,7 +266,7 @@ fn real_main() {
     // is trusted, so resolve its symlinks (e.g. macOS /var -> /private/var)
     // once here; a missing file keeps its name for the error reported later.
     if let Some(project) = cli.project.take() {
-        cli.project = Some(std::fs::canonicalize(&project).unwrap_or(project));
+        cli.project = Some(canonical_project_path(project));
     }
 
     // Discover config: start from the .dproj directory when --project is given,
@@ -584,6 +584,28 @@ fn resolve_source_project(cli: &Cli, config: &Config, files: &[FileInfo]) -> Opt
         roots: vec![root],
         configuration_id,
     })
+}
+
+/// Resolve symlinks in the user's project path. On Windows `canonicalize`
+/// returns a verbatim path (`\\?\C:\...`), which project path handling does
+/// not accept, so a verbatim drive path is turned back into `C:\...`.
+fn canonical_project_path(path: PathBuf) -> PathBuf {
+    let Ok(canonical) = std::fs::canonicalize(&path) else {
+        return path;
+    };
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = canonical.components();
+        if let Some(Component::Prefix(prefix)) = components.next()
+            && let Prefix::VerbatimDisk(drive) = prefix.kind()
+        {
+            let mut plain = PathBuf::from(format!("{}:\\", drive as char));
+            plain.extend(components.filter(|component| *component != Component::RootDir));
+            return plain;
+        }
+    }
+    canonical
 }
 
 fn lexical_absolute(path: &Path) -> PathBuf {

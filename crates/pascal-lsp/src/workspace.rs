@@ -16704,6 +16704,78 @@ mod tests {
         );
     }
 
+    /// `main` with enough routines appended that one scan of its symbol keys
+    /// and names, which each unqualified lookup charges, costs about 40 KiB.
+    fn with_many_symbols(main: &str) -> String {
+        let padding = (0..3000)
+            .map(|index| format!("procedure Pad{index:04}; begin end;\n"))
+            .collect::<String>();
+        main.replacen("end.\n", &format!("{padding}end.\n"), 1)
+    }
+
+    #[test]
+    fn hover_resolves_inherited_members_from_a_document_with_many_symbols() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Main.pas"),
+            with_many_symbols(INHERITED_THROUGH_DEPENDENCY_MAIN),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let hover = super::queries::hover_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover")
+        .expect("hover for an inherited member");
+
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Open;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn type_definition_resolves_inherited_fields_from_a_document_with_many_symbols() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("  public\n", "  public\n    Peer: TConn;\n"),
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Main.pas"),
+            with_many_symbols(
+                &INHERITED_THROUGH_DEPENDENCY_MAIN.replace("Db.Open", "Db.Peer.Open"),
+            ),
+        )
+        .unwrap();
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+
+        let locations = super::queries::type_definitions_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("type definition");
+
+        assert_eq!(
+            locations
+                .iter()
+                .map(|location| (&location.uri, location.range.start.line))
+                .collect::<Vec<_>>(),
+            [(&fixture.base, 3)],
+            "{locations:?}"
+        );
+    }
+
     /// Warms `Main` and `Derived`, then returns the tokens on `  Db.Open;`.
     fn warm_body_line_token_kinds(fixture: &InheritedFixture) -> Vec<(u32, u32, String)> {
         fixture.warm(&[&fixture.main, &fixture.derived]);

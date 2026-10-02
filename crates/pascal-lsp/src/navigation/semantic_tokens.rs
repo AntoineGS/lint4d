@@ -66,8 +66,8 @@ const MODIFIER_READONLY: u32 = 1 << 2;
 const MODIFIER_STATIC: u32 = 1 << 3;
 
 const MAX_SEMANTIC_NODES: usize = 1_000_000;
-const MAX_SEMANTIC_RESOLUTION_WORK: usize = 512_000;
-const MAX_SEMANTIC_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_SEMANTIC_RESOLUTION_WORK: usize = 512_000;
+pub(super) const MAX_SEMANTIC_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {

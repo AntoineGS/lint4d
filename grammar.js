@@ -177,7 +177,10 @@ function enable_if(cond, ...args) {
 // Generate rules for trailing & non-trailing statements
 function statements(trailing) {
 	let rn            = x => trailing ? x + 'Tr' : x
-	let lastStatement = $ => trailing ? optional(tr($,'_statement')) : $._statement;
+	let labeledBody   = $ => trailing ? optional(tr($,'_statement')) : $._statement;
+	let lastStatement = $ => trailing
+		? optional(choice(tr($,'_statement'), tr($,'labeledStatement')))
+		: choice($._statement, $.labeledStatement);
 	let lastStatement1= $ => trailing ? tr($,'_statement') : $._statement;
 	let semicolon     = trailing ? [] : [';'];
 
@@ -191,7 +194,11 @@ function statements(trailing) {
 
 		[rn('ifElse'),      $ => prec.right(1, seq(
 			$.kIf, field('condition', $._expr), $.kThen,
-			field('then', optional(choice(tr($,'_statement'), $.if))),
+			field('then', optional(choice(
+				tr($,'_statement'),
+				tr($,'labeledStatement'),
+				$.if
+			))),
 			$.kElse,
 			field('else', lastStatement($))
 		))],
@@ -231,7 +238,7 @@ function statements(trailing) {
 		)],
 
 		[rn('exceptionElse'), $ => seq(
-			$.kElse, repeat($._statement), lastStatement($)
+			$.kElse, repeat(choice($._statement, $.label)), lastStatement($)
 		)],
 
 		[rn('_exceptionHandlers'), $ => seq(
@@ -312,6 +319,12 @@ function statements(trailing) {
 			...semicolon
 		)],
 
+		[rn('labeledStatement'), $ => seq(
+			$.label,
+			repeat($.label),
+			labeledBody($)
+		)],
+
 		[rn('_statement'),   $ => choice(
 			...semicolon,
 			seq($.assignment, ...semicolon),
@@ -346,6 +359,8 @@ module.exports = grammar({
 	word: $ => $.identifier,
 
 	conflicts: $ => [
+		[$._statementsTr],
+		[$.exceptionElse, $.labeledStatement],
 		// The following conflict rules are only needed because "public" can be
 		// a visibility or an attribute. *sigh*
 		// TODO: We would probably avoid this by having separate decl* clauses
@@ -483,9 +498,15 @@ module.exports = grammar({
 		caseLabel:       $ => seq(delimited1(choice($._expr, $.range)), ':'),
 
 		_statements:     $ => repeat1(choice($.varDef, $._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
-		_statementsTr:   $ => seq(
-			repeat(choice($._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
-			choice(tr($,'_statement'), $._statement, $.ppBlock, $.ppFragmentStmt)
+		_statementsTr:   $ => choice(
+			seq(
+				repeat(choice($._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
+				choice(tr($,'_statement'), $._statement, $.ppBlock, $.ppFragmentStmt)
+			),
+			seq(
+				repeat(choice($._statement, $.label, $.ppBlock, $.ppFragmentStmt)),
+				repeat1($.label)
+			)
 		),
 
 		statements:      $ => $._statements,

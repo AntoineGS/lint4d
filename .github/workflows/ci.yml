@@ -36,7 +36,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     # Source-project support does not work on Windows yet (backlog TASK-94);
-    # its test failures are reported in full but do not fail the workflow.
+    # its test failures are reported but do not fail the workflow.
     continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +49,7 @@ jobs:
       - name: Resolve TMPDIR symlinks
         if: runner.os == 'macOS'
         run: echo "TMPDIR=$(cd "$TMPDIR" && pwd -P)/" >> "$GITHUB_ENV"
-      - run: cargo test --workspace ${{ matrix.os == 'windows-latest' && '--no-fail-fast' || '' }}
+      - run: cargo test --workspace --no-fail-fast
 
   clippy:
     name: Clippy

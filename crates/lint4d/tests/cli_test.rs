@@ -237,6 +237,39 @@ fn project_resolution_reports_incomplete_imports_but_keeps_linting() {
         );
 }
 
+// macOS reaches its temporary directories through symlinks (/var, /tmp).
+#[cfg(unix)]
+#[test]
+fn project_given_through_a_symlinked_directory_is_resolved() {
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(
+        real.join("Main.pas"),
+        "unit Main;\ninterface\nuses MissingUnit;\nimplementation\nend.\n",
+    )
+    .unwrap();
+    fs::write(
+        real.join("MyProject.dproj"),
+        r#"<Project><ItemGroup><DCCReference Include="Main.pas"/></ItemGroup></Project>"#,
+    )
+    .unwrap();
+    let linked = dir.path().join("linked");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+    lint4d()
+        .arg("--project")
+        .arg(linked.join("MyProject.dproj"))
+        .current_dir(&linked)
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("source-project CFG")
+                .and(predicate::str::contains("incomplete"))
+                .and(predicate::str::contains("not authorized").not()),
+        );
+}
+
 #[test]
 fn project_cfg_preserves_crlf_diagnostics_and_original_scope() {
     let dir = TempDir::new().unwrap();

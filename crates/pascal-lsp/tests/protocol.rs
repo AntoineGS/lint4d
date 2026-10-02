@@ -1318,6 +1318,7 @@ impl TestServer {
         response.result.expect("initialize result")
     }
 
+    #[cfg(unix)]
     fn initialize_with_workspace_folders(
         &mut self,
         root: &Path,

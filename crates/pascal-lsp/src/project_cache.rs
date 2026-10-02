@@ -472,6 +472,25 @@ mod cache_tests {
         );
     }
 
+    #[test]
+    fn an_overflow_forgets_closure_misses() {
+        let cache = ProjectCache::new(usize::MAX);
+        let main = uri("Main.pas");
+        let misses = || HashSet::from([uri("Sync.pas")]);
+        cache.report_closure_misses(&main, misses());
+        cache.report_closure_misses(&main, misses());
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+
+        cache.invalidate_after_overflow();
+        cache.report_closure_misses(&main, misses());
+
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![main],
+            "an overflow discarded what the last crawl stored"
+        );
+    }
+
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
     }
@@ -2027,6 +2046,12 @@ impl ProjectCache {
         }
     }
 
+    /// Makes the root's next walk with misses request a crawl, because the
+    /// crawl that followed its last report did not settle the closure.
+    pub(crate) fn forget_closure_misses(&self, root: &Url) {
+        lock(&self.inner).closure_misses.remove(root);
+    }
+
     pub(crate) fn take_closure_crawl_requests(&self) -> Vec<Url> {
         std::mem::take(&mut lock(&self.inner).closure_crawl_requests)
     }
@@ -2122,6 +2147,7 @@ impl ProjectCache {
                 release_watches(&mut state, &entry);
             }
         }
+        state.closure_misses.clear();
         drop(state);
         self.inner.changed.notify_all();
     }

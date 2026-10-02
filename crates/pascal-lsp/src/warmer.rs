@@ -493,6 +493,7 @@ impl Warmer {
         self.open_order.retain(|opened| opened != uri);
         self.open_epochs.remove(uri);
         cache.unpin(uri);
+        cache.forget_closure_misses(uri);
     }
 
     /// Project switch: cancel in-flight work and crawl `open` again.
@@ -523,7 +524,7 @@ impl Warmer {
     pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.events.try_recv() {
-            if self.accept_event(&event) {
+            if self.accept_event(&event, workspace.project_cache()) {
                 events.push(event);
             }
         }
@@ -558,7 +559,11 @@ impl Warmer {
         events
     }
 
-    fn accept_event(&mut self, event: &WarmEvent) -> bool {
+    fn accept_event(
+        &mut self,
+        event: &WarmEvent,
+        cache: &crate::project_cache::ProjectCache,
+    ) -> bool {
         match event {
             WarmEvent::End {
                 uri,
@@ -572,7 +577,13 @@ impl Warmer {
                     && self.open_epochs.get(uri).copied() == Some(*open_epoch);
                 if accepted {
                     if let Some(epoch) = self.dispatched_epochs.remove(uri) {
-                        self.crawled_epochs.insert(uri.clone(), epoch);
+                        if epoch == cache.invalidation_epoch() {
+                            self.crawled_epochs.insert(uri.clone(), epoch);
+                        } else {
+                            // The cache rejected this crawl's stores once it
+                            // was invalidated, so the closure is not settled.
+                            cache.forget_closure_misses(uri);
+                        }
                     }
                 }
                 accepted
@@ -942,6 +953,62 @@ mod tests {
     }
 
     #[test]
+    fn a_crawl_invalidated_while_in_flight_is_requested_again() {
+        let (temp, workspace, main) = fixture();
+        let cache = workspace.project_cache();
+        let misses = || HashSet::from([uri("Sync.pas")]);
+        let gate = Arc::new(InteractiveGate::default());
+        gate.set(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main.clone());
+        cache.report_closure_misses(&main, misses());
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+        warmer.poll(&workspace);
+        assert!(warmer.queue.is_empty(), "the crawl was dispatched");
+
+        // An edit while the crawl waits makes the cache drop its stores.
+        cache.invalidate_file_contents(&temp.path().join("Provider.pas"));
+        cache.report_closure_misses(&main, misses());
+        gate.set(0);
+        run_until_end(&mut warmer, &workspace);
+        cache.report_closure_misses(&main, misses());
+
+        assert_eq!(
+            cache.take_closure_crawl_requests(),
+            vec![main.clone()],
+            "the invalidated crawl did not settle the closure"
+        );
+        warmer.request_closure_crawl(main.clone(), cache.invalidation_epoch());
+        assert!(!warmer.queue.is_empty(), "the crawl is queued again");
+
+        run_until_end(&mut warmer, &workspace);
+        for _ in 0..3 {
+            cache.report_closure_misses(&main, misses());
+        }
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "a crawl at the current epoch settles a persistent miss"
+        );
+    }
+
+    #[test]
+    fn closing_a_file_forgets_its_closure_misses() {
+        let (_temp, workspace, main) = fixture();
+        let cache = workspace.project_cache();
+        let misses = || HashSet::from([uri("Sync.pas")]);
+        let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
+        warmer.open(main.clone());
+        cache.report_closure_misses(&main, misses());
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main.clone()]);
+
+        warmer.close(&main, cache);
+        warmer.open(main.clone());
+        cache.report_closure_misses(&main, misses());
+
+        assert_eq!(cache.take_closure_crawl_requests(), vec![main]);
+    }
+
+    #[test]
     fn most_recently_opened_file_is_warmed_first_and_deduplicated() {
         let mut queue = WarmQueue::default();
         queue.push_front(uri("A.pas"));
@@ -1259,7 +1326,7 @@ mod tests {
 
     #[test]
     fn paused_event_requeues_open_file_for_retry() {
-        let (_temp, _workspace, main) = fixture();
+        let (_temp, workspace, main) = fixture();
         let mut warmer = Warmer::start(Arc::new(InteractiveGate::default()));
         warmer.open(main.clone());
         warmer.queue.clear();
@@ -1270,7 +1337,7 @@ mod tests {
             open_epoch: warmer.open_epochs[&main],
         };
 
-        assert!(warmer.accept_event(&event));
+        assert!(warmer.accept_event(&event, workspace.project_cache()));
         assert!(!warmer.busy);
         assert_eq!(warmer.queue.pop(), Some(main));
     }
@@ -1437,7 +1504,7 @@ mod tests {
             generation: warmer.generation,
             open_epoch,
         };
-        let begin_accepted = warmer.accept_event(&late_begin);
+        let begin_accepted = warmer.accept_event(&late_begin, workspace.project_cache());
         if begin_accepted {
             progress
                 .handle_with_retry(&connection, &late_begin, true)
@@ -1448,7 +1515,7 @@ mod tests {
             generation: warmer.generation,
             open_epoch,
         };
-        let paused_accepted = warmer.accept_event(&late_paused);
+        let paused_accepted = warmer.accept_event(&late_paused, workspace.project_cache());
         if paused_accepted {
             progress
                 .handle_with_retry(&connection, &late_paused, workspace.is_open(&main))

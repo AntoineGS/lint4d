@@ -10470,6 +10470,7 @@ fn skip_string(bytes: &[u8], index: &mut usize) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::FileChange;
     use super::super::MetadataObservation;
     use super::{
@@ -10478,10 +10479,12 @@ mod tests {
         ProjectPathProvenance, ReadPolicy, SnapshotMode, Workspace, WorkspaceOptions,
         apply_text_edits_for_proof, build_snapshot, capture_consumed_configuration_baseline,
         capture_context_baseline, contains_any_identifier, directive_kind,
-        enumerate_external_overlays, file_content_hash, install_snapshot_priority_barrier,
-        path_key, path_record_at, read_exact_file_bytes, read_record_content_hash,
-        rename_from_input, revalidate_input, snapshot_records, test_cancel_in_include_analysis,
+        enumerate_external_overlays, install_snapshot_priority_barrier, path_key, path_record_at,
+        read_record_content_hash, rename_from_input, revalidate_input, snapshot_records,
+        test_cancel_in_include_analysis,
     };
+    #[cfg(target_os = "linux")]
+    use super::{file_content_hash, read_exact_file_bytes};
     use lsp_types::{Position, Range, TextEdit, Url};
     use pascal_core::resolver::{
         ResolutionObservation, ResolutionReport, SourceId, SourceRevision,

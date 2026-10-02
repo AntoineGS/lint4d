@@ -9595,19 +9595,22 @@ fn lex_pascal(source: &str) -> Vec<PascalToken> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_package_metadata;
     use super::{
         EffectiveOverrides, ExistingPathStatus, MAX_OWNERSHIP_CANDIDATES,
         MAX_OWNERSHIP_SOURCE_BYTES, MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES,
         MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry,
         ProjectPathProvenance, ProjectReadStamp, ProjectReadTracker, ReadPolicy,
         content_hash_bytes, path_stamp_result, project_candidate_membership,
-        read_bounded_with_tracker, read_package_metadata, resolve_existing_path_status,
-        test_before_project_read_at, test_cancel_project_scan_after_checks,
-        with_legacy_path_resolution, with_path_resolution_read_dir_count,
+        read_bounded_with_tracker, resolve_existing_path_status, test_before_project_read_at,
+        test_cancel_project_scan_after_checks, with_legacy_path_resolution,
+        with_path_resolution_read_dir_count,
     };
     use crate::delphi_overrides::OverrideSession;
     use std::cell::Cell;
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write;
     #[cfg(unix)]
     use std::path::Path;

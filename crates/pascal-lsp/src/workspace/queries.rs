@@ -2372,17 +2372,21 @@ mod tests {
         signature_help_from_input, type_definitions_from_input,
     };
     use crate::navigation::CompletionOptions;
+    #[cfg(target_os = "linux")]
+    use crate::workspace::content_hash_bytes;
     use crate::workspace::rename::{
         CANCELLATION_MESSAGE, Computed, WorkspaceInput, binding_info_for_input,
         install_snapshot_priority_barrier, owner_for_input, project_context_and_metadata_for_input,
         revalidate_input,
     };
-    use crate::workspace::{Workspace, WorkspaceOptions, content_hash_bytes};
+    use crate::workspace::{Workspace, WorkspaceOptions};
     use lsp_types::{MarkupKind, Position, Url};
-    use pascal_project::delphi_overrides::{EffectiveOverrides, OverrideSession};
-    use pascal_project::{
-        MetadataObservation, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ReadPolicy,
-    };
+    use pascal_project::ProjectPathProvenance;
+    #[cfg(target_os = "linux")]
+    use pascal_project::delphi_overrides::EffectiveOverrides;
+    use pascal_project::delphi_overrides::OverrideSession;
+    #[cfg(target_os = "linux")]
+    use pascal_project::{MetadataObservation, ProjectOptions, ProjectPathEntry, ReadPolicy};
     use std::collections::HashSet;
     #[cfg(target_os = "linux")]
     use std::ffi::CString;

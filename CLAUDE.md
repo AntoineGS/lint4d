@@ -4,7 +4,7 @@
 
 Local sibling checkouts — edit upstream instead of working around bugs:
 
-- `../tree-sitter-pascal` — git dep (`github.com/AntoineGS/tree-sitter-pascal`; grammar, parser, queries); edit, push, bump the rev in `[workspace.dependencies]`. cfg-pascal parses with the same grammar, so it must pin the **same** rev: bump it in cfg-pascal first, push, then bump both pins here
+- `../tree-sitter-pascal` — git dep (`github.com/AntoineGS/tree-sitter-pascal`; grammar, parser, queries); edit, push, bump the rev in `crates/lint4d` and `crates/pascal-core` (kept per crate: cargo-deny cannot resolve git workspace dependencies). cfg-pascal parses with the same grammar, so it must pin the **same** rev: bump it in cfg-pascal first, push, then bump the pins here
 - `../cfg-core` — git dep (`github.com/AntoineGS/cfg-core`); edit, push, bump rev
 - `../cfg-pascal` — git dep (`github.com/AntoineGS/cfg-pascal`); same flow
 

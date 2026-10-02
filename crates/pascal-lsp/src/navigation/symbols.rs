@@ -458,10 +458,30 @@ fn lsp_kind(symbol: &Symbol) -> LspSymbolKind {
 
 #[cfg(test)]
 mod tests {
-    use super::super::NavigationIndex;
+    use super::super::{NavigationIndex, SymbolKind};
     use super::{PositionIndex, project_workspace_symbols};
     use lsp_types::Url;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn numeric_labels_are_label_symbols_like_named_labels() {
+        let uri = Url::parse("file:///workspace/Labels.pas").expect("test URI");
+        let source = "unit Labels; interface implementation \
+                      procedure Jump; label 7, Done; begin goto 7; 7: goto Done; Done: end; end.";
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_string())
+            .expect("source parses");
+        let document = index.documents.get(&uri).expect("indexed document");
+
+        let labels: Vec<&str> = document
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::Label)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(labels, vec!["7", "Done"]);
+    }
 
     #[test]
     fn cancellable_workspace_symbol_queries_honor_cancellation() {

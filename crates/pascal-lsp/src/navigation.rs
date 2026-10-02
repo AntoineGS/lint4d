@@ -17523,6 +17523,9 @@ fn add_named_symbol(
         declaration_name_identifiers(node)
     } else if matches!(node.kind(), "varDef" | "varAssignDef") {
         identifier_nodes(node).into_iter().take(1).collect()
+    } else if node.kind() == "declLabel" {
+        // A label's name is an identifier or an unsigned integer.
+        node.child_by_field_name("name").into_iter().collect()
     } else {
         field_identifier_nodes(node, "name")
     };

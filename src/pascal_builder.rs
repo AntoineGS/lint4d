@@ -233,17 +233,6 @@ fn collect_module_cfgs(
                             exception_types,
                         ));
                     }
-                    "block" => {
-                        out.push(build_scope_cfg(
-                            format!("{module_name}.<initialization>"),
-                            section.start_byte()..section.end_byte(),
-                            section,
-                            ScopeBody::Block,
-                            source,
-                            unit_key,
-                            exception_types,
-                        ));
-                    }
                     _ => continue,
                 }
             }
@@ -1023,19 +1012,20 @@ fn walk_statements_node(
 /// Walk the statements directly contained by a unit initialization or
 /// finalization section. Those sections use an implicit `begin`, so their
 /// statement nodes are siblings of the section keyword rather than children
-/// of a `block` node.
+/// of a `block` node. A legacy unit's `begin ... end.` is an initialization
+/// section headed by `begin`; the closing `end.` belongs to the unit.
 fn walk_section_stmts(ctx: &mut BuildContext<'_>, section: Node, current: BlockId) -> Flow {
-    let header_kind = match section.kind() {
-        "initialization" => "kInitialization",
-        "finalization" => "kFinalization",
-        _ => "",
+    let header_kinds: &[&str] = match section.kind() {
+        "initialization" => &["kInitialization", "kBegin"],
+        "finalization" => &["kFinalization"],
+        _ => &[],
     };
     let mut cursor = section.walk();
     let mut current = Some(current);
     let mut transfers = Vec::new();
 
     for child in section.children(&mut cursor) {
-        if child.is_extra() || child.kind() == ";" || child.kind() == header_kind {
+        if child.is_extra() || child.kind() == ";" || header_kinds.contains(&child.kind()) {
             continue;
         }
 

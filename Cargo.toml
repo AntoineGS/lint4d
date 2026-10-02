@@ -8,7 +8,5 @@ license = "MIT"
 [dependencies]
 cfg-core = { git = "https://github.com/AntoineGS/cfg-core.git", rev = "b4131e61a939e0685194712689d1fd1497a41492" }
 tree-sitter = "0.24"
-tree-sitter-pascal = { package = "cfg-tree-sitter-pascal", path = "vendor/tree-sitter-pascal" }
+tree-sitter-pascal = { git = "https://github.com/AntoineGS/tree-sitter-pascal.git", rev = "2167e95ca744d3d1e7fb1f638824c2fa64414031" }
 
-[dev-dependencies]
-lsp-tree-sitter-pascal = { package = "tree-sitter-pascal", git = "https://github.com/AntoineGS/tree-sitter-pascal", rev = "2f95d9cd6af861b364dd73b7a99529a2c08300af" }

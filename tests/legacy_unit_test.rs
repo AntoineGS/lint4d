@@ -71,14 +71,16 @@ end.
     );
     let initialization = cfg_for(&cfgs, "LegacyUnit.<initialization>");
     let init = block_with_stmt(initialization, &source, "statement", "LegacyInit");
-    let block_text = b"begin\n  LegacyInit;\nend";
-    let block_start = source
-        .windows(block_text.len())
-        .position(|window| window == block_text)
-        .expect("legacy unit block");
+    // Like an explicit `initialization` section, the legacy section spans its
+    // keyword and statements; the closing `end.` belongs to the unit.
+    let section_text = b"begin\n  LegacyInit;";
+    let section_start = source
+        .windows(section_text.len())
+        .position(|window| window == section_text)
+        .expect("legacy unit initialization");
     assert_eq!(
         initialization.byte_range,
-        block_start..block_start + block_text.len()
+        section_start..section_start + section_text.len()
     );
     assert!(successors(initialization, init)
         .iter()
@@ -107,4 +109,28 @@ end.
             "ExplicitSections.<finalization>"
         ]
     );
+}
+
+#[test]
+fn legacy_unit_begin_keyword_is_not_a_statement() {
+    let source = br#"
+unit LegacyUnit;
+interface
+implementation
+begin
+  LegacyInit;
+end.
+"#
+    .to_vec();
+    let tree = parse_clean(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+    let initialization = cfg_for(&cfgs, "LegacyUnit.<initialization>");
+
+    let kinds: Vec<&str> = initialization
+        .graph
+        .node_indices()
+        .flat_map(|index| initialization.graph[index].stmts.iter())
+        .map(|stmt| stmt.node_kind.as_str())
+        .collect();
+    assert_eq!(kinds, vec!["statement"]);
 }

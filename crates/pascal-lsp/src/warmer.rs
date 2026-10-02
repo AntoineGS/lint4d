@@ -14,6 +14,10 @@ use crate::workspace::rename::WorkspaceInput;
 pub(crate) struct InteractiveGate {
     busy: Mutex<usize>,
     idle: Condvar,
+    /// Test seam: after this many passing `try_wait_idle` checks, mark the
+    /// gate busy so a pause lands at an exact unit boundary.
+    #[cfg(test)]
+    busy_after_checks: Mutex<Option<usize>>,
 }
 
 impl InteractiveGate {
@@ -42,6 +46,22 @@ impl InteractiveGate {
 
     /// Checks whether warming may proceed without waiting while it owns a cache claim.
     pub(crate) fn try_wait_idle(&self, cancel: &AtomicBool) -> bool {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .busy_after_checks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match remaining.as_mut() {
+                Some(0) => {
+                    *remaining = None;
+                    drop(remaining);
+                    self.set(1);
+                }
+                Some(checks) => *checks -= 1,
+                None => {}
+            }
+        }
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
@@ -682,15 +702,18 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
             Err(crate::workspace::rename::CANCELLATION_MESSAGE.to_string())
         }
     }));
-    match workspace.warm_with_cancel(&job.uri, &job.cancel) {
+    let result = workspace.warm_with_cancel(&job.uri, &job.cancel);
+    // Entries stored before a pause or error are already in the shared cache,
+    // and a retry will not store them again, so report them now.
+    if workspace.interface_entries_stored() > 0 {
+        let _ = events.send(WarmEvent::ClosureStored {
+            uri: job.uri.clone(),
+            generation: job.generation,
+            open_epoch: job.open_epoch,
+        });
+    }
+    match result {
         Ok(outcome) => {
-            if outcome.interface_entries_stored > 0 {
-                let _ = events.send(WarmEvent::ClosureStored {
-                    uri: job.uri.clone(),
-                    generation: job.generation,
-                    open_epoch: job.open_epoch,
-                });
-            }
             let pins = outcome
                 .fingerprint
                 .map(|fingerprint| {
@@ -833,6 +856,41 @@ mod tests {
                 .any(|event| matches!(event, WarmEvent::ClosureStored { .. })),
             "{second:?}"
         );
+    }
+
+    #[test]
+    fn a_paused_crawl_reports_the_interface_entries_it_stored() {
+        let (_temp, workspace, main, _base) = closure_fixture();
+        let gate = Arc::new(InteractiveGate::default());
+        // The first check (before Provider loads) passes; the closure crawl's
+        // check, after Main's interface imports were stored, pauses.
+        *gate.busy_after_checks.lock().unwrap() = Some(1);
+        let mut warmer = Warmer::start(gate.clone());
+        warmer.open(main.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline
+            && !events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Paused { .. }))
+        {
+            events.extend(warmer.poll(&workspace));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let stored = events
+            .iter()
+            .filter(|event| matches!(event, WarmEvent::ClosureStored { .. }))
+            .count();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WarmEvent::Paused { .. })),
+            "the crawl never paused: {events:?}"
+        );
+        assert_eq!(stored, 1, "{events:?}");
+        gate.set(0);
     }
 
     #[test]

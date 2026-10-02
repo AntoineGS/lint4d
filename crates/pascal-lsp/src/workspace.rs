@@ -2788,8 +2788,6 @@ pub(crate) struct WarmOutcome {
     pub(crate) dependencies: Vec<Url>,
     /// Units reached through interface imports beyond `dependencies`.
     pub(crate) closure: Vec<Url>,
-    /// Interface entries this warm stored that were new or changed.
-    pub(crate) interface_entries_stored: usize,
 }
 
 fn build_workspace_roots(
@@ -7176,6 +7174,11 @@ impl Workspace {
         }
     }
 
+    /// Interface entries this workspace stored that were new or changed.
+    pub(crate) fn interface_entries_stored(&self) -> usize {
+        self.interface_entries_stored
+    }
+
     pub(crate) fn set_dependency_hook(&mut self, hook: DependencyHook) {
         self.dependency_hook = Some(hook);
     }
@@ -7195,12 +7198,10 @@ impl Workspace {
                 fingerprint,
                 dependencies: Vec::new(),
                 closure: Vec::new(),
-                interface_entries_stored: 0,
             });
         }
         let mut pinned = HashSet::from([uri.clone()]);
         let session_cache = ResolverSessionCache::default();
-        let stored_before = self.interface_entries_stored;
         let dependencies = self.load_imports_with_session_cache(
             uri,
             &context_key,
@@ -7220,7 +7221,6 @@ impl Workspace {
             fingerprint,
             dependencies,
             closure,
-            interface_entries_stored: self.interface_entries_stored - stored_before,
         })
     }
 
@@ -16773,7 +16773,8 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = worker_view(&fixture.workspace)
+        let mut worker = worker_view(&fixture.workspace);
+        let outcome = worker
             .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
             .expect("warm");
 
@@ -16783,15 +16784,17 @@ mod tests {
             vec![fixture.base.clone()],
             "only interface imports are followed"
         );
-        assert!(outcome.interface_entries_stored > 0);
+        assert!(worker.interface_entries_stored() > 0);
         let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
         assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
 
-        let again = worker_view(&fixture.workspace)
+        let mut again = worker_view(&fixture.workspace);
+        again
             .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
             .expect("warm again");
         assert_eq!(
-            again.interface_entries_stored, 0,
+            again.interface_entries_stored(),
+            0,
             "an unchanged closure stores nothing new"
         );
     }

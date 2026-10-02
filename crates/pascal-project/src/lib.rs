@@ -3584,7 +3584,7 @@ fn normalize_workspace_roots(
         let absolute = absolute_lexical(root)?;
         if let Some(actual) = resolve_existing_path(&absolute, warnings, "workspace root") {
             add_unique_path(&mut normalized, actual);
-        } else if !is_windows_absolute(root) {
+        } else if !is_foreign_windows_path(root) {
             warnings.push(format!(
                 "workspace root could not be resolved; preserving its lexical boundary: {}",
                 root.display()
@@ -3602,7 +3602,7 @@ fn explicit_project_file(
     warnings: &mut Vec<String>,
 ) -> ProjectSelection {
     let requested_text = requested.to_string_lossy();
-    if is_windows_absolute_text(&requested_text) {
+    if cfg!(not(windows)) && is_windows_absolute_text(&requested_text) {
         warnings.push(format!(
             "Windows project path is unavailable on Linux and was omitted: {}",
             requested.display()
@@ -6677,7 +6677,7 @@ fn resolve_existing_path_status(
     warnings: &mut Vec<String>,
     kind: &str,
 ) -> ExistingPathStatus {
-    if is_windows_absolute(path) {
+    if is_foreign_windows_path(path) {
         warnings.push(format!(
             "Windows path in {kind} is unavailable on Linux and was omitted: {}",
             path.display()
@@ -6948,6 +6948,12 @@ fn with_legacy_path_resolution<T>(run: impl FnOnce() -> T) -> T {
 
 fn is_windows_absolute(path: &Path) -> bool {
     is_windows_absolute_text(&path.to_string_lossy())
+}
+
+/// A Windows absolute path on a host that cannot open it. On Windows such a
+/// path is native.
+fn is_foreign_windows_path(path: &Path) -> bool {
+    cfg!(not(windows)) && is_windows_absolute(path)
 }
 
 fn is_windows_absolute_text(path: &str) -> bool {

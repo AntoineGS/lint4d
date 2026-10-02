@@ -2009,8 +2009,10 @@ fn exact_restricted_provenance_is_not_downgraded_by_directory_candidates() {
     assert!(!resolver.finish().complete);
 }
 
+// macOS volumes are usually case-insensitive, which path identity does not
+// handle yet (backlog TASK-74).
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn case_adjusted_include_reapplies_exact_restricted_provenance() {
     let directory = tempdir().expect("restricted include root");
     let root = directory.path();
@@ -2102,7 +2104,10 @@ fn case_adjusted_mapped_include_retains_mapping_restriction() {
     );
 }
 
+// macOS volumes are usually case-insensitive, which path identity does not
+// handle yet (backlog TASK-74).
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn authorized_parent_relative_and_absolute_include_case_adjustment_is_preserved() {
     let directory = tempdir().expect("include root");
     let root = directory.path();

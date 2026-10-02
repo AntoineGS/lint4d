@@ -24025,7 +24025,9 @@ BDS = '/fake/37'
         );
     }
 
-    #[cfg(not(windows))]
+    // Needs `SDK` and `sdk` side by side: not on Windows, and not on macOS
+    // volumes, which are usually case-insensitive (backlog TASK-74).
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn mapped_root_resolution_prefers_exact_case_before_unique_fallback() {
         let temp = tempfile::tempdir().expect("temporary directory");

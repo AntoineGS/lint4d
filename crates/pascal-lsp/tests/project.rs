@@ -791,7 +791,9 @@ fn incomplete_configured_candidate_does_not_establish_a_unique_owner() {
     );
 }
 
-#[cfg(unix)]
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn case_distinct_external_project_does_not_inherit_workspace_overrides() {
     let root = tempfile::tempdir().unwrap();
@@ -1481,7 +1483,10 @@ fn tainted_condition_comparisons_remain_unknown() {
     );
 }
 
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
@@ -1513,7 +1518,10 @@ fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
     );
 }
 
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn case_distinct_workspace_roots_keep_relative_project_ambiguity() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
@@ -2330,7 +2338,9 @@ fn metadata_limit_prevents_automatic_exclusion() {
     );
 }
 
-#[cfg(unix)]
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
     let temp = tempfile::tempdir().expect("temporary fixture");
@@ -3017,7 +3027,9 @@ fn mapped_include_paths_remain_separate_from_unit_search_paths() {
     assert_eq!(context.include_paths, vec![include]);
 }
 
-#[cfg(unix)]
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn mapped_native_lookup_prefers_exact_case_and_rejects_ambiguous_fallback() {
     let root = tempfile::tempdir().unwrap();

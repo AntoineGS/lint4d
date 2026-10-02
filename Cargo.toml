@@ -17,9 +17,49 @@ codegen-units = 1
 strip = "symbols"
 opt-level = 3
 
+# File:line backtraces without full debuginfo: much smaller binaries and
+# faster links. Set `debug = true` locally if you need a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
 # Optimize third-party deps in dev builds so incremental edits stay fast.
 [profile.dev.package."*"]
 opt-level = 3
+
+# ...except proc macros and their helpers, which only run at compile time;
+# optimizing them roughly doubles clean-build time for no runtime benefit.
+[profile.dev.package.proc-macro2]
+opt-level = 0
+[profile.dev.package.quote]
+opt-level = 0
+[profile.dev.package.syn]
+opt-level = 0
+[profile.dev.package.synstructure]
+opt-level = 0
+[profile.dev.package.heck]
+opt-level = 0
+[profile.dev.package.rustversion]
+opt-level = 0
+[profile.dev.package.clap_derive]
+opt-level = 0
+[profile.dev.package.serde_derive]
+opt-level = 0
+[profile.dev.package.serde_repr]
+opt-level = 0
+[profile.dev.package.thiserror-impl]
+opt-level = 0
+[profile.dev.package.displaydoc]
+opt-level = 0
+[profile.dev.package.icu_provider_macros]
+opt-level = 0
+[profile.dev.package.yoke-derive]
+opt-level = 0
+[profile.dev.package.zerofrom-derive]
+opt-level = 0
+[profile.dev.package.zerovec-derive]
+opt-level = 0
+[profile.dev.package.zerocopy-derive]
+opt-level = 0
 
 # ---- Shared package metadata (review BP-H8) ------------------------
 [workspace.package]

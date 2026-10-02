@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never runs a debugger and backtraces aren't needed to read failures;
+  # skipping debuginfo shrinks compile/link time and the rust-cache archives.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 # Cancel in-flight runs on the same branch when a new push lands.
 concurrency:

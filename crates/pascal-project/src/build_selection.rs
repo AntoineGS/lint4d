@@ -56,8 +56,9 @@ struct ElementFrame {
 /// Read build configurations, enabled platforms, and project defaults from a
 /// `.dproj` document. Malformed trailing XML leaves the metadata parsed so far.
 pub fn parse_build_candidates(xml: &str) -> BuildCandidates {
+    // Element text is trimmed when the element closes; trimming each event
+    // would drop the spaces around entity references.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let mut stack = Vec::<ElementFrame>::new();
     let mut candidates = BuildCandidates::default();
@@ -72,8 +73,7 @@ pub fn parse_build_candidates(xml: &str) -> BuildCandidates {
         match event {
             Event::Start(start) => {
                 let name = super::local_name(start.name().as_ref());
-                let attributes =
-                    super::xml_attributes(&start, reader.decoder()).unwrap_or_default();
+                let attributes = super::xml_attributes(&start).unwrap_or_default();
                 let frame = open_element(
                     name,
                     attributes,
@@ -86,8 +86,7 @@ pub fn parse_build_candidates(xml: &str) -> BuildCandidates {
             }
             Event::Empty(empty) => {
                 let name = super::local_name(empty.name().as_ref());
-                let attributes =
-                    super::xml_attributes(&empty, reader.decoder()).unwrap_or_default();
+                let attributes = super::xml_attributes(&empty).unwrap_or_default();
                 let frame = open_element(
                     name,
                     attributes,
@@ -107,15 +106,20 @@ pub fn parse_build_candidates(xml: &str) -> BuildCandidates {
                 );
             }
             Event::Text(text) => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.text.push_str(&text);
+                }
+            }
+            Event::GeneralRef(reference) => {
                 if let Some(frame) = stack.last_mut()
-                    && let Ok(decoded) = text.unescape()
+                    && let Ok(resolved) = super::xml_reference_text(&reference)
                 {
-                    frame.text.push_str(&decoded);
+                    frame.text.push_str(&resolved);
                 }
             }
             Event::CData(text) => {
                 if let Some(frame) = stack.last_mut() {
-                    frame.text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                    frame.text.push_str(&text);
                 }
             }
             Event::End(_) => {

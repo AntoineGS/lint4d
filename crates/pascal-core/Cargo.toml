@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 globset = "0.4"
 walkdir = "2"
-quick-xml = "0.37"
+quick-xml = "0.42"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

@@ -28,7 +28,6 @@ owo-colors = { version = "4", features = ["supports-colors"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 globset = "0.4"
 walkdir = "2"
-quick-xml = "0.37"
 tempfile = "3"
 pascal-core = { path = "../pascal-core" }
 pascal-project = { path = "../pascal-project" }

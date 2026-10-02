@@ -16894,3 +16894,46 @@ fn imports_record_their_uses_section() {
             .all(|import| import.section == ImportSection::Module)
     );
 }
+
+#[test]
+fn inherited_routines_resolve_through_forward_class_declarations() {
+    let base = r#"unit ForwardBase;
+interface
+type
+  TConn = class;
+  TDerived = class;
+  TDerived = class(TConn)
+  end;
+  TConn = class
+  public
+    procedure Open;
+  end;
+implementation
+procedure TConn.Open; begin end;
+end.
+"#;
+    let main = r#"unit ForwardMain;
+interface
+uses ForwardBase;
+implementation
+procedure Run(Db: TDerived);
+begin
+  Db.Open;
+end;
+end.
+"#;
+    let base_uri = uri("ForwardBase");
+    let main_uri = uri("ForwardMain");
+    let mut index = NavigationIndex::new();
+    index
+        .update(base_uri, base.to_owned())
+        .expect("forward base parses");
+    index
+        .update(main_uri.clone(), main.to_owned())
+        .expect("forward main parses");
+
+    let hover = index
+        .hover(&main_uri, position_of(main, "Open", 0))
+        .expect("hover for an inherited routine");
+    assert!(hover_text(&hover).contains("procedure Open;"), "{hover:?}");
+}

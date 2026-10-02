@@ -16704,6 +16704,121 @@ mod tests {
         );
     }
 
+    /// Warms `Main` and `Derived`, then returns the tokens on `  Db.Open;`.
+    fn warm_body_line_token_kinds(fixture: &InheritedFixture) -> Vec<(u32, u32, String)> {
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        body_line_token_kinds(&fixture.workspace, &fixture.main)
+    }
+
+    #[test]
+    fn a_forward_declaration_of_the_receiver_class_keeps_inherited_members() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Derived.pas"),
+            "unit Derived;\ninterface\nuses Base;\ntype\n  TDerived = class;\n  TDerived = class(TConn)\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn a_forward_declaration_of_the_ancestor_keeps_inherited_members() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("  TConn = class\n", "  TConn = class;\n  TConn = class\n"),
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn an_explicit_tobject_ancestor_without_system_is_the_implicit_root() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace("TConn = class\n", "TConn = class(TObject)\n"),
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+        let hover = super::queries::hover_from_input(
+            fixture.workspace.analysis_input(),
+            &fixture.main,
+            lsp_types::Position::new(6, 6),
+            lsp_types::MarkupKind::PlainText,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("hover")
+        .expect("hover for an inherited member");
+        assert!(
+            format!("{:?}", hover.contents).contains("procedure Open;"),
+            "{hover:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_members_resolve_through_a_classes_style_chain() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Classes.pas"),
+            "unit Classes;\ninterface\ntype\n  TComponent = class;\n  TPersistent = class(TObject)\n  public\n    procedure Assign;\n  end;\n  TComponent = class(TPersistent)\n  public\n    procedure Open;\n  end;\nimplementation\nprocedure TPersistent.Assign; begin end;\nprocedure TComponent.Open; begin end;\nend.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("Base.pas"),
+            "unit Base;\ninterface\nuses Classes;\ntype\n  TConn = class(TComponent)\n  end;\nimplementation\nend.\n",
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn an_ancestor_with_only_a_forward_declaration_stays_unknown() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            INHERITED_BASE.replace(
+                "  TConn = class\n",
+                "  TLonely = class;\n  TConn = class(TLonely)\n",
+            ),
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(
+            !tokens.contains(&(6, 5, "method".to_string())),
+            "{tokens:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_source_tobject_still_supplies_inherited_members() {
+        let fixture = inherited_fixture("Base");
+        fs::write(
+            fixture.root.join("Base.pas"),
+            "unit Base;\ninterface\ntype\n  TObject = class\n  public\n    procedure Open;\n  end;\n  TConn = class(TObject)\n  end;\nimplementation\nprocedure TObject.Open; begin end;\nend.\n",
+        )
+        .unwrap();
+
+        let tokens = warm_body_line_token_kinds(&fixture);
+
+        assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
     #[test]
     fn highlights_resolve_members_reached_through_a_warm_closure() {
         let fixture = inherited_fixture("Base");

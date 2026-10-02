@@ -31,6 +31,11 @@ repository = "https://github.com/AntoineGS/lint4d"
 homepage = "https://github.com/AntoineGS/lint4d"
 authors = ["Antoine Gaudreau Simard"]
 
+# ---- Shared dependencies ---------------------------------------------
+[workspace.dependencies]
+# Must match the rev cfg-pascal pins, or the grammar is linked twice.
+tree-sitter-pascal = { git = "https://github.com/AntoineGS/tree-sitter-pascal.git", rev = "2167e95ca744d3d1e7fb1f638824c2fa64414031" }
+
 # ---- Workspace lints (review BP-H3, BP-H4) -------------------------
 [workspace.lints.rust]
 warnings = "deny"

@@ -490,6 +490,7 @@ pub(crate) fn source_record_for_loaded(
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -521,6 +522,7 @@ pub(crate) fn source_record_for_loaded(
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -562,6 +564,7 @@ fn payload_record(
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -590,6 +593,7 @@ fn payload_record(
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -646,6 +650,7 @@ pub(crate) fn observation_record(observation: &ResolutionObservation) -> Option<
         missing_provider_candidate,
         document_link_missing_candidate: false,
         directory_observation,
+        document_link_ancestor: false,
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
@@ -753,6 +758,7 @@ pub(crate) fn report_records(
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -847,6 +853,8 @@ pub(crate) fn merge_source_record(
     existing.missing_provider_candidate |= incoming.missing_provider_candidate;
     existing.document_link_missing_candidate |= incoming.document_link_missing_candidate;
     existing.directory_observation |= incoming.directory_observation;
+    // Any other observation of the same directory keeps the strict check.
+    existing.document_link_ancestor &= incoming.document_link_ancestor;
 }
 
 fn merge_candidate_observations(

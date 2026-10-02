@@ -1909,6 +1909,7 @@ fn compact_completion_records(
             missing_provider_candidate: record.missing_provider_candidate,
             document_link_missing_candidate: record.document_link_missing_candidate,
             directory_observation: record.directory_observation,
+            document_link_ancestor: record.document_link_ancestor,
             missing_provider_scope: record.missing_provider_scope.clone(),
             auto_import_provider_observation: record.auto_import_provider_observation,
             auto_import_scopes: record.auto_import_scopes.clone(),
@@ -2527,6 +2528,7 @@ fn compact_diagnostic_records(records: &[SourceRecord]) -> Result<Vec<SourceReco
             missing_provider_candidate: record.missing_provider_candidate,
             document_link_missing_candidate: record.document_link_missing_candidate,
             directory_observation: record.directory_observation,
+            document_link_ancestor: record.document_link_ancestor,
             missing_provider_scope: record.missing_provider_scope.clone(),
             auto_import_provider_observation: record.auto_import_provider_observation,
             auto_import_scopes: record.auto_import_scopes.clone(),
@@ -2553,6 +2555,7 @@ fn diagnostic_record_fingerprint(record: &SourceRecord) -> u64 {
     record.missing_provider_candidate.hash(&mut hasher);
     record.document_link_missing_candidate.hash(&mut hasher);
     record.directory_observation.hash(&mut hasher);
+    record.document_link_ancestor.hash(&mut hasher);
     record.auto_import_provider_observation.hash(&mut hasher);
     hash_debug(&mut hasher, &record.candidate_membership);
     hash_debug(&mut hasher, &record.candidate_observations);
@@ -17566,6 +17569,7 @@ mod tests {
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -17769,6 +17773,7 @@ mod tests {
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),

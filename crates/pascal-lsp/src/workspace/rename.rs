@@ -330,6 +330,10 @@ pub(crate) struct SourceRecord {
     /// A child create/delete/rename invalidates this record, but unrelated
     /// source records remain exact-path dependencies.
     pub(crate) directory_observation: bool,
+    /// An ancestor directory of a document-link target. Only its kind is a
+    /// dependency (a directory may not become a symlink); entries added or
+    /// removed beside the target change its size and mtime but not the link.
+    pub(crate) document_link_ancestor: bool,
     /// A complete projectless recursive filename lookup found no provider with
     /// any of these names below this root.  The scope is retained separately
     /// from the synthetic direct candidate so live validation can notice a
@@ -1890,9 +1894,12 @@ fn revalidate_path_record(
         // present (or a file/type change) changes the selected context.
         let effective_path_changed = is_configuration_file(path)
             && !effective_path_stamp_matches(&actual_path_stamp, &record.path_stamp);
-        if (validate_transport_observations && actual_path_stamp != record.path_stamp)
-            || effective_path_changed
-        {
+        let path_stamp_changed = if record.document_link_ancestor {
+            !path_kind_matches(&actual_path_stamp, &record.path_stamp)
+        } else {
+            actual_path_stamp != record.path_stamp
+        };
+        if (validate_transport_observations && path_stamp_changed) || effective_path_changed {
             let kind = if is_configuration_file(path) {
                 "configuration"
             } else {
@@ -2060,6 +2067,16 @@ fn effective_overlay_text_changed(
     Ok(overlay.text != current.text)
 }
 
+fn path_kind_matches(actual: &Option<PathStamp>, expected: &Option<PathStamp>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => {
+            actual.is_dir == expected.is_dir && actual.is_symlink == expected.is_symlink
+        }
+        _ => false,
+    }
+}
+
 fn effective_path_stamp_matches(actual: &Option<PathStamp>, expected: &Option<PathStamp>) -> bool {
     match (actual, expected) {
         (None, None) => true,
@@ -2195,6 +2212,7 @@ pub(super) fn path_record_at(
         missing_provider_candidate: false,
         document_link_missing_candidate: false,
         directory_observation: false,
+        document_link_ancestor: false,
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
@@ -2299,6 +2317,7 @@ pub(crate) fn source_for_input_with_cancel(
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -2346,6 +2365,7 @@ pub(crate) fn source_for_input_with_owner(
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -2407,6 +2427,7 @@ pub(crate) fn source_for_input_with_owner(
         missing_provider_candidate: false,
         document_link_missing_candidate: false,
         directory_observation: false,
+        document_link_ancestor: false,
         missing_provider_scope: None,
         auto_import_provider_observation: false,
         auto_import_scopes: Vec::new(),
@@ -6261,6 +6282,7 @@ fn build_snapshot_with_policy(
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -6351,6 +6373,7 @@ fn build_snapshot_with_policy(
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -6853,6 +6876,7 @@ fn build_snapshot_with_policy(
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -6896,6 +6920,7 @@ fn build_snapshot_with_policy(
                     missing_provider_candidate: false,
                     document_link_missing_candidate: false,
                     directory_observation: false,
+                    document_link_ancestor: false,
                     missing_provider_scope: None,
                     auto_import_provider_observation: false,
                     auto_import_scopes: Vec::new(),
@@ -7164,6 +7189,7 @@ fn retain_expansion_dependencies(
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -7215,6 +7241,7 @@ fn retain_expansion_dependencies(
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -12650,6 +12677,7 @@ mod tests {
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: false,
+            document_link_ancestor: false,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),

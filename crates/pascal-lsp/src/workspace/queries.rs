@@ -1769,6 +1769,7 @@ pub(crate) fn document_links_from_input(
                 missing_provider_candidate: false,
                 document_link_missing_candidate: false,
                 directory_observation: false,
+                document_link_ancestor: false,
                 missing_provider_scope: None,
                 auto_import_provider_observation: false,
                 auto_import_scopes: Vec::new(),
@@ -1948,6 +1949,7 @@ fn record_document_link_ancestors(
             missing_provider_candidate: false,
             document_link_missing_candidate: false,
             directory_observation: true,
+            document_link_ancestor: true,
             missing_provider_scope: None,
             auto_import_provider_observation: false,
             auto_import_scopes: Vec::new(),
@@ -2419,6 +2421,65 @@ mod tests {
         )
         .expect_err("a symlinked ancestor must never become the trusted baseline");
         assert!(error.contains("symlink"), "unexpected refusal: {error}");
+    }
+
+    fn nested_resource_links(root: &Path) -> Computed<Vec<lsp_types::DocumentLink>> {
+        let main = root.join("Main.pas");
+        fs::create_dir_all(root.join("assets")).expect("assets directory");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nimplementation\n{$R assets/Form.dfm}\nend.\n",
+        )
+        .expect("main source");
+        fs::write(root.join("assets/Form.dfm"), "object Form1: TForm1\nend\n").expect("form");
+        let workspace = test_workspace(vec![root.to_path_buf()], WorkspaceOptions::default());
+        let computed = super::document_links_from_input(
+            workspace.analysis_input(),
+            &source_uri(&main),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            computed.value.as_ref().expect("document links").len(),
+            1,
+            "{computed:?}"
+        );
+        computed
+    }
+
+    #[test]
+    fn document_link_revalidation_ignores_new_entries_in_ancestor_directories() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let computed = nested_resource_links(&root);
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+
+        fs::write(temp.path().join("Sibling.txt"), "above the root").expect("parent entry");
+        fs::write(root.join(".Main.pas.swp"), "editor swap file").expect("root entry");
+        fs::write(root.join("assets/Other.dfm"), "object Other: TForm\nend\n")
+            .expect("nested entry");
+
+        revalidate_input(&input, &computed.records, &AtomicBool::new(false))
+            .expect("new entries beside a link target's ancestors must not stale the links");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_link_revalidation_rejects_an_ancestor_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = temp.path().join("workspace");
+        let computed = nested_resource_links(&root);
+        let input =
+            test_workspace(vec![root.clone()], WorkspaceOptions::default()).analysis_input();
+
+        let moved = temp.path().join("moved-assets");
+        fs::rename(root.join("assets"), &moved).expect("move assets away");
+        symlink(&moved, root.join("assets")).expect("symlink in place of assets");
+
+        revalidate_input(&input, &computed.records, &AtomicBool::new(false))
+            .expect_err("an ancestor replaced by a symlink must stale the links");
     }
 
     fn test_workspace(roots: Vec<PathBuf>, options: WorkspaceOptions) -> Workspace {

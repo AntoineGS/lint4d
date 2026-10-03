@@ -15,28 +15,34 @@ removes a dependency, push it and bump the pin first.
 
 ## Backlog (required)
 
-Tracked work lives in `backlog/`, managed with the Backlog.md CLI (`backlog`).
-Change tasks through the CLI only; never hand-edit files under `backlog/`.
-Run `backlog instructions` for the full workflow.
+Tracked work lives in `backlog/`, managed with Backlog.md. Access it **only
+through the Backlog.md MCP server** (`backlog mcp start`): read and change
+tasks, milestones and docs with its tools. Do not read, grep, glob or
+hand-edit files under `backlog/`, and do not use the `backlog` CLI. If the
+MCP tools are not available in the session, stop and ask the user to
+connect the server instead of falling back. Call
+`get_backlog_instructions` for the full workflow.
 
-- **Find work:** `backlog task list --plain`, `backlog task <id> --plain`.
+- **Find work:** `task_list` (filter by `status`, `milestone`, `labels`;
+  `ready` for unblocked tasks), `task_search`, `task_view`.
   Respect `dependencies`; milestones `M1`..`M7` give the intended order.
-- **Start:** `backlog task edit <id> -s "In Progress" --plan "<steps>"`
+- **Start:** `task_edit` with `status: "In Progress"` and `planSet`
   before writing code.
 - **Complete:** only after the acceptance criteria are verified (tests, fmt,
-  clippy). Check each one with `--check-ac <n>`, add `--final-summary`
-  (what changed, commits, how it was verified), then `-s Done`.
-- **Defer or put off:** set `-s Deferred` and `--append-notes` with the
+  clippy). Check each one with `acceptanceCriteriaCheck`, add
+  `finalSummary` (what changed, commits, how it was verified), then set
+  `status: "Done"`.
+- **Defer or put off:** set `status: "Deferred"` and `notesAppend` with the
   reason, what was done so far, and what would unblock it. A deferred task
   must never be left `In Progress`.
-- **Partial work or new findings:** record progress with `--append-notes`;
-  create new tasks (`backlog task create`) for follow-ups or bugs discovered,
-  and link them with `--dep`. Fix stale `file:line` citations you notice.
+- **Partial work or new findings:** record progress with `notesAppend`;
+  create new tasks (`task_create`) for follow-ups or bugs discovered, and
+  link them with `dependencies`. Fix stale `file:line` citations you notice.
 - Commit backlog changes together with the code change that caused them.
 - Do not keep separate TODO files. The former `AGENT_TODOS.md` was
-  converted into `agent-todos` tasks; its original text is archived in
-  `backlog/docs/` (`backlog doc view doc-1`). `TODOS.md` is the user's own
-  list: do not edit it.
+  converted into `agent-todos` tasks; its original text is archived as a
+  Backlog.md document (`document_view` with id `doc-1`). `TODOS.md` is the
+  user's own list: do not edit it.
 
 `arch-review` tasks come from `2026-10-02-architecture-review-backlog.md`.
 Their titles keep the review IDs (`LSP-3`, `CORE-7`, ...); read that

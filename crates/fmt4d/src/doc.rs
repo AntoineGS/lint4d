@@ -19,6 +19,10 @@ pub enum Doc {
     /// Pre-formatted text (comments, verbatim regions) — no spacing logic.
     Raw(String),
 
+    /// Start a line for verbatim text that starts a line in the source: a
+    /// newline unless already at line start, then this source indentation.
+    LineStart(String),
+
     /// Always a newline.
     Hardline,
 

@@ -1,5 +1,6 @@
 use pascal_core::node_kind as K;
 use std::collections::HashMap;
+use std::ops::Range;
 use tree_sitter::Node;
 
 /// A comment attached to a code node.
@@ -15,6 +16,8 @@ pub struct AttachedComment {
     /// Number of bytes between the preceding token and this comment in the source.
     /// Only meaningful for trailing comments; 0 for leading comments.
     pub gap: usize,
+    /// Byte range of the comment in the source.
+    pub span: Range<usize>,
 }
 
 /// Maps node IDs to their attached comments.
@@ -56,6 +59,7 @@ impl CommentMap {
                         trailing: true,
                         source_row: comment_line,
                         gap,
+                        span: comment_node.byte_range(),
                     });
                 continue;
             }
@@ -67,6 +71,7 @@ impl CommentMap {
                     trailing: false,
                     source_row: comment_line,
                     gap: 0,
+                    span: comment_node.byte_range(),
                 });
             }
         }

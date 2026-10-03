@@ -622,6 +622,16 @@ impl<'a> DocBuilder<'a> {
                 group_items.push(Doc::BlankLine);
             }
 
+            // A format-off declaration is emitted verbatim together with its
+            // comments and directives; splitting it into cells would rewrite it.
+            if self.is_in_format_off_region(*child) {
+                group_items.push(self.doc_for_node(*child));
+                prev_child_kind = kind;
+                prev_single_line = single_line;
+                prev_end = Some(child.end_position().row);
+                continue;
+            }
+
             // Expand multi-identifier var declarations (e.g. `I, J, K: Integer;`)
             // into one row per identifier before trying normal decomposition.
             if section_kind == K::DECL_VARS

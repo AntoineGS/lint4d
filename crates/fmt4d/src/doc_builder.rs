@@ -67,7 +67,7 @@ impl<'a> DocBuilder<'a> {
     /// 5. Return `concat([leading, body, trailing])`.
     pub(crate) fn doc_for_node(&self, node: Node<'a>) -> Doc {
         if self.is_in_format_off_region(node) {
-            return Doc::Raw(self.node_text(node));
+            return self.format_off_doc(node, true, true);
         }
 
         let leading_comments = self.leading_comments_doc(node);
@@ -92,7 +92,7 @@ impl<'a> DocBuilder<'a> {
     /// inside aligned cells.
     pub(crate) fn doc_for_node_sans_leading(&self, node: Node<'a>) -> Doc {
         if self.is_in_format_off_region(node) {
-            return Doc::Raw(self.node_text(node));
+            return self.format_off_doc(node, false, true);
         }
 
         let leading_directives = self.leading_directives_doc(node);
@@ -115,7 +115,7 @@ impl<'a> DocBuilder<'a> {
     /// embedded inside the last data cell.
     pub(crate) fn doc_for_node_sans_trailing(&self, node: Node<'a>) -> Doc {
         if self.is_in_format_off_region(node) {
-            return Doc::Raw(self.node_text(node));
+            return self.format_off_doc(node, true, false);
         }
 
         let leading_comments = self.leading_comments_doc(node);
@@ -129,6 +129,64 @@ impl<'a> DocBuilder<'a> {
             body,
             trailing_directives,
         ])
+    }
+
+    /// Emit a node inside a format-off region as its source text.
+    ///
+    /// Comments and directives are attached to leaves, so the ones leading
+    /// the node's first leaf (such as the `{$FMT.OFF}` itself) and trailing
+    /// its last leaf lie outside the node's text; descending would have
+    /// emitted them, so the slice is widened to cover them. Leading
+    /// comments on the node itself are left out when `with_leading` is
+    /// false, trailing ones when `with_trailing` is false, mirroring the
+    /// `sans_*` variants. Text that starts a line in the source starts one
+    /// in the output too, with its source indentation.
+    fn format_off_doc(&self, node: Node<'a>, with_leading: bool, with_trailing: bool) -> Doc {
+        let first = first_leaf(node);
+        let last = last_leaf(node);
+        let leading_comments = if with_leading || first.id() != node.id() {
+            self.comments.leading_comments(first.id())
+        } else {
+            &[]
+        };
+        let trailing_comments = if with_trailing || last.id() != node.id() {
+            self.comments.trailing_comments(last.id())
+        } else {
+            &[]
+        };
+        let start = leading_comments
+            .iter()
+            .map(|c| c.span.start)
+            .chain(
+                self.directives
+                    .leading_directives(first.id())
+                    .iter()
+                    .map(|d| d.span.start),
+            )
+            .fold(node.start_byte(), usize::min);
+        let end = trailing_comments
+            .iter()
+            .map(|c| c.span.end)
+            .chain(
+                self.directives
+                    .trailing_directives(last.id())
+                    .iter()
+                    .map(|d| d.span.end),
+            )
+            .fold(node.end_byte(), usize::max);
+
+        let line_start = self.source[..start]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let prefix = &self.source[line_start..start];
+        let line = if start > 0 && prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+            Doc::LineStart(String::from_utf8_lossy(prefix).into_owned())
+        } else {
+            Doc::Empty
+        };
+        let text = pascal_core::decode_bytes(&self.source[start..end]).replace('\r', "");
+        doc::concat(vec![line, Doc::Raw(text)])
     }
 
     /// Dispatch to the correct handler by node kind.
@@ -627,6 +685,21 @@ pub(crate) fn ends_with_hardline(doc: &Doc) -> bool {
             .is_some_and(ends_with_hardline),
         Doc::Group(inner) | Doc::Indent(inner) => ends_with_hardline(inner),
         _ => false,
+    }
+}
+
+/// Descend through `node`'s leftmost non-extra children until we reach a
+/// leaf, where [`CommentMap`] attaches leading comments.
+fn first_leaf(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+    loop {
+        let first_child = current
+            .children(&mut current.walk())
+            .find(|c| !c.is_extra());
+        match first_child {
+            Some(child) => current = child,
+            None => return current,
+        }
     }
 }
 

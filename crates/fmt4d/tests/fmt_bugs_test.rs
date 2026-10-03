@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 mod common;
-use common::{format_source, idempotency_check};
+use common::{format_aligned, format_source, idempotency_check, idempotency_check_aligned};
 
 // ── Bug 1: Character literal corruption ─────────────────────────
 // #0, #9, #10, #13 etc. are reduced to bare `#`, producing code
@@ -3955,7 +3955,73 @@ fn format_off_region_with_multiline_string_survives_formatting() {
         format!("unit T;\ninterface\nimplementation\n{{$FMT.OFF}}\n{region}{{$FMT.ON}}\nend.\n");
     let result = format_source(&src);
     assert!(
-        result.contains(&region),
+        result.contains(&format!("{{$FMT.OFF}}\n{region}")),
         "{{$FMT.OFF}} region was rewritten:\n{result:?}"
     );
+    idempotency_check(&src);
+}
+
+// ── Bug: trivia around a {$FMT.OFF} node is dropped ─────────────
+// A node inside a format-off region is emitted as its raw source text,
+// but comments and directives are attached to leaves: the `{$FMT.OFF}`
+// directive (leading on the node's first leaf) and a trailing comment on
+// its last leaf sit outside the node's text and were never emitted. The
+// directive loss made the next run reformat the region.
+
+#[test]
+fn fmt_off_directive_and_surrounding_comments_survive_formatting() {
+    let region = "\
+{$FMT.OFF}
+// keep me
+procedure P;
+begin
+  S  :=  S;
+end; // tail
+";
+    let src = format!("unit T;\ninterface\nimplementation\n{region}{{$FMT.ON}}\nend.\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains(region),
+        "{{$FMT.OFF}} region lost trivia:\n{result:?}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn fmt_off_statement_region_keeps_directive_and_indentation() {
+    let src = "\
+unit T;
+interface
+implementation
+procedure P;
+begin
+  {$FMT.OFF}
+  S  :=  S;
+  {$FMT.ON}
+  X  :=  1;
+end;
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains("begin\n  {$FMT.OFF}\n  S  :=  S;\n  {$FMT.ON}\n  X := 1;\n"),
+        "statement-level {{$FMT.OFF}} region was rewritten:\n{result:?}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn fmt_off_declaration_in_aligned_section_keeps_trivia_once() {
+    let region = "  {$FMT.OFF}\n  // c\n  BB  :  string; // t\n";
+    let src = format!(
+        "unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  A: Integer;\n  CCC: Integer; // u\n{region}  {{$FMT.ON}}\nbegin\nend;\nend.\n"
+    );
+    let result = format_aligned(&src);
+    assert!(
+        result.contains(region),
+        "aligned {{$FMT.OFF}} declaration was rewritten:\n{result:?}"
+    );
+    assert_eq!(result.matches("// c").count(), 1, "{result}");
+    assert_eq!(result.matches("// t").count(), 1, "{result}");
+    idempotency_check_aligned(&src);
 }

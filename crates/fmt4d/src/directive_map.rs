@@ -1,6 +1,7 @@
 use pascal_core::directive_fragment_rewrite::DirectivePatch;
 use pascal_core::node_kind as K;
 use std::collections::HashMap;
+use std::ops::Range;
 use tree_sitter::Node;
 
 /// A directive synthesized from a `DirectivePatch` returned by the
@@ -25,6 +26,8 @@ pub struct AttachedDirective {
     pub trailing: bool,
     /// Gap in bytes between preceding token and this directive (trailing only).
     pub gap: usize,
+    /// Byte range of the directive in the source.
+    pub span: Range<usize>,
 }
 
 /// Maps node IDs to their attached standalone directives.
@@ -142,6 +145,7 @@ fn attach_one(
                 text,
                 trailing: true,
                 gap,
+                span: dir_start..dir_end,
             });
         return;
     }
@@ -153,6 +157,7 @@ fn attach_one(
                 text,
                 trailing: false,
                 gap: 0,
+                span: dir_start..dir_end,
             });
     }
 }

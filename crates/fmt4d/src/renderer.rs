@@ -161,6 +161,14 @@ impl Renderer {
                     self.push_verbatim(&text);
                 }
 
+                Doc::LineStart(indent) => {
+                    if !self.at_line_start() {
+                        self.emit_newline();
+                    }
+                    self.output.push_str(&indent);
+                    self.current_column += indent.len();
+                }
+
                 Doc::Hardline => {
                     self.emit_newline();
                 }
@@ -508,7 +516,7 @@ impl Renderer {
                     *width += last_line.len();
                 }
             }
-            Doc::Hardline | Doc::BlankLine => {
+            Doc::Hardline | Doc::BlankLine | Doc::LineStart(_) => {
                 // Newlines in a cell shouldn't happen, but handle gracefully.
                 *width = 0;
             }
@@ -649,7 +657,7 @@ impl Renderer {
                 true
             }
 
-            Doc::Hardline | Doc::BlankLine => {
+            Doc::Hardline | Doc::BlankLine | Doc::LineStart(_) => {
                 // A hardline starts a new line even in flat mode.  Reset
                 // `remaining` to the space available on the new line
                 // (accounting for indentation) so subsequent tokens are
@@ -797,7 +805,7 @@ impl Renderer {
         match doc {
             Doc::Empty => FitsResult::Continue,
 
-            Doc::Hardline | Doc::BlankLine => FitsResult::LineBreak,
+            Doc::Hardline | Doc::BlankLine | Doc::LineStart(_) => FitsResult::LineBreak,
 
             Doc::Token {
                 text,

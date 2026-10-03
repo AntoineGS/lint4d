@@ -4,7 +4,7 @@ title: 'BUILD-5: Measure the dev-profile optimization policy'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - build
@@ -19,7 +19,7 @@ ordinal: 71000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-5).
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-5). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: low. Cost: build time.
 

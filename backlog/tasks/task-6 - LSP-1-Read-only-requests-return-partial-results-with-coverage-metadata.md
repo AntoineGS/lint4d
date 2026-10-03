@@ -4,7 +4,7 @@ title: 'LSP-1: Read-only requests return partial results with coverage metadata'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lsp
@@ -19,7 +19,7 @@ ordinal: 6000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-1).
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-1). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: high. Cost: runtime and usability.
 

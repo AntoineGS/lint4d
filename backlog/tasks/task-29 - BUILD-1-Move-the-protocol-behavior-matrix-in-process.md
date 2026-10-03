@@ -4,7 +4,7 @@ title: 'BUILD-1: Move the protocol behavior matrix in-process'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - build
@@ -20,7 +20,7 @@ ordinal: 29000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-1).
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-1). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: high. Cost: build time, test time, flakiness.
 

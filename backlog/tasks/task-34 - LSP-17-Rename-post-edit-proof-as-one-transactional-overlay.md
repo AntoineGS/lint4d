@@ -4,7 +4,7 @@ title: 'LSP-17: Rename post-edit proof as one transactional overlay'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lsp
@@ -20,7 +20,7 @@ ordinal: 34000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-17).
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-17). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: high. Cost: runtime and maintenance.
 
@@ -39,6 +39,8 @@ units, from LSP-16) once.
 
 **Depends on.** LSP-16 for the closure; can be done before with the current
 full index.
+
+**Parallel work.** Never hold this task at the same time as TASK-33, TASK-35, TASK-36 (LSP-16 to LSP-19); they edit the same files.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

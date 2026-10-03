@@ -4,7 +4,7 @@ title: 'BUILD-6: Repository hygiene'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - build
@@ -20,7 +20,7 @@ ordinal: 1000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-6).
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-6). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: low. Cost: maintenance.
 

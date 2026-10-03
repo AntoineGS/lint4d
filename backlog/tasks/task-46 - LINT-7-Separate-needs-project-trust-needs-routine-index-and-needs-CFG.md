@@ -4,7 +4,7 @@ title: 'LINT-7: Separate "needs project trust", "needs routine index" and "needs
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lint
@@ -20,7 +20,7 @@ ordinal: 46000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-7).
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-7). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: both.
 

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lsp
@@ -25,7 +25,7 @@ ordinal: 33000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-16).
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-16). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: high. Cost: runtime; this is the structural investment.
 
@@ -56,6 +56,8 @@ O(workspace bytes + retained AST nodes).
 
 **Depends on.** LSP-1, LSP-6, LSP-8, LSP-15. Coordinate with LSP-17,
 LSP-18, LSP-24 which consume it.
+
+**Parallel work.** Never hold this task at the same time as TASK-34, TASK-35, TASK-36 (LSP-16 to LSP-19); they edit the same files.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

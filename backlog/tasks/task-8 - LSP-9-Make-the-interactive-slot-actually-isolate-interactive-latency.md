@@ -4,7 +4,7 @@ title: 'LSP-9: Make the interactive slot actually isolate interactive latency'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lsp
@@ -20,7 +20,7 @@ ordinal: 8000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-9).
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-9). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: high. Cost: runtime latency.
 

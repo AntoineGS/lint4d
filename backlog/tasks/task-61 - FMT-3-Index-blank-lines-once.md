@@ -4,7 +4,7 @@ title: 'FMT-3: Index blank lines once'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - fmt
@@ -19,7 +19,7 @@ ordinal: 61000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (FMT-3).
+Imported from `2026-10-02-architecture-review-backlog.md` (FMT-3). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: runtime.
 

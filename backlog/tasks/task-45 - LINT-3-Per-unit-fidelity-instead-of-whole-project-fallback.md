@@ -4,7 +4,7 @@ title: 'LINT-3: Per-unit fidelity instead of whole-project fallback'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lint
@@ -21,7 +21,7 @@ ordinal: 45000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-3).
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-3). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: high. Cost: both.
 

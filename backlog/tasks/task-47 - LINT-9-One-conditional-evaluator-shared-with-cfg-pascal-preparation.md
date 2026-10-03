@@ -4,7 +4,7 @@ title: 'LINT-9: One conditional evaluator shared with cfg-pascal preparation'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lint
@@ -22,7 +22,7 @@ ordinal: 47000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-9).
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-9). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: both.
 

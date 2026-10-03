@@ -4,7 +4,7 @@ title: 'CORE-10: Shared text and path primitives with explicit contracts'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - core
@@ -20,7 +20,7 @@ ordinal: 52000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-10).
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-10). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: both.
 

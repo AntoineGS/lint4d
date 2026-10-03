@@ -4,7 +4,7 @@ title: 'LSP-22: Remove budgeted/unbudgeted duplicates and repeated AST primitive
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lsp
@@ -19,7 +19,7 @@ ordinal: 49000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-22).
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-22). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: maintenance.
 

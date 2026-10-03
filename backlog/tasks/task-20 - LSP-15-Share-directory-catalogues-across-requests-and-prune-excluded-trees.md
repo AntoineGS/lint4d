@@ -4,7 +4,7 @@ title: 'LSP-15: Share directory catalogues across requests and prune excluded tr
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lsp
@@ -20,7 +20,7 @@ ordinal: 20000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-15).
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-15). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: runtime i/o.
 

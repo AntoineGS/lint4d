@@ -4,7 +4,7 @@ title: 'LINT-11: Shared source-semantic facts below the LSP for exception dispat
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:16'
+updated_date: '2026-10-03 01:29'
 labels:
   - arch-review
   - lint
@@ -20,7 +20,7 @@ ordinal: 56000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-11).
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-11). Shared constraints, measured baselines and parallel-work rules for review tasks: document doc-2 (`document_view`).
 
 Severity: medium. Cost: maintenance.
 

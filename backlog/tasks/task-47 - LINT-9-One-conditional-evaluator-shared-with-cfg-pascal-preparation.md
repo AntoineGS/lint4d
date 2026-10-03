@@ -4,7 +4,7 @@ title: 'LINT-9: One conditional evaluator shared with cfg-pascal preparation'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lint
@@ -14,8 +14,6 @@ labels:
 milestone: m-5
 dependencies:
   - TASK-40
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: enhancement
 ordinal: 47000
@@ -24,7 +22,7 @@ ordinal: 47000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-9). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-9).
 
 Severity: medium. Cost: both.
 

@@ -4,14 +4,13 @@ title: 'LSP-5: Sparse newline map and position index'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
   - runtime
 milestone: m-2
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 11000
@@ -20,7 +19,7 @@ ordinal: 11000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-5). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-5).
 
 Severity: high. Cost: runtime memory.
 

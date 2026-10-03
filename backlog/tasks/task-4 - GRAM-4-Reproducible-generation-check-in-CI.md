@@ -4,6 +4,7 @@ title: 'GRAM-4: Reproducible generation check in CI'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - grammar
@@ -11,8 +12,6 @@ labels:
   - cross-repo
 milestone: m-0
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: chore
 ordinal: 4000
@@ -21,7 +20,7 @@ ordinal: 4000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (GRAM-4). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (GRAM-4).
 
 Severity: medium. Cost: maintenance.
 

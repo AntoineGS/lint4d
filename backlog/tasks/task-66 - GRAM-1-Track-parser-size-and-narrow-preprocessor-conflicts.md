@@ -4,7 +4,7 @@ title: 'GRAM-1: Track parser size and narrow preprocessor conflicts'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - grammar
@@ -14,8 +14,6 @@ labels:
 milestone: m-6
 dependencies:
   - TASK-4
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: enhancement
 ordinal: 66000
@@ -24,7 +22,7 @@ ordinal: 66000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (GRAM-1). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (GRAM-1).
 
 Severity: medium. Cost: build and runtime.
 

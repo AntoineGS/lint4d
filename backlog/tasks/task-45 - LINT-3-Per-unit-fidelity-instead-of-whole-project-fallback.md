@@ -4,6 +4,7 @@ title: 'LINT-3: Per-unit fidelity instead of whole-project fallback'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lint
@@ -12,8 +13,6 @@ labels:
   - cross-repo
 milestone: m-5
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 45000
@@ -22,7 +21,7 @@ ordinal: 45000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-3). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-3).
 
 Severity: high. Cost: both.
 

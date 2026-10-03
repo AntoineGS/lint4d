@@ -4,14 +4,13 @@ title: 'LINT-4: Naming auto-fix must be binding-aware or restricted'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lint
   - correctness
 milestone: m-3
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: bug
 ordinal: 22000
@@ -20,7 +19,7 @@ ordinal: 22000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-4). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-4).
 
 Severity: high. Cost: correctness.
 

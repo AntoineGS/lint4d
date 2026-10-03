@@ -4,6 +4,7 @@ title: 'LSP-25: Split the three monolith files along existing seams'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
@@ -11,8 +12,6 @@ labels:
   - build-time
 milestone: m-4
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: task
 ordinal: 31000
@@ -21,7 +20,7 @@ ordinal: 31000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-25). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-25).
 
 Severity: medium. Cost: maintenance and build time.
 

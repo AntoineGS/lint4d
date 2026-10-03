@@ -4,7 +4,7 @@ title: 'CORE-12: Narrow the public API surface'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
@@ -12,8 +12,6 @@ labels:
 milestone: m-6
 dependencies:
   - TASK-32
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: task
 ordinal: 53000
@@ -22,7 +20,7 @@ ordinal: 53000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-12). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-12).
 
 Severity: medium. Cost: maintenance.
 

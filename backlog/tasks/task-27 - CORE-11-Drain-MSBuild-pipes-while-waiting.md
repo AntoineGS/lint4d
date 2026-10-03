@@ -4,14 +4,13 @@ title: 'CORE-11: Drain MSBuild pipes while waiting'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
   - runtime
 milestone: m-3
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: bug
 ordinal: 27000
@@ -20,7 +19,7 @@ ordinal: 27000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-11). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-11).
 
 Severity: medium. Cost: runtime.
 

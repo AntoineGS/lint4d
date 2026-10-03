@@ -4,14 +4,13 @@ title: 'BUILD-2: Separate the barrier target and run it in CI'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - build
   - maintenance
 milestone: m-4
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: chore
 ordinal: 30000
@@ -20,7 +19,7 @@ ordinal: 30000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-2). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-2).
 
 Severity: medium. Cost: maintenance.
 

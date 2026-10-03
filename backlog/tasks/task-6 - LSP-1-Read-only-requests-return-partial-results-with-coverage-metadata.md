@@ -4,15 +4,13 @@ title: 'LSP-1: Read-only requests return partial results with coverage metadata'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
   - runtime
 milestone: m-1
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 6000
@@ -21,7 +19,7 @@ ordinal: 6000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-1). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-1).
 
 Severity: high. Cost: runtime and usability.
 

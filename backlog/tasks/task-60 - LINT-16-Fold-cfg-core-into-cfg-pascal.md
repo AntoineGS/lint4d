@@ -4,7 +4,7 @@ title: 'LINT-16: Fold cfg-core into cfg-pascal'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lint
@@ -13,8 +13,6 @@ labels:
 milestone: m-6
 dependencies:
   - TASK-3
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: task
 ordinal: 60000
@@ -23,7 +21,7 @@ ordinal: 60000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-16). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-16).
 
 Severity: medium. Cost: maintenance.
 

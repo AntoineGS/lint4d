@@ -4,6 +4,7 @@ title: 'CORE-8: Canonical immutable `ProjectContext` and a complete cache key'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
@@ -11,8 +12,6 @@ labels:
   - maintenance
 milestone: m-6
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: bug
 ordinal: 51000
@@ -21,7 +20,7 @@ ordinal: 51000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-8). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-8).
 
 Severity: medium. Cost: both.
 

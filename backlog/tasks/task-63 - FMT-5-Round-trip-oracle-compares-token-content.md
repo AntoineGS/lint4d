@@ -4,7 +4,7 @@ title: 'FMT-5: Round-trip oracle compares token content'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - fmt
@@ -13,8 +13,6 @@ milestone: m-6
 dependencies:
   - TASK-25
   - TASK-26
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: bug
 ordinal: 63000
@@ -23,7 +21,7 @@ ordinal: 63000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (FMT-5). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (FMT-5).
 
 Severity: medium. Cost: correctness.
 

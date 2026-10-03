@@ -4,14 +4,13 @@ title: 'LSP-20: Fix-all naming validates one batch, not growing prefixes'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
   - runtime
 milestone: m-1
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 9000
@@ -20,7 +19,7 @@ ordinal: 9000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-20). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-20).
 
 Severity: high. Cost: runtime.
 

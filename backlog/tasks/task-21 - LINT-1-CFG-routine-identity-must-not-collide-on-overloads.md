@@ -4,6 +4,7 @@ title: 'LINT-1: CFG routine identity must not collide on overloads'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lint
@@ -11,8 +12,6 @@ labels:
   - cross-repo
 milestone: m-3
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: bug
 ordinal: 21000
@@ -21,7 +20,7 @@ ordinal: 21000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-1). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-1).
 
 Severity: high. Cost: correctness.
 

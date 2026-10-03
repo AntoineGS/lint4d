@@ -4,14 +4,13 @@ title: 'FMT-4: Fill rendering without `Vec::remove(0)`'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - fmt
   - runtime
 milestone: m-6
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: enhancement
 ordinal: 62000
@@ -20,7 +19,7 @@ ordinal: 62000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (FMT-4). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (FMT-4).
 
 Severity: medium. Cost: runtime.
 

@@ -4,7 +4,7 @@ title: 'LSP-15: Share directory catalogues across requests and prune excluded tr
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
@@ -12,8 +12,6 @@ labels:
 milestone: m-2
 dependencies:
   - TASK-13
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: enhancement
 ordinal: 20000
@@ -22,7 +20,7 @@ ordinal: 20000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-15). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-15).
 
 Severity: medium. Cost: runtime i/o.
 

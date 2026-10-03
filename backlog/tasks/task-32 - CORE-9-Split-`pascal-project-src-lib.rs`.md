@@ -4,14 +4,13 @@ title: 'CORE-9: Split `pascal-project/src/lib.rs`'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
   - maintenance
 milestone: m-4
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: task
 ordinal: 32000
@@ -20,7 +19,7 @@ ordinal: 32000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-9). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-9).
 
 Severity: high. Cost: maintenance.
 

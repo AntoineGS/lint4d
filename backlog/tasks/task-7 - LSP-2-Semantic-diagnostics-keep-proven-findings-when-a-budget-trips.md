@@ -4,14 +4,13 @@ title: 'LSP-2: Semantic diagnostics keep proven findings when a budget trips'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
   - correctness
 milestone: m-1
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: bug
 ordinal: 7000
@@ -20,7 +19,7 @@ ordinal: 7000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-2). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-2).
 
 Severity: high. Cost: correctness and usability.
 

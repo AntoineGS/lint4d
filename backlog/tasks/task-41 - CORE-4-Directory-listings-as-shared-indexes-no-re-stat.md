@@ -4,14 +4,13 @@ title: 'CORE-4: Directory listings as shared indexes, no re-stat'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
   - runtime
 milestone: m-5
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 41000
@@ -20,7 +19,7 @@ ordinal: 41000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-4). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-4).
 
 Severity: high. Cost: runtime.
 

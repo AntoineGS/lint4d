@@ -4,7 +4,7 @@ title: 'CORE-13: Named operation budgets instead of scattered constants'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
@@ -13,8 +13,6 @@ milestone: m-6
 dependencies:
   - TASK-32
   - TASK-53
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: task
 ordinal: 54000
@@ -23,7 +21,7 @@ ordinal: 54000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-13). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-13).
 
 Severity: medium. Cost: maintenance.
 

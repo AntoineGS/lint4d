@@ -44,9 +44,9 @@ connect the server instead of falling back. Call
   Backlog.md document (`document_view` with id `doc-1`). `TODOS.md` is the
   user's own list: do not edit it.
 
-`arch-review` tasks come from `2026-10-02-architecture-review-backlog.md`.
-Their titles keep the review IDs (`LSP-3`, `CORE-7`, ...); read that
-file's Global constraints section before starting one.
+`arch-review` tasks come from a 2026-10-02 architecture review that is no
+longer in the repo. Their titles keep the review IDs (`LSP-3`, `CORE-7`,
+...).
 
 ## Bug fixes
 

@@ -4,14 +4,13 @@ title: 'LINT-8: One syntax index per file for the simple rules'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lint
   - runtime
 milestone: m-6
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: enhancement
 ordinal: 55000
@@ -20,7 +19,7 @@ ordinal: 55000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LINT-8). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LINT-8).
 
 Severity: medium. Cost: runtime.
 

@@ -4,14 +4,13 @@ title: 'LSP-22: Remove budgeted/unbudgeted duplicates and repeated AST primitive
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
   - maintenance
 milestone: m-6
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: task
 ordinal: 49000
@@ -20,7 +19,7 @@ ordinal: 49000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-22). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-22).
 
 Severity: medium. Cost: maintenance.
 

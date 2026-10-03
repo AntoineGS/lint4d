@@ -4,6 +4,7 @@ title: 'LSP-17: Rename post-edit proof as one transactional overlay'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
@@ -11,8 +12,6 @@ labels:
   - maintenance
 milestone: m-5
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 34000
@@ -21,7 +20,7 @@ ordinal: 34000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-17). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-17).
 
 Severity: high. Cost: runtime and maintenance.
 

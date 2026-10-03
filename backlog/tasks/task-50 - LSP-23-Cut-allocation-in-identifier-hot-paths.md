@@ -4,14 +4,13 @@ title: 'LSP-23: Cut allocation in identifier hot paths'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
   - runtime
 milestone: m-6
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: enhancement
 ordinal: 50000
@@ -20,7 +19,7 @@ ordinal: 50000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-23). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-23).
 
 Severity: medium. Cost: runtime cpu.
 

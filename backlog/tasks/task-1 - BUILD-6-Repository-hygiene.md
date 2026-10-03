@@ -4,7 +4,7 @@ title: 'BUILD-6: Repository hygiene'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - build
@@ -12,8 +12,6 @@ labels:
   - agent-todos
 milestone: m-0
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: low
 type: chore
 ordinal: 1000
@@ -22,7 +20,7 @@ ordinal: 1000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-6). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-6).
 
 Severity: low. Cost: maintenance.
 

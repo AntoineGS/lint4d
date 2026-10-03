@@ -4,7 +4,7 @@ title: 'LSP-18: Index include owners and drop the 256-owner discovery cap'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
@@ -12,8 +12,6 @@ labels:
 milestone: m-5
 dependencies:
   - TASK-33
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 35000
@@ -22,7 +20,7 @@ ordinal: 35000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-18). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-18).
 
 Severity: high. Cost: runtime and usability.
 

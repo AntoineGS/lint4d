@@ -4,6 +4,7 @@ title: 'CORE-2: Typed completeness instead of warning-string matching'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
@@ -11,8 +12,6 @@ labels:
   - maintenance
 milestone: m-5
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: bug
 ordinal: 39000
@@ -21,7 +20,7 @@ ordinal: 39000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-2). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-2).
 
 Severity: high. Cost: maintenance and correctness.
 

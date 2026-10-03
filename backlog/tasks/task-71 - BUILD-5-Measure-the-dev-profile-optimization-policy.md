@@ -4,14 +4,13 @@ title: 'BUILD-5: Measure the dev-profile optimization policy'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - build
   - build-time
 milestone: m-6
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: low
 type: chore
 ordinal: 71000
@@ -20,7 +19,7 @@ ordinal: 71000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-5). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-5).
 
 Severity: low. Cost: build time.
 

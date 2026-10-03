@@ -4,7 +4,7 @@ title: 'LSP-11: One prepared artifact per source revision for diagnostics'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
@@ -12,8 +12,6 @@ labels:
 milestone: m-2
 dependencies:
   - TASK-12
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 17000
@@ -22,7 +20,7 @@ ordinal: 17000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-11). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-11).
 
 Severity: high. Cost: runtime cpu.
 

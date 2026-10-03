@@ -4,7 +4,7 @@ title: 'CORE-6: Bound the case-insensitive path-resolution walk'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - core
@@ -13,8 +13,6 @@ labels:
 milestone: m-5
 dependencies:
   - TASK-41
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 43000
@@ -23,7 +21,7 @@ ordinal: 43000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (CORE-6). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (CORE-6).
 
 Severity: high. Cost: both.
 

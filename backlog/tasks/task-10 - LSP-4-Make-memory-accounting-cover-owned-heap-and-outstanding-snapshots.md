@@ -4,7 +4,7 @@ title: 'LSP-4: Make memory accounting cover owned heap and outstanding snapshots
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - lsp
@@ -12,8 +12,6 @@ labels:
   - agent-todos
 milestone: m-2
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: enhancement
 ordinal: 10000
@@ -22,7 +20,7 @@ ordinal: 10000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-4). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-4).
 
 Severity: high. Cost: runtime memory.
 

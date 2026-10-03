@@ -4,14 +4,13 @@ title: 'LSP-3: Replace the permanent recovery fence with cache invalidation'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:15'
 labels:
   - arch-review
   - lsp
   - runtime
 milestone: m-1
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: bug
 ordinal: 5000
@@ -20,7 +19,7 @@ ordinal: 5000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (LSP-3). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (LSP-3).
 
 Severity: high. Cost: runtime, availability.
 

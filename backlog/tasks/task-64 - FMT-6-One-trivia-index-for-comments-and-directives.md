@@ -4,7 +4,7 @@ title: 'FMT-6: One trivia index for comments and directives'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - fmt
@@ -12,8 +12,6 @@ labels:
 milestone: m-6
 dependencies:
   - TASK-26
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: low
 type: task
 ordinal: 64000
@@ -22,7 +20,7 @@ ordinal: 64000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (FMT-6). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (FMT-6).
 
 Severity: low. Cost: maintenance.
 

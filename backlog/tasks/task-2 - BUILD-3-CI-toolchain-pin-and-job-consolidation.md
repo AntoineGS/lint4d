@@ -4,14 +4,13 @@ title: 'BUILD-3: CI toolchain pin and job consolidation'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:22'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - build
   - build-time
 milestone: m-0
 dependencies: []
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: chore
 ordinal: 2000
@@ -20,7 +19,7 @@ ordinal: 2000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-3). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-3).
 
 Severity: medium. Cost: build time, reproducibility.
 

@@ -4,7 +4,7 @@ title: 'FMT-7: Shared CLI input and config orchestration'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:23'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - fmt
@@ -13,8 +13,6 @@ labels:
 milestone: m-6
 dependencies:
   - TASK-38
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: medium
 type: bug
 ordinal: 65000
@@ -23,7 +21,7 @@ ordinal: 65000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (FMT-7). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (FMT-7).
 
 Severity: medium. Cost: maintenance and correctness.
 

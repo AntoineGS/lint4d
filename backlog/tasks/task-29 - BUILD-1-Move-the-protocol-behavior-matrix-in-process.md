@@ -4,7 +4,7 @@ title: 'BUILD-1: Move the protocol behavior matrix in-process'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 01:16'
 labels:
   - arch-review
   - build
@@ -12,8 +12,6 @@ labels:
 milestone: m-4
 dependencies:
   - TASK-30
-references:
-  - 2026-10-02-architecture-review-backlog.md
 priority: high
 type: chore
 ordinal: 29000
@@ -22,7 +20,7 @@ ordinal: 29000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-1). Read that file's Global constraints section before starting.
+Imported from `2026-10-02-architecture-review-backlog.md` (BUILD-1).
 
 Severity: high. Cost: build time, test time, flakiness.
 

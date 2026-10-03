@@ -1848,6 +1848,57 @@ fn descendant_overlay_does_not_enter_an_immediate_directory_tier() {
     ));
 }
 
+// A client may spell an open file differently from the disk (VS Code sends
+// a lowercase drive letter); on a case-insensitive volume it is one file.
+#[test]
+#[cfg(windows)]
+fn overlay_under_another_letter_case_replaces_the_disk_file() {
+    let directory = tempdir().expect("overlay root");
+    let root = directory.path();
+    fs::create_dir_all(root.join("later")).expect("search path");
+    fs::write(
+        root.join("later/Errors.pas"),
+        "unit Errors; interface implementation end.",
+    )
+    .expect("disk unit");
+    let mut context = configured_disk_context(root);
+    context.search_path_entries = vec![ProjectPathEntry {
+        path: root.join("later"),
+        provenance: ProjectPathProvenance::Configured,
+    }];
+    let mut store = FilesystemSourceStore::new();
+    store.insert_overlay(
+        PathBuf::from(
+            root.join("later/Errors.pas")
+                .to_string_lossy()
+                .to_lowercase(),
+        ),
+        7,
+        b"unit Errors; interface const Overlay = 1; implementation end.".to_vec(),
+    );
+    let mut resolver =
+        UnitResolver::new(context, vec![root.to_path_buf()], store, Default::default());
+
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Errors",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+
+    assert!(
+        matches!(
+            &outcome.result,
+            Resolution::Found(unit)
+                if matches!(unit.source.revision, SourceRevision::Overlay { version: 7, .. })
+        ),
+        "{:?}",
+        outcome.result
+    );
+}
+
 #[test]
 fn qualifiers_name_the_selected_alias_and_declaration_only() {
     let mut context = fixture_context();

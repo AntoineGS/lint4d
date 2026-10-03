@@ -85,6 +85,9 @@ impl FilesystemSourceStore {
         }
         // A client may spell a path differently from the disk, e.g. with a
         // lowercase drive letter; on a case-insensitive volume it is the same file.
+        if !path_identity::is_case_insensitive(&path) {
+            return None;
+        }
         self.overlays
             .iter()
             .find(|(overlay_path, _)| path_equivalent(overlay_path, &path))

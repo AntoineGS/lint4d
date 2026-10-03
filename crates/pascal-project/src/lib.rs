@@ -6805,7 +6805,7 @@ fn resolve_existing_path_status(
 
 /// The listed name that `component` aliases when it is not itself listed,
 /// such as the long name behind a Windows 8.3 short name (`RUNNER~1`). A
-/// final symlink is never followed, matching the walk.
+/// symlinked component is kept as is, never replaced by its target's name.
 #[cfg(windows)]
 fn short_name_alias_target(
     directory: &Path,
@@ -11584,6 +11584,34 @@ mod windows_path_tests {
         };
         let mut warnings = Vec::new();
         let status = resolve_existing_path_status(&short, &mut warnings, "unit");
+        assert!(
+            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
+            "{} -> {status:?} {warnings:?}",
+            short.display()
+        );
+    }
+
+    // CI's temporary directory may sit on a volume without 8.3 names; the
+    // system volume normally has them.
+    #[test]
+    fn path_resolution_reports_the_long_name_for_a_system_short_name() {
+        let Some(program_files) = std::env::var_os("ProgramFiles").map(PathBuf::from) else {
+            return;
+        };
+        let long =
+            path_identity::without_verbatim_prefix(fs::canonicalize(&program_files).unwrap());
+        let Some(short) = windows_short_path(&long) else {
+            // GitHub's Windows runners have 8.3 names on the system volume,
+            // so CI must not skip this silently.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no 8.3 name for {}",
+                long.display()
+            );
+            return;
+        };
+        let mut warnings = Vec::new();
+        let status = resolve_existing_path_status(&short, &mut warnings, "directory");
         assert!(
             matches!(&status, ExistingPathStatus::Found(found) if found == &long),
             "{} -> {status:?} {warnings:?}",

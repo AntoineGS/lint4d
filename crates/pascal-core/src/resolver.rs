@@ -7,8 +7,8 @@
 
 use pascal_project::{
     MetadataObservation, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
-    ProjectReadObservation, ProjectReadStamp, ReadPolicy, content_hash_bytes, path_stamp_result,
-    read_package_metadata_with_observations,
+    ProjectReadObservation, ProjectReadStamp, ReadPolicy, content_hash_bytes, path_identity,
+    path_stamp_result, read_package_metadata_with_observations,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -3373,11 +3373,9 @@ fn canonical_path(path: &Path) -> PathBuf {
             Component::Normal(value) => normalized.push(value),
         }
     }
-    if cfg!(windows) {
-        PathBuf::from(normalized.to_string_lossy().to_ascii_lowercase())
-    } else {
-        normalized
-    }
+    // Keep the spelling: these paths are opened, reported and compared with
+    // the caller's paths. Case-insensitive identity is `path_key`'s job.
+    normalized
 }
 
 fn source_id_for_path(path: &Path) -> SourceId {
@@ -3410,18 +3408,15 @@ fn relative_components(base: &Path, path: &Path) -> Option<Vec<std::ffi::OsStrin
     let base_components = base.components().collect::<Vec<_>>();
     let path_components = path.components().collect::<Vec<_>>();
     if path_components.len() < base_components.len()
-        || !base_components
-            .iter()
-            .zip(path_components.iter())
-            .all(|(base, path)| {
-                if cfg!(windows) {
-                    base.as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&path.as_os_str().to_string_lossy())
-                } else {
-                    base == path
-                }
-            })
+        || !base_components.iter().zip(path_components.iter()).all(
+            |(base_component, path_component)| {
+                path_identity::components_equal(
+                    *base_component,
+                    *path_component,
+                    path_identity::is_case_insensitive(base),
+                )
+            },
+        )
     {
         return None;
     }
@@ -3437,12 +3432,7 @@ fn relative_components(base: &Path, path: &Path) -> Option<Vec<std::ffi::OsStrin
 }
 
 fn path_key(path: &Path) -> String {
-    let key = canonical_path(path).to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    }
+    path_identity::path_key(&canonical_path(path)).replace('\\', "/")
 }
 
 fn path_equivalent(left: &Path, right: &Path) -> bool {
@@ -3450,23 +3440,7 @@ fn path_equivalent(left: &Path, right: &Path) -> bool {
 }
 
 fn path_starts_with(path: &Path, root: &Path) -> bool {
-    let path = canonical_path(path);
-    let root = canonical_path(root);
-    let path_components = path.components().collect::<Vec<_>>();
-    let root_components = root.components().collect::<Vec<_>>();
-    path_components.len() >= root_components.len()
-        && path_components
-            .iter()
-            .zip(root_components.iter())
-            .all(|(left, right)| {
-                if cfg!(windows) {
-                    left.as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-                } else {
-                    left == right
-                }
-            })
+    path_identity::path_starts_with(&canonical_path(path), &canonical_path(root))
 }
 
 fn context_uses_package_root(context: &ProjectContext, root: &Path) -> bool {

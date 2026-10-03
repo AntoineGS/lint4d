@@ -2711,9 +2711,7 @@ fn production_override_session() -> (OverrideSession, Vec<String>) {
 
 #[cfg(not(test))]
 fn production_override_session() -> (OverrideSession, Vec<String>) {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match pascal_project::delphi_overrides::user_config_path(xdg.as_deref(), home.as_deref()) {
+    match pascal_project::delphi_overrides::user_config_path_from_env() {
         Ok(path) => (OverrideSession::new(Some(path)), Vec::new()),
         Err(error) => (OverrideSession::new(None), vec![error]),
     }
@@ -15311,7 +15309,7 @@ fn has_symlink_component(path: &Path, root: &Path) -> bool {
 
 fn resolve_case_insensitive_path(path: &Path) -> Option<PathBuf> {
     let absolute = absolute_path(path.to_path_buf());
-    let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+    let mut current = pascal_project::path_identity::walk_root(&absolute);
     for component in absolute.components() {
         let Component::Normal(component) = component else {
             continue;

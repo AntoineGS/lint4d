@@ -246,6 +246,23 @@ impl EffectiveOverrides {
     }
 }
 
+/// The user's home directory from `HOME`, else `USERPROFILE`, which is what
+/// Windows sets.
+pub fn user_home_dir(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(var)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// [`user_config_path`] for the process environment.
+pub fn user_config_path_from_env() -> Result<PathBuf, String> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = user_home_dir(|name| std::env::var_os(name));
+    user_config_path(xdg.as_deref(), home.as_deref())
+}
+
 pub fn user_config_path(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathBuf, String> {
     let xdg = xdg.filter(|path| !path.as_os_str().is_empty());
     if let Some(xdg) = xdg.filter(|path| path.is_absolute()) {
@@ -256,7 +273,7 @@ pub fn user_config_path(xdg: Option<&Path>, home: Option<&Path>) -> Result<PathB
         .filter(|path| !path.as_os_str().is_empty())
         .filter(|path| path.is_absolute())
         .ok_or_else(|| {
-            "could not resolve user configuration: HOME must be a non-empty absolute path"
+            "could not resolve user configuration: HOME (or USERPROFILE) must be a non-empty absolute path"
                 .to_owned()
         })?;
     normalize_absolute_lexical(

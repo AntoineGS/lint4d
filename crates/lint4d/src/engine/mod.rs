@@ -438,7 +438,7 @@ fn position_at_offset(source: &[u8], offset: usize) -> Option<(usize, usize)> {
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    lexical_absolute(left) == lexical_absolute(right)
+    pascal_project::path_identity::paths_equal(&lexical_absolute(left), &lexical_absolute(right))
 }
 
 fn lexical_absolute(path: &Path) -> PathBuf {

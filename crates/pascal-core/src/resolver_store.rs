@@ -80,10 +80,15 @@ impl FilesystemSourceStore {
 
     fn overlay_for(&self, path: &Path) -> Option<(PathBuf, OverlaySource)> {
         let path = canonical_path(path);
+        if let Some(overlay) = self.overlays.get(&path) {
+            return Some((path, overlay.clone()));
+        }
+        // A client may spell a path differently from the disk, e.g. with a
+        // lowercase drive letter; on a case-insensitive volume it is the same file.
         self.overlays
-            .get(&path)
-            .cloned()
-            .map(|overlay| (path, overlay))
+            .iter()
+            .find(|(overlay_path, _)| path_equivalent(overlay_path, &path))
+            .map(|(_, overlay)| (path, overlay.clone()))
     }
 }
 
@@ -221,10 +226,10 @@ impl SourceStore for FilesystemSourceStore {
             }
         }
         for path in self.overlays.keys() {
-            if path.parent().is_some_and(|parent| parent == directory)
-                && !files
-                    .iter()
-                    .any(|existing| canonical_path(existing) == *path)
+            if path
+                .parent()
+                .is_some_and(|parent| path_equivalent(parent, &directory))
+                && !files.iter().any(|existing| path_equivalent(existing, path))
             {
                 files.push(path.clone());
             }

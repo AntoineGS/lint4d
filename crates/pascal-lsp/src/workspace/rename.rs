@@ -9548,7 +9548,7 @@ fn resolve_case_insensitive_include_path(
     let mut base = absolute.clone();
     while !base.exists() {
         if !base.pop() {
-            base = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+            base = pascal_project::path_identity::walk_root(&absolute);
             break;
         }
     }

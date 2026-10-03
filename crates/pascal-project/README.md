@@ -58,7 +58,7 @@ Installation profiles are opt-in and do not depend on Multidev Makefiles or
 
 The loader captures these configuration layers in order:
 
-1. `$XDG_CONFIG_HOME/delphi-tools/config.toml` (or the existing HOME fallback).
+1. `$XDG_CONFIG_HOME/delphi-tools/config.toml` (or the `$HOME/.config` fallback; `%USERPROFILE%` stands in for an unset `HOME` on Windows).
 2. `<workspace-root>/.delphi-tools.local.toml`.
 3. `<selected-project-directory>/.delphi-tools.local.toml`.
 

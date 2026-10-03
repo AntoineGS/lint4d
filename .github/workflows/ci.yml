@@ -53,6 +53,15 @@ jobs:
       - name: Resolve TMPDIR symlinks
         if: runner.os == 'macOS'
         run: echo "TMPDIR=$(cd "$TMPDIR" && pwd -P)/" >> "$GITHUB_ENV"
+      # The runner's TEMP is an 8.3 short name (C:\Users\RUNNER~1\...).
+      # Resolution reports long names, so tests that compare a resolved
+      # path with the fixture path need fixtures under a long name.
+      - name: Use a long-name TEMP
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: cargo test --workspace --no-fail-fast
 
   clippy:

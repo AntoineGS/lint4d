@@ -4154,3 +4154,18 @@ end.
     assert_parses_cleanly(&result);
     idempotency_check(src);
 }
+
+#[test]
+fn uses_clause_ending_in_a_directive_keeps_its_semicolon() {
+    let src = "unit T;\ninterface\nuses A {$I x.inc};\nimplementation\nend.\n";
+    let result = format_source(src);
+    // The `;` follows the directive, as in the source, so the directive
+    // stays inside the clause and keeps its place after `A` (an include
+    // may itself list units).
+    assert!(
+        result.contains("uses\n  A\n  {$I x.inc};\n"),
+        "the clause lost its `;`:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}

@@ -9725,7 +9725,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // (backlog TASK-74).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn path_resolution_prefers_an_exact_component_over_case_variants() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let exact = temp.path().join("Foo");
@@ -9764,7 +9767,10 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // (backlog TASK-74).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn path_resolution_rejects_ambiguous_case_insensitive_matches() {
         let temp = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(temp.path().join("Foo")).expect("first case variant");
@@ -9901,7 +9907,10 @@ mod tests {
         );
     }
 
+    // Only Linux resolves exact paths without listing directories; elsewhere
+    // the on-disk spelling is found by a component walk (backlog TASK-74).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn path_resolution_does_not_list_directories_for_exact_paths() {
         const PATHS: usize = 24;
         let temp = tempfile::tempdir().expect("temporary directory");

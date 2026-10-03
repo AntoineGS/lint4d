@@ -5407,7 +5407,10 @@ fn document_links_reject_an_ancestor_symlink_inserted_while_delivery_waits() {
     server.shutdown();
 }
 
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn document_links_refuse_case_insensitive_lookup_over_directory_scan_limit() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");
@@ -49820,7 +49823,9 @@ fn code_action_withholds_public_overloads_and_unsupported_routine_identity() {
     );
 }
 
+// macOS limits paths to 1024 bytes, too short for this fixture.
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn code_action_creation_rejects_overlong_identity_and_caps_serialized_output() {
     let long_name = "M".repeat(257);
     let temp = tempfile::tempdir().expect("temporary workspace");
@@ -53838,7 +53843,9 @@ fn public_rename_applies_retained_limits_only_to_relevant_sources() {
     server.shutdown();
 }
 
-#[cfg(not(windows))]
+// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// (backlog TASK-74).
+#[cfg(all(not(windows), not(target_os = "macos")))]
 #[test]
 fn public_rename_never_deduplicates_case_distinct_linux_source_paths() {
     let temp = tempfile::tempdir().expect("temporary workspace");
@@ -55209,7 +55216,9 @@ fn rename_does_not_fall_back_to_disk_for_a_rejected_open_document() {
     server.shutdown();
 }
 
+// macOS limits paths to 1024 bytes, too short for this fixture.
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn oversized_uri_open_fails_closed_for_existing_disk_navigation() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");

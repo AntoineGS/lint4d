@@ -167,7 +167,7 @@ impl UriSpellings {
 }
 
 fn is_uri_key(key: &str) -> bool {
-    key.len() >= 3 && key[key.len() - 3..].eq_ignore_ascii_case("uri")
+    key.len() >= 3 && key.as_bytes()[key.len() - 3..].eq_ignore_ascii_case(b"uri")
 }
 
 /// The canonical spelling of a file URI, or `None` when `text` is not one.
@@ -255,6 +255,31 @@ mod tests {
             params(&response)["uri"],
             canonical,
             "the latest client spelling wins"
+        );
+    }
+
+    #[test]
+    fn uri_keys_are_matched_by_bytes_without_char_boundary_panics() {
+        for key in ["uri", "Uri", "documentUri", "targetURI"] {
+            assert!(is_uri_key(key), "{key}");
+        }
+        for key in ["ur", "", "éé", "a😀", "é", "uriX"] {
+            assert!(!is_uri_key(key), "{key}");
+        }
+        let mut spellings = UriSpellings::default();
+        let mut message = notification(json!({
+            "settings": {"éé": "file:///a%40b/X.pas", "a😀": {"uri": "file:///a%40b/X.pas"}}
+        }));
+        spellings.canonicalize_inbound(&mut message);
+        assert_eq!(params(&message)["settings"]["éé"], "file:///a%40b/X.pas");
+        assert_eq!(
+            params(&message)["settings"]["a😀"]["uri"],
+            "file:///a@b/X.pas"
+        );
+        spellings.restore_outbound(&mut message);
+        assert_eq!(
+            params(&message)["settings"]["a😀"]["uri"],
+            "file:///a%40b/X.pas"
         );
     }
 

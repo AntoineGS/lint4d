@@ -92,3 +92,22 @@ fn good_no_transaction_produces_no_transaction_diagnostics() {
         trx_diags
     );
 }
+
+#[test]
+fn transaction_no_commit_flags_the_overload_that_misses_it() {
+    let diagnostics =
+        lint_fixture("tests/fixtures/transaction/bad_no_commit_in_second_overload.pas");
+    let lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id.starts_with("transaction-"))
+        .map(|d| (d.rule_id.as_str(), d.line))
+        .collect();
+    assert!(
+        !lines.is_empty()
+            && lines
+                .iter()
+                .all(|&(rule, line)| rule == "transaction-no-commit" && (23..=35).contains(&line)),
+        "Expected transaction-no-commit only in Test(const S: string) (lines 23-35), got: {:?}",
+        lines
+    );
+}

@@ -569,3 +569,22 @@ fn resource_leak_no_try_flags_result_raise_after_try() {
 
 // Factory detection tests removed — factory detection has been migrated to
 // cfg-pascal and will be re-wired in a future task.
+
+#[test]
+fn resource_leak_no_try_flags_the_leaking_overload() {
+    let project = empty_project();
+    let diagnostics = lint_fixture_with_context(
+        "tests/fixtures/resource_leak/bad_no_try_in_first_overload.pas",
+        &project,
+    );
+    let lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id.starts_with("resource-leak-"))
+        .map(|d| (d.rule_id.as_str(), d.line))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![("resource-leak-no-try", 14)],
+        "Only Foo(A: Integer) leaks Obj"
+    );
+}

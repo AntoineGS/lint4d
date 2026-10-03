@@ -126,7 +126,7 @@ fn run_lint_with_cfg_project_mode(
         file_cfgs
             .into_iter()
             .map(|cfg| {
-                let proc_id = ProcId::new(&unit_name, &cfg.proc_name);
+                let proc_id = ProcId::new(&unit_name, &cfg.proc_name, cfg.byte_range.clone());
                 (proc_id, cfg)
             })
             .collect()

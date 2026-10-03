@@ -15,7 +15,7 @@ use crate::dcu::{ProjectContext, TypeKind};
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
     byte_offset_to_line_col, extract_type_from_decl_arg, extract_type_from_decl_var,
-    extract_uses_clauses, has_out_modifier, node_text,
+    extract_uses_clauses, find_def_proc_at, has_out_modifier, node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -224,20 +224,6 @@ fn build_nillable_vars(
     }
 
     vars
-}
-
-/// Find the `defProc` AST node whose start byte matches the given offset.
-fn find_def_proc_at(root: Node, start_byte: usize) -> Option<Node> {
-    if root.kind() == K::DEF_PROC && root.start_byte() == start_byte {
-        return Some(root);
-    }
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if let Some(found) = find_def_proc_at(child, start_byte) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 // ─── CFG analysis ────────────────────────────────────────────────────────────
@@ -537,24 +523,32 @@ fn can_function_return_nil(
     // Insert sentinel to break recursion (assume can return nil)
     FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower.clone(), true));
 
-    // Find the function's CFG by matching proc name (case-insensitive)
-    // qualified_name may be just "FuncName" or "TClass.MethodName"
-    let cfg = cfgs
-        .iter()
-        .find(|(pid, _)| {
-            // Only consider functions from the same unit
-            pid.unit_name.eq_ignore_ascii_case(unit_name)
-                && pid.qualified_name.eq_ignore_ascii_case(func_name)
-        })
-        .map(|(_, c)| c)?;
+    // Find the function's CFGs by matching proc name (case-insensitive)
+    // qualified_name may be just "FuncName" or "TClass.MethodName".
+    // The call is resolved by name only, so every overload is a candidate and
+    // the answer is known only when all of them agree.
+    let mut result = None;
+    for (pid, cfg) in cfgs {
+        // Only consider functions from the same unit
+        if !pid.unit_name.eq_ignore_ascii_case(unit_name)
+            || !pid.qualified_name.eq_ignore_ascii_case(func_name)
+        {
+            continue;
+        }
 
-    // Verify it's a function (has return type) by checking the AST
-    let def_proc = find_def_proc_at(root, cfg.byte_range.start)?;
-    if !is_function_def(def_proc, source) {
-        return None; // Procedures don't have return values
+        // Verify it's a function (has return type) by checking the AST
+        let def_proc = find_def_proc_at(root, cfg.byte_range.start)?;
+        if !is_function_def(def_proc, source) {
+            return None; // Procedures don't have return values
+        }
+
+        let can_return_nil = analyze_return_nil(cfg, source);
+        if result.is_some_and(|known| known != can_return_nil) {
+            return None;
+        }
+        result = Some(can_return_nil);
     }
-
-    let result = analyze_return_nil(cfg, source);
+    let result = result?;
 
     // Update cache
     FN_RETURN_CACHE.with(|cache| cache.borrow_mut().insert(func_lower, result));

@@ -12,6 +12,23 @@ pub fn node_text(node: Node, source: &[u8]) -> String {
     pascal_core::decode_bytes(&source[node.start_byte()..node.end_byte()]).into_owned()
 }
 
+/// Find the `defProc` AST node whose start byte matches the given offset.
+///
+/// A CFG's `byte_range` starts at its `defProc`, so this maps a CFG back to
+/// its own routine even when overloads share its name.
+pub fn find_def_proc_at(root: Node, start_byte: usize) -> Option<Node> {
+    if root.kind() == K::DEF_PROC && root.start_byte() == start_byte {
+        return Some(root);
+    }
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if let Some(found) = find_def_proc_at(child, start_byte) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Check whether a node represents a constructor call pattern.
 ///
 /// Matches only `TFoo.Create` (exact match, case-insensitive).

@@ -4139,8 +4139,14 @@ fn interface_post_edit_proves_obligation(
         return Ok(false);
     }
 
-    let diagnostics = match snapshot.index.semantic_diagnostics_with_cancel(uri, cancel) {
-        Ok(diagnostics) => diagnostics,
+    // An absent diagnostic only proves the obligation is met when every
+    // candidate was checked.
+    let diagnostics = match snapshot
+        .index
+        .semantic_diagnostic_report_with_cancel(uri, cancel)
+    {
+        Ok(report) if report.is_complete() => report.diagnostics,
+        Ok(_) => return Ok(false),
         Err(error) if error == CANCELLATION_MESSAGE => return Err(error),
         Err(_) => return Ok(false),
     };

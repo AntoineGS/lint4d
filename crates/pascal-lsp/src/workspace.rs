@@ -13818,8 +13818,13 @@ impl Workspace {
                 resolver::merge_source_record(records, record);
             }
         }
-        match snapshot.index.semantic_diagnostics_with_cancel(uri, cancel) {
-            Ok(diagnostics) => Ok(diagnostics),
+        // Every reported finding is proven even when coverage has gaps; the
+        // client has no channel for coverage yet (LSP-1).
+        match snapshot
+            .index
+            .semantic_diagnostic_report_with_cancel(uri, cancel)
+        {
+            Ok(report) => Ok(report.diagnostics),
             Err(error) if error == CANCELLATION_MESSAGE => Err(error),
             Err(_) => Ok(Vec::new()),
         }

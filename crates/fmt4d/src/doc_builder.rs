@@ -73,9 +73,8 @@ impl<'a> DocBuilder<'a> {
             return Doc::Empty;
         }
         let last = last_leaf(root);
-        let prev_end = if last.id() == root.id() {
-            0
-        } else {
+        // Without a code leaf, the first item starts the output.
+        let prev_end = (last.id() != root.id()).then(|| {
             self.comments
                 .trailing_comments(last.id())
                 .iter()
@@ -87,8 +86,8 @@ impl<'a> DocBuilder<'a> {
                         .map(|d| d.span.end),
                 )
                 .fold(last.end_byte(), usize::max)
-        };
-        self.trivia_run_doc(trivia, Some(prev_end)).0
+        });
+        self.trivia_run_doc(trivia, prev_end).0
     }
 
     /// Pair attached comments and directives with their docs, in source order.

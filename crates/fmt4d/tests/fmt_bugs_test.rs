@@ -4106,3 +4106,11 @@ fn directive_after_final_end_is_kept() {
     );
     idempotency_check(src);
 }
+
+#[test]
+fn file_with_only_trivia_gets_no_leading_space() {
+    let src = "// only a comment\n{$DEFINE X}\n";
+    let result = format_source(src);
+    assert_eq!(result, src);
+    idempotency_check(src);
+}

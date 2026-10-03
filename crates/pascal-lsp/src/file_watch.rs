@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +125,7 @@ pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<
     match event {
         WatchEvent::Modified(paths) | WatchEvent::Changed(paths) => {
             let mut affected = Vec::new();
+            let mut seen = HashSet::new();
             for path in paths {
                 let invalidated = if include_parent {
                     cache.invalidate_path(&path)
@@ -131,7 +133,7 @@ pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<
                     cache.invalidate_file_contents(&path)
                 };
                 for uri in invalidated {
-                    if !affected.contains(&uri) {
+                    if seen.insert(uri.clone()) {
                         affected.push(uri);
                     }
                 }

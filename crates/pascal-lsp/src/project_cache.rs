@@ -1,9 +1,9 @@
 //! Project-scoped cache shared by analysis workers and the warmer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, WaitTimeoutResult};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, WaitTimeoutResult};
 use std::time::Duration;
 
 use lsp_types::Url;
@@ -1035,6 +1035,231 @@ mod cache_tests {
         assert!(cache.stats().bytes <= 25);
     }
 
+    fn ready(cache: &ProjectCache, name: &str) -> bool {
+        !cache.ready_layers(&uri(name)).is_empty()
+    }
+
+    fn pin_names(cache: &ProjectCache, owner: &str, names: &[&str], ctx: &ProjectContext) {
+        cache.pin(
+            &uri(owner),
+            names
+                .iter()
+                .map(|name| (uri(name), project_context_fingerprint(ctx)))
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn eviction_follows_last_use_across_hits_and_peeks() {
+        let cache = ProjectCache::new(30);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        fill_unit(&cache, "C.pas", &ctx, 1, vec![]);
+        fill(&cache, "D.pas", &ctx, 1, 9);
+        assert!(matches!(
+            cache.imports(&uri("A.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+        assert!(
+            cache
+                .peek_unit(&uri("C.pas"), &ctx, 1, &HashMap::new())
+                .is_some()
+        );
+
+        fill(&cache, "E.pas", &ctx, 1, 11);
+        assert!(!ready(&cache, "B.pas"), "B is the least recently used");
+        assert!(!ready(&cache, "D.pas"), "D is next once B is gone");
+        for name in ["A.pas", "C.pas", "E.pas"] {
+            assert!(ready(&cache, name), "{name} was used more recently");
+        }
+        assert_eq!(cache.stats().bytes, 22);
+    }
+
+    #[test]
+    fn a_pin_protects_every_layer_of_its_unit_until_the_last_owner_unpins() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
+        pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill_unit(&cache, "A.pas", &ctx, 1, vec![]);
+        fill(&cache, "B.pas", &ctx, 1, 9);
+
+        cache.unpin(&uri("Open1.pas"));
+        fill(&cache, "C.pas", &ctx, 1, 9);
+        assert!(!ready(&cache, "B.pas"));
+        assert_eq!(cache.ready_layers(&uri("A.pas")), vec!["Import", "Unit"]);
+
+        cache.unpin(&uri("Open2.pas"));
+        assert!(
+            ready(&cache, "A.pas"),
+            "unpinning alone stays within budget"
+        );
+        fill(&cache, "D.pas", &ctx, 1, 9);
+        assert_eq!(
+            cache.ready_layers(&uri("A.pas")),
+            vec!["Unit"],
+            "A's import is now the oldest unpinned entry"
+        );
+        assert!(ready(&cache, "C.pas") && ready(&cache, "D.pas"));
+    }
+
+    #[test]
+    fn repinning_an_owner_replaces_its_previous_pins() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        pin_names(&cache, "Open.pas", &["B.pas"], &ctx);
+        fill(&cache, "C.pas", &ctx, 1, 10);
+        assert!(!ready(&cache, "A.pas"));
+        assert!(ready(&cache, "B.pas") && ready(&cache, "C.pas"));
+    }
+
+    #[test]
+    fn pins_only_cover_their_own_project_fingerprint() {
+        let cache = ProjectCache::new(10);
+        let a = context("A.dproj");
+        let b = context("B.dproj");
+        pin_names(&cache, "Open.pas", &["Main.pas"], &b);
+        fill(&cache, "Main.pas", &a, 1, 10);
+        fill(&cache, "Other.pas", &a, 1, 10);
+        assert!(!ready(&cache, "Main.pas"));
+        assert!(ready(&cache, "Other.pas"));
+    }
+
+    #[test]
+    fn pinning_a_ready_entry_counts_it_as_pinned_until_unpinned() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        assert!(cache.has_room());
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        assert!(!cache.has_room());
+        cache.clear_pins();
+        assert!(cache.has_room());
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert!(cache.has_room(), "an evicted pinned entry no longer counts");
+    }
+
+    #[test]
+    fn invalidating_one_path_among_ten_thousand_entries_examines_one() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        for index in 0..10_000 {
+            let name = format!("Main{index}.pas");
+            let Lookup::Compute(claim) =
+                cache.imports(&uri(&name), &ctx, 1, &HashMap::new(), &no_cancel())
+            else {
+                panic!("expected a miss for {name}");
+            };
+            let probe = Probe::Content {
+                path: PathBuf::from(format!("/deps/Dep{index}.pas")),
+                stamp: None,
+                content_hash: 0,
+            };
+            cache.store_imports(claim, import_value(vec![probe]), 1, &no_cancel());
+        }
+        cache.reset_examined_entries();
+        assert_eq!(
+            cache.invalidate_path(Path::new("/deps/Dep5000.pas")),
+            vec![uri("Main5000.pas")]
+        );
+        assert_eq!(cache.examined_entries(), 1);
+        assert_eq!(cache.stats().imports, 9_999);
+    }
+
+    #[test]
+    fn evicting_one_entry_among_ten_thousand_examines_one() {
+        let cache = ProjectCache::new(10_000);
+        let ctx = context("A.dproj");
+        for index in 0..10_000 {
+            fill(&cache, &format!("Main{index}.pas"), &ctx, 1, 1);
+        }
+        cache.reset_examined_entries();
+        fill(&cache, "Last.pas", &ctx, 1, 1);
+        assert!(!ready(&cache, "Main0.pas"));
+        assert_eq!(cache.examined_entries(), 1);
+    }
+
+    type WatchCalls = Arc<Mutex<Vec<(&'static str, PathBuf, bool)>>>;
+
+    /// Records each watcher call and whether the cache state was unlocked.
+    struct RecordingWatch {
+        inner: Arc<Inner>,
+        calls: WatchCalls,
+    }
+
+    impl DirectoryWatch for RecordingWatch {
+        fn watch(&mut self, directory: &Path) -> bool {
+            let unlocked = self.inner.state.try_lock().is_ok();
+            let call = ("watch", directory.to_path_buf(), unlocked);
+            self.calls.lock().unwrap().push(call);
+            true
+        }
+
+        fn unwatch(&mut self, directory: &Path) {
+            let unlocked = self.inner.state.try_lock().is_ok();
+            let call = ("unwatch", directory.to_path_buf(), unlocked);
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    fn recording_watcher(cache: &ProjectCache) -> WatchCalls {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        cache.set_watcher(Box::new(RecordingWatch {
+            inner: cache.inner.clone(),
+            calls: calls.clone(),
+        }));
+        calls
+    }
+
+    fn store_watching(cache: &ProjectCache, name: &str, ctx: &ProjectContext, dir: &Path) {
+        let Lookup::Compute(claim) =
+            cache.imports(&uri(name), ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss for {name}");
+        };
+        let mut value = import_value(vec![]);
+        value.watch_dirs.push(dir.to_path_buf());
+        cache.store_imports(claim, value, 1, &no_cancel());
+    }
+
+    #[test]
+    fn watcher_calls_run_without_the_cache_lock() {
+        let cache = ProjectCache::new(1 << 20);
+        let calls = recording_watcher(&cache);
+        let ctx = context("A.dproj");
+        let dir = PathBuf::from("/ws/includes");
+        store_watching(&cache, "Main.pas", &ctx, &dir);
+        store_watching(&cache, "Other.pas", &ctx, &dir);
+        cache.invalidate_path(Path::new("/ws/Main.pas"));
+        cache.invalidate_path(Path::new("/ws/Other.pas"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("watch", dir.clone(), true), ("unwatch", dir, true)],
+            "one registration per directory, made with the cache unlocked"
+        );
+    }
+
+    #[test]
+    fn poison_recovery_releases_watches_without_the_cache_lock() {
+        let cache = ProjectCache::new(1 << 20);
+        let calls = recording_watcher(&cache);
+        let ctx = context("A.dproj");
+        let dir = PathBuf::from("/ws/includes");
+        store_watching(&cache, "Main.pas", &ctx, &dir);
+        cache.poison_state();
+        fill(&cache, "Other.pas", &ctx, 1, 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("watch", dir.clone(), true), ("unwatch", dir, true)]
+        );
+    }
+
     #[test]
     fn unpinned_entries_at_budget_still_allow_room_for_warming() {
         let cache = ProjectCache::new(10);
@@ -1369,11 +1594,30 @@ struct State {
     invalidation_epoch: u64,
     max_bytes: usize,
     pins: HashMap<Url, HashSet<(Url, u64)>>,
+    /// Number of owners in `pins` that pin each `(uri, fingerprint)`.
+    pin_counts: HashMap<Url, HashMap<u64, usize>>,
+    /// Bytes of the ready entries that are pinned.
+    pinned_bytes: usize,
+    /// Unpinned ready entries by `last_used`, oldest first. Clock values are
+    /// unique, so each entry has its own slot.
+    lru: BTreeMap<u64, Key>,
+    /// Ready entries with a stamp or content probe on the path. A change to
+    /// the path, or to a child for a directory probe, invalidates them.
+    observed: HashMap<PathBuf, HashSet<Key>>,
+    /// Ready entries for the source at the path or with an overlay probe on
+    /// it. Only a change to the path itself invalidates them.
+    exact: HashMap<PathBuf, HashSet<Key>>,
+    by_uri: HashMap<Url, HashSet<Key>>,
     watch_counts: HashMap<PathBuf, usize>,
-    watcher: Option<Box<dyn DirectoryWatch>>,
+    /// Directories whose watch count reached or left zero. `sync_watches`
+    /// applies them to the watcher once the state lock is released.
+    watch_changes: Vec<PathBuf>,
     closure_crawl_requests: Vec<Url>,
     /// Each root's uncached closure units at its last snapshot walk.
     closure_misses: HashMap<Url, HashSet<Url>>,
+    /// Ready entries looked at by eviction and invalidation.
+    #[cfg(test)]
+    examined: std::cell::Cell<usize>,
 }
 
 impl Default for State {
@@ -1386,18 +1630,43 @@ impl Default for State {
             invalidation_epoch: 0,
             max_bytes: DEFAULT_MAX_CACHE_BYTES,
             pins: HashMap::new(),
+            pin_counts: HashMap::new(),
+            pinned_bytes: 0,
+            lru: BTreeMap::new(),
+            observed: HashMap::new(),
+            exact: HashMap::new(),
+            by_uri: HashMap::new(),
             watch_counts: HashMap::new(),
-            watcher: None,
+            watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
             closure_misses: HashMap::new(),
+            #[cfg(test)]
+            examined: std::cell::Cell::new(0),
         }
     }
 }
 
+#[cfg(test)]
+fn note_examined(state: &State) {
+    state.examined.set(state.examined.get() + 1);
+}
+
+/// The directory watcher and the directories it currently watches.
+#[derive(Default)]
+struct WatcherState {
+    watcher: Option<Box<dyn DirectoryWatch>>,
+    registered: HashSet<PathBuf>,
+}
+
+/// Lock order: `watcher` before `state`. Code holding `state` never takes
+/// `watcher`, never calls the watcher and never touches the filesystem; it
+/// queues watch-count changes in `State::watch_changes`, and `sync_watches`
+/// applies them after `state` is released.
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
+    watcher: Mutex<WatcherState>,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -1431,6 +1700,14 @@ impl ProjectCache {
             .collect::<Vec<_>>();
         layers.sort();
         layers
+    }
+
+    fn reset_examined_entries(&self) {
+        lock(&self.inner).examined.set(0);
+    }
+
+    fn examined_entries(&self) -> usize {
+        lock(&self.inner).examined.get()
     }
 
     fn set_validation_hook(&self, hook: impl FnOnce() + Send + 'static) {
@@ -1512,13 +1789,14 @@ fn recover_poisoned_state<'a>(
     state.slots.clear();
     state.generation = state.generation.wrapping_add(1);
     state.bytes = 0;
-    let watched_directories = state.watch_counts.keys().cloned().collect::<Vec<_>>();
-    if let Some(watcher) = state.watcher.as_mut() {
-        for directory in &watched_directories {
-            watcher.unwatch(directory);
-        }
-    }
-    state.watch_counts.clear();
+    state.pinned_bytes = 0;
+    state.lru.clear();
+    state.observed.clear();
+    state.exact.clear();
+    state.by_uri.clear();
+    let watched_directories = state.watch_counts.drain().map(|(directory, _)| directory);
+    let watched_directories = watched_directories.collect::<Vec<_>>();
+    state.watch_changes.extend(watched_directories);
     inner.state.clear_poison();
     state
 }
@@ -1556,6 +1834,57 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         state.max_bytes = max_bytes;
         evict_to_budget(&mut state);
+        self.release(state);
+    }
+
+    /// Releases the state lock, then applies the watch changes it queued.
+    fn release(&self, state: MutexGuard<'_, State>) {
+        let changed = !state.watch_changes.is_empty();
+        drop(state);
+        if changed {
+            self.sync_watches();
+        }
+    }
+
+    /// Brings the watcher in line with the current watch counts of every
+    /// directory queued in `watch_changes`. Changes are applied in the order
+    /// threads take the watcher lock, each against the counts at that time,
+    /// so the last application for a directory always reflects its count.
+    fn sync_watches(&self) {
+        let mut watcher = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let changes = {
+            let mut state = lock(&self.inner);
+            let mut directories = std::mem::take(&mut state.watch_changes);
+            directories.sort();
+            directories.dedup();
+            directories
+                .into_iter()
+                .map(|directory| {
+                    let wanted = state.watch_counts.contains_key(&directory);
+                    (directory, wanted)
+                })
+                .collect::<Vec<_>>()
+        };
+        let WatcherState {
+            watcher: Some(watch),
+            registered,
+        } = &mut *watcher
+        else {
+            return;
+        };
+        for (directory, wanted) in changes {
+            if wanted && !registered.contains(&directory) {
+                if watch.watch(&directory) {
+                    registered.insert(directory);
+                }
+            } else if !wanted && registered.remove(&directory) {
+                watch.unwatch(&directory);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1682,11 +2011,9 @@ impl ProjectCache {
             last_used: state.clock,
         };
         // Replace even an unchanged entry: its probes may be fresher.
-        if let Some(Slot::Ready(old)) = state.slots.insert(key, Slot::Ready(entry)) {
-            state.bytes = state.bytes.saturating_sub(old.bytes);
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
+        insert_ready(&mut state, key, entry);
         evict_to_budget(&mut state);
+        self.release(state);
         !unchanged
     }
 
@@ -1719,12 +2046,10 @@ impl ProjectCache {
             return None;
         }
         let mut state = lock(&self.inner);
-        state.clock += 1;
-        let clock = state.clock;
-        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key)
+        if let Some(Slot::Ready(entry)) = state.slots.get(&key)
             && extract(&entry.value).is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
         {
-            entry.last_used = clock;
+            touch(&mut state, &key);
         }
         Some(value)
     }
@@ -1737,12 +2062,13 @@ impl ProjectCache {
         content_hash: u64,
     ) -> Option<Option<String>> {
         let state = lock(&self.inner);
-        state.slots.iter().find_map(|(key, slot)| match slot {
-            Slot::Ready(Entry {
+        let keys = state.by_uri.get(uri)?;
+        keys.iter().find_map(|key| match state.slots.get(key) {
+            Some(Slot::Ready(Entry {
                 value: Value::Unit(unit),
                 input_hash,
                 ..
-            }) if key.uri == *uri && *input_hash == content_hash => {
+            })) if *input_hash == content_hash => {
                 Some(Some(unit.parsed.unit_name().to_string()).filter(|name| !name.is_empty()))
             }
             _ => None,
@@ -1757,13 +2083,7 @@ impl ProjectCache {
         bytes: usize,
         cancel: &AtomicBool,
     ) {
-        self.store(
-            claim,
-            Value::Unit(Arc::new(value)),
-            bytes,
-            Vec::new(),
-            cancel,
-        );
+        self.store(claim, Value::Unit(Arc::new(value)), bytes, cancel);
     }
 
     pub(crate) fn imports(
@@ -1808,14 +2128,7 @@ impl ProjectCache {
         bytes: usize,
         cancel: &AtomicBool,
     ) {
-        let watch_dirs = value.watch_dirs.clone();
-        self.store(
-            claim,
-            Value::Import(Arc::new(value)),
-            bytes,
-            watch_dirs,
-            cancel,
-        );
+        self.store(claim, Value::Import(Arc::new(value)), bytes, cancel);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1873,11 +2186,7 @@ impl ProjectCache {
                         continue;
                     }
                     if probes_hold {
-                        state.clock += 1;
-                        let clock = state.clock;
-                        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key) {
-                            entry.last_used = clock;
-                        }
+                        touch(&mut state, &key);
                         return Lookup::Hit(value);
                     }
                     break;
@@ -1885,65 +2194,207 @@ impl ProjectCache {
                 _ => break,
             }
         }
-        if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-            state.bytes = state.bytes.saturating_sub(entry.bytes);
-            release_watches(&mut state, &entry);
-        }
+        remove_ready(&mut state, &key);
         let generation = state.generation;
         state
             .slots
             .insert(key.clone(), Slot::Computing { generation });
+        let invalidation_epoch = snapshot_epoch.unwrap_or(state.invalidation_epoch);
+        self.release(state);
         Lookup::Compute(Claim {
             inner: self.inner.clone(),
             key,
             generation,
             context: Arc::new(context.clone()),
             input_hash,
-            invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
+            invalidation_epoch,
         })
     }
 }
 
+const LAYERS: [Layer; 3] = [Layer::Unit, Layer::Import, Layer::Interface];
+
 fn is_pinned(state: &State, key: &Key) -> bool {
     state
-        .pins
-        .values()
-        .any(|pins| pins.contains(&(key.uri.clone(), key.fingerprint)))
+        .pin_counts
+        .get(&key.uri)
+        .is_some_and(|fingerprints| fingerprints.contains_key(&key.fingerprint))
 }
 
-fn pinned_bytes(state: &State) -> usize {
-    state
-        .slots
-        .iter()
-        .filter_map(|(key, slot)| match slot {
-            Slot::Ready(entry) if is_pinned(state, key) => Some(entry.bytes),
-            _ => None,
-        })
-        .fold(0usize, |bytes, entry_bytes| {
-            bytes.saturating_add(entry_bytes)
-        })
+fn value_probes(value: &Value) -> &[Probe] {
+    match value {
+        Value::Unit(unit) => &unit.probes,
+        Value::Import(imports) => &imports.probes,
+        Value::Interface(interface) => &interface.probes,
+    }
+}
+
+/// The paths whose change invalidates the entry: `true` marks a stamp or
+/// content probe, which a change to a child also invalidates.
+fn indexed_paths(key: &Key, entry: &Entry) -> Vec<(bool, PathBuf)> {
+    let mut paths = Vec::new();
+    if let Ok(own) = key.uri.to_file_path() {
+        paths.push((false, own));
+    }
+    for probe in value_probes(&entry.value) {
+        match probe {
+            Probe::Stamp { path, .. } | Probe::Content { path, .. } => {
+                paths.push((true, path.clone()));
+            }
+            Probe::Overlay { uri, .. } => {
+                if let Ok(path) = uri.to_file_path() {
+                    paths.push((false, path));
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn index_insert<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at: K, key: &Key) {
+    map.entry(at).or_default().insert(key.clone());
+}
+
+fn index_remove<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at: &K, key: &Key) {
+    if let Some(keys) = map.get_mut(at) {
+        keys.remove(key);
+        if keys.is_empty() {
+            map.remove(at);
+        }
+    }
+}
+
+/// Stores a ready entry, replacing any ready entry under the key, and keeps
+/// every index in step with it.
+fn insert_ready(state: &mut State, key: Key, entry: Entry) {
+    remove_ready(state, &key);
+    state.bytes = state.bytes.saturating_add(entry.bytes);
+    if is_pinned(state, &key) {
+        state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);
+    } else {
+        state.lru.insert(entry.last_used, key.clone());
+    }
+    for (observed, path) in indexed_paths(&key, &entry) {
+        let map = if observed {
+            &mut state.observed
+        } else {
+            &mut state.exact
+        };
+        index_insert(map, path, &key);
+    }
+    index_insert(&mut state.by_uri, key.uri.clone(), &key);
+    if let Value::Import(imports) = &entry.value {
+        for directory in &imports.watch_dirs {
+            acquire_watch(state, directory);
+        }
+    }
+    state.slots.insert(key, Slot::Ready(entry));
+}
+
+/// Removes a ready entry and its index records. A computing slot stays.
+fn remove_ready(state: &mut State, key: &Key) -> Option<Entry> {
+    if !matches!(state.slots.get(key), Some(Slot::Ready(_))) {
+        return None;
+    }
+    let Some(Slot::Ready(entry)) = state.slots.remove(key) else {
+        return None;
+    };
+    state.bytes = state.bytes.saturating_sub(entry.bytes);
+    if is_pinned(state, key) {
+        state.pinned_bytes = state.pinned_bytes.saturating_sub(entry.bytes);
+    } else {
+        state.lru.remove(&entry.last_used);
+    }
+    for (observed, path) in indexed_paths(key, &entry) {
+        let map = if observed {
+            &mut state.observed
+        } else {
+            &mut state.exact
+        };
+        index_remove(map, &path, key);
+    }
+    index_remove(&mut state.by_uri, &key.uri, key);
+    release_watches(state, &entry);
+    Some(entry)
+}
+
+/// Marks a ready entry as the most recently used.
+fn touch(state: &mut State, key: &Key) {
+    state.clock += 1;
+    let clock = state.clock;
+    let pinned = is_pinned(state, key);
+    let Some(Slot::Ready(entry)) = state.slots.get_mut(key) else {
+        return;
+    };
+    let previous = std::mem::replace(&mut entry.last_used, clock);
+    if !pinned {
+        state.lru.remove(&previous);
+        state.lru.insert(clock, key.clone());
+    }
+}
+
+/// Moves the ready entries of a `(uri, fingerprint)` between the LRU order
+/// and the pinned total when its first owner pins it or its last unpins it.
+fn set_pinned(state: &mut State, uri: &Url, fingerprint: u64, pinned: bool) {
+    for layer in LAYERS {
+        let key = Key {
+            layer,
+            uri: uri.clone(),
+            fingerprint,
+        };
+        let Some(Slot::Ready(entry)) = state.slots.get(&key) else {
+            continue;
+        };
+        let (bytes, last_used) = (entry.bytes, entry.last_used);
+        if pinned {
+            state.lru.remove(&last_used);
+            state.pinned_bytes = state.pinned_bytes.saturating_add(bytes);
+        } else {
+            state.lru.insert(last_used, key);
+            state.pinned_bytes = state.pinned_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+fn add_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
+    let count = state
+        .pin_counts
+        .entry(uri.clone())
+        .or_default()
+        .entry(*fingerprint)
+        .or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        set_pinned(state, uri, *fingerprint, true);
+    }
+}
+
+fn remove_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
+    let Some(fingerprints) = state.pin_counts.get_mut(uri) else {
+        return;
+    };
+    let Some(count) = fingerprints.get_mut(fingerprint) else {
+        return;
+    };
+    *count -= 1;
+    if *count > 0 {
+        return;
+    }
+    fingerprints.remove(fingerprint);
+    if fingerprints.is_empty() {
+        state.pin_counts.remove(uri);
+    }
+    set_pinned(state, uri, *fingerprint, false);
 }
 
 fn evict_to_budget(state: &mut State) {
     while state.bytes > state.max_bytes {
-        let victim = state
-            .slots
-            .iter()
-            .filter_map(|(key, slot)| match slot {
-                Slot::Ready(entry) if !is_pinned(state, key) => {
-                    Some((entry.last_used, key.clone()))
-                }
-                _ => None,
-            })
-            .min_by_key(|(last_used, _)| *last_used)
-            .map(|(_, key)| key);
-        let Some(key) = victim else {
+        let Some((_, key)) = state.lru.pop_first() else {
             return;
         };
-        if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-            state.bytes = state.bytes.saturating_sub(entry.bytes);
-            release_watches(state, &entry);
-        }
+        #[cfg(test)]
+        note_examined(state);
+        remove_ready(state, &key);
     }
 }
 
@@ -1953,10 +2404,8 @@ fn acquire_watch(state: &mut State, directory: &Path) {
         .entry(directory.to_path_buf())
         .or_insert(0);
     *count += 1;
-    if *count == 1
-        && let Some(watcher) = state.watcher.as_mut()
-    {
-        let _ = watcher.watch(directory);
+    if *count == 1 {
+        state.watch_changes.push(directory.to_path_buf());
     }
 }
 
@@ -1971,23 +2420,14 @@ fn release_watches(state: &mut State, entry: &Entry) {
         *count -= 1;
         if *count == 0 {
             state.watch_counts.remove(directory);
-            if let Some(watcher) = state.watcher.as_mut() {
-                watcher.unwatch(directory);
-            }
+            state.watch_changes.push(directory.clone());
         }
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ProjectCache {
-    fn store(
-        &self,
-        claim: Claim,
-        value: Value,
-        bytes: usize,
-        watch_dirs: Vec<PathBuf>,
-        cancel: &AtomicBool,
-    ) {
+    fn store(&self, claim: Claim, value: Value, bytes: usize, cancel: &AtomicBool) {
         let mut state = lock(&self.inner);
         let current = !cancel.load(Ordering::Relaxed)
             && claim.invalidation_epoch == state.invalidation_epoch
@@ -2002,14 +2442,10 @@ impl ProjectCache {
                 bytes,
                 last_used: state.clock,
             };
-            for directory in &watch_dirs {
-                acquire_watch(&mut state, directory);
-            }
-            state.slots.insert(claim.key.clone(), Slot::Ready(entry));
-            state.bytes = state.bytes.saturating_add(bytes);
+            insert_ready(&mut state, claim.key.clone(), entry);
             evict_to_budget(&mut state);
         }
-        drop(state);
+        self.release(state);
         drop(claim); // Removes the slot only when it is still Computing.
     }
 
@@ -2057,21 +2493,39 @@ impl ProjectCache {
     }
 
     pub(crate) fn pin(&self, owner: &Url, keys: Vec<(Url, u64)>) {
-        lock(&self.inner)
-            .pins
-            .insert(owner.clone(), keys.into_iter().collect());
+        let mut state = lock(&self.inner);
+        let keys = keys.into_iter().collect::<HashSet<_>>();
+        // Count the new set first so keys in both sets stay pinned throughout.
+        for key in &keys {
+            add_pin(&mut state, key);
+        }
+        if let Some(previous) = state.pins.insert(owner.clone(), keys) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
     }
 
     pub(crate) fn unpin(&self, owner: &Url) {
         let mut state = lock(&self.inner);
-        state.pins.remove(owner);
+        if let Some(previous) = state.pins.remove(owner) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
         evict_to_budget(&mut state);
+        self.release(state);
     }
 
     pub(crate) fn clear_pins(&self) {
         let mut state = lock(&self.inner);
-        state.pins.clear();
+        for (_, previous) in std::mem::take(&mut state.pins) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
         evict_to_budget(&mut state);
+        self.release(state);
     }
 
     /// Evicts every entry that depends on `path` and returns the affected URIs.
@@ -2089,44 +2543,26 @@ impl ProjectCache {
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
-        let parent = path.parent();
+        let parent = path.parent().filter(|_| include_parent);
         let doomed = state
-            .slots
-            .iter()
-            .filter_map(|(key, slot)| {
-                let Slot::Ready(entry) = slot else {
-                    return None;
-                };
-                let probes = match &entry.value {
-                    Value::Unit(unit) => &unit.probes,
-                    Value::Import(imports) => &imports.probes,
-                    Value::Interface(interface) => &interface.probes,
-                };
-                let own_path = key.uri.to_file_path().ok();
-                let hit = own_path.as_deref() == Some(path)
-                    || probes.iter().any(|probe| match probe {
-                        Probe::Stamp { path: observed, .. }
-                        | Probe::Content { path: observed, .. } => {
-                            observed == path
-                                || (include_parent && Some(observed.as_path()) == parent)
-                        }
-                        Probe::Overlay { uri, .. } => {
-                            uri.to_file_path().ok().as_deref() == Some(path)
-                        }
-                    });
-                hit.then(|| key.clone())
-            })
-            .collect::<Vec<_>>();
+            .exact
+            .get(path)
+            .into_iter()
+            .chain(state.observed.get(path))
+            .chain(parent.and_then(|parent| state.observed.get(parent)))
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut affected = Vec::new();
+        let mut seen = HashSet::new();
         for key in doomed {
-            if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-                state.bytes = state.bytes.saturating_sub(entry.bytes);
-                release_watches(&mut state, &entry);
-                if !affected.contains(&key.uri) {
-                    affected.push(key.uri);
-                }
+            #[cfg(test)]
+            note_examined(&state);
+            if remove_ready(&mut state, &key).is_some() && seen.insert(key.uri.clone()) {
+                affected.push(key.uri);
             }
         }
+        self.release(state);
         affected
     }
 
@@ -2142,13 +2578,10 @@ impl ProjectCache {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in doomed {
-            if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-                state.bytes = state.bytes.saturating_sub(entry.bytes);
-                release_watches(&mut state, &entry);
-            }
+            remove_ready(&mut state, &key);
         }
         state.closure_misses.clear();
-        drop(state);
+        self.release(state);
         self.inner.changed.notify_all();
     }
 
@@ -2162,18 +2595,17 @@ impl ProjectCache {
             .cloned()
             .collect::<Vec<_>>();
         for key in doomed {
-            if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-                state.bytes = state.bytes.saturating_sub(entry.bytes);
-                release_watches(&mut state, &entry);
+            if remove_ready(&mut state, &key).is_none() {
+                state.slots.remove(&key);
             }
         }
-        drop(state);
+        self.release(state);
         self.inner.changed.notify_all();
     }
 
     pub(crate) fn has_room(&self) -> bool {
         let state = lock(&self.inner);
-        pinned_bytes(&state) < state.max_bytes
+        state.pinned_bytes < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -2193,12 +2625,18 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
-            pinned_over_budget: pinned_bytes(&state) > state.max_bytes,
+            pinned_over_budget: state.pinned_bytes > state.max_bytes,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn set_watcher(&self, watcher: Box<dyn DirectoryWatch>) {
-        lock(&self.inner).watcher = Some(watcher);
+        let mut state = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.watcher = Some(watcher);
+        state.registered.clear();
     }
 }

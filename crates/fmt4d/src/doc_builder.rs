@@ -87,9 +87,10 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// Comments and directives after the file's last leaf, laid out as in
-    /// the source (see [`Self::trivia_run_doc`]).
+    /// the source (see [`Self::trivia_run_doc`]). Items inside a
+    /// `{$FMT.OFF}` region are emitted verbatim instead.
     fn eof_trivia_doc(&self, root: Node<'a>) -> Doc {
-        let trivia = self.trivia_items(
+        let mut trivia = self.trivia_items(
             self.comments.eof_comments(),
             self.directives.eof_directives(),
         );
@@ -98,7 +99,7 @@ impl<'a> DocBuilder<'a> {
         }
         let last = last_leaf(root);
         // Without a code leaf, the first item starts the output.
-        let prev_end = (last.id() != root.id()).then(|| {
+        let mut prev_end = (last.id() != root.id()).then(|| {
             self.comments
                 .trailing_comments(last.id())
                 .iter()
@@ -111,7 +112,64 @@ impl<'a> DocBuilder<'a> {
                 )
                 .fold(last.end_byte(), usize::max)
         });
-        self.trivia_run_doc(trivia, prev_end).0
+        let mut parts = Vec::new();
+        while !trivia.is_empty() {
+            let off = trivia
+                .iter()
+                .position(|(span, _)| self.in_format_off_region(span.start));
+            let run: Vec<_> = trivia.drain(..off.unwrap_or(trivia.len())).collect();
+            let (run_doc, end) = self.trivia_run_doc(run, prev_end);
+            parts.push(run_doc);
+            prev_end = end;
+            if off.is_none() {
+                break;
+            }
+            let verbatim = trivia
+                .iter()
+                .position(|(span, _)| !self.in_format_off_region(span.start))
+                .unwrap_or(trivia.len());
+            let region: Vec<_> = trivia.drain(..verbatim).collect();
+            let (first, end) = (region[0].0.start, region[region.len() - 1].0.end);
+            // The region began before the file's last token: keep the gap
+            // after it too.
+            let start = match prev_end {
+                Some(prev) if self.in_format_off_region(prev.saturating_sub(1)) => prev,
+                _ => first,
+            };
+            parts.push(self.verbatim_doc(start, end));
+            prev_end = Some(end);
+        }
+        doc::concat(parts)
+    }
+
+    /// Whether the line holding source byte `offset` is inside a
+    /// `{$FMT.OFF}` region.
+    fn in_format_off_region(&self, offset: usize) -> bool {
+        let line = 1 + self.source[..offset.min(self.source.len())]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.format_regions
+            .iter()
+            .any(|r| line >= r.start_line && line <= r.end_line)
+    }
+
+    /// Source text between two byte offsets, emitted as written. Text that
+    /// starts a line in the source starts one in the output, with its
+    /// source indentation.
+    fn verbatim_doc(&self, start: usize, end: usize) -> Doc {
+        let line_start = self.source[..start]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let prefix = &self.source[line_start..start];
+        let line = if start > 0 && prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+            Doc::LineStart(String::from_utf8_lossy(prefix).into_owned())
+        } else {
+            Doc::Empty
+        };
+        let text = pascal_core::decode_bytes(&self.source[start..end]).replace('\r', "");
+        doc::concat(vec![line, Doc::Raw(text)])
     }
 
     /// Pair attached comments and directives with their docs, in source order.
@@ -286,18 +344,7 @@ impl<'a> DocBuilder<'a> {
             )
             .fold(node.end_byte(), usize::max);
 
-        let line_start = self.source[..start]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let prefix = &self.source[line_start..start];
-        let line = if start > 0 && prefix.iter().all(|&b| b == b' ' || b == b'\t') {
-            Doc::LineStart(String::from_utf8_lossy(prefix).into_owned())
-        } else {
-            Doc::Empty
-        };
-        let text = pascal_core::decode_bytes(&self.source[start..end]).replace('\r', "");
-        doc::concat(vec![line, Doc::Raw(text)])
+        self.verbatim_doc(start, end)
     }
 
     /// Dispatch to the correct handler by node kind.

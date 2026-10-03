@@ -4207,3 +4207,34 @@ fn parameter_list_keeps_comments_around_commas() {
     }
     idempotency_check(src);
 }
+
+// ── Bug: end-of-file trivia in an unclosed {$FMT.OFF} is re-laid-out ──
+
+#[test]
+fn eof_trivia_in_unclosed_format_off_is_verbatim() {
+    for tail in [
+        "end.\n  // tail\n",
+        "end.\n  // tail",
+        "end.\n\n\n    { a }   // b\n\t{$R+}\n",
+        "end.   // same line\n   {$DEFINE X}\n",
+    ] {
+        let src = format!("unit T;\n\ninterface\n\nimplementation\n\n{{$FMT.OFF}}\n{tail}");
+        let expected = if tail.ends_with('\n') {
+            src.clone()
+        } else {
+            format!("{src}\n")
+        };
+        let result = format_source(&src);
+        assert_eq!(result, expected, "source: {src:?}");
+        idempotency_check(&src);
+        assert_eq!(format_aligned(&src), expected, "aligned, source: {src:?}");
+    }
+}
+
+#[test]
+fn eof_trivia_after_a_closed_format_off_is_laid_out_normally() {
+    let src = "unit T;\ninterface\nimplementation\n{$FMT.OFF}\n{$FMT.ON}\nend.\n   // tail\n";
+    let result = format_source(src);
+    assert!(result.ends_with("end.\n// tail\n"), "{result:?}");
+    idempotency_check(src);
+}

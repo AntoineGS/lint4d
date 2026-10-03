@@ -1044,3 +1044,10 @@ end.
     assert_same_program(source, &aligned);
     common::idempotency_check_aligned(source);
 }
+
+#[test]
+fn roundtrip_eof_trivia_in_unclosed_format_off() {
+    let source = "unit T;\ninterface\nimplementation\n{$FMT.OFF}\nend.\n  // tail\n\n   { more }\n";
+    roundtrip_check(source);
+    idempotency_check(source);
+}

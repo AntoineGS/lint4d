@@ -11930,6 +11930,7 @@ fn large_ordinary_results_survive_temporary_control_byte_pressure() {
     let expected_ids = ordinary_ids.iter().cloned().collect::<HashSet<_>>();
     let mut responses = HashMap::new();
     let mut work_done_ends = HashMap::<String, usize>::new();
+    let mut flood_finished = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     while responses.len() < expected_ids.len() || work_done_ends.len() < expected_ids.len() {
         assert!(
@@ -11967,6 +11968,8 @@ fn large_ordinary_results_survive_temporary_control_byte_pressure() {
                     .to_string();
                 *work_done_ends.entry(token).or_default() += 1;
             }
+            // The flood can finish while the ordinary results drain.
+            Message::Response(response) if response.id == flood_id => flood_finished = true,
             _ => {}
         }
     }
@@ -11979,8 +11982,10 @@ fn large_ordinary_results_survive_temporary_control_byte_pressure() {
         ])
     );
 
-    server.send_notification("$/cancelRequest", json!({"id": flood_id}));
-    let _ = server.response(&flood_id);
+    if !flood_finished {
+        server.send_notification("$/cancelRequest", json!({"id": flood_id}));
+        let _ = server.response(&flood_id);
+    }
 
     let healthy_id = RequestId::from("temporary-byte-follow-up".to_string());
     server.send_request(

@@ -4155,6 +4155,11 @@ struct PartialDeliveryRecipient {
     next_item: usize,
 }
 
+/// Read-set validation for one partial delivery. Chunks are guarded by the
+/// generation token captured when the delivery starts (an integer compare per
+/// chunk); this filesystem pass runs once, after the last chunk and before the
+/// first successful final response, so an unnotified disk change during
+/// delivery still fails the request closed.
 #[derive(Debug)]
 struct PartialDeliveryValidation {
     input: Arc<rename::RevalidationInput>,
@@ -4163,6 +4168,9 @@ struct PartialDeliveryValidation {
     cancellation: Arc<AtomicBool>,
     receiver: Option<Receiver<Result<(), String>>>,
     handle: Option<JoinHandle<()>>,
+    passed: bool,
+    #[cfg(test)]
+    runs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PartialDeliveryValidation {
@@ -4170,17 +4178,34 @@ impl PartialDeliveryValidation {
         input: Arc<rename::RevalidationInput>,
         records: Arc<Vec<SourceRecord>>,
         test_barriers: TestBarrierConfig,
-    ) -> Result<Self, String> {
-        let mut validation = Self {
+    ) -> Self {
+        Self {
             input,
             records,
             test_barriers,
             cancellation: Arc::new(AtomicBool::new(false)),
             receiver: None,
             handle: None,
-        };
-        validation.request()?;
-        Ok(validation)
+            passed: false,
+            #[cfg(test)]
+            runs: Arc::default(),
+        }
+    }
+
+    /// Starts the validation on first use and reports its outcome; `None`
+    /// while it is still running. A passed validation is not repeated.
+    fn check(&mut self) -> Option<Result<(), String>> {
+        if self.passed {
+            return Some(Ok(()));
+        }
+        if !self.is_running()
+            && let Err(error) = self.request()
+        {
+            return Some(Err(error));
+        }
+        let result = self.poll()?;
+        self.passed = result.is_ok();
+        Some(result)
     }
 
     fn request(&mut self) -> Result<(), String> {
@@ -4192,9 +4217,13 @@ impl PartialDeliveryValidation {
         let records = Arc::clone(&self.records);
         let cancellation = Arc::clone(&self.cancellation);
         let test_barriers = self.test_barriers.clone();
+        #[cfg(test)]
+        let runs = Arc::clone(&self.runs);
         let handle = thread::Builder::new()
             .name("PascalLspPartialValidation".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                runs.fetch_add(1, Ordering::Relaxed);
                 let result = match wait_at_uninterruptible_test_barrier(
                     TestBarrier::PartialValidation,
                     &test_barriers,
@@ -8277,31 +8306,11 @@ impl AnalysisJobs {
                     "partial result delivery capacity is full; retry the request",
                 );
             }
-            let records = Arc::new(records);
-            let validation = match PartialDeliveryValidation::new(
+            let validation = PartialDeliveryValidation::new(
                 revalidation_input,
-                records,
+                Arc::new(records),
                 self.test_barriers.clone(),
-            ) {
-                Ok(validation) => validation,
-                Err(error) => {
-                    let recipients = partial_recipients
-                        .into_iter()
-                        .map(|recipient| ClientRecipient {
-                            id: recipient.id,
-                            work_done_token: None,
-                            partial_result_token: Some(recipient.token),
-                        })
-                        .collect();
-                    return self.fail_client_recipients(
-                        connection,
-                        primary_id,
-                        recipients,
-                        ErrorCode::RequestFailed,
-                        &error,
-                    );
-                }
-            };
+            );
             let retrigger_on_stale =
                 matches!(&payload, PartialResultPayload::WorkspaceDiagnostics(_));
             self.partial_deliveries.push_back(PartialDelivery {
@@ -8325,10 +8334,16 @@ impl AnalysisJobs {
         workspace: &Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.reap_retired_partial_validations();
-        for _ in 0..MAX_PARTIAL_RESULT_CHUNKS_PER_TURN {
+        let mut sent = 0;
+        let mut inspected = 0;
+        // A delivery waiting for its read-set validation rotates to the back so
+        // it does not hold up chunks of the other deliveries.
+        while sent < MAX_PARTIAL_RESULT_CHUNKS_PER_TURN && inspected < self.partial_deliveries.len()
+        {
             let Some(mut delivery) = self.partial_deliveries.pop_front() else {
                 return Ok(());
             };
+            inspected += 1;
             if workspace.analysis_admission_fenced()
                 || delivery.source_generation != workspace.source_generation()
                 || delivery.configuration_generation != workspace.configuration_generation()
@@ -8352,31 +8367,34 @@ impl AnalysisJobs {
             if delivery.recipients.is_empty() {
                 continue;
             }
-            match delivery.validation.poll() {
-                None => {
-                    self.partial_deliveries.push_front(delivery);
-                    return Ok(());
-                }
-                Some(Err(error)) => {
-                    let message =
-                        format!("analysis result became stale during partial delivery: {error}");
-                    if delivery.retrigger_on_stale {
-                        self.fail_partial_delivery_with_retrigger(connection, delivery, &message)?;
-                    } else {
-                        self.fail_partial_delivery(
-                            connection,
-                            delivery,
-                            ErrorCode::RequestFailed,
-                            &message,
-                        )?;
-                    }
-                    continue;
-                }
-                Some(Ok(())) => {}
-            }
             let recipient_index = delivery.next_recipient % delivery.recipients.len();
             let next_item = delivery.recipients[recipient_index].next_item;
             if next_item >= delivery.payload.len() {
+                match delivery.validation.check() {
+                    None => {
+                        self.partial_deliveries.push_back(delivery);
+                        continue;
+                    }
+                    Some(Err(error)) => {
+                        let message = format!(
+                            "analysis result became stale during partial delivery: {error}"
+                        );
+                        if delivery.retrigger_on_stale {
+                            self.fail_partial_delivery_with_retrigger(
+                                connection, delivery, &message,
+                            )?;
+                        } else {
+                            self.fail_partial_delivery(
+                                connection,
+                                delivery,
+                                ErrorCode::RequestFailed,
+                                &message,
+                            )?;
+                        }
+                        continue;
+                    }
+                    Some(Ok(())) => {}
+                }
                 let recipient = delivery.recipients.remove(recipient_index);
                 send_ok(
                     connection,
@@ -8384,9 +8402,9 @@ impl AnalysisJobs {
                     delivery.payload.empty_result(),
                 )?;
                 self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
+                sent += 1;
                 if !delivery.recipients.is_empty() {
                     delivery.next_recipient %= delivery.recipients.len();
-                    delivery.validation.request()?;
                     self.partial_deliveries.push_back(delivery);
                 }
                 continue;
@@ -8406,16 +8424,13 @@ impl AnalysisJobs {
             };
             let token = delivery.recipients[recipient_index].token.clone();
             if !send_partial_result_chunk(connection, &token, value)? {
-                delivery.validation.request()?;
                 self.partial_deliveries.push_front(delivery);
                 return Ok(());
             }
+            sent += 1;
             delivery.recipients[recipient_index].next_item = end;
-            if !delivery.recipients.is_empty() {
-                delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
-                delivery.validation.request()?;
-                self.partial_deliveries.push_back(delivery);
-            }
+            delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
+            self.partial_deliveries.push_back(delivery);
         }
         Ok(())
     }
@@ -15346,15 +15361,15 @@ mod tests {
         DocumentationFormat, FileWatcherRegistration, MAX_ANALYSIS_QUEUE,
         MAX_CLIENT_ANALYSIS_RECIPIENTS, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
         MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
-        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES,
-        MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
-        MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass,
-        OutboundQueue, OutputError, PartialDelivery, PartialDeliveryRecipient,
-        PartialDeliveryValidation, PartialResultPayload, PendingAnalysis, PriorityQueue,
-        ProtocolSender, TestBarrierConfig, deliver_analysis_result, event_loop_receive_timeout,
-        handle_request, invalidate_analysis_result, pump_pending_diagnostic_publications,
-        select_workspace_event_message, supports_diagnostic_refresh,
-        supports_workspace_diagnostic_reports,
+        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK,
+        MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, OutputError,
+        PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload,
+        PendingAnalysis, PriorityQueue, ProtocolSender, TestBarrierConfig, deliver_analysis_result,
+        event_loop_receive_timeout, handle_request, invalidate_analysis_result,
+        pump_pending_diagnostic_publications, select_workspace_event_message,
+        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
     };
     use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -18549,8 +18564,7 @@ mod tests {
             Arc::new(workspace.revalidation_input()),
             Arc::clone(&records),
             TestBarrierConfig::disabled(),
-        )
-        .expect("validation worker");
+        );
         let recipients = (0..MAX_CLIENT_ANALYSIS_RECIPIENTS)
             .map(|index| PartialDeliveryRecipient {
                 id: RequestId::from(format!("delivering-{index}")),
@@ -18589,6 +18603,107 @@ mod tests {
         assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
     }
 
+    #[derive(Default)]
+    struct RecordingSender {
+        messages: Mutex<Vec<Message>>,
+    }
+
+    impl ProtocolSender for RecordingSender {
+        fn send_control(&self, message: Message) -> Result<(), OutputError> {
+            self.messages
+                .lock()
+                .expect("recorded messages")
+                .push(message);
+            Ok(())
+        }
+
+        fn send_result(&self, message: Message) -> Result<(), OutputError> {
+            self.send_control(message)
+        }
+
+        fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+            self.send_control(message).map(|()| true)
+        }
+    }
+
+    #[test]
+    fn fifty_chunk_partial_delivery_validates_the_read_set_once() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).expect("source URI");
+        let chunks = 50;
+        let locations = (0..chunks * MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK)
+            .map(|line| {
+                let line = u32::try_from(line).expect("line");
+                Location::new(
+                    uri.clone(),
+                    Range::new(Position::new(line, 0), Position::new(line, 1)),
+                )
+            })
+            .collect();
+        let connection = RecordingSender::default();
+        let id = RequestId::from("fifty-chunks".to_string());
+        let mut jobs = AnalysisJobs::new();
+        jobs.start_partial_delivery(
+            &connection,
+            &workspace,
+            AnalysisResult {
+                id: AnalysisJobId::Client(AnalysisComputationId(0)),
+                source_generation: workspace.source_generation(),
+                configuration_generation: workspace.configuration_generation(),
+                records: Vec::new(),
+                value: AnalysisResultValue::References(Ok(locations)),
+            },
+            vec![super::ClientRecipient {
+                id: id.clone(),
+                work_done_token: None,
+                partial_result_token: Some(lsp_types::ProgressToken::String(
+                    "fifty-chunks".to_string(),
+                )),
+            }],
+            AnalysisComputationId(0),
+        )
+        .expect("start partial delivery");
+        let runs = Arc::clone(
+            &jobs
+                .partial_deliveries
+                .front()
+                .expect("partial delivery")
+                .validation
+                .runs,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !jobs.partial_deliveries.is_empty() {
+            assert!(Instant::now() < deadline, "partial delivery must finish");
+            let sent = connection.messages.lock().expect("recorded messages").len();
+            jobs.pump_partial_deliveries(&connection, &workspace)
+                .expect("pump partial delivery");
+            if connection.messages.lock().expect("recorded messages").len() == sent {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let messages = connection.messages.lock().expect("recorded messages");
+        let progress = messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::Notification(notification) if notification.method == "$/progress")
+            })
+            .count();
+        assert_eq!(progress, chunks);
+        let Some(Message::Response(response)) = messages.last() else {
+            panic!("final response expected: {:?}", messages.last());
+        };
+        assert_eq!(response.id, id);
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the read set is validated once per delivery, not once per chunk"
+        );
+    }
+
     #[cfg(feature = "test-support")]
     #[test]
     fn retired_partial_validation_keeps_worker_and_bytes_until_reaped() {
@@ -18598,13 +18713,13 @@ mod tests {
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
         let entered = barrier_directory.join("entered");
         let release = barrier_directory.join("release");
-        let validation = PartialDeliveryValidation::new(
+        let mut validation = PartialDeliveryValidation::new(
             Arc::new(workspace.revalidation_input()),
             Arc::new(Vec::new()),
             TestBarrierConfig::default()
                 .with_partial_validation(Some((entered.clone(), release.clone()))),
-        )
-        .expect("validation worker");
+        );
+        validation.request().expect("validation worker");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !entered.exists() {

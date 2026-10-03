@@ -4,7 +4,7 @@ title: 'BUILD-2: Separate the barrier target and run it in CI'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:29'
+updated_date: '2026-10-03 03:11'
 labels:
   - arch-review
   - build
@@ -42,3 +42,9 @@ that makes `neovim.rs` fail rather than skip.
 <!-- AC:BEGIN -->
 - [ ] #1 CI runs both; a missing `nvim` fails the job.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-10-03 (from TASK-1.1): `cargo clippy --workspace --all-targets --all-features -- -D warnings` was failing on master 81418f2 (collapsible_if in server.rs and tests/protocol.rs, manual_is_multiple_of in tests/protocol.rs). CI's clippy job does not enable test-support, so nobody noticed. Branch fix/master-tests-clippy (9f3a2f1) cleans them up. When this task adds the barrier target to CI, also run clippy with --features test-support (or --all-features). Note that every #[cfg(feature = "test-support")] test in tests/protocol.rs is skipped by `cargo test --workspace`, including the two TASK-1.2 sixty_sixth_ordinary_frame tests.
+<!-- SECTION:NOTES:END -->

@@ -4,7 +4,7 @@ title: 'FMT-6: One trivia index for comments and directives'
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 01:29'
+updated_date: '2026-10-03 03:28'
 labels:
   - arch-review
   - fmt
@@ -40,3 +40,9 @@ the same non-extra leaf index.
 - [ ] #1 One leaf-index implementation; fmt suites green.
 - [ ] #2 No behaviour change: the existing suites named in the task stay green (cargo fmt --check, clippy -D warnings, and the affected crate's tests).
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Known behaviour to revisit (from the TASK-26 review): under uses sorting, a header comment above the first unit counts as that unit's leading comment and moves with it, e.g. `uses\n  // first\n  B, A;` → `uses\n  A,\n  // first\n  B;`. A comment meant as a header for the whole clause ends up in the middle of it. A single trivia index could tell a clause header (above the first unit, maybe followed by a blank line) from a unit's own comment.
+<!-- SECTION:NOTES:END -->

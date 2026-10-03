@@ -6985,6 +6985,12 @@ impl Workspace {
                     None,
                 ),
                 crate::project_cache::Lookup::Compute(claim) => {
+                    #[cfg(feature = "test-support")]
+                    if !claim.is_detached()
+                        && !crate::project_cache::claim_waits_are_limited_on_this_thread()
+                    {
+                        wait_at_import_claim_test_barrier();
+                    }
                     let input = self.analysis_input();
                     let mut resolver = resolver::resolver_for_context_with_session_cache(
                         context.clone(),
@@ -15091,6 +15097,30 @@ fn add_configuration_watch_directories(
 ) {
     for directory in directories {
         add_configuration_watch_directory(paths, &directory);
+    }
+}
+
+/// Holds a thread whose import-cache claim other lookups would wait on, so
+/// protocol tests can check that interactive work does not wait it out.
+#[cfg(feature = "test-support")]
+fn wait_at_import_claim_test_barrier() {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_IMPORT_CLAIM_BARRIER") else {
+        return;
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return;
+    };
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+    {
+        let _ = marker.write_all(b"x");
+    }
+    while !Path::new(release).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 

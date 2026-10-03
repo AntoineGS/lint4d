@@ -944,6 +944,87 @@ mod cache_tests {
     }
 
     #[test]
+    fn a_claim_for_other_input_is_not_waited_on() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let Lookup::Compute(older) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected initial miss")
+        };
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let newer = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                let Lookup::Compute(claim) =
+                    cache.imports(&main, &ctx, 2, &HashMap::new(), &no_cancel())
+                else {
+                    panic!("a newer revision computes")
+                };
+                cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+                result_tx.send(()).unwrap();
+            })
+        };
+        let result = result_rx.recv_timeout(Duration::from_secs(5));
+        drop(older);
+        newer.join().unwrap();
+        result.expect("a newer revision must not wait behind an older claim");
+        assert!(
+            matches!(
+                cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+                Lookup::Compute(_)
+            ),
+            "the uncached computation must not have stored anything"
+        );
+    }
+
+    #[test]
+    fn limited_waits_compute_without_caching_and_leave_the_claim() {
+        let cache = ProjectCache::new(1 << 20);
+        let ctx = context("A.dproj");
+        let main = uri("Main.pas");
+        let Lookup::Compute(claim) = cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected initial miss")
+        };
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let interactive = {
+            let cache = cache.clone();
+            let ctx = ctx.clone();
+            let main = main.clone();
+            std::thread::spawn(move || {
+                limit_claim_waits_on_this_thread(Some(Duration::from_millis(50)));
+                let Lookup::Compute(local) =
+                    cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel())
+                else {
+                    panic!("a limited wait computes locally")
+                };
+                cache.store_imports(local, import_value(vec![]), 1, &no_cancel());
+                result_tx.send(()).unwrap();
+            })
+        };
+        let result = result_rx.recv_timeout(Duration::from_secs(5));
+        let still_claimed = matches!(
+            lock(&cache.inner).slots.get(&Key {
+                layer: Layer::Import,
+                uri: main.clone(),
+                fingerprint: project_context_fingerprint(&ctx),
+            }),
+            Some(Slot::Computing { .. })
+        );
+        cache.store_imports(claim, import_value(vec![]), 1, &no_cancel());
+        interactive.join().unwrap();
+        result.expect("a limited wait must give up on the claim");
+        assert!(still_claimed, "the local computation must leave the claim");
+        assert!(matches!(
+            cache.imports(&main, &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
     fn waiter_recovers_poisoned_state_when_condvar_reacquires() {
         let cache = ProjectCache::new(1 << 20);
         let ctx = context("A.dproj");
@@ -1358,7 +1439,7 @@ struct Entry {
 #[derive(Debug)]
 enum Slot {
     Ready(Entry),
-    Computing { generation: u64 },
+    Computing { generation: u64, input_hash: u64 },
 }
 
 struct State {
@@ -1482,12 +1563,25 @@ pub(crate) struct Claim {
     invalidation_epoch: u64,
     context: Arc<ProjectContext>,
     input_hash: u64,
+    /// The slot is computed by another claim; this one computes without
+    /// caching, so storing and dropping it leave the slot alone.
+    detached: bool,
+}
+
+impl Claim {
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached
+    }
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
         let mut state = lock(&self.inner);
-        if matches!(state.slots.get(&self.key), Some(Slot::Computing { generation }) if *generation == self.generation)
+        if matches!(state.slots.get(&self.key), Some(Slot::Computing { generation, .. }) if *generation == self.generation)
         {
             state.slots.remove(&self.key);
         }
@@ -1530,11 +1624,37 @@ fn lock(inner: &Inner) -> MutexGuard<'_, State> {
     }
 }
 
+thread_local! {
+    static CLAIM_WAIT_LIMIT: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Bounds how long lookups on the calling thread wait for a slot another
+/// thread is computing. Past the limit the lookup computes without caching,
+/// so an interactive worker never waits out a bulk job's or the warmer's
+/// claim.
+pub(crate) fn limit_claim_waits_on_this_thread(limit: Option<Duration>) {
+    CLAIM_WAIT_LIMIT.with(|cell| cell.set(limit));
+}
+
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+pub(crate) fn claim_waits_are_limited_on_this_thread() -> bool {
+    CLAIM_WAIT_LIMIT.with(|cell| cell.get().is_some())
+}
+
 fn wait_timeout_recovering_poison<'a>(
     inner: &'a Inner,
     state: MutexGuard<'a, State>,
 ) -> (MutexGuard<'a, State>, WaitTimeoutResult) {
-    match inner.changed.wait_timeout(state, WAIT_SLICE) {
+    wait_timeout_recovering_poison_for(inner, state, WAIT_SLICE)
+}
+
+fn wait_timeout_recovering_poison_for<'a>(
+    inner: &'a Inner,
+    state: MutexGuard<'a, State>,
+    timeout: Duration,
+) -> (MutexGuard<'a, State>, WaitTimeoutResult) {
+    match inner.changed.wait_timeout(state, timeout) {
         Ok(result) => result,
         Err(poisoned) => {
             let (state, timeout) = poisoned.into_inner();
@@ -1835,16 +1955,54 @@ impl ProjectCache {
             uri: uri.clone(),
             fingerprint: project_context_fingerprint(context),
         };
+        let wait_limit = CLAIM_WAIT_LIMIT.with(std::cell::Cell::get);
+        let mut waiting_since = None;
         let mut state = lock(&self.inner);
         loop {
             match state.slots.get(&key) {
-                Some(Slot::Computing { .. }) => {
+                Some(Slot::Computing {
+                    generation,
+                    input_hash: claimed_input,
+                }) => {
                     if cancel.load(Ordering::Relaxed) {
                         return Lookup::Cancelled;
                     }
+                    let waited_out = wait_limit.is_some_and(|limit| {
+                        waiting_since
+                            .get_or_insert_with(std::time::Instant::now)
+                            .elapsed()
+                            >= limit
+                    });
+                    // The claim computes another revision of the input, or
+                    // this thread may not wait longer: compute without
+                    // caching instead of waiting on it.
+                    if *claimed_input != input_hash || waited_out {
+                        return Lookup::Compute(Claim {
+                            inner: self.inner.clone(),
+                            key: key.clone(),
+                            generation: *generation,
+                            context: Arc::new(context.clone()),
+                            input_hash,
+                            invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
+                            detached: true,
+                        });
+                    }
                     #[cfg(test)]
                     self.signal_waiter_hook();
-                    state = wait_timeout_recovering_poison(&self.inner, state).0;
+                    state = match wait_limit {
+                        Some(limit) => {
+                            let remaining = limit.saturating_sub(
+                                waiting_since.map_or(Duration::ZERO, |since| since.elapsed()),
+                            );
+                            wait_timeout_recovering_poison_for(
+                                &self.inner,
+                                state,
+                                remaining.min(WAIT_SLICE),
+                            )
+                            .0
+                        }
+                        None => wait_timeout_recovering_poison(&self.inner, state).0,
+                    };
                 }
                 Some(Slot::Ready(entry))
                     if entry.context.as_ref() == context && entry.input_hash == input_hash =>
@@ -1890,9 +2048,13 @@ impl ProjectCache {
             release_watches(&mut state, &entry);
         }
         let generation = state.generation;
-        state
-            .slots
-            .insert(key.clone(), Slot::Computing { generation });
+        state.slots.insert(
+            key.clone(),
+            Slot::Computing {
+                generation,
+                input_hash,
+            },
+        );
         Lookup::Compute(Claim {
             inner: self.inner.clone(),
             key,
@@ -1900,6 +2062,7 @@ impl ProjectCache {
             context: Arc::new(context.clone()),
             input_hash,
             invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
+            detached: false,
         })
     }
 }
@@ -1989,10 +2152,11 @@ impl ProjectCache {
         cancel: &AtomicBool,
     ) {
         let mut state = lock(&self.inner);
-        let current = !cancel.load(Ordering::Relaxed)
+        let current = !claim.detached
+            && !cancel.load(Ordering::Relaxed)
             && claim.invalidation_epoch == state.invalidation_epoch
             && matches!(state.slots.get(&claim.key),
-            Some(Slot::Computing { generation }) if *generation == claim.generation && claim.generation == state.generation);
+            Some(Slot::Computing { generation, .. }) if *generation == claim.generation && claim.generation == state.generation);
         if current {
             state.clock += 1;
             let entry = Entry {

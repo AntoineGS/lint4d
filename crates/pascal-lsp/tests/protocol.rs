@@ -37653,6 +37653,129 @@ fn completed_navigation_is_delivered_while_a_watcher_batch_reconciles() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn queued_hover_is_replaced_by_a_newer_hover_for_the_same_document() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let source = "unit Main;\ninterface\ntype\n  TTarget = class end;\n  TUse = TTarget;\n  TOther = TUse;\nimplementation\nend.\n";
+    write_file(&main, source);
+    let (mut server, barrier) =
+        TestServer::launch_with_navigation_barrier(tempfile::tempdir().expect("environment"));
+    server.initialize(root.path(), Value::Null);
+
+    let blockers = [("TTarget", 1), ("TUse", 1), ("TUse", 0)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (needle, occurrence))| {
+            let id = RequestId::from(format!("hover-replacement-blocker-{index}"));
+            server.send_request(
+                id.clone(),
+                "textDocument/definition",
+                navigation_params(&main, source, needle, occurrence),
+            );
+            id
+        })
+        .collect::<Vec<_>>();
+    barrier.wait_for_entries(blockers.len());
+
+    let older = RequestId::from("older-queued-hover".to_string());
+    server.send_request(
+        older.clone(),
+        "textDocument/hover",
+        navigation_params(&main, source, "TTarget", 0),
+    );
+    let newer = RequestId::from("newer-queued-hover".to_string());
+    server.send_request(
+        newer.clone(),
+        "textDocument/hover",
+        navigation_params(&main, source, "TOther", 0),
+    );
+    let replaced = server.response(&older);
+    let error = replaced.error.expect("the older queued hover is cancelled");
+    assert_eq!(error.code, -32800);
+    assert!(error.message.contains("superseded"), "{error:?}");
+
+    barrier.release();
+    let answered = server.response(&newer);
+    assert!(answered.error.is_none(), "{answered:?}");
+    for id in blockers {
+        let _ = server.response(&id);
+    }
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
+    let root = tempfile::tempdir().expect("workspace");
+    let provider = root.path().join("Provider.pas");
+    let main = root.path().join("Main.pas");
+    write_file(
+        &provider,
+        "unit Provider;\ninterface\ntype\n  TProvided = class end;\nimplementation\nend.\n",
+    );
+    let source = format!(
+        "unit Main;\ninterface\nuses Provider;\ntype\n  TUse = TProvided;\nimplementation\nprocedure Run;\nvar Value: TProvided;\nbegin\n{}end;\nend.\n",
+        "  Value := nil;\n".repeat(20)
+    );
+    write_file(&main, &source);
+    // The import cache is used for project-backed sources.
+    write_file(
+        &root.path().join("App.dproj"),
+        "<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup></Project>",
+    );
+
+    let environment = tempfile::tempdir().expect("server environment");
+    let barrier_directory = environment.path().join("import-claim-barrier");
+    fs::create_dir_all(&barrier_directory).expect("barrier directory");
+    let claim = TestBarrier {
+        entered: barrier_directory.join("entered"),
+        release: barrier_directory.join("release"),
+    };
+    let claim_spec = format!("{}|{}", claim.entered.display(), claim.release.display());
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        environment.path(),
+        [("PASCAL_LSP_TEST_IMPORT_CLAIM_BARRIER", claim_spec.as_str())],
+    );
+    server.initialize(root.path(), Value::Null);
+
+    let references_id = RequestId::from("bulk-references-holding-a-claim".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&main)},
+            "position": position_of(&source, "TProvided", 1),
+            "context": {"includeDeclaration": true}
+        }),
+    );
+    claim.wait_until_entered();
+
+    let definition_id = RequestId::from("definition-behind-a-bulk-claim".to_string());
+    let started = Instant::now();
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, &source, "TProvided", 0),
+    );
+    let definition = server
+        .response_with_timeout(&definition_id, IO_TIMEOUT)
+        .expect("definition must not wait for the bulk job's cache claim");
+    eprintln!(
+        "definition answered in {:?} while references held a cache claim",
+        started.elapsed()
+    );
+    let locations = result_locations(definition);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+
+    claim.release();
+    let references = server.response(&references_id);
+    assert!(references.error.is_none(), "{references:?}");
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn result_older_than_the_reconciling_revision_waits_for_the_commit() {
     let root = tempfile::tempdir().expect("workspace");
     let main = root.path().join("Main.pas");

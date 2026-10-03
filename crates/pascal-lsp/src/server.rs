@@ -65,6 +65,9 @@ const MAX_GENERAL_ANALYSIS_JOBS: usize = 2;
 // One additional slot is reserved for interactive work. Bulk analysis and
 // diagnostics must never occupy all workers while a navigation request waits.
 const MAX_ANALYSIS_JOBS: usize = MAX_GENERAL_ANALYSIS_JOBS + 1;
+/// How long an interactive worker waits for a cache slot that a bulk job or
+/// the warmer is computing before it computes the slot itself, uncached.
+const INTERACTIVE_CLAIM_WAIT: Duration = Duration::from_millis(50);
 /// Maximum number of accepted analysis requests waiting for a worker.
 ///
 /// Queued requests retain only their parsed request parameters, never a
@@ -90,6 +93,8 @@ const WORKSPACE_NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+const ANALYSIS_REPLACED_MESSAGE: &str =
+    "request superseded by a newer request of the same kind for the document";
 const OPEN_ADMISSION_FENCE_MESSAGE: &str = "analysis is disabled because an editor document could not be tracked; close the rejected document or restart the workspace";
 const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
 const MAX_WORKSPACE_MUTATION_DEFERRED_BYTES: usize = 1024 * 1024;
@@ -954,7 +959,6 @@ impl AnalysisPriority {
         match request {
             AnalysisRequest::Hover { .. }
             | AnalysisRequest::ProjectContext { .. }
-            | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
             | AnalysisRequest::BuildContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
@@ -969,8 +973,6 @@ impl AnalysisPriority {
             | AnalysisRequest::PrepareCallHierarchy { .. }
             | AnalysisRequest::PrepareTypeHierarchy { .. }
             | AnalysisRequest::TypeHierarchySupertypes { .. }
-            | AnalysisRequest::TypeHierarchySubtypes { .. }
-            | AnalysisRequest::IncomingCalls { .. }
             | AnalysisRequest::OutgoingCalls { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
@@ -978,9 +980,13 @@ impl AnalysisPriority {
             | AnalysisRequest::ResolveCodeLens(_)
             | AnalysisRequest::DocumentHighlights { .. }
             | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
-            AnalysisRequest::DocumentLinks { .. } | AnalysisRequest::CodeLenses { .. } => {
-                Self::Bulk
-            }
+            // Repository listing and the reverse-edge hierarchy requests scan
+            // the workspace; they must not take the interactive slot.
+            AnalysisRequest::DocumentLinks { .. }
+            | AnalysisRequest::CodeLenses { .. }
+            | AnalysisRequest::ListProjects { .. }
+            | AnalysisRequest::TypeHierarchySubtypes { .. }
+            | AnalysisRequest::IncomingCalls { .. } => Self::Bulk,
             AnalysisRequest::Diagnostics { .. }
             | AnalysisRequest::DocumentDiagnostics { .. }
             | AnalysisRequest::WorkspaceDiagnostics { .. } => Self::Diagnostics,
@@ -5109,6 +5115,21 @@ impl ObservationKey {
         self.same_query(newer)
             && matches!((self.version, newer.version), (Some(old), Some(new)) if new > old)
     }
+
+    /// Cursor-following requests a client discards once it asks again for
+    /// the same document: a queued one is cancelled instead of computed.
+    fn is_replaced_by(&self, newer: &Self) -> bool {
+        matches!(
+            self.method,
+            ObservationMethod::Hover { .. }
+                | ObservationMethod::SignatureHelp { .. }
+                | ObservationMethod::DocumentHighlights
+                | ObservationMethod::Prepare
+        ) && self.method == newer.method
+            && self.uri.is_some()
+            && self.uri == newer.uri
+            && !self.same_query(newer)
+    }
 }
 
 #[derive(Debug)]
@@ -5782,6 +5803,11 @@ impl AnalysisJobs {
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
             .spawn(move || {
+                if priority == AnalysisPriority::Interactive {
+                    crate::project_cache::limit_claim_waits_on_this_thread(Some(
+                        INTERACTIVE_CLAIM_WAIT,
+                    ));
+                }
                 let validation_input = input.clone();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
@@ -7257,7 +7283,18 @@ impl AnalysisJobs {
                 .map(|(_, id)| *id)
                 .collect::<Vec<_>>();
             for primary_id in superseded {
-                self.supersede_client(&primary_id, connection)?;
+                self.supersede_client(&primary_id, connection, ANALYSIS_SUPERSEDED_MESSAGE)?;
+            }
+            let replaced = self
+                .observation_jobs
+                .iter()
+                .filter(|(existing, id)| {
+                    existing.is_replaced_by(key) && !self.pending.contains_key(id)
+                })
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>();
+            for primary_id in replaced {
+                self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
             }
 
             if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
@@ -7450,6 +7487,7 @@ impl AnalysisJobs {
         &mut self,
         primary_id: &AnalysisComputationId,
         connection: Option<&dyn ProtocolSender>,
+        message: &str,
     ) -> Result<(), String> {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
@@ -7464,12 +7502,7 @@ impl AnalysisJobs {
             for id in &request_ids {
                 self.remove_client_mapping(id, primary_id);
             }
-            Self::send_client_error(
-                connection,
-                request_ids,
-                ErrorCode::RequestCanceled,
-                ANALYSIS_SUPERSEDED_MESSAGE,
-            )?;
+            Self::send_client_error(connection, request_ids, ErrorCode::RequestCanceled, message)?;
             for recipient in job.recipients {
                 self.release_partial_token(&recipient);
                 self.progress.finish_recipient(
@@ -7498,12 +7531,7 @@ impl AnalysisJobs {
         for id in &request_ids {
             self.remove_client_mapping(id, primary_id);
         }
-        Self::send_client_error(
-            connection,
-            request_ids,
-            ErrorCode::RequestCanceled,
-            ANALYSIS_SUPERSEDED_MESSAGE,
-        )?;
+        Self::send_client_error(connection, request_ids, ErrorCode::RequestCanceled, message)?;
         for recipient in recipients {
             self.release_partial_token(&recipient);
             self.progress.finish_recipient(
@@ -19424,6 +19452,54 @@ mod tests {
     }
 
     #[test]
+    fn reverse_hierarchy_requests_do_not_take_the_interactive_slot() {
+        let uri = Url::parse("file:///Main.pas").unwrap();
+        let range = Range::new(Position::new(0, 0), Position::new(0, 1));
+        let call_item = lsp_types::CallHierarchyItem {
+            name: "Run".to_string(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: uri.clone(),
+            range,
+            selection_range: range,
+            data: None,
+        };
+        let type_item = lsp_types::TypeHierarchyItem {
+            name: "TBase".to_string(),
+            kind: SymbolKind::CLASS,
+            tags: None,
+            detail: None,
+            uri,
+            range,
+            selection_range: range,
+            data: None,
+        };
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::IncomingCalls {
+                item: call_item.clone()
+            }),
+            AnalysisPriority::Bulk
+        );
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::TypeHierarchySubtypes {
+                item: type_item.clone()
+            }),
+            AnalysisPriority::Bulk
+        );
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::OutgoingCalls { item: call_item }),
+            AnalysisPriority::Interactive
+        );
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::TypeHierarchySupertypes {
+                item: type_item
+            }),
+            AnalysisPriority::Interactive
+        );
+    }
+
+    #[test]
     fn superseding_queued_interactive_request_releases_warmer_gate() {
         let mut jobs = AnalysisJobs::new();
         let computation_id = AnalysisComputationId(1);
@@ -19452,7 +19528,7 @@ mod tests {
         assert!(!jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)));
 
         let (server, _client) = Connection::memory();
-        jobs.supersede_client(&computation_id, Some(&server))
+        jobs.supersede_client(&computation_id, Some(&server), ANALYSIS_SUPERSEDED_MESSAGE)
             .expect("supersede the queued interactive request");
 
         assert!(

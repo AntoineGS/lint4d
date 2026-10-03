@@ -223,17 +223,22 @@ impl Renderer {
                     Mode::Break => stack.push((indent, mode, *broken)),
                 },
 
-                Doc::Fill(mut parts) => {
+                Doc::Fill(parts) => {
+                    stack.push((indent, mode, Doc::FillRest(parts.into_iter())));
+                }
+
+                Doc::FillRest(mut parts) => {
                     if parts.len() < 2 {
                         // Trailing element or empty — render flat.
-                        for p in parts.into_iter().rev() {
+                        for p in parts.rev() {
                             stack.push((indent, Mode::Flat, p));
                         }
                         continue;
                     }
 
-                    let sep = parts.remove(0);
-                    let content = parts.remove(0);
+                    let (Some(sep), Some(content)) = (parts.next(), parts.next()) else {
+                        continue;
+                    };
 
                     let sep_mode = if matches!(&sep, Doc::Hardline) {
                         // Hardline always forces a break.
@@ -277,8 +282,8 @@ impl Renderer {
                     };
 
                     // Push remaining fill (processed after this pair).
-                    if !parts.is_empty() {
-                        stack.push((indent, mode, Doc::Fill(parts)));
+                    if parts.len() > 0 {
+                        stack.push((indent, mode, Doc::FillRest(parts)));
                     }
 
                     // Push pair: content after sep (LIFO order).
@@ -543,6 +548,11 @@ impl Renderer {
                     Self::measure_width_inner(p, width, last_kind, last_parent);
                 }
             }
+            Doc::FillRest(parts) => {
+                for p in parts.as_slice() {
+                    Self::measure_width_inner(p, width, last_kind, last_parent);
+                }
+            }
             Doc::AlignGroup(children) => {
                 for c in children {
                     Self::measure_width_inner(c, width, last_kind, last_parent);
@@ -612,6 +622,37 @@ impl Renderer {
             IndentStyle::Space => level * self.indent_size,
             IndentStyle::Tab => level,
         }
+    }
+
+    fn fits_inner_parts(
+        &self,
+        parts: &[Doc],
+        indent: usize,
+        remaining: &mut usize,
+        last_kind: &mut &'static str,
+        last_parent: &mut &'static str,
+    ) -> bool {
+        parts
+            .iter()
+            .all(|part| self.fits_inner(part, indent, remaining, last_kind, last_parent))
+    }
+
+    fn fits_stack_parts(
+        &self,
+        parts: &[Doc],
+        indent: usize,
+        remaining: &mut usize,
+        last_kind: &mut &'static str,
+        last_parent: &mut &'static str,
+    ) -> FitsResult {
+        for part in parts {
+            match self.fits_stack_item(part, indent, Mode::Flat, remaining, last_kind, last_parent)
+            {
+                FitsResult::Continue => {}
+                other => return other,
+            }
+        }
+        FitsResult::Continue
     }
 
     fn fits_inner(
@@ -701,14 +742,12 @@ impl Renderer {
                 self.fits_inner(flat, indent, remaining, last_kind, last_parent)
             }
 
+            // In fit-checking treat Fill like Concat (all flat).
             Doc::Fill(parts) => {
-                // In fit-checking treat Fill like Concat (all flat).
-                for part in parts {
-                    if !self.fits_inner(part, indent, remaining, last_kind, last_parent) {
-                        return false;
-                    }
-                }
-                true
+                self.fits_inner_parts(parts, indent, remaining, last_kind, last_parent)
+            }
+            Doc::FillRest(parts) => {
+                self.fits_inner_parts(parts.as_slice(), indent, remaining, last_kind, last_parent)
             }
 
             // Alignment groups are always rendered in break mode (one
@@ -887,24 +926,14 @@ impl Renderer {
                 self.fits_stack_item(branch, indent, mode, remaining, last_kind, last_parent)
             }
 
+            // Optimistic: measure all parts flat (same semantics as
+            // `fits_inner`). Fill's real break decisions are made at
+            // render time, not here.
             Doc::Fill(parts) => {
-                // Optimistic: measure all parts flat (same semantics as
-                // `fits_inner`). Fill's real break decisions are made at
-                // render time, not here.
-                for part in parts.iter() {
-                    match self.fits_stack_item(
-                        part,
-                        indent,
-                        Mode::Flat,
-                        remaining,
-                        last_kind,
-                        last_parent,
-                    ) {
-                        FitsResult::Continue => {}
-                        other => return other,
-                    }
-                }
-                FitsResult::Continue
+                self.fits_stack_parts(parts, indent, remaining, last_kind, last_parent)
+            }
+            Doc::FillRest(parts) => {
+                self.fits_stack_parts(parts.as_slice(), indent, remaining, last_kind, last_parent)
             }
 
             // AlignGroup renders one row per line — treat as a line
@@ -1146,5 +1175,25 @@ mod tests {
         // "xx + aa" = 7 chars, then " + bb" = 5 more → 12, fits.
         // " + cc" = 5 more → 17, doesn't fit → breaks.
         assert_eq!(result, "xx + aa + bb\n  + cc");
+    }
+
+    #[test]
+    fn fill_with_many_parts_renders_in_linear_time() {
+        const ELEMENTS: usize = 80_000;
+        // Fill alternates [sep, content, ...].
+        let mut parts = Vec::new();
+        for i in 0..ELEMENTS {
+            parts.push(Doc::Line);
+            parts.push(tok(&format!("x{i}"), K::IDENTIFIER, ""));
+        }
+        let start = std::time::Instant::now();
+        let result = default_renderer().render(indent(fill(parts)));
+        let elapsed = start.elapsed();
+        eprintln!("fill of {ELEMENTS} elements: {elapsed:?}");
+        assert!(result.contains(&format!("x{}", ELEMENTS - 1)));
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}, expected < 5s"
+        );
     }
 }

@@ -455,7 +455,8 @@ pub(crate) fn extract_uses_items(
 ///
 /// Units are sorted/grouped according to `config`; pinned items are re-inserted
 /// after their anchor unit (the unit that immediately preceded them in the
-/// original list), preserving their relative order.
+/// original list), preserving their relative order. A block is never left
+/// after the last unit: it moves in front of that unit instead.
 ///
 /// When grouping is enabled, an `{$IFDEF}` block whose units all belong to the
 /// same section is placed at the end of that section instead of being pinned
@@ -613,6 +614,25 @@ pub(crate) fn layout_uses_items(
                 }
             }
         }
+    }
+
+    // A block followed by no unit would end the clause, but units inside a
+    // block written among others get a `,`, so every configuration that
+    // includes them would read `A, C, ;`. When blocks end up after the last
+    // unit (by sorting, or written `A {$IFDEF X}, C{$ENDIF};`), move the
+    // pinned items up to the last of them in front of that unit; the
+    // sections they leave behind are empty.
+    if let Some(last_unit) = slots.iter().rposition(|s| matches!(s, Slot::Unit { .. }))
+        && let Some(last_block) = slots
+            .iter()
+            .rposition(|s| matches!(s, Slot::Pinned(UsesItem::IfDefBlock(_))))
+        && last_block > last_unit
+    {
+        let moved: Vec<Slot> = slots
+            .drain(last_unit + 1..=last_block)
+            .filter(|s| !matches!(s, Slot::GroupSep))
+            .collect();
+        slots.splice(last_unit..last_unit, moved);
     }
 
     // Give the units back their comments; `None` separates groups.
@@ -815,14 +835,16 @@ fn push_with_trailing(
     lines.push(line);
 }
 
-/// Emit an `IfDefBlock` that ends with `end`. A terminated block ending the
-/// clause ends each branch with the `;`; otherwise every unit inside gets a
-/// `,` and a `;` follows the `{$ENDIF}`.
+/// Emit an `IfDefBlock` that ends with `end`. Followed by more units, every
+/// unit inside gets a `,`. Otherwise each branch's last unit gets nothing
+/// and a `;` follows the `{$ENDIF}`, except that a terminated block ends
+/// each branch with the `;`.
 fn emit_ifdef_block(block: &IfDefBlock, indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
     let (branch_end, after_endif) = match end {
+        ItemEnd::Comma => (ItemEnd::Comma, ""),
         ItemEnd::Semicolon if block.terminated => (ItemEnd::Semicolon, ""),
-        ItemEnd::Semicolon => (ItemEnd::Comma, ";"),
-        ItemEnd::Comma | ItemEnd::Open => (ItemEnd::Comma, ""),
+        ItemEnd::Semicolon => (ItemEnd::Open, ";"),
+        ItemEnd::Open => (ItemEnd::Open, ""),
     };
 
     // Emit if_branch directive
@@ -1334,11 +1356,9 @@ mod tests {
     // ─── Task 7: format_uses_items() ─────────────────────────────────────────
 
     #[test]
-    fn format_items_ifdef_block_follows_anchor() {
+    fn format_items_ifdef_block_left_last_moves_before_last_unit() {
         // SysUtils, {$IFDEF FOO} SpecialUnit {$ELSE} OtherUnit {$ENDIF}, Classes
         // After sort (no grouping here): Classes, SysUtils
-        // The IfDefBlock anchor is SysUtils (preceded it in original list)
-        // So result should be: Classes, SysUtils, {IFDEF block}
         let config = UsesConfig {
             sort: true,
             group: false,
@@ -1364,21 +1384,37 @@ mod tests {
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
-        // Classes sorts before SysUtils; IfDefBlock anchored to SysUtils stays after it.
-        // Expected: Classes,\nSysUtils,\n{$IFDEF FOO}\nSpecialUnit,\n{$ELSE}\nOtherUnit,\n{$ENDIF};\n
-        assert!(
-            output.contains("  Classes,\n"),
-            "Classes should appear with comma: {output:?}"
+        // The block would follow its anchor SysUtils and end the clause,
+        // leaving `SpecialUnit,` dangling; it moves in front of SysUtils.
+        assert_eq!(
+            output,
+            "  Classes,\n  {$IFDEF FOO}\n  SpecialUnit,\n  {$ELSE}\n  OtherUnit,\n  {$ENDIF}\n  SysUtils;\n"
         );
-        let classes_pos = output.find("  Classes,\n").unwrap();
-        let sysutils_pos = output.find("  SysUtils,\n").unwrap();
-        let ifdef_pos = output.find("  {$IFDEF FOO}\n").unwrap();
-        assert!(classes_pos < sysutils_pos, "Classes before SysUtils");
-        assert!(sysutils_pos < ifdef_pos, "SysUtils before IFDEF block");
-        // The last line should end with {$ENDIF};
-        assert!(
-            output.contains("  {$ENDIF};\n"),
-            "endif should have semicolon: {output:?}"
+    }
+
+    #[test]
+    fn format_items_block_left_last_leaves_its_empty_section() {
+        // A Project-only block forms a section of its own after the Core units.
+        let mut config = default_config();
+        config.sort = true;
+        let block = IfDefBlock {
+            if_branch: CondBranch {
+                directive: "{$IFDEF X}".to_string(),
+                items: vec![UsesItem::unit("MyApp.Extra")],
+                ..CondBranch::default()
+            },
+            endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
+        };
+        let items = vec![
+            UsesItem::unit("SysUtils"),
+            UsesItem::IfDefBlock(block),
+            UsesItem::unit("Classes"),
+        ];
+        let output = format_uses_items(&items, &config, "  ", &HashSet::new());
+        assert_eq!(
+            output,
+            "  Classes,\n  {$IFDEF X}\n  MyApp.Extra,\n  {$ENDIF}\n  SysUtils;\n"
         );
     }
 
@@ -1512,6 +1548,8 @@ mod tests {
             UsesItem::unit("MyApp.Main"),
             UsesItem::IfDefBlock(block),
             UsesItem::unit("Vcl.Forms"),
+            // Keeps a unit after the block (a block is never left last).
+            UsesItem::unit("MyApp.Zed"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1580,6 +1618,8 @@ mod tests {
             UsesItem::unit("Zebra"),
             UsesItem::IfDefBlock(block),
             UsesItem::unit("Alpha"),
+            // Keeps a unit after the block (a block is never left last).
+            UsesItem::unit("Zulu"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());

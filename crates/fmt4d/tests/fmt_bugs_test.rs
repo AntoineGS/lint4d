@@ -4169,3 +4169,30 @@ fn uses_clause_ending_in_a_directive_keeps_its_semicolon() {
     assert_parses_cleanly(&result);
     idempotency_check(src);
 }
+
+#[test]
+fn uses_sorting_never_leaves_a_conditional_block_last() {
+    let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
+    let result = format_source(src);
+    // A plain unit ends the clause, so it reads `A, C, B;` with X defined
+    // and `A, B;` without.
+    assert!(
+        result.contains("uses\n  A,\n  {$IFDEF X}\n  C,\n  {$ENDIF}\n  B;\n"),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_clause_of_only_a_conditional_block_ends_after_endif() {
+    let src =
+        "unit T;\ninterface\nuses {$IFDEF X} A {$ELSE} B, C {$ENDIF};\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains("uses\n  {$IFDEF X}\n  A\n  {$ELSE}\n  B,\n  C\n  {$ENDIF};\n"),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}

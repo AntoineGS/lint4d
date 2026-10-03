@@ -4114,3 +4114,43 @@ fn file_with_only_trivia_gets_no_leading_space() {
     assert_eq!(result, src);
     idempotency_check(src);
 }
+
+// ── Bug: uses clause punctuation broken around conditional blocks ──
+// Units inside an {$IFDEF} block always got a `,` and the clause's `;`
+// went to the last slot, whatever it was, so some configurations read
+// `uses A, B, ;` or lost the `;` altogether.
+
+fn assert_parses_cleanly(src: &str) {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let (_, diagnostics) =
+        pascal_core::parser::parse_file(&info, src.as_bytes()).expect("parse failed");
+    assert!(
+        diagnostics.is_empty(),
+        "formatted source has parse errors: {diagnostics:?}\n{src}"
+    );
+}
+
+#[test]
+fn uses_clause_terminated_in_each_branch_keeps_its_semicolons() {
+    let src = "\
+unit T;
+interface
+uses
+{$IFDEF VER270}
+  WinAPI.Windows, SysUtils;
+{$ELSE}
+  Windows, SysUtils;
+{$ENDIF}
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains(
+            "uses\n  {$IFDEF VER270}\n  WinAPI.Windows,\n  SysUtils;\n  {$ELSE}\n  Windows,\n  SysUtils;\n  {$ENDIF}\n"
+        ),
+        "each branch must end with the clause's `;`:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}

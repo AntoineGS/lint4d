@@ -533,12 +533,7 @@ struct KnownFailure {
     error: &'static str,
 }
 
-const KNOWN_FAILING_FIXTURES: &[KnownFailure] = &[KnownFailure {
-    // `SysUtils;` ending each branch becomes `SysUtils,` plus `{$ENDIF};`.
-    path: "crates/fmt4d/tests/fixtures/ppFragment/bucket_c_uses_semi.pas",
-    task: "TASK-102",
-    error: r#"per configuration ["U,U;", "U,U;"] -> ["U,U,;", "U,U,;"]"#,
-}];
+const KNOWN_FAILING_FIXTURES: &[KnownFailure] = &[];
 
 fn fixture_files() -> Vec<PathBuf> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

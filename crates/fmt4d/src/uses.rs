@@ -58,6 +58,8 @@ pub struct IfDefBlock {
     pub endif: String,
     /// Comments on the `{$ENDIF}` line, after any `;`.
     pub trailing: Vec<String>,
+    /// Each branch ends with the clause's `;` (a `ppUsesBlockWithSemi`).
+    pub terminated: bool,
 }
 
 /// A conditional branch with its directive text and items.
@@ -432,9 +434,9 @@ pub(crate) fn extract_uses_items(
                         .into_iter()
                         .map(UsesItem::Comment),
                 );
-                items.push(UsesItem::IfDefBlock(parse_pp_uses_block(
-                    child, source, comments,
-                )));
+                let mut block = parse_pp_uses_block(child, source, comments);
+                block.terminated = child.kind() == K::PP_USES_BLOCK_WITH_SEMI;
+                items.push(UsesItem::IfDefBlock(block));
             }
             K::PP_DIRECTIVE => {
                 let text = node_text(child, source);
@@ -623,7 +625,11 @@ pub(crate) fn layout_uses_items(
     // Emit the output.
     let mut lines = Vec::new();
     for (slot_idx, slot) in slots.iter().enumerate() {
-        let is_last = slot_idx == last_real_idx;
+        let end = if slot_idx == last_real_idx {
+            ItemEnd::Semicolon
+        } else {
+            ItemEnd::Comma
+        };
         match slot {
             Slot::GroupSep => lines.push(String::new()),
             Slot::Unit { name } => {
@@ -631,10 +637,10 @@ pub(crate) fn layout_uses_items(
                     .get_mut(name.as_str())
                     .and_then(VecDeque::pop_front)
                     .unwrap_or((&[], &[]));
-                emit_unit(name, leading, trailing, indent, is_last, &mut lines);
+                emit_unit(name, leading, trailing, indent, end, &mut lines);
             }
             Slot::Pinned(item) => {
-                emit_uses_item(item, indent, is_last, &mut lines);
+                emit_uses_item(item, indent, end, &mut lines);
             }
         }
     }
@@ -642,20 +648,58 @@ pub(crate) fn layout_uses_items(
     lines
 }
 
+/// The punctuation a unit or conditional block ends with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemEnd {
+    /// `,`: more units follow.
+    Comma,
+    /// `;`: the item ends the clause.
+    Semicolon,
+}
+
+impl ItemEnd {
+    fn text(self) -> &'static str {
+        match self {
+            ItemEnd::Comma => ",",
+            ItemEnd::Semicolon => ";",
+        }
+    }
+}
+
 /// Recursively emit a single `UsesItem` into `lines`.
-fn emit_uses_item(item: &UsesItem, indent: &str, is_last_overall: bool, lines: &mut Vec<String>) {
+fn emit_uses_item(item: &UsesItem, indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
     match item {
         UsesItem::Unit {
             name,
             leading,
             trailing,
-        } => emit_unit(name, leading, trailing, indent, is_last_overall, lines),
+        } => emit_unit(name, leading, trailing, indent, end, lines),
         UsesItem::Directive(text) | UsesItem::Comment(text) => {
             lines.push(format!("{indent}{text}"));
         }
         UsesItem::IfDefBlock(block) => {
-            emit_ifdef_block(block, indent, is_last_overall, lines);
+            emit_ifdef_block(block, indent, end, lines);
         }
+    }
+}
+
+/// Emit a branch's items; its last unit or block ends with `end`, the
+/// others with `,`. A branch with nothing to carry `end` gets it alone on
+/// a line.
+fn emit_branch_items(items: &[UsesItem], indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
+    let last = items
+        .iter()
+        .rposition(|item| matches!(item, UsesItem::Unit { .. } | UsesItem::IfDefBlock(_)));
+    for (idx, item) in items.iter().enumerate() {
+        let item_end = if Some(idx) == last {
+            end
+        } else {
+            ItemEnd::Comma
+        };
+        emit_uses_item(item, indent, item_end, lines);
+    }
+    if last.is_none() && end != ItemEnd::Comma {
+        lines.push(format!("{indent}{}", end.text()));
     }
 }
 
@@ -665,15 +709,14 @@ fn emit_unit(
     leading: &[String],
     trailing: &[String],
     indent: &str,
-    is_last_overall: bool,
+    end: ItemEnd,
     lines: &mut Vec<String>,
 ) {
     for comment in leading {
         lines.push(format!("{indent}{comment}"));
     }
-    let punctuation = if is_last_overall { ';' } else { ',' };
     push_with_trailing(
-        format!("{indent}{name}{punctuation}"),
+        format!("{indent}{name}{}", end.text()),
         trailing,
         indent,
         lines,
@@ -701,14 +744,16 @@ fn push_with_trailing(
     lines.push(line);
 }
 
-/// Emit an `IfDefBlock`. If `is_last_overall` is true, the `{$ENDIF}` line
-/// gets a trailing `;`.
-fn emit_ifdef_block(
-    block: &IfDefBlock,
-    indent: &str,
-    is_last_overall: bool,
-    lines: &mut Vec<String>,
-) {
+/// Emit an `IfDefBlock` that ends with `end`. A terminated block ending the
+/// clause ends each branch with the `;`; otherwise every unit inside gets a
+/// `,` and a `;` follows the `{$ENDIF}`.
+fn emit_ifdef_block(block: &IfDefBlock, indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
+    let (branch_end, after_endif) = match end {
+        ItemEnd::Semicolon if block.terminated => (ItemEnd::Semicolon, ""),
+        ItemEnd::Semicolon => (ItemEnd::Comma, ";"),
+        ItemEnd::Comma => (ItemEnd::Comma, ""),
+    };
+
     // Emit if_branch directive
     push_with_trailing(
         format!("{indent}{}", block.if_branch.directive),
@@ -716,12 +761,7 @@ fn emit_ifdef_block(
         indent,
         lines,
     );
-
-    // Emit if_branch items (never the very last item of the clause, since the
-    // last item is determined at the top level). Within the block, all units get commas.
-    for item in &block.if_branch.items {
-        emit_uses_item(item, indent, false, lines);
-    }
+    emit_branch_items(&block.if_branch.items, indent, branch_end, lines);
 
     // Emit elseif branches
     for branch in &block.else_if_branches {
@@ -731,9 +771,7 @@ fn emit_ifdef_block(
             indent,
             lines,
         );
-        for item in &branch.items {
-            emit_uses_item(item, indent, false, lines);
-        }
+        emit_branch_items(&branch.items, indent, branch_end, lines);
     }
 
     // Emit else branch
@@ -744,15 +782,12 @@ fn emit_ifdef_block(
             indent,
             lines,
         );
-        for item in else_items {
-            emit_uses_item(item, indent, false, lines);
-        }
+        emit_branch_items(else_items, indent, branch_end, lines);
     }
 
     // Emit endif
-    let semicolon = if is_last_overall { ";" } else { "" };
     push_with_trailing(
-        format!("{indent}{}{semicolon}", block.endif),
+        format!("{indent}{}{after_endif}", block.endif),
         &block.trailing,
         indent,
         lines,

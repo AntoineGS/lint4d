@@ -5,6 +5,7 @@ use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
 use pascal_core::node_kind as K;
 use std::collections::HashSet;
+use std::ops::Range;
 use tree_sitter::Node;
 
 /// Controls how a binary chain breaks across lines.
@@ -52,8 +53,92 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// Entry point: build a `Doc` for the entire AST rooted at `root`.
-    pub fn build(&self, root: Node) -> Doc {
-        self.doc_for_node(root)
+    pub fn build(&self, root: Node<'a>) -> Doc {
+        let body = self.doc_for_node(root);
+        if self.is_in_format_off_region(root) {
+            // The verbatim root text already spans the end-of-file trivia.
+            return body;
+        }
+        doc::concat(vec![body, self.eof_trivia_doc(root)])
+    }
+
+    /// Comments and directives after the file's last leaf, laid out as in
+    /// the source (see [`Self::trivia_run_doc`]).
+    fn eof_trivia_doc(&self, root: Node<'a>) -> Doc {
+        let trivia = self.trivia_items(
+            self.comments.eof_comments(),
+            self.directives.eof_directives(),
+        );
+        if trivia.is_empty() {
+            return Doc::Empty;
+        }
+        let last = last_leaf(root);
+        let prev_end = if last.id() == root.id() {
+            0
+        } else {
+            self.comments
+                .trailing_comments(last.id())
+                .iter()
+                .map(|c| c.span.end)
+                .chain(
+                    self.directives
+                        .trailing_directives(last.id())
+                        .iter()
+                        .map(|d| d.span.end),
+                )
+                .fold(last.end_byte(), usize::max)
+        };
+        self.trivia_run_doc(trivia, Some(prev_end)).0
+    }
+
+    /// Pair attached comments and directives with their docs, in source order.
+    fn trivia_items(
+        &self,
+        comments: &[crate::comments::AttachedComment],
+        directives: &[crate::directive_map::AttachedDirective],
+    ) -> Vec<(Range<usize>, Doc)> {
+        let mut trivia: Vec<(Range<usize>, Doc)> = comments
+            .iter()
+            .map(|c| (c.span.clone(), doc::token(c.text.clone(), K::COMMENT, "")))
+            .chain(directives.iter().map(|d| {
+                (
+                    d.span.clone(),
+                    doc::token(d.text.clone(), K::PP_DIRECTIVE, ""),
+                )
+            }))
+            .collect();
+        trivia.sort_by_key(|(span, _)| span.start);
+        trivia
+    }
+
+    /// Emit standalone trivia items separated as in the source: an item on
+    /// the same line as the previous one keeps its spacing, a blank line
+    /// before an item is kept, and any other item starts a new line.
+    /// `prev_end` is where the source before the first item ends; `None`
+    /// leaves the first item's placement to the caller. Also returns where
+    /// the last item ends.
+    fn trivia_run_doc(
+        &self,
+        trivia: Vec<(Range<usize>, Doc)>,
+        mut prev_end: Option<usize>,
+    ) -> (Doc, Option<usize>) {
+        let mut parts = Vec::new();
+        for (span, item) in trivia {
+            if let Some(end) = prev_end {
+                let gap = &self.source[end.min(span.start)..span.start];
+                match gap.iter().filter(|&&b| b == b'\n').count() {
+                    0 => parts.push(Doc::Raw(" ".repeat(gap.len().max(1)))),
+                    1 => parts.push(Doc::LineStart(String::new())),
+                    _ => {
+                        parts.push(Doc::LineStart(String::new()));
+                        parts.push(Doc::Hardline);
+                    }
+                }
+            }
+            parts.push(item);
+            prev_end = Some(span.end);
+        }
+        (doc::concat(parts), prev_end)
     }
 
     // ── Core dispatch ────────────────────────────────────────────────
@@ -484,45 +569,64 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_uses(&self, node: Node<'a>) -> Doc {
-        let items = crate::uses::extract_uses_items(node, self.source);
+        let items = crate::uses::extract_uses_items(node, self.source, self.comments);
         let indent_str = " ".repeat(self.config.indent_size);
-        let formatted = crate::uses::format_uses_items(
+        let lines = crate::uses::layout_uses_items(
             &items,
             &self.config.uses,
             &indent_str,
             self.external_units,
         );
 
-        // Collect pre-uses directives (extras immediately before this node)
-        let pre_directives = self.collect_pre_uses_directives(node);
-
         let mut parts = Vec::new();
         parts.push(Doc::Hardline);
-        for dir in pre_directives {
-            parts.push(Doc::Raw(dir));
-            parts.push(Doc::Hardline);
-        }
+        let keyword = first_leaf(node);
+        parts.push(self.uses_leading_trivia_doc(keyword));
         parts.push(doc::token("uses", K::K_USES, ""));
+        parts.push(self.trailing_comments_doc(keyword));
         parts.push(Doc::Hardline);
-        // Convert the pre-formatted uses body to a Doc tree of Token+Hardline
-        // pairs so the renderer can see the contents (line-length budgeting,
-        // no blind Doc::Raw escape hatch). Review AH2 (intermediate fix);
-        // the full fix would have format_uses_items return Doc directly.
+        // Emit the laid-out uses body as Token+Hardline pairs so the renderer
+        // can see the contents (line-length budgeting, no blind Doc::Raw
+        // escape hatch). Review AH2 (intermediate fix); the full fix would
+        // have the layout return Doc directly.
         // The synthetic kind "pp_raw_line" is not matched by spacing.rs, and
         // since each line is followed by a Hardline the renderer is at line
         // start when the next token is emitted, so no spurious spaces leak.
-        for (i, line) in formatted.lines().enumerate() {
+        // A line holding a multi-line comment stays one token, so the
+        // renderer protects its inner lines.
+        for (i, line) in lines.iter().enumerate() {
             if i > 0 {
                 parts.push(Doc::Hardline);
             }
             if !line.is_empty() {
-                parts.push(doc::token(line.to_string(), "pp_raw_line", ""));
+                parts.push(doc::token(line.clone(), "pp_raw_line", ""));
             }
         }
-        if formatted.ends_with('\n') {
+        if !lines.is_empty() {
             parts.push(Doc::Hardline);
         }
         doc::concat(parts)
+    }
+
+    /// Comments and directives leading the `uses` keyword, laid out as in
+    /// the source, then a line break. `build_uses` does not descend into
+    /// the clause, so nothing else emits them.
+    fn uses_leading_trivia_doc(&self, keyword: Node<'a>) -> Doc {
+        let trivia = self.trivia_items(
+            self.comments.leading_comments(keyword.id()),
+            self.directives.leading_directives(keyword.id()),
+        );
+        let (run, last_end) = self.trivia_run_doc(trivia, None);
+        let Some(last_end) = last_end else {
+            return Doc::Empty;
+        };
+        let gap = &self.source[last_end.min(keyword.start_byte())..keyword.start_byte()];
+        let line_break = if gap.iter().filter(|&&b| b == b'\n').count() >= 2 {
+            Doc::BlankLine
+        } else {
+            Doc::Hardline
+        };
+        doc::concat(vec![run, line_break])
     }
 
     fn build_pp_block(&self, node: Node<'a>) -> Doc {
@@ -560,26 +664,6 @@ impl<'a> DocBuilder<'a> {
             }
         }
         doc::concat(parts)
-    }
-
-    /// Collect preprocessor directive texts that appear immediately before a
-    /// `declUses` node in the parent's children (e.g., `{$I MDCompilers.inc}`).
-    fn collect_pre_uses_directives(&self, uses_node: Node<'a>) -> Vec<String> {
-        let mut found = Vec::new();
-        let mut prev = uses_node.prev_sibling();
-        while let Some(sib) = prev {
-            if sib.is_extra() && sib.kind() == K::PP_DIRECTIVE {
-                let text =
-                    pascal_core::decode_bytes(&self.source[sib.start_byte()..sib.end_byte()])
-                        .into_owned();
-                found.push(text);
-            } else {
-                break;
-            }
-            prev = sib.prev_sibling();
-        }
-        found.reverse();
-        found
     }
 
     /// Format an `rttiAttributes` node so each `[...]` group sits on its own
@@ -683,7 +767,7 @@ pub(crate) fn ends_with_hardline(doc: &Doc) -> bool {
 
 /// Descend through `node`'s leftmost non-extra children until we reach a
 /// leaf, where [`CommentMap`] attaches leading comments.
-fn first_leaf(node: Node<'_>) -> Node<'_> {
+pub(crate) fn first_leaf(node: Node<'_>) -> Node<'_> {
     let mut current = node;
     loop {
         let first_child = current
@@ -701,7 +785,7 @@ fn first_leaf(node: Node<'_>) -> Node<'_> {
 /// because tree-sitter-pascal sometimes wraps operator tokens in a
 /// single-child node — comments are attached to the inner leaf, not the
 /// wrapper, by [`CommentMap`].
-fn last_leaf(node: Node<'_>) -> Node<'_> {
+pub(crate) fn last_leaf(node: Node<'_>) -> Node<'_> {
     let mut current = node;
     loop {
         let last_child = current
@@ -770,8 +854,13 @@ mod tests {
             &external_units,
         );
         let doc = builder.build(tree.root_node());
-        // The whole unit falls inside the format-off region, so it should be Raw.
-        assert!(matches!(doc, Doc::Raw(_)));
+        // The whole unit falls inside the format-off region, so it should be
+        // Raw, followed by the `{$FMT.ON}` after `end.`.
+        let Doc::Concat(parts) = &doc else {
+            panic!("expected the unit and its end-of-file trivia: {doc:?}");
+        };
+        assert!(matches!(parts.first(), Some(Doc::Raw(text)) if text.ends_with("end.")));
+        assert_eq!(format!("{doc:?}").matches("{$FMT.ON}").count(), 1);
     }
 
     #[test]

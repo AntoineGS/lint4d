@@ -27,6 +27,8 @@ pub struct CommentMap {
     leading: HashMap<usize, Vec<AttachedComment>>,
     /// Trailing comments keyed by the node ID they follow.
     trailing: HashMap<usize, Vec<AttachedComment>>,
+    /// Standalone comments after the last leaf, which have no node to lead.
+    eof: Vec<AttachedComment>,
 }
 
 impl CommentMap {
@@ -41,6 +43,7 @@ impl CommentMap {
 
         let mut leading: HashMap<usize, Vec<AttachedComment>> = HashMap::new();
         let mut trailing: HashMap<usize, Vec<AttachedComment>> = HashMap::new();
+        let mut eof = Vec::new();
 
         for (comment_node, text) in &comments {
             let comment_line = comment_node.start_position().row;
@@ -64,19 +67,26 @@ impl CommentMap {
                 continue;
             }
 
-            // Otherwise it is a leading comment for the next non-comment node.
-            if let Some(next) = find_next_code_node_in(&leaves, *comment_node) {
-                leading.entry(next.id()).or_default().push(AttachedComment {
-                    text: text.clone(),
-                    trailing: false,
-                    source_row: comment_line,
-                    gap: 0,
-                    span: comment_node.byte_range(),
-                });
+            // Otherwise it is a leading comment for the next non-comment node,
+            // or an end-of-file comment when no node follows.
+            let comment = AttachedComment {
+                text: text.clone(),
+                trailing: false,
+                source_row: comment_line,
+                gap: 0,
+                span: comment_node.byte_range(),
+            };
+            match find_next_code_node_in(&leaves, *comment_node) {
+                Some(next) => leading.entry(next.id()).or_default().push(comment),
+                None => eof.push(comment),
             }
         }
 
-        CommentMap { leading, trailing }
+        CommentMap {
+            leading,
+            trailing,
+            eof,
+        }
     }
 
     /// Get leading comments for a node (comments on lines above it).
@@ -87,6 +97,11 @@ impl CommentMap {
     /// Get trailing comments for a node (comments on same line after it).
     pub fn trailing_comments(&self, node_id: usize) -> &[AttachedComment] {
         self.trailing.get(&node_id).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Get the standalone comments after the last leaf, in source order.
+    pub fn eof_comments(&self) -> &[AttachedComment] {
+        &self.eof
     }
 }
 

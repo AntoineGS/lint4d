@@ -4196,3 +4196,65 @@ fn uses_clause_of_only_a_conditional_block_ends_after_endif() {
     assert_parses_cleanly(&result);
     idempotency_check(src);
 }
+
+#[test]
+fn uses_branch_ending_in_a_block_writes_it_comma_first() {
+    // Inside a branch, units keep their order; a block after the branch's
+    // last unit is written comma-first, so `A` alone still ends the branch.
+    let src = "unit T;\ninterface\nuses {$IFDEF X} A {$IFDEF Y}, C {$ENDIF}; {$ELSE} D; {$ENDIF}\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains(
+            "uses\n  {$IFDEF X}\n  A\n  {$IFDEF Y}\n  , C\n  {$ENDIF};\n  {$ELSE}\n  D;\n  {$ENDIF}\n"
+        ),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+
+    let src = "unit T;\ninterface\nuses {$IFDEF X} A {$IFDEF Y}, C {$ENDIF} {$ELSE} D {$ENDIF};\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains(
+            "uses\n  {$IFDEF X}\n  A\n  {$IFDEF Y}\n  , C\n  {$ENDIF}\n  {$ELSE}\n  D\n  {$ENDIF};\n"
+        ),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+fn format_unsorted(source: &str) -> String {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.sort = false;
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
+}
+
+#[test]
+fn uses_trailing_block_keeps_its_place_with_sorting_off() {
+    // Uses order is initialization order and decides which same-named
+    // identifier wins, so with sorting off no unit may move.
+    let src = "unit T;\ninterface\nuses C, A {$IFDEF X}, B{$ENDIF};\nimplementation\nend.\n";
+    let result = format_unsorted(src);
+    assert!(
+        result.contains("uses\n  C,\n  A\n  {$IFDEF X}\n  , B\n  {$ENDIF};\n"),
+        "units were reordered with sorting off:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    assert_eq!(format_unsorted(&result), result, "not idempotent");
+
+    let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
+    let result = format_unsorted(src);
+    assert!(
+        result.contains("uses\n  B,\n  {$IFDEF X}\n  C,\n  {$ENDIF}\n  A;\n"),
+        "units were reordered with sorting off:\n{result}"
+    );
+    assert_eq!(format_unsorted(&result), result, "not idempotent");
+}

@@ -455,8 +455,9 @@ pub(crate) fn extract_uses_items(
 ///
 /// Units are sorted/grouped according to `config`; pinned items are re-inserted
 /// after their anchor unit (the unit that immediately preceded them in the
-/// original list), preserving their relative order. A block is never left
-/// after the last unit: it moves in front of that unit instead.
+/// original list), preserving their relative order. With sorting, a block
+/// is never left after the last unit: it moves in front of that unit
+/// instead. Without sorting it is written comma-first.
 ///
 /// When grouping is enabled, an `{$IFDEF}` block whose units all belong to the
 /// same section is placed at the end of that section instead of being pinned
@@ -616,13 +617,13 @@ pub(crate) fn layout_uses_items(
         }
     }
 
-    // A block followed by no unit would end the clause, but units inside a
-    // block written among others get a `,`, so every configuration that
-    // includes them would read `A, C, ;`. When blocks end up after the last
-    // unit (by sorting, or written `A {$IFDEF X}, C{$ENDIF};`), move the
-    // pinned items up to the last of them in front of that unit; the
-    // sections they leave behind are empty.
-    if let Some(last_unit) = slots.iter().rposition(|s| matches!(s, Slot::Unit { .. }))
+    // Blocks after the last unit would have to be written comma-first (see
+    // `list_puncts`). When sorting already reorders the units, move the
+    // pinned items up to the last such block in front of that unit instead,
+    // keeping one unit per line; the sections they leave behind are empty.
+    // Without sorting the units keep their source order.
+    if config.sort
+        && let Some(last_unit) = slots.iter().rposition(|s| matches!(s, Slot::Unit { .. }))
         && let Some(last_block) = slots
             .iter()
             .rposition(|s| matches!(s, Slot::Pinned(UsesItem::IfDefBlock(_))))
@@ -657,7 +658,7 @@ pub(crate) fn layout_uses_items(
     let ordered: Vec<Option<&UsesItem>> = ordered.iter().map(Option::as_ref).collect();
 
     let mut lines = Vec::new();
-    emit_list(&ordered, indent, ItemEnd::Semicolon, &mut lines);
+    emit_list(&ordered, indent, ItemEnd::Semicolon, false, &mut lines);
     lines
 }
 
@@ -707,26 +708,69 @@ impl ItemRole {
     }
 }
 
-/// The punctuation after each item of a list that ends with `end`: its
-/// last unit or block takes `end`, the units and blocks before it a `,`.
-/// When directives follow that last item, a `;` is written after the last
-/// of them instead, so they stay inside the clause in their source order
-/// (an `{$I}` may itself list units).
-fn list_ends(roles: &[ItemRole], end: ItemEnd) -> Vec<ItemEnd> {
-    let mut ends: Vec<ItemEnd> = roles
+/// How an item of a uses clause is punctuated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Punct {
+    /// Write `, ` before each unit (comma-first): the item comes after its
+    /// list's last unit, so whatever it contributes follows a unit.
+    lead: bool,
+    /// What follows the item.
+    end: ItemEnd,
+}
+
+impl Punct {
+    fn plain(end: ItemEnd) -> Self {
+        Punct { lead: false, end }
+    }
+}
+
+/// The punctuation of each item of a list that ends with `end`; `lead`
+/// writes the whole list comma-first. Otherwise the last unit or block
+/// takes `end` and the units and blocks before it a `,`. Every
+/// configuration must still read `unit (, unit)*`, so when the list does
+/// not continue past its end and blocks follow its last unit, that unit
+/// gets nothing and those blocks are written comma-first, the last of them
+/// taking `end`. When directives follow the item taking a `;`, the `;` is
+/// written after the last of them instead, so they stay inside the clause
+/// in their source order (an `{$I}` may itself list units).
+fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
+    if lead {
+        return roles
+            .iter()
+            .map(|_| Punct {
+                lead: true,
+                end: ItemEnd::Open,
+            })
+            .collect();
+    }
+    let mut puncts: Vec<Punct> = roles
         .iter()
         .map(|role| match role {
-            ItemRole::Unit | ItemRole::Block { .. } => ItemEnd::Comma,
-            ItemRole::Directive | ItemRole::Other => ItemEnd::Open,
+            ItemRole::Unit | ItemRole::Block { .. } => Punct::plain(ItemEnd::Comma),
+            ItemRole::Directive | ItemRole::Other => Punct::plain(ItemEnd::Open),
         })
         .collect();
     let Some(last) = roles
         .iter()
         .rposition(|role| matches!(role, ItemRole::Unit | ItemRole::Block { .. }))
     else {
-        return ends;
+        return puncts;
     };
-    ends[last] = end;
+    if end != ItemEnd::Comma
+        && let Some(last_unit) = roles.iter().rposition(|role| *role == ItemRole::Unit)
+        && last_unit < last
+    {
+        puncts[last_unit] = Punct::plain(ItemEnd::Open);
+        for idx in last_unit + 1..=last {
+            if matches!(roles[idx], ItemRole::Block { .. }) {
+                puncts[idx] = Punct {
+                    lead: true,
+                    end: ItemEnd::Open,
+                };
+            }
+        }
+    }
+    puncts[last].end = end;
     // A terminated block already ends with the `;` inside its branches.
     if end == ItemEnd::Semicolon
         && roles[last] != (ItemRole::Block { terminated: true })
@@ -734,50 +778,62 @@ fn list_ends(roles: &[ItemRole], end: ItemEnd) -> Vec<ItemEnd> {
             .iter()
             .rposition(|role| *role == ItemRole::Directive)
     {
-        ends[last] = ItemEnd::Open;
-        ends[last + 1 + offset] = ItemEnd::Semicolon;
+        puncts[last].end = ItemEnd::Open;
+        puncts[last + 1 + offset].end = ItemEnd::Semicolon;
     }
-    ends
+    puncts
 }
 
 /// Recursively emit a single `UsesItem` into `lines`.
-fn emit_uses_item(item: &UsesItem, indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
+fn emit_uses_item(item: &UsesItem, indent: &str, punct: Punct, lines: &mut Vec<String>) {
     match item {
         UsesItem::Unit {
             name,
             leading,
             trailing,
-        } => emit_unit(name, leading, trailing, indent, end, lines),
+        } => emit_unit(name, leading, trailing, indent, punct, lines),
         UsesItem::Directive(text) | UsesItem::Comment(text) => {
             lines.push(format!("{indent}{text}"));
         }
         UsesItem::IfDefBlock(block) => {
-            emit_ifdef_block(block, indent, end, lines);
+            emit_ifdef_block(block, indent, punct, lines);
         }
     }
 }
 
-/// Emit a branch's items as a list ending with `end`.
-fn emit_branch_items(items: &[UsesItem], indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
+/// Emit a branch's items as a list ending with `end`, comma-first if `lead`.
+fn emit_branch_items(
+    items: &[UsesItem],
+    indent: &str,
+    end: ItemEnd,
+    lead: bool,
+    lines: &mut Vec<String>,
+) {
     let items: Vec<Option<&UsesItem>> = items.iter().map(Some).collect();
-    emit_list(&items, indent, end, lines);
+    emit_list(&items, indent, end, lead, lines);
 }
 
-/// Emit a list of items (`None` is a group separator) ending with `end`.
-/// Comments after a directive carrying the `;` stay on its line, so they
-/// remain inside the clause. A list with nothing to carry a `;` gets it
-/// alone on a line.
-fn emit_list(items: &[Option<&UsesItem>], indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
+/// Emit a list of items (`None` is a group separator) ending with `end`,
+/// comma-first if `lead`. Comments after a directive carrying the `;` stay
+/// on its line, so they remain inside the clause. A list with nothing to
+/// carry a `;` gets it alone on a line.
+fn emit_list(
+    items: &[Option<&UsesItem>],
+    indent: &str,
+    end: ItemEnd,
+    lead: bool,
+    lines: &mut Vec<String>,
+) {
     let roles: Vec<ItemRole> = items
         .iter()
         .map(|item| item.map_or(ItemRole::Other, ItemRole::of))
         .collect();
-    let ends = list_ends(&roles, end);
+    let puncts = list_puncts(&roles, end, lead);
     let mut idx = 0;
     while idx < items.len() {
         match items[idx] {
             None => lines.push(String::new()),
-            Some(UsesItem::Directive(text)) if ends[idx] == ItemEnd::Semicolon => {
+            Some(UsesItem::Directive(text)) if puncts[idx].end == ItemEnd::Semicolon => {
                 let mut trailing = Vec::new();
                 while let Some(Some(UsesItem::Comment(comment))) = items.get(idx + 1) {
                     trailing.push(comment.clone());
@@ -785,11 +841,11 @@ fn emit_list(items: &[Option<&UsesItem>], indent: &str, end: ItemEnd, lines: &mu
                 }
                 push_with_trailing(format!("{indent}{text};"), &trailing, indent, lines);
             }
-            Some(item) => emit_uses_item(item, indent, ends[idx], lines),
+            Some(item) => emit_uses_item(item, indent, puncts[idx], lines),
         }
         idx += 1;
     }
-    if end == ItemEnd::Semicolon && !ends.contains(&ItemEnd::Semicolon) {
+    if end == ItemEnd::Semicolon && !puncts.iter().any(|p| p.end == ItemEnd::Semicolon) {
         lines.push(format!("{indent};"));
     }
 }
@@ -800,14 +856,15 @@ fn emit_unit(
     leading: &[String],
     trailing: &[String],
     indent: &str,
-    end: ItemEnd,
+    punct: Punct,
     lines: &mut Vec<String>,
 ) {
     for comment in leading {
         lines.push(format!("{indent}{comment}"));
     }
+    let lead = if punct.lead { ", " } else { "" };
     push_with_trailing(
-        format!("{indent}{name}{}", end.text()),
+        format!("{indent}{lead}{name}{}", punct.end.text()),
         trailing,
         indent,
         lines,
@@ -835,16 +892,19 @@ fn push_with_trailing(
     lines.push(line);
 }
 
-/// Emit an `IfDefBlock` that ends with `end`. Followed by more units, every
-/// unit inside gets a `,`. Otherwise each branch's last unit gets nothing
-/// and a `;` follows the `{$ENDIF}`, except that a terminated block ends
-/// each branch with the `;`.
-fn emit_ifdef_block(block: &IfDefBlock, indent: &str, end: ItemEnd, lines: &mut Vec<String>) {
-    let (branch_end, after_endif) = match end {
-        ItemEnd::Comma => (ItemEnd::Comma, ""),
-        ItemEnd::Semicolon if block.terminated => (ItemEnd::Semicolon, ""),
-        ItemEnd::Semicolon => (ItemEnd::Open, ";"),
-        ItemEnd::Open => (ItemEnd::Open, ""),
+/// Emit an `IfDefBlock` punctuated by `punct`. Followed by more units,
+/// every unit inside gets a `,`. Written comma-first, every unit inside
+/// gets a leading `, ` and `punct.end` follows the `{$ENDIF}`. Otherwise
+/// each branch is a list ending the clause: a terminated block ends each
+/// branch with the `;`, other blocks end with nothing and a `;` follows the
+/// `{$ENDIF}`.
+fn emit_ifdef_block(block: &IfDefBlock, indent: &str, punct: Punct, lines: &mut Vec<String>) {
+    let (branch_end, lead, after_endif) = match punct.end {
+        _ if punct.lead => (ItemEnd::Open, true, punct.end.text()),
+        ItemEnd::Comma => (ItemEnd::Comma, false, ""),
+        ItemEnd::Semicolon if block.terminated => (ItemEnd::Semicolon, false, ""),
+        ItemEnd::Semicolon => (ItemEnd::Open, false, ";"),
+        ItemEnd::Open => (ItemEnd::Open, false, ""),
     };
 
     // Emit if_branch directive
@@ -854,7 +914,7 @@ fn emit_ifdef_block(block: &IfDefBlock, indent: &str, end: ItemEnd, lines: &mut 
         indent,
         lines,
     );
-    emit_branch_items(&block.if_branch.items, indent, branch_end, lines);
+    emit_branch_items(&block.if_branch.items, indent, branch_end, lead, lines);
 
     // Emit elseif branches
     for branch in &block.else_if_branches {
@@ -864,7 +924,7 @@ fn emit_ifdef_block(block: &IfDefBlock, indent: &str, end: ItemEnd, lines: &mut 
             indent,
             lines,
         );
-        emit_branch_items(&branch.items, indent, branch_end, lines);
+        emit_branch_items(&branch.items, indent, branch_end, lead, lines);
     }
 
     // Emit else branch
@@ -875,7 +935,7 @@ fn emit_ifdef_block(block: &IfDefBlock, indent: &str, end: ItemEnd, lines: &mut 
             indent,
             lines,
         );
-        emit_branch_items(else_items, indent, branch_end, lines);
+        emit_branch_items(else_items, indent, branch_end, lead, lines);
     }
 
     // Emit endif

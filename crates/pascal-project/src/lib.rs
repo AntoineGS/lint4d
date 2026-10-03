@@ -2374,6 +2374,7 @@ fn discover_context_with_selections(
     test_record_project_discovery(false);
     record_project_discovery_cache_discovery();
     let _path_resolution_cache_scope = PathResolutionCacheScope::new();
+    let _path_resolution_cancel_scope = PathResolutionCancelScope::new(cancel);
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -6708,11 +6709,17 @@ fn resolve_existing_path_status(
         let Component::Normal(component) = component else {
             continue;
         };
+        if path_resolution_cancelled() {
+            return ExistingPathStatus::Unresolvable;
+        }
         let wanted = component.to_string_lossy();
         let entries = match path_resolution_directory_listing(&current) {
             PathResolutionDirectoryListing::Entries(entries) => entries,
             PathResolutionDirectoryListing::Missing => {
                 return ExistingPathStatus::Missing;
+            }
+            PathResolutionDirectoryListing::Cancelled => {
+                return ExistingPathStatus::Unresolvable;
             }
             PathResolutionDirectoryListing::Error(error) => {
                 warnings.push(format!(
@@ -6822,6 +6829,7 @@ enum PathResolutionDirectoryListing {
     Entries(Arc<PathResolutionDirectoryEntries>),
     Missing,
     Error(String),
+    Cancelled,
 }
 
 thread_local! {
@@ -6848,6 +6856,51 @@ impl Drop for PathResolutionCacheScope {
     }
 }
 
+/// Directory entries listed between cancellation checks.
+const PATH_RESOLUTION_CANCEL_CHECK_INTERVAL: usize = 1024;
+
+thread_local! {
+    static PATH_RESOLUTION_CANCEL: std::cell::Cell<Option<std::ptr::NonNull<AtomicBool>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes `cancel` visible to path resolution on this thread. Callers of
+/// `resolve_existing_path_status` are too many and too deep to thread a token
+/// through, so the walk reads it from here, like the directory cache above.
+struct PathResolutionCancelScope<'a> {
+    previous: Option<std::ptr::NonNull<AtomicBool>>,
+    _cancel: std::marker::PhantomData<&'a AtomicBool>,
+}
+
+impl<'a> PathResolutionCancelScope<'a> {
+    fn new(cancel: Option<&'a AtomicBool>) -> Self {
+        let pointer = cancel.map(std::ptr::NonNull::from);
+        let previous = PATH_RESOLUTION_CANCEL.with(|slot| slot.replace(pointer));
+        Self {
+            previous,
+            _cancel: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for PathResolutionCancelScope<'_> {
+    fn drop(&mut self) {
+        PATH_RESOLUTION_CANCEL.with(|slot| slot.set(self.previous));
+    }
+}
+
+fn path_resolution_cancelled() -> bool {
+    PATH_RESOLUTION_CANCEL.with(|slot| {
+        slot.get().is_some_and(|cancel| {
+            // SAFETY: the pointer is installed by a `PathResolutionCancelScope`
+            // that borrows the `AtomicBool` for its lifetime and restores the
+            // previous value on drop. The scope is `!Send` (it holds a
+            // `NonNull`), so this thread-local read happens on the thread that
+            // owns the borrow while the borrow is live.
+            unsafe { cancel.as_ref() }.load(Ordering::Relaxed)
+        })
+    })
+}
+
 fn path_resolution_directory_listing(path: &Path) -> PathResolutionDirectoryListing {
     let cached = PATH_RESOLUTION_DIRECTORY_CACHE.with(|cache| {
         cache
@@ -6869,6 +6922,14 @@ fn path_resolution_directory_listing(path: &Path) -> PathResolutionDirectoryList
             let mut entries = PathResolutionDirectoryEntries::default();
             let mut error = None;
             for entry in directory {
+                if entries
+                    .names
+                    .len()
+                    .is_multiple_of(PATH_RESOLUTION_CANCEL_CHECK_INTERVAL)
+                    && path_resolution_cancelled()
+                {
+                    return PathResolutionDirectoryListing::Cancelled;
+                }
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(entry_error) => {
@@ -9623,10 +9684,12 @@ mod tests {
     use super::{
         EffectiveOverrides, ExistingPathStatus, MAX_OWNERSHIP_CANDIDATES,
         MAX_OWNERSHIP_SOURCE_BYTES, MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES,
-        MetadataObservation, ProjectContext, ProjectOptions, ProjectPathEntry,
+        MetadataObservation, PathResolutionCacheScope, PathResolutionCancelScope,
+        PathResolutionDirectoryListing, ProjectContext, ProjectOptions, ProjectPathEntry,
         ProjectPathProvenance, ProjectReadStamp, ProjectReadTracker, ReadPolicy,
-        content_hash_bytes, path_stamp_result, project_candidate_membership,
-        read_bounded_with_tracker, resolve_existing_path_status, test_before_project_read_at,
+        content_hash_bytes, path_resolution_cancelled, path_resolution_directory_listing,
+        path_stamp_result, project_candidate_membership, read_bounded_with_tracker,
+        resolve_existing_path_status, test_before_project_read_at,
         test_cancel_project_scan_after_checks, with_legacy_path_resolution,
         with_path_resolution_read_dir_count,
     };
@@ -9744,6 +9807,65 @@ mod tests {
             ExistingPathStatus::Unresolvable => panic!("exact entry should be resolvable"),
         }
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_stops_when_cancelled_before_walking() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for index in 0..3000 {
+            fs::write(temp.path().join(format!("file{index}.pas")), b"").expect("entry");
+        }
+        fs::write(temp.path().join("Target.pas"), b"").expect("unit file");
+        let requested = temp.path().join("TARGET.PAS");
+        let cancel = AtomicBool::new(true);
+        let mut warnings = Vec::new();
+
+        let (status, read_dirs) = with_path_resolution_read_dir_count(|| {
+            let _scope = PathResolutionCancelScope::new(Some(&cancel));
+            resolve_existing_path_status(&requested, &mut warnings, "unit")
+        });
+
+        assert!(matches!(status, ExistingPathStatus::Unresolvable));
+        assert_eq!(read_dirs, 0, "a cancelled walk must not list directories");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn path_resolution_listing_stops_when_cancelled_and_is_not_cached() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        for index in 0..3000 {
+            fs::write(temp.path().join(format!("file{index}.pas")), b"").expect("entry");
+        }
+        let cancel = AtomicBool::new(true);
+        let _cache = PathResolutionCacheScope::new();
+
+        {
+            let _scope = PathResolutionCancelScope::new(Some(&cancel));
+            assert!(matches!(
+                path_resolution_directory_listing(temp.path()),
+                PathResolutionDirectoryListing::Cancelled
+            ));
+        }
+
+        match path_resolution_directory_listing(temp.path()) {
+            PathResolutionDirectoryListing::Entries(entries) => {
+                assert_eq!(entries.names.len(), 3000);
+            }
+            other => panic!("a cancelled listing must not be cached: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_resolution_cancel_scope_restores_the_previous_token() {
+        let outer = AtomicBool::new(true);
+        let inner = AtomicBool::new(false);
+        let _outer = PathResolutionCancelScope::new(Some(&outer));
+        assert!(path_resolution_cancelled());
+        {
+            let _inner = PathResolutionCancelScope::new(Some(&inner));
+            assert!(!path_resolution_cancelled());
+        }
+        assert!(path_resolution_cancelled());
     }
 
     #[test]

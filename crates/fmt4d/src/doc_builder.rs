@@ -18,6 +18,27 @@ pub(crate) enum BreakStyle {
     ExpandAll,
 }
 
+/// Rows of every newline-terminated line that is empty or whitespace-only.
+fn blank_line_rows(source: &[u8]) -> Vec<u32> {
+    let mut rows = Vec::new();
+    let mut line_start = 0;
+    for (row, line_end) in source
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| (b == b'\n').then_some(i))
+        .enumerate()
+    {
+        if source[line_start..line_end]
+            .iter()
+            .all(|c| c.is_ascii_whitespace())
+        {
+            rows.push(row as u32);
+        }
+        line_start = line_end + 1;
+    }
+    rows
+}
+
 /// Stateless AST-to-Doc builder.
 ///
 /// Converts a tree-sitter AST into a `Doc` IR tree. The key invariant is that
@@ -30,6 +51,8 @@ pub struct DocBuilder<'a> {
     directives: &'a DirectiveMap,
     format_regions: Vec<FormatOffRegion>,
     pub(crate) external_units: &'a HashSet<String>,
+    /// Ascending 0-based rows of newline-terminated, whitespace-only lines.
+    blank_line_rows: Vec<u32>,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -48,6 +71,7 @@ impl<'a> DocBuilder<'a> {
             directives,
             format_regions,
             external_units,
+            blank_line_rows: blank_line_rows(source),
         }
     }
 
@@ -429,25 +453,12 @@ impl<'a> DocBuilder<'a> {
         if end_row <= start_row + 1 {
             return false;
         }
-        let bytes = self.source;
-        let mut row_idx: usize = 0;
-        let mut line_start: usize = 0;
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'\n' {
-                if row_idx > start_row && row_idx < end_row {
-                    let line = &bytes[line_start..i];
-                    if line.iter().all(|c| c.is_ascii_whitespace()) {
-                        return true;
-                    }
-                }
-                row_idx += 1;
-                if row_idx >= end_row {
-                    return false;
-                }
-                line_start = i + 1;
-            }
-        }
-        false
+        let first_after_start = self
+            .blank_line_rows
+            .partition_point(|&row| row as usize <= start_row);
+        self.blank_line_rows
+            .get(first_after_start)
+            .is_some_and(|&row| (row as usize) < end_row)
     }
 
     /// Return `true` if `node` falls entirely within a format-off region.
@@ -721,6 +732,42 @@ mod tests {
     use crate::comments::CommentMap;
     use crate::config::FmtConfig;
     use crate::directive_map::DirectiveMap;
+
+    fn blank_line_between_by_scan(bytes: &[u8], start_row: usize, end_row: usize) -> bool {
+        let mut lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+        lines.pop(); // text after the last newline is not a terminated line
+        lines.iter().enumerate().any(|(row, line)| {
+            row > start_row && row < end_row && line.iter().all(|c| c.is_ascii_whitespace())
+        })
+    }
+
+    #[test]
+    fn blank_line_index_matches_line_scan() {
+        let sources: [&[u8]; 5] = [
+            b"a\n\nb\n  \t\nc\n",
+            b"a\r\n\r\nb\r\n\r\n",
+            b"a\nb\n\n\n\nc\n   ",
+            b"\n\n\n",
+            b"caf\xe9\n\nx\n",
+        ];
+        for source in sources {
+            let (tree, unit_bytes) = parse("unit T;\ninterface\nimplementation\nend.\n");
+            let config = FmtConfig::default();
+            let comments = CommentMap::build(tree.root_node(), &unit_bytes);
+            let directives = DirectiveMap::build(tree.root_node(), &unit_bytes);
+            let external_units = HashSet::new();
+            let builder = make_builder(source, &config, &comments, &directives, &external_units);
+            for start in 0..8 {
+                for end in 0..10 {
+                    assert_eq!(
+                        builder.has_blank_line_between(start, end),
+                        blank_line_between_by_scan(source, start, end),
+                        "{source:?} rows {start}..{end}"
+                    );
+                }
+            }
+        }
+    }
 
     fn parse(source: &str) -> (tree_sitter::Tree, Vec<u8>) {
         let bytes = source.as_bytes().to_vec();

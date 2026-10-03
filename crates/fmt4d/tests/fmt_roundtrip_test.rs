@@ -11,8 +11,12 @@ use common::{format_source, idempotency_check};
 ///
 /// Two intentional transformations are allowed, and only these:
 /// - Uses sorting (on by default) reorders units, and their comments move
-///   with them, so with `uses_sorted` each `declUses` is compared as a
-///   multiset of its leaf tokens and of the trivia inside it.
+///   with them. With `uses_sorted` a `declUses` must keep its conditional
+///   blocks and their directive texts in order, the same multiset of unit
+///   names (each a whole dotted name) at its top level and in each branch,
+///   and, for every choice of branches, the same sequence of units and
+///   punctuation up to the order of the units. The trivia inside it is
+///   compared as a multiset.
 /// - A `var` declaration naming several identifiers (`A, B: T;`) is
 ///   expanded into one declaration per identifier, so a node with such a
 ///   child is compared by its leaf tokens with the expansion applied.
@@ -111,15 +115,8 @@ fn compare_nodes(
         ));
     }
     if uses_sorted && x.kind() == K::DECL_USES {
-        let (mut ta, mut tb) = (Vec::new(), Vec::new());
-        collect_leaf_tokens(a, x, &mut ta);
-        collect_leaf_tokens(b, y, &mut tb);
-        ta.sort();
-        tb.sort();
-        if ta != tb {
-            return Err(format!("uses clause changed: {ta:?} -> {tb:?}, {}", at()));
-        }
-        return Ok(());
+        return compare_sorted_uses(&uses_parts(a, x), &uses_parts(b, y))
+            .map_err(|e| format!("uses clause changed: {e}, {}", at()));
     }
     if code_children(x).iter().any(|c| is_var_list(*c)) {
         let (ta, tb) = (expanded_tokens(a, x), expanded_tokens(b, y));
@@ -168,6 +165,166 @@ fn collect_leaf_tokens(side: &Side, node: tree_sitter::Node, out: &mut Vec<(Stri
     for child in children {
         collect_leaf_tokens(side, child, out);
     }
+}
+
+/// A uses clause or conditional branch, as the compiler reads it.
+#[derive(Debug, Clone, PartialEq)]
+enum UsesPart {
+    /// A whole unit name such as `System.SysUtils`.
+    Unit(String),
+    /// `,`, `;` or any other code token outside a unit name.
+    Token(String),
+    Block(UsesBlock),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct UsesBlock {
+    /// Each branch's opening directive (`{$IFDEF X}`, `{$ELSE}`, ...) and parts.
+    branches: Vec<(String, Vec<UsesPart>)>,
+    endif: String,
+}
+
+fn uses_parts(side: &Side, node: tree_sitter::Node) -> Vec<UsesPart> {
+    let mut parts = Vec::new();
+    for child in code_children(node) {
+        match child.kind() {
+            K::K_USES => {}
+            K::MODULE_NAME => parts.push(UsesPart::Unit(side.text(child))),
+            K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
+                parts.push(UsesPart::Block(uses_block(side, child)))
+            }
+            _ => parts.push(UsesPart::Token(side.text(child))),
+        }
+    }
+    parts
+}
+
+fn uses_block(side: &Side, node: tree_sitter::Node) -> UsesBlock {
+    let mut block = UsesBlock {
+        branches: Vec::new(),
+        endif: String::new(),
+    };
+    // Tokens after `{$ENDIF}` (a `;` in ppUsesBlockWithSemi) follow the block.
+    let mut after = Vec::new();
+    for child in code_children(node) {
+        let part = match child.kind() {
+            K::PP_IF | K::PP_ELSE => {
+                block.branches.push((side.text(child), Vec::new()));
+                continue;
+            }
+            K::PP_END_IF => {
+                block.endif = side.text(child);
+                continue;
+            }
+            K::MODULE_NAME => UsesPart::Unit(side.text(child)),
+            K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
+                UsesPart::Block(uses_block(side, child))
+            }
+            _ => UsesPart::Token(side.text(child)),
+        };
+        match block.branches.last_mut() {
+            Some((_, parts)) if block.endif.is_empty() => parts.push(part),
+            _ => after.push(part),
+        }
+    }
+    if !after.is_empty() {
+        block.branches.push(("<after {$ENDIF}>".to_string(), after));
+    }
+    block
+}
+
+/// Directive texts of every block, in order, with their nesting.
+fn uses_skeleton(parts: &[UsesPart], out: &mut Vec<String>) {
+    for part in parts {
+        if let UsesPart::Block(block) = part {
+            out.push("block".to_string());
+            for (directive, branch) in &block.branches {
+                out.push(directive.clone());
+                uses_skeleton(branch, out);
+            }
+            out.push(block.endif.clone());
+        }
+    }
+}
+
+/// Sorted unit names of each level (the clause's top level, then each
+/// branch, in skeleton order); a unit moving between levels changes them.
+fn uses_levels(parts: &[UsesPart], out: &mut Vec<Vec<String>>) {
+    let mut units: Vec<String> = parts
+        .iter()
+        .filter_map(|p| match p {
+            UsesPart::Unit(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    units.sort();
+    out.push(units);
+    for part in parts {
+        if let UsesPart::Block(block) = part {
+            for (_, branch) in &block.branches {
+                uses_levels(branch, out);
+            }
+        }
+    }
+}
+
+const MAX_USES_CONFIGURATIONS: usize = 4096;
+
+/// The unit/punctuation sequence the compiler sees for every choice of
+/// branches (a block without `{$ELSE}` may also contribute nothing), with
+/// unit names replaced by `U`.
+fn uses_shapes(parts: &[UsesPart]) -> Result<Vec<String>, String> {
+    let mut shapes = vec![String::new()];
+    for part in parts {
+        match part {
+            UsesPart::Unit(_) => shapes.iter_mut().for_each(|s| s.push('U')),
+            UsesPart::Token(text) => shapes.iter_mut().for_each(|s| s.push_str(text)),
+            UsesPart::Block(block) => {
+                let mut choices = Vec::new();
+                let mut has_else = false;
+                for (directive, branch) in &block.branches {
+                    has_else |= directive.to_ascii_uppercase().starts_with("{$ELSE}");
+                    choices.extend(uses_shapes(branch)?);
+                }
+                if !has_else {
+                    choices.push(String::new());
+                }
+                let mut next = Vec::new();
+                for prefix in &shapes {
+                    for choice in &choices {
+                        next.push(format!("{prefix}{choice}"));
+                    }
+                }
+                if next.len() > MAX_USES_CONFIGURATIONS {
+                    return Err("too many conditional configurations to compare".to_string());
+                }
+                shapes = next;
+            }
+        }
+    }
+    Ok(shapes)
+}
+
+fn compare_sorted_uses(a: &[UsesPart], b: &[UsesPart]) -> Result<(), String> {
+    let (mut sa, mut sb) = (Vec::new(), Vec::new());
+    uses_skeleton(a, &mut sa);
+    uses_skeleton(b, &mut sb);
+    if sa != sb {
+        return Err(format!("conditional blocks {sa:?} -> {sb:?}"));
+    }
+    let (mut la, mut lb) = (Vec::new(), Vec::new());
+    uses_levels(a, &mut la);
+    uses_levels(b, &mut lb);
+    if la != lb {
+        return Err(format!("units per branch {la:?} -> {lb:?}"));
+    }
+    let (ca, cb) = (uses_shapes(a)?, uses_shapes(b)?);
+    if ca != cb {
+        return Err(format!(
+            "units and punctuation per configuration {ca:?} -> {cb:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// A `declVar` naming several identifiers.
@@ -296,6 +453,66 @@ fn oracle_accepts_var_list_expansion_only() {
     assert!(check_same_program(source, &renamed, true).is_err());
 }
 
+const CONDITIONAL_USES: &str = "\
+unit T;
+interface
+uses
+  System.Classes,
+  Vcl.SysUtils,
+  {$IFDEF X}
+  XUnit,
+  {$ELSE}
+  YUnit,
+  {$ENDIF}
+  Zed;
+implementation
+end.
+";
+
+#[test]
+fn oracle_accepts_sorted_units_around_a_conditional_block() {
+    let sorted = CONDITIONAL_USES.replace(
+        "  System.Classes,\n  Vcl.SysUtils,",
+        "  Vcl.SysUtils,\n  System.Classes,",
+    );
+    assert_ne!(sorted, CONDITIONAL_USES);
+    check_same_program(CONDITIONAL_USES, &sorted, true).unwrap();
+}
+
+#[test]
+fn oracle_rejects_a_unit_qualifier_swap() {
+    let swapped = CONDITIONAL_USES
+        .replace("System.Classes", "System.SysUtils")
+        .replace("Vcl.SysUtils", "Vcl.Classes");
+    let err = check_same_program(CONDITIONAL_USES, &swapped, true).expect_err("qualifier swap");
+    assert!(err.contains("units per branch"), "{err}");
+}
+
+#[test]
+fn oracle_rejects_a_unit_moved_across_ifdef() {
+    let moved = CONDITIONAL_USES.replace(
+        "  XUnit,\n  {$ELSE}\n  YUnit,\n",
+        "  XUnit,\n  YUnit,\n  {$ELSE}\n",
+    );
+    assert_ne!(moved, CONDITIONAL_USES);
+    let err = check_same_program(CONDITIONAL_USES, &moved, true).expect_err("branch move");
+    assert!(err.contains("units per branch"), "{err}");
+
+    let hoisted = CONDITIONAL_USES.replace("  {$IFDEF X}\n  XUnit,\n", "  XUnit,\n  {$IFDEF X}\n");
+    let err = check_same_program(CONDITIONAL_USES, &hoisted, true).expect_err("unit out of block");
+    assert!(err.contains("units per branch"), "{err}");
+}
+
+#[test]
+fn oracle_rejects_punctuation_that_breaks_a_configuration() {
+    // Sorting leaving the block last must not end it with `{$ENDIF};`,
+    // which reads `uses A, B, C, ;` when X is defined.
+    let source = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
+    let broken = "unit T;\ninterface\nuses A, B, {$IFDEF X} C, {$ENDIF};\nimplementation\nend.\n";
+    let err = check_same_program(source, broken, true).expect_err("dangling comma");
+    assert!(err.contains("per configuration"), "{err}");
+}
+
 #[test]
 fn oracle_compares_uses_order_unless_sorting() {
     let reordered = SANITY_SOURCE.replace("B, A;", "A, B;");
@@ -305,17 +522,23 @@ fn oracle_compares_uses_order_unless_sorting() {
 
 // ── Fixture sweep ───────────────────────────────────────────────
 
-/// Fixtures the oracle is known to reject because of formatter bugs that
-/// are tracked separately, as (path relative to the workspace root, task
-/// ID). Fix the bug, then remove the entry; the sweep fails if a listed
-/// fixture starts passing.
-const KNOWN_FAILING_FIXTURES: &[(&str, &str)] = &[
+/// A fixture the oracle is known to reject because of a formatter bug that
+/// is tracked separately. Fix the bug, then remove the entry; the sweep
+/// fails if a listed fixture starts passing or fails for another reason.
+struct KnownFailure {
+    /// Path relative to the workspace root.
+    path: &'static str,
+    task: &'static str,
+    /// Text the oracle's error must contain.
+    error: &'static str,
+}
+
+const KNOWN_FAILING_FIXTURES: &[KnownFailure] = &[KnownFailure {
     // `SysUtils;` ending each branch becomes `SysUtils,` plus `{$ENDIF};`.
-    (
-        "crates/fmt4d/tests/fixtures/ppFragment/bucket_c_uses_semi.pas",
-        "TASK-102",
-    ),
-];
+    path: "crates/fmt4d/tests/fixtures/ppFragment/bucket_c_uses_semi.pas",
+    task: "TASK-102",
+    error: r#"per configuration ["U,U;", "U,U;"] -> ["U,U,;", "U,U,;"]"#,
+}];
 
 fn fixture_files() -> Vec<PathBuf> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -358,21 +581,27 @@ fn every_fixture_round_trips() {
     let mut unexpected = Vec::new();
     for path in &files {
         let name = path.to_string_lossy().replace('\\', "/");
-        let known = KNOWN_FAILING_FIXTURES.iter().find(|(p, _)| *p == name);
+        let known = KNOWN_FAILING_FIXTURES.iter().find(|k| k.path == name);
         match (check_fixture(path), known) {
-            (Ok(()), None) | (Err(_), Some(_)) => {}
+            (Ok(()), None) => {}
+            (Err(e), Some(k)) if e.contains(k.error) => {}
+            (Err(e), Some(k)) => unexpected.push(format!(
+                "{name} fails differently than expected for {}: {e}",
+                k.task
+            )),
             (Err(e), None) => unexpected.push(format!("{name}: {e}")),
-            (Ok(()), Some((_, task))) => unexpected.push(format!(
-                "{name} passes now; remove it from KNOWN_FAILING_FIXTURES ({task})"
+            (Ok(()), Some(k)) => unexpected.push(format!(
+                "{name} passes now; remove it from KNOWN_FAILING_FIXTURES ({})",
+                k.task
             )),
         }
     }
-    for (listed, task) in KNOWN_FAILING_FIXTURES {
+    for k in KNOWN_FAILING_FIXTURES {
         if !files
             .iter()
-            .any(|p| p.to_string_lossy().replace('\\', "/") == *listed)
+            .any(|p| p.to_string_lossy().replace('\\', "/") == k.path)
         {
-            unexpected.push(format!("{listed} ({task}) is not a fixture"));
+            unexpected.push(format!("{} ({}) is not a fixture", k.path, k.task));
         }
     }
     assert!(unexpected.is_empty(), "{}", unexpected.join("\n\n"));

@@ -7660,6 +7660,78 @@ fn pull_diagnostics_advertises_provider_and_returns_document_report() {
 }
 
 #[test]
+fn percent_encoded_at_sign_uri_is_the_same_open_document() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let root = temp.path().join("user@host");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+    let encoded = |path: &Path| {
+        let raw = uri(path);
+        assert!(raw.as_str().contains('@'), "{raw}");
+        Url::parse(&raw.as_str().replace('@', "%40")).expect("encoded URI")
+    };
+    let main_uri = encoded(&main);
+    let provider_uri = encoded(&provider);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    for (document, source) in [(&main_uri, main_source), (&provider_uri, provider_source)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": document,
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source,
+                }
+            }),
+        );
+    }
+
+    let pull_id = RequestId::from("encoded-at-pull".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": main_uri},
+            "previousResultId": null
+        }),
+    );
+    let pull = server.response(&pull_id);
+    assert!(pull.error.is_none(), "encoded-URI pull failed: {pull:?}");
+    let pull = pull.result.expect("encoded-URI pull result");
+    assert_eq!(pull["kind"], "full", "{pull}");
+
+    let definition_id = RequestId::from("encoded-at-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": main_uri},
+            "position": position_of(main_source, "PublicRoutine", 0),
+        }),
+    );
+    let definition = server.response(&definition_id);
+    assert!(
+        definition.error.is_none(),
+        "encoded-URI definition failed: {definition:?}"
+    );
+    let locations = result_locations(definition);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(
+        locations[0]["uri"].as_str(),
+        Some(provider_uri.as_str()),
+        "responses must use the URI the client opened the document with"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn pull_workspace_diagnostics_reports_authorized_unopened_sources() {
     let root = tempfile::tempdir().expect("workspace");
     let first = root.path().join("First.pas");

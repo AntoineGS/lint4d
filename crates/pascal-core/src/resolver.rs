@@ -562,6 +562,9 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<LoadedSource, ResolverError> {
         self.check_cancel(cancel)?;
         let path = canonical_path(path);
+        // The project's entries carry on-disk spellings; a caller's 8.3 short
+        // or other-case spelling of the same file must match them.
+        let path = path_identity::on_disk_spelling(&path).unwrap_or(path);
         let entry = self
             .context
             .path_entry_for(&path)

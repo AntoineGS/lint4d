@@ -84,14 +84,23 @@ impl FilesystemSourceStore {
             return Some((path, overlay.clone()));
         }
         // A client may spell a path differently from the disk, e.g. with a
-        // lowercase drive letter; on a case-insensitive volume it is the same file.
+        // lowercase drive letter; on a case-insensitive volume it is the same
+        // file. A file on disk keeps the on-disk spelling `load` found; an
+        // unsaved one has only the overlay's spelling.
         if !path_identity::is_case_insensitive(&path) {
             return None;
         }
         self.overlays
             .iter()
             .find(|(overlay_path, _)| path_equivalent(overlay_path, &path))
-            .map(|(_, overlay)| (path, overlay.clone()))
+            .map(|(overlay_path, overlay)| {
+                let identity = if fs::symlink_metadata(&path).is_ok() {
+                    path
+                } else {
+                    overlay_path.clone()
+                };
+                (identity, overlay.clone())
+            })
     }
 }
 

@@ -72,17 +72,31 @@ pub fn walk_root(absolute: &Path) -> PathBuf {
     root
 }
 
-/// The spelling on disk of the existing file `path` when it differs from
-/// `path` only by letter case on a case-insensitive volume. Symlinked and
-/// other aliased spellings are not rewritten.
+/// The spelling on disk of the existing file `path` on a case-insensitive
+/// volume, when it differs from `path`: other letter case, or 8.3 short
+/// names (`RUNNER~1`) for long ones. Symlinked components keep their own
+/// name; they are never replaced by their target's.
 pub fn on_disk_spelling(path: &Path) -> Option<PathBuf> {
     if !is_case_insensitive(path) {
         return None;
     }
-    // Windows reports the on-disk spelling from an open handle. Volumes that
-    // do not (macOS, backlog TASK-74) need a directory walk instead.
+    // Windows reports the on-disk spelling from an open handle; a letter-case
+    // difference alone needs nothing more. Volumes that do not report it
+    // (macOS, backlog TASK-74) need the directory walk below.
     let actual = without_verbatim_prefix(std::fs::canonicalize(path).ok()?);
-    (actual != path && paths_equal(&actual, path)).then_some(actual)
+    if actual == path {
+        return None;
+    }
+    if paths_equal(&actual, path) {
+        return Some(actual);
+    }
+    // Short names, symlinks or junctions: walk the listings, which map short
+    // names to long ones but keep symlinked components as named.
+    let mut warnings = Vec::new();
+    match crate::resolve_existing_path_status(path, &mut warnings, "path") {
+        crate::ExistingPathStatus::Found(walked) if walked != path => Some(walked),
+        _ => None,
+    }
 }
 
 /// Turns a verbatim Windows path from `canonicalize` (`\\?\C:\x`,

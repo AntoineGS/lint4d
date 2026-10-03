@@ -323,6 +323,8 @@ impl ReadPolicy {
                 let source = PathBuf::from(source);
                 let source = if source.is_absolute() {
                     source
+                } else if is_foreign_windows_path(&source) {
+                    continue;
                 } else {
                     root.join(source)
                 };
@@ -9807,6 +9809,27 @@ mod tests {
             ExistingPathStatus::Unresolvable => panic!("exact entry should be resolvable"),
         }
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_policy_does_not_join_windows_source_paths_under_the_root() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().to_path_buf();
+        let policy = ReadPolicy::new_with_installation_roots(
+            std::slice::from_ref(&root),
+            &["C:/Delphi/lib".to_string(), "src".to_string()],
+            &[],
+            &EffectiveOverrides::default(),
+            &[],
+        );
+
+        let roots: Vec<&Path> = policy
+            .configured_roots
+            .iter()
+            .map(|root| root.path.as_path())
+            .collect();
+        assert_eq!(roots, [root.as_path(), root.join("src").as_path()]);
     }
 
     #[test]

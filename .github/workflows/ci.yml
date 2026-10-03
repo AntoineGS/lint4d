@@ -39,9 +39,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Source-project support does not work on Windows yet (backlog TASK-94);
-    # its test failures are reported but do not fail the workflow.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:

@@ -493,7 +493,9 @@ fn explicit_mapping_wins_and_alias_is_applied_once() {
     assert_eq!(found.declared_name, "Vendor.Errors");
 }
 
+// Errors.pas and errors.PAS cannot coexist on a case-insensitive volume.
 #[test]
+#[cfg(not(windows))]
 fn ambiguity_at_current_tier_blocks_search_path_fallback() {
     let mut context = fixture_context();
     context.search_path_entries = vec![

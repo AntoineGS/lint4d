@@ -5407,10 +5407,11 @@ fn document_links_reject_an_ancestor_symlink_inserted_while_delivery_waits() {
     server.shutdown();
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// Needs a case-sensitive volume, where the include needs a directory scan;
+// Windows opens it directly, and macOS volumes are usually case-insensitive
 // (backlog TASK-74).
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn document_links_refuse_case_insensitive_lookup_over_directory_scan_limit() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let main = temp.path().join("Main.pas");

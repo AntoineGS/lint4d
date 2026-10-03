@@ -875,7 +875,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
 
+    /// A file URI for a fixture path written Unix-style; Windows needs a drive.
     fn uri(path: &str) -> Url {
+        let path = if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        };
         Url::from_file_path(path).expect("file URI")
     }
 

@@ -10213,58 +10213,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[cfg(windows)]
-    fn path_resolution_keeps_the_drive_and_fixes_spelling() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let unit = temp.path().join("Unit1.pas");
-        fs::write(&unit, b"").expect("unit file");
-        let long = path_identity::without_verbatim_prefix(fs::canonicalize(&unit).unwrap());
-        let requested = PathBuf::from(unit.to_string_lossy().to_ascii_uppercase());
-        let mut warnings = Vec::new();
-        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
-        assert!(
-            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
-            "{status:?} {warnings:?}"
-        );
-    }
-
-    /// The 8.3 short name of `path`, when the volume generates one.
-    #[cfg(windows)]
-    fn windows_short_path(path: &Path) -> Option<PathBuf> {
-        let output = std::process::Command::new("cmd")
-            .args([
-                "/C",
-                &format!("for %I in (\"{}\") do @echo %~sI", path.display()),
-            ])
-            .output()
-            .ok()?;
-        let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        (short.as_os_str() != path.as_os_str() && short.exists()).then_some(short)
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn path_resolution_reports_the_long_name_for_a_short_name() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let directory = temp.path().join("Long Directory Name");
-        fs::create_dir(&directory).expect("directory");
-        let unit = directory.join("LongUnitName.pas");
-        fs::write(&unit, b"").expect("unit file");
-        let long = path_identity::without_verbatim_prefix(fs::canonicalize(&unit).unwrap());
-        let Some(short) = windows_short_path(&unit) else {
-            eprintln!("skipped: the volume does not generate 8.3 names");
-            return;
-        };
-        let mut warnings = Vec::new();
-        let status = resolve_existing_path_status(&short, &mut warnings, "unit");
-        assert!(
-            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
-            "{} -> {status:?} {warnings:?}",
-            short.display()
-        );
-    }
-
     // Linux and Windows resolve exact paths without listing directories; on
     // macOS the on-disk spelling is found by a component walk (backlog TASK-74).
     #[test]
@@ -11575,6 +11523,64 @@ mod tests {
         assert!(
             !policy.allows_legacy_payload_entry(&entry),
             "legacy payload compatibility must not bypass configured exclusions"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::{ExistingPathStatus, path_identity, resolve_existing_path_status};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn path_resolution_keeps_the_drive_and_fixes_spelling() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let unit = temp.path().join("Unit1.pas");
+        fs::write(&unit, b"").expect("unit file");
+        let long = path_identity::without_verbatim_prefix(fs::canonicalize(&unit).unwrap());
+        let requested = PathBuf::from(unit.to_string_lossy().to_ascii_uppercase());
+        let mut warnings = Vec::new();
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+        assert!(
+            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
+            "{status:?} {warnings:?}"
+        );
+    }
+
+    /// The 8.3 short name of `path`, when the volume generates one.
+    fn windows_short_path(path: &Path) -> Option<PathBuf> {
+        use std::os::windows::process::CommandExt;
+        // cmd does not parse the quoting `Command::arg` applies.
+        let output = std::process::Command::new("cmd")
+            .raw_arg(format!(
+                "/C for %I in (\"{}\") do @echo %~sI",
+                path.display()
+            ))
+            .output()
+            .ok()?;
+        let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        (short.as_os_str() != path.as_os_str() && short.exists()).then_some(short)
+    }
+
+    #[test]
+    fn path_resolution_reports_the_long_name_for_a_short_name() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let directory = temp.path().join("Long Directory Name");
+        fs::create_dir(&directory).expect("directory");
+        let unit = directory.join("LongUnitName.pas");
+        fs::write(&unit, b"").expect("unit file");
+        let long = path_identity::without_verbatim_prefix(fs::canonicalize(&unit).unwrap());
+        let Some(short) = windows_short_path(&unit) else {
+            eprintln!("skipped: the volume does not generate 8.3 names");
+            return;
+        };
+        let mut warnings = Vec::new();
+        let status = resolve_existing_path_status(&short, &mut warnings, "unit");
+        assert!(
+            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
+            "{} -> {status:?} {warnings:?}",
+            short.display()
         );
     }
 }

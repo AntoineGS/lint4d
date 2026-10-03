@@ -549,3 +549,102 @@ end.
     assert!(content.contains("MAX_SIZE = 100;"));
     assert!(content.contains("x := MAX_SIZE;"));
 }
+
+/// The 8.3 short form of `path`, when its volume generates short names.
+#[cfg(windows)]
+fn windows_short_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::process::CommandExt;
+    // cmd does not parse the quoting `Command::arg` applies.
+    let output = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/C for %I in (\"{}\") do @echo %~sI",
+            path.display()
+        ))
+        .output()
+        .ok()?;
+    let short = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    (short.as_os_str() != path.as_os_str() && short.exists()).then_some(short)
+}
+
+/// A project under the user's own temporary directory on the system volume
+/// (`C:\Users\<name>\AppData\Local\Temp`), which has 8.3 names, as `TEMP`
+/// does on a stock Windows runner. Returns the directory and its short form.
+#[cfg(windows)]
+fn short_name_project(
+    main_source: impl Fn(&std::path::Path) -> String,
+) -> Option<(TempDir, std::path::PathBuf)> {
+    let local_temp = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Temp");
+    let dir = TempDir::new_in(&local_temp).unwrap();
+    let project_dir = dir.path().join("Long Project Directory");
+    fs::create_dir(&project_dir).unwrap();
+    let main = project_dir.join("Main.pas");
+    fs::write(
+        &main,
+        "unit Main;\ninterface\nimplementation\nprocedure Test;\nvar X: TObject;\nbegin\n  X.Free;\n  X.Foo;\nend;\nend.\n",
+    )
+    .unwrap();
+    let Some(short_dir) = windows_short_path(&project_dir) else {
+        // GitHub's Windows runners have 8.3 names on the system volume,
+        // so CI must not skip this silently.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no 8.3 name for {}",
+            project_dir.display()
+        );
+        return None;
+    };
+    let reference = main_source(&short_dir.join("Main.pas"));
+    fs::write(
+        project_dir.join("App.dproj"),
+        format!(
+            "<Project><PropertyGroup><MainSource>{reference}</MainSource></PropertyGroup><ItemGroup><DCCReference Include=\"{reference}\"/></ItemGroup></Project>"
+        ),
+    )
+    .unwrap();
+    Some((dir, short_dir))
+}
+
+#[cfg(windows)]
+fn assert_project_cfg_for(project: &std::path::Path) {
+    let output = lint4d()
+        .arg("--project")
+        .arg(project)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "lint4d failed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("file-local CFG") && !stderr.contains("source-project resolution"),
+        "source project was not resolved for {}: {stderr}",
+        project.display()
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["files"][0]["diagnostics"][0]["rule_id"], "use-after-free",
+        "{report}\n{stderr}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn project_flag_resolves_the_source_project_through_a_short_name_path() {
+    let Some((_dir, short_dir)) = short_name_project(|_| "Main.pas".to_string()) else {
+        return;
+    };
+    assert_project_cfg_for(&short_dir.join("App.dproj"));
+}
+
+#[cfg(windows)]
+#[test]
+fn project_source_referenced_by_a_short_name_path_resolves_the_source_project() {
+    let Some((dir, _short_dir)) = short_name_project(|short_main| short_main.display().to_string())
+    else {
+        return;
+    };
+    assert_project_cfg_for(&dir.path().join("Long Project Directory").join("App.dproj"));
+}

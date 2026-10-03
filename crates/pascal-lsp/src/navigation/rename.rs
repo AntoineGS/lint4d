@@ -6,6 +6,7 @@ use super::{
     is_unit_declaration_identifier, member_expression_at, node_text, qualified_type_path_at,
     qualified_type_path_at_with_budget, routine_name, routine_signature, use_name_at,
 };
+use crate::coverage::Coverage;
 use crate::text::PositionIndex;
 use lsp_types::{
     DocumentHighlight, DocumentHighlightKind, Position, PrepareRenameResponse, Range, TextEdit, Url,
@@ -380,6 +381,7 @@ struct BindingLocationOptions<'a> {
     result_limit: Option<usize>,
     work_budget: Option<&'a mut BindingWorkBudget>,
     shared_work_budget: Option<&'a mut super::AssistanceBudget>,
+    gaps: Option<&'a mut Coverage>,
 }
 
 struct OccurrenceCollectionOptions<'a> {
@@ -390,6 +392,38 @@ struct OccurrenceCollectionOptions<'a> {
     cancel: Option<&'a AtomicBool>,
     work_budget: Option<&'a mut BindingWorkBudget>,
     shared_work_budget: Option<&'a mut super::AssistanceBudget>,
+    /// Read-only callers: an occurrence strict resolution cannot prove is
+    /// left out and recorded here instead of failing the whole collection.
+    gaps: Option<&'a mut Coverage>,
+    /// The requested occurrence. It must be proven even for read-only
+    /// callers, since it identifies the binding.
+    selected: Option<(&'a Url, Span)>,
+}
+
+impl OccurrenceCollectionOptions<'_> {
+    /// Leave out an unprovable occurrence in `uri` when collecting a
+    /// read-only answer; otherwise fail with `error`.
+    fn withhold(
+        &mut self,
+        uri: &Url,
+        span: Option<Span>,
+        reason: &str,
+        error: impl FnOnce() -> String,
+    ) -> Result<(), String> {
+        let selected = self.selected.is_some_and(|(selected_uri, selected_span)| {
+            selected_uri == uri
+                && span.is_none_or(|span| {
+                    span.start < selected_span.end && selected_span.start < span.end
+                })
+        });
+        match self.gaps.as_deref_mut() {
+            Some(gaps) if !selected => {
+                gaps.note(Some(uri), reason);
+                Ok(())
+            }
+            _ => Err(error()),
+        }
+    }
 }
 
 impl NavigationIndex {
@@ -418,6 +452,7 @@ impl NavigationIndex {
                 result_limit: Some(MAX_BINDING_LOCATIONS),
                 work_budget: None,
                 shared_work_budget: Some(&mut semantic_budget),
+                gaps: None,
             },
         )
     }
@@ -447,6 +482,39 @@ impl NavigationIndex {
                 result_limit: None,
                 work_budget: Some(work_budget),
                 shared_work_budget: Some(shared_work_budget),
+                gaps: None,
+            },
+        )
+    }
+
+    /// Read-only references: like
+    /// [`Self::binding_locations_with_cancel_and_work_budget`], but an
+    /// occurrence strict resolution cannot prove is recorded in `gaps` and
+    /// left out instead of failing the request. Edits must not use this.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn partial_binding_locations_with_cancel_and_work_budget(
+        &self,
+        uri: &Url,
+        position: lsp_types::Position,
+        include_declaration: bool,
+        cancel: &AtomicBool,
+        work_budget: &mut BindingWorkBudget,
+        shared_work_budget: &mut super::AssistanceBudget,
+        gaps: &mut Coverage,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        self.binding_locations_impl(
+            uri,
+            position,
+            include_declaration,
+            BindingLocationOptions {
+                document_uri: None,
+                strict_resolution: true,
+                allow_unit: true,
+                cancel: Some(cancel),
+                result_limit: None,
+                work_budget: Some(work_budget),
+                shared_work_budget: Some(shared_work_budget),
+                gaps: Some(gaps),
             },
         )
     }
@@ -515,6 +583,8 @@ impl NavigationIndex {
             cancel: Some(cancel),
             work_budget: Some(work_budget),
             shared_work_budget: Some(semantic_budget),
+            gaps: None,
+            selected: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         let position_index = PositionIndex::new_with_cancel(&document.source, cancel)
@@ -767,6 +837,11 @@ impl NavigationIndex {
             cancel: options.cancel,
             work_budget: options.work_budget,
             shared_work_budget,
+            selected: options
+                .gaps
+                .is_some()
+                .then(|| (uri, Span::from_node(selected_identifier))),
+            gaps: options.gaps,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         self.locations_for_occurrences(
@@ -1101,6 +1176,8 @@ impl NavigationIndex {
             cancel: Some(cancel),
             work_budget: Some(&mut binding_budget),
             shared_work_budget: Some(budget),
+            gaps: None,
+            selected: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         if occurrences.is_empty() {
@@ -1426,6 +1503,8 @@ impl NavigationIndex {
             cancel,
             work_budget: None,
             shared_work_budget: None,
+            gaps: None,
+            selected: None,
         };
         let occurrences = self.collect_occurrences_bounded(&binding, &mut occurrence_options)?;
         if occurrences.is_empty() {
@@ -1823,10 +1902,13 @@ impl NavigationIndex {
                         .any(|name| contains_identifier(&document.source, *range, name))
                 })
             {
-                return Err(format!(
-                    "rename is incomplete: {:?} occurs in an opaque compiler-directive block in {uri}",
-                    binding.old_key
-                ));
+                options.withhold(uri, None, "the symbol occurs in an opaque compiler-directive block", || {
+                    format!(
+                        "rename is incomplete: {:?} occurs in an opaque compiler-directive block in {uri}",
+                        binding.old_key
+                    )
+                })?;
+                continue;
             }
 
             let root = document.tree.root_node();
@@ -1896,10 +1978,13 @@ impl NavigationIndex {
                     if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
-                    return Err(format!(
-                        "rename cannot prove the binding of {:?} at {}:{} because parser recovery affects the identifier",
-                        binding.old_key, uri, span.start
-                    ));
+                    options.withhold(uri, Some(span), "parser recovery affects an occurrence", || {
+                        format!(
+                            "rename cannot prove the binding of {:?} at {}:{} because parser recovery affects the identifier",
+                            binding.old_key, uri, span.start
+                        )
+                    })?;
+                    continue;
                 }
 
                 if has_ancestor_kind(identifier, "with")
@@ -1909,10 +1994,18 @@ impl NavigationIndex {
                         continue;
                     }
                     if has_ancestor_kind(identifier, "inherited") || binding_has_class_owner {
-                        return Err(format!(
-                            "rename does not support with/inherited references at {}:{}",
-                            uri, span.start
-                        ));
+                        options.withhold(
+                            uri,
+                            Some(span),
+                            "an occurrence is a with or inherited reference",
+                            || {
+                                format!(
+                                    "rename does not support with/inherited references at {}:{}",
+                                    uri, span.start
+                                )
+                            },
+                        )?;
+                        continue;
                     }
                 }
                 let is_unit_declaration = binding.kind == SymbolKind::Unit
@@ -1935,10 +2028,18 @@ impl NavigationIndex {
                     if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
-                    return Err(format!(
-                        "rename does not support inherited class lookup at {}:{}",
-                        uri, span.start
-                    ));
+                    options.withhold(
+                        uri,
+                        Some(span),
+                        "an occurrence depends on inherited class lookup",
+                        || {
+                            format!(
+                                "rename does not support inherited class lookup at {}:{}",
+                                uri, span.start
+                            )
+                        },
+                    )?;
+                    continue;
                 }
 
                 let simple_reference = !is_binding_member
@@ -2026,19 +2127,28 @@ impl NavigationIndex {
                     if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
-                    return Err(format!(
-                        "rename cannot prove the binding of {:?} at {}:{} because its declaration is in an unknown conditional branch",
-                        binding.old_key, uri, span.start
-                    ));
+                    options.withhold(uri, Some(span),
+                        "an occurrence may bind to a declaration in an unknown conditional branch",
+                        || {
+                            format!(
+                                "rename cannot prove the binding of {:?} at {}:{} because its declaration is in an unknown conditional branch",
+                                binding.old_key, uri, span.start
+                            )
+                        },
+                    )?;
+                    continue;
                 }
                 if unknown_global_fallback {
                     if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
-                    return Err(format!(
-                        "rename cannot prove the binding of {:?} at {}:{} because the class ancestor is unknown",
-                        binding.old_key, uri, span.start
-                    ));
+                    options.withhold(uri, Some(span), "an occurrence depends on an unknown class ancestor", || {
+                        format!(
+                            "rename cannot prove the binding of {:?} at {}:{} because the class ancestor is unknown",
+                            binding.old_key, uri, span.start
+                        )
+                    })?;
+                    continue;
                 }
                 let matching = candidates
                     .iter()
@@ -2048,26 +2158,25 @@ impl NavigationIndex {
                     && !binding_has_class_owner
                     && !is_binding_member
                 {
-                    if candidates.is_empty() {
+                    if candidates.is_empty() || (matching != 0 && matching != candidates.len()) {
                         if !options.strict_resolution {
                             continue;
                         }
-                        return Err(format!(
-                            "rename cannot prove the local binding through with at {}:{}",
-                            uri, span.start
-                        ));
+                        options.withhold(
+                            uri,
+                            Some(span),
+                            "an occurrence binds through a with statement",
+                            || {
+                                format!(
+                                    "rename cannot prove the local binding through with at {}:{}",
+                                    uri, span.start
+                                )
+                            },
+                        )?;
+                        continue;
                     }
                     if matching == 0 {
                         continue;
-                    }
-                    if matching != candidates.len() {
-                        if !options.strict_resolution {
-                            continue;
-                        }
-                        return Err(format!(
-                            "rename cannot prove the local binding through with at {}:{}",
-                            uri, span.start
-                        ));
                     }
                     if !options.strict_resolution {
                         continue;
@@ -2084,20 +2193,31 @@ impl NavigationIndex {
                     if !options.strict_resolution && !is_binding_member {
                         continue;
                     }
-                    return Err(format!(
-                        "rename does not support inherited class lookup at {}:{}",
-                        uri, span.start
-                    ));
+                    options.withhold(
+                        uri,
+                        Some(span),
+                        "an occurrence depends on inherited class lookup",
+                        || {
+                            format!(
+                                "rename does not support inherited class lookup at {}:{}",
+                                uri, span.start
+                            )
+                        },
+                    )?;
+                    continue;
                 }
                 if matching > 0 {
                     if matching != candidates.len() {
                         if !options.strict_resolution && !is_binding_member {
                             continue;
                         }
-                        return Err(format!(
-                            "ambiguous rename reference {:?} at {}:{}",
-                            binding.old_key, uri, span.start
-                        ));
+                        options.withhold(uri, Some(span), "an occurrence is ambiguous", || {
+                            format!(
+                                "ambiguous rename reference {:?} at {}:{}",
+                                binding.old_key, uri, span.start
+                            )
+                        })?;
+                        continue;
                     }
                     let occurrence = Occurrence {
                         uri: uri.clone(),
@@ -2119,10 +2239,17 @@ impl NavigationIndex {
                     && (!has_ancestor_kind(identifier, "moduleName")
                         || binding.kind == SymbolKind::Unit)
                 {
-                    return Err(format!(
-                        "unresolved rename reference {:?} at {}:{}",
-                        binding.old_key, uri, span.start
-                    ));
+                    options.withhold(
+                        uri,
+                        Some(span),
+                        "an occurrence of the name is unresolved",
+                        || {
+                            format!(
+                                "unresolved rename reference {:?} at {}:{}",
+                                binding.old_key, uri, span.start
+                            )
+                        },
+                    )?;
                 }
             }
         }

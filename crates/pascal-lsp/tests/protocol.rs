@@ -1892,6 +1892,19 @@ fn decoded_semantic_tokens(
     tokens
 }
 
+/// The `window/logMessage` line a read-only request sends when its result
+/// left out what it could not prove.
+fn incomplete_result_log(server: &mut TestServer, method: &str) -> String {
+    let log = server.notification("window/logMessage");
+    let message = log["message"]
+        .as_str()
+        .expect("log message text")
+        .to_string();
+    assert!(message.contains(method), "{message}");
+    assert!(message.contains("incomplete result"), "{message}");
+    message
+}
+
 fn position_of(source: &str, needle: &str, occurrence: usize) -> Position {
     let mut from = 0;
     let mut offset = 0;
@@ -22096,7 +22109,7 @@ fn source_bearing_repeated_include_maps_non_bmp_crlf_ranges_once() {
 }
 
 #[test]
-fn references_reject_a_variable_rhs_in_a_cast_receiver() {
+fn references_withhold_a_variable_rhs_in_a_cast_receiver() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("InvalidCastReferences.pas");
     let source = "unit InvalidCastReferences;\ninterface\ntype\n  TWidget = class\n    Member: Integer;\n  end;\n  TOther = class\n    Member: Integer;\n  end;\nimplementation\nprocedure Caller;\nvar\n  Obj: TWidget;\n  OtherObj: TOther;\nbegin\n  (Obj as OtherObj).Member := 1;\nend;\nend.\n";
@@ -22115,10 +22128,14 @@ fn references_reject_a_variable_rhs_in_a_cast_receiver() {
         }),
     );
     let response = server.response(&id);
-    assert!(
-        response.error.is_some(),
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result,
+        Some(json!([])),
         "an unresolved cast receiver must not return references"
     );
+    let message = incomplete_result_log(&mut server, "textDocument/references");
+    assert!(message.contains("unresolved"), "{message}");
     server.shutdown();
 }
 
@@ -22251,7 +22268,7 @@ fn self_contained_local_references_ignore_unrelated_broken_imports() {
 }
 
 #[test]
-fn local_references_do_not_skip_imports_when_a_same_source_shadow_is_present() {
+fn local_references_report_unresolved_imports_when_a_same_source_shadow_is_present() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("ShadowedLocalReferences.pas");
     let source = "unit ShadowedLocalReferences;\ninterface\nuses MissingSdkUnit;\nimplementation\nprocedure Run;\nvar\n  LocalValue: Integer;\n  procedure Nested;\n  var\n    LocalValue: Integer;\n  begin\n    LocalValue := 2;\n  end;\nbegin\n  LocalValue := 1;\n  Nested;\nend;\nend.\n";
@@ -22270,12 +22287,24 @@ fn local_references_do_not_skip_imports_when_a_same_source_shadow_is_present() {
         }),
     );
     let response = server.response(&id);
-    let error = response
-        .error
-        .expect("same-source shadowing must not authorize skipping imports");
-    assert_eq!(error.code, -32803);
-    assert!(error.message.contains("incomplete"), "{error:?}");
-    assert!(response.result.is_none());
+    assert!(response.error.is_none(), "{response:?}");
+    let locations = result_locations(response);
+    assert_exact_location_signatures(
+        &locations,
+        vec![expected_location_signature(
+            &source_path,
+            source,
+            "LocalValue",
+            3,
+        )],
+    );
+    // Same-source shadowing must not authorize skipping imports: the
+    // unresolved import is still reported.
+    let message = incomplete_result_log(&mut server, "textDocument/references");
+    assert!(
+        message.contains("imports could not be resolved"),
+        "{message}"
+    );
     server.shutdown();
 }
 
@@ -24290,7 +24319,7 @@ fn rename_rejects_edits_to_a_mapped_external_consumer() {
 
 #[cfg(unix)]
 #[test]
-fn references_reject_a_missing_nested_include_in_a_mapped_consumer() {
+fn references_withhold_a_mapped_consumer_with_a_missing_nested_include() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let project_root = temp.path().join("project");
     let sdk = temp.path().join("sdk");
@@ -24328,11 +24357,151 @@ fn references_reject_a_missing_nested_include_in_a_mapped_consumer() {
         }),
     );
     let response = server.response(&references_id);
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result,
+        Some(json!([])),
+        "the consumer's use is unproven"
+    );
+    let log = server.notification("window/logMessage");
+    let message = log["message"].as_str().expect("log message text");
+    assert!(message.contains("incomplete"), "{message}");
+    assert!(message.contains("Consumer.pas"), "{message}");
+    server.shutdown();
+}
+
+#[test]
+fn workspace_diagnostics_answer_and_log_when_a_project_cannot_be_evaluated() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let ambiguous = temp.path().join("Ambiguous");
+    for name in ["First", "Second"] {
+        write_file(
+            &ambiguous.join(format!("{name}.dproj")),
+            &format!(
+                "<Project><PropertyGroup><MainSource>{name}.dpr</MainSource></PropertyGroup></Project>"
+            ),
+        );
+    }
+    for index in 0..3 {
+        write_file(
+            &ambiguous.join(format!("Unit{index}.pas")),
+            &format!("unit Unit{index};\ninterface\nimplementation\nend.\n"),
+        );
+    }
+    write_file(
+        &temp.path().join("Clean/Clean.pas"),
+        "unit Clean;\ninterface\nimplementation\nend.\n",
+    );
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(temp.path());
+    let id = RequestId::from("workspace-diagnostic-ambiguous-project".to_string());
+    server.send_request(
+        id.clone(),
+        "workspace/diagnostic",
+        json!({"identifier": "pascal-lsp", "previousResultIds": []}),
+    );
+    let response = server.response(&id);
+    assert!(
+        response.error.is_none(),
+        "an unevaluable project must not fail the whole report: {response:?}"
+    );
+    let result = response.result.expect("workspace diagnostic result");
+    assert!(result["items"].is_array(), "{result}");
+    let log = server.notification("window/logMessage");
+    let message = log["message"].as_str().expect("log message text");
+    assert!(message.contains("workspace/diagnostic"), "{message}");
+    assert!(message.contains("incomplete"), "{message}");
+    server.shutdown();
+}
+
+/// `Legacy.pas` has an active directive the include audit does not support,
+/// so its own use of `SharedValue` is unproven. `Consumer.pas` uses the
+/// symbol three times.
+fn unsupported_directive_consumer_workspace() -> (TempDir, PathBuf, &'static str) {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let provider = temp.path().join("Provider.pas");
+    let provider_source =
+        "unit Provider;\ninterface\nconst SharedValue = 1;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(
+        &temp.path().join("Consumer.pas"),
+        "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Consume;\nvar Total: Integer;\nbegin\n  Total := SharedValue;\n  Total := Total + SharedValue;\n  Total := Total * SharedValue;\nend;\nend.\n",
+    );
+    write_file(
+        &temp.path().join("Legacy.pas"),
+        "unit Legacy;\n{$SCOPEDENUMS ON}\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nvar Total: Integer;\nbegin\n  Total := SharedValue;\nend;\nend.\n",
+    );
+    (temp, provider, provider_source)
+}
+
+#[test]
+fn references_return_proven_locations_and_log_the_unit_they_could_not_prove() {
+    let (temp, provider, provider_source) = unsupported_directive_consumer_workspace();
+    let consumer = temp.path().join("Consumer.pas");
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let references_id = RequestId::from("references-with-unproven-unit".to_string());
+    server.send_request(
+        references_id.clone(),
+        "textDocument/references",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let response = server.response(&references_id);
+    assert!(
+        response.error.is_none(),
+        "an unproven unit must not fail the whole request: {response:?}"
+    );
+    let locations = response
+        .result
+        .expect("references result")
+        .as_array()
+        .expect("references array")
+        .clone();
+    assert_eq!(locations.len(), 3, "{locations:?}");
+    assert!(
+        locations
+            .iter()
+            .all(|location| location["uri"] == uri(&consumer).to_string()),
+        "{locations:?}"
+    );
+
+    let log = server.notification("window/logMessage");
+    let message = log["message"].as_str().expect("log message text");
+    assert!(message.contains("textDocument/references"), "{message}");
+    assert!(message.contains("incomplete"), "{message}");
+    assert!(message.contains("Legacy.pas"), "{message}");
+    server.shutdown();
+}
+
+#[test]
+fn rename_still_refuses_when_a_consumer_has_an_unsupported_directive() {
+    let (temp, provider, provider_source) = unsupported_directive_consumer_workspace();
+    let mut server = TestServer::launch();
+    server.initialize(temp.path(), Value::Null);
+
+    let rename_id = RequestId::from("rename-with-unproven-unit".to_string());
+    server.send_request(
+        rename_id.clone(),
+        "textDocument/rename",
+        json!({
+            "textDocument": {"uri": uri(&provider)},
+            "position": position_of(provider_source, "SharedValue", 0),
+            "newName": "RenamedValue"
+        }),
+    );
+    let response = server.response(&rename_id);
     let error = response
         .error
-        .expect("missing mapped nested include must reject references");
-    assert!(error.message.contains("workspace scan incomplete"));
+        .expect("rename must keep requiring complete proof");
+    assert!(error.message.contains("unsupported directive"), "{error:?}");
     assert!(response.result.is_none());
+    assert_eq!(fs::read_to_string(&provider).unwrap(), provider_source);
     server.shutdown();
 }
 
@@ -25487,7 +25656,7 @@ fn legacy_sibling_grant_cannot_bypass_mapped_explicit_symlink_safety() {
 
 #[cfg(unix)]
 #[test]
-fn references_reject_exhausted_mapped_source_budgets() {
+fn references_mark_exhausted_mapped_source_budgets_incomplete() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let project_root = temp.path().join("project");
     let sdk = temp.path().join("sdk");
@@ -25523,11 +25692,14 @@ fn references_reject_exhausted_mapped_source_budgets() {
         }),
     );
     let response = server.response(&references_id);
-    let error = response
-        .error
-        .expect("mapped source budget exhaustion must reject references");
-    assert!(error.message.contains("incomplete"));
-    assert!(response.result.is_none());
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result,
+        Some(json!([])),
+        "the unread consumer cannot be reported"
+    );
+    let message = incomplete_result_log(&mut server, "textDocument/references");
+    assert!(message.contains("file limit"), "{message}");
     server.shutdown();
 }
 
@@ -25639,7 +25811,7 @@ fn workspace_symbols_enumerate_mapped_sources_from_project_metadata() {
 }
 
 #[test]
-fn workspace_symbols_reject_incomplete_override_context_without_mapped_roots() {
+fn workspace_symbols_keep_proven_symbols_when_the_override_context_is_incomplete() {
     let temp = tempfile::tempdir().unwrap();
     let project_root = temp.path().join("project");
     let source = project_root.join("Main.pas");
@@ -25665,10 +25837,22 @@ fn workspace_symbols_reject_incomplete_override_context_without_mapped_roots() {
         json!({"query": "IncompleteThing"}),
     );
     let response = server.response(&id);
-    let error = response
-        .error
-        .expect("workspace symbols must fail on malformed override configuration");
-    assert!(error.message.contains("incomplete"), "{error:?}");
+    assert!(
+        response.error.is_none(),
+        "malformed overrides must not fail the whole request: {response:?}"
+    );
+    let result = response.result.expect("workspace symbols result");
+    let symbols = result.as_array().expect("workspace symbols array");
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["location"]["uri"] == uri(&source).to_string()),
+        "the symbol declared in the workspace is still proven: {symbols:?}"
+    );
+    let log = server.notification("window/logMessage");
+    let message = log["message"].as_str().expect("log message text");
+    assert!(message.contains("workspace/symbol"), "{message}");
+    assert!(message.contains("incomplete"), "{message}");
     server.shutdown();
 }
 
@@ -26751,7 +26935,7 @@ fn document_highlights_return_empty_for_an_unbound_cursor() {
 }
 
 #[test]
-fn references_reject_an_incomplete_workspace_without_partial_locations() {
+fn references_mark_an_incomplete_workspace_without_inventing_locations() {
     let temp = tempfile::tempdir().unwrap();
     let provider = temp.path().join("Provider.pas");
     let consumer = temp.path().join("Consumer.pas");
@@ -26774,11 +26958,14 @@ fn references_reject_an_incomplete_workspace_without_partial_locations() {
         }),
     );
     let response = server.response(&id);
-    let error = response
-        .error
-        .expect("incomplete reference discovery must fail closed");
-    assert!(error.message.contains("incomplete"));
-    assert!(response.result.is_none());
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result,
+        Some(json!([])),
+        "the consumer does not use Provider"
+    );
+    let message = incomplete_result_log(&mut server, "textDocument/references");
+    assert!(message.contains("Consumer.pas"), "{message}");
     server.shutdown();
 }
 
@@ -27298,7 +27485,7 @@ fn structural_symbol_queries_ignore_unresolved_include_dependencies_in_ambiguous
 }
 
 #[test]
-fn workspace_symbol_queries_report_the_actual_file_count_bound() {
+fn workspace_symbol_queries_log_the_actual_file_count_bound() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     write_file(
@@ -27319,16 +27506,19 @@ fn workspace_symbol_queries_report_the_actual_file_count_bound() {
         json!({"query": "SecondThing"}),
     );
     let response = server.response(&id);
-    let error = response
-        .error
-        .expect("workspace symbol file bound must fail closed");
-    assert!(error.message.contains("incomplete"));
-    assert!(error.message.contains("file limit"));
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result,
+        Some(json!([])),
+        "Second.pas is past the file bound"
+    );
+    let message = incomplete_result_log(&mut server, "workspace/symbol");
+    assert!(message.contains("file limit"), "{message}");
     server.shutdown();
 }
 
 #[test]
-fn workspace_symbol_queries_report_the_actual_total_byte_bound() {
+fn workspace_symbol_queries_log_the_actual_total_byte_bound() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     let source = "unit Bounded;\ninterface\nprocedure BoundedThing;\nimplementation\nend.\n";
@@ -27347,11 +27537,15 @@ fn workspace_symbol_queries_report_the_actual_total_byte_bound() {
         json!({"query": "BoundedThing"}),
     );
     let response = server.response(&id);
-    let error = response
-        .error
-        .expect("workspace symbol total byte bound must fail closed");
-    assert!(error.message.contains("incomplete"));
-    assert!(error.message.contains("byte limit"));
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("workspace symbols result");
+    assert_eq!(
+        result.as_array().expect("symbols array").len(),
+        1,
+        "only the source within the byte bound is indexed: {result}"
+    );
+    let message = incomplete_result_log(&mut server, "workspace/symbol");
+    assert!(message.contains("byte limit"), "{message}");
     server.shutdown();
 }
 

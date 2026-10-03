@@ -18078,12 +18078,13 @@ mod tests {
         );
         let discovered = super::rename::test_take_enumerated_owners();
 
-        let Err(error) = computed.value else {
-            panic!("an incomplete workspace scan must fail");
-        };
+        let result = computed
+            .value
+            .expect("an incomplete workspace scan still answers");
+        assert!(!result.coverage.is_complete());
         assert!(
-            error.starts_with("workspace diagnostic scan incomplete:"),
-            "{error}"
+            result.publications.is_empty(),
+            "the stopped scan proved no unit"
         );
         assert!(
             discovered.len() < ambiguous_sources.len(),
@@ -18179,7 +18180,8 @@ mod tests {
             super::queries::references_from_input(input.clone(), &uri, position, true, &cancel);
         let references = references
             .value
-            .expect("same-document parameter references");
+            .expect("same-document parameter references")
+            .value;
         assert_eq!(references.len(), 3, "declaration headings and body use");
         assert!(references.iter().all(|location| location.uri == uri));
         assert!(
@@ -18828,8 +18830,45 @@ mod tests {
     }
 
     #[test]
-    fn references_still_fail_closed_on_an_unsupported_directive_in_an_imported_unit() {
+    fn references_withhold_an_imported_unit_with_an_unsupported_directive() {
         let (_temp, main, workspace) = unsupported_provider_fixture("", "Value.Hello;");
+
+        let references = super::queries::references_from_input(
+            workspace.analysis_input(),
+            &main,
+            lsp_types::Position::new(4, 23),
+            true,
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("an imported unit's directive does not reject references");
+
+        assert_eq!(
+            references
+                .value
+                .iter()
+                .map(|location| (&location.uri, location.range.start))
+                .collect::<Vec<_>>(),
+            vec![(&main, lsp_types::Position::new(4, 21))],
+            "only the use in Main is proven"
+        );
+        let provider = main.join("Provider.pas").unwrap();
+        assert!(
+            !references.coverage.is_complete()
+                && references
+                    .coverage
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.uri.as_ref() == Some(&provider)),
+            "{:?}",
+            references.coverage
+        );
+    }
+
+    #[test]
+    fn references_still_fail_closed_on_an_unsupported_directive_in_the_document() {
+        let (_temp, main, workspace) =
+            unsupported_provider_fixture(" {$SCOPEDENUMS ON}", "Value.Hello;");
 
         let references = super::queries::references_from_input(
             workspace.analysis_input(),

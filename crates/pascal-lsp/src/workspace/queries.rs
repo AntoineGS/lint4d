@@ -7,6 +7,7 @@ use super::rename::{
     snapshot_records, source_for_input_with_cancel, source_for_input_with_owner,
 };
 use super::{KnownDocumentOwner, conditional_context_for_uri};
+use crate::coverage::{Coverage, Partial};
 use crate::include_expansion::{MappingBudget, VirtualMapping};
 use crate::navigation::{
     CompletionMetadata, CompletionOptions, CompletionResult, FoldingRangeOptions, InlayHintOptions,
@@ -20,7 +21,7 @@ use lsp_types::{
     Position, Range, SelectionRange, SemanticTokens, SignatureHelp, SymbolInformation, Url,
 };
 use pascal_project::{ProjectPathEntry, ProjectPathProvenance, has_invalid_project_selection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -46,6 +47,8 @@ pub(crate) struct DiagnosticsResult {
 pub(crate) struct WorkspaceDiagnosticsResult {
     pub(crate) publications: Vec<DiagnosticPublication>,
     pub(crate) publication_dependencies: HashMap<Url, Arc<Vec<SourceRecord>>>,
+    /// Units the scan did not reach are missing from `publications`.
+    pub(crate) coverage: Coverage,
 }
 
 #[derive(Debug, Clone)]
@@ -919,7 +922,7 @@ pub(crate) fn references_from_input(
     position: Position,
     include_declaration: bool,
     cancel: &AtomicBool,
-) -> super::rename::Computed<Vec<Location>> {
+) -> super::rename::Computed<Partial<Vec<Location>>> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     let uri = super::canonical_file_uri(uri);
@@ -965,7 +968,7 @@ pub(crate) fn references_from_input(
         return with_records(
             source_generation,
             configuration_generation,
-            Ok(Vec::new()),
+            Ok(Partial::complete(Vec::new())),
             records,
         );
     }
@@ -975,18 +978,29 @@ pub(crate) fn references_from_input(
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
     let records = snapshot_records(&snapshot);
-    if let Err(error) = ensure_reference_ready(&snapshot, &uri) {
-        return with_records(
-            source_generation,
-            configuration_generation,
-            Err(error),
-            records,
-        );
-    }
+    let (mut coverage, withheld) = match read_only_reference_coverage(&snapshot, &uri) {
+        Ok(coverage) => coverage,
+        Err(error) => {
+            return with_records(
+                source_generation,
+                configuration_generation,
+                Err(error),
+                records,
+            );
+        }
+    };
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
-    let value = snapshot.binding_locations(&uri, position, include_declaration, cancel);
+    let value = snapshot
+        .binding_locations(&uri, position, include_declaration, cancel, &mut coverage)
+        .map(|mut locations| {
+            locations.retain(|location| !withheld.contains(&location.uri));
+            Partial {
+                value: locations,
+                coverage,
+            }
+        });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
@@ -1285,6 +1299,125 @@ fn ensure_reference_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), St
         return Err(format!("reference workspace scan incomplete: {reason}"));
     }
     Ok(())
+}
+
+/// Read-only references over a workspace snapshot. The requested document
+/// must be proven, so a failure there still rejects the request. Elsewhere,
+/// units whose include audit or project context is unproven are returned
+/// for withholding, and they and an incomplete discovery become gaps.
+fn read_only_reference_coverage(
+    snapshot: &RenameSnapshot,
+    uri: &Url,
+) -> Result<(Coverage, HashSet<Url>), String> {
+    if !snapshot.records.contains_key(uri) {
+        return Err(format!(
+            "reference document was not retained in the workspace snapshot: {uri}"
+        ));
+    }
+    if !snapshot.readable.contains(uri) {
+        return Err(format!(
+            "reference document is outside configured workspace roots: {uri}"
+        ));
+    }
+    let requested_has_include = snapshot
+        .sources
+        .get(uri)
+        .is_some_and(|source| super::rename::may_contain_include_directive(source.as_bytes()));
+    let other_include_error = snapshot
+        .other_include_errors
+        .then(|| {
+            snapshot
+                .include_errors
+                .iter()
+                .find(|error| !error.contains("unsupported directive"))
+                .or(snapshot.include_errors.first())
+        })
+        .flatten();
+    if snapshot.unsupported_directive_owners.contains(uri) {
+        let error = snapshot
+            .include_errors
+            .iter()
+            .find(|error| error.contains(uri.as_str()))
+            .map_or(
+                "the document contains an unsupported directive",
+                String::as_str,
+            );
+        return Err(format!("reference workspace scan incomplete: {error}"));
+    }
+    if requested_has_include && let Some(error) = other_include_error {
+        return Err(format!("reference workspace scan incomplete: {error}"));
+    }
+    if snapshot
+        .expansions
+        .get(uri)
+        .is_some_and(|expansion| !expansion.complete)
+    {
+        return Err(format!(
+            "reference workspace scan incomplete: include expansion is incomplete for {uri}"
+        ));
+    }
+
+    let mut coverage = Coverage::default();
+    let mut withheld = HashSet::new();
+    for owner in &snapshot.unsupported_directive_owners {
+        coverage.note(
+            Some(owner),
+            "the unit contains an unsupported compiler directive",
+        );
+        withheld.insert(owner.clone());
+    }
+    for unit in &snapshot.incomplete_context_sources {
+        coverage.note(
+            Some(unit),
+            "the unit's project context is ambiguous or incomplete",
+        );
+        withheld.insert(unit.clone());
+    }
+    if let Some(error) = other_include_error {
+        // Which owner failed is not recorded, and an early stop leaves later
+        // owners unaudited, so no unit with an include directive is proven.
+        coverage.note(None, error.as_str());
+        let mut owners = snapshot
+            .sources
+            .iter()
+            .filter(|(_, source)| super::rename::may_contain_include_directive(source.as_bytes()))
+            .map(|(owner, _)| owner)
+            .collect::<Vec<_>>();
+        owners.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for owner in owners {
+            coverage.note(Some(owner), "include analysis is incomplete for the unit");
+            withheld.insert(owner.clone());
+        }
+    }
+    let mut incomplete_expansions = snapshot
+        .expansions
+        .iter()
+        .filter(|(_, expansion)| !expansion.complete)
+        .map(|(owner, _)| owner)
+        .collect::<Vec<_>>();
+    incomplete_expansions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for owner in incomplete_expansions {
+        coverage.note(Some(owner), "include expansion is incomplete for the unit");
+        withheld.insert(owner.clone());
+    }
+    // Include files are reported under their own URIs; a withheld owner
+    // withholds what it includes.
+    let included = withheld
+        .iter()
+        .filter_map(|owner| snapshot.expansions.get(owner))
+        .flat_map(|expansion| expansion.dependencies.iter().cloned())
+        .collect::<Vec<_>>();
+    withheld.extend(included);
+    if !snapshot.complete {
+        coverage.note(
+            None,
+            snapshot
+                .incomplete_reason
+                .as_deref()
+                .unwrap_or("bounded source discovery did not finish"),
+        );
+    }
+    Ok((coverage, withheld))
 }
 
 fn ensure_document_ready(snapshot: &RenameSnapshot, uri: &Url) -> Result<(), String> {
@@ -2061,18 +2194,25 @@ pub(crate) fn workspace_diagnostics_from_input(
         }
         Err(error) => return failed(source_generation, configuration_generation, error),
     };
+    // Each publication is computed for one unit on its own, so units the
+    // scan did not reach only make the report shorter.
+    let mut coverage = Coverage::default();
     if !snapshot.complete {
-        let reason = snapshot
-            .incomplete_reason
-            .as_deref()
-            .unwrap_or("bounded source discovery did not finish");
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("workspace diagnostic scan incomplete: {reason}"),
+        coverage.note(
+            None,
+            snapshot
+                .incomplete_reason
+                .as_deref()
+                .unwrap_or("bounded source discovery did not finish"),
         );
     }
 
+    for unit in &snapshot.incomplete_context_sources {
+        coverage.note(
+            Some(unit),
+            "the unit's project context is ambiguous or incomplete",
+        );
+    }
     let mut uris = snapshot
         .sources
         .keys()
@@ -2080,6 +2220,7 @@ pub(crate) fn workspace_diagnostics_from_input(
             uri.to_file_path()
                 .ok()
                 .is_some_and(|path| super::is_pascal_path(&path))
+                && !snapshot.incomplete_context_sources.contains(uri)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2179,6 +2320,7 @@ pub(crate) fn workspace_diagnostics_from_input(
         Ok(WorkspaceDiagnosticsResult {
             publications,
             publication_dependencies,
+            coverage,
         }),
         records,
     )
@@ -2188,7 +2330,7 @@ pub(crate) fn workspace_symbols_from_input(
     input: WorkspaceInput,
     query: &str,
     cancel: &AtomicBool,
-) -> super::rename::Computed<Vec<SymbolInformation>> {
+) -> super::rename::Computed<Partial<Vec<SymbolInformation>>> {
     let source_generation = input.source_generation;
     let configuration_generation = input.configuration_generation;
     if is_cancelled(cancel) {
@@ -2210,26 +2352,28 @@ pub(crate) fn workspace_symbols_from_input(
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
     }
+    // Every indexed declaration is proven on its own, so units discovery
+    // did not reach only make the list shorter.
+    let mut coverage = Coverage::default();
     if !snapshot.complete {
-        let reason = snapshot
-            .incomplete_reason
-            .as_deref()
-            .unwrap_or("bounded source discovery did not finish");
-        return failed(
-            source_generation,
-            configuration_generation,
-            format!("workspace symbol search incomplete: {reason}"),
+        coverage.note(
+            None,
+            snapshot
+                .incomplete_reason
+                .as_deref()
+                .unwrap_or("bounded source discovery did not finish"),
         );
     }
 
     let value = snapshot
         .index
         .workspace_symbols_with_cancel(query, cancel)
-        .map(|symbols| {
-            symbols
+        .map(|symbols| Partial {
+            value: symbols
                 .into_iter()
                 .filter(|symbol| snapshot.readable.contains(&symbol.location.uri))
-                .collect()
+                .collect(),
+            coverage,
         });
     if is_cancelled(cancel) {
         return cancelled(source_generation, configuration_generation);
@@ -2527,7 +2671,9 @@ mod tests {
         Position::new(2, 6)
     }
 
-    fn compute_references(fixture: &ReferenceFixture) -> Computed<Vec<lsp_types::Location>> {
+    fn compute_references(
+        fixture: &ReferenceFixture,
+    ) -> Computed<crate::coverage::Partial<Vec<lsp_types::Location>>> {
         let cancel = AtomicBool::new(false);
         let computed = references_from_input(
             fixture.input.clone(),
@@ -2770,7 +2916,10 @@ mod tests {
             true,
             &AtomicBool::new(false),
         );
-        let locations = computed.value.expect("mapped references should complete");
+        let locations = computed
+            .value
+            .expect("mapped references should complete")
+            .value;
         assert!(
             locations
                 .iter()

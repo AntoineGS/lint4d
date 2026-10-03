@@ -305,7 +305,15 @@ pub(crate) fn resolve(
                 false,
                 cancel,
             );
-            (result.value, result.records, "references")
+            // A lens shows only a count, with no room to say it is partial.
+            let value = result.value.and_then(|references| {
+                if references.coverage.is_complete() {
+                    Ok(references.value)
+                } else {
+                    Err(references.coverage.summary("textDocument/references"))
+                }
+            });
+            (value, result.records, "references")
         }
         LensKind::Implementation => {
             let result = queries::navigation_from_input(

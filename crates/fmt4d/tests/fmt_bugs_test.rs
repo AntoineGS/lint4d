@@ -4114,3 +4114,96 @@ fn file_with_only_trivia_gets_no_leading_space() {
     assert_eq!(result, src);
     idempotency_check(src);
 }
+
+// ── Bug: var-list expansion duplicates and drops comments ───────
+// `A, B: T;` is expanded into one declaration per identifier. The
+// comments after the type belong to the last declaration only, and
+// comments around a comma stay with the identifier before it.
+
+fn var_list_source(decls: &str) -> String {
+    format!("unit T;\ninterface\nimplementation\nprocedure P;\nvar\n{decls}begin\nend;\nend.\n")
+}
+
+#[test]
+fn var_list_trailing_comment_is_emitted_once() {
+    let src = var_list_source("  A, B: Integer; // shared\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains("  A: Integer;\n  B: Integer; // shared\n"),
+        "trailing comment duplicated or misplaced:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_block_comment_after_comma_is_kept() {
+    let src = var_list_source("  C, { why } D: string;\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains("  C: string; { why }\n  D: string;\n"),
+        "comment after a comma was dropped:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_line_comment_after_comma_is_kept() {
+    let src = var_list_source("  E, // after comma\n    F: Byte; // end\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains("  E: Byte; // after comma\n  F: Byte; // end\n"),
+        "line comment after a comma was dropped:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_line_comment_after_identifier_does_not_swallow_the_type() {
+    let src = var_list_source("  A // first\n  , B: Integer;\n");
+    let result = format_source(&src);
+    assert_eq!(result.matches("// first").count(), 1, "{result}");
+    assert!(
+        result.contains("  A: Integer; // first\n  B: Integer;\n"),
+        "line comment swallowed the type:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_own_line_comment_before_later_identifier_is_kept_once() {
+    let src = var_list_source("  G, H,\n  // own line\n  I: Word; { blk }\n");
+    let result = format_source(&src);
+    assert_eq!(result.matches("// own line").count(), 1, "{result}");
+    assert_eq!(result.matches("{ blk }").count(), 1, "{result}");
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_comments_with_default_value_are_kept_once() {
+    let src = var_list_source("  A {x}, B {y}: Integer = 1; // z\n");
+    let result = format_source(&src);
+    for c in ["{x}", "{y}", "// z"] {
+        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
+    }
+    idempotency_check(&src);
+}
+
+#[test]
+fn record_field_list_keeps_comments_around_commas() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A, // a\n    B: Integer; // shared\n  end;\nimplementation\nend.\n";
+    let result = format_source(src);
+    for c in ["// a", "// shared"] {
+        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
+    }
+    idempotency_check(src);
+}
+
+#[test]
+fn parameter_list_keeps_comments_around_commas() {
+    let src = "unit T;\ninterface\nimplementation\nprocedure Q(A, { c } B: Integer; C, // d\n  D: Byte);\nbegin\nend;\nend.\n";
+    let result = format_source(src);
+    for c in ["{ c }", "// d"] {
+        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
+    }
+    idempotency_check(src);
+}

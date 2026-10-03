@@ -3,6 +3,13 @@ use crate::doc_builder::DocBuilder;
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
+/// One alignment row of an expanded `A, B: T;` declaration.
+pub(crate) struct VarListRow {
+    /// Docs emitted above the row (leading comments and directives).
+    pub(crate) leading: Vec<Doc>,
+    pub(crate) cells: Vec<AlignCell>,
+}
+
 impl<'a> DocBuilder<'a> {
     /// Check if alignment is enabled for the given section kind.
     pub(crate) fn should_align(&self, section_kind: &str) -> bool {
@@ -45,6 +52,22 @@ impl<'a> DocBuilder<'a> {
                 }
             })
             .collect();
+        doc::concat(parts)
+    }
+
+    /// Like `concat_range_strip_trailing` with stripping, but the last node
+    /// also loses its trailing directives: the copy of a shared suffix for a
+    /// declaration that is not the last of its list.
+    fn concat_range_bare_last(&self, range: &[Node<'a>]) -> Doc {
+        let Some((last, rest)) = range.split_last() else {
+            return Doc::Empty;
+        };
+        let mut parts: Vec<Doc> = rest.iter().map(|c| self.doc_for_node(*c)).collect();
+        parts.push(doc::concat(vec![
+            self.leading_comments_doc(*last),
+            self.leading_directives_doc(*last),
+            self.doc_for_node_bare(*last),
+        ]));
         doc::concat(parts)
     }
 
@@ -183,9 +206,15 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// Expand a multi-identifier `declVar` (e.g. `I, J, K: Integer;`) into
-    /// one alignment row per identifier.  Returns `None` when the node has
+    /// one alignment row per identifier. Returns `None` when the node has
     /// no commas (single-identifier declaration).
-    pub(crate) fn expand_comma_var_rows(&self, node: Node<'a>) -> Option<Vec<Vec<AlignCell>>> {
+    ///
+    /// Each row comes with the docs to emit above it: the leading comments
+    /// and directives of every identifier but the first, whose trivia the
+    /// caller lifts above the whole declaration. The trailing comments of the
+    /// declaration stay on the last row; the comments after a comma go with
+    /// the row of the identifier before it.
+    pub(crate) fn expand_comma_var_rows(&self, node: Node<'a>) -> Option<Vec<VarListRow>> {
         let children = self.code_children(node);
 
         // Only expand when there are commas.
@@ -205,58 +234,99 @@ impl<'a> DocBuilder<'a> {
             return None;
         }
 
-        // Build the type cell docs (from colon onward) — shared by all rows.
+        // Build the type cell docs (from colon onward). Every row but the
+        // last gets a copy without the declaration's trailing trivia.
         let trailing_comment = self.trailing_comment_cell(node);
         let has_tail = trailing_comment.is_some();
 
         let default_idx = children.iter().position(|c| c.kind() == K::DEFAULT_VALUE);
 
-        let (type_doc, value_doc) = if let Some(def_idx) = default_idx {
-            let type_parts: Vec<Doc> = children[colon_idx..def_idx]
-                .iter()
-                .map(|c| self.doc_for_node(*c))
-                .collect();
-            let value_doc = self.concat_range_strip_trailing(&children[def_idx..], has_tail);
-            (doc::concat(type_parts), Some(value_doc))
-        } else {
-            let type_doc = self.concat_range_strip_trailing(&children[colon_idx..], has_tail);
-            (type_doc, None)
+        let range_doc = |range: &[Node<'a>], strip_trailing: bool| {
+            if strip_trailing {
+                self.concat_range_bare_last(range)
+            } else {
+                self.concat_range_strip_trailing(range, has_tail)
+            }
         };
+        let build_docs = |strip_trailing: bool| {
+            if let Some(def_idx) = default_idx {
+                let type_parts: Vec<Doc> = children[colon_idx..def_idx]
+                    .iter()
+                    .map(|c| self.doc_for_node(*c))
+                    .collect();
+                let value_doc = range_doc(&children[def_idx..], strip_trailing);
+                (doc::concat(type_parts), Some(value_doc))
+            } else {
+                (range_doc(&children[colon_idx..], strip_trailing), None)
+            }
+        };
+        let (type_doc, value_doc) = build_docs(false);
+        let (bare_type_doc, bare_value_doc) = build_docs(true);
 
+        let before_colon = &children[..colon_idx];
         let mut rows = Vec::with_capacity(idents.len());
         for (i, ident) in idents.iter().enumerate() {
-            // The group emits the first identifier's leading trivia above
-            // the rows; later identifiers keep their directives in place.
-            let name_doc = if i == 0 {
-                self.doc_for_node_sans_leading(*ident)
-            } else {
-                doc::concat(vec![
-                    self.leading_directives_doc(*ident),
-                    self.doc_for_node_sans_leading(*ident),
-                ])
-            };
-
             let is_last = i == idents.len() - 1;
-
-            let mut cells = if let Some(ref val) = value_doc {
-                vec![
-                    doc::align_cell(name_doc, true),
-                    doc::align_cell(type_doc.clone(), true),
-                    doc::align_cell(val.clone(), is_last && has_tail),
-                ]
+            let (name_doc, moved) = self.var_list_ident(before_colon, *ident, is_last, true);
+            let leading = if i == 0 {
+                Vec::new()
             } else {
-                vec![
-                    doc::align_cell(name_doc, true),
-                    doc::align_cell(type_doc.clone(), is_last && has_tail),
+                [
+                    self.leading_comments_doc(*ident),
+                    self.leading_directives_doc(*ident),
                 ]
+                .into_iter()
+                .filter(|d| !matches!(d, Doc::Empty))
+                .collect()
             };
 
-            // Trailing comment only on the last row.
-            if is_last && let Some(ref comment_cell) = trailing_comment {
-                cells.push(comment_cell.clone());
-            }
+            let (row_type, row_value) = if is_last {
+                (type_doc.clone(), value_doc.clone())
+            } else {
+                (bare_type_doc.clone(), bare_value_doc.clone())
+            };
+            // The last row's trailing comment cell comes from the node; an
+            // earlier row's moved comments get a cell of their own when
+            // comments are aligned, else they follow the row.
+            let comment_cell = if is_last {
+                trailing_comment.clone()
+            } else if moved.is_empty() {
+                None
+            } else if self.config.alignment.comments {
+                Some(doc::align_cell(doc::concat(moved.clone()), false))
+            } else {
+                None
+            };
+            let inline_moved = if !is_last && comment_cell.is_none() {
+                Some(doc::concat(moved))
+            } else {
+                None
+            };
+            let has_comment_cell = comment_cell.is_some();
 
-            rows.push(cells);
+            let mut cells = if let Some(val) = row_value {
+                let val = match inline_moved {
+                    Some(m) => doc::concat(vec![val, m]),
+                    None => val,
+                };
+                vec![
+                    doc::align_cell(name_doc, true),
+                    doc::align_cell(row_type, true),
+                    doc::align_cell(val, has_comment_cell),
+                ]
+            } else {
+                let row_type = match inline_moved {
+                    Some(m) => doc::concat(vec![row_type, m]),
+                    None => row_type,
+                };
+                vec![
+                    doc::align_cell(name_doc, true),
+                    doc::align_cell(row_type, has_comment_cell),
+                ]
+            };
+            cells.extend(comment_cell);
+
+            rows.push(VarListRow { leading, cells });
         }
 
         Some(rows)
@@ -670,23 +740,24 @@ impl<'a> DocBuilder<'a> {
                 && kind == K::DECL_VAR
                 && let Some(expanded) = self.expand_comma_var_rows(*child)
             {
-                // Leading comments/directives only on first row.
+                // Leading comments/directives of the declaration go above
+                // the first row.
                 group_items.extend(self.row_leading_docs(*child));
 
                 let trailing_dir = self.trailing_directives_doc(*child);
                 let expanded_len = expanded.len();
-                for (i, cells) in expanded.into_iter().enumerate() {
+                for (i, row) in expanded.into_iter().enumerate() {
+                    group_items.extend(row.leading);
+                    let mut cells = row.cells;
                     let is_last = i == expanded_len.saturating_sub(1);
-                    if !is_last || matches!(trailing_dir, Doc::Empty) {
-                        group_items.push(doc::align_row(cells));
-                    } else {
-                        let mut cells = cells;
-                        if let Some(last) = cells.last_mut() {
-                            last.content =
-                                doc::concat(vec![last.content.clone(), trailing_dir.clone()]);
-                        }
-                        group_items.push(doc::align_row(cells));
+                    if is_last
+                        && !matches!(trailing_dir, Doc::Empty)
+                        && let Some(last) = cells.last_mut()
+                    {
+                        last.content =
+                            doc::concat(vec![last.content.clone(), trailing_dir.clone()]);
                     }
+                    group_items.push(doc::align_row(cells));
                 }
 
                 prev_child_kind = kind;

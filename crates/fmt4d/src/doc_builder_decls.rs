@@ -378,16 +378,24 @@ impl<'a> DocBuilder<'a> {
                 .filter(|c| c.kind() == K::IDENTIFIER)
                 .collect();
             if !idents.is_empty() && !from_colon.is_empty() {
-                let suffix_docs: Vec<Doc> =
-                    from_colon.iter().map(|c| self.doc_for_node(*c)).collect();
-                let suffix = doc::concat(suffix_docs);
+                let suffix = self.suffix_doc(from_colon, true);
+                let bare_suffix = self.suffix_doc(from_colon, false);
 
                 let mut parts = Vec::new();
                 for (i, ident) in idents.iter().enumerate() {
                     if i > 0 {
                         parts.push(Doc::Hardline);
                     }
-                    parts.push(doc::concat(vec![self.doc_for_node(*ident), suffix.clone()]));
+                    let is_last = i == idents.len() - 1;
+                    let (ident_doc, moved) =
+                        self.var_list_ident(before_colon, *ident, is_last, false);
+                    parts.push(ident_doc);
+                    parts.push(if is_last {
+                        suffix.clone()
+                    } else {
+                        bare_suffix.clone()
+                    });
+                    parts.extend(moved);
                 }
                 return doc::concat(parts);
             }
@@ -406,6 +414,11 @@ impl<'a> DocBuilder<'a> {
 
         // Split identifiers at commas.
         let groups = Self::split_children_at(ident_list, K::COMMA);
+        let commas: Vec<Node<'a>> = ident_list
+            .iter()
+            .copied()
+            .filter(|c| c.kind() == K::COMMA)
+            .collect();
         let group_docs: Vec<Doc> = groups
             .iter()
             .map(|g| {
@@ -418,7 +431,13 @@ impl<'a> DocBuilder<'a> {
         for (i, gdoc) in group_docs.into_iter().enumerate() {
             if i > 0 {
                 ident_parts.push(doc::token(",", K::COMMA, node.kind()));
-                ident_parts.push(Doc::Line);
+                // Comments after a comma stay after it; a `//` comment
+                // forces the next identifier onto a new line.
+                let comma = commas.get(i - 1).copied();
+                let comments = comma.map(|c| self.comma_trivia(c)).unwrap_or_default();
+                let ends_line = comma.is_some_and(|c| self.has_trailing_line_comment(c));
+                ident_parts.extend(comments);
+                ident_parts.push(if ends_line { Doc::Hardline } else { Doc::Line });
             }
             ident_parts.push(gdoc);
         }
@@ -430,6 +449,94 @@ impl<'a> DocBuilder<'a> {
             doc::concat(ident_parts),
             doc::concat(suffix_docs),
         ]))
+    }
+
+    /// The `: Type;` part of a `declVar` (children from the colon on). With
+    /// `with_trivia` false the last child loses its trailing comments and
+    /// directives, for the declarations that precede the last one.
+    fn suffix_doc(&self, from_colon: &[Node<'a>], with_trivia: bool) -> Doc {
+        let last = from_colon.len().saturating_sub(1);
+        let docs: Vec<Doc> = from_colon
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if with_trivia || i != last {
+                    self.doc_for_node(*c)
+                } else {
+                    doc::concat(vec![
+                        self.leading_comments_doc(*c),
+                        self.leading_directives_doc(*c),
+                        self.doc_for_node_bare(*c),
+                    ])
+                }
+            })
+            .collect();
+        doc::concat(docs)
+    }
+
+    /// Comments and directives after a comma of an identifier list, as
+    /// same-line docs.
+    pub(crate) fn comma_trivia(&self, comma: Node<'a>) -> Vec<Doc> {
+        let leading = self.comments.leading_comments(comma.id());
+        let trailing = self.comments.trailing_comments(comma.id());
+        let directives = self.directives.trailing_directives(comma.id());
+        leading
+            .iter()
+            .map(|c| (c.span.start, 1, c.text.as_str()))
+            .chain(
+                trailing
+                    .iter()
+                    .map(|c| (c.span.start, c.gap, c.text.as_str())),
+            )
+            .chain(
+                directives
+                    .iter()
+                    .map(|d| (d.span.start, d.gap, d.text.as_str())),
+            )
+            .map(|(_, gap, text)| Doc::Raw(format!("{}{text}", " ".repeat(gap.max(1)))))
+            .collect()
+    }
+
+    /// An identifier of an expanded `A, B: T;` list, and the same-line docs
+    /// to put after its declaration's `;`: the comments after the following
+    /// comma and, when its own trailing comments end in a `//` comment that
+    /// would swallow the `:`, those too. `sans_leading` leaves the
+    /// identifier's leading trivia to the caller.
+    pub(crate) fn var_list_ident(
+        &self,
+        before_colon: &[Node<'a>],
+        ident: Node<'a>,
+        is_last: bool,
+        sans_leading: bool,
+    ) -> (Doc, Vec<Doc>) {
+        let comma = before_colon
+            .iter()
+            .position(|c| c.id() == ident.id())
+            .and_then(|i| before_colon.get(i + 1))
+            .filter(|c| c.kind() == K::COMMA);
+        let move_own = !is_last && self.has_trailing_line_comment(ident);
+        let ident_doc = match (sans_leading, move_own) {
+            (false, false) => self.doc_for_node(ident),
+            (false, true) => self.doc_for_node_sans_trailing(ident),
+            (true, false) => self.doc_for_node_sans_leading(ident),
+            (true, true) => doc::concat(vec![
+                self.doc_for_node_bare(ident),
+                self.trailing_directives_doc(ident),
+            ]),
+        };
+        let mut moved = Vec::new();
+        if move_own {
+            let comments = self.comments.trailing_comments(ident.id());
+            moved.extend(
+                comments
+                    .iter()
+                    .map(|c| Doc::Raw(format!("{}{}", " ".repeat(c.gap.max(1)), c.text))),
+            );
+        }
+        if let Some(comma) = comma {
+            moved.extend(self.comma_trivia(*comma));
+        }
+        (ident_doc, moved)
     }
 
     /// Handle the alias keyword misparse for non-alignment mode.

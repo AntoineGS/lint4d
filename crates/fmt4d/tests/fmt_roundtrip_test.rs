@@ -1011,3 +1011,36 @@ end.
         formatted
     );
 }
+
+#[test]
+fn roundtrip_var_list_comments_plain_and_aligned() {
+    let source = "\
+unit T;
+interface
+type
+  R = record
+    A, // a
+    B: Integer; // shared
+  end;
+implementation
+procedure P(X, { c } Y: Integer; Z, // d
+  W: Byte);
+var
+  A, B: Integer; // shared
+  C, { why } D: string;
+  E, // after comma
+    F: Byte;
+  G, H,
+  // own line
+  I: Word; { blk }
+  J {x}, K {y}: Integer = 1; // z
+begin
+end;
+end.
+";
+    roundtrip_check(source);
+    idempotency_check(source);
+    let aligned = common::format_aligned(source);
+    assert_same_program(source, &aligned);
+    common::idempotency_check_aligned(source);
+}

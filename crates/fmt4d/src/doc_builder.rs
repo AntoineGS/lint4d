@@ -49,7 +49,7 @@ pub struct DocBuilder<'a> {
     pub(crate) source: &'a [u8],
     pub(crate) config: &'a FmtConfig,
     pub(crate) comments: &'a CommentMap,
-    directives: &'a DirectiveMap,
+    pub(crate) directives: &'a DirectiveMap,
     format_regions: Vec<FormatOffRegion>,
     pub(crate) external_units: &'a HashSet<String>,
     /// Ascending 0-based rows of newline-terminated, whitespace-only lines.
@@ -232,6 +232,16 @@ impl<'a> DocBuilder<'a> {
             body,
             trailing_directives,
         ])
+    }
+
+    /// Only the node's own body: no leading or trailing comments or
+    /// directives. For the copies of a shared suffix whose trivia belongs to
+    /// the last copy alone.
+    pub(crate) fn doc_for_node_bare(&self, node: Node<'a>) -> Doc {
+        if self.is_in_format_off_region(node) {
+            return self.format_off_doc(node, false, false);
+        }
+        self.build_doc(node)
     }
 
     /// Emit a node inside a format-off region as its source text.

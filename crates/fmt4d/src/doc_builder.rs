@@ -85,27 +85,22 @@ impl<'a> DocBuilder<'a> {
         ])
     }
 
-    /// Like `doc_for_node` but omits leading comments.
+    /// Like `doc_for_node` but omits leading comments and directives.
     ///
-    /// Used by alignment decompose functions so that leading comments
-    /// can be extracted at the group level instead of being embedded
-    /// inside aligned cells.
+    /// Used by alignment decompose functions so that leading comments and
+    /// directives can be extracted at the group level instead of being
+    /// embedded inside aligned cells, where their line breaks would land
+    /// after the row has already started its line.
     pub(crate) fn doc_for_node_sans_leading(&self, node: Node<'a>) -> Doc {
         if self.is_in_format_off_region(node) {
             return self.format_off_doc(node, false, true);
         }
 
-        let leading_directives = self.leading_directives_doc(node);
         let body = self.build_doc(node);
         let trailing_comments = self.trailing_comments_doc(node);
         let trailing_directives = self.trailing_directives_doc(node);
 
-        doc::concat(vec![
-            leading_directives,
-            body,
-            trailing_comments,
-            trailing_directives,
-        ])
+        doc::concat(vec![body, trailing_comments, trailing_directives])
     }
 
     /// Like `doc_for_node` but omits trailing comments.
@@ -137,17 +132,20 @@ impl<'a> DocBuilder<'a> {
     /// the node's first leaf (such as the `{$FMT.OFF}` itself) and trailing
     /// its last leaf lie outside the node's text; descending would have
     /// emitted them, so the slice is widened to cover them. Leading
-    /// comments on the node itself are left out when `with_leading` is
-    /// false, trailing ones when `with_trailing` is false, mirroring the
-    /// `sans_*` variants. Text that starts a line in the source starts one
+    /// comments and directives on the node itself are left out when
+    /// `with_leading` is false, trailing comments when `with_trailing` is
+    /// false, mirroring the `sans_*` variants. Text that starts a line in the source starts one
     /// in the output too, with its source indentation.
     fn format_off_doc(&self, node: Node<'a>, with_leading: bool, with_trailing: bool) -> Doc {
         let first = first_leaf(node);
         let last = last_leaf(node);
-        let leading_comments = if with_leading || first.id() != node.id() {
-            self.comments.leading_comments(first.id())
+        let (leading_comments, leading_directives) = if with_leading || first.id() != node.id() {
+            (
+                self.comments.leading_comments(first.id()),
+                self.directives.leading_directives(first.id()),
+            )
         } else {
-            &[]
+            (&[][..], &[][..])
         };
         let trailing_comments = if with_trailing || last.id() != node.id() {
             self.comments.trailing_comments(last.id())
@@ -157,12 +155,7 @@ impl<'a> DocBuilder<'a> {
         let start = leading_comments
             .iter()
             .map(|c| c.span.start)
-            .chain(
-                self.directives
-                    .leading_directives(first.id())
-                    .iter()
-                    .map(|d| d.span.start),
-            )
+            .chain(leading_directives.iter().map(|d| d.span.start))
             .fold(node.start_byte(), usize::min);
         let end = trailing_comments
             .iter()

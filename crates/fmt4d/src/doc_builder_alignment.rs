@@ -225,7 +225,16 @@ impl<'a> DocBuilder<'a> {
 
         let mut rows = Vec::with_capacity(idents.len());
         for (i, ident) in idents.iter().enumerate() {
-            let name_doc = self.doc_for_node_sans_leading(*ident);
+            // The group emits the first identifier's leading trivia above
+            // the rows; later identifiers keep their directives in place.
+            let name_doc = if i == 0 {
+                self.doc_for_node_sans_leading(*ident)
+            } else {
+                doc::concat(vec![
+                    self.leading_directives_doc(*ident),
+                    self.doc_for_node_sans_leading(*ident),
+                ])
+            };
 
             let is_last = i == idents.len() - 1;
 
@@ -587,6 +596,29 @@ impl<'a> DocBuilder<'a> {
         Some(doc::align_cell(doc::concat(docs), false))
     }
 
+    /// Leading comments and directives of a declaration, emitted above its
+    /// aligned row.
+    ///
+    /// Both maps attach to leaves, so when a comment or directive precedes
+    /// a declaration it's typically attached to the first leaf child (e.g.
+    /// the identifier), not to the declaration node itself. Check both; the
+    /// decomposers render that child with `doc_for_node_sans_leading`.
+    fn row_leading_docs(&self, decl: Node<'a>) -> Vec<Doc> {
+        let first = self.code_children(decl).first().copied();
+        let mut comments = self.leading_comments_doc(decl);
+        if let (Doc::Empty, Some(first)) = (&comments, first) {
+            comments = self.leading_comments_doc(first);
+        }
+        let mut directives = self.leading_directives_doc(decl);
+        if let (Doc::Empty, Some(first)) = (&directives, first) {
+            directives = self.leading_directives_doc(first);
+        }
+        [comments, directives]
+            .into_iter()
+            .filter(|d| !matches!(d, Doc::Empty))
+            .collect()
+    }
+
     /// Build an alignment group from a list of declaration nodes within
     /// a section (const/var/type block).
     ///
@@ -639,20 +671,7 @@ impl<'a> DocBuilder<'a> {
                 && let Some(expanded) = self.expand_comma_var_rows(*child)
             {
                 // Leading comments/directives only on first row.
-                let mut leading = self.leading_comments_doc(*child);
-                if matches!(leading, Doc::Empty) {
-                    let ch = self.code_children(*child);
-                    if let Some(first) = ch.first() {
-                        leading = self.leading_comments_doc(*first);
-                    }
-                }
-                if !matches!(leading, Doc::Empty) {
-                    group_items.push(leading);
-                }
-                let leading_dir = self.leading_directives_doc(*child);
-                if !matches!(leading_dir, Doc::Empty) {
-                    group_items.push(leading_dir);
-                }
+                group_items.extend(self.row_leading_docs(*child));
 
                 let trailing_dir = self.trailing_directives_doc(*child);
                 let expanded_len = expanded.len();
@@ -682,20 +701,7 @@ impl<'a> DocBuilder<'a> {
                 && kind == K::DECL_VAR
                 && let Some(expanded) = self.expand_alias_misparse(*child)
             {
-                let mut leading = self.leading_comments_doc(*child);
-                if matches!(leading, Doc::Empty) {
-                    let ch = self.code_children(*child);
-                    if let Some(first) = ch.first() {
-                        leading = self.leading_comments_doc(*first);
-                    }
-                }
-                if !matches!(leading, Doc::Empty) {
-                    group_items.push(leading);
-                }
-                let leading_dir = self.leading_directives_doc(*child);
-                if !matches!(leading_dir, Doc::Empty) {
-                    group_items.push(leading_dir);
-                }
+                group_items.extend(self.row_leading_docs(*child));
 
                 for cells in expanded {
                     group_items.push(doc::align_row(cells));
@@ -721,25 +727,7 @@ impl<'a> DocBuilder<'a> {
                 // Emit leading comments/directives for this declaration
                 // as plain docs (they don't participate in alignment but
                 // don't break the group either).
-                //
-                // CommentMap associates comments with leaves, so when a
-                // comment precedes a declaration it's typically attached
-                // to the first leaf child (e.g. the identifier), not to
-                // the declaration node itself.  Check both.
-                let mut leading = self.leading_comments_doc(*child);
-                if matches!(leading, Doc::Empty) {
-                    let children = self.code_children(*child);
-                    if let Some(first) = children.first() {
-                        leading = self.leading_comments_doc(*first);
-                    }
-                }
-                if !matches!(leading, Doc::Empty) {
-                    group_items.push(leading);
-                }
-                let leading_dir = self.leading_directives_doc(*child);
-                if !matches!(leading_dir, Doc::Empty) {
-                    group_items.push(leading_dir);
-                }
+                group_items.extend(self.row_leading_docs(*child));
                 // Emit trailing directives after the row content if present.
                 let trailing_dir = self.trailing_directives_doc(*child);
                 if matches!(trailing_dir, Doc::Empty) {

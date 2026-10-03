@@ -897,3 +897,98 @@ end.
     );
     idempotency_check_aligned(source);
 }
+
+// ── Standalone directive between aligned declarations ──────────────
+// The directive leads the next declaration's first leaf. Its Hardline
+// used to land inside the row's first cell, after the row had already
+// started a line, leaving a blank line that split the alignment group on
+// the next run.
+
+fn assert_directive_kept_without_blank_lines(result: &str, directive: &str) {
+    let lines: Vec<&str> = result.lines().collect();
+    let at: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].trim() == directive)
+        .collect();
+    assert_eq!(at.len(), 1, "expected {directive} once:\n{result}");
+    let i = at[0];
+    assert!(
+        !lines[i - 1].trim().is_empty() && !lines[i + 1].trim().is_empty(),
+        "blank line around {directive}:\n{result}"
+    );
+}
+
+#[test]
+fn var_alignment_keeps_standalone_directive() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure P;
+var
+  A: Integer;
+  {$R+}
+  CCC: Integer;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    assert_directive_kept_without_blank_lines(&result, "{$R+}");
+    idempotency_check_aligned(source);
+}
+
+#[test]
+fn const_alignment_keeps_standalone_directive() {
+    let source = "\
+unit Test;
+interface
+const
+  kA = 1;
+  {$R-}
+  kLONGER = 2;
+implementation
+end.
+";
+    let result = format_aligned(source);
+    assert_directive_kept_without_blank_lines(&result, "{$R-}");
+    idempotency_check_aligned(source);
+}
+
+#[test]
+fn comma_var_alignment_keeps_standalone_directive() {
+    let source = "\
+unit Test;
+interface
+implementation
+procedure P;
+var
+  I, J: Integer;
+  {$R+}
+  K, LONGER: string;
+begin
+end;
+end.
+";
+    let result = format_aligned(source);
+    assert_directive_kept_without_blank_lines(&result, "{$R+}");
+    idempotency_check_aligned(source);
+}
+
+#[test]
+fn field_alignment_keeps_standalone_directive() {
+    let source = "\
+unit Test;
+interface
+type
+  TFoo = class
+    FA: Integer;
+    {$R+}
+    FLONGER: string;
+  end;
+implementation
+end.
+";
+    let result = format_aligned(source);
+    assert_directive_kept_without_blank_lines(&result, "{$R+}");
+    idempotency_check_aligned(source);
+}

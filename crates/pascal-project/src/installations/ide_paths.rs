@@ -648,7 +648,10 @@ mod tests {
         assert_eq!(paths.library[0].path, sdk.join("lib"));
     }
 
+    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // (backlog TASK-74).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn copied_envoptions_source_path_resolves_case_insensitively_on_linux() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
@@ -692,7 +695,9 @@ mod tests {
         assert_eq!(paths.library[0].path, physical);
     }
 
-    #[cfg(unix)]
+    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // (backlog TASK-74).
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn reconciliation_accepts_case_correction_in_a_directory_with_over_256_entries() {
         let temp = tempfile::tempdir().unwrap();
@@ -743,7 +748,10 @@ mod tests {
         );
     }
 
+    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // (backlog TASK-74).
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn reconciliation_rejects_ambiguous_case_insensitive_components() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sdk");

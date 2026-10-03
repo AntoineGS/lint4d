@@ -366,7 +366,9 @@ fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
     }
 }
 
-#[cfg(not(windows))]
+// Needs case-distinct paths: not on Windows, and not on macOS volumes,
+// which are usually case-insensitive (backlog TASK-74).
+#[cfg(not(any(windows, target_os = "macos")))]
 #[cfg(test)]
 mod tests {
     use super::add_unique_path;

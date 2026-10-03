@@ -258,14 +258,15 @@ pub fn discover_dcu_paths_via_msbuild(
         }
     };
 
-    let output = match wait_with_timeout(child, std::time::Duration::from_secs(15)) {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
-            eprintln!("warning: MSBuild invocation failed: {}", e);
-            return Vec::new();
-        }
-    };
+    let (output, stdout_truncated) =
+        match wait_with_timeout(child, std::time::Duration::from_secs(15)) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                eprintln!("warning: MSBuild invocation failed: {}", e);
+                return Vec::new();
+            }
+        };
 
     // Clean up temp file after MSBuild completes
     let _ = std::fs::remove_file(&temp_path);
@@ -277,6 +278,13 @@ pub fn discover_dcu_paths_via_msbuild(
             output.status,
             stderr.trim()
         );
+        return Vec::new();
+    }
+
+    // Like every other MSBuild failure, a truncated listing yields no paths
+    // rather than a silently partial list.
+    if stdout_truncated {
+        eprintln!("warning: MSBuild output exceeded the capture limit; ignoring its paths");
         return Vec::new();
     }
 
@@ -312,17 +320,24 @@ fn strip_unc_prefix(path: PathBuf) -> PathBuf {
 /// Captured output per pipe; anything beyond this is read and discarded.
 const MAX_CAPTURED_PIPE_BYTES: usize = 1024 * 1024;
 
+/// Bytes captured from a pipe and whether more were read and discarded.
+type DrainedPipe = (Vec<u8>, bool);
+
 /// Read `pipe` to EOF, keeping at most `MAX_CAPTURED_PIPE_BYTES` so the child
 /// never blocks on a full pipe.
-fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+fn drain_pipe(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<DrainedPipe> {
     std::thread::spawn(move || {
         let mut captured = Vec::new();
+        let mut truncated = false;
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => return captured,
+                Ok(0) | Err(_) => return (captured, truncated),
                 Ok(read) => {
                     let room = MAX_CAPTURED_PIPE_BYTES.saturating_sub(captured.len());
+                    truncated |= read > room;
                     captured.extend_from_slice(&chunk[..read.min(room)]);
                 }
             }
@@ -334,26 +349,34 @@ fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::Joi
 /// is exceeded (and kills and reaps the process).
 ///
 /// Stdout and stderr are drained on reader threads from launch, so a child
-/// that fills a pipe is not mistaken for a hung one.
+/// that fills a pipe is not mistaken for a hung one. The flag reports that
+/// stdout exceeded `MAX_CAPTURED_PIPE_BYTES` and was truncated.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
-) -> Result<std::process::Output, String> {
+) -> Result<(std::process::Output, bool), String> {
     let stdout = child.stdout.take().map(drain_pipe);
     let stderr = child.stderr.take().map(drain_pipe);
-    let join = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        reader.map_or_else(Vec::new, |reader| reader.join().unwrap_or_default())
+    let join = |reader: Option<std::thread::JoinHandle<DrainedPipe>>| {
+        reader.map_or_else(DrainedPipe::default, |reader| {
+            reader.join().unwrap_or_default()
+        })
     };
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return Ok(std::process::Output {
-                    status,
-                    stdout: join(stdout),
-                    stderr: join(stderr),
-                });
+                let (stdout, stdout_truncated) = join(stdout);
+                let (stderr, _) = join(stderr);
+                return Ok((
+                    std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    },
+                    stdout_truncated,
+                ));
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
@@ -390,8 +413,9 @@ mod wait_with_timeout_tests {
     fn child_writing_more_than_a_pipe_buffer_completes_without_timeout() {
         let child = spawn_sh("head -c 4194304 /dev/zero; head -c 2097152 /dev/zero >&2");
         let started = Instant::now();
-        let output = wait_with_timeout(child, Duration::from_secs(10))
+        let (output, stdout_truncated) = wait_with_timeout(child, Duration::from_secs(10))
             .expect("a child that fills its pipes must not time out");
+        assert!(stdout_truncated);
         assert!(output.status.success());
         assert!(started.elapsed() < Duration::from_secs(8));
         assert_eq!(output.stdout.len(), 1024 * 1024);

@@ -374,10 +374,9 @@ impl OutboundQueue {
                 Message::Notification(notification)
                     if notification.method == "textDocument/publishDiagnostics"
             )
+            && let Some(limit) = self.test_control_message_limit
         {
-            if let Some(limit) = self.test_control_message_limit {
-                return limit;
-            }
+            return limit;
         }
         MAX_PENDING_OUTBOUND_CONTROL_MESSAGES
     }
@@ -6667,14 +6666,12 @@ impl AnalysisJobs {
                         | AnalysisResultValue::OutgoingCalls(_)
                         | AnalysisResultValue::TypeHierarchySupertypes(_)
                         | AnalysisResultValue::TypeHierarchySubtypes(_)
+                ) && let Err(error) = wait_at_test_barrier(
+                    TestBarrier::PartialValidation,
+                    &test_barriers,
+                    &worker_cancellation,
                 ) {
-                    if let Err(error) = wait_at_test_barrier(
-                        TestBarrier::PartialValidation,
-                        &test_barriers,
-                        &worker_cancellation,
-                    ) {
-                        invalidate_analysis_result(&mut result, error);
-                    }
+                    invalidate_analysis_result(&mut result, error);
                 }
                 if let Err(error) = rename::revalidate_input(
                     &validation_input,

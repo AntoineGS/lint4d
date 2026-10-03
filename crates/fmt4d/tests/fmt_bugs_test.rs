@@ -4025,3 +4025,92 @@ fn fmt_off_declaration_in_aligned_section_keeps_trivia_once() {
     assert_eq!(result.matches("// t").count(), 1, "{result}");
     idempotency_check_aligned(&src);
 }
+
+// ── Bug: comments inside a uses clause and after `end.` are dropped ──
+// The uses clause is rebuilt from its unit names, which had no slot for
+// comments, and the comment and directive maps only attach trivia to a
+// following or same-line preceding leaf, so trivia after the last token
+// of the file had nowhere to go.
+
+#[test]
+fn uses_clause_keeps_trailing_comment_after_unit() {
+    let src = "unit T;\ninterface\nuses A, // why A\n B;\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains("uses\n  A, // why A\n  B;\n"),
+        "uses comment was dropped:\n{result}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_clause_leading_comment_moves_with_sorted_unit() {
+    let src = "unit T;\ninterface\nuses\n  // second\n  B,\n  A; // last\nimplementation\nend.\n";
+    let result = format_source(src);
+    // A comment on a unit's line, before or after its `,`/`;`, belongs to
+    // that unit and moves with it.
+    assert!(
+        result.contains("uses\n  A, // last\n  // second\n  B;\n"),
+        "uses comments were dropped or detached:\n{result}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_clause_keeps_comments_around_keyword_and_conditional_block() {
+    let src = "\
+unit T;
+interface
+// deps
+uses // keyword
+  A,
+  {$IFDEF X} // x only
+  // gated
+  XUnit,
+  {$ENDIF}
+  B
+  { tail }
+  ;
+implementation
+end.
+";
+    let result = format_source(src);
+    for comment in ["// deps", "// keyword", "// x only", "// gated", "{ tail }"] {
+        assert_eq!(
+            result.matches(comment).count(),
+            1,
+            "{comment:?} was not kept exactly once:\n{result}"
+        );
+    }
+    idempotency_check(src);
+}
+
+#[test]
+fn comment_after_final_end_is_kept() {
+    let src = "unit T;\ninterface\nimplementation\nend.\n// trailing note\n\n{ footer\n  block }\n";
+    let result = format_source(src);
+    assert!(
+        result.ends_with("end.\n// trailing note\n\n{ footer\n  block }\n"),
+        "trivia after `end.` was dropped:\n{result:?}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn directive_after_final_end_is_kept() {
+    let src = "unit T;\ninterface\nimplementation\nend.\n{$ENDREGION}\n";
+    let result = format_source(src);
+    assert!(
+        result.ends_with("end.\n{$ENDREGION}\n"),
+        "directive after `end.` was dropped:\n{result:?}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn file_with_only_trivia_gets_no_leading_space() {
+    let src = "// only a comment\n{$DEFINE X}\n";
+    let result = format_source(src);
+    assert_eq!(result, src);
+    idempotency_check(src);
+}

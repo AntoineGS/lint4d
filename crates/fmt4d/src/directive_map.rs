@@ -38,6 +38,8 @@ pub struct AttachedDirective {
 pub struct DirectiveMap {
     leading: HashMap<usize, Vec<AttachedDirective>>,
     trailing: HashMap<usize, Vec<AttachedDirective>>,
+    /// Standalone directives after the last leaf, which have no node to lead.
+    eof: Vec<AttachedDirective>,
 }
 
 impl DirectiveMap {
@@ -57,36 +59,63 @@ impl DirectiveMap {
         let mut leaves = Vec::new();
         collect_leaves(root, &mut leaves);
 
-        let mut leading: HashMap<usize, Vec<AttachedDirective>> = HashMap::new();
-        let mut trailing: HashMap<usize, Vec<AttachedDirective>> = HashMap::new();
-
+        let mut map = DirectiveMap::empty();
         for (dir_node, text) in &directives {
-            attach_one(
+            map.attach(
                 &leaves,
                 dir_node.start_byte(),
                 dir_node.end_byte(),
                 dir_node.start_position().row,
                 text.clone(),
-                &mut leading,
-                &mut trailing,
             );
         }
 
         // Fold virtual directives derived from patches.
         let virtuals = patches_to_virtuals(patches);
         for v in &virtuals {
-            attach_one(
-                &leaves,
-                v.start_byte,
-                v.end_byte,
-                v.row,
-                v.text.clone(),
-                &mut leading,
-                &mut trailing,
-            );
+            map.attach(&leaves, v.start_byte, v.end_byte, v.row, v.text.clone());
         }
 
-        DirectiveMap { leading, trailing }
+        map.eof.sort_by_key(|d| d.span.start);
+        map
+    }
+
+    /// Attach a single directive (real or virtual) to either a preceding leaf
+    /// (trailing), the next leaf (leading), or the end of the file when no
+    /// leaf follows. Shared by `build` and `build_with_patches`.
+    fn attach(
+        &mut self,
+        leaves: &[Node<'_>],
+        dir_start: usize,
+        dir_end: usize,
+        dir_row: usize,
+        text: String,
+    ) {
+        if let Some(prev) = find_prev_leaf_at(leaves, dir_start)
+            && prev.end_position().row == dir_row
+        {
+            let gap = dir_start.saturating_sub(prev.end_byte());
+            self.trailing
+                .entry(prev.id())
+                .or_default()
+                .push(AttachedDirective {
+                    text,
+                    trailing: true,
+                    gap,
+                    span: dir_start..dir_end,
+                });
+            return;
+        }
+        let directive = AttachedDirective {
+            text,
+            trailing: false,
+            gap: 0,
+            span: dir_start..dir_end,
+        };
+        match find_next_leaf_at(leaves, dir_end) {
+            Some(next) => self.leading.entry(next.id()).or_default().push(directive),
+            None => self.eof.push(directive),
+        }
     }
 
     /// Get leading directives for a node.
@@ -99,12 +128,17 @@ impl DirectiveMap {
         self.trailing.get(&node_id).map_or(&[], |v| v.as_slice())
     }
 
+    /// Get the standalone directives after the last leaf, in source order.
+    pub fn eof_directives(&self) -> &[AttachedDirective] {
+        &self.eof
+    }
+
     /// Returns an empty DirectiveMap (no directives attached).
-    #[allow(dead_code)] // Phase F follow-up: wire into builder fall-back paths.
     pub fn empty() -> Self {
         DirectiveMap {
             leading: HashMap::new(),
             trailing: HashMap::new(),
+            eof: Vec::new(),
         }
     }
 }
@@ -119,46 +153,6 @@ fn collect_directives<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<(Node<'a>
     }
     for child in node.children(&mut node.walk()) {
         collect_directives(child, source, out);
-    }
-}
-
-/// Attach a single directive (real or virtual) to either a preceding leaf
-/// (trailing) or the next leaf (leading). Shared by `build` and
-/// `build_with_patches`.
-fn attach_one(
-    leaves: &[Node<'_>],
-    dir_start: usize,
-    dir_end: usize,
-    dir_row: usize,
-    text: String,
-    leading: &mut HashMap<usize, Vec<AttachedDirective>>,
-    trailing: &mut HashMap<usize, Vec<AttachedDirective>>,
-) {
-    if let Some(prev) = find_prev_leaf_at(leaves, dir_start)
-        && prev.end_position().row == dir_row
-    {
-        let gap = dir_start.saturating_sub(prev.end_byte());
-        trailing
-            .entry(prev.id())
-            .or_default()
-            .push(AttachedDirective {
-                text,
-                trailing: true,
-                gap,
-                span: dir_start..dir_end,
-            });
-        return;
-    }
-    if let Some(next) = find_next_leaf_at(leaves, dir_end) {
-        leading
-            .entry(next.id())
-            .or_default()
-            .push(AttachedDirective {
-                text,
-                trailing: false,
-                gap: 0,
-                span: dir_start..dir_end,
-            });
     }
 }
 

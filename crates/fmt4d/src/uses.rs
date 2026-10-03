@@ -1,6 +1,8 @@
+use crate::comments::CommentMap;
 use crate::config::UsesConfig;
+use crate::doc_builder::{first_leaf, last_leaf};
 use pascal_core::node_kind as K;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,16 +15,36 @@ pub enum UnitSection {
 /// An item in a uses clause — either a sortable unit or a pinned directive.
 #[derive(Debug, Clone)]
 pub enum UsesItem {
-    /// A regular unit name — participates in sorting/grouping.
-    Unit(String),
+    /// A regular unit name — participates in sorting/grouping. Its comments
+    /// move with it: `leading` ones sit on their own lines above it,
+    /// `trailing` ones (including those around its `,` or `;`) follow the
+    /// punctuation on its line.
+    Unit {
+        name: String,
+        leading: Vec<String>,
+        trailing: Vec<String>,
+    },
     /// An {$IFDEF}...{$ENDIF} block — pinned in position, contents untouched.
     IfDefBlock(IfDefBlock),
     /// A standalone directive ({$I ...}, {$HINTS OFF}, etc.) — pinned in position.
     Directive(String),
+    /// A comment with no unit to attach to — pinned in position.
+    Comment(String),
+}
+
+impl UsesItem {
+    /// A unit without comments.
+    pub fn unit(name: impl Into<String>) -> Self {
+        UsesItem::Unit {
+            name: name.into(),
+            leading: Vec::new(),
+            trailing: Vec::new(),
+        }
+    }
 }
 
 /// A complete {$IFDEF}...{$ENDIF} conditional block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IfDefBlock {
     /// The opening condition branch.
     pub if_branch: CondBranch,
@@ -30,15 +52,21 @@ pub struct IfDefBlock {
     pub else_if_branches: Vec<CondBranch>,
     /// Optional {$ELSE} fallback branch (units only, directive text is implicit "{$ELSE}").
     pub else_branch: Option<Vec<UsesItem>>,
+    /// Comments on the `{$ELSE}` line.
+    pub else_trailing: Vec<String>,
     /// The closing directive text, e.g. "{$ENDIF}".
     pub endif: String,
+    /// Comments on the `{$ENDIF}` line, after any `;`.
+    pub trailing: Vec<String>,
 }
 
 /// A conditional branch with its directive text and items.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CondBranch {
     /// The directive text: "{$IFDEF DELPHI_XE6_UP}", "{$ELSEIF expr}", etc.
     pub directive: String,
+    /// Comments on the directive's line.
+    pub trailing: Vec<String>,
     /// Items in this branch (order preserved, not sorted). Recursive — can
     /// contain nested IfDefBlocks.
     pub items: Vec<UsesItem>,
@@ -138,9 +166,9 @@ fn legacy_namespace(name: &str) -> Option<&'static str> {
 fn collect_items_units(items: &[UsesItem], out: &mut Vec<String>) {
     for item in items {
         match item {
-            UsesItem::Unit(name) => out.push(name.clone()),
+            UsesItem::Unit { name, .. } => out.push(name.clone()),
             UsesItem::IfDefBlock(block) => collect_ifdef_units(block, out),
-            UsesItem::Directive(_) => {}
+            UsesItem::Directive(_) | UsesItem::Comment(_) => {}
         }
     }
 }
@@ -247,156 +275,175 @@ enum BranchState {
     Else,
 }
 
+/// The item list of the branch `state` points at.
+fn branch_items(block: &mut IfDefBlock, state: BranchState) -> &mut Vec<UsesItem> {
+    match state {
+        BranchState::ElseIf if !block.else_if_branches.is_empty() => {
+            let last = block.else_if_branches.len() - 1;
+            &mut block.else_if_branches[last].items
+        }
+        BranchState::Else => block.else_branch.get_or_insert_with(Vec::new),
+        _ => &mut block.if_branch.items,
+    }
+}
+
+/// Texts of the comments leading `node`'s first leaf.
+fn leading_texts(node: tree_sitter::Node, comments: &CommentMap) -> Vec<String> {
+    comments
+        .leading_comments(first_leaf(node).id())
+        .iter()
+        .map(|c| c.text.clone())
+        .collect()
+}
+
+/// Texts of the comments trailing `node`'s last leaf.
+fn trailing_texts(node: tree_sitter::Node, comments: &CommentMap) -> Vec<String> {
+    comments
+        .trailing_comments(last_leaf(node).id())
+        .iter()
+        .map(|c| c.text.clone())
+        .collect()
+}
+
+/// Texts of the comments on either side of a `,` or `;`.
+fn punctuation_texts(node: tree_sitter::Node, comments: &CommentMap) -> Vec<String> {
+    let mut texts = leading_texts(node, comments);
+    texts.extend(trailing_texts(node, comments));
+    texts
+}
+
+/// Give comments found after an item (around its `,` or `;`) to that item,
+/// or pin them in place when it cannot carry comments.
+fn attach_after(items: &mut Vec<UsesItem>, texts: Vec<String>) {
+    match items.last_mut() {
+        Some(UsesItem::Unit { trailing, .. }) => trailing.extend(texts),
+        Some(UsesItem::IfDefBlock(block)) => block.trailing.extend(texts),
+        _ => items.extend(texts.into_iter().map(UsesItem::Comment)),
+    }
+}
+
+/// Build a unit item from a `moduleName` node, with the comments that
+/// lead its first leaf and trail its last one.
+fn unit_item(node: tree_sitter::Node, source: &[u8], comments: &CommentMap) -> Option<UsesItem> {
+    let name = node_text(node, source);
+    (!name.is_empty()).then(|| UsesItem::Unit {
+        name,
+        leading: leading_texts(node, comments),
+        trailing: trailing_texts(node, comments),
+    })
+}
+
 /// Walk children of a `ppUsesBlock` node and return an `IfDefBlock`.
-fn parse_pp_uses_block(node: tree_sitter::Node, source: &[u8]) -> IfDefBlock {
-    let children: Vec<tree_sitter::Node> = node.children(&mut node.walk()).collect();
-
-    let mut if_branch = CondBranch {
-        directive: String::new(),
-        items: Vec::new(),
-    };
-    let mut else_if_branches: Vec<CondBranch> = Vec::new();
-    let mut else_branch: Option<Vec<UsesItem>> = None;
-    let mut endif = String::new();
-
+///
+/// Comments leading the block's own `{$IFDEF}` belong to the caller.
+fn parse_pp_uses_block(
+    node: tree_sitter::Node,
+    source: &[u8],
+    comments: &CommentMap,
+) -> IfDefBlock {
+    let mut block = IfDefBlock::default();
     // Which conditional branch we are currently appending items into.
     let mut state = BranchState::If;
-    // Current elseif branch being built (used when state == BranchState::ElseIf)
-    let mut current_elseif: Option<CondBranch> = None;
+    let mut ended = false;
 
-    for child in children {
+    for child in node.children(&mut node.walk()) {
         match child.kind() {
-            k if k == K::PP_IF => {
-                if_branch.directive = node_text(child, source);
+            K::PP_IF => {
+                block.if_branch.directive = node_text(child, source);
+                block.if_branch.trailing = trailing_texts(child, comments);
             }
-            k if k == K::PP_ELSE => {
+            K::PP_ELSE => {
+                let leading = leading_texts(child, comments);
+                branch_items(&mut block, state).extend(leading.into_iter().map(UsesItem::Comment));
                 let text = node_text(child, source);
+                let trailing = trailing_texts(child, comments);
                 if text.to_lowercase().contains("elseif") {
-                    // Flush current branch
-                    match state {
-                        BranchState::If => {
-                            // we were in if_branch, nothing to flush to else_if_branches yet
-                        }
-                        BranchState::ElseIf => {
-                            if let Some(branch) = current_elseif.take() {
-                                else_if_branches.push(branch);
-                            }
-                        }
-                        BranchState::Else => {
-                            // Unreachable in well-formed input: {$ELSEIF} after {$ELSE}.
-                        }
-                    }
-                    current_elseif = Some(CondBranch {
+                    block.else_if_branches.push(CondBranch {
                         directive: text,
+                        trailing,
                         items: Vec::new(),
                     });
                     state = BranchState::ElseIf;
                 } else {
                     // It's a plain {$ELSE}
-                    if state == BranchState::ElseIf
-                        && let Some(branch) = current_elseif.take()
-                    {
-                        else_if_branches.push(branch);
-                    }
-                    else_branch = Some(Vec::new());
+                    block.else_branch = Some(Vec::new());
+                    block.else_trailing = trailing;
                     state = BranchState::Else;
                 }
             }
-            k if k == K::PP_END_IF => {
-                // Flush any pending elseif
-                if state == BranchState::ElseIf
-                    && let Some(branch) = current_elseif.take()
-                {
-                    else_if_branches.push(branch);
-                }
-                endif = node_text(child, source);
+            K::PP_END_IF => {
+                let leading = leading_texts(child, comments);
+                branch_items(&mut block, state).extend(leading.into_iter().map(UsesItem::Comment));
+                block.endif = node_text(child, source);
+                block.trailing = trailing_texts(child, comments);
+                ended = true;
             }
-            k if k == K::MODULE_NAME => {
+            K::MODULE_NAME => {
+                if let Some(item) = unit_item(child, source, comments) {
+                    branch_items(&mut block, state).push(item);
+                }
+            }
+            K::PP_USES_BLOCK => {
+                let items = branch_items(&mut block, state);
+                items.extend(
+                    leading_texts(child, comments)
+                        .into_iter()
+                        .map(UsesItem::Comment),
+                );
+                items.push(UsesItem::IfDefBlock(parse_pp_uses_block(
+                    child, source, comments,
+                )));
+            }
+            K::PP_DIRECTIVE => {
                 let text = node_text(child, source);
-                if !text.is_empty() {
-                    let item = UsesItem::Unit(text);
-                    match state {
-                        BranchState::If => if_branch.items.push(item),
-                        BranchState::ElseIf => {
-                            if let Some(ref mut branch) = current_elseif {
-                                branch.items.push(item);
-                            }
-                        }
-                        BranchState::Else => {
-                            if let Some(ref mut v) = else_branch {
-                                v.push(item);
-                            }
-                        }
-                    }
+                branch_items(&mut block, state).push(UsesItem::Directive(text));
+            }
+            K::COMMA | K::SEMICOLON => {
+                let texts = punctuation_texts(child, comments);
+                if ended {
+                    block.trailing.extend(texts);
+                } else {
+                    attach_after(branch_items(&mut block, state), texts);
                 }
             }
-            k if k == K::PP_USES_BLOCK => {
-                let nested = UsesItem::IfDefBlock(parse_pp_uses_block(child, source));
-                match state {
-                    BranchState::If => if_branch.items.push(nested),
-                    BranchState::ElseIf => {
-                        if let Some(ref mut branch) = current_elseif {
-                            branch.items.push(nested);
-                        }
-                    }
-                    BranchState::Else => {
-                        if let Some(ref mut v) = else_branch {
-                            v.push(nested);
-                        }
-                    }
-                }
-            }
-            k if k == K::PP_DIRECTIVE => {
-                let text = node_text(child, source);
-                let item = UsesItem::Directive(text);
-                match state {
-                    BranchState::If => if_branch.items.push(item),
-                    BranchState::ElseIf => {
-                        if let Some(ref mut branch) = current_elseif {
-                            branch.items.push(item);
-                        }
-                    }
-                    BranchState::Else => {
-                        if let Some(ref mut v) = else_branch {
-                            v.push(item);
-                        }
-                    }
-                }
-            }
-            _ => {} // skip kUses, commas, etc.
+            _ => {} // skip comments (taken from `comments`), etc.
         }
     }
 
-    IfDefBlock {
-        if_branch,
-        else_if_branches,
-        else_branch,
-        endif,
-    }
+    block
 }
 
 /// Extract all items from a `declUses` node into a `Vec<UsesItem>`.
-pub fn extract_uses_items(node: tree_sitter::Node, source: &[u8]) -> Vec<UsesItem> {
+///
+/// Comments come from `comments`; those attached to the `uses` keyword
+/// are left to the caller.
+pub(crate) fn extract_uses_items(
+    node: tree_sitter::Node,
+    source: &[u8],
+    comments: &CommentMap,
+) -> Vec<UsesItem> {
     let mut items = Vec::new();
-    let children: Vec<tree_sitter::Node> = node.children(&mut node.walk()).collect();
-    for child in children {
+    for child in node.children(&mut node.walk()) {
         match child.kind() {
-            k if k == K::MODULE_NAME => {
-                let text = node_text(child, source);
-                if !text.is_empty() {
-                    items.push(UsesItem::Unit(text));
-                }
+            K::MODULE_NAME => items.extend(unit_item(child, source, comments)),
+            K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
+                items.extend(
+                    leading_texts(child, comments)
+                        .into_iter()
+                        .map(UsesItem::Comment),
+                );
+                items.push(UsesItem::IfDefBlock(parse_pp_uses_block(
+                    child, source, comments,
+                )));
             }
-            k if k == K::PP_USES_BLOCK || k == K::PP_USES_BLOCK_WITH_SEMI => {
-                items.push(UsesItem::IfDefBlock(parse_pp_uses_block(child, source)));
-            }
-            k if k == K::PP_DIRECTIVE => {
+            K::PP_DIRECTIVE => {
                 let text = node_text(child, source);
                 if !text.is_empty() {
                     items.push(UsesItem::Directive(text));
                 }
             }
-            _ => {} // skip kUses keyword, commas, semicolons, etc.
+            K::COMMA | K::SEMICOLON => attach_after(&mut items, punctuation_texts(child, comments)),
+            _ => {} // skip kUses keyword, comments, etc.
         }
     }
     items
@@ -417,10 +464,31 @@ pub fn format_uses_items(
     indent: &str,
     external_units: &HashSet<String>,
 ) -> String {
+    layout_uses_items(items, config, indent, external_units)
+        .into_iter()
+        .map(|line| line + "\n")
+        .collect()
+}
+
+/// A unit's leading and trailing comments.
+type UnitComments<'a> = (&'a [String], &'a [String]);
+
+/// Like [`format_uses_items`], but return the output lines without their
+/// newlines. An empty line separates groups; a line holding a multi-line
+/// block comment contains its inner newlines.
+pub(crate) fn layout_uses_items(
+    items: &[UsesItem],
+    config: &UsesConfig,
+    indent: &str,
+    external_units: &HashSet<String>,
+) -> Vec<String> {
     // Separate plain units from pinned items, recording the anchor (preceding unit name).
     // When grouping is enabled, ifdef blocks whose units all belong to one section
     // are placed in that section rather than pinned.
     let mut plain_units: Vec<String> = Vec::new();
+    // Comments of each unit, queued per name in source order (sorting is
+    // stable, so duplicates keep their relative order).
+    let mut unit_comments: HashMap<&str, VecDeque<UnitComments>> = HashMap::new();
     // pinned: (anchor: Option<String>, item)
     // anchor is None when the pinned item appears before any unit.
     let mut pinned: Vec<(Option<String>, UsesItem)> = Vec::new();
@@ -430,8 +498,16 @@ pub fn format_uses_items(
 
     for item in items {
         match item {
-            UsesItem::Unit(name) => {
+            UsesItem::Unit {
+                name,
+                leading,
+                trailing,
+            } => {
                 plain_units.push(name.clone());
+                unit_comments
+                    .entry(name.as_str())
+                    .or_default()
+                    .push_back((leading, trailing));
                 last_unit = Some(name.clone());
             }
             UsesItem::IfDefBlock(block) if config.group => {
@@ -441,7 +517,7 @@ pub fn format_uses_items(
                     pinned.push((last_unit.clone(), item.clone()));
                 }
             }
-            UsesItem::IfDefBlock(_) | UsesItem::Directive(_) => {
+            UsesItem::IfDefBlock(_) | UsesItem::Directive(_) | UsesItem::Comment(_) => {
                 pinned.push((last_unit.clone(), item.clone()));
             }
         }
@@ -537,103 +613,150 @@ pub fn format_uses_items(
         }
     }
 
-    // Count total real items (units + pinned items) to determine the last one for semicolon.
-    // We need to find the last non-GroupSep slot.
+    // The last unit or ifdef block takes the clause's semicolon; pinned
+    // comments after it cannot.
     let last_real_idx = slots
         .iter()
-        .rposition(|s| !matches!(s, Slot::GroupSep))
+        .rposition(|s| !matches!(s, Slot::GroupSep | Slot::Pinned(UsesItem::Comment(_))))
         .unwrap_or(0);
 
     // Emit the output.
-    let mut output = String::new();
+    let mut lines = Vec::new();
     for (slot_idx, slot) in slots.iter().enumerate() {
         let is_last = slot_idx == last_real_idx;
         match slot {
-            Slot::GroupSep => {
-                output.push('\n');
-            }
+            Slot::GroupSep => lines.push(String::new()),
             Slot::Unit { name } => {
-                output.push_str(indent);
-                output.push_str(name);
-                if is_last {
-                    output.push_str(";\n");
-                } else {
-                    output.push_str(",\n");
-                }
+                let (leading, trailing) = unit_comments
+                    .get_mut(name.as_str())
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or((&[], &[]));
+                emit_unit(name, leading, trailing, indent, is_last, &mut lines);
             }
             Slot::Pinned(item) => {
-                emit_uses_item(item, indent, is_last, &mut output);
+                emit_uses_item(item, indent, is_last, &mut lines);
             }
         }
     }
 
-    output
+    lines
 }
 
-/// Recursively emit a single `UsesItem` into `output`.
-fn emit_uses_item(item: &UsesItem, indent: &str, is_last_overall: bool, output: &mut String) {
+/// Recursively emit a single `UsesItem` into `lines`.
+fn emit_uses_item(item: &UsesItem, indent: &str, is_last_overall: bool, lines: &mut Vec<String>) {
     match item {
-        UsesItem::Unit(name) => {
-            output.push_str(indent);
-            output.push_str(name);
-            if is_last_overall {
-                output.push_str(";\n");
-            } else {
-                output.push_str(",\n");
-            }
-        }
-        UsesItem::Directive(text) => {
-            output.push_str(indent);
-            output.push_str(text);
-            output.push('\n');
+        UsesItem::Unit {
+            name,
+            leading,
+            trailing,
+        } => emit_unit(name, leading, trailing, indent, is_last_overall, lines),
+        UsesItem::Directive(text) | UsesItem::Comment(text) => {
+            lines.push(format!("{indent}{text}"));
         }
         UsesItem::IfDefBlock(block) => {
-            emit_ifdef_block(block, indent, is_last_overall, output);
+            emit_ifdef_block(block, indent, is_last_overall, lines);
         }
     }
 }
 
-/// Emit an `IfDefBlock`. If `semicolon_after_endif` is true, the `{$ENDIF}` line
+/// Emit a unit line, its leading comments on their own lines above it.
+fn emit_unit(
+    name: &str,
+    leading: &[String],
+    trailing: &[String],
+    indent: &str,
+    is_last_overall: bool,
+    lines: &mut Vec<String>,
+) {
+    for comment in leading {
+        lines.push(format!("{indent}{comment}"));
+    }
+    let punctuation = if is_last_overall { ';' } else { ',' };
+    push_with_trailing(
+        format!("{indent}{name}{punctuation}"),
+        trailing,
+        indent,
+        lines,
+    );
+}
+
+/// Push `line` followed by its trailing comments. A comment after a `//`
+/// comment starts its own line, since the `//` would swallow it.
+fn push_with_trailing(
+    mut line: String,
+    trailing: &[String],
+    indent: &str,
+    lines: &mut Vec<String>,
+) {
+    let mut after_line_comment = false;
+    for comment in trailing {
+        if after_line_comment {
+            lines.push(std::mem::replace(&mut line, format!("{indent}{comment}")));
+        } else {
+            line.push(' ');
+            line.push_str(comment);
+        }
+        after_line_comment = comment.starts_with("//");
+    }
+    lines.push(line);
+}
+
+/// Emit an `IfDefBlock`. If `is_last_overall` is true, the `{$ENDIF}` line
 /// gets a trailing `;`.
-fn emit_ifdef_block(block: &IfDefBlock, indent: &str, is_last_overall: bool, output: &mut String) {
+fn emit_ifdef_block(
+    block: &IfDefBlock,
+    indent: &str,
+    is_last_overall: bool,
+    lines: &mut Vec<String>,
+) {
     // Emit if_branch directive
-    output.push_str(indent);
-    output.push_str(&block.if_branch.directive);
-    output.push('\n');
+    push_with_trailing(
+        format!("{indent}{}", block.if_branch.directive),
+        &block.if_branch.trailing,
+        indent,
+        lines,
+    );
 
     // Emit if_branch items (never the very last item of the clause, since the
     // last item is determined at the top level). Within the block, all units get commas.
     for item in &block.if_branch.items {
-        emit_uses_item(item, indent, false, output);
+        emit_uses_item(item, indent, false, lines);
     }
 
     // Emit elseif branches
     for branch in &block.else_if_branches {
-        output.push_str(indent);
-        output.push_str(&branch.directive);
-        output.push('\n');
+        push_with_trailing(
+            format!("{indent}{}", branch.directive),
+            &branch.trailing,
+            indent,
+            lines,
+        );
         for item in &branch.items {
-            emit_uses_item(item, indent, false, output);
+            emit_uses_item(item, indent, false, lines);
         }
     }
 
     // Emit else branch
     if let Some(else_items) = &block.else_branch {
-        output.push_str(indent);
-        output.push_str("{$ELSE}");
-        output.push('\n');
+        push_with_trailing(
+            format!("{indent}{{$ELSE}}"),
+            &block.else_trailing,
+            indent,
+            lines,
+        );
         for item in else_items {
-            emit_uses_item(item, indent, false, output);
+            emit_uses_item(item, indent, false, lines);
         }
     }
 
     // Emit endif
-    output.push_str(indent);
-    output.push_str(&block.endif);
-    if is_last_overall {
-        output.push(';');
-    }
-    output.push('\n');
+    let semicolon = if is_last_overall { ";" } else { "" };
+    push_with_trailing(
+        format!("{indent}{}{semicolon}", block.endif),
+        &block.trailing,
+        indent,
+        lines,
+    );
 }
 
 /// Recursively scan directories for `.pas` files and collect unit names (lowercased).
@@ -904,7 +1027,7 @@ mod tests {
             "MyApp.Utils",
         ]
         .into_iter()
-        .map(|s| UsesItem::Unit(s.to_string()))
+        .map(UsesItem::unit)
         .collect();
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
         let expected =
@@ -916,9 +1039,9 @@ mod tests {
 
     #[test]
     fn uses_item_unit_constructable() {
-        let item = UsesItem::Unit("SysUtils".to_string());
+        let item = UsesItem::unit("SysUtils");
         match item {
-            UsesItem::Unit(name) => assert_eq!(name, "SysUtils"),
+            UsesItem::Unit { name, .. } => assert_eq!(name, "SysUtils"),
             _ => panic!("wrong variant"),
         }
     }
@@ -937,11 +1060,13 @@ mod tests {
         let block = IfDefBlock {
             if_branch: CondBranch {
                 directive: "{$IFDEF FOO}".to_string(),
-                items: vec![UsesItem::Unit("SpecialUnit".to_string())],
+                items: vec![UsesItem::unit("SpecialUnit")],
+                ..CondBranch::default()
             },
             else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::Unit("OtherUnit".to_string())]),
+            else_branch: Some(vec![UsesItem::unit("OtherUnit")]),
             endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
         };
         assert_eq!(block.if_branch.directive, "{$IFDEF FOO}");
         assert_eq!(block.endif, "{$ENDIF}");
@@ -974,14 +1099,15 @@ mod tests {
         let src = "unit Foo;\ninterface\nuses\n  SysUtils,\n  Classes;\nimplementation\nend.";
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
-        let items = extract_uses_items(uses_node, &bytes);
+        let comments = CommentMap::build(tree.root_node(), &bytes);
+        let items = extract_uses_items(uses_node, &bytes, &comments);
         assert_eq!(items.len(), 2);
         match &items[0] {
-            UsesItem::Unit(name) => assert_eq!(name, "SysUtils"),
+            UsesItem::Unit { name, .. } => assert_eq!(name, "SysUtils"),
             _ => panic!("expected Unit"),
         }
         match &items[1] {
-            UsesItem::Unit(name) => assert_eq!(name, "Classes"),
+            UsesItem::Unit { name, .. } => assert_eq!(name, "Classes"),
             _ => panic!("expected Unit"),
         }
     }
@@ -1000,12 +1126,13 @@ mod tests {
         );
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
-        let items = extract_uses_items(uses_node, &bytes);
+        let comments = CommentMap::build(tree.root_node(), &bytes);
+        let items = extract_uses_items(uses_node, &bytes, &comments);
 
         // Expect: Unit(SysUtils), IfDefBlock(...), Unit(Classes)
         assert_eq!(items.len(), 3);
         match &items[0] {
-            UsesItem::Unit(name) => assert_eq!(name, "SysUtils"),
+            UsesItem::Unit { name, .. } => assert_eq!(name, "SysUtils"),
             _ => panic!("expected Unit at 0"),
         }
         match &items[1] {
@@ -1013,14 +1140,14 @@ mod tests {
                 assert!(block.if_branch.directive.contains("IFDEF"));
                 assert_eq!(block.if_branch.items.len(), 1);
                 match &block.if_branch.items[0] {
-                    UsesItem::Unit(name) => assert_eq!(name, "SpecialUnit"),
+                    UsesItem::Unit { name, .. } => assert_eq!(name, "SpecialUnit"),
                     _ => panic!("expected Unit in if_branch"),
                 }
                 assert!(block.else_branch.is_some());
                 let else_items = block.else_branch.as_ref().unwrap();
                 assert_eq!(else_items.len(), 1);
                 match &else_items[0] {
-                    UsesItem::Unit(name) => assert_eq!(name, "OtherUnit"),
+                    UsesItem::Unit { name, .. } => assert_eq!(name, "OtherUnit"),
                     _ => panic!("expected Unit in else_branch"),
                 }
                 assert!(block.endif.contains("ENDIF"));
@@ -1028,7 +1155,7 @@ mod tests {
             _ => panic!("expected IfDefBlock at 1"),
         }
         match &items[2] {
-            UsesItem::Unit(name) => assert_eq!(name, "Classes"),
+            UsesItem::Unit { name, .. } => assert_eq!(name, "Classes"),
             _ => panic!("expected Unit at 2"),
         }
     }
@@ -1042,7 +1169,8 @@ mod tests {
         );
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
-        let items = extract_uses_items(uses_node, &bytes);
+        let comments = CommentMap::build(tree.root_node(), &bytes);
+        let items = extract_uses_items(uses_node, &bytes, &comments);
 
         // ppDirective is an extra — it may appear before SysUtils
         let directive_items: Vec<_> = items
@@ -1073,7 +1201,8 @@ mod tests {
         );
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
-        let items = extract_uses_items(uses_node, &bytes);
+        let comments = CommentMap::build(tree.root_node(), &bytes);
+        let items = extract_uses_items(uses_node, &bytes, &comments);
 
         // Find the outer IfDefBlock
         let outer_block = items.iter().find_map(|i| match i {
@@ -1113,17 +1242,19 @@ mod tests {
         let block = IfDefBlock {
             if_branch: CondBranch {
                 directive: "{$IFDEF FOO}".to_string(),
-                items: vec![UsesItem::Unit("SpecialUnit".to_string())],
+                items: vec![UsesItem::unit("SpecialUnit")],
+                ..CondBranch::default()
             },
             else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::Unit("OtherUnit".to_string())]),
+            else_branch: Some(vec![UsesItem::unit("OtherUnit")]),
             endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
         };
 
         let items = vec![
-            UsesItem::Unit("SysUtils".to_string()),
+            UsesItem::unit("SysUtils"),
             UsesItem::IfDefBlock(block),
-            UsesItem::Unit("Classes".to_string()),
+            UsesItem::unit("Classes"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1156,8 +1287,8 @@ mod tests {
 
         let items = vec![
             UsesItem::Directive("{$I compilers.inc}".to_string()),
-            UsesItem::Unit("SysUtils".to_string()),
-            UsesItem::Unit("Classes".to_string()),
+            UsesItem::unit("SysUtils"),
+            UsesItem::unit("Classes"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1184,9 +1315,9 @@ mod tests {
         };
 
         let items = vec![
-            UsesItem::Unit("SysUtils".to_string()),
+            UsesItem::unit("SysUtils"),
             UsesItem::Directive("{$I myinc.inc}".to_string()),
-            UsesItem::Unit("Classes".to_string()),
+            UsesItem::unit("Classes"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1208,7 +1339,7 @@ mod tests {
         let items = vec![
             UsesItem::Directive("{$I a.inc}".to_string()),
             UsesItem::Directive("{$I b.inc}".to_string()),
-            UsesItem::Unit("SysUtils".to_string()),
+            UsesItem::unit("SysUtils"),
         ];
         let output = format_uses_items(&items, &default_config(), "  ", &HashSet::new());
         let a_pos = output.find("{$I a.inc}").expect("a.inc missing");
@@ -1233,23 +1364,22 @@ mod tests {
             if_branch: CondBranch {
                 directive: "{$IFDEF DELPHI_XE6_UP}".to_string(),
                 items: vec![
-                    UsesItem::Unit("ibx.IBDatabase".to_string()),
-                    UsesItem::Unit("ibx.IBSQL".to_string()),
+                    UsesItem::unit("ibx.IBDatabase"),
+                    UsesItem::unit("ibx.IBSQL"),
                 ],
+                ..CondBranch::default()
             },
             else_if_branches: Vec::new(),
-            else_branch: Some(vec![
-                UsesItem::Unit("IBDatabase".to_string()),
-                UsesItem::Unit("IBSQL".to_string()),
-            ]),
+            else_branch: Some(vec![UsesItem::unit("IBDatabase"), UsesItem::unit("IBSQL")]),
             endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
         };
 
         let items = vec![
-            UsesItem::Unit("MDIBDatabase".to_string()),
+            UsesItem::unit("MDIBDatabase"),
             UsesItem::IfDefBlock(block),
-            UsesItem::Unit("Utils".to_string()),
-            UsesItem::Unit("ibxUtils".to_string()),
+            UsesItem::unit("Utils"),
+            UsesItem::unit("ibxUtils"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1272,17 +1402,19 @@ mod tests {
         let block = IfDefBlock {
             if_branch: CondBranch {
                 directive: "{$IFDEF FOO}".to_string(),
-                items: vec![UsesItem::Unit("System.SysUtils".to_string())],
+                items: vec![UsesItem::unit("System.SysUtils")],
+                ..CondBranch::default()
             },
             else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::Unit("MyProject.Utils".to_string())]),
+            else_branch: Some(vec![UsesItem::unit("MyProject.Utils")]),
             endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
         };
 
         let items = vec![
-            UsesItem::Unit("MyApp.Main".to_string()),
+            UsesItem::unit("MyApp.Main"),
             UsesItem::IfDefBlock(block),
-            UsesItem::Unit("Vcl.Forms".to_string()),
+            UsesItem::unit("Vcl.Forms"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1305,17 +1437,16 @@ mod tests {
         let block = IfDefBlock {
             if_branch: CondBranch {
                 directive: "{$IFDEF XE6}".to_string(),
-                items: vec![UsesItem::Unit("ibx.IBDatabase".to_string())],
+                items: vec![UsesItem::unit("ibx.IBDatabase")],
+                ..CondBranch::default()
             },
             else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::Unit("IBDatabase".to_string())]),
+            else_branch: Some(vec![UsesItem::unit("IBDatabase")]),
             endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
         };
 
-        let items = vec![
-            UsesItem::Unit("MyApp.Main".to_string()),
-            UsesItem::IfDefBlock(block),
-        ];
+        let items = vec![UsesItem::unit("MyApp.Main"), UsesItem::IfDefBlock(block)];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
         // Core section (ifdef block) should come before Project section (MyApp.Main).
@@ -1339,17 +1470,19 @@ mod tests {
         let block = IfDefBlock {
             if_branch: CondBranch {
                 directive: "{$IFDEF FOO}".to_string(),
-                items: vec![UsesItem::Unit("System.SysUtils".to_string())],
+                items: vec![UsesItem::unit("System.SysUtils")],
+                ..CondBranch::default()
             },
             else_if_branches: Vec::new(),
-            else_branch: Some(vec![UsesItem::Unit("Classes".to_string())]),
+            else_branch: Some(vec![UsesItem::unit("Classes")]),
             endif: "{$ENDIF}".to_string(),
+            ..IfDefBlock::default()
         };
 
         let items = vec![
-            UsesItem::Unit("Zebra".to_string()),
+            UsesItem::unit("Zebra"),
             UsesItem::IfDefBlock(block),
-            UsesItem::Unit("Alpha".to_string()),
+            UsesItem::unit("Alpha"),
         ];
 
         let output = format_uses_items(&items, &config, "  ", &HashSet::new());
@@ -1387,7 +1520,8 @@ mod tests {
         let info = pascal_core::FileInfo::new(std::path::PathBuf::from("test.pas"));
         let (tree, _) = pascal_core::parser::parse_file(&info, src).unwrap();
         let uses_node = find_decl_uses(tree.root_node()).unwrap();
-        let items = extract_uses_items(uses_node, src);
+        let comments = CommentMap::build(tree.root_node(), src);
+        let items = extract_uses_items(uses_node, src, &comments);
         // IfDefBlock + Classes
         assert_eq!(items.len(), 2);
         if let UsesItem::IfDefBlock(block) = &items[0] {

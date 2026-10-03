@@ -15784,7 +15784,6 @@ mod tests {
     }
 
     fn assert_exhausted_recovery_case(documents: usize, expected: super::RecoveryOutcome) {
-        let should_recover = expected == super::RecoveryOutcome::Recovered;
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15902,6 +15901,7 @@ mod tests {
         );
         #[cfg(feature = "test-support")]
         {
+            let should_recover = expected == super::RecoveryOutcome::Recovered;
             let metrics = budget.metrics(true);
             assert_eq!(metrics["recovery_refused"], !should_recover);
             if should_recover {

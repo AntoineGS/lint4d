@@ -1826,10 +1826,10 @@ impl TestDispatchLog {
     fn wait_for_entries(&self, expected: usize) -> Vec<u8> {
         let deadline = Instant::now() + IO_TIMEOUT;
         while Instant::now() < deadline {
-            if let Ok(entries) = fs::read(&self.path) {
-                if entries.len() >= expected {
-                    return entries;
-                }
+            if let Ok(entries) = fs::read(&self.path)
+                && entries.len() >= expected
+            {
+                return entries;
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -11719,18 +11719,18 @@ fn coalesced_work_done_lifecycles_survive_a_paused_stdout_queue() {
                 );
                 assert!(responses.insert(response.id));
             }
-            Message::Notification(notification) if notification.method == "$/progress" => {
-                if notification.params["value"]["kind"] == "end"
+            Message::Notification(notification)
+                if notification.method == "$/progress"
+                    && notification.params["value"]["kind"] == "end"
                     && notification.params["token"]
                         .as_str()
-                        .is_some_and(|token| token.starts_with("paused-work-done-"))
-                {
-                    let token = notification.params["token"]
-                        .as_str()
-                        .expect("work-done token")
-                        .to_string();
-                    *work_done_ends.entry(token).or_default() += 1;
-                }
+                        .is_some_and(|token| token.starts_with("paused-work-done-")) =>
+            {
+                let token = notification.params["token"]
+                    .as_str()
+                    .expect("work-done token")
+                    .to_string();
+                *work_done_ends.entry(token).or_default() += 1;
             }
             _ => {}
         }
@@ -11826,18 +11826,18 @@ fn large_ordinary_results_survive_temporary_control_byte_pressure() {
                 assert_eq!(result, 3_003);
                 assert!(responses.insert(response.id, result).is_none());
             }
-            Message::Notification(notification) if notification.method == "$/progress" => {
-                if notification.params["value"]["kind"] == "end"
+            Message::Notification(notification)
+                if notification.method == "$/progress"
+                    && notification.params["value"]["kind"] == "end"
                     && notification.params["token"]
                         .as_str()
-                        .is_some_and(|token| token.starts_with("large-ordinary-work-"))
-                {
-                    let token = notification.params["token"]
-                        .as_str()
-                        .expect("large ordinary work-done token")
-                        .to_string();
-                    *work_done_ends.entry(token).or_default() += 1;
-                }
+                        .is_some_and(|token| token.starts_with("large-ordinary-work-")) =>
+            {
+                let token = notification.params["token"]
+                    .as_str()
+                    .expect("large ordinary work-done token")
+                    .to_string();
+                *work_done_ends.entry(token).or_default() += 1;
             }
             _ => {}
         }
@@ -41038,7 +41038,7 @@ fn assert_rename_overlay_is_invalidated_on_reconciliation_fallback(deadline_ms: 
             .as_u64()
             .unwrap_or_default();
         assert!(
-            (2..=82).contains(&rename_path_visits) && rename_path_visits % 2 == 0,
+            (2..=82).contains(&rename_path_visits) && rename_path_visits.is_multiple_of(2),
             "processed rename pairs must charge their old/new file-event visits, without charging unattempted pairs: {metrics}"
         );
         assert!(
@@ -41101,12 +41101,11 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
 fn wait_until_json_bool(path: &Path, field: &str, expected: bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(bytes) = fs::read(path) {
-            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                if value[field].as_bool() == Some(expected) {
-                    return true;
-                }
-            }
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && value[field].as_bool() == Some(expected)
+        {
+            return true;
         }
         thread::sleep(Duration::from_millis(5));
     }

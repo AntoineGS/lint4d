@@ -64,6 +64,12 @@ pub enum Doc {
     /// sep as break (newline + indent).
     Fill(Vec<Doc>),
 
+    /// Renderer-internal: the not-yet-rendered tail of a `Fill`, drained
+    /// through an iterator so each pair is taken in O(1). Builders never
+    /// produce this variant.
+    #[doc(hidden)]
+    FillRest(std::vec::IntoIter<Doc>),
+
     /// A group of rows that should be column-aligned.
     /// The renderer pre-calculates column widths across all rows
     /// before rendering with padding.

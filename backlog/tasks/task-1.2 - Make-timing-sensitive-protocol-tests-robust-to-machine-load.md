@@ -4,7 +4,7 @@ title: Make timing-sensitive protocol tests robust to machine load
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:28'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 02:21'
 labels:
   - agent-todos
   - workspace-perf
@@ -38,4 +38,6 @@ full parallel suite.
 
 <!-- SECTION:NOTES:BEGIN -->
 Related review task: TASK-29 (BUILD-1). Check it before starting to avoid duplicate work.
+
+2026-10-02 (from TASK-5): shutdown_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline and cancel_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline failed 6/6 on unmodified c456f8c at load average ~2.6 on an 8-core machine, so they fail even at moderate load, not only under heavy load. A probe measured the shutdown response at 1.07-1.28 s against the 750 ms window, with the same timing on the old fail-closed recovery and on TASK-5's discard path.
 <!-- SECTION:NOTES:END -->

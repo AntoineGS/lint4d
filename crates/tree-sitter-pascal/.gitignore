@@ -1,0 +1,8 @@
+node_modules
+/.worktrees/
+build
+*.log
+*.exp
+*.lib
+*.obj
+/target

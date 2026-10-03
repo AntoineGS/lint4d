@@ -1,0 +1,211 @@
+===
+Inline Variables
+===
+procedure Test;
+begin
+  var a : string;
+  var b : integer := 20;
+end;
+---
+(root
+(defProc
+  (declProc
+  (kProcedure)
+  (identifier))
+  (block
+  (kBegin)
+    (varDef
+     (kVar)
+     (identifier)
+     (typeref
+      (identifier)))
+    (assignment
+      (varAssignDef
+      (kVar)
+      (identifier)
+      (typeref
+        (identifier)))
+      (kAssign)
+      (literalNumber))
+  (kEnd))))
+
+===
+Inline Auto Variables
+===
+procedure Test;
+begin
+  var a := 10;
+end;
+---
+(root
+ (defProc
+  (declProc
+   (kProcedure)
+   (identifier))
+  (block
+   (kBegin)
+   (assignment
+    (varAssignDef
+     (kVar)
+     (identifier))
+    (kAssign)
+    (literalNumber))
+   (kEnd))))
+===
+Inline For loop Variables
+===
+procedure Test;
+begin
+  for var a := 0 to 10 do
+  begin
+  end;
+  for var b : integer := 0 to 10 do
+  begin
+  end;
+end;
+---
+(root
+(defProc
+  (declProc
+    (kProcedure)
+    (identifier))
+  (block
+    (kBegin)
+    (for
+      (kFor)
+      (assignment
+        (varAssignDef
+          (kVar)
+          (identifier))
+        (kAssign)
+        (literalNumber))
+      (kTo)
+      (literalNumber)
+      (kDo)
+      (block
+        (kBegin)
+        (kEnd)))
+    (for
+      (kFor)
+      (assignment
+        (varAssignDef
+          (kVar)
+          (identifier)
+          (typeref
+            (identifier)))
+        (kAssign)
+        (literalNumber))
+      (kTo)
+      (literalNumber)
+      (kDo)
+      (block
+        (kBegin)
+        (kEnd)))
+    (kEnd))))
+===
+Inline Variables and Anonymous function
+===
+procedure Test;
+begin
+  var proc := procedure
+    begin
+    end;
+end;
+---
+(root
+ (defProc
+  (declProc
+   (kProcedure)
+   (identifier))
+  (block
+   (kBegin)
+   (assignment
+    (varAssignDef
+     (kVar)
+     (identifier))
+    (kAssign)
+    (lambda
+     (kProcedure)
+     (block
+      (kBegin)
+      (kEnd))))
+   (kEnd))))
+
+===
+Inline Constants
+===
+procedure Test;
+begin
+  const A = 10;
+  const B: Integer = A * 2;
+  if B > A then
+    Exit;
+  const C = 'last'
+end;
+---
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (constDef
+        (kConst)
+        (identifier)
+        (defaultValue
+          (kEq)
+          (literalNumber)))
+      (constDef
+        (kConst)
+        (identifier)
+        (type
+          (typeref
+            (identifier)))
+        (defaultValue
+          (kEq)
+          (exprBinary
+            (identifier)
+            (kMul)
+            (literalNumber))))
+      (if
+        (kIf)
+        (exprBinary
+          (identifier)
+          (kGt)
+          (identifier))
+        (kThen)
+        (statement
+          (identifier)))
+      (constDef
+        (kConst)
+        (identifier)
+        (defaultValue
+          (kEq)
+          (literalString)))
+      (kEnd))))
+
+===
+Local const section still parses before body
+===
+procedure Test;
+const
+  A = 1;
+begin
+end;
+---
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (declConsts
+      (kConst)
+      (declConst
+        (identifier)
+        (defaultValue
+          (kEq)
+          (literalNumber))))
+    (block
+      (kBegin)
+      (kEnd))))

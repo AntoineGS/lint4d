@@ -207,6 +207,11 @@ fn statement_effects(root: Node, source: &[u8], range: Range<usize>) -> Effects 
             continue;
         }
         let inside = node.start_byte() >= range.start && node.end_byte() <= range.end;
+        // The for-in header range ends at the iterable, so the node itself is
+        // never inside it.
+        if node.kind() == K::FOREACH {
+            collect_foreach_effects(node, source, &mut effects, &mut skipped);
+        }
         if inside {
             collect_node_effects(node, source, &mut effects, &mut skipped);
         }
@@ -214,6 +219,37 @@ fn statement_effects(root: Node, source: &[u8], range: Range<usize>) -> Effects 
         stack.extend(node.children(&mut cursor));
     }
     effects
+}
+
+/// The identifier an assignment or for-in header writes: a plain identifier,
+/// or the name declared by an inline `var X`.
+fn assign_target(node: Option<Node>) -> Option<Node> {
+    let node = node?;
+    match node.kind() {
+        K::IDENTIFIER => Some(node),
+        "varAssignDef" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == K::IDENTIFIER)
+        }
+        _ => None,
+    }
+}
+
+/// The for-in variable is assigned by the header on every iteration.
+fn collect_foreach_effects(
+    node: Node,
+    source: &[u8],
+    effects: &mut Effects,
+    skipped: &mut HashSet<usize>,
+) {
+    let target = assign_target(node.child_by_field_name("iterator"));
+    if let Some(target) = target {
+        skipped.insert(target.id());
+        effects
+            .assigns
+            .push(node_text(target, source).to_lowercase());
+    }
 }
 
 fn collect_node_effects(
@@ -257,17 +293,7 @@ fn collect_node_effects(
             let plain = node
                 .child_by_field_name("operator")
                 .is_some_and(|operator| operator.kind() == K::K_ASSIGN);
-            let target = node
-                .child_by_field_name("lhs")
-                .and_then(|lhs| match lhs.kind() {
-                    K::IDENTIFIER => Some(lhs),
-                    "varAssignDef" => {
-                        let mut cursor = lhs.walk();
-                        lhs.named_children(&mut cursor)
-                            .find(|child| child.kind() == K::IDENTIFIER)
-                    }
-                    _ => None,
-                });
+            let target = assign_target(node.child_by_field_name("lhs"));
             if let Some(target) = target {
                 if plain {
                     skipped.insert(target.id());

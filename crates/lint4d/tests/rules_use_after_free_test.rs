@@ -165,3 +165,49 @@ fn use_after_free_flags_freed_read_in_assignment_rhs() {
         )]
     );
 }
+
+#[test]
+fn use_after_free_allows_freeing_for_in_loop_variable() {
+    let matches =
+        use_after_free_lines("tests/fixtures/use_after_free/good_for_in_frees_loop_variable.pas");
+    assert!(
+        matches.is_empty(),
+        "The for-in variable is reassigned on every iteration: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn use_after_free_still_flags_use_after_free_in_for_in_body() {
+    let matches =
+        use_after_free_lines("tests/fixtures/use_after_free/bad_use_after_free_in_for_in_body.pas");
+    assert_eq!(
+        matches,
+        vec![(
+            11,
+            "Use after free: 'item' is used after being freed".to_string()
+        )]
+    );
+}
+
+#[test]
+fn use_after_free_treats_loop_headers_as_assigning_the_control_variable() {
+    let matches =
+        use_after_free_lines("tests/fixtures/use_after_free/good_for_loop_variable_reassigned.pas");
+    assert!(
+        matches.is_empty(),
+        "A for header assigns its control variable: {:?}",
+        matches
+    );
+}
+
+#[test]
+fn use_after_free_allows_freeing_inline_var_for_in_variable() {
+    let matches =
+        use_after_free_lines("tests/fixtures/use_after_free/good_for_in_inline_var_frees.pas");
+    assert!(
+        matches.is_empty(),
+        "The inline for-in variable is reassigned on every iteration: {:?}",
+        matches
+    );
+}

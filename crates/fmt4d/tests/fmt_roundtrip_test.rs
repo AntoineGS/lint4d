@@ -1051,3 +1051,40 @@ fn roundtrip_eof_trivia_in_unclosed_format_off() {
     roundtrip_check(source);
     idempotency_check(source);
 }
+
+#[test]
+fn roundtrip_comments_around_list_commas_in_three_modes() {
+    let source = "\
+unit T;
+interface
+type
+  R = record
+    A
+    // lc
+    , B: Integer; // shared
+    D // d
+    , E: Byte;
+  end;
+implementation
+procedure Q(A
+  // lc
+  , B: Integer; C, {x} D: Byte);
+var
+  F, {$R+} // c
+  G: Integer;
+  H, {x} {$R-} {y} I: Byte;
+  J
+  // lj
+  , {k} K: Integer;
+  L, M: {t} Integer {u};
+  N, O
+  { blk }
+  : Byte;
+begin
+end;
+end.
+";
+    for formatted in common::format_three_modes(source) {
+        assert_same_program(source, &formatted);
+    }
+}

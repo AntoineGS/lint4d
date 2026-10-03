@@ -55,22 +55,6 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    /// Like `concat_range_strip_trailing` with stripping, but the last node
-    /// also loses its trailing directives: the copy of a shared suffix for a
-    /// declaration that is not the last of its list.
-    fn concat_range_bare_last(&self, range: &[Node<'a>]) -> Doc {
-        let Some((last, rest)) = range.split_last() else {
-            return Doc::Empty;
-        };
-        let mut parts: Vec<Doc> = rest.iter().map(|c| self.doc_for_node(*c)).collect();
-        parts.push(doc::concat(vec![
-            self.leading_comments_doc(*last),
-            self.leading_directives_doc(*last),
-            self.doc_for_node_bare(*last),
-        ]));
-        doc::concat(parts)
-    }
-
     /// Decompose a `declConst` node into alignment cells.
     ///
     /// Structure: `identifier [: type] = <initializer> ;`
@@ -235,50 +219,59 @@ impl<'a> DocBuilder<'a> {
         }
 
         // Build the type cell docs (from colon onward). Every row but the
-        // last gets a copy without the declaration's trailing trivia.
+        // last gets a copy without any of the suffix's comments or
+        // directives, so they are emitted once, on the last row.
         let trailing_comment = self.trailing_comment_cell(node);
         let has_tail = trailing_comment.is_some();
 
         let default_idx = children.iter().position(|c| c.kind() == K::DEFAULT_VALUE);
 
-        let range_doc = |range: &[Node<'a>], strip_trailing: bool| {
-            if strip_trailing {
-                self.concat_range_bare_last(range)
-            } else {
-                self.concat_range_strip_trailing(range, has_tail)
-            }
-        };
-        let build_docs = |strip_trailing: bool| {
+        let build_docs = || {
             if let Some(def_idx) = default_idx {
                 let type_parts: Vec<Doc> = children[colon_idx..def_idx]
                     .iter()
                     .map(|c| self.doc_for_node(*c))
                     .collect();
-                let value_doc = range_doc(&children[def_idx..], strip_trailing);
+                let value_doc = self.concat_range_strip_trailing(&children[def_idx..], has_tail);
                 (doc::concat(type_parts), Some(value_doc))
             } else {
-                (range_doc(&children[colon_idx..], strip_trailing), None)
+                let type_doc = self.concat_range_strip_trailing(&children[colon_idx..], has_tail);
+                (type_doc, None)
             }
         };
-        let (type_doc, value_doc) = build_docs(false);
-        let (bare_type_doc, bare_value_doc) = build_docs(true);
+        let (type_doc, value_doc) = build_docs();
+        let (bare_type_doc, bare_value_doc) = self.without_trivia(build_docs);
 
         let before_colon = &children[..colon_idx];
         let mut rows = Vec::with_capacity(idents.len());
+        // Trivia after a `//` moved from the previous comma: own lines
+        // above this row.
+        let mut carried: Vec<Doc> = Vec::new();
         for (i, ident) in idents.iter().enumerate() {
             let is_last = i == idents.len() - 1;
-            let (name_doc, moved) = self.var_list_ident(before_colon, *ident, is_last, true);
-            let leading = if i == 0 {
-                Vec::new()
-            } else {
-                [
-                    self.leading_comments_doc(*ident),
-                    self.leading_directives_doc(*ident),
-                ]
-                .into_iter()
-                .filter(|d| !matches!(d, Doc::Empty))
-                .collect()
-            };
+            let (name_doc, trivia) = self.var_list_ident(before_colon, *ident, is_last, true);
+            let mut leading = Vec::new();
+            if !carried.is_empty() {
+                let mut lines = Vec::new();
+                for item in carried.drain(..) {
+                    lines.push(Doc::Hardline);
+                    lines.push(item);
+                }
+                lines.push(Doc::Hardline);
+                leading.push(doc::concat(lines));
+            }
+            if i > 0 {
+                leading.extend(
+                    [
+                        self.leading_comments_doc(*ident),
+                        self.leading_directives_doc(*ident),
+                    ]
+                    .into_iter()
+                    .filter(|d| !matches!(d, Doc::Empty)),
+                );
+            }
+            carried = trivia.rest;
+            let moved = trivia.inline;
 
             let (row_type, row_value) = if is_last {
                 (type_doc.clone(), value_doc.clone())
@@ -642,7 +635,7 @@ impl<'a> DocBuilder<'a> {
     /// the `;` token), not with parent declaration nodes.  We check the
     /// declaration node first, then fall back to its last code leaf.
     fn trailing_comment_cell(&self, node: Node<'a>) -> Option<AlignCell> {
-        if !self.config.alignment.comments {
+        if !self.config.alignment.comments || self.trivia_suppressed() {
             return None;
         }
 
@@ -832,6 +825,10 @@ impl<'a> DocBuilder<'a> {
                     group_items.push(child_doc);
                     group_items.push(Doc::BlankLine);
                 } else {
+                    // Start a line: the previous item may end in a `//`
+                    // comment, and nothing else breaks the line between
+                    // non-row items.
+                    group_items.push(Doc::LineStart(String::new()));
                     group_items.push(child_doc);
                 }
             }

@@ -1064,3 +1064,14 @@ fn comma_var_alignment_keeps_directive_before_later_identifier() {
     assert_directive_kept_without_blank_lines(&result, "{$R+}");
     idempotency_check_aligned(&src);
 }
+
+#[test]
+fn field_list_after_a_line_comment_starts_its_own_line() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A, B: Integer; // shared\n    D // d\n    , E: Byte;\n    F: Word;\n  end;\nimplementation\nend.\n";
+    let result = format_aligned(src);
+    assert!(
+        result.contains("    A, B: Integer; // shared\n    D, // d\n    E: Byte;\n"),
+        "{result}"
+    );
+    idempotency_check_aligned(src);
+}

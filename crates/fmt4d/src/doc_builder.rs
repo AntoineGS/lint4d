@@ -4,6 +4,7 @@ use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
 use pascal_core::node_kind as K;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::Range;
 use tree_sitter::Node;
@@ -54,6 +55,9 @@ pub struct DocBuilder<'a> {
     pub(crate) external_units: &'a HashSet<String>,
     /// Ascending 0-based rows of newline-terminated, whitespace-only lines.
     blank_line_rows: Vec<u32>,
+    /// Set while building a copy of a node whose comments and directives
+    /// are emitted with another copy (see [`Self::without_trivia`]).
+    trivia_suppressed: Cell<bool>,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -73,6 +77,7 @@ impl<'a> DocBuilder<'a> {
             format_regions,
             external_units,
             blank_line_rows: blank_line_rows(source),
+            trivia_suppressed: Cell::new(false),
         }
     }
 
@@ -302,6 +307,19 @@ impl<'a> DocBuilder<'a> {
         self.build_doc(node)
     }
 
+    pub(crate) fn trivia_suppressed(&self) -> bool {
+        self.trivia_suppressed.get()
+    }
+
+    /// Run `build` with every comment and directive left out, for a copy of
+    /// nodes whose trivia another copy emits.
+    pub(crate) fn without_trivia<T>(&self, build: impl FnOnce() -> T) -> T {
+        let outer = self.trivia_suppressed.replace(true);
+        let result = build();
+        self.trivia_suppressed.set(outer);
+        result
+    }
+
     /// Emit a node inside a format-off region as its source text.
     ///
     /// Comments and directives are attached to leaves, so the ones leading
@@ -471,7 +489,7 @@ impl<'a> DocBuilder<'a> {
     /// between the last comment and the node), a `BlankLine` is inserted.
     pub(crate) fn leading_comments_doc(&self, node: Node<'a>) -> Doc {
         let comments = self.comments.leading_comments(node.id());
-        if comments.is_empty() {
+        if comments.is_empty() || self.trivia_suppressed.get() {
             return Doc::Empty;
         }
 
@@ -508,7 +526,7 @@ impl<'a> DocBuilder<'a> {
     /// Each trailing comment is preceded by a single space.
     pub(crate) fn trailing_comments_doc(&self, node: Node<'a>) -> Doc {
         let comments = self.comments.trailing_comments(node.id());
-        if comments.is_empty() {
+        if comments.is_empty() || self.trivia_suppressed.get() {
             return Doc::Empty;
         }
 
@@ -534,15 +552,17 @@ impl<'a> DocBuilder<'a> {
         // child is the actual `+` leaf. Descend to the last non-extra leaf
         // before consulting the comment map.
         let leaf = last_leaf(node);
-        self.comments
-            .trailing_comments(leaf.id())
-            .last()
-            .is_some_and(|c| c.text.trim_start().starts_with("//"))
+        !self.trivia_suppressed.get()
+            && self
+                .comments
+                .trailing_comments(leaf.id())
+                .last()
+                .is_some_and(|c| c.text.trim_start().starts_with("//"))
     }
 
     pub(crate) fn leading_directives_doc(&self, node: Node<'a>) -> Doc {
         let directives = self.directives.leading_directives(node.id());
-        if directives.is_empty() {
+        if directives.is_empty() || self.trivia_suppressed.get() {
             return Doc::Empty;
         }
         let mut parts = Vec::new();
@@ -556,7 +576,7 @@ impl<'a> DocBuilder<'a> {
 
     pub(crate) fn trailing_directives_doc(&self, node: Node<'a>) -> Doc {
         let directives = self.directives.trailing_directives(node.id());
-        if directives.is_empty() {
+        if directives.is_empty() || self.trivia_suppressed.get() {
             return Doc::Empty;
         }
         let docs: Vec<Doc> = directives

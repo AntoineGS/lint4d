@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 mod common;
-use common::{format_aligned, format_source, idempotency_check, idempotency_check_aligned};
+use common::{
+    format_aligned, format_source, format_three_modes, format_three_modes_idempotent,
+    idempotency_check, idempotency_check_aligned,
+};
 
 // ── Bug 1: Character literal corruption ─────────────────────────
 // #0, #9, #10, #13 etc. are reduced to bare `#`, producing code
@@ -4192,9 +4195,10 @@ fn var_list_comments_with_default_value_are_kept_once() {
 fn record_field_list_keeps_comments_around_commas() {
     let src = "unit T;\ninterface\ntype\n  R = record\n    A, // a\n    B: Integer; // shared\n  end;\nimplementation\nend.\n";
     let result = format_source(src);
-    for c in ["// a", "// shared"] {
-        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
-    }
+    assert!(
+        result.contains("    A, // a\n    B: Integer; // shared\n"),
+        "{result}"
+    );
     idempotency_check(src);
 }
 
@@ -4202,10 +4206,125 @@ fn record_field_list_keeps_comments_around_commas() {
 fn parameter_list_keeps_comments_around_commas() {
     let src = "unit T;\ninterface\nimplementation\nprocedure Q(A, { c } B: Integer; C, // d\n  D: Byte);\nbegin\nend;\nend.\n";
     let result = format_source(src);
-    for c in ["{ c }", "// d"] {
-        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
-    }
+    assert!(
+        result.contains("  A, { c } B: Integer;\n  C, // d\n  D: Byte\n"),
+        "{result}"
+    );
     idempotency_check(src);
+}
+
+/// Lines of `result` with their indentation removed.
+fn trimmed_lines(result: &str) -> Vec<&str> {
+    result.lines().map(str::trim).collect()
+}
+
+#[test]
+fn comment_before_comma_does_not_swallow_the_next_parameter() {
+    let src = "unit T;\ninterface\nimplementation\nprocedure Q(A\n  // lc\n  , B: Integer);\nbegin\nend;\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        let lines = trimmed_lines(&result);
+        assert!(lines.contains(&"A, // lc"), "{result}");
+        assert!(lines.contains(&"B: Integer"), "{result}");
+    }
+}
+
+#[test]
+fn comment_before_comma_does_not_swallow_the_next_field() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A\n    // lc\n    , B: Integer;\n  end;\nimplementation\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        assert!(
+            result.contains("    A, // lc\n    B: Integer;\n"),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn line_comment_after_identifier_does_not_swallow_the_next_field() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    D // d\n    , E: Byte;\n  end;\nimplementation\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        assert!(result.contains("    D, // d\n    E: Byte;\n"), "{result}");
+    }
+}
+
+#[test]
+fn var_list_comma_trivia_keeps_source_order_and_spacing() {
+    // The expanded lines carry several trailing items on one token, which
+    // a second pass re-spaces and reorders (pre-existing, TASK-125), so
+    // only the first pass is checked here.
+    let src = var_list_source("  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n");
+    let [plain, aligned, no_cells] = format_three_modes(&src);
+    assert!(
+        plain.contains(
+            "  A: Integer; {$R+} // c\n  B: Integer;\n  C: Byte; {x} {$R-} {y}\n  D: Byte;\n"
+        ),
+        "{plain}"
+    );
+    for result in [aligned, no_cells] {
+        let lines = trimmed_lines(&result);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("A") && l.ends_with("{$R+} // c")),
+            "{result}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("C") && l.ends_with("{x} {$R-} {y}")),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn var_list_comma_trivia_is_idempotent() {
+    // One moved item per line: several trailing items on one token are
+    // not idempotent yet (TASK-125).
+    let src =
+        var_list_source("  A // c\n  , B: Integer;\n  C, {x} D: Byte;\n  E\n  {l}\n  , F: Word;\n");
+    let [plain, ..] = format_three_modes_idempotent(&src);
+    assert!(
+        plain.contains(
+            "  A: Integer; // c\n  B: Integer;\n  C: Byte; {x}\n  D: Byte;\n  E: Word; {l}\n  F: Word;\n"
+        ),
+        "{plain}"
+    );
+}
+
+#[test]
+fn var_list_trivia_after_a_line_comment_starts_a_new_line() {
+    let src = var_list_source("  A\n  // lc\n  , {x} B: Integer;\n");
+    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
+    for result in [plain, aligned, no_cells] {
+        let lines = trimmed_lines(&result);
+        let a = lines
+            .iter()
+            .position(|l| l.starts_with("A") && l.ends_with("// lc"))
+            .unwrap_or_else(|| panic!("{result}"));
+        assert_eq!(lines[a + 1], "{x}", "{result}");
+        assert!(lines[a + 2].starts_with("B"), "{result}");
+    }
+}
+
+#[test]
+fn var_list_trivia_inside_the_type_is_emitted_once() {
+    for decls in [
+        "  A, B: {t} Integer {u};\n",
+        "  M, N\n  { blk }\n  : Byte;\n",
+    ] {
+        let src = var_list_source(decls);
+        for result in format_three_modes_idempotent(&src) {
+            for c in ["{t}", "{u}", "{ blk }"] {
+                assert!(result.matches(c).count() <= 1, "{c} twice in:\n{result}");
+                assert_eq!(
+                    result.matches(c).count(),
+                    decls.matches(c).count(),
+                    "{c} in:\n{result}"
+                );
+            }
+        }
+    }
 }
 
 // ── Bug: end-of-file trivia in an unclosed {$FMT.OFF} is re-laid-out ──

@@ -65,9 +65,11 @@ pub fn format_source(
     // Source length is a good upper bound for output length (the
     // formatter mostly adds/removes whitespace). Slight overshoot
     // avoids the final realloc. Review PERF-H4.
-    let raw_output = Renderer::with_capacity(config, source.len() + source.len() / 16).render(doc);
+    let (raw_output, protected_spans) =
+        Renderer::with_capacity(config, source.len() + source.len() / 16)
+            .render_with_protected_spans(doc);
 
-    let normalized = normalize_blank_lines(&raw_output, &config.blank_lines);
+    let normalized = normalize_blank_lines(&raw_output, &protected_spans, &config.blank_lines);
 
     let mut final_output = resolved_eol.apply(&normalized);
 

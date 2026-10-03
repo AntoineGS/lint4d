@@ -3922,3 +3922,40 @@ end.
         "formatter is not idempotent.\nFirst pass:\n{result}\nSecond pass:\n{result2}"
     );
 }
+
+// ── Bug: blank-line post-pass rewrites protected spans ──────────
+// `normalize_blank_lines` ran over the whole rendered output, so blank
+// runs and whitespace-only lines inside multiline string literals and
+// `{$FMT.OFF}` regions were collapsed and trimmed. Those spans are
+// emitted verbatim by the Doc builder and must survive byte-identical.
+
+/// A multiline string whose body has three consecutive blank lines (two
+/// of them whitespace-only) and a line with trailing spaces.
+const MULTILINE_LITERAL: &str = "'''\n    alpha   \n\n  \n      \n    omega\n    '''";
+
+#[test]
+fn multiline_string_blank_lines_survive_formatting() {
+    let src = format!(
+        "unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  S: string;\nbegin\n  S := {MULTILINE_LITERAL};\nend;\nend.\n"
+    );
+    let result = format_source(&src);
+    assert!(
+        result.contains(MULTILINE_LITERAL),
+        "multiline string literal was rewritten:\n{result:?}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn format_off_region_with_multiline_string_survives_formatting() {
+    let region = format!(
+        "procedure P;\nvar\n  S: string;\nbegin\n  S := {MULTILINE_LITERAL};\n\n\n\n  S  :=  S;\nend;\n"
+    );
+    let src =
+        format!("unit T;\ninterface\nimplementation\n{{$FMT.OFF}}\n{region}{{$FMT.ON}}\nend.\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains(&region),
+        "{{$FMT.OFF}} region was rewritten:\n{result:?}"
+    );
+}

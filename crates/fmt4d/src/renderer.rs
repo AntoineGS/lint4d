@@ -1,6 +1,7 @@
 use crate::config::{FmtConfig, IndentStyle};
 use crate::doc::{AlignCell, Doc};
 use crate::spacing;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
@@ -80,6 +81,8 @@ pub struct Renderer {
     max_line_length: usize,
     last_token_kind: &'static str,
     last_token_parent_kind: &'static str,
+    /// Output byte ranges of verbatim text spanning more than one line.
+    protected_spans: Vec<Range<usize>>,
 }
 
 impl Renderer {
@@ -92,6 +95,7 @@ impl Renderer {
             max_line_length: config.max_line_length,
             last_token_kind: "",
             last_token_parent_kind: "",
+            protected_spans: Vec::new(),
         }
     }
 
@@ -106,13 +110,21 @@ impl Renderer {
         r
     }
 
-    pub fn render(mut self, doc: Doc) -> String {
+    #[cfg(test)]
+    pub fn render(self, doc: Doc) -> String {
+        self.render_with_protected_spans(doc).0
+    }
+
+    /// Render `doc` and also return the ascending output byte ranges of
+    /// multi-line verbatim text (raw source, comments, multiline string
+    /// literals) that post-processing must leave untouched.
+    pub fn render_with_protected_spans(mut self, doc: Doc) -> (String, Vec<Range<usize>>) {
         // Pre-size the stack to absorb typical nested-group depth without
         // reallocation. Review PERF-H3.
         let mut stack: Vec<(usize, Mode, Doc)> = Vec::with_capacity(64);
         stack.push((0, Mode::Break, doc));
         self.drain_render_stack(stack);
-        self.output
+        (self.output, self.protected_spans)
     }
 
     /// Drain a render stack into `self.output`. Shared by the top-level
@@ -146,7 +158,7 @@ impl Renderer {
                         self.last_token_kind = "";
                         self.last_token_parent_kind = "";
                     }
-                    self.output.push_str(&text);
+                    self.push_verbatim(&text);
                 }
 
                 Doc::Hardline => {
@@ -560,10 +572,18 @@ impl Renderer {
             self.output.push(' ');
             self.current_column += 1;
         }
-        self.output.push_str(text);
+        self.push_verbatim(text);
         self.current_column += text.len();
         self.last_token_kind = kind;
         self.last_token_parent_kind = parent_kind;
+    }
+
+    fn push_verbatim(&mut self, text: &str) {
+        let start = self.output.len();
+        self.output.push_str(text);
+        if text.contains('\n') {
+            self.protected_spans.push(start..self.output.len());
+        }
     }
 
     fn emit_newline(&mut self) {

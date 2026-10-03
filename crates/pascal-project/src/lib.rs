@@ -2366,6 +2366,45 @@ fn discover_context_with_selections(
     options: &ProjectOptions,
     selections: &ProjectSelections,
     overrides: &OverrideSession,
+    warnings: Vec<String>,
+    exclusions: &[String],
+    cancel: Option<&AtomicBool>,
+    work_budget: Option<&dyn ProjectWorkBudget>,
+    deleted_paths: &[PathBuf],
+) -> Result<ProjectDiscovery, String> {
+    with_path_resolution_cancel(cancel, || {
+        let discovery = discover_context_with_selections_inner(
+            file,
+            workspace_roots,
+            options,
+            selections,
+            overrides,
+            warnings,
+            exclusions,
+            cancel,
+            work_budget,
+            deleted_paths,
+        )?;
+        // Work built with no token (standalone contexts) can drop paths
+        // silently once the token is set, so a result is only returned if the
+        // request was still live.
+        if let Some(work_budget) = work_budget {
+            work_budget.check_cancelled()?;
+        }
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("request cancelled".to_string());
+        }
+        Ok(discovery)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn discover_context_with_selections_inner(
+    file: &Path,
+    workspace_roots: &[PathBuf],
+    options: &ProjectOptions,
+    selections: &ProjectSelections,
+    overrides: &OverrideSession,
     mut warnings: Vec<String>,
     exclusions: &[String],
     cancel: Option<&AtomicBool>,
@@ -2376,7 +2415,6 @@ fn discover_context_with_selections(
     test_record_project_discovery(false);
     record_project_discovery_cache_discovery();
     let _path_resolution_cache_scope = PathResolutionCacheScope::new();
-    let _path_resolution_cancel_scope = PathResolutionCancelScope::new(cancel);
     check_project_scan_cancel(cancel)?;
     if let Some(work_budget) = work_budget {
         work_budget.check_cancelled()?;
@@ -6865,39 +6903,38 @@ thread_local! {
     static PATH_RESOLUTION_CANCEL: std::cell::Cell<Option<std::ptr::NonNull<AtomicBool>>> = const { std::cell::Cell::new(None) };
 }
 
-/// Makes `cancel` visible to path resolution on this thread. Callers of
-/// `resolve_existing_path_status` are too many and too deep to thread a token
+/// Runs `run` with `cancel` visible to path resolution on this thread. Callers
+/// of `resolve_existing_path_status` are too many and too deep to thread a token
 /// through, so the walk reads it from here, like the directory cache above.
-struct PathResolutionCancelScope<'a> {
-    previous: Option<std::ptr::NonNull<AtomicBool>>,
-    _cancel: std::marker::PhantomData<&'a AtomicBool>,
-}
-
-impl<'a> PathResolutionCancelScope<'a> {
-    fn new(cancel: Option<&'a AtomicBool>) -> Self {
-        let pointer = cancel.map(std::ptr::NonNull::from);
-        let previous = PATH_RESOLUTION_CANCEL.with(|slot| slot.replace(pointer));
-        Self {
-            previous,
-            _cancel: std::marker::PhantomData,
+/// Without a token the enclosing scope's token stays visible.
+fn with_path_resolution_cancel<T>(cancel: Option<&AtomicBool>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::ptr::NonNull<AtomicBool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PATH_RESOLUTION_CANCEL.with(|slot| slot.set(self.0));
         }
     }
-}
 
-impl Drop for PathResolutionCancelScope<'_> {
-    fn drop(&mut self) {
-        PATH_RESOLUTION_CANCEL.with(|slot| slot.set(self.previous));
-    }
+    let Some(cancel) = cancel else {
+        return run();
+    };
+    let _restore = Restore(
+        PATH_RESOLUTION_CANCEL.with(|slot| slot.replace(Some(std::ptr::NonNull::from(cancel)))),
+    );
+    run()
 }
 
 fn path_resolution_cancelled() -> bool {
     PATH_RESOLUTION_CANCEL.with(|slot| {
         slot.get().is_some_and(|cancel| {
-            // SAFETY: the pointer is installed by a `PathResolutionCancelScope`
-            // that borrows the `AtomicBool` for its lifetime and restores the
-            // previous value on drop. The scope is `!Send` (it holds a
-            // `NonNull`), so this thread-local read happens on the thread that
-            // owns the borrow while the borrow is live.
+            // SAFETY: the slot is only written by `with_path_resolution_cancel`,
+            // which keeps its restore guard private and holds it on its own
+            // stack frame for the duration of `run`, while `cancel` is borrowed
+            // by that call. The guard cannot be forgotten or dropped out of
+            // order, so call-stack nesting restores the previous pointer before
+            // any borrow ends, and the slot only holds pointers whose borrows
+            // are live. The slot is thread-local, so only the installing
+            // thread reads it.
             unsafe { cancel.as_ref() }.load(Ordering::Relaxed)
         })
     })
@@ -9686,14 +9723,13 @@ mod tests {
     use super::{
         EffectiveOverrides, ExistingPathStatus, MAX_OWNERSHIP_CANDIDATES,
         MAX_OWNERSHIP_SOURCE_BYTES, MAX_OWNERSHIP_SOURCE_FILES, MAX_PROJECT_DIRECTORY_ENTRIES,
-        MetadataObservation, PathResolutionCacheScope, PathResolutionCancelScope,
-        PathResolutionDirectoryListing, ProjectContext, ProjectOptions, ProjectPathEntry,
-        ProjectPathProvenance, ProjectReadStamp, ProjectReadTracker, ReadPolicy,
-        content_hash_bytes, path_resolution_cancelled, path_resolution_directory_listing,
-        path_stamp_result, project_candidate_membership, read_bounded_with_tracker,
-        resolve_existing_path_status, test_before_project_read_at,
+        MetadataObservation, PathResolutionCacheScope, PathResolutionDirectoryListing,
+        ProjectContext, ProjectOptions, ProjectPathEntry, ProjectPathProvenance, ProjectReadStamp,
+        ProjectReadTracker, ReadPolicy, content_hash_bytes, path_resolution_cancelled,
+        path_resolution_directory_listing, path_stamp_result, project_candidate_membership,
+        read_bounded_with_tracker, resolve_existing_path_status, test_before_project_read_at,
         test_cancel_project_scan_after_checks, with_legacy_path_resolution,
-        with_path_resolution_read_dir_count,
+        with_path_resolution_cancel, with_path_resolution_read_dir_count,
     };
     use crate::delphi_overrides::OverrideSession;
     use std::cell::Cell;
@@ -9832,6 +9868,78 @@ mod tests {
         assert_eq!(roots, [root.as_path(), root.join("src").as_path()]);
     }
 
+    struct FlagSettingBudget<'a> {
+        calls: Cell<usize>,
+        set_on_call: usize,
+        cancel: &'a AtomicBool,
+    }
+
+    impl FlagSettingBudget<'_> {
+        fn tick(&self) -> Result<(), String> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.set_on_call {
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    impl super::ProjectWorkBudget for FlagSettingBudget<'_> {
+        fn check_cancelled(&self) -> Result<(), String> {
+            self.tick()
+        }
+        fn charge_path_visits(&self, _amount: usize) -> Result<(), String> {
+            self.tick()
+        }
+        fn ensure_file_read_fits(&self, _max_bytes: usize) -> Result<(), String> {
+            self.tick()
+        }
+        fn charge_file_bytes(&self, _amount: usize) -> Result<(), String> {
+            self.tick()
+        }
+    }
+
+    #[test]
+    fn discovery_never_returns_ok_after_the_token_was_set() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().to_path_buf();
+        let file = root.join("Unit1.pas");
+        fs::write(&file, b"unit Unit1;\ninterface\nimplementation\nend.\n").expect("unit");
+        let options = ProjectOptions {
+            source_paths: vec!["src".to_string()],
+            ..ProjectOptions::default()
+        };
+        fs::create_dir(root.join("src")).expect("source directory");
+        let overrides = OverrideSession::default();
+        let selections = super::ProjectSelections::new();
+
+        for set_on_call in 1..=120 {
+            let cancel = AtomicBool::new(false);
+            let budget = FlagSettingBudget {
+                calls: Cell::new(0),
+                set_on_call,
+                cancel: &cancel,
+            };
+            let result = super::discover_with_selections_and_observations_with_work_budget_and_optional_cancel_and_deleted_paths(
+                &file,
+                std::slice::from_ref(&root),
+                &options,
+                &selections,
+                &overrides,
+                &[],
+                Some(&cancel),
+                Some(&budget),
+                &[],
+            );
+            assert!(
+                result.is_err() || !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                "discovery returned Ok although the token was set on budget call {set_on_call}"
+            );
+        }
+    }
+
     #[test]
     fn path_resolution_stops_when_cancelled_before_walking() {
         let temp = tempfile::tempdir().expect("temporary directory");
@@ -9844,8 +9952,9 @@ mod tests {
         let mut warnings = Vec::new();
 
         let (status, read_dirs) = with_path_resolution_read_dir_count(|| {
-            let _scope = PathResolutionCancelScope::new(Some(&cancel));
-            resolve_existing_path_status(&requested, &mut warnings, "unit")
+            with_path_resolution_cancel(Some(&cancel), || {
+                resolve_existing_path_status(&requested, &mut warnings, "unit")
+            })
         });
 
         assert!(matches!(status, ExistingPathStatus::Unresolvable));
@@ -9862,13 +9971,12 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let _cache = PathResolutionCacheScope::new();
 
-        {
-            let _scope = PathResolutionCancelScope::new(Some(&cancel));
+        with_path_resolution_cancel(Some(&cancel), || {
             assert!(matches!(
                 path_resolution_directory_listing(temp.path()),
                 PathResolutionDirectoryListing::Cancelled
             ));
-        }
+        });
 
         match path_resolution_directory_listing(temp.path()) {
             PathResolutionDirectoryListing::Entries(entries) => {
@@ -9879,16 +9987,21 @@ mod tests {
     }
 
     #[test]
-    fn path_resolution_cancel_scope_restores_the_previous_token() {
+    fn path_resolution_cancel_scope_nests_and_restores_the_previous_token() {
         let outer = AtomicBool::new(true);
         let inner = AtomicBool::new(false);
-        let _outer = PathResolutionCancelScope::new(Some(&outer));
-        assert!(path_resolution_cancelled());
-        {
-            let _inner = PathResolutionCancelScope::new(Some(&inner));
-            assert!(!path_resolution_cancelled());
-        }
-        assert!(path_resolution_cancelled());
+        assert!(!path_resolution_cancelled());
+        with_path_resolution_cancel(Some(&outer), || {
+            assert!(path_resolution_cancelled());
+            with_path_resolution_cancel(Some(&inner), || {
+                assert!(!path_resolution_cancelled());
+            });
+            assert!(path_resolution_cancelled());
+            with_path_resolution_cancel(None, || {
+                assert!(path_resolution_cancelled(), "no token keeps the outer one");
+            });
+        });
+        assert!(!path_resolution_cancelled());
     }
 
     #[test]

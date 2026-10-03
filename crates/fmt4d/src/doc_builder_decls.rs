@@ -15,9 +15,26 @@ use tree_sitter::Node;
 /// a `//` comment (`ends_line`), the rest go on lines of their own.
 #[derive(Default)]
 pub(crate) struct SeparatorTrivia {
-    pub(crate) inline: Vec<Doc>,
+    /// Each item's text and the spaces before it.
+    pub(crate) inline: Vec<(usize, String)>,
+    /// Index in `inline` of the first comment (`inline.len()` if none).
+    pub(crate) first_comment: usize,
     pub(crate) ends_line: bool,
     pub(crate) rest: Vec<Doc>,
+}
+
+impl SeparatorTrivia {
+    /// Docs for `items` of `inline`, the first one preceded by one space.
+    pub(crate) fn docs(items: &[(usize, String)]) -> Vec<Doc> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, (gap, text))| {
+                let gap = if i == 0 { 1 } else { *gap };
+                Doc::Raw(format!("{}{text}", " ".repeat(gap)))
+            })
+            .collect()
+    }
 }
 
 impl<'a> DocBuilder<'a> {
@@ -406,7 +423,7 @@ impl<'a> DocBuilder<'a> {
                     } else {
                         bare_suffix.clone()
                     });
-                    parts.extend(moved.inline);
+                    parts.extend(SeparatorTrivia::docs(&moved.inline));
                     for item in moved.rest {
                         parts.push(Doc::Hardline);
                         parts.push(item);
@@ -456,7 +473,7 @@ impl<'a> DocBuilder<'a> {
             };
             ident_parts.push(doc::token(",", K::COMMA, node.kind()));
             let trivia = self.separator_trivia(moved_from, comma);
-            ident_parts.extend(trivia.inline);
+            ident_parts.extend(SeparatorTrivia::docs(&trivia.inline));
             if trivia.rest.is_empty() {
                 ident_parts.push(if trivia.ends_line {
                     Doc::Hardline
@@ -489,8 +506,8 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// The comments and directives that leave their place at a list comma
-    /// (see [`SeparatorTrivia`]): the trailing comments of `moved_from`
-    /// when given, and the comma's leading comments and trailing comments
+    /// (see [`SeparatorTrivia`]): the trailing items of `moved_from` from
+    /// its first comment on when given, and the comma's leading comments and trailing comments
     /// and directives. Items keep their source order and the spacing
     /// between them; the first gets one space.
     pub(crate) fn separator_trivia(
@@ -498,15 +515,26 @@ impl<'a> DocBuilder<'a> {
         moved_from: Option<Node<'a>>,
         comma: Node<'a>,
     ) -> SeparatorTrivia {
-        let moved: &[crate::comments::AttachedComment] = match moved_from {
-            Some(n) => self.comments.trailing_comments(n.id()),
-            None => &[],
-        };
+        let moved = moved_from
+            .map(|n| self.trailing_items_from_first_comment(n))
+            .unwrap_or_default();
         let mut items: Vec<(Range<usize>, &str, &'static str)> = moved
             .iter()
-            .chain(self.comments.leading_comments(comma.id()))
-            .chain(self.comments.trailing_comments(comma.id()))
-            .map(|c| (c.span.clone(), c.text.as_str(), K::COMMENT))
+            .map(|item| {
+                let kind = if item.is_comment {
+                    K::COMMENT
+                } else {
+                    K::PP_DIRECTIVE
+                };
+                (item.span.clone(), item.text, kind)
+            })
+            .chain(
+                self.comments
+                    .leading_comments(comma.id())
+                    .iter()
+                    .chain(self.comments.trailing_comments(comma.id()))
+                    .map(|c| (c.span.clone(), c.text.as_str(), K::COMMENT)),
+            )
             .chain(
                 self.directives
                     .trailing_directives(comma.id())
@@ -517,6 +545,7 @@ impl<'a> DocBuilder<'a> {
         items.sort_by_key(|(span, _, _)| span.start);
 
         let mut trivia = SeparatorTrivia::default();
+        let mut first_comment = None;
         let mut prev_end: Option<usize> = None;
         for (span, text, kind) in items {
             if trivia.ends_line {
@@ -531,12 +560,14 @@ impl<'a> DocBuilder<'a> {
                     between.len().max(1)
                 }
             });
-            trivia
-                .inline
-                .push(Doc::Raw(format!("{}{text}", " ".repeat(gap))));
+            if kind == K::COMMENT && first_comment.is_none() {
+                first_comment = Some(trivia.inline.len());
+            }
+            trivia.inline.push((gap, text.to_string()));
             trivia.ends_line = kind == K::COMMENT && text.starts_with("//");
             prev_end = Some(span.end);
         }
+        trivia.first_comment = first_comment.unwrap_or(trivia.inline.len());
         trivia
     }
 
@@ -564,7 +595,7 @@ impl<'a> DocBuilder<'a> {
             (true, false) => self.doc_for_node_sans_leading(ident),
             (true, true) => doc::concat(vec![
                 self.doc_for_node_bare(ident),
-                self.trailing_directives_doc(ident),
+                self.trailing_directives_before_comments_doc(ident),
             ]),
         };
         let trivia = match comma {

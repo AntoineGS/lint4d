@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 mod common;
 use common::{
-    format_aligned, format_source, format_three_modes, format_three_modes_idempotent,
-    idempotency_check, idempotency_check_aligned,
+    format_aligned, format_source, format_three_modes_idempotent, idempotency_check,
+    idempotency_check_aligned,
 };
 
 // ── Bug 1: Character literal corruption ─────────────────────────
@@ -4249,11 +4249,8 @@ fn line_comment_after_identifier_does_not_swallow_the_next_field() {
 
 #[test]
 fn var_list_comma_trivia_keeps_source_order_and_spacing() {
-    // The expanded lines carry several trailing items on one token, which
-    // a second pass re-spaces and reorders (pre-existing, TASK-125), so
-    // only the first pass is checked here.
     let src = var_list_source("  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n");
-    let [plain, aligned, no_cells] = format_three_modes(&src);
+    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
     assert!(
         plain.contains(
             "  A: Integer; {$R+} // c\n  B: Integer;\n  C: Byte; {x} {$R-} {y}\n  D: Byte;\n"
@@ -4279,8 +4276,6 @@ fn var_list_comma_trivia_keeps_source_order_and_spacing() {
 
 #[test]
 fn var_list_comma_trivia_is_idempotent() {
-    // One moved item per line: several trailing items on one token are
-    // not idempotent yet (TASK-125).
     let src =
         var_list_source("  A // c\n  , B: Integer;\n  C, {x} D: Byte;\n  E\n  {l}\n  , F: Word;\n");
     let [plain, ..] = format_three_modes_idempotent(&src);
@@ -4324,6 +4319,64 @@ fn var_list_trivia_inside_the_type_is_emitted_once() {
                 );
             }
         }
+    }
+}
+
+// ── Bug: several trailing items after one token (TASK-125) ─────
+// Each trailing comment's gap was measured from the code token, so the
+// gap before a second item grew on every run, and directives were always
+// emitted after the comments, so `{$R+} // c` became `// c {$R+}`.
+
+/// The line of `result` that starts (after indentation) with `prefix`.
+fn line_starting<'r>(result: &'r str, prefix: &str) -> &'r str {
+    result
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line starting with {prefix:?} in:\n{result}"))
+}
+
+/// `items` appear on `line` in this order.
+fn assert_in_order(line: &str, items: &[&str]) {
+    let mut from = 0;
+    for item in items {
+        let at = line[from..]
+            .find(item)
+            .unwrap_or_else(|| panic!("{item:?} missing or out of order in {line:?}"));
+        from += at + item.len();
+    }
+}
+
+#[test]
+fn several_trailing_items_keep_order_and_spacing() {
+    let src = var_list_source(
+        "  S: Byte; {t1} // t2\n  R: Byte; {$R+} // end\n  C: Byte; {x} {$R-} {y}\n  T: Byte;   {a}    {b}\n",
+    );
+    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
+    assert!(
+        plain.contains(
+            "  S: Byte; {t1} // t2\n  R: Byte; {$R+} // end\n  C: Byte; {x} {$R-} {y}\n  T: Byte;   {a}    {b}\n"
+        ),
+        "{plain}"
+    );
+    for result in [aligned, no_cells] {
+        assert_in_order(line_starting(&result, "S"), &["{t1}", "// t2"]);
+        assert_in_order(line_starting(&result, "R"), &["{$R+}", "// end"]);
+        assert_in_order(line_starting(&result, "C"), &["{x}", "{$R-}", "{y}"]);
+        assert_in_order(line_starting(&result, "T"), &["{a}    {b}"]);
+    }
+}
+
+#[test]
+fn var_list_with_several_comma_items_is_idempotent() {
+    for decls in [
+        "  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n",
+        "  A, // la\n  // own\n  B, {c1} {c2} C: Integer; {t1} // t2\n  D {d}, E // e\n  , F: Byte;\n",
+        "  A, {$R+}   // c\n  B: Integer;\n  CCC, {x}    {y} D: Byte;\n",
+    ] {
+        let src = var_list_source(decls);
+        let [plain, ..] = format_three_modes_idempotent(&src);
+        assert!(!plain.contains("// c {$R+}"), "{plain}");
     }
 }
 

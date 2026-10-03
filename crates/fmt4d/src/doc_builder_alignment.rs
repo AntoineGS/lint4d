@@ -1,5 +1,6 @@
 use crate::doc::{self, AlignCell, Doc};
 use crate::doc_builder::DocBuilder;
+use crate::doc_builder_decls::SeparatorTrivia;
 use pascal_core::node_kind as K;
 use tree_sitter::Node;
 
@@ -271,29 +272,32 @@ impl<'a> DocBuilder<'a> {
                 );
             }
             carried = trivia.rest;
-            let moved = trivia.inline;
+            let mut moved = trivia.inline;
 
             let (row_type, row_value) = if is_last {
                 (type_doc.clone(), value_doc.clone())
             } else {
                 (bare_type_doc.clone(), bare_value_doc.clone())
             };
-            // The last row's trailing comment cell comes from the node; an
-            // earlier row's moved comments get a cell of their own when
-            // comments are aligned, else they follow the row.
+            // The last row's trailing comment cell comes from the node. An
+            // earlier row's moved items are laid out the way the next run
+            // reads them back as trailing trivia of its `;`: with comments
+            // aligned, the items from the first comment on get a cell of
+            // their own and the directives before it follow the data;
+            // otherwise they all follow the row.
             let comment_cell = if is_last {
                 trailing_comment.clone()
-            } else if moved.is_empty() {
-                None
-            } else if self.config.alignment.comments {
-                Some(doc::align_cell(doc::concat(moved.clone()), false))
+            } else if self.config.alignment.comments && trivia.first_comment < moved.len() {
+                let comments = moved.split_off(trivia.first_comment);
+                let docs = SeparatorTrivia::docs(&comments);
+                Some(doc::align_cell(doc::concat(docs), false))
             } else {
                 None
             };
-            let inline_moved = if !is_last && comment_cell.is_none() {
-                Some(doc::concat(moved))
-            } else {
+            let inline_moved = if is_last || moved.is_empty() {
                 None
+            } else {
+                Some(doc::concat(SeparatorTrivia::docs(&moved)))
             };
             let has_comment_cell = comment_cell.is_some();
 
@@ -628,7 +632,7 @@ impl<'a> DocBuilder<'a> {
         cells
     }
 
-    /// Extract the trailing comment for a node as an AlignCell, if present
+    /// Extract the trailing comments for a node as an AlignCell, if present
     /// and comment alignment is enabled.
     ///
     /// CommentMap associates trailing comments with leaf nodes (e.g.
@@ -639,24 +643,24 @@ impl<'a> DocBuilder<'a> {
             return None;
         }
 
-        let mut comments = self.comments.trailing_comments(node.id());
-        if comments.is_empty() {
+        // Directives after the first comment stay with it, in source order;
+        // `doc_for_node_sans_trailing` leaves them out of the data cell.
+        let mut items = self.trailing_items_from_first_comment(node);
+        if items.is_empty() {
             // Fall back to last leaf descendant (typically `;`).
             let children = self.code_children(node);
             if let Some(last) = children.last() {
-                comments = self.comments.trailing_comments(last.id());
+                items = self.trailing_items_from_first_comment(*last);
             }
         }
-        if comments.is_empty() {
+        if items.is_empty() {
             return None;
         }
 
-        let docs: Vec<Doc> = comments
-            .iter()
-            .map(|c| Doc::Raw(format!(" {}", c.text)))
-            .collect();
-
-        Some(doc::align_cell(doc::concat(docs), false))
+        Some(doc::align_cell(
+            self.trailing_run_doc(&items, Some(1)),
+            false,
+        ))
     }
 
     /// Leading comments and directives of a declaration, emitted above its

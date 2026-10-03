@@ -27556,7 +27556,11 @@ fn production_project_context_reports_configured_override_errors_as_warnings() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path();
     let source = root.join("Main.pas");
-    let user_config = environment.path().join("config/delphi-tools/config.toml");
+    let user_config = environment
+        .path()
+        .join("config")
+        .join("delphi-tools")
+        .join("config.toml");
     write_file(&source, "unit Main; interface implementation end.\n");
     write_file(&user_config, "[properties\ninvalid = 'user'\n");
 
@@ -28840,7 +28844,7 @@ fn project_sidecar_external_scan_enforces_per_file_bytes() {
     let root = temp.path();
     let app = root.join("app");
     let main = app.join("Main.pas");
-    let external = app.join("vendor/TooBig.pas");
+    let external = app.join("vendor").join("TooBig.pas");
     let source = "unit Main;\ninterface\nuses\n  System.SysUtils;\nimplementation\nend.\n";
     write_file(&main, source);
     write_file(
@@ -31323,7 +31327,15 @@ fn project_context_retains_shared_owner_selection_outside_source_ancestry() {
             .any(|warning| warning
                 .as_str()
                 .unwrap_or_default()
-                .contains(&fixture.a_project.display().to_string())),
+                // Rejoin the fixture path with native separators.
+                .contains(
+                    &fixture
+                        .a_project
+                        .components()
+                        .collect::<PathBuf>()
+                        .display()
+                        .to_string()
+                )),
         "invalid retained owner warning must be preserved: {after}"
     );
     server.shutdown();

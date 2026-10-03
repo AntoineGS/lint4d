@@ -72,6 +72,19 @@ pub fn walk_root(absolute: &Path) -> PathBuf {
     root
 }
 
+/// The spelling on disk of the existing file `path` when it differs from
+/// `path` only by letter case on a case-insensitive volume. Symlinked and
+/// other aliased spellings are not rewritten.
+pub fn on_disk_spelling(path: &Path) -> Option<PathBuf> {
+    if !is_case_insensitive(path) {
+        return None;
+    }
+    // Windows reports the on-disk spelling from an open handle. Volumes that
+    // do not (macOS, backlog TASK-74) need a directory walk instead.
+    let actual = without_verbatim_prefix(std::fs::canonicalize(path).ok()?);
+    (actual != path && paths_equal(&actual, path)).then_some(actual)
+}
+
 /// Turns a verbatim Windows path from `canonicalize` (`\\?\C:\x`,
 /// `\\?\UNC\server\share\x`) back into its plain form, which the rest of the
 /// path handling and every user-facing path use. Other paths are unchanged.
@@ -138,6 +151,18 @@ mod tests {
             walk_root(Path::new(r"\\server\share\x.pas")),
             PathBuf::from(r"\\server\share\")
         );
+    }
+
+    #[test]
+    fn on_disk_spelling_corrects_letter_case_only_on_case_insensitive_volumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let actual =
+            without_verbatim_prefix(std::fs::canonicalize(temp.path()).unwrap()).join("Body.inc");
+        std::fs::write(&actual, "").unwrap();
+        let requested = actual.with_file_name("BODY.INC");
+        let expected = is_case_insensitive(&actual).then(|| actual.clone());
+        assert_eq!(on_disk_spelling(&requested), expected);
+        assert_eq!(on_disk_spelling(&actual), None);
     }
 
     #[test]

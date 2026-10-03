@@ -9874,10 +9874,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
     // (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn path_resolution_prefers_an_exact_component_over_case_variants() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let exact = temp.path().join("Foo");
@@ -10073,10 +10073,10 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
     // (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn path_resolution_rejects_ambiguous_case_insensitive_matches() {
         let temp = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(temp.path().join("Foo")).expect("first case variant");
@@ -10197,6 +10197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn path_resolution_rejects_windows_absolute_paths_on_linux() {
         let requested = std::path::Path::new(r"C:\Delphi\Unit.pas");
         let mut warnings = Vec::new();
@@ -10295,9 +10296,15 @@ mod tests {
                 expected.display()
             );
         }
+        // The walk lists the filesystem root, each directory down to `root`,
+        // then Tools and Units.
+        let root_listings = 1 + root
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count();
         assert_eq!(
             read_dir_calls,
-            root.components().count() + 2,
+            root_listings + 2,
             "shared case-insensitive prefixes should be listed once"
         );
     }
@@ -10503,7 +10510,7 @@ mod tests {
             .collect::<Vec<_>>();
         let key_bytes = paths
             .iter()
-            .map(|path| path.to_string_lossy().len())
+            .map(|path| super::project_path_materialization_bytes(path.as_os_str()).unwrap())
             .sum::<usize>();
         let admitted_pre_sort_work = CANDIDATES * 4 + key_bytes;
         let budget = TestProjectWorkBudget::limited_path_visits(admitted_pre_sort_work);

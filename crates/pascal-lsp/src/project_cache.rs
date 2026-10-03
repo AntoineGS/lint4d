@@ -342,6 +342,14 @@ mod probe_tests {
             content_hash: pascal_project::content_hash_bytes(b"unit A;"),
         }];
         std::fs::write(&file, "unit B;").unwrap();
+        // Windows can stamp both writes with the same timer tick; the probe
+        // only rereads content once the stamp moved.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
         assert!(!probes_hold(&probes, &HashMap::new()));
     }
 

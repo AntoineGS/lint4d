@@ -167,7 +167,9 @@ fn same_root_with_resolver(known_root: &str, candidate: &str) -> bool {
         .is_ok_and(|resolved| resolved.path == marker_root)
 }
 
-#[cfg(test)]
+// These relocate imported Windows paths onto Unix roots; on Windows the
+// imported paths are native.
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::super::PropertyMap;
     use super::{relocate_environment, resolve_path_with_inferred};

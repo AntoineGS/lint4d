@@ -19550,7 +19550,8 @@ installation = '7.0'
         // Simulate the post-reset session map before context invalidation; the
         // response must be based on automatic/configured selection, not the
         // stale context fallback.
-        let project_path = project.canonicalize().unwrap();
+        let project_path =
+            pascal_project::path_identity::without_verbatim_prefix(project.canonicalize().unwrap());
         workspace.installation_selections.remove(&project_path);
         let reset_context = workspace.installation_context(&project_uri).unwrap();
         assert_eq!(

@@ -1199,15 +1199,12 @@ fn normalizes_case_insensitive_paths_and_rejects_unknown_windows_paths() {
     assert_eq!(context.main_source, Some(main));
     assert!(context.search_paths.contains(&root.join("Common")));
     assert_eq!(context.explicit_units.get("shared"), Some(&vec![shared]));
-    assert!(
-        context
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Windows path"))
-    );
-    assert!(context.warnings.iter().any(|warning| {
-        warning == "Windows path in DCC_UnitSearchPath is unavailable on Linux and was omitted: C:\\Windows\\Never"
-    }));
+    // On Windows the drive path is native and simply absent.
+    if cfg!(not(windows)) {
+        assert!(context.warnings.iter().any(|warning| {
+            warning == "Windows path in DCC_UnitSearchPath is unavailable on Linux and was omitted: C:\\Windows\\Never"
+        }));
+    }
     assert!(
         context
             .warnings
@@ -1483,10 +1480,10 @@ fn tainted_condition_comparisons_remain_unknown() {
     );
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
 // (backlog TASK-74).
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();
@@ -1518,10 +1515,10 @@ fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
     );
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
+// Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
 // (backlog TASK-74).
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn case_distinct_workspace_roots_keep_relative_project_ambiguity() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();

@@ -2585,6 +2585,11 @@ fn fixture_resolver(context: ProjectContext) -> UnitResolver<MemoryStore> {
     )
 }
 
+/// Memory fixture paths are written with `/`; Windows requests use `\`.
+fn memory_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[derive(Default)]
 struct MemoryStore {
     sources: HashMap<String, Vec<u8>>,
@@ -2611,10 +2616,7 @@ impl SourceStore for MemoryStore {
         request: DirectoryRequest<'_>,
         _cancel: &dyn CancellationToken,
     ) -> Result<DirectoryListing, SourceStoreError> {
-        let prefix = format!(
-            "{}/",
-            request.directory.to_string_lossy().trim_end_matches('/')
-        );
+        let prefix = format!("{}/", memory_key(request.directory).trim_end_matches('/'));
         let files = self
             .sources
             .keys()
@@ -2638,7 +2640,7 @@ impl SourceStore for MemoryStore {
         request: SourceRequest<'_>,
         _cancel: &dyn CancellationToken,
     ) -> Result<LoadedSource, SourceStoreError> {
-        let key = request.path.to_string_lossy().to_string();
+        let key = memory_key(request.path);
         let bytes = self
             .sources
             .get(&key)

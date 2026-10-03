@@ -12,7 +12,9 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    // Relocates imported Windows paths onto a Unix host; on Windows they are native.
     #[test]
+    #[cfg(not(windows))]
     fn ide_paths_preserve_platform_order_and_relocate_original_bdslib() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
@@ -335,7 +337,9 @@ mod tests {
         );
     }
 
+    // Relocates imported Windows paths onto a Unix host; on Windows they are native.
     #[test]
+    #[cfg(not(windows))]
     fn explicit_bdslib_override_preserves_original_environment_root_for_relocation() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
@@ -380,7 +384,9 @@ mod tests {
         );
     }
 
+    // An unmapped Windows locator is only invalid off Windows.
     #[test]
+    #[cfg(not(windows))]
     fn invalid_explicit_environment_locator_does_not_fall_back_to_appdata() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
@@ -648,10 +654,10 @@ mod tests {
         assert_eq!(paths.library[0].path, sdk.join("lib"));
     }
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
     // (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn copied_envoptions_source_path_resolves_case_insensitively_on_linux() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
@@ -748,10 +754,10 @@ mod tests {
         );
     }
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
     // (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn reconciliation_rejects_ambiguous_case_insensitive_components() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("sdk");

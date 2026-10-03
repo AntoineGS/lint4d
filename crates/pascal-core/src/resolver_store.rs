@@ -6,7 +6,7 @@ use super::{
     SourceStoreError, canonical_path, content_hash_bytes, path_equivalent, path_key,
     path_starts_with, source_id_for_path,
 };
-use pascal_project::path_stamp_result;
+use pascal_project::{path_identity, path_stamp_result};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -280,6 +280,9 @@ impl SourceStore for FilesystemSourceStore {
                 reason: "source and authorization entry identify different paths".to_string(),
             });
         }
+        // On a case-insensitive volume any spelling opens the file; report and
+        // authorize the one on disk so a file has one identity.
+        let path = path_identity::on_disk_spelling(&path).unwrap_or(path);
         let entry = ProjectPathEntry {
             path: path.clone(),
             provenance: request.entry.provenance.clone(),

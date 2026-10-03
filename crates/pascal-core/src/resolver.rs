@@ -3354,7 +3354,9 @@ fn push_observation(
 }
 
 fn canonical_path(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
+    // A rooted Windows path without a drive (`\workspace`) keeps its form, so
+    // it still matches the project paths it was compared with.
+    let absolute = if path.is_absolute() || path.has_root() {
         path.to_path_buf()
     } else {
         std::env::current_dir()

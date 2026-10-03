@@ -7217,7 +7217,8 @@ mod tests {
             source.push_str(&format!("  badConst{index} = {index};\n"));
         }
         source.push_str("implementation\nend.\n");
-        let uri = Url::parse("file:///tmp/fix-all-candidate-limit.pas").expect("fixture URI");
+        let uri = Url::from_file_path(std::env::temp_dir().join("fix-all-candidate-limit.pas"))
+            .expect("fixture URI");
         let config = r#"version = 1
 [rules.naming]
 constant_style = "UPPER_CASE""#

@@ -380,10 +380,11 @@ mod tests {
 
     #[test]
     fn project_prompt_titles_expand_duplicate_suffixes_from_the_scope() {
-        let scope = Url::parse("file:///workspace").unwrap();
+        let workspace = std::env::temp_dir().join("workspace");
+        let scope = Url::from_file_path(&workspace).unwrap();
         let candidates = [
-            Url::parse("file:///workspace/first/src/App.dproj").unwrap(),
-            Url::parse("file:///workspace/second/src/App.dproj").unwrap(),
+            Url::from_file_path(workspace.join("first/src/App.dproj")).unwrap(),
+            Url::from_file_path(workspace.join("second/src/App.dproj")).unwrap(),
         ];
         let titles = project_prompt_titles(&candidates, &scope);
         assert_eq!(titles, ["first/src/App.dproj", "second/src/App.dproj"]);

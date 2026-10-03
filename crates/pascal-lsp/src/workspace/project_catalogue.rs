@@ -59,6 +59,7 @@ impl Workspace {
             .to_file_path()
             .map_err(|_| format!("project catalogue requires a file URI: {anchor}"))?;
         let anchor_path = fs::canonicalize(absolute_path(anchor_path))
+            .map(pascal_project::path_identity::without_verbatim_prefix)
             .map_err(|error| format!("project catalogue anchor is unavailable: {error}"))?;
         let (root, root_path) = self
             .roots
@@ -66,6 +67,7 @@ impl Workspace {
             .filter_map(|root| {
                 fs::canonicalize(&root.path)
                     .ok()
+                    .map(pascal_project::path_identity::without_verbatim_prefix)
                     .filter(|physical_root| path_starts_with_native(&anchor_path, physical_root))
                     .map(|physical_root| (root, physical_root))
             })

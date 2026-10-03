@@ -7,6 +7,7 @@ categories = ["parsing", "text-editors"]
 repository = "https://github.com/Isopod/tree-sitter-pascal"
 edition = "2018"
 license = "MIT"
+publish = false
 
 build = "bindings/rust/build.rs"
 include = [

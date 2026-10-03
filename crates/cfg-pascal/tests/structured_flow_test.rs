@@ -695,8 +695,12 @@ end.
     assert_eq!(gotos.len(), 3);
     assert_eq!(labels.len(), 6);
 
-    let expected_pairs: Vec<Vec<BlockId>> =
-        labels.chunks_exact(2).map(|pair| pair.to_vec()).collect();
+    let expected_pairs: Vec<Vec<BlockId>> = labels
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| pair.to_vec())
+        .collect();
     let mut actual_pairs = Vec::new();
     for goto in gotos {
         let edges = successors(cfg, goto);
@@ -762,8 +766,12 @@ end.
     assert_eq!(gotos.len(), 3);
     assert_eq!(labels.len(), 6);
 
-    let expected_pairs: Vec<Vec<BlockId>> =
-        labels.chunks_exact(2).map(|pair| pair.to_vec()).collect();
+    let expected_pairs: Vec<Vec<BlockId>> = labels
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| pair.to_vec())
+        .collect();
     let mut actual_pairs = Vec::new();
     for goto in gotos {
         let edges = successors(cfg, goto);
@@ -880,8 +888,12 @@ end.
     assert_eq!(gotos.len(), 6);
     assert_eq!(labels.len(), 6);
 
-    let expected_pairs: HashSet<Vec<BlockId>> =
-        labels.chunks_exact(2).map(|pair| pair.to_vec()).collect();
+    let expected_pairs: HashSet<Vec<BlockId>> = labels
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| pair.to_vec())
+        .collect();
     let mut actual_pairs = HashSet::new();
     for goto in gotos {
         let edges = successors(cfg, goto);

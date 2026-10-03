@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Language-agnostic control flow graph with interprocedural analysis"
 license = "MIT"
+publish = false
 
 [dependencies]
 petgraph = "0.7"

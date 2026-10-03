@@ -110,7 +110,10 @@ mod tests {
         parser.set_language(&super::LANGUAGE.into()).unwrap();
         for (source, comment_end) in [
             ("unit U;\n// hello\ninterface\nimplementation\nend.\n", 16),
-            ("unit U;\r\n// hello\r\ninterface\r\nimplementation\r\nend.\r\n", 17),
+            (
+                "unit U;\r\n// hello\r\ninterface\r\nimplementation\r\nend.\r\n",
+                17,
+            ),
             ("unit U;\r// hello\rinterface\rimplementation\rend.\r", 16),
         ] {
             let tree = parser.parse(source, None).unwrap();

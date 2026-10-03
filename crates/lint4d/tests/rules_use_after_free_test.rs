@@ -200,3 +200,14 @@ fn use_after_free_treats_loop_headers_as_assigning_the_control_variable() {
         matches
     );
 }
+
+#[test]
+fn use_after_free_allows_freeing_inline_var_for_in_variable() {
+    let matches =
+        use_after_free_lines("tests/fixtures/use_after_free/good_for_in_inline_var_frees.pas");
+    assert!(
+        matches.is_empty(),
+        "The inline for-in variable is reassigned on every iteration: {:?}",
+        matches
+    );
+}

@@ -210,8 +210,13 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
             }
             match current_stamp(path) {
                 Ok(Some(now)) if Some(&now) == stamp.as_ref() => true,
-                Ok(Some(_)) => std::fs::read(path)
-                    .is_ok_and(|bytes| pascal_project::content_hash_bytes(&bytes) == *content_hash),
+                Ok(Some(_)) => {
+                    #[cfg(test)]
+                    crate::workspace::resolver::record_test_disk_read(path);
+                    std::fs::read(path).is_ok_and(|bytes| {
+                        pascal_project::content_hash_bytes(&bytes) == *content_hash
+                    })
+                }
                 _ => false,
             }
         }
@@ -408,17 +413,17 @@ mod cache_tests {
 
     fn import_value(probes: Vec<Probe>) -> ImportValue {
         ImportValue {
-            resolved: pascal_core::ResolvedImports {
+            resolved: Arc::new(pascal_core::ResolvedImports {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
-            },
-            report: pascal_core::ResolutionReport {
+            }),
+            report: Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],
                 warnings: vec![],
                 complete: true,
                 incomplete_reasons: vec![],
-            },
+            }),
             probes,
             watch_dirs: vec![],
         }
@@ -521,6 +526,7 @@ mod cache_tests {
                     parsed: parsed_unit(name),
                     expansion: None,
                     probes,
+                    disk: None,
                 },
                 1,
                 &no_cancel(),
@@ -1503,15 +1509,32 @@ pub(crate) struct UnitValue {
     #[allow(dead_code)]
     pub(crate) expansion: Option<Arc<ExpansionResult>>,
     pub(crate) probes: Vec<Probe>,
+    /// The closed file the unit was read from, when it was read from disk.
+    pub(crate) disk: Option<DiskOrigin>,
+}
+
+/// A closed source file as it was read. A later load whose `stat` still
+/// shows this length and modification time takes `text` instead of reading
+/// and decoding the file again.
+#[derive(Debug)]
+pub(crate) struct DiskOrigin {
+    pub(crate) len: u64,
+    pub(crate) modified: std::time::SystemTime,
+    /// Raw file size, before decoding.
+    pub(crate) raw_bytes: usize,
+    /// Decoded file text. Without include expansion this is the parse's own
+    /// text, so it costs nothing extra.
+    pub(crate) text: Arc<str>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ImportValue {
+    /// Shared with the request that resolved it, so hits do not copy it.
     #[allow(dead_code)]
-    pub(crate) resolved: pascal_core::ResolvedImports,
+    pub(crate) resolved: Arc<pascal_core::ResolvedImports>,
     #[allow(dead_code)]
-    pub(crate) report: pascal_core::ResolutionReport,
+    pub(crate) report: Arc<pascal_core::ResolutionReport>,
     pub(crate) probes: Vec<Probe>,
     pub(crate) watch_dirs: Vec<PathBuf>,
 }
@@ -1545,6 +1568,29 @@ pub(crate) struct InterfaceImportsValue {
     /// Copied from the unit's import entry. They include a content probe for
     /// every dependency, so a bound unit's hash is verified before use.
     pub(crate) probes: Vec<Probe>,
+}
+
+/// A cached value whose probes decide whether it may be served.
+trait Probed {
+    fn probes(&self) -> &[Probe];
+}
+
+impl Probed for UnitValue {
+    fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
+}
+
+impl Probed for ImportValue {
+    fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
+}
+
+impl Probed for InterfaceImportsValue {
+    fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
 }
 
 fn interface_value_bytes(value: &InterfaceImportsValue) -> usize {
@@ -1917,7 +1963,7 @@ impl ProjectCache {
             overlays,
             cancel,
             |value| match value {
-                Value::Unit(unit) => Some((unit.clone(), unit.probes.clone())),
+                Value::Unit(unit) => Some(unit.clone()),
                 _ => None,
             },
         )
@@ -1939,10 +1985,44 @@ impl ProjectCache {
             content_hash,
             overlays,
             |value| match value {
-                Value::Unit(unit) => Some((unit.clone(), unit.probes.clone())),
+                Value::Unit(unit) => Some(unit.clone()),
                 _ => None,
             },
         )
+    }
+
+    /// A verified unit entry read from a closed file whose length and
+    /// modification time are still `len` and `modified`, with the raw content
+    /// hash that keys it. Lets a load skip reading the file; never claims.
+    pub(crate) fn peek_unit_from_disk(
+        &self,
+        uri: &Url,
+        context: &ProjectContext,
+        len: u64,
+        modified: std::time::SystemTime,
+        overlays: &HashMap<Url, OverlayInput>,
+    ) -> Option<(Arc<UnitValue>, u64)> {
+        let same_file = |unit: &UnitValue| {
+            unit.disk
+                .as_ref()
+                .is_some_and(|disk| disk.len == len && disk.modified == modified)
+        };
+        let key = Key {
+            layer: Layer::Unit,
+            uri: uri.clone(),
+            fingerprint: project_context_fingerprint(context),
+        };
+        let content_hash = match lock(&self.inner).slots.get(&key) {
+            Some(Slot::Ready(Entry {
+                value: Value::Unit(unit),
+                context: entry_context,
+                input_hash,
+                ..
+            })) if entry_context.as_ref() == context && same_file(unit) => *input_hash,
+            _ => return None,
+        };
+        let unit = self.peek_unit(uri, context, content_hash, overlays)?;
+        same_file(&unit).then_some((unit, content_hash))
     }
 
     /// A verified interface-imports entry, or `None`, under the same rules as
@@ -1961,7 +2041,7 @@ impl ProjectCache {
             content_hash,
             overlays,
             |value| match value {
-                Value::Interface(interface) => Some((interface.clone(), interface.probes.clone())),
+                Value::Interface(interface) => Some(interface.clone()),
                 _ => None,
             },
         )
@@ -2017,21 +2097,21 @@ impl ProjectCache {
         !unchanged
     }
 
-    fn peek<V>(
+    fn peek<V: Probed>(
         &self,
         layer: Layer,
         uri: &Url,
         context: &ProjectContext,
         input_hash: u64,
         overlays: &HashMap<Url, OverlayInput>,
-        extract: impl Fn(&Value) -> Option<(Arc<V>, Vec<Probe>)>,
+        extract: impl Fn(&Value) -> Option<Arc<V>>,
     ) -> Option<Arc<V>> {
         let key = Key {
             layer,
             uri: uri.clone(),
             fingerprint: project_context_fingerprint(context),
         };
-        let (value, probes) = {
+        let value = {
             let state = lock(&self.inner);
             match state.slots.get(&key) {
                 Some(Slot::Ready(entry))
@@ -2042,12 +2122,12 @@ impl ProjectCache {
                 _ => return None,
             }
         };
-        if !probes_hold(&probes, overlays) {
+        if !probes_hold(value.probes(), overlays) {
             return None;
         }
         let mut state = lock(&self.inner);
         if let Some(Slot::Ready(entry)) = state.slots.get(&key)
-            && extract(&entry.value).is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
+            && extract(&entry.value).is_some_and(|current| Arc::ptr_eq(&current, &value))
         {
             touch(&mut state, &key);
         }
@@ -2115,7 +2195,7 @@ impl ProjectCache {
             overlays,
             cancel,
             |value| match value {
-                Value::Import(imports) => Some((imports.clone(), imports.probes.clone())),
+                Value::Import(imports) => Some(imports.clone()),
                 _ => None,
             },
         )
@@ -2132,7 +2212,7 @@ impl ProjectCache {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn lookup<V>(
+    fn lookup<V: Probed>(
         &self,
         layer: Layer,
         uri: &Url,
@@ -2141,7 +2221,7 @@ impl ProjectCache {
         snapshot_epoch: Option<u64>,
         overlays: &HashMap<Url, OverlayInput>,
         cancel: &AtomicBool,
-        extract: impl Fn(&Value) -> Option<(Arc<V>, Vec<Probe>)>,
+        extract: impl Fn(&Value) -> Option<Arc<V>>,
     ) -> Lookup<V> {
         let key = Key {
             layer,
@@ -2162,11 +2242,11 @@ impl ProjectCache {
                 Some(Slot::Ready(entry))
                     if entry.context.as_ref() == context && entry.input_hash == input_hash =>
                 {
-                    let Some((value, probes)) = extract(&entry.value) else {
+                    let Some(value) = extract(&entry.value) else {
                         break;
                     };
                     drop(state);
-                    let probes_hold = probes_hold(&probes, overlays);
+                    let probes_hold = probes_hold(value.probes(), overlays);
                     #[cfg(test)]
                     if probes_hold {
                         self.run_validation_hook();
@@ -2178,7 +2258,7 @@ impl ProjectCache {
                                 && entry.input_hash == input_hash =>
                         {
                             extract(&entry.value)
-                                .is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
+                                .is_some_and(|current| Arc::ptr_eq(&current, &value))
                         }
                         _ => false,
                     };

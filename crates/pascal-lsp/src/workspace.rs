@@ -6962,8 +6962,8 @@ impl Workspace {
         let (resolved, cached_report, cached_probes, import_claim, mut resolver) =
             match import_lookup {
                 crate::project_cache::Lookup::Hit(hit) => (
-                    hit.resolved.clone(),
-                    Some(hit.report.clone()),
+                    std::sync::Arc::clone(&hit.resolved),
+                    Some(std::sync::Arc::clone(&hit.report)),
                     Some(hit.probes.clone()),
                     None,
                     None,
@@ -7019,17 +7019,25 @@ impl Workspace {
                                 error.to_string()
                             }
                         })?;
-                    (resolved, None, None, Some(claim), Some(resolver))
+                    (
+                        std::sync::Arc::new(resolved),
+                        None,
+                        None,
+                        Some(claim),
+                        Some(resolver),
+                    )
                 }
                 crate::project_cache::Lookup::Cancelled => {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
             };
-        let resolved_for_cache = import_claim.as_ref().map(|_| resolved.clone());
-        let import_bytes = resolved_for_cache
+        let resolved_for_cache = import_claim
             .as_ref()
+            .map(|_| std::sync::Arc::clone(&resolved));
+        let import_bytes = resolved_for_cache
+            .as_deref()
             .map(crate::project_cache::import_value_bytes);
-        let mut dependency_units = resolved.dependencies;
+        let mut dependency_units = resolved.dependencies.iter().collect::<Vec<_>>();
         if self.dependency_hook.is_some() {
             // Warm workspace units before library units: they are small and
             // are where navigation usually lands.
@@ -7154,10 +7162,12 @@ impl Workspace {
         check_workspace_cancel(cancel)?;
         let report = match cached_report {
             Some(report) => report,
-            None => resolver
-                .take()
-                .expect("a resolver is present when imports were computed")
-                .finish(),
+            None => std::sync::Arc::new(
+                resolver
+                    .take()
+                    .expect("a resolver is present when imports were computed")
+                    .finish(),
+            ),
         };
         let rejected_dependency = report
             .warnings
@@ -7197,7 +7207,7 @@ impl Workspace {
                 claim,
                 crate::project_cache::ImportValue {
                     resolved,
-                    report: report.clone(),
+                    report: std::sync::Arc::clone(&report),
                     probes,
                     watch_dirs,
                 },
@@ -7619,6 +7629,7 @@ impl Workspace {
                 source.clone(),
                 None,
                 None,
+                None,
                 context_key,
                 pinned,
                 cancel,
@@ -7661,14 +7672,24 @@ impl Workspace {
             }
             return Ok(true);
         }
-        let source = match read_disk_source_with_budget(
-            &path,
-            self.options.limits.max_file_bytes,
-            &context.read_policy,
-            &entry,
-            verified_legacy_payload,
-            cancel,
-            budget,
+        let cached_source = if verified_legacy_payload {
+            None
+        } else {
+            self.cached_closed_source(uri, &path, &context, &current_stamp)
+        };
+        let source = match cached_source.map_or_else(
+            || {
+                read_disk_source_with_budget(
+                    &path,
+                    self.options.limits.max_file_bytes,
+                    &context.read_policy,
+                    &entry,
+                    verified_legacy_payload,
+                    cancel,
+                    budget,
+                )
+            },
+            Ok,
         ) {
             Ok(source) => source,
             Err(error)
@@ -7694,6 +7715,7 @@ impl Workspace {
             text.clone(),
             Some(bytes),
             Some(content_hash),
+            Some(&stamp),
             context_key,
             pinned,
             cancel,
@@ -7744,6 +7766,7 @@ impl Workspace {
             source,
             disk_size,
             raw_content_hash,
+            None,
             context_key,
             pinned,
             cancel,
@@ -7758,6 +7781,7 @@ impl Workspace {
         source: String,
         disk_size: Option<usize>,
         raw_content_hash: Option<u64>,
+        disk_stamp: Option<&DiskStamp>,
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
         cancel: Option<&AtomicBool>,
@@ -7923,6 +7947,17 @@ impl Workspace {
         }
         self.index.clear_import_bindings(uri);
         self.touch(uri);
+        // The parse holds the expanded text when includes were expanded, so
+        // the disk origin then keeps its own copy of the file text.
+        let disk_origin = match (&claim, disk_stamp, disk_size) {
+            (Some(_), Some(stamp), Some(raw_bytes)) => stamp.modified.map(|modified| {
+                let text = expansion
+                    .as_ref()
+                    .map(|_| std::sync::Arc::<str>::from(source.as_str()));
+                (stamp.bytes, modified, raw_bytes, text)
+            }),
+            _ => None,
+        };
         if let Some(expansion) = expansion {
             self.store_expansion_with_control(uri, context_key, source, expansion, cancel, budget)?;
             let context = self
@@ -7946,18 +7981,62 @@ impl Workspace {
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
+            let disk = disk_origin.map(|(len, modified, raw_bytes, text)| {
+                crate::project_cache::DiskOrigin {
+                    len,
+                    modified,
+                    raw_bytes,
+                    text: text.unwrap_or_else(|| parsed.source_text().clone()),
+                }
+            });
             self.project_cache.store_unit(
                 claim,
                 crate::project_cache::UnitValue {
                     parsed,
                     expansion: cached_expansion.map(std::sync::Arc::new),
                     probes,
+                    disk,
                 },
                 crate::project_cache::unit_value_bytes(indexed_source.len()),
                 cancel.unwrap_or(&lookup_cancel),
             );
         }
         Ok(true)
+    }
+
+    /// The text of a closed source whose cached parse was read from a file
+    /// with `stamp`, so a warm load needs no read or decode. Symlinks and
+    /// oversized files take the full read path, which checks them.
+    fn cached_closed_source(
+        &self,
+        uri: &Url,
+        path: &Path,
+        context: &ProjectContext,
+        stamp: &DiskStamp,
+    ) -> Option<DiskSource> {
+        let modified = stamp.modified?;
+        if stamp.bytes > self.options.limits.max_file_bytes as u64
+            || fs::symlink_metadata(path).ok()?.file_type().is_symlink()
+        {
+            return None;
+        }
+        let (unit, content_hash) = self.project_cache.peek_unit_from_disk(
+            uri,
+            context,
+            stamp.bytes,
+            modified,
+            &self.overlay_inputs(),
+        )?;
+        let origin = unit.disk.as_ref()?;
+        if origin.text.len() > self.options.limits.max_file_bytes {
+            return None;
+        }
+        Some(DiskSource {
+            text: origin.text.to_string(),
+            bytes: origin.raw_bytes,
+            stamp: stamp.clone(),
+            content_hash,
+        })
     }
 
     fn overlay_inputs(&self) -> HashMap<Url, rename::OverlayInput> {
@@ -14820,6 +14899,8 @@ fn read_disk_source_with_budget(
         ));
     }
 
+    #[cfg(test)]
+    resolver::record_test_disk_read(path);
     let bytes = if allow_legacy_payload {
         read_policy.read_legacy_payload_bytes(entry, max_bytes as u64)
     } else {
@@ -14859,6 +14940,8 @@ fn closed_source_content_hash(
     read_policy: &pascal_project::ReadPolicy,
     entry: &ProjectPathEntry,
 ) -> u64 {
+    #[cfg(test)]
+    resolver::record_test_disk_read(&entry.path);
     let bytes = if matches!(entry.provenance, ProjectPathProvenance::LegacyNative) {
         read_policy.read_legacy_payload_bytes(entry, max_bytes as u64)
     } else {
@@ -18962,6 +19045,55 @@ mod tests {
     }
 
     #[test]
+    fn second_definition_on_a_closed_unit_reads_no_files() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let definition = || {
+            super::queries::navigation_from_input(
+                main.analysis_input(),
+                &main_uri,
+                Position::new(6, 2),
+                NavigationTarget::Definition,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("definition")
+            .locations
+        };
+        let first = definition();
+        assert_eq!(
+            first.first().map(|location| &location.uri),
+            Some(&provider_uri)
+        );
+        assert!(!super::resolver::take_test_disk_reads().is_empty());
+
+        let second = definition();
+        assert_eq!(second, first);
+        assert_eq!(
+            super::resolver::take_test_disk_reads(),
+            Vec::<PathBuf>::new(),
+            "a warm definition request must not read sources again"
+        );
+
+        let main_path = main_uri.to_file_path().unwrap();
+        fs::write(
+            &main_path,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello; Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        let edited = definition();
+        assert_eq!(
+            edited.first().map(|location| &location.uri),
+            Some(&provider_uri)
+        );
+        assert!(
+            super::resolver::take_test_disk_reads().contains(&main_path),
+            "a changed stamp must read the file"
+        );
+    }
+
+    #[test]
     fn client_delete_invalidates_cached_resolution_even_if_file_remains_on_disk() {
         let temp = tempfile::tempdir().expect("workspace");
         let (main_uri, provider_uri) = provider_fixture(temp.path());
@@ -21687,17 +21819,17 @@ BDS = '/fake/37'
         workspace.project_cache.store_imports(
             claim,
             crate::project_cache::ImportValue {
-                resolved: pascal_core::ResolvedImports {
+                resolved: std::sync::Arc::new(pascal_core::ResolvedImports {
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
-                },
-                report: pascal_core::ResolutionReport {
+                }),
+                report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],
                     warnings: vec![],
                     complete: true,
                     incomplete_reasons: vec![],
-                },
+                }),
                 probes: vec![],
                 watch_dirs: vec![],
             },

@@ -15769,6 +15769,11 @@ impl ParsedDocument {
         &self.unit_name
     }
 
+    /// The parsed text, before conditional projection.
+    pub(crate) fn source_text(&self) -> &Arc<str> {
+        &self.source
+    }
+
     pub(crate) fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

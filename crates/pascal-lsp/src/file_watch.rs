@@ -163,17 +163,17 @@ mod tests {
         cache.store_imports(
             claim,
             ImportValue {
-                resolved: pascal_core::ResolvedImports {
+                resolved: std::sync::Arc::new(pascal_core::ResolvedImports {
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
-                },
-                report: pascal_core::ResolutionReport {
+                }),
+                report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],
                     warnings: vec![],
                     complete: true,
                     incomplete_reasons: vec![],
-                },
+                }),
                 probes,
                 watch_dirs: vec![],
             },
@@ -354,17 +354,17 @@ mod tests {
         let context = pascal_project::ProjectContext::default();
         let main = lsp_types::Url::from_file_path(temp.path().join("Main.pas")).unwrap();
         let empty = || ImportValue {
-            resolved: pascal_core::ResolvedImports {
+            resolved: std::sync::Arc::new(pascal_core::ResolvedImports {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
-            },
-            report: pascal_core::ResolutionReport {
+            }),
+            report: std::sync::Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],
                 warnings: vec![],
                 complete: true,
                 incomplete_reasons: vec![],
-            },
+            }),
             probes: vec![Probe::Stamp {
                 path: temp.path().to_path_buf(),
                 expected: pascal_project::path_stamp_result(temp.path())

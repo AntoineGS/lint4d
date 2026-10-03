@@ -38367,13 +38367,13 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         "textDocument/definition",
         navigation_params(&consumers[0], &consumer_sources[0], "TBefore", 0),
     );
-    let fresh_definition = server.response(&fresh_definition_id);
-    assert!(
-        fresh_definition
-            .error
-            .as_ref()
-            .is_some_and(|error| { error.message.contains("analysis is disabled") }),
-        "over-cap retained project observations must fence fresh navigation instead of serving a partial candidate: {fresh_definition:?}"
+    let fresh_locations = result_locations(server.response(&fresh_definition_id));
+    assert_eq!(
+        fresh_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&replacement_providers[0]).as_str()),
+        "a refused recovery must discard the over-cap project observations and answer from the edited descriptor"
     );
     let closed_definition_id = RequestId::from("metadata-budget-closed-provider".to_string());
     server.send_request(
@@ -38381,14 +38381,13 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         "textDocument/definition",
         navigation_params(&consumers[1], &consumer_sources[1], "TBefore", 0),
     );
+    let closed_locations = result_locations(server.response(&closed_definition_id));
     assert_eq!(
-        server
-            .response(&closed_definition_id)
-            .error
-            .as_ref()
-            .map(|error| error.code),
-        Some(-32803),
-        "cached closed owners must be denied behind the same fail-closed fence"
+        closed_locations
+            .first()
+            .and_then(|location| location["uri"].as_str()),
+        Some(uri(&replacement_providers[1]).as_str()),
+        "cached closed owners must be rebuilt from the edited descriptor too"
     );
 
     let refreshed_id = RequestId::from("metadata-budget-refreshed-pull".to_string());
@@ -38398,12 +38397,11 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
         json!({"textDocument":{"uri":uri(&consumers[0])},"previousResultId":previous_result_id}),
     );
     let refreshed = server.response(&refreshed_id);
-    assert!(
-        refreshed
-            .error
-            .as_ref()
-            .is_some_and(|error| { error.message.contains("analysis is disabled") }),
-        "pull diagnostics must not reuse or publish stale state behind the recovery fence: {refreshed:?}"
+    assert!(refreshed.error.is_none(), "refreshed pull: {refreshed:?}");
+    assert_ne!(
+        refreshed.result.as_ref().unwrap()["resultId"].as_str(),
+        Some(previous_result_id.as_str()),
+        "pull diagnostics must not reuse the result computed before the discarded state: {refreshed:?}"
     );
     let closed_refreshed_id = RequestId::from("metadata-budget-closed-refreshed-pull".to_string());
     server.send_request(
@@ -38413,11 +38411,13 @@ fn sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_p
     );
     let closed_refreshed = server.response(&closed_refreshed_id);
     assert!(
-        closed_refreshed
-            .error
-            .as_ref()
-            .is_some_and(|error| { error.message.contains("analysis is disabled") }),
-        "closed-owner pull diagnostics must also remain fenced: {closed_refreshed:?}"
+        closed_refreshed.error.is_none(),
+        "closed-owner refreshed pull: {closed_refreshed:?}"
+    );
+    assert_ne!(
+        closed_refreshed.result.as_ref().unwrap()["resultId"].as_str(),
+        Some(closed_previous_result_id.as_str()),
+        "closed-owner pull diagnostics must not reuse the stale result: {closed_refreshed:?}"
     );
     assert!(
         wait_for_file(&metrics, IO_TIMEOUT),
@@ -40159,21 +40159,16 @@ fn assert_saturated_control_bypasses_workspace_fifo(
             panic!("deferred query was not replayed after the notification deadline");
         }
         let response = response.expect("query response was checked");
-        let locations = if final_delete_after_barrier && deadline_ms.is_some() {
-            assert!(
-                response.error.is_some(),
-                "cancellation during fallback must fail closed rather than answer from partially reconciled state: {response:?}"
-            );
-            Vec::new()
-        } else {
-            result_locations(response)
-        };
+        let locations = result_locations(response);
         let expected_provider_uri = uri(&provider).to_string();
         let location_uri = locations
             .first()
             .and_then(|location| location["uri"].as_str());
         if final_delete_after_barrier {
-            assert!(locations.is_empty());
+            assert!(
+                locations.is_empty(),
+                "cancellation during fallback must keep the unprocessed delete tombstone authoritative: {locations:?}"
+            );
         } else {
             assert_eq!(
                 location_uri,
@@ -40994,37 +40989,27 @@ fn assert_rename_overlay_is_invalidated_on_reconciliation_fallback(deadline_ms: 
             "diagnostic comparison counter must establish the actual overrun: {metrics}"
         );
     }
-    let definition = server.response(&definition_id);
-    if deadline_ms.is_some() {
-        assert!(
-            definition.error.is_some(),
-            "deadline cancellation during recovery must fail closed instead of publishing a partial candidate: {definition:?}"
-        );
-        let fifo_definition = server.response(&fifo_definition_id);
-        assert!(fifo_definition.error.is_some());
-        let pull = server.response(&pull_id);
-        assert!(pull.error.is_some());
-    } else {
-        let definition = result_locations(definition);
-        assert!(
-            definition.is_empty(),
-            "fallback must reject the already-transferred B overlay rather than resolve stale B disk: {definition:?}"
-        );
-        let fifo_definition = result_locations(server.response(&fifo_definition_id));
-        assert_eq!(
-            fifo_definition.len(),
-            1,
-            "deferred didChange must replay before query"
-        );
-        assert_eq!(fifo_definition[0]["uri"], uri(&consumers[0]).to_string());
-        let pull = server.response(&pull_id);
-        assert!(pull.error.is_none(), "post-fallback pull failed: {pull:?}");
-        let result = pull.result.expect("fresh post-fallback pull result");
-        assert_eq!(
-            result["kind"], "full",
-            "old pull result ID must be invalidated: {result}"
-        );
-    }
+    // Budget exhaustion and deadline cancellation both discard derived state
+    // and reject the transferred overlay; neither fences the workspace.
+    let definition = result_locations(server.response(&definition_id));
+    assert!(
+        definition.is_empty(),
+        "fallback must reject the already-transferred B overlay rather than resolve stale B disk: {definition:?}"
+    );
+    let fifo_definition = result_locations(server.response(&fifo_definition_id));
+    assert_eq!(
+        fifo_definition.len(),
+        1,
+        "deferred didChange must replay before query"
+    );
+    assert_eq!(fifo_definition[0]["uri"], uri(&consumers[0]).to_string());
+    let pull = server.response(&pull_id);
+    assert!(pull.error.is_none(), "post-fallback pull failed: {pull:?}");
+    let result = pull.result.expect("fresh post-fallback pull result");
+    assert_eq!(
+        result["kind"], "full",
+        "old pull result ID must be invalidated: {result}"
+    );
     server.shutdown();
 }
 

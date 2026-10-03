@@ -343,7 +343,7 @@ mod probe_tests {
         }];
         std::fs::write(&file, "unit B;").unwrap();
         // Windows can stamp both writes with the same timer tick; the probe
-        // only rereads content once the stamp moved.
+        // only rereads content once the stamp moved (TASK-122).
         std::fs::File::options()
             .write(true)
             .open(&file)
@@ -603,6 +603,13 @@ mod cache_tests {
         );
 
         std::fs::write(&include, "{$DEFINE B}").unwrap();
+        // Windows can stamp both writes with the same timer tick (TASK-122).
+        std::fs::File::options()
+            .write(true)
+            .open(&include)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
         assert!(
             cache
                 .peek_unit(&uri("Base.pas"), &ctx, 7, &HashMap::new())

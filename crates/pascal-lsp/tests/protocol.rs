@@ -7660,6 +7660,134 @@ fn pull_diagnostics_advertises_provider_and_returns_document_report() {
 }
 
 #[test]
+fn percent_encoded_at_sign_uri_is_the_same_open_document() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let root = temp.path().join("user@host");
+    let provider = root.join("Provider.pas");
+    let main = root.join("Main.pas");
+    let provider_source = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
+    let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  PublicRoutine;\nend;\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&main, main_source);
+    let encoded = |path: &Path| {
+        let raw = uri(path);
+        assert!(raw.as_str().contains('@'), "{raw}");
+        Url::parse(&raw.as_str().replace('@', "%40")).expect("encoded URI")
+    };
+    let main_uri = encoded(&main);
+    let provider_uri = encoded(&provider);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    for (document, source) in [(&main_uri, main_source), (&provider_uri, provider_source)] {
+        server.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": document,
+                    "languageId": "pascal",
+                    "version": 1,
+                    "text": source,
+                }
+            }),
+        );
+    }
+
+    let pull_id = RequestId::from("encoded-at-pull".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": main_uri},
+            "previousResultId": null
+        }),
+    );
+    let pull = server.response(&pull_id);
+    assert!(pull.error.is_none(), "encoded-URI pull failed: {pull:?}");
+    let pull = pull.result.expect("encoded-URI pull result");
+    assert_eq!(pull["kind"], "full", "{pull}");
+
+    let definition_id = RequestId::from("encoded-at-definition".to_string());
+    server.send_request(
+        definition_id.clone(),
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": main_uri},
+            "position": position_of(main_source, "PublicRoutine", 0),
+        }),
+    );
+    let definition = server.response(&definition_id);
+    assert!(
+        definition.error.is_none(),
+        "encoded-URI definition failed: {definition:?}"
+    );
+    let locations = result_locations(definition);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(
+        locations[0]["uri"].as_str(),
+        Some(provider_uri.as_str()),
+        "responses must use the URI the client opened the document with"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn percent_encoded_at_sign_related_document_reports_use_the_client_uri() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let root = temp.path().join("user@host");
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\ntype\n  TBox = class\n    Value: Integer;\n  end;\nimplementation\n{$I Shared.inc}\nend.\n";
+    let include_source = "procedure Run;\nvar Box: TBox;\nbegin\n  Box.Missing := 1;\nend;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    let encoded = |path: &Path| Url::parse(&uri(path).as_str().replace('@', "%40")).expect("URI");
+    let main_uri = encoded(&main);
+    let include_uri = encoded(&include);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    // The include stays closed so it is reported as a related document; the
+    // client still names it with its own spelling, here in a watched-file event.
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": include_uri, "type": 2}]}),
+    );
+    let request_id = RequestId::from("encoded-at-related".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": main_uri}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "related pull failed: {response:?}"
+    );
+    let result = response.result.expect("related document result");
+    let related = result["relatedDocuments"]
+        .as_object()
+        .expect("related document reports");
+    assert!(
+        related.contains_key(include_uri.as_str()),
+        "related reports must be keyed by the client's URI: {:?}",
+        related.keys().collect::<Vec<_>>()
+    );
+    server.shutdown();
+}
+
+#[test]
 fn pull_workspace_diagnostics_reports_authorized_unopened_sources() {
     let root = tempfile::tempdir().expect("workspace");
     let first = root.path().join("First.pas");

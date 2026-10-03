@@ -2,6 +2,8 @@
 
 #[path = "server/project_prompts.rs"]
 mod project_prompts;
+#[path = "server/uri_spelling.rs"]
+mod uri_spelling;
 
 #[cfg(test)]
 use crate::navigation::CompletionResolutionSeed;
@@ -50,8 +52,8 @@ use std::io::Write;
 use std::io::{self, BufRead, Read};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -10133,6 +10135,8 @@ fn bounded_stdio(
 ) -> (Connection, Receiver<Message>, StdioThreads) {
     #[cfg(feature = "test-support")]
     let reader_test_barriers = test_barriers.clone();
+    let uri_spellings = Arc::new(Mutex::new(uri_spelling::UriSpellings::default()));
+    let reader_uri_spellings = Arc::clone(&uri_spellings);
     let (writer_sender, writer_receiver) = bounded::<Message>(MAX_OUTBOUND_MESSAGES);
     let writer = thread::Builder::new()
         .name("PascalLspWriter".to_string())
@@ -10145,7 +10149,11 @@ fn bounded_stdio(
             let mut outbound_writer_barrier_used = false;
             #[cfg(not(feature = "test-support"))]
             let _ = test_barriers;
-            for message in writer_receiver {
+            for mut message in writer_receiver {
+                uri_spellings
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .restore_outbound(&mut message);
                 #[cfg(feature = "test-support")]
                 if !outbound_writer_barrier_used
                     && outbound_writer_barrier
@@ -10174,7 +10182,11 @@ fn bounded_stdio(
         .spawn(move || {
             let stdin = io::stdin();
             let mut stdin = BoundedReader::new(stdin.lock());
-            while let Some(message) = Message::read(&mut stdin)? {
+            while let Some(mut message) = Message::read(&mut stdin)? {
+                reader_uri_spellings
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .canonicalize_inbound(&mut message);
                 let is_exit = is_exit_notification(&message);
                 let dispatch = reader_sender.try_send(message);
                 match dispatch {

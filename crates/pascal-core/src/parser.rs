@@ -281,14 +281,6 @@ fn visit_node(root: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if node.is_error() || node.is_missing() {
-            // Skip bare `raise;` ERROR nodes — tree-sitter-pascal does not
-            // recognise standalone `raise` (re-raise) as valid syntax, but
-            // it is perfectly legal Delphi. The error node contains a single
-            // `kRaise` child.
-            if node.is_error() && is_bare_raise_error(node) {
-                continue;
-            }
-
             let start = node.start_position();
             let end = node.end_position();
 
@@ -326,31 +318,14 @@ fn visit_node(root: tree_sitter::Node, source: &[u8], out: &mut Vec<Diagnostic>)
     }
 }
 
-/// Check whether an ERROR node represents a bare `raise;` statement.
-///
-/// tree-sitter-pascal does not support standalone `raise` (re-raise the
-/// current exception). The ERROR node in this case contains a single
-/// `kRaise` child.
-fn is_bare_raise_error(node: tree_sitter::Node) -> bool {
-    if node.child_count() == 1
-        && let Some(child) = node.child(0)
-    {
-        return child.kind() == crate::node_kind::K_RAISE;
-    }
-    false
-}
-
-/// Returns true iff the tree contains at least one ERROR or MISSING node
-/// that is *not* a bare `raise;` false-positive. This is the Phase 2
-/// fallback gate in `parse_file_with_patches`: if `has_real_error` returns
-/// true, we rerun the source through `rewrite_opaque_if_blocks` and reparse.
+/// Returns true iff the tree contains at least one ERROR or MISSING node.
+/// This is the Phase 2 fallback gate in `parse_file_with_patches`: if
+/// `has_real_error` returns true, we rerun the source through
+/// `rewrite_opaque_if_blocks` and reparse.
 fn has_real_error(root: tree_sitter::Node) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if node.is_error() || node.is_missing() {
-            if node.is_error() && is_bare_raise_error(node) {
-                continue;
-            }
             return true;
         }
 
@@ -397,16 +372,45 @@ mod has_real_error_tests {
     }
 
     #[test]
-    fn has_real_error_false_for_bare_raise_only() {
-        // `raise;` is a known false-positive ERROR node that
-        // is_bare_raise_error filters out; has_real_error must do the same.
+    fn grammar_parses_bare_raise_without_error_nodes() {
+        let bodies = [
+            "procedure P; begin raise; end;",
+            "procedure P; begin raise end;",
+            "procedure P; begin try P; except raise; end; end;",
+            "procedure P; begin try P; except Log; raise end; end;",
+            "procedure P; begin try P; except on E: Exception do raise; end; end;",
+            "procedure P; begin try P; except on E: Exception do begin Log; raise; end; else raise; end; end;",
+            "procedure P; begin begin begin raise end end end;",
+            "procedure P; begin if A then raise else B; end;",
+            "procedure P; begin case A of 1: raise; else raise; end; end;",
+            "procedure P; begin while A do raise; end;",
+            "procedure TFoo.M; begin try P; finally Q; end; raise; end;",
+        ];
+        for body in bodies {
+            let source = format!("unit X;\ninterface\nimplementation\n{body}\nend.\n");
+            let tree = parse_raw(source.as_bytes());
+            let sexp = tree.root_node().to_sexp();
+            assert!(
+                !has_real_error(tree.root_node()) && sexp.contains("(raise"),
+                "bare `raise` must parse cleanly in {body:?}: {sexp}"
+            );
+            let (_tree, diagnostics, patches) = parse_file_with_patches(
+                &crate::types::FileInfo::new("x.pas".into()),
+                source.as_bytes(),
+            )
+            .expect("parse ok");
+            assert!(
+                diagnostics.is_empty() && patches.is_empty(),
+                "{body:?}: {diagnostics:?}"
+            );
+        }
         let tree = parse_raw(
-            b"unit X;\ninterface\nimplementation\n\
-              procedure P; begin raise; end;\nend.\n",
+            b"unit X;\ninterface\nimplementation\ninitialization\n  try P; except raise; end;\nend.\n",
         );
         assert!(
             !has_real_error(tree.root_node()),
-            "bare `raise;` must not count as a real error"
+            "{}",
+            tree.root_node().to_sexp()
         );
     }
 }

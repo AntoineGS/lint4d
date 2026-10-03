@@ -576,25 +576,25 @@ impl<'a> DocBuilder<'a> {
         let mut parts = Vec::new();
         let mut prev: Option<&TrailingItem<'a>> = None;
         for item in items {
-            match prev {
-                None => {
-                    let gap = first_gap.unwrap_or(item.gap).max(1);
-                    parts.push(Doc::Raw(" ".repeat(gap)));
-                }
+            // Gap and text go in one Raw: the renderer forgets the previous
+            // token after a whitespace-ending Raw, and the next token would
+            // lose its space.
+            let gap = match prev {
+                None => first_gap.unwrap_or(item.gap).max(1),
                 Some(p) if p.is_line_comment() => {
                     parts.push(Doc::Hardline);
+                    0
                 }
                 Some(p) => {
                     let between = &self.source[p.span.end.min(item.span.start)..item.span.start];
-                    let gap = if between.contains(&b'\n') {
+                    if between.contains(&b'\n') {
                         1
                     } else {
                         between.len().max(1)
-                    };
-                    parts.push(Doc::Raw(" ".repeat(gap)));
+                    }
                 }
-            }
-            parts.push(Doc::Raw(item.text.to_string()));
+            };
+            parts.push(Doc::Raw(format!("{}{}", " ".repeat(gap), item.text)));
             prev = Some(item);
         }
         doc::concat(parts)

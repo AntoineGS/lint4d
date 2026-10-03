@@ -831,8 +831,11 @@ impl<'a> DocBuilder<'a> {
                 } else {
                     // Start a line: the previous item may end in a `//`
                     // comment, and nothing else breaks the line between
-                    // non-row items.
-                    group_items.push(Doc::LineStart(String::new()));
+                    // non-row items. A doc that starts with a hardline (a
+                    // leading comment or directive) already does.
+                    if !crate::doc_builder::starts_with_hardline(&child_doc) {
+                        group_items.push(Doc::LineStart(String::new()));
+                    }
                     group_items.push(child_doc);
                 }
             }

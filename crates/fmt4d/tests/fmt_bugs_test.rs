@@ -4304,20 +4304,23 @@ fn var_list_trivia_after_a_line_comment_starts_a_new_line() {
 
 #[test]
 fn var_list_trivia_inside_the_type_is_emitted_once() {
-    for decls in [
-        "  A, B: {t} Integer {u};\n",
-        "  M, N\n  { blk }\n  : Byte;\n",
+    // The suffix's trivia is emitted with the last declaration only.
+    for (decls, expected) in [
+        (
+            "  A, B: {t} Integer {u};\n",
+            "  A: Integer;\n  B: {t} Integer {u};\n",
+        ),
+        (
+            "  M, N\n  { blk }\n  : Byte;\n",
+            "  M: Byte;\n  N\n  { blk }\n  : Byte;\n",
+        ),
     ] {
         let src = var_list_source(decls);
         for result in format_three_modes_idempotent(&src) {
-            for c in ["{t}", "{u}", "{ blk }"] {
-                assert!(result.matches(c).count() <= 1, "{c} twice in:\n{result}");
-                assert_eq!(
-                    result.matches(c).count(),
-                    decls.matches(c).count(),
-                    "{c} in:\n{result}"
-                );
-            }
+            assert!(
+                result.contains(expected),
+                "{expected:?} missing in:\n{result}"
+            );
         }
     }
 }
@@ -4409,4 +4412,22 @@ fn eof_trivia_after_a_closed_format_off_is_laid_out_normally() {
     let result = format_source(src);
     assert!(result.ends_with("end.\n// tail\n"), "{result:?}");
     idempotency_check(src);
+}
+
+// ── Bug: a trailing comment's gap dropped the space before the next token ─
+
+#[test]
+fn comment_inside_code_keeps_the_space_after_it() {
+    let src = "unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  A: {t} Integer;\n  B: {$R+} Integer;\nbegin\n  X := {a} 1;\n  if {c} X then\n    Y;\n  Z := A + {c} B;\nend;\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        for line in [
+            "  A: {t} Integer;\n",
+            "  B: {$R+} Integer;\n",
+            "  X := {a} 1;\n",
+            "  if {c} X then\n",
+            "  Z := A + {c} B;\n",
+        ] {
+            assert!(result.contains(line), "{line:?} missing in:\n{result}");
+        }
+    }
 }

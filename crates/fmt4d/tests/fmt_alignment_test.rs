@@ -1075,3 +1075,19 @@ fn field_list_after_a_line_comment_starts_its_own_line() {
     );
     idempotency_check_aligned(src);
 }
+
+#[test]
+fn var_alignment_with_ifdef_blocks_adds_no_blank_lines() {
+    // Same output as d55c0f6: conditional blocks are not aligned rows.
+    let src = var_list_source(
+        "  {$IFDEF DEBUG}\n  bad_var: Integer;\n  {$ENDIF}\n  GoodVar: Integer;\n  LongerName: Byte;\n  {$IFDEF X}\n  Y: Byte;\n  {$ENDIF}\n  Z: Word;\n",
+    );
+    let result = format_aligned(&src);
+    assert!(
+        result.contains(
+            "var\n  {$IFDEF DEBUG}\n  bad_var: Integer;\n  {$ENDIF}\n  GoodVar   : Integer;\n  LongerName: Byte;\n  {$IFDEF X}\n  Y: Byte;\n  {$ENDIF}\n  Z         : Word;\nbegin\n"
+        ),
+        "{result}"
+    );
+    idempotency_check_aligned(&src);
+}

@@ -4163,9 +4163,10 @@ struct PartialDeliveryRecipient {
 
 /// Read-set validation for one partial delivery. Chunks are guarded by the
 /// generation token captured when the delivery starts (an integer compare per
-/// chunk); this filesystem pass runs once, after the last chunk and before the
-/// first successful final response, so an unnotified disk change during
-/// delivery still fails the request closed.
+/// chunk); this filesystem pass runs before a successful final response and
+/// covers every chunk sent before it started. It runs again only when chunks
+/// were sent after the previous pass started, so an unnotified disk change
+/// before a recipient's last chunk still fails that request closed.
 #[derive(Debug)]
 struct PartialDeliveryValidation {
     input: Arc<rename::RevalidationInput>,
@@ -4174,7 +4175,11 @@ struct PartialDeliveryValidation {
     cancellation: Arc<AtomicBool>,
     receiver: Option<Receiver<Result<(), String>>>,
     handle: Option<JoinHandle<()>>,
-    passed: bool,
+    /// Chunks sent so far, the count when the running pass started, and the
+    /// count the last successful pass covers.
+    chunks_sent: u64,
+    started_at: u64,
+    passed_at: Option<u64>,
     #[cfg(test)]
     runs: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -4192,25 +4197,37 @@ impl PartialDeliveryValidation {
             cancellation: Arc::new(AtomicBool::new(false)),
             receiver: None,
             handle: None,
-            passed: false,
+            chunks_sent: 0,
+            started_at: 0,
+            passed_at: None,
             #[cfg(test)]
             runs: Arc::default(),
         }
     }
 
-    /// Starts the validation on first use and reports its outcome; `None`
-    /// while it is still running. A passed validation is not repeated.
+    fn note_chunk_sent(&mut self) {
+        self.chunks_sent = self.chunks_sent.saturating_add(1);
+    }
+
+    /// Starts a pass unless one already covers every chunk sent, and reports
+    /// its outcome; `None` while a pass is running.
     fn check(&mut self) -> Option<Result<(), String>> {
-        if self.passed {
+        if self.passed_at == Some(self.chunks_sent) {
             return Some(Ok(()));
         }
-        if !self.is_running()
-            && let Err(error) = self.request()
-        {
-            return Some(Err(error));
+        if !self.is_running() {
+            self.started_at = self.chunks_sent;
+            if let Err(error) = self.request() {
+                return Some(Err(error));
+            }
         }
         let result = self.poll()?;
-        self.passed = result.is_ok();
+        if result.is_ok() {
+            self.passed_at = Some(self.started_at);
+            if self.started_at != self.chunks_sent {
+                return self.check();
+            }
+        }
         Some(result)
     }
 
@@ -8470,6 +8487,7 @@ impl AnalysisJobs {
                 return Ok(());
             }
             sent += 1;
+            delivery.validation.note_chunk_sent();
             delivery.recipients[recipient_index].next_item = end;
             delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
             self.partial_deliveries.push_back(delivery);
@@ -18943,6 +18961,80 @@ mod tests {
         fn send_data(&self, message: Message) -> Result<bool, OutputError> {
             self.send_control(message).map(|()| true)
         }
+    }
+
+    #[test]
+    fn chunks_sent_after_a_validation_started_are_validated_again() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).expect("source URI");
+        let locations = (0..2 * MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK)
+            .map(|line| {
+                let line = u32::try_from(line).expect("line");
+                Location::new(
+                    uri.clone(),
+                    Range::new(Position::new(line, 0), Position::new(line, 1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let validation = PartialDeliveryValidation::new(
+            Arc::new(workspace.revalidation_input()),
+            Arc::new(Vec::new()),
+            TestBarrierConfig::disabled(),
+        );
+        let runs = Arc::clone(&validation.runs);
+        let finished = RequestId::from("finished-recipient".to_string());
+        let behind = RequestId::from("behind-recipient".to_string());
+        let mut jobs = AnalysisJobs::new();
+        jobs.partial_deliveries.push_back(PartialDelivery {
+            job_id: AnalysisComputationId(0),
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            payload: PartialResultPayload::References(Arc::new(locations.clone())),
+            retrigger_on_stale: false,
+            recipients: vec![
+                PartialDeliveryRecipient {
+                    id: finished.clone(),
+                    token: lsp_types::ProgressToken::String("finished".to_string()),
+                    next_item: locations.len(),
+                },
+                PartialDeliveryRecipient {
+                    id: behind.clone(),
+                    token: lsp_types::ProgressToken::String("behind".to_string()),
+                    next_item: 0,
+                },
+            ],
+            next_recipient: 0,
+            retained_bytes: 1,
+            validation,
+        });
+        let connection = RecordingSender::default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !jobs.partial_deliveries.is_empty() {
+            assert!(Instant::now() < deadline, "partial delivery must finish");
+            let sent = connection.messages.lock().expect("recorded messages").len();
+            jobs.pump_partial_deliveries(&connection, &workspace)
+                .expect("pump partial delivery");
+            if connection.messages.lock().expect("recorded messages").len() == sent {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let messages = connection.messages.lock().expect("recorded messages");
+        let responses = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Response(response) => Some(response),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().all(|response| response.error.is_none()));
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "chunks sent after the first validation started need their own validation"
+        );
     }
 
     #[test]

@@ -37767,6 +37767,15 @@ fn definition_does_not_wait_out_a_bulk_references_cache_claim() {
     let locations = result_locations(definition);
     assert_eq!(locations.len(), 1, "{locations:?}");
     assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    // No document is open, so nothing warms: the one held claim is the
+    // references job's, and the definition did not take one at the barrier.
+    assert_eq!(
+        fs::read(&claim.entered)
+            .expect("claim barrier marker")
+            .len(),
+        1,
+        "only the references job may hold a claim at the barrier"
+    );
 
     claim.release();
     let references = server.response(&references_id);

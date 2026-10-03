@@ -5295,6 +5295,12 @@ struct AnalysisJobs {
     next_computation_id: u64,
     shutting_down: bool,
     configuration_watch_sync_pending: bool,
+    /// Results received while a file-notification worker owned the workspace
+    /// that could not be delivered without it; polled before `receiver`.
+    held_results: VecDeque<AnalysisResult>,
+    /// Navigation state of results delivered during reconciliation, applied
+    /// after the commit only if the result is still fresh.
+    held_navigation_states: Vec<AnalysisResult>,
 }
 
 #[derive(Clone)]
@@ -5497,6 +5503,8 @@ impl AnalysisJobs {
             next_computation_id: 0,
             shutting_down: false,
             configuration_watch_sync_pending: false,
+            held_results: VecDeque::new(),
+            held_navigation_states: Vec::new(),
         }
     }
 
@@ -8508,7 +8516,11 @@ impl AnalysisJobs {
                 job.analysis.cancellation.store(true, Ordering::Relaxed);
             }
         }
-        while let Ok(result) = self.receiver.try_recv() {
+        while let Some(result) = self
+            .held_results
+            .pop_front()
+            .or_else(|| self.receiver.try_recv().ok())
+        {
             match result.id {
                 AnalysisJobId::Diagnostic(id) => {
                     let Some(job) = self.diagnostics.remove(&id) else {
@@ -8853,6 +8865,113 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    /// Runs while a file-notification worker owns the workspace. A completed
+    /// client result whose generations equal the revision the worker started
+    /// from is exactly as fresh as it would have been just before the batch:
+    /// the batch is not applied yet and every later workspace message is
+    /// deferred behind it. Such results are delivered now when their delivery
+    /// is read-only; everything else is held for the post-commit poll.
+    fn deliver_during_reconciliation(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        revision: WorkspaceRevision,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        while let Ok(mut result) = self.receiver.try_recv() {
+            let AnalysisJobId::Client(primary_id) = result.id else {
+                self.held_results.push_back(result);
+                continue;
+            };
+            if !self.is_deliverable_during_reconciliation(primary_id, &result, revision) {
+                self.held_results.push_back(result);
+                continue;
+            }
+            let job = self
+                .pending
+                .remove(&primary_id)
+                .expect("deliverable result has a pending job");
+            self.publish_interactive_load();
+            self.compiled_content_payload_budget.release(&primary_id);
+            let _ = job.handle.join();
+            self.remove_observation(job.key.as_ref(), &primary_id);
+            if let AnalysisResultValue::Navigation(navigation) = &mut result.value
+                && let Some(state) = navigation.state.take()
+            {
+                self.held_navigation_states.push(AnalysisResult {
+                    id: result.id,
+                    source_generation: result.source_generation,
+                    configuration_generation: result.configuration_generation,
+                    records: result.records.clone(),
+                    value: AnalysisResultValue::Navigation(NavigationAnalysis {
+                        value: Ok(Vec::new()),
+                        state: Some(state),
+                    }),
+                });
+            }
+            for recipient in &job.recipients {
+                send_read_only_analysis_result(
+                    connection,
+                    &mut self.completion_resolutions,
+                    result.clone(),
+                    Some(recipient.id.clone()),
+                )?;
+                self.remove_client_mapping(&recipient.id, &primary_id);
+                self.release_partial_token(recipient);
+                self.progress
+                    .finish_recipient(
+                        Some(connection),
+                        AnalysisJobId::Client(primary_id),
+                        &recipient.id,
+                        None,
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_deliverable_during_reconciliation(
+        &self,
+        primary_id: AnalysisComputationId,
+        result: &AnalysisResult,
+        revision: WorkspaceRevision,
+    ) -> bool {
+        let Some(job) = self.pending.get(&primary_id) else {
+            return false;
+        };
+        revision.admits(result)
+            && is_read_only_delivery(&result.value)
+            && !job.recipients.is_empty()
+            && !job.cancellation.load(Ordering::Relaxed)
+            && !(is_partial_result_value(&result.value)
+                && job
+                    .recipients
+                    .iter()
+                    .any(|recipient| recipient.partial_result_token.is_some()))
+            && !job.recipients.iter().any(|recipient| {
+                self.automatic_discovery_requests
+                    .contains_key(&recipient.id)
+                    || self.automatic_apply_requests.contains_key(&recipient.id)
+                    || self.automatic_answer_requests.contains_key(&recipient.id)
+                    || self.manual_selection_requests.contains_key(&recipient.id)
+            })
+    }
+
+    /// Applies navigation state held by `deliver_during_reconciliation` once
+    /// the reconciled workspace is committed, under the same freshness rule
+    /// as ordinary delivery.
+    fn apply_held_navigation_states(&mut self, workspace: &mut Workspace) {
+        for mut result in std::mem::take(&mut self.held_navigation_states) {
+            if analysis_result_is_stale(workspace, &result) {
+                continue;
+            }
+            if let AnalysisResultValue::Navigation(navigation) = &mut result.value
+                && let Some(state) = navigation.state.take()
+            {
+                workspace.apply_navigation_state(state);
+            }
+        }
+    }
+
     fn take_configuration_watch_sync_pending(&mut self) -> bool {
         std::mem::take(&mut self.configuration_watch_sync_pending)
     }
@@ -9157,6 +9276,32 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
         )
 }
 
+/// The workspace revision a result can be compared with when the workspace
+/// itself is unavailable: equal generations and no admission fence mean the
+/// protocol loop has observed no change since the result's input was captured.
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceRevision {
+    source_generation: u64,
+    configuration_generation: u64,
+    fenced: bool,
+}
+
+impl WorkspaceRevision {
+    fn of(workspace: &Workspace) -> Self {
+        Self {
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            fenced: workspace.analysis_admission_fenced(),
+        }
+    }
+
+    fn admits(&self, result: &AnalysisResult) -> bool {
+        !self.fenced
+            && result.source_generation == self.source_generation
+            && result.configuration_generation == self.configuration_generation
+    }
+}
+
 fn analysis_result_is_stale(workspace: &Workspace, result: &AnalysisResult) -> bool {
     if workspace.analysis_admission_fenced() {
         return true;
@@ -9264,6 +9409,10 @@ fn deliver_analysis_result_with_store(
         && let Some(state) = navigation.state.take()
     {
         workspace.apply_navigation_state(state);
+    }
+    if is_read_only_delivery(&result.value) {
+        send_read_only_analysis_result(connection, completion_resolutions, result, client_id)?;
+        return Ok(false);
     }
     let mut selection_committed = false;
     match result.value {
@@ -9384,6 +9533,139 @@ fn deliver_analysis_result_with_store(
                 ),
             }
         }
+        AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
+            Ok(publications) => {
+                send_diagnostic_publications(connection, workspace, &diagnostics.uri, publications)
+            }
+            Err(error) if error == rename::CANCELLATION_MESSAGE => {
+                workspace.reschedule_diagnostics(diagnostics.uri);
+                Ok(())
+            }
+            Err(error) => {
+                let uri = diagnostics.uri;
+                let version = diagnostics.version;
+                let updates = workspace
+                    .stage_diagnostic_publications(
+                        &uri,
+                        std::iter::once(queries::DiagnosticPublication {
+                            uri: uri.clone(),
+                            version,
+                            diagnostics: vec![crate::workspace::server_diagnostic(
+                                &error,
+                                lsp_types::DiagnosticSeverity::ERROR,
+                            )],
+                        }),
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                if updates.incomplete {
+                    workspace.mark_pending_diagnostic_publication_incomplete();
+                }
+                Ok(())
+            }
+        },
+        AnalysisResultValue::DocumentDiagnostics(value) => match value {
+            Ok(analysis) => send_document_diagnostics(
+                connection,
+                workspace,
+                diagnostic_results,
+                analysis,
+                client_id.expect("client result"),
+            ),
+            Err(error) => {
+                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::WorkspaceDiagnostics(value) => match value {
+            Ok(analysis) => send_workspace_diagnostics(
+                connection,
+                workspace,
+                diagnostic_results,
+                analysis,
+                client_id.expect("client result"),
+            ),
+            Err(error) => {
+                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::Rename {
+            value,
+            unit_file_move,
+        } => match *value {
+            Ok(value) => {
+                if let Some((old_uri, new_uri)) = unit_file_move {
+                    if let Err(error) = workspace.stage_unit_file_rename(&old_uri, &new_uri, &value)
+                    {
+                        send_analysis_error(
+                            connection,
+                            client_id.clone().expect("client result"),
+                            error,
+                        )?;
+                        return Ok(false);
+                    }
+                    let response =
+                        send_ok(connection, client_id.clone().expect("client result"), value);
+                    if response.is_err() {
+                        workspace.cancel_staged_unit_file_rename(&old_uri, &new_uri);
+                    }
+                    response
+                } else {
+                    send_ok(connection, client_id.clone().expect("client result"), value)
+                }
+            }
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        _ => unreachable!("read-only results are sent above"),
+    }?;
+    Ok(selection_committed)
+}
+
+/// Results whose delivery writes only protocol output and the completion
+/// resolution store, never the workspace.
+fn is_read_only_delivery(value: &AnalysisResultValue) -> bool {
+    matches!(
+        value,
+        AnalysisResultValue::CompiledContent(_)
+            | AnalysisResultValue::Hover(_)
+            | AnalysisResultValue::Completion(_)
+            | AnalysisResultValue::ResolveCompletion(_)
+            | AnalysisResultValue::SignatureHelp(_)
+            | AnalysisResultValue::Navigation(_)
+            | AnalysisResultValue::Formatting(_)
+            | AnalysisResultValue::DocumentLinks(_)
+            | AnalysisResultValue::CodeLenses(_)
+            | AnalysisResultValue::ResolveCodeLens(_)
+            | AnalysisResultValue::TypeDefinitions(_)
+            | AnalysisResultValue::Prepare(_)
+            | AnalysisResultValue::CodeActions(_)
+            | AnalysisResultValue::Resolve(_)
+            | AnalysisResultValue::DocumentSymbols { .. }
+            | AnalysisResultValue::WorkspaceSymbols(_)
+            | AnalysisResultValue::References(_)
+            | AnalysisResultValue::DocumentHighlights(_)
+            | AnalysisResultValue::SelectionRanges(_)
+            | AnalysisResultValue::SemanticTokens(_)
+            | AnalysisResultValue::FoldingRanges(_)
+            | AnalysisResultValue::InlayHints(_)
+            | AnalysisResultValue::PrepareCallHierarchy(_)
+            | AnalysisResultValue::PrepareTypeHierarchy(_)
+            | AnalysisResultValue::TypeHierarchySupertypes(_)
+            | AnalysisResultValue::TypeHierarchySubtypes(_)
+            | AnalysisResultValue::IncomingCalls(_)
+            | AnalysisResultValue::OutgoingCalls(_)
+    )
+}
+
+/// Sends a result accepted by `is_read_only_delivery`. Navigation state must
+/// already have been taken out by the caller.
+fn send_read_only_analysis_result(
+    connection: &dyn ProtocolSender,
+    completion_resolutions: &mut CompletionResolutionStore,
+    result: AnalysisResult,
+    client_id: Option<RequestId>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    match result.value {
         AnalysisResultValue::CompiledContent(value) => match value {
             Ok(Some(text)) => send_ok(
                 connection,
@@ -9497,60 +9779,6 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-        AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
-            Ok(publications) => {
-                send_diagnostic_publications(connection, workspace, &diagnostics.uri, publications)
-            }
-            Err(error) if error == rename::CANCELLATION_MESSAGE => {
-                workspace.reschedule_diagnostics(diagnostics.uri);
-                Ok(())
-            }
-            Err(error) => {
-                let uri = diagnostics.uri;
-                let version = diagnostics.version;
-                let updates = workspace
-                    .stage_diagnostic_publications(
-                        &uri,
-                        std::iter::once(queries::DiagnosticPublication {
-                            uri: uri.clone(),
-                            version,
-                            diagnostics: vec![crate::workspace::server_diagnostic(
-                                &error,
-                                lsp_types::DiagnosticSeverity::ERROR,
-                            )],
-                        }),
-                    )
-                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                if updates.incomplete {
-                    workspace.mark_pending_diagnostic_publication_incomplete();
-                }
-                Ok(())
-            }
-        },
-        AnalysisResultValue::DocumentDiagnostics(value) => match value {
-            Ok(analysis) => send_document_diagnostics(
-                connection,
-                workspace,
-                diagnostic_results,
-                analysis,
-                client_id.expect("client result"),
-            ),
-            Err(error) => {
-                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
-            }
-        },
-        AnalysisResultValue::WorkspaceDiagnostics(value) => match value {
-            Ok(analysis) => send_workspace_diagnostics(
-                connection,
-                workspace,
-                diagnostic_results,
-                analysis,
-                client_id.expect("client result"),
-            ),
-            Err(error) => {
-                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
-            }
-        },
         AnalysisResultValue::TypeDefinitions(value) => match value {
             Ok(value) => send_ok(
                 connection,
@@ -9563,35 +9791,6 @@ fn deliver_analysis_result_with_store(
         },
         AnalysisResultValue::Prepare(value) => match value {
             Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
-            Err(error) => {
-                send_analysis_error(connection, client_id.clone().expect("client result"), error)
-            }
-        },
-        AnalysisResultValue::Rename {
-            value,
-            unit_file_move,
-        } => match *value {
-            Ok(value) => {
-                if let Some((old_uri, new_uri)) = unit_file_move {
-                    if let Err(error) = workspace.stage_unit_file_rename(&old_uri, &new_uri, &value)
-                    {
-                        send_analysis_error(
-                            connection,
-                            client_id.clone().expect("client result"),
-                            error,
-                        )?;
-                        return Ok(false);
-                    }
-                    let response =
-                        send_ok(connection, client_id.clone().expect("client result"), value);
-                    if response.is_err() {
-                        workspace.cancel_staged_unit_file_rename(&old_uri, &new_uri);
-                    }
-                    response
-                } else {
-                    send_ok(connection, client_id.clone().expect("client result"), value)
-                }
-            }
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
@@ -9693,8 +9892,8 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-    }?;
-    Ok(selection_committed)
+        _ => unreachable!("only read-only results are sent without the workspace"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10506,6 +10705,8 @@ struct WorkspaceFileNotificationWorker {
     deadline_expired: Arc<AtomicBool>,
     deadline: Instant,
     join: Option<JoinHandle<()>>,
+    /// The revision the worker took the workspace at.
+    revision: WorkspaceRevision,
 }
 
 impl WorkspaceFileNotificationWorker {
@@ -10607,6 +10808,7 @@ fn spawn_workspace_file_notification(
     let worker_cancellation = Arc::clone(&cancellation);
     let deadline_expired = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + workspace_notification_deadline();
+    let revision = WorkspaceRevision::of(workspace);
     let owned_workspace = std::mem::take(workspace);
     let join = thread::Builder::new()
         .name("PascalLspWorkspaceMutation".to_string())
@@ -10663,6 +10865,7 @@ fn spawn_workspace_file_notification(
         deadline_expired,
         deadline,
         join: Some(join),
+        revision,
     }
 }
 
@@ -10839,6 +11042,7 @@ fn event_loop(
                         result = Ok(effect);
                     }
                     *workspace = completed_workspace;
+                    jobs.apply_held_navigation_states(workspace);
                     match result {
                         Ok(effect) => {
                             if !pull_diagnostics_supported {
@@ -10950,6 +11154,7 @@ fn event_loop(
                         );
                         worker.cancellation.store(true, Ordering::Release);
                     }
+                    jobs.deliver_during_reconciliation(connection, worker.revision)?;
                 }
             }
         }

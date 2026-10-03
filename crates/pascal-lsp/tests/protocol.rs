@@ -37572,6 +37572,175 @@ fn queued_local_project_config_events_refresh_unopened_cross_project_owners() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn completed_navigation_is_delivered_while_a_watcher_batch_reconciles() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let source = "unit Main;\ninterface\ntype\n  TTarget = class end;\n  TUse = TTarget;\nimplementation\nend.\n";
+    write_file(&main, source);
+    let batch = root.path().join("batch");
+    fs::create_dir_all(&batch).expect("batch directory");
+    let changes = (0..1_000)
+        .map(|index| {
+            let path = batch.join(format!("Batch{index}.pas"));
+            write_file(
+                &path,
+                &format!("unit Batch{index}; interface implementation end.\n"),
+            );
+            json!({"uri": uri(&path), "type": 1})
+        })
+        .collect::<Vec<_>>();
+
+    let barrier_directory = root.path().join("reconciliation-delivery-barriers");
+    fs::create_dir_all(&barrier_directory).expect("barrier directory");
+    let validation = TestBarrier {
+        entered: barrier_directory.join("validation-entered"),
+        release: barrier_directory.join("validation-release"),
+    };
+    let reconciliation = TestBarrier {
+        entered: barrier_directory.join("reconciliation-entered"),
+        release: barrier_directory.join("reconciliation-release"),
+    };
+    let validation_spec = format!(
+        "{}|{}",
+        validation.entered.display(),
+        validation.release.display()
+    );
+    let reconciliation_spec = format!(
+        "{}|{}",
+        reconciliation.entered.display(),
+        reconciliation.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER",
+                validation_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_WORKSPACE_FILE_WORKER_BARRIER",
+                reconciliation_spec.as_str(),
+            ),
+        ],
+    );
+    server.initialize(root.path(), Value::Null);
+
+    let id = RequestId::from("navigation-during-reconciliation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "TTarget", 1),
+    );
+    validation.wait_until_entered();
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": changes}),
+    );
+    reconciliation.wait_until_entered();
+    validation.release();
+
+    let response = server
+        .response_with_timeout(&id, IO_TIMEOUT)
+        .expect("a result computed before the batch must not wait for reconciliation");
+    let locations = result_locations(response);
+    assert_eq!(locations.len(), 1, "{locations:?}");
+    assert_eq!(locations[0]["uri"], uri(&main).to_string());
+
+    // A batch over 64 entries still fences analysis once it commits (TASK-97).
+    reconciliation.release();
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn result_older_than_the_reconciling_revision_waits_for_the_commit() {
+    let root = tempfile::tempdir().expect("workspace");
+    let main = root.path().join("Main.pas");
+    let other = root.path().join("Other.pas");
+    let source = "unit Main;\ninterface\ntype\n  TTarget = class end;\n  TUse = TTarget;\nimplementation\nend.\n";
+    write_file(&main, source);
+    write_file(&other, "unit Other; interface implementation end.\n");
+
+    let barrier_directory = root.path().join("reconciliation-hold-barriers");
+    fs::create_dir_all(&barrier_directory).expect("barrier directory");
+    let validation = TestBarrier {
+        entered: barrier_directory.join("validation-entered"),
+        release: barrier_directory.join("validation-release"),
+    };
+    let reconciliation = TestBarrier {
+        entered: barrier_directory.join("reconciliation-entered"),
+        release: barrier_directory.join("reconciliation-release"),
+    };
+    let validation_spec = format!(
+        "{}|{}",
+        validation.entered.display(),
+        validation.release.display()
+    );
+    let reconciliation_spec = format!(
+        "{}|{}",
+        reconciliation.entered.display(),
+        reconciliation.release.display()
+    );
+    let mut server = TestServer::launch_test_server_with_environment_path_and_variables(
+        root.path(),
+        [
+            (
+                "PASCAL_LSP_TEST_PARTIAL_VALIDATION_BARRIER",
+                validation_spec.as_str(),
+            ),
+            (
+                "PASCAL_LSP_TEST_WORKSPACE_FILE_WORKER_BARRIER",
+                reconciliation_spec.as_str(),
+            ),
+        ],
+    );
+    server.initialize(root.path(), Value::Null);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri(&main), "languageId": "pascal", "version": 1, "text": source
+        }}),
+    );
+
+    let id = RequestId::from("navigation-older-than-reconciliation".to_string());
+    server.send_request(
+        id.clone(),
+        "textDocument/definition",
+        navigation_params(&main, source, "TTarget", 1),
+    );
+    validation.wait_until_entered();
+    let changed = source.replace("TUse", "TOther");
+    server.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri(&main), "version": 2},
+            "contentChanges": [{"text": changed}]
+        }),
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri(&other), "type": 2}]}),
+    );
+    reconciliation.wait_until_entered();
+    validation.release();
+    assert!(
+        server
+            .response_with_timeout(&id, Duration::from_millis(500))
+            .is_none(),
+        "a result computed before an applied edit must wait for the reconciled workspace"
+    );
+
+    reconciliation.release();
+    let response = server.response(&id);
+    assert!(
+        response.error.is_some(),
+        "the edited overlay must reject the older result: {response:?}"
+    );
+    server.shutdown();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn blocked_file_discovery_does_not_block_cancel_or_unrelated_protocol_messages() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");

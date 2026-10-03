@@ -207,6 +207,11 @@ fn statement_effects(root: Node, source: &[u8], range: Range<usize>) -> Effects 
             continue;
         }
         let inside = node.start_byte() >= range.start && node.end_byte() <= range.end;
+        // The for-in header range ends at the iterable, so the node itself is
+        // never inside it.
+        if node.kind() == K::FOREACH {
+            collect_foreach_effects(node, source, &mut effects, &mut skipped);
+        }
         if inside {
             collect_node_effects(node, source, &mut effects, &mut skipped);
         }
@@ -214,6 +219,33 @@ fn statement_effects(root: Node, source: &[u8], range: Range<usize>) -> Effects 
         stack.extend(node.children(&mut cursor));
     }
     effects
+}
+
+/// The for-in variable is assigned by the header on every iteration.
+fn collect_foreach_effects(
+    node: Node,
+    source: &[u8],
+    effects: &mut Effects,
+    skipped: &mut HashSet<usize>,
+) {
+    let target = node
+        .child_by_field_name("iterator")
+        .and_then(|iterator| match iterator.kind() {
+            K::IDENTIFIER => Some(iterator),
+            "varAssignDef" => {
+                let mut cursor = iterator.walk();
+                iterator
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == K::IDENTIFIER)
+            }
+            _ => None,
+        });
+    if let Some(target) = target {
+        skipped.insert(target.id());
+        effects
+            .assigns
+            .push(node_text(target, source).to_lowercase());
+    }
 }
 
 fn collect_node_effects(

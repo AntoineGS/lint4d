@@ -7732,6 +7732,62 @@ fn percent_encoded_at_sign_uri_is_the_same_open_document() {
 }
 
 #[test]
+fn percent_encoded_at_sign_related_document_reports_use_the_client_uri() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let root = temp.path().join("user@host");
+    let main = root.join("Main.pas");
+    let include = root.join("Shared.inc");
+    let main_source = "unit Main;\ninterface\ntype\n  TBox = class\n    Value: Integer;\n  end;\nimplementation\n{$I Shared.inc}\nend.\n";
+    let include_source = "procedure Run;\nvar Box: TBox;\nbegin\n  Box.Missing := 1;\nend;\n";
+    write_file(&main, main_source);
+    write_file(&include, include_source);
+    let encoded = |path: &Path| Url::parse(&uri(path).as_str().replace('@', "%40")).expect("URI");
+    let main_uri = encoded(&main);
+    let include_uri = encoded(&include);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(&root);
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "pascal",
+                "version": 1,
+                "text": main_source,
+            }
+        }),
+    );
+    // The include stays closed so it is reported as a related document; the
+    // client still names it with its own spelling, here in a watched-file event.
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": include_uri, "type": 2}]}),
+    );
+    let request_id = RequestId::from("encoded-at-related".to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": main_uri}}),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "related pull failed: {response:?}"
+    );
+    let result = response.result.expect("related document result");
+    let related = result["relatedDocuments"]
+        .as_object()
+        .expect("related document reports");
+    assert!(
+        related.contains_key(include_uri.as_str()),
+        "related reports must be keyed by the client's URI: {:?}",
+        related.keys().collect::<Vec<_>>()
+    );
+    server.shutdown();
+}
+
+#[test]
 fn pull_workspace_diagnostics_reports_authorized_unopened_sources() {
     let root = tempfile::tempdir().expect("workspace");
     let first = root.path().join("First.pas");

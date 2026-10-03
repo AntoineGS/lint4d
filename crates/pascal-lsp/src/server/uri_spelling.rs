@@ -11,6 +11,9 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+/// Outbound objects keyed by document URI: `WorkspaceEdit.changes` and the
+/// `relatedDocuments` of a document diagnostic report.
+const URI_KEYED_MAPS: [&str; 2] = ["changes", "relatedDocuments"];
 
 #[derive(Default)]
 pub(super) struct UriSpellings {
@@ -129,8 +132,8 @@ impl UriSpellings {
                         Value::String(text) if is_uri_key(key) || key == "target" => {
                             self.restore_string(text);
                         }
-                        Value::Object(changes) if key == "changes" => {
-                            self.restore_keys(changes);
+                        Value::Object(map) if URI_KEYED_MAPS.contains(&key.as_str()) => {
+                            self.restore_keys(map);
                             self.restore_value(value);
                         }
                         _ => self.restore_value(value),
@@ -280,6 +283,38 @@ mod tests {
         assert_eq!(
             params(&message)["settings"]["a😀"]["uri"],
             "file:///a%40b/X.pas"
+        );
+    }
+
+    #[test]
+    fn related_document_report_keys_use_the_client_spelling() {
+        let mut spellings = UriSpellings::default();
+        let mut open = notification(json!({"textDocument": {"uri": "file:///a%40b/Dep.pas"}}));
+        spellings.canonicalize_inbound(&mut open);
+        let mut report = Message::Response(Response::new_ok(
+            RequestId::from(1),
+            json!({
+                "kind": "full",
+                "items": [],
+                "relatedDocuments": {
+                    "file:///a@b/Dep.pas": {"kind": "full", "items": [{
+                        "relatedInformation": [{"location": {"uri": "file:///a@b/Dep.pas"}}]
+                    }]},
+                    "file:///other/X.pas": {"kind": "unchanged", "resultId": "1"},
+                },
+            }),
+        ));
+        spellings.restore_outbound(&mut report);
+        let related = params(&report)["relatedDocuments"]
+            .as_object()
+            .expect("related documents");
+        let keys = related.keys().map(String::as_str).collect::<Vec<_>>();
+        assert!(keys.contains(&"file:///a%40b/Dep.pas"), "{keys:?}");
+        assert!(keys.contains(&"file:///other/X.pas"), "{keys:?}");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            related["file:///a%40b/Dep.pas"]["items"][0]["relatedInformation"][0]["location"]["uri"],
+            "file:///a%40b/Dep.pas"
         );
     }
 

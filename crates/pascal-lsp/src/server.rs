@@ -7275,6 +7275,17 @@ impl AnalysisJobs {
 
         let title = progress_title(&request).to_string();
         let key = ObservationKey::for_request(&request, workspace);
+        // Queued requests this one replaces are cancelled only once it is
+        // admitted, so a rejected request does not cost the client both answers.
+        let replaced = key.as_ref().map_or_else(Vec::new, |key| {
+            self.observation_jobs
+                .iter()
+                .filter(|(existing, id)| {
+                    existing.is_replaced_by(key) && !self.pending.contains_key(id)
+                })
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>()
+        });
         if let Some(key) = key.as_ref() {
             let superseded = self
                 .observation_jobs
@@ -7284,17 +7295,6 @@ impl AnalysisJobs {
                 .collect::<Vec<_>>();
             for primary_id in superseded {
                 self.supersede_client(&primary_id, connection, ANALYSIS_SUPERSEDED_MESSAGE)?;
-            }
-            let replaced = self
-                .observation_jobs
-                .iter()
-                .filter(|(existing, id)| {
-                    existing.is_replaced_by(key) && !self.pending.contains_key(id)
-                })
-                .map(|(_, id)| *id)
-                .collect::<Vec<_>>();
-            for primary_id in replaced {
-                self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
             }
 
             if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
@@ -7325,6 +7325,9 @@ impl AnalysisJobs {
                             AnalysisJobId::Client(primary_id),
                             &recipient.id,
                         )?;
+                    }
+                    for primary_id in replaced {
+                        self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
                     }
                     return Ok(());
                 }
@@ -7370,6 +7373,9 @@ impl AnalysisJobs {
             &recipient,
             &title,
         )?;
+        for primary_id in replaced {
+            self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
+        }
         let failures = self.pump(workspace, connection);
         self.handle_dispatch_failures(failures, connection)
     }
@@ -18783,6 +18789,86 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES + 3);
+    }
+
+    #[test]
+    fn rejected_newer_hover_does_not_cancel_the_queued_one() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let workspace = test_workspace(vec![root.clone()], Default::default());
+        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
+        let hover = |line| AnalysisRequest::Hover {
+            uri: uri.clone(),
+            position: Position::new(line, 0),
+            format: MarkupKind::PlainText,
+        };
+        let mut jobs = AnalysisJobs::new();
+        let older_id = RequestId::from("older-queued-hover".to_string());
+        let older_job = AnalysisComputationId(1);
+        let older_key = super::ObservationKey::for_request(&hover(0), &workspace);
+        jobs.observation_jobs
+            .insert(older_key.clone().expect("hover key"), older_job);
+        jobs.request_to_job.insert(older_id.clone(), older_job);
+        jobs.queue.push(
+            AnalysisPriority::Interactive,
+            super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                id: older_job,
+                request: hover(0),
+                features: symbol_client_features(),
+                recipients: vec![super::ClientRecipient {
+                    id: older_id.clone(),
+                    work_done_token: None,
+                    partial_result_token: None,
+                }],
+                key: older_key,
+            }),
+        );
+        // Fill the rest of the recipient admission budget.
+        jobs.partial_deliveries.push_back(PartialDelivery {
+            job_id: AnalysisComputationId(0),
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            payload: PartialResultPayload::References(Arc::new(Vec::new())),
+            retrigger_on_stale: false,
+            recipients: (1..MAX_CLIENT_ANALYSIS_RECIPIENTS)
+                .map(|index| PartialDeliveryRecipient {
+                    id: RequestId::from(format!("delivering-{index}")),
+                    token: lsp_types::ProgressToken::String(format!("partial-{index}")),
+                    next_item: 0,
+                })
+                .collect(),
+            next_recipient: 0,
+            retained_bytes: 1,
+            validation: PartialDeliveryValidation::new(
+                Arc::new(workspace.revalidation_input()),
+                Arc::new(Vec::new()),
+                TestBarrierConfig::disabled(),
+            ),
+        });
+        let connection = RecordingSender::default();
+
+        let error = jobs
+            .enqueue_client(
+                RequestId::from("newer-rejected-hover".to_string()),
+                hover(1),
+                &workspace,
+                symbol_client_features(),
+                None,
+                Some(&connection),
+            )
+            .expect_err("the full admission budget rejects the newer hover");
+
+        assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
+        assert!(
+            connection
+                .messages
+                .lock()
+                .expect("recorded messages")
+                .is_empty(),
+            "the older hover must not be cancelled for a rejected request"
+        );
+        assert_eq!(jobs.request_to_job.get(&older_id), Some(&older_job));
+        assert_eq!(jobs.queue.len(), 1);
     }
 
     #[test]

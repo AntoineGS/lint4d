@@ -309,41 +309,102 @@ fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Captured output per pipe; anything beyond this is read and discarded.
+const MAX_CAPTURED_PIPE_BYTES: usize = 1024 * 1024;
+
+/// Read `pipe` to EOF, keeping at most `MAX_CAPTURED_PIPE_BYTES` so the child
+/// never blocks on a full pipe.
+fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => return captured,
+                Ok(read) => {
+                    let room = MAX_CAPTURED_PIPE_BYTES.saturating_sub(captured.len());
+                    captured.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            }
+        }
+    })
+}
+
 /// Wait for a child process with a timeout. Returns an error if the timeout
-/// is exceeded (and kills the process).
-#[cfg(target_os = "windows")]
+/// is exceeded (and kills and reaps the process).
+///
+/// Stdout and stderr are drained on reader threads from launch, so a child
+/// that fills a pipe is not mistaken for a hung one.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, String> {
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
+    let join = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        reader.map_or_else(Vec::new, |reader| reader.join().unwrap_or_default())
+    };
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = child.stdout.take().map_or_else(Vec::new, |mut s| {
-                    let mut buf = Vec::new();
-                    std::io::Read::read_to_end(&mut s, &mut buf).unwrap_or(0);
-                    buf
-                });
-                let stderr = child.stderr.take().map_or_else(Vec::new, |mut s| {
-                    let mut buf = Vec::new();
-                    std::io::Read::read_to_end(&mut s, &mut buf).unwrap_or(0);
-                    buf
-                });
                 return Ok(std::process::Output {
                     status,
-                    stdout,
-                    stderr,
+                    stdout: join(stdout),
+                    stderr: join(stderr),
                 });
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
-                    return Err("MSBuild timed out after 15 seconds".to_string());
+                    let _ = child.wait();
+                    return Err(format!(
+                        "MSBuild timed out after {} seconds",
+                        timeout.as_secs()
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => return Err(format!("Failed to wait for MSBuild: {}", e)),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod wait_with_timeout_tests {
+    use super::wait_with_timeout;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn spawn_sh(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh should spawn")
+    }
+
+    #[test]
+    fn child_writing_more_than_a_pipe_buffer_completes_without_timeout() {
+        let child = spawn_sh("head -c 4194304 /dev/zero; head -c 2097152 /dev/zero >&2");
+        let started = Instant::now();
+        let output = wait_with_timeout(child, Duration::from_secs(10))
+            .expect("a child that fills its pipes must not time out");
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_eq!(output.stdout.len(), 1024 * 1024);
+        assert_eq!(output.stderr.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn timeout_kills_and_returns_an_error() {
+        let child = spawn_sh("exec sleep 30");
+        let started = Instant::now();
+        let error = wait_with_timeout(child, Duration::from_millis(300))
+            .expect_err("a hung child must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

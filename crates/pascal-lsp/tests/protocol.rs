@@ -5641,6 +5641,66 @@ fn diagnostics_report_type_and_argument_mismatches_with_utf16_ranges() {
 }
 
 #[test]
+fn pull_diagnostics_keep_a_type_mismatch_above_a_syntax_error() {
+    let root = tempfile::tempdir().expect("workspace");
+    let source_path = root.path().join("Main.pas");
+    let source = concat!(
+        "unit Main;\n",
+        "interface\n",
+        "implementation\n",
+        "procedure Run;\n",
+        "var I: Integer; B: Boolean;\n",
+        "begin\n",
+        "  B := I;\n",
+        "end;\n",
+        "procedure Broken;\n",
+        "var B: Boolean;\n",
+        "begin\n",
+        "  B := ;\n",
+        "end;\n",
+        "end.\n",
+    );
+    write_file(&source_path, source);
+
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    server.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri(&source_path),
+                "languageId": "pascal",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let pull_id = RequestId::from("mismatch-above-syntax-error".to_string());
+    server.send_request(
+        pull_id.clone(),
+        "textDocument/diagnostic",
+        json!({"textDocument":{"uri":uri(&source_path)}}),
+    );
+    let pull = server.response(&pull_id);
+    assert!(pull.error.is_none(), "pull failed: {pull:?}");
+    let result = pull.result.expect("pull result");
+    let items = result["items"].as_array().expect("diagnostic items");
+    let mismatch_start = position_of(source, "I;", 0);
+    let mismatch = items
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "pascal-type-mismatch")
+        .unwrap_or_else(|| panic!("a syntax error below must not hide the mismatch: {result}"));
+    assert_eq!(
+        mismatch["range"],
+        json!({
+            "start": mismatch_start,
+            "end": Position::new(mismatch_start.line, mismatch_start.character + 1),
+        })
+    );
+    server.shutdown();
+}
+
+#[test]
 fn diagnostics_report_override_and_interface_contracts_with_protocol_codes() {
     let root = tempfile::tempdir().expect("workspace");
     let source_path = root.path().join("Main.pas");

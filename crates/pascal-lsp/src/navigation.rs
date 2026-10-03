@@ -506,12 +506,80 @@ pub(crate) struct SemanticDiagnostic {
     pub(crate) message: String,
 }
 
+/// Why a semantic diagnostic pass checked fewer than all candidates. This is a
+/// local stand-in for the shared coverage type planned by LSP-1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticCoverageGap {
+    /// Findings at or after the first parser recovery span were withheld.
+    ParserRecovery,
+    /// More than `MAX_SEMANTIC_DIAGNOSTICS` findings exist.
+    DiagnosticCap,
+    /// The work or byte budget ran out before every candidate was checked.
+    Budget,
+    /// Analysis of at least one candidate failed and that candidate was skipped.
+    CandidateSkipped,
+}
+
+/// Proven semantic findings plus what the pass could not check. Every
+/// diagnostic is proven even when `gaps` is not empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticDiagnosticReport {
+    pub(crate) diagnostics: Vec<SemanticDiagnostic>,
+    pub(crate) gaps: Vec<SemanticCoverageGap>,
+}
+
+impl SemanticDiagnosticReport {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.gaps.is_empty()
+    }
+
+    fn note(&mut self, gap: SemanticCoverageGap) {
+        if !self.gaps.contains(&gap) {
+            self.gaps.push(gap);
+        }
+    }
+
+    /// False, recording the cap, once another finding would exceed it.
+    fn has_capacity(&mut self) -> bool {
+        if self.diagnostics.len() < MAX_SEMANTIC_DIAGNOSTICS {
+            true
+        } else {
+            self.note(SemanticCoverageGap::DiagnosticCap);
+            false
+        }
+    }
+
+    /// Classify one candidate's analysis. `Ok(None)` means the candidate has
+    /// no usable result: callers skip it, or stop once the budget is
+    /// exhausted. A result computed while the budget ran out is discarded
+    /// too, since the analysis may have read the failure as absence.
+    fn checked_candidate<T>(
+        &mut self,
+        result: Result<T, String>,
+        budget: &AssistanceBudget,
+    ) -> Result<Option<T>, String> {
+        match result {
+            Err(error) if error == "request cancelled" => Err(error),
+            _ if budget.exhausted() => {
+                self.note(SemanticCoverageGap::Budget);
+                Ok(None)
+            }
+            Err(_) => {
+                self.note(SemanticCoverageGap::CandidateSkipped);
+                Ok(None)
+            }
+            Ok(value) => Ok(Some(value)),
+        }
+    }
+}
+
 const MAX_SEMANTIC_DIAGNOSTIC_NODES: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_WORK: usize = 100_000;
 const MAX_SEMANTIC_DIAGNOSTIC_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_WORK: usize = 300_000;
 pub(crate) const MAX_MISSING_UNIT_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEMANTIC_DIAGNOSTICS: usize = 256;
+const SEMANTIC_DIAGNOSTICS_LIMIT: &str = "semantic diagnostics limit";
 const MAX_CONTRACT_ANCESTRY_DEPTH: usize = 256;
 const MAX_QUALIFIED_IMPORT_ALIAS_PATH_NODES: usize = 128;
 
@@ -2322,22 +2390,36 @@ impl NavigationIndex {
     /// Return only source-semantic diagnostics whose absence was proven by the
     /// bounded navigation model.
     ///
-    /// This intentionally reports no result when the syntax tree, imports,
-    /// receiver, ancestry, helper selection, accessibility, or traversal
-    /// budget is uncertain.  It is therefore safe to use as an additive
-    /// diagnostic pass without turning compiler-dependent Pascal semantics
-    /// into false positives.
-    pub(crate) fn semantic_diagnostics_with_cancel(
+    /// A candidate whose syntax tree, imports, receiver, ancestry, helper
+    /// selection, accessibility or budget is uncertain produces no finding,
+    /// so this is safe to use as an additive diagnostic pass without turning
+    /// compiler-dependent Pascal semantics into false positives. When the pass
+    /// cannot check every candidate it keeps the findings it did prove and
+    /// records why in the report's gaps.
+    pub(crate) fn semantic_diagnostic_report_with_cancel(
         &self,
         uri: &Url,
         cancel: &AtomicBool,
-    ) -> Result<Vec<SemanticDiagnostic>, String> {
+    ) -> Result<SemanticDiagnosticReport, String> {
         let Some(document) = self.documents.get(uri) else {
             return Err(format!("document is not indexed: {uri}"));
         };
-        if !document.parser_recovery_spans.is_empty() {
-            return Ok(Vec::new());
-        }
+        let mut report = SemanticDiagnosticReport::default();
+        // Pascal declares before use, so a recovery span can hide a
+        // declaration that any later finding depends on. Only the prefix
+        // before the first one is analysed.
+        let proven_end = match document
+            .parser_recovery_spans
+            .iter()
+            .map(|span| span.start)
+            .min()
+        {
+            Some(start) => {
+                report.note(SemanticCoverageGap::ParserRecovery);
+                start
+            }
+            None => usize::MAX,
+        };
 
         let mut budget = AssistanceBudget::new(
             MAX_SEMANTIC_DIAGNOSTIC_WORK,
@@ -2355,20 +2437,30 @@ impl NavigationIndex {
             }
             visited = visited.saturating_add(1);
             if visited > MAX_SEMANTIC_DIAGNOSTIC_NODES {
-                return Ok(Vec::new());
+                report.note(SemanticCoverageGap::Budget);
+                break;
             }
             match budget.require_work(1, cancel) {
                 Ok(()) => {}
                 Err(error) if error == "request cancelled" => return Err(error),
-                Err(_) => return Ok(Vec::new()),
+                Err(_) => {
+                    report.note(SemanticCoverageGap::Budget);
+                    break;
+                }
             }
-            if node.kind() == "identifier" {
-                identifiers.push(node);
+            if node.start_byte() >= proven_end {
                 continue;
             }
-            if node.kind() == "assignment" {
+            let before_recovery = node.end_byte() <= proven_end;
+            if node.kind() == "identifier" {
+                if before_recovery {
+                    identifiers.push(node);
+                }
+                continue;
+            }
+            if before_recovery && node.kind() == "assignment" {
                 assignments.push(node);
-            } else if node.kind() == "exprCall" {
+            } else if before_recovery && node.kind() == "exprCall" {
                 calls.push(node);
             }
             let mut cursor = node.walk();
@@ -2380,169 +2472,221 @@ impl NavigationIndex {
             );
         }
 
-        let mut diagnostics = Vec::new();
-        for identifier in identifiers {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("request cancelled".to_string());
-            }
-            let status = match self.semantic_proof_at_with_budget(
-                uri,
-                document,
-                identifier.start_byte(),
-                identifier,
-                cancel,
-                &mut budget,
-            ) {
-                Ok(status) => status,
-                Err(error) if error == "request cancelled" => return Err(error),
-                Err(_) => return Ok(Vec::new()),
-            };
-            let kind = match status {
-                SemanticProofStatus::ProvenAbsent => {
-                    if member_expression_at(identifier)
-                        .is_some_and(|dot| is_right_hand_member(dot, identifier))
-                    {
-                        SemanticDiagnosticKind::MissingMember
-                    } else {
-                        SemanticDiagnosticKind::UnresolvedIdentifier
-                    }
+        'analysis: {
+            for identifier in identifiers {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("request cancelled".to_string());
                 }
-                SemanticProofStatus::Resolved
-                | SemanticProofStatus::Ambiguous
-                | SemanticProofStatus::Incomplete => continue,
-            };
-            if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
-                return Ok(Vec::new());
-            }
-            let name = node_text(identifier, &document.source);
-            let message = match kind {
-                SemanticDiagnosticKind::UnresolvedIdentifier => {
-                    format!("unresolved identifier '{name}'")
-                }
-                SemanticDiagnosticKind::MissingMember => {
-                    format!("missing member '{name}'")
-                }
-                SemanticDiagnosticKind::TypeMismatch
-                | SemanticDiagnosticKind::IncompatibleArgument
-                | SemanticDiagnosticKind::InvalidOverride
-                | SemanticDiagnosticKind::MissingInterfaceImplementation => continue,
-            };
-            diagnostics.push(SemanticDiagnostic {
-                kind,
-                span: SourceSpan {
-                    start: identifier.start_byte(),
-                    end: identifier.end_byte(),
-                },
-                message,
-            });
-        }
-        for assignment in assignments {
-            if document.conditionals.is_unknown_at(assignment.start_byte())
-                || document
-                    .opaque_ranges
-                    .iter()
-                    .any(|range| range.contains(Span::from_node(assignment)))
-            {
-                continue;
-            }
-            let Some(operator) = assignment.child_by_field_name("operator") else {
-                continue;
-            };
-            if node_text_with_budget(operator, &document.source, cancel, &mut budget)? != ":=" {
-                continue;
-            }
-            let (Some(lhs), Some(rhs)) = (
-                assignment.child_by_field_name("lhs"),
-                assignment.child_by_field_name("rhs"),
-            ) else {
-                continue;
-            };
-            let mut state = ResolutionState::new();
-            let analysis = match overload::analyze_assignment(
-                self,
-                uri,
-                document,
-                lhs,
-                rhs,
-                &mut state,
-                0,
-                cancel,
-                &mut budget,
-            ) {
-                Ok(analysis) => analysis,
-                Err(error) if error == "request cancelled" => return Err(error),
-                Err(_) => return Ok(Vec::new()),
-            };
-            let overload::AssignmentAnalysis::Incompatible { expected, actual } = analysis else {
-                continue;
-            };
-            if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
-                return Ok(Vec::new());
-            }
-            diagnostics.push(SemanticDiagnostic {
-                kind: SemanticDiagnosticKind::TypeMismatch,
-                span: SourceSpan {
-                    start: rhs.start_byte(),
-                    end: rhs.end_byte(),
-                },
-                message: format!("type mismatch: cannot assign '{actual}' to '{expected}'"),
-            });
-        }
-        for call in calls {
-            if document.conditionals.is_unknown_at(call.start_byte())
-                || document
-                    .opaque_ranges
-                    .iter()
-                    .any(|range| range.contains(Span::from_node(call)))
-            {
-                continue;
-            }
-            let analysis = match self.semantic_call_analysis_with_budget(
-                uri,
-                document,
-                call,
-                cancel,
-                &mut budget,
-            ) {
-                Ok(analysis) => analysis,
-                Err(error) if error == "request cancelled" => return Err(error),
-                Err(_) => return Ok(Vec::new()),
-            };
-            let overload::CallAnalysis::Incompatible(mismatches) = analysis else {
-                continue;
-            };
-            for mismatch in mismatches {
-                if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
-                    return Ok(Vec::new());
-                }
-                diagnostics.push(SemanticDiagnostic {
-                    kind: SemanticDiagnosticKind::IncompatibleArgument,
-                    span: SourceSpan {
-                        start: mismatch.span.start,
-                        end: mismatch.span.end,
-                    },
-                    message: format!(
-                        "incompatible argument: expected '{}', found '{}'",
-                        mismatch.expected, mismatch.actual
+                let Some(status) = report.checked_candidate(
+                    self.semantic_proof_at_with_budget(
+                        uri,
+                        document,
+                        identifier.start_byte(),
+                        identifier,
+                        cancel,
+                        &mut budget,
                     ),
+                    &budget,
+                )?
+                else {
+                    if budget.exhausted() {
+                        break 'analysis;
+                    }
+                    continue;
+                };
+                let kind = match status {
+                    SemanticProofStatus::ProvenAbsent => {
+                        if member_expression_at(identifier)
+                            .is_some_and(|dot| is_right_hand_member(dot, identifier))
+                        {
+                            SemanticDiagnosticKind::MissingMember
+                        } else {
+                            SemanticDiagnosticKind::UnresolvedIdentifier
+                        }
+                    }
+                    SemanticProofStatus::Resolved
+                    | SemanticProofStatus::Ambiguous
+                    | SemanticProofStatus::Incomplete => continue,
+                };
+                if !report.has_capacity() {
+                    break 'analysis;
+                }
+                let name = node_text(identifier, &document.source);
+                let message = match kind {
+                    SemanticDiagnosticKind::UnresolvedIdentifier => {
+                        format!("unresolved identifier '{name}'")
+                    }
+                    SemanticDiagnosticKind::MissingMember => {
+                        format!("missing member '{name}'")
+                    }
+                    SemanticDiagnosticKind::TypeMismatch
+                    | SemanticDiagnosticKind::IncompatibleArgument
+                    | SemanticDiagnosticKind::InvalidOverride
+                    | SemanticDiagnosticKind::MissingInterfaceImplementation => continue,
+                };
+                report.diagnostics.push(SemanticDiagnostic {
+                    kind,
+                    span: SourceSpan {
+                        start: identifier.start_byte(),
+                        end: identifier.end_byte(),
+                    },
+                    message,
                 });
             }
+            for assignment in assignments {
+                if document.conditionals.is_unknown_at(assignment.start_byte())
+                    || document
+                        .opaque_ranges
+                        .iter()
+                        .any(|range| range.contains(Span::from_node(assignment)))
+                {
+                    continue;
+                }
+                let Some(operator) = assignment.child_by_field_name("operator") else {
+                    continue;
+                };
+                let Some(operator) = report.checked_candidate(
+                    node_text_with_budget(operator, &document.source, cancel, &mut budget),
+                    &budget,
+                )?
+                else {
+                    if budget.exhausted() {
+                        break 'analysis;
+                    }
+                    continue;
+                };
+                if operator != ":=" {
+                    continue;
+                }
+                let (Some(lhs), Some(rhs)) = (
+                    assignment.child_by_field_name("lhs"),
+                    assignment.child_by_field_name("rhs"),
+                ) else {
+                    continue;
+                };
+                let mut state = ResolutionState::new();
+                let Some(analysis) = report.checked_candidate(
+                    overload::analyze_assignment(
+                        self,
+                        uri,
+                        document,
+                        lhs,
+                        rhs,
+                        &mut state,
+                        0,
+                        cancel,
+                        &mut budget,
+                    ),
+                    &budget,
+                )?
+                else {
+                    if budget.exhausted() {
+                        break 'analysis;
+                    }
+                    continue;
+                };
+                let overload::AssignmentAnalysis::Incompatible { expected, actual } = analysis
+                else {
+                    continue;
+                };
+                if !report.has_capacity() {
+                    break 'analysis;
+                }
+                report.diagnostics.push(SemanticDiagnostic {
+                    kind: SemanticDiagnosticKind::TypeMismatch,
+                    span: SourceSpan {
+                        start: rhs.start_byte(),
+                        end: rhs.end_byte(),
+                    },
+                    message: format!("type mismatch: cannot assign '{actual}' to '{expected}'"),
+                });
+            }
+            for call in calls {
+                if document.conditionals.is_unknown_at(call.start_byte())
+                    || document
+                        .opaque_ranges
+                        .iter()
+                        .any(|range| range.contains(Span::from_node(call)))
+                {
+                    continue;
+                }
+                let Some(analysis) = report.checked_candidate(
+                    self.semantic_call_analysis_with_budget(
+                        uri,
+                        document,
+                        call,
+                        cancel,
+                        &mut budget,
+                    ),
+                    &budget,
+                )?
+                else {
+                    if budget.exhausted() {
+                        break 'analysis;
+                    }
+                    continue;
+                };
+                let overload::CallAnalysis::Incompatible(mismatches) = analysis else {
+                    continue;
+                };
+                for mismatch in mismatches {
+                    if !report.has_capacity() {
+                        break 'analysis;
+                    }
+                    report.diagnostics.push(SemanticDiagnostic {
+                        kind: SemanticDiagnosticKind::IncompatibleArgument,
+                        span: SourceSpan {
+                            start: mismatch.span.start,
+                            end: mismatch.span.end,
+                        },
+                        message: format!(
+                            "incompatible argument: expected '{}', found '{}'",
+                            mismatch.expected, mismatch.actual
+                        ),
+                    });
+                }
+            }
+            let capacity = MAX_SEMANTIC_DIAGNOSTICS - report.diagnostics.len();
+            match self.contract_diagnostics_with_budget(
+                uri,
+                document,
+                capacity,
+                cancel,
+                &mut budget,
+            ) {
+                Err(error) if error == SEMANTIC_DIAGNOSTICS_LIMIT => {
+                    report.note(SemanticCoverageGap::DiagnosticCap);
+                }
+                result => {
+                    if let Some(contracts) = report.checked_candidate(result, &budget)? {
+                        report.diagnostics.extend(contracts);
+                    }
+                }
+            }
         }
-        let contract_diagnostics =
-            match self.contract_diagnostics_with_budget(uri, document, cancel, &mut budget) {
-                Ok(diagnostics) => diagnostics,
-                Err(error) if error == "request cancelled" => return Err(error),
-                Err(_) => return Ok(Vec::new()),
-            };
-        diagnostics.extend(contract_diagnostics);
-        diagnostics.sort_by_key(|diagnostic| {
+        report
+            .diagnostics
+            .retain(|diagnostic| diagnostic.span.end <= proven_end);
+        report.diagnostics.sort_by_key(|diagnostic| {
             (
                 diagnostic.span.start,
                 diagnostic.span.end,
                 semantic_diagnostic_kind_rank(diagnostic.kind),
             )
         });
-        Ok(diagnostics)
+        Ok(report)
+    }
+
+    /// The diagnostics of [`Self::semantic_diagnostic_report_with_cancel`]
+    /// without their coverage.
+    #[cfg(test)]
+    pub(crate) fn semantic_diagnostics_with_cancel(
+        &self,
+        uri: &Url,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SemanticDiagnostic>, String> {
+        self.semantic_diagnostic_report_with_cancel(uri, cancel)
+            .map(|report| report.diagnostics)
     }
 
     /// Return stable identities for interface obligations affected by a
@@ -3008,6 +3152,7 @@ impl NavigationIndex {
         &self,
         uri: &Url,
         document: &Document,
+        capacity: usize,
         cancel: &AtomicBool,
         budget: &mut AssistanceBudget,
     ) -> Result<Vec<SemanticDiagnostic>, String> {
@@ -3143,8 +3288,8 @@ impl NavigationIndex {
                 continue;
             }
             let _ = (same_name, exact_nonvirtual);
-            if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
-                return Err("semantic diagnostics limit".to_owned());
+            if diagnostics.len() >= capacity {
+                return Err(SEMANTIC_DIAGNOSTICS_LIMIT.to_owned());
             }
             let name = symbol.name.clone();
             budget.require_bytes(name.len().saturating_mul(2), cancel)?;
@@ -3213,8 +3358,8 @@ impl NavigationIndex {
                 let Some(interface_method) = self.symbol(&obligation.requirement.candidate) else {
                     continue;
                 };
-                if diagnostics.len() >= MAX_SEMANTIC_DIAGNOSTICS {
-                    return Err("semantic diagnostics limit".to_owned());
+                if diagnostics.len() >= capacity {
+                    return Err(SEMANTIC_DIAGNOSTICS_LIMIT.to_owned());
                 }
                 let class_name = class_symbol.name.clone();
                 let method_name = interface_method.name.clone();
@@ -5819,7 +5964,7 @@ impl NavigationIndex {
     }
 
     /// Classify one source identifier using the same conservative proof model
-    /// as [`NavigationIndex::semantic_diagnostics_with_cancel`].
+    /// as [`NavigationIndex::semantic_diagnostic_report_with_cancel`].
     #[allow(dead_code)]
     pub(crate) fn semantic_proof_status_at_with_cancel(
         &self,
@@ -24821,6 +24966,129 @@ mod tests {
     }
 
     #[test]
+    fn semantic_diagnostics_keep_the_first_findings_up_to_the_cap() {
+        let uri = Url::parse("file:///tmp/semantic-diagnostics-cap.pas").expect("cap URI");
+        let mut source = String::from(
+            "unit SemanticDiagnosticsCap;\ninterface\nimplementation\nprocedure Run;\nvar I: Integer; B: Boolean;\nbegin\n",
+        );
+        for _ in 0..300 {
+            source.push_str("  B := I;\n");
+        }
+        source.push_str("end;\nend.\n");
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.clone())
+            .expect("cap fixture parses");
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("capped diagnostics complete");
+
+        assert_eq!(
+            report.diagnostics.len(),
+            MAX_SEMANTIC_DIAGNOSTICS,
+            "{report:?}"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind == SemanticDiagnosticKind::TypeMismatch)
+        );
+        assert_eq!(
+            report.diagnostics[0].span.start,
+            source.find("I;\n").expect("first mismatch")
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::DiagnosticCap]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_a_finding_above_a_syntax_error() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-recovery-below.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsRecoveryBelow;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Run;\n",
+            "var I: Integer; B: Boolean;\n",
+            "begin\n",
+            "  B := I;\n",
+            "end;\n",
+            "procedure Broken;\n",
+            "var B: Boolean;\n",
+            "begin\n",
+            "  B := ;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("recovery fixture parses");
+        let mismatch_start = source.find("I;\n").expect("mismatch");
+        let recovery = &index.documents[&uri].parser_recovery_spans;
+        assert!(
+            !recovery.is_empty() && recovery.iter().all(|span| span.start > mismatch_start),
+            "fixture needs a recovery span below the mismatch: {recovery:?}"
+        );
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("recovery diagnostics complete");
+
+        assert_eq!(
+            report.diagnostics,
+            vec![SemanticDiagnostic {
+                kind: SemanticDiagnosticKind::TypeMismatch,
+                span: SourceSpan {
+                    start: mismatch_start,
+                    end: mismatch_start + 1,
+                },
+                message: "type mismatch: cannot assign 'Integer' to 'Boolean'".to_string(),
+            }]
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::ParserRecovery]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_withhold_findings_below_a_syntax_error() {
+        let uri =
+            Url::parse("file:///tmp/semantic-diagnostics-recovery-above.pas").expect("fixture URI");
+        let source = concat!(
+            "unit SemanticDiagnosticsRecoveryAbove;\n",
+            "interface\n",
+            "implementation\n",
+            "procedure Broken;\n",
+            "var B: Boolean;\n",
+            "begin\n",
+            "  B := ;\n",
+            "end;\n",
+            "procedure Run;\n",
+            "var I: Integer; B: Boolean;\n",
+            "begin\n",
+            "  B := I;\n",
+            "  Missing := 1;\n",
+            "end;\n",
+            "end.\n",
+        );
+        let mut index = NavigationIndex::new();
+        index
+            .update(uri.clone(), source.to_owned())
+            .expect("recovery fixture parses");
+        assert!(!index.documents[&uri].parser_recovery_spans.is_empty());
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("recovery diagnostics complete");
+
+        // A recovery span can hide a declaration that a later finding
+        // depends on, so nothing after the first one is claimed.
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::ParserRecovery]);
+    }
+
+    #[test]
     fn recovered_callable_alias_context_does_not_prove_overloads_or_mismatches() {
         assert_incomplete_callable_context("alias context", "uses ;\n", "", true);
     }
@@ -26472,14 +26740,15 @@ mod tests {
             .update(uri.clone(), source)
             .expect("overload bound fixture parses");
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
             .expect("overload bound diagnostics complete");
 
         assert!(
-            diagnostics.is_empty(),
-            "an overload set beyond the supported bound must not publish a partial mismatch: {diagnostics:?}"
+            report.diagnostics.is_empty(),
+            "an overload set beyond the supported bound must not publish a partial mismatch: {report:?}"
         );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::CandidateSkipped]);
     }
 
     #[test]
@@ -26850,15 +27119,65 @@ mod tests {
         );
         test_reset_semantic_generic_symbol_visits();
 
-        let diagnostics = index
-            .semantic_diagnostics_with_cancel(&consumer_uri, &AtomicBool::new(false))
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&consumer_uri, &AtomicBool::new(false))
             .expect("bounded semantic diagnostics complete");
         let visits = test_semantic_generic_symbol_visits();
 
         assert!(
-            diagnostics.is_empty() && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
-            "budget exhaustion must not publish a partial result after {visits} provider generic-symbol visits: {diagnostics:?}"
+            report.diagnostics.is_empty() && visits <= MAX_SEMANTIC_DIAGNOSTIC_WORK,
+            "the typo after budget exhaustion must stay unclaimed after {visits} provider generic-symbol visits: {report:?}"
         );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
+    }
+
+    #[test]
+    fn semantic_diagnostics_keep_findings_proven_before_the_budget_ran_out() {
+        let provider_uri =
+            Url::parse("file:///tmp/semantic-budget-early-provider.pas").expect("provider URI");
+        let consumer_uri =
+            Url::parse("file:///tmp/semantic-budget-early-consumer.pas").expect("consumer URI");
+        let mut provider = String::from("unit Provider;\ninterface\nconst\n  C0 = 0;\n");
+        for index in 1..=3_000 {
+            writeln!(&mut provider, "  C{index} = {index};").expect("write provider symbol");
+        }
+        provider.push_str(
+            "type\n  TRec = record\n    Value: Integer;\n  end;\nvar Box: TRec;\nimplementation\nend.\n",
+        );
+        let mut consumer = String::from(
+            "unit Consumer;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Box.Missing := 1;\n",
+        );
+        for _ in 0..100 {
+            consumer.push_str("  with Box do Value := 1;\n");
+        }
+        consumer.push_str("end;\nend.\n");
+        let missing_start = consumer.find("Missing").expect("missing member");
+
+        let mut index = NavigationIndex::new();
+        index
+            .update(provider_uri.clone(), provider)
+            .expect("provider parses");
+        index
+            .update(consumer_uri.clone(), consumer)
+            .expect("consumer parses");
+        index.bind_imports(
+            &consumer_uri,
+            std::iter::once(("Provider".to_owned(), provider_uri)),
+        );
+
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&consumer_uri, &AtomicBool::new(false))
+            .expect("bounded semantic diagnostics complete");
+
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.kind, diagnostic.span.start))
+                .collect::<Vec<_>>(),
+            vec![(SemanticDiagnosticKind::MissingMember, missing_start)]
+        );
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
     }
 
     #[test]
@@ -26895,12 +27214,11 @@ mod tests {
             .update(uri.clone(), source)
             .expect("limit fixture parses");
 
-        assert!(
-            index
-                .semantic_diagnostics_with_cancel(&uri, &AtomicBool::new(false))
-                .expect("bounded semantic diagnostics complete")
-                .is_empty()
-        );
+        let report = index
+            .semantic_diagnostic_report_with_cancel(&uri, &AtomicBool::new(false))
+            .expect("bounded semantic diagnostics complete");
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+        assert_eq!(report.gaps, vec![SemanticCoverageGap::Budget]);
     }
 
     #[test]

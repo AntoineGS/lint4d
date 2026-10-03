@@ -2356,6 +2356,59 @@ impl CompiledContentSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryOutcome {
+    /// Bounded recovery cleared derived state within its admitted envelope.
+    Recovered,
+    /// Bounded recovery was refused or interrupted, so derived state was
+    /// discarded wholesale and will be rebuilt lazily.
+    DiscardedReconstructible,
+    /// Client-reported state (such as a deletion tombstone) could not be
+    /// retained, so the workspace is permanently fenced.
+    LostAuthoritativeEditorState,
+}
+
+#[allow(dead_code)] // Fields are held only to be dropped off-thread.
+struct DiscardedRecoveryState {
+    index: NavigationIndex,
+    contexts: HashMap<ContextKey, ContextState>,
+    document_contexts: HashMap<Url, ContextKey>,
+    open_document_contexts: HashMap<Url, ContextKey>,
+    cached_documents: HashMap<Url, rename::CachedDocument>,
+    directory_catalogues: HashMap<PathBuf, DirectoryCatalogue>,
+    filename_catalogues: HashMap<PathBuf, FilenameCatalogue>,
+    package_catalogues: HashMap<PackageCatalogueKey, PackageCatalogue>,
+    package_metadata_cache: HashMap<PackageMetadataKey, CachedPackageMetadata>,
+    source_change_generations: HashMap<Url, u64>,
+    source_change_observations: HashMap<PathBuf, SourceChangeObservation>,
+    configuration_change_generations: HashMap<Url, u64>,
+    expansions: HashMap<Url, ExpansionRecord>,
+    include_parents: HashMap<Url, HashSet<Url>>,
+    diagnostic_dependencies: HashMap<Url, Vec<rename::SourceRecord>>,
+    pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
+    indexed_files: HashSet<Url>,
+    indexed_sizes: HashMap<Url, usize>,
+    indexed_content_hashes: HashMap<Url, u64>,
+    interface_import_summaries: HashMap<Url, InterfaceImportSummary>,
+    disk_stamps: HashMap<Url, DiskStamp>,
+    last_used: HashMap<Url, u64>,
+    pending_diagnostics: HashMap<Url, Instant>,
+    owner_last_used: HashMap<Url, u64>,
+    warnings: Vec<String>,
+    analysis_records: Option<HashMap<Url, rename::SourceRecord>>,
+}
+
+impl DiscardedRecoveryState {
+    /// Freeing the discarded state is proportional to its size, so do it on
+    /// a short-lived thread instead of while the workspace is held. If the
+    /// thread cannot be spawned, the closure and its state drop inline.
+    fn drop_off_thread(self) {
+        let _ = std::thread::Builder::new()
+            .name("pascal-lsp-recovery-drop".into())
+            .spawn(move || drop(self));
+    }
+}
+
 struct NotificationRecoveryPlan {
     rename_rejections: HashMap<Url, i32>,
     deleted_uris: Vec<Url>,
@@ -4432,13 +4485,109 @@ impl Workspace {
         self.invalidate_for_reconciliation_budget(&budget);
     }
 
-    pub(crate) fn invalidate_for_reconciliation_budget(&mut self, budget: &ReconciliationBudget) {
+    pub(crate) fn invalidate_for_reconciliation_budget(
+        &mut self,
+        budget: &ReconciliationBudget,
+    ) -> RecoveryOutcome {
         let result = self
             .prepare_notification_recovery(budget)
             .and_then(|plan| self.apply_notification_recovery(plan, budget));
-        if let Err(error) = result {
-            eprintln!("pascal-lsp: notification recovery failed closed: {error}");
-            self.fail_closed_notification_recovery(budget);
+        let outcome = match result {
+            Ok(()) => RecoveryOutcome::Recovered,
+            Err(error) => {
+                eprintln!(
+                    "pascal-lsp: bounded notification recovery fell back to discarding derived state: {error}"
+                );
+                self.discard_reconstructible_state(budget);
+                RecoveryOutcome::DiscardedReconstructible
+            }
+        };
+        if self.rejected_open_fence_permanent {
+            RecoveryOutcome::LostAuthoritativeEditorState
+        } else {
+            outcome
+        }
+    }
+
+    /// Drops every derived cache when bounded recovery is refused or
+    /// interrupted. Each container is swapped for an empty one and freed off
+    /// this thread, so the work here is proportional to open documents and
+    /// owners, not to the size of the discarded state. Open editor text
+    /// survives except at rename endpoints, which are rejected exactly as
+    /// bounded recovery rejects them.
+    fn discard_reconstructible_state(&mut self, budget: &ReconciliationBudget) {
+        let mut rename_endpoints = HashSet::new();
+        for (old_uri, pending) in &self.pending_unit_file_renames {
+            rename_endpoints.insert(old_uri.clone());
+            rename_endpoints.insert(pending.new_uri.clone());
+        }
+        rename_endpoints.extend(budget.rename_endpoints.borrow().iter().cloned());
+
+        self.bump_source_generation();
+        self.bump_configuration_generation();
+        self.mark_global_change();
+        let discarded = DiscardedRecoveryState {
+            index: std::mem::replace(&mut self.index, NavigationIndex::new()),
+            contexts: std::mem::take(&mut self.contexts),
+            document_contexts: std::mem::take(&mut self.document_contexts),
+            open_document_contexts: std::mem::take(&mut self.open_document_contexts),
+            cached_documents: std::mem::take(&mut self.cached_documents),
+            directory_catalogues: std::mem::take(&mut self.directory_catalogues),
+            filename_catalogues: std::mem::take(&mut self.filename_catalogues),
+            package_catalogues: std::mem::take(&mut self.package_catalogues),
+            package_metadata_cache: std::mem::take(&mut self.package_metadata_cache),
+            source_change_generations: std::mem::take(&mut self.source_change_generations),
+            source_change_observations: std::mem::take(&mut self.source_change_observations),
+            configuration_change_generations: std::mem::take(
+                &mut self.configuration_change_generations,
+            ),
+            expansions: std::mem::take(&mut self.expansions),
+            include_parents: std::mem::take(&mut self.include_parents),
+            diagnostic_dependencies: std::mem::take(&mut self.diagnostic_dependencies),
+            pending_unit_file_renames: std::mem::take(&mut self.pending_unit_file_renames),
+            indexed_files: std::mem::take(&mut self.indexed_files),
+            indexed_sizes: std::mem::take(&mut self.indexed_sizes),
+            indexed_content_hashes: std::mem::take(&mut self.indexed_content_hashes),
+            interface_import_summaries: std::mem::take(&mut self.interface_import_summaries),
+            disk_stamps: std::mem::take(&mut self.disk_stamps),
+            last_used: std::mem::take(&mut self.last_used),
+            pending_diagnostics: std::mem::take(&mut self.pending_diagnostics),
+            owner_last_used: std::mem::take(&mut self.owner_last_used),
+            warnings: std::mem::take(&mut self.warnings),
+            analysis_records: self.analysis_records.as_mut().map(std::mem::take),
+        };
+        discarded.drop_off_thread();
+        for owner in self.document_owners.values_mut() {
+            owner.needs_revalidation = true;
+            owner.legacy_route = None;
+        }
+        self.pending_unit_file_rename_bytes = 0;
+        self.indexed_bytes = 0;
+        self.file_cap_warning_sent = false;
+        self.total_cap_warning_sent = false;
+
+        // Without the fence, a tombstone must carry the observed disk stamp:
+        // an unstamped one is cleared as soon as the not-yet-removed file is
+        // seen. This costs at most MAX_DELETED_OVERRIDES metadata calls;
+        // beyond that, `remember_deleted` fences instead of stamping.
+        let deleted_uris = budget.deleted_uris.borrow().clone();
+        for uri in &deleted_uris {
+            self.remember_deleted(uri);
+        }
+
+        let deadline = Instant::now() + DIAGNOSTIC_DEBOUNCE;
+        let source_generation = self.source_generation;
+        for (uri, document) in &mut self.open_documents {
+            if rename_endpoints.contains(uri)
+                && let Some(text) = document.text.take()
+            {
+                self.open_text_bytes = self.open_text_bytes.saturating_sub(text.len());
+                document.rejection = Some(
+                    "document rejected: reconciliation fallback abandoned a file rename transition; close and reopen this document".to_string(),
+                );
+                document.identity_generation = source_generation;
+            }
+            self.pending_diagnostics.insert(uri.clone(), deadline);
         }
     }
 
@@ -15629,7 +15778,8 @@ mod tests {
         assert!(roots.iter().all(|uri| !workspace.index.contains(uri)));
     }
 
-    fn assert_exhausted_recovery_case(documents: usize, should_recover: bool) {
+    fn assert_exhausted_recovery_case(documents: usize, expected: super::RecoveryOutcome) {
+        let should_recover = expected == super::RecoveryOutcome::Recovered;
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15710,35 +15860,41 @@ mod tests {
         budget.record_rename_endpoint(rename_old.clone());
         budget.record_rename_endpoint(rename_new.clone());
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
+        assert_eq!(outcome, expected);
+        assert!(!workspace.analysis_admission_fenced());
         let old_document = &workspace.open_documents[&rename_old];
         let new_document = &workspace.open_documents[&rename_new];
-        if should_recover {
+        assert!(
+            old_document.text.is_none(),
+            "old rename overlay is rejected"
+        );
+        assert!(
+            new_document.text.is_none(),
+            "new rename overlay is rejected"
+        );
+        assert!(old_document.rejection.is_some());
+        assert!(new_document.rejection.is_some());
+        if documents > 2 {
+            let unrelated = Url::from_file_path(temp.path().join("Owner0002.pas"))
+                .expect("unrelated owner URI");
             assert!(
-                old_document.text.is_none(),
-                "old rename overlay is rejected"
-            );
-            assert!(
-                new_document.text.is_none(),
-                "new rename overlay is rejected"
-            );
-            assert!(old_document.rejection.is_some());
-            assert!(new_document.rejection.is_some());
-            assert!(workspace.indexed_files.is_empty());
-            assert!(workspace.pending_unit_file_renames.is_empty());
-        } else {
-            assert!(workspace.analysis_admission_fenced());
-            assert!(old_document.text.is_some());
-            assert!(new_document.text.is_some());
-            assert_eq!(workspace.index.document_count(), documents);
-            assert_eq!(workspace.indexed_files.len(), documents);
-            assert!(
-                workspace
-                    .pending_unit_file_renames
-                    .contains_key(&rename_old)
+                workspace.open_documents[&unrelated].text.is_some(),
+                "editor text outside the rename transition survives recovery"
             );
         }
+        assert!(workspace.indexed_files.is_empty());
+        assert_eq!(workspace.index.document_count(), 0);
+        assert!(workspace.document_contexts.is_empty());
+        assert!(workspace.pending_unit_file_renames.is_empty());
+        assert_eq!(workspace.pending_diagnostics.len(), documents);
+        assert!(
+            workspace
+                .document_owners
+                .values()
+                .all(|owner| owner.needs_revalidation)
+        );
         #[cfg(feature = "test-support")]
         {
             let metrics = budget.metrics(true);
@@ -15771,16 +15927,16 @@ mod tests {
 
     #[test]
     fn exhausted_recovery_preflights_and_visits_admitted_state_once() {
-        assert_exhausted_recovery_case(512, true);
+        assert_exhausted_recovery_case(512, super::RecoveryOutcome::Recovered);
     }
 
     #[test]
-    fn oversized_recovery_at_2048_owners_refuses_without_mutating_state() {
-        assert_exhausted_recovery_case(2_048, false);
+    fn oversized_recovery_at_2048_owners_discards_derived_state_without_fencing() {
+        assert_exhausted_recovery_case(2_048, super::RecoveryOutcome::DiscardedReconstructible);
     }
 
     #[test]
-    fn cancelled_recovery_latches_global_fence_before_mutating_rename_overlays() {
+    fn cancelled_recovery_discards_state_and_rejects_rename_overlays_without_fencing() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15821,12 +15977,17 @@ mod tests {
         budget.record_rename_endpoint(old_uri.clone());
         budget.record_rename_endpoint(new_uri.clone());
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert!(workspace.open_documents[&old_uri].text.is_some());
-        assert!(workspace.open_documents[&new_uri].text.is_some());
-        assert!(workspace.pending_unit_file_renames.contains_key(&old_uri));
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(workspace.open_documents[&old_uri].text.is_none());
+        assert!(workspace.open_documents[&new_uri].text.is_none());
+        assert!(workspace.open_documents[&old_uri].rejection.is_some());
+        assert!(workspace.open_documents[&new_uri].rejection.is_some());
+        assert_eq!(workspace.open_text_bytes, 0);
+        assert!(workspace.pending_unit_file_renames.is_empty());
+        assert_eq!(workspace.pending_unit_file_rename_bytes, 0);
         #[cfg(feature = "test-support")]
         {
             let metrics = budget.metrics(true);
@@ -15836,7 +15997,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_refuses_nested_catalogue_payload_before_clearing_it() {
+    fn refused_recovery_discards_nested_catalogue_payload() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15857,28 +16018,17 @@ mod tests {
         budget
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
-        let retained_catalogues = workspace.package_catalogues.len();
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
-
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.package_catalogues.len(), retained_catalogues);
-        assert_eq!(
-            workspace
-                .package_catalogues
-                .values()
-                .next()
-                .unwrap()
-                .entries["many-children"]
-                .len(),
-            65_537
-        );
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(workspace.package_catalogues.is_empty());
         #[cfg(feature = "test-support")]
         assert!(budget.metrics(true)["recovery_refused"].as_bool().unwrap());
     }
 
     #[test]
-    fn recovery_refuses_provider_map_entries_before_clearing_navigation_index() {
+    fn refused_recovery_discards_provider_map_entries() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15909,18 +16059,15 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.index.document_count(), 0);
-        assert_eq!(
-            workspace.index.recovery_test_provider_map_lengths(),
-            (32_768, 32_767)
-        );
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert_eq!(workspace.index.recovery_test_provider_map_lengths(), (0, 0));
     }
 
     #[test]
-    fn recovery_refuses_large_provider_uri_bytes_before_clearing_navigation_index() {
+    fn refused_recovery_discards_large_provider_uri_bytes() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15939,14 +16086,15 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.index.recovery_test_provider_map_lengths(), (0, 1));
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert_eq!(workspace.index.recovery_test_provider_map_lengths(), (0, 0));
     }
 
     #[test]
-    fn recovery_refuses_nested_context_state_before_clearing_it() {
+    fn refused_recovery_discards_nested_context_state() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -15963,24 +16111,15 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.contexts.len(), 1);
-        assert_eq!(
-            workspace
-                .contexts
-                .values()
-                .next()
-                .unwrap()
-                .watched_paths
-                .len(),
-            65_537
-        );
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(workspace.contexts.is_empty());
     }
 
     #[test]
-    fn recovery_refuses_cached_document_project_payload_before_clearing_it() {
+    fn refused_recovery_discards_cached_document_project_payload() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -16011,15 +16150,16 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.cached_documents.len(), 1);
-        assert_eq!(workspace.index.document_count(), 1);
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(workspace.cached_documents.is_empty());
+        assert_eq!(workspace.index.document_count(), 0);
     }
 
     #[test]
-    fn recovery_refuses_cached_document_with_too_many_semantic_members() {
+    fn refused_recovery_discards_cached_document_with_too_many_semantic_members() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -16051,15 +16191,16 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.cached_documents.len(), 1);
-        assert_eq!(workspace.index.document_count(), 1);
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(workspace.cached_documents.is_empty());
+        assert_eq!(workspace.index.document_count(), 0);
     }
 
     #[test]
-    fn recovery_refuses_oversized_expanded_source_before_clearing_it() {
+    fn refused_recovery_discards_oversized_expanded_source() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -16085,18 +16226,15 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.expansions.len(), 1);
-        assert_eq!(
-            workspace.expansions[&uri].expanded.text().len(),
-            super::MAX_NOTIFICATION_RECOVERY_BYTES + 1
-        );
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(!workspace.expansions.contains_key(&uri));
     }
 
     #[test]
-    fn recovery_refuses_too_many_expansion_map_segments_before_clearing_them() {
+    fn refused_recovery_discards_too_many_expansion_map_segments() {
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -16123,11 +16261,35 @@ mod tests {
             .charge_path_visits(super::MAX_NOTIFICATION_RECONCILIATION_PATH_VISITS)
             .expect("force notification recovery");
 
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert!(workspace.analysis_admission_fenced());
-        assert_eq!(workspace.expansions.len(), 1);
-        assert_eq!(workspace.expansions[&uri].expanded.text().len(), 65_537);
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(!workspace.expansions.contains_key(&uri));
+    }
+
+    #[test]
+    fn discarded_recovery_keeps_blocking_a_deleted_file_still_on_disk() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let path = temp.path().join("Deleted.pas");
+        std::fs::write(&path, "unit Deleted; interface implementation end.")
+            .expect("file the client reported deleted before the disk caught up");
+        let uri = Url::from_file_path(&path).expect("deleted URI");
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(true)));
+        budget.record_file_event(uri.clone(), super::FileChange::Deleted);
+
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
+
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
+        assert!(
+            workspace
+                .deletion_blocks_load_with_control(&uri, &path, None, None)
+                .expect("tombstone check"),
+            "without the fence, the tombstone must keep the reported deletion authoritative"
+        );
     }
 
     #[test]
@@ -16147,8 +16309,12 @@ mod tests {
         let cancellation = std::sync::Arc::new(AtomicBool::new(true));
         let budget = ReconciliationBudget::new(cancellation);
         budget.record_file_event(overflow_uri, super::FileChange::Deleted);
-        workspace.invalidate_for_reconciliation_budget(&budget);
+        let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
+        assert_eq!(
+            outcome,
+            super::RecoveryOutcome::LostAuthoritativeEditorState
+        );
         assert!(workspace.analysis_admission_fenced());
         assert!(workspace.deleted_overrides.contains_key(&first_uri));
         assert_eq!(

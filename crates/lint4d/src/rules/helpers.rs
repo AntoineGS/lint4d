@@ -149,6 +149,39 @@ fn is_free_or_destroy_call(dot_node: Node, source: &[u8], var_name: &str) -> boo
         && (rhs_text.eq_ignore_ascii_case("free") || rhs_text.eq_ignore_ascii_case("destroy"))
 }
 
+/// Return the identifier freed by `node` itself, if `node` is a free call.
+///
+/// Matches `variable.Free` / `variable.Destroy` (a bare exprDot, or the entity
+/// of an exprCall such as `variable.Free()`) and `FreeAndNil(variable)`.  Only
+/// a plain identifier counts as the freed variable; `A.B.Free` frees no local.
+pub fn freed_identifier<'tree>(node: Node<'tree>, source: &[u8]) -> Option<Node<'tree>> {
+    match node.kind() {
+        K::EXPR_DOT => {
+            let lhs = node.child_by_field_name("lhs")?;
+            let rhs = node.child_by_field_name("rhs")?;
+            let method = node_text(rhs, source);
+            (lhs.kind() == K::IDENTIFIER
+                && (method.eq_ignore_ascii_case("free") || method.eq_ignore_ascii_case("destroy")))
+            .then_some(lhs)
+        }
+        K::EXPR_CALL => {
+            let entity = node.child_by_field_name("entity")?;
+            if entity.kind() != K::IDENTIFIER
+                || !node_text(entity, source).eq_ignore_ascii_case("freeandnil")
+            {
+                return None;
+            }
+            let args = node.child_by_field_name("args")?;
+            let mut cursor = args.walk();
+            let first = args
+                .named_children(&mut cursor)
+                .find(|child| !child.is_extra())?;
+            (first.kind() == K::IDENTIFIER).then_some(first)
+        }
+        _ => None,
+    }
+}
+
 /// AST-based check: does any descendant of `node` reference the given variable?
 ///
 /// Walks the AST for `identifier` nodes matching the variable name (case-insensitive).

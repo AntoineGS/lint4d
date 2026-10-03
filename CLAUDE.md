@@ -39,10 +39,8 @@ connect the server instead of falling back. Call
   create new tasks (`task_create`) for follow-ups or bugs discovered, and
   link them with `dependencies`. Fix stale `file:line` citations you notice.
 - Commit backlog changes together with the code change that caused them.
-- Do not keep separate TODO files. The former `AGENT_TODOS.md` was
-  converted into `agent-todos` tasks; its original text is archived as a
-  Backlog.md document (`document_view` with id `doc-1`). `TODOS.md` is the
-  user's own list: do not edit it.
+- Do not keep separate TODO files. `TODOS.md` is the user's own list: do
+  not edit it.
 
 ## Bug fixes
 

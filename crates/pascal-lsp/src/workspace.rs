@@ -13530,10 +13530,10 @@ impl Workspace {
             ) else {
                 continue;
             };
-            let Some(&start) = normalized.raw_offsets.get(normalized_range.start) else {
+            let Some(start) = normalized.raw_offset(normalized_range.start) else {
                 continue;
             };
-            let Some(&end) = normalized.raw_offsets.get(normalized_range.end) else {
+            let Some(end) = normalized.raw_offset(normalized_range.end) else {
                 continue;
             };
             if start >= end {
@@ -14728,41 +14728,46 @@ impl<'a> DiagnosticLineIndex<'a> {
 
 struct NormalizedSource {
     text: String,
-    /// For every byte boundary in `text`, the corresponding byte boundary in
-    /// the original source.  CRLF therefore maps one normalized byte to two
-    /// physical bytes while all other UTF-8 scalars retain their boundaries.
-    raw_offsets: Vec<usize>,
+    /// Offsets in `text` of each `\n` that replaced a CRLF pair, ascending.
+    /// Every other byte keeps its width, so a normalized offset maps to the
+    /// original source by adding the number of pairs that end before it.
+    collapsed_pairs: Vec<usize>,
+}
+
+impl NormalizedSource {
+    /// The byte boundary in the original source for a byte boundary in
+    /// `text`. CRLF maps one normalized byte to two physical bytes.
+    fn raw_offset(&self, offset: usize) -> Option<usize> {
+        (offset <= self.text.len())
+            .then(|| offset + self.collapsed_pairs.partition_point(|&pair| pair < offset))
+    }
 }
 
 fn normalize_line_endings_with_offsets(source: &str) -> NormalizedSource {
     let bytes = source.as_bytes();
     let mut text = String::with_capacity(source.len());
-    let mut raw_offsets = vec![0];
+    let mut collapsed_pairs = Vec::new();
+    let mut start = 0;
     let mut raw = 0;
     while raw < bytes.len() {
-        if bytes[raw] == b'\r' {
-            text.push('\n');
+        if bytes[raw] != b'\r' {
             raw += 1;
-            if bytes.get(raw) == Some(&b'\n') {
-                raw += 1;
-            }
-            raw_offsets.push(raw);
             continue;
         }
-
-        let character = source[raw..]
-            .chars()
-            .next()
-            .expect("raw offset is inside the source");
-        let width = character.len_utf8();
-        text.push(character);
-        for offset in 1..width {
-            raw_offsets.push(raw + offset);
+        text.push_str(&source[start..raw]);
+        if bytes.get(raw + 1) == Some(&b'\n') {
+            collapsed_pairs.push(text.len());
+            raw += 1;
         }
-        raw += width;
-        raw_offsets.push(raw);
+        text.push('\n');
+        raw += 1;
+        start = raw;
     }
-    NormalizedSource { text, raw_offsets }
+    text.push_str(&source[start..]);
+    NormalizedSource {
+        text,
+        collapsed_pairs,
+    }
 }
 
 fn normalize_line_endings(source: &str) -> String {
@@ -23344,6 +23349,80 @@ BDS = '/fake/37'
         };
 
         assert!(!owner.has_legacy_route(Path::new("/external/helper.pas")));
+    }
+
+    /// The per-byte map `normalize_line_endings_with_offsets` used to build,
+    /// kept as the oracle for the sparse one.
+    fn per_byte_normalized_offsets(source: &str) -> (String, Vec<usize>) {
+        let bytes = source.as_bytes();
+        let mut text = String::new();
+        let mut raw_offsets = vec![0];
+        let mut raw = 0;
+        while raw < bytes.len() {
+            if bytes[raw] == b'\r' {
+                text.push('\n');
+                raw += 1;
+                if bytes.get(raw) == Some(&b'\n') {
+                    raw += 1;
+                }
+                raw_offsets.push(raw);
+                continue;
+            }
+            let character = source[raw..].chars().next().unwrap();
+            text.push(character);
+            for offset in 1..character.len_utf8() {
+                raw_offsets.push(raw + offset);
+            }
+            raw += character.len_utf8();
+            raw_offsets.push(raw);
+        }
+        (text, raw_offsets)
+    }
+
+    fn normalized_raw_offset(normalized: &super::NormalizedSource, offset: usize) -> Option<usize> {
+        normalized.raw_offset(offset)
+    }
+
+    fn normalized_map_bytes(normalized: &super::NormalizedSource) -> usize {
+        normalized.collapsed_pairs.capacity() * std::mem::size_of::<usize>()
+    }
+
+    #[test]
+    fn sparse_line_ending_map_agrees_with_per_byte_map() {
+        const PIECES: [&str; 8] = ["a", "\n", "\r", "\r\n", "é", "中", "😀", "\r\r\n"];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..400 {
+            let mut source = String::new();
+            for _ in 0..round % 40 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                source.push_str(PIECES[(state % PIECES.len() as u64) as usize]);
+            }
+            let (text, raw_offsets) = per_byte_normalized_offsets(&source);
+            let normalized = super::normalize_line_endings_with_offsets(&source);
+            assert_eq!(normalized.text, text, "{source:?}");
+            for offset in 0..=text.len() + 1 {
+                assert_eq!(
+                    normalized_raw_offset(&normalized, offset),
+                    raw_offsets.get(offset).copied(),
+                    "offset {offset} in {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lf_only_line_ending_map_allocates_nothing_per_byte() {
+        let source = format!("{}\n", "x".repeat(99)).repeat(100 * 1024 * 1024 / 100);
+        let normalized = super::normalize_line_endings_with_offsets(&source);
+        assert_eq!(normalized.text.len(), source.len());
+        assert!(
+            normalized_map_bytes(&normalized) < 1024 * 1024,
+            "{} map bytes for {} source bytes",
+            normalized_map_bytes(&normalized),
+            source.len()
+        );
     }
 
     #[test]

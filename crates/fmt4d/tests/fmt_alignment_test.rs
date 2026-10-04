@@ -1,3 +1,4 @@
+use fmt4d::config::{AlignmentConfig, FmtConfig};
 use std::path::PathBuf;
 
 mod common;
@@ -991,4 +992,102 @@ end.
     let result = format_aligned(source);
     assert_directive_kept_without_blank_lines(&result, "{$R+}");
     idempotency_check_aligned(source);
+}
+
+// ── Var-list expansion keeps every comment exactly once ─────────────
+
+fn format_with(source: &str, config: &FmtConfig) -> String {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
+}
+
+fn var_list_source(decls: &str) -> String {
+    format!("unit T;\ninterface\nimplementation\nprocedure P;\nvar\n{decls}begin\nend;\nend.\n")
+}
+
+fn assert_each_once(result: &str, comments: &[&str]) {
+    for c in comments {
+        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
+    }
+}
+
+#[test]
+fn comma_var_alignment_emits_trailing_comment_once() {
+    let src = var_list_source("  A, B: Integer; // shared\n  CCC: Byte;\n");
+    let result = format_aligned(&src);
+    assert_each_once(&result, &["// shared"]);
+    idempotency_check_aligned(&src);
+
+    let no_comment_cells = FmtConfig {
+        alignment: AlignmentConfig {
+            enabled: true,
+            comments: false,
+            ..AlignmentConfig::default()
+        },
+        ..FmtConfig::default()
+    };
+    let result = format_with(&src, &no_comment_cells);
+    assert_each_once(&result, &["// shared"]);
+}
+
+#[test]
+fn comma_var_alignment_keeps_comments_around_commas() {
+    let src = var_list_source(
+        "  C, { why } D: string;\n  E, // after comma\n    F: Byte;\n  G, H,\n  // own line\n  I: Word; { blk }\n",
+    );
+    let result = format_aligned(&src);
+    assert_each_once(
+        &result,
+        &["{ why }", "// after comma", "// own line", "{ blk }"],
+    );
+    idempotency_check_aligned(&src);
+}
+
+#[test]
+fn comma_var_alignment_keeps_comments_with_default_value() {
+    let src = var_list_source("  A {x}, B {y}: Integer = 1; // z\n");
+    let result = format_aligned(&src);
+    assert_each_once(&result, &["{x}", "{y}", "// z"]);
+    idempotency_check_aligned(&src);
+}
+
+#[test]
+fn comma_var_alignment_keeps_directive_before_later_identifier() {
+    let src = var_list_source("  I,\n  {$R+}\n  J: Integer;\n");
+    let result = format_aligned(&src);
+    assert_directive_kept_without_blank_lines(&result, "{$R+}");
+    idempotency_check_aligned(&src);
+}
+
+#[test]
+fn field_list_after_a_line_comment_starts_its_own_line() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A, B: Integer; // shared\n    D // d\n    , E: Byte;\n    F: Word;\n  end;\nimplementation\nend.\n";
+    let result = format_aligned(src);
+    assert!(
+        result.contains("    A, B: Integer; // shared\n    D, // d\n    E: Byte;\n"),
+        "{result}"
+    );
+    idempotency_check_aligned(src);
+}
+
+#[test]
+fn var_alignment_with_ifdef_blocks_adds_no_blank_lines() {
+    // Same output as d55c0f6: conditional blocks are not aligned rows.
+    let src = var_list_source(
+        "  {$IFDEF DEBUG}\n  bad_var: Integer;\n  {$ENDIF}\n  GoodVar: Integer;\n  LongerName: Byte;\n  {$IFDEF X}\n  Y: Byte;\n  {$ENDIF}\n  Z: Word;\n",
+    );
+    let result = format_aligned(&src);
+    assert!(
+        result.contains(
+            "var\n  {$IFDEF DEBUG}\n  bad_var: Integer;\n  {$ENDIF}\n  GoodVar   : Integer;\n  LongerName: Byte;\n  {$IFDEF X}\n  Y: Byte;\n  {$ENDIF}\n  Z         : Word;\nbegin\n"
+        ),
+        "{result}"
+    );
+    idempotency_check_aligned(&src);
 }

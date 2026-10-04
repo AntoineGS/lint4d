@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 mod common;
-use common::{format_aligned, format_source, idempotency_check, idempotency_check_aligned};
+use common::{
+    format_aligned, format_source, format_three_modes_idempotent, idempotency_check,
+    idempotency_check_aligned,
+};
 
 // ── Bug 1: Character literal corruption ─────────────────────────
 // #0, #9, #10, #13 etc. are reduced to bare `#`, producing code
@@ -4257,4 +4260,318 @@ fn uses_trailing_block_keeps_its_place_with_sorting_off() {
         "units were reordered with sorting off:\n{result}"
     );
     assert_eq!(format_unsorted(&result), result, "not idempotent");
+}
+
+// ── Bug: var-list expansion duplicates and drops comments ───────
+// `A, B: T;` is expanded into one declaration per identifier. The
+// comments after the type belong to the last declaration only, and
+// comments around a comma stay with the identifier before it.
+
+fn var_list_source(decls: &str) -> String {
+    format!("unit T;\ninterface\nimplementation\nprocedure P;\nvar\n{decls}begin\nend;\nend.\n")
+}
+
+#[test]
+fn var_list_trailing_comment_is_emitted_once() {
+    let src = var_list_source("  A, B: Integer; // shared\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains("  A: Integer;\n  B: Integer; // shared\n"),
+        "trailing comment duplicated or misplaced:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_block_comment_after_comma_is_kept() {
+    let src = var_list_source("  C, { why } D: string;\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains("  C: string; { why }\n  D: string;\n"),
+        "comment after a comma was dropped:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_line_comment_after_comma_is_kept() {
+    let src = var_list_source("  E, // after comma\n    F: Byte; // end\n");
+    let result = format_source(&src);
+    assert!(
+        result.contains("  E: Byte; // after comma\n  F: Byte; // end\n"),
+        "line comment after a comma was dropped:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_line_comment_after_identifier_does_not_swallow_the_type() {
+    let src = var_list_source("  A // first\n  , B: Integer;\n");
+    let result = format_source(&src);
+    assert_eq!(result.matches("// first").count(), 1, "{result}");
+    assert!(
+        result.contains("  A: Integer; // first\n  B: Integer;\n"),
+        "line comment swallowed the type:\n{result}"
+    );
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_own_line_comment_before_later_identifier_is_kept_once() {
+    let src = var_list_source("  G, H,\n  // own line\n  I: Word; { blk }\n");
+    let result = format_source(&src);
+    assert_eq!(result.matches("// own line").count(), 1, "{result}");
+    assert_eq!(result.matches("{ blk }").count(), 1, "{result}");
+    idempotency_check(&src);
+}
+
+#[test]
+fn var_list_comments_with_default_value_are_kept_once() {
+    let src = var_list_source("  A {x}, B {y}: Integer = 1; // z\n");
+    let result = format_source(&src);
+    for c in ["{x}", "{y}", "// z"] {
+        assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
+    }
+    idempotency_check(&src);
+}
+
+#[test]
+fn record_field_list_keeps_comments_around_commas() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A, // a\n    B: Integer; // shared\n  end;\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains("    A, // a\n    B: Integer; // shared\n"),
+        "{result}"
+    );
+    idempotency_check(src);
+}
+
+#[test]
+fn parameter_list_keeps_comments_around_commas() {
+    let src = "unit T;\ninterface\nimplementation\nprocedure Q(A, { c } B: Integer; C, // d\n  D: Byte);\nbegin\nend;\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains("  A, { c } B: Integer;\n  C, // d\n  D: Byte\n"),
+        "{result}"
+    );
+    idempotency_check(src);
+}
+
+/// Lines of `result` with their indentation removed.
+fn trimmed_lines(result: &str) -> Vec<&str> {
+    result.lines().map(str::trim).collect()
+}
+
+#[test]
+fn comment_before_comma_does_not_swallow_the_next_parameter() {
+    let src = "unit T;\ninterface\nimplementation\nprocedure Q(A\n  // lc\n  , B: Integer);\nbegin\nend;\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        let lines = trimmed_lines(&result);
+        assert!(lines.contains(&"A, // lc"), "{result}");
+        assert!(lines.contains(&"B: Integer"), "{result}");
+    }
+}
+
+#[test]
+fn comment_before_comma_does_not_swallow_the_next_field() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A\n    // lc\n    , B: Integer;\n  end;\nimplementation\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        assert!(
+            result.contains("    A, // lc\n    B: Integer;\n"),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn line_comment_after_identifier_does_not_swallow_the_next_field() {
+    let src = "unit T;\ninterface\ntype\n  R = record\n    D // d\n    , E: Byte;\n  end;\nimplementation\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        assert!(result.contains("    D, // d\n    E: Byte;\n"), "{result}");
+    }
+}
+
+#[test]
+fn var_list_comma_trivia_keeps_source_order_and_spacing() {
+    let src = var_list_source("  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n");
+    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
+    assert!(
+        plain.contains(
+            "  A: Integer; {$R+} // c\n  B: Integer;\n  C: Byte; {x} {$R-} {y}\n  D: Byte;\n"
+        ),
+        "{plain}"
+    );
+    for result in [aligned, no_cells] {
+        let lines = trimmed_lines(&result);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("A") && l.ends_with("{$R+} // c")),
+            "{result}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("C") && l.ends_with("{x} {$R-} {y}")),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn var_list_comma_trivia_is_idempotent() {
+    let src =
+        var_list_source("  A // c\n  , B: Integer;\n  C, {x} D: Byte;\n  E\n  {l}\n  , F: Word;\n");
+    let [plain, ..] = format_three_modes_idempotent(&src);
+    assert!(
+        plain.contains(
+            "  A: Integer; // c\n  B: Integer;\n  C: Byte; {x}\n  D: Byte;\n  E: Word; {l}\n  F: Word;\n"
+        ),
+        "{plain}"
+    );
+}
+
+#[test]
+fn var_list_trivia_after_a_line_comment_starts_a_new_line() {
+    let src = var_list_source("  A\n  // lc\n  , {x} B: Integer;\n");
+    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
+    for result in [plain, aligned, no_cells] {
+        let lines = trimmed_lines(&result);
+        let a = lines
+            .iter()
+            .position(|l| l.starts_with("A") && l.ends_with("// lc"))
+            .unwrap_or_else(|| panic!("{result}"));
+        assert_eq!(lines[a + 1], "{x}", "{result}");
+        assert!(lines[a + 2].starts_with("B"), "{result}");
+    }
+}
+
+#[test]
+fn var_list_trivia_inside_the_type_is_emitted_once() {
+    // The suffix's trivia is emitted with the last declaration only.
+    for (decls, expected) in [
+        (
+            "  A, B: {t} Integer {u};\n",
+            "  A: Integer;\n  B: {t} Integer {u};\n",
+        ),
+        (
+            "  M, N\n  { blk }\n  : Byte;\n",
+            "  M: Byte;\n  N\n  { blk }\n  : Byte;\n",
+        ),
+    ] {
+        let src = var_list_source(decls);
+        for result in format_three_modes_idempotent(&src) {
+            assert!(
+                result.contains(expected),
+                "{expected:?} missing in:\n{result}"
+            );
+        }
+    }
+}
+
+// ── Bug: several trailing items after one token (TASK-125) ─────
+// Each trailing comment's gap was measured from the code token, so the
+// gap before a second item grew on every run, and directives were always
+// emitted after the comments, so `{$R+} // c` became `// c {$R+}`.
+
+/// The line of `result` that starts (after indentation) with `prefix`.
+fn line_starting<'r>(result: &'r str, prefix: &str) -> &'r str {
+    result
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line starting with {prefix:?} in:\n{result}"))
+}
+
+/// `items` appear on `line` in this order.
+fn assert_in_order(line: &str, items: &[&str]) {
+    let mut from = 0;
+    for item in items {
+        let at = line[from..]
+            .find(item)
+            .unwrap_or_else(|| panic!("{item:?} missing or out of order in {line:?}"));
+        from += at + item.len();
+    }
+}
+
+#[test]
+fn several_trailing_items_keep_order_and_spacing() {
+    let src = var_list_source(
+        "  S: Byte; {t1} // t2\n  R: Byte; {$R+} // end\n  C: Byte; {x} {$R-} {y}\n  T: Byte;   {a}    {b}\n",
+    );
+    let [plain, aligned, no_cells] = format_three_modes_idempotent(&src);
+    assert!(
+        plain.contains(
+            "  S: Byte; {t1} // t2\n  R: Byte; {$R+} // end\n  C: Byte; {x} {$R-} {y}\n  T: Byte;   {a}    {b}\n"
+        ),
+        "{plain}"
+    );
+    for result in [aligned, no_cells] {
+        assert_in_order(line_starting(&result, "S"), &["{t1}", "// t2"]);
+        assert_in_order(line_starting(&result, "R"), &["{$R+}", "// end"]);
+        assert_in_order(line_starting(&result, "C"), &["{x}", "{$R-}", "{y}"]);
+        assert_in_order(line_starting(&result, "T"), &["{a}    {b}"]);
+    }
+}
+
+#[test]
+fn var_list_with_several_comma_items_is_idempotent() {
+    for decls in [
+        "  A, {$R+} // c\n  B: Integer;\n  C, {x} {$R-} {y} D: Byte;\n",
+        "  A, // la\n  // own\n  B, {c1} {c2} C: Integer; {t1} // t2\n  D {d}, E // e\n  , F: Byte;\n",
+        "  A, {$R+}   // c\n  B: Integer;\n  CCC, {x}    {y} D: Byte;\n",
+    ] {
+        let src = var_list_source(decls);
+        let [plain, ..] = format_three_modes_idempotent(&src);
+        assert!(!plain.contains("// c {$R+}"), "{plain}");
+    }
+}
+
+// ── Bug: end-of-file trivia in an unclosed {$FMT.OFF} is re-laid-out ──
+
+#[test]
+fn eof_trivia_in_unclosed_format_off_is_verbatim() {
+    for tail in [
+        "end.\n  // tail\n",
+        "end.\n  // tail",
+        "end.\n\n\n    { a }   // b\n\t{$R+}\n",
+        "end.   // same line\n   {$DEFINE X}\n",
+    ] {
+        let src = format!("unit T;\n\ninterface\n\nimplementation\n\n{{$FMT.OFF}}\n{tail}");
+        let expected = if tail.ends_with('\n') {
+            src.clone()
+        } else {
+            format!("{src}\n")
+        };
+        let result = format_source(&src);
+        assert_eq!(result, expected, "source: {src:?}");
+        idempotency_check(&src);
+        assert_eq!(format_aligned(&src), expected, "aligned, source: {src:?}");
+    }
+}
+
+#[test]
+fn eof_trivia_after_a_closed_format_off_is_laid_out_normally() {
+    let src = "unit T;\ninterface\nimplementation\n{$FMT.OFF}\n{$FMT.ON}\nend.\n   // tail\n";
+    let result = format_source(src);
+    assert!(result.ends_with("end.\n// tail\n"), "{result:?}");
+    idempotency_check(src);
+}
+
+// ── Bug: a trailing comment's gap dropped the space before the next token ─
+
+#[test]
+fn comment_inside_code_keeps_the_space_after_it() {
+    let src = "unit T;\ninterface\nimplementation\nprocedure P;\nvar\n  A: {t} Integer;\n  B: {$R+} Integer;\nbegin\n  X := {a} 1;\n  if {c} X then\n    Y;\n  Z := A + {c} B;\nend;\nend.\n";
+    for result in format_three_modes_idempotent(src) {
+        for line in [
+            "  A: {t} Integer;\n",
+            "  B: {$R+} Integer;\n",
+            "  X := {a} 1;\n",
+            "  if {c} X then\n",
+            "  Z := A + {c} B;\n",
+        ] {
+            assert!(result.contains(line), "{line:?} missing in:\n{result}");
+        }
+    }
 }

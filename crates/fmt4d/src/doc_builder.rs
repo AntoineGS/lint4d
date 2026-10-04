@@ -4,7 +4,7 @@ use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
 use pascal_core::node_kind as K;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use tree_sitter::Node;
@@ -41,6 +41,22 @@ fn blank_line_rows(source: &[u8]) -> Vec<u32> {
     rows
 }
 
+/// A trailing comment or directive, as laid out by
+/// [`DocBuilder::trailing_run_doc`].
+pub(crate) struct TrailingItem<'m> {
+    pub(crate) span: Range<usize>,
+    pub(crate) text: &'m str,
+    /// Bytes between the code token and the item in the source.
+    pub(crate) gap: usize,
+    pub(crate) is_comment: bool,
+}
+
+impl TrailingItem<'_> {
+    pub(crate) fn is_line_comment(&self) -> bool {
+        self.is_comment && self.text.trim_start().starts_with("//")
+    }
+}
+
 /// Stateless AST-to-Doc builder.
 ///
 /// Converts a tree-sitter AST into a `Doc` IR tree. The key invariant is that
@@ -50,7 +66,7 @@ pub struct DocBuilder<'a> {
     pub(crate) source: &'a [u8],
     pub(crate) config: &'a FmtConfig,
     pub(crate) comments: &'a CommentMap,
-    directives: &'a DirectiveMap,
+    pub(crate) directives: &'a DirectiveMap,
     format_regions: Vec<FormatOffRegion>,
     pub(crate) external_units: &'a HashSet<String>,
     /// Ascending 0-based rows of newline-terminated, whitespace-only lines.
@@ -58,6 +74,9 @@ pub struct DocBuilder<'a> {
     /// Parent kind of every node, by node id, filled by [`Self::build`].
     /// `Node::parent()` is O(depth) and a long binary chain is that deep.
     parent_kinds: RefCell<HashMap<usize, &'static str>>,
+    /// Set while building a copy of a node whose comments and directives
+    /// are emitted with another copy (see [`Self::without_trivia`]).
+    trivia_suppressed: Cell<bool>,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -78,6 +97,7 @@ impl<'a> DocBuilder<'a> {
             external_units,
             blank_line_rows: blank_line_rows(source),
             parent_kinds: RefCell::new(HashMap::new()),
+            trivia_suppressed: Cell::new(false),
         }
     }
 
@@ -123,9 +143,10 @@ impl<'a> DocBuilder<'a> {
     }
 
     /// Comments and directives after the file's last leaf, laid out as in
-    /// the source (see [`Self::trivia_run_doc`]).
+    /// the source (see [`Self::trivia_run_doc`]). Items inside a
+    /// `{$FMT.OFF}` region are emitted verbatim instead.
     fn eof_trivia_doc(&self, root: Node<'a>) -> Doc {
-        let trivia = self.trivia_items(
+        let mut trivia = self.trivia_items(
             self.comments.eof_comments(),
             self.directives.eof_directives(),
         );
@@ -134,7 +155,7 @@ impl<'a> DocBuilder<'a> {
         }
         let last = last_leaf(root);
         // Without a code leaf, the first item starts the output.
-        let prev_end = (last.id() != root.id()).then(|| {
+        let mut prev_end = (last.id() != root.id()).then(|| {
             self.comments
                 .trailing_comments(last.id())
                 .iter()
@@ -147,7 +168,64 @@ impl<'a> DocBuilder<'a> {
                 )
                 .fold(last.end_byte(), usize::max)
         });
-        self.trivia_run_doc(trivia, prev_end).0
+        let mut parts = Vec::new();
+        while !trivia.is_empty() {
+            let off = trivia
+                .iter()
+                .position(|(span, _)| self.in_format_off_region(span.start));
+            let run: Vec<_> = trivia.drain(..off.unwrap_or(trivia.len())).collect();
+            let (run_doc, end) = self.trivia_run_doc(run, prev_end);
+            parts.push(run_doc);
+            prev_end = end;
+            if off.is_none() {
+                break;
+            }
+            let verbatim = trivia
+                .iter()
+                .position(|(span, _)| !self.in_format_off_region(span.start))
+                .unwrap_or(trivia.len());
+            let region: Vec<_> = trivia.drain(..verbatim).collect();
+            let (first, end) = (region[0].0.start, region[region.len() - 1].0.end);
+            // The region began before the file's last token: keep the gap
+            // after it too.
+            let start = match prev_end {
+                Some(prev) if self.in_format_off_region(prev.saturating_sub(1)) => prev,
+                _ => first,
+            };
+            parts.push(self.verbatim_doc(start, end));
+            prev_end = Some(end);
+        }
+        doc::concat(parts)
+    }
+
+    /// Whether the line holding source byte `offset` is inside a
+    /// `{$FMT.OFF}` region.
+    fn in_format_off_region(&self, offset: usize) -> bool {
+        let line = 1 + self.source[..offset.min(self.source.len())]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.format_regions
+            .iter()
+            .any(|r| line >= r.start_line && line <= r.end_line)
+    }
+
+    /// Source text between two byte offsets, emitted as written. Text that
+    /// starts a line in the source starts one in the output, with its
+    /// source indentation.
+    fn verbatim_doc(&self, start: usize, end: usize) -> Doc {
+        let line_start = self.source[..start]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let prefix = &self.source[line_start..start];
+        let line = if start > 0 && prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+            Doc::LineStart(String::from_utf8_lossy(prefix).into_owned())
+        } else {
+            Doc::Empty
+        };
+        let text = pascal_core::decode_bytes(&self.source[start..end]).replace('\r', "");
+        doc::concat(vec![line, Doc::Raw(text)])
     }
 
     /// Pair attached comments and directives with their docs, in source order.
@@ -217,16 +295,9 @@ impl<'a> DocBuilder<'a> {
         let leading_comments = self.leading_comments_doc(node);
         let leading_directives = self.leading_directives_doc(node);
         let body = self.build_doc(node);
-        let trailing_comments = self.trailing_comments_doc(node);
-        let trailing_directives = self.trailing_directives_doc(node);
+        let trailing = self.trailing_trivia_doc(node);
 
-        doc::concat(vec![
-            leading_comments,
-            leading_directives,
-            body,
-            trailing_comments,
-            trailing_directives,
-        ])
+        doc::concat(vec![leading_comments, leading_directives, body, trailing])
     }
 
     /// Like `doc_for_node` but omits leading comments and directives.
@@ -241,13 +312,13 @@ impl<'a> DocBuilder<'a> {
         }
 
         let body = self.build_doc(node);
-        let trailing_comments = self.trailing_comments_doc(node);
-        let trailing_directives = self.trailing_directives_doc(node);
+        let trailing = self.trailing_trivia_doc(node);
 
-        doc::concat(vec![body, trailing_comments, trailing_directives])
+        doc::concat(vec![body, trailing])
     }
 
-    /// Like `doc_for_node` but omits trailing comments.
+    /// Like `doc_for_node` but omits trailing comments, and the trailing
+    /// directives after the first of them, which go with the comments.
     ///
     /// Used by alignment decompose functions so that trailing comments
     /// can be extracted as a separate alignment cell instead of being
@@ -260,7 +331,7 @@ impl<'a> DocBuilder<'a> {
         let leading_comments = self.leading_comments_doc(node);
         let leading_directives = self.leading_directives_doc(node);
         let body = self.build_doc(node);
-        let trailing_directives = self.trailing_directives_doc(node);
+        let trailing_directives = self.trailing_directives_before_comments_doc(node);
 
         doc::concat(vec![
             leading_comments,
@@ -268,6 +339,29 @@ impl<'a> DocBuilder<'a> {
             body,
             trailing_directives,
         ])
+    }
+
+    /// Only the node's own body: no leading or trailing comments or
+    /// directives. For the copies of a shared suffix whose trivia belongs to
+    /// the last copy alone.
+    pub(crate) fn doc_for_node_bare(&self, node: Node<'a>) -> Doc {
+        if self.is_in_format_off_region(node) {
+            return self.format_off_doc(node, false, false);
+        }
+        self.build_doc(node)
+    }
+
+    pub(crate) fn trivia_suppressed(&self) -> bool {
+        self.trivia_suppressed.get()
+    }
+
+    /// Run `build` with every comment and directive left out, for a copy of
+    /// nodes whose trivia another copy emits.
+    pub(crate) fn without_trivia<T>(&self, build: impl FnOnce() -> T) -> T {
+        let outer = self.trivia_suppressed.replace(true);
+        let result = build();
+        self.trivia_suppressed.set(outer);
+        result
     }
 
     /// Emit a node inside a format-off region as its source text.
@@ -312,18 +406,7 @@ impl<'a> DocBuilder<'a> {
             )
             .fold(node.end_byte(), usize::max);
 
-        let line_start = self.source[..start]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let prefix = &self.source[line_start..start];
-        let line = if start > 0 && prefix.iter().all(|&b| b == b' ' || b == b'\t') {
-            Doc::LineStart(String::from_utf8_lossy(prefix).into_owned())
-        } else {
-            Doc::Empty
-        };
-        let text = pascal_core::decode_bytes(&self.source[start..end]).replace('\r', "");
-        doc::concat(vec![line, Doc::Raw(text)])
+        self.verbatim_doc(start, end)
     }
 
     /// Dispatch to the correct handler by node kind.
@@ -450,7 +533,7 @@ impl<'a> DocBuilder<'a> {
     /// between the last comment and the node), a `BlankLine` is inserted.
     pub(crate) fn leading_comments_doc(&self, node: Node<'a>) -> Doc {
         let comments = self.comments.leading_comments(node.id());
-        if comments.is_empty() {
+        if comments.is_empty() || self.trivia_suppressed.get() {
             return Doc::Empty;
         }
 
@@ -482,24 +565,109 @@ impl<'a> DocBuilder<'a> {
         doc::concat(parts)
     }
 
-    /// Build a `Doc` for the trailing comments of `node`.
-    ///
-    /// Each trailing comment is preceded by a single space.
-    pub(crate) fn trailing_comments_doc(&self, node: Node<'a>) -> Doc {
-        let comments = self.comments.trailing_comments(node.id());
-        if comments.is_empty() {
-            return Doc::Empty;
+    /// Trailing comments and directives of `node`, in source order. Empty
+    /// while trivia is suppressed.
+    pub(crate) fn trailing_items(&self, node: Node<'a>) -> Vec<TrailingItem<'a>> {
+        if self.trivia_suppressed.get() {
+            return Vec::new();
         }
-
-        let docs: Vec<Doc> = comments
+        let comments: &'a CommentMap = self.comments;
+        let directives: &'a DirectiveMap = self.directives;
+        let mut items: Vec<TrailingItem<'a>> = comments
+            .trailing_comments(node.id())
             .iter()
-            .map(|c| {
-                let gap = if c.gap > 0 { c.gap } else { 1 };
-                Doc::Raw(format!("{}{}", " ".repeat(gap), c.text))
+            .map(|c| TrailingItem {
+                span: c.span.clone(),
+                text: &c.text,
+                gap: c.gap,
+                is_comment: true,
             })
+            .chain(
+                directives
+                    .trailing_directives(node.id())
+                    .iter()
+                    .map(|d| TrailingItem {
+                        span: d.span.clone(),
+                        text: &d.text,
+                        gap: d.gap,
+                        is_comment: false,
+                    }),
+            )
             .collect();
+        items.sort_by_key(|item| item.span.start);
+        items
+    }
 
-        doc::concat(docs)
+    /// Lay out trailing items on the line they follow. The first item is
+    /// separated by `first_gap`, or by its source distance from the code
+    /// token when `None`; each later item keeps its source distance from
+    /// the previous item, so spacing is stable across runs. Anything after
+    /// a `//` comment starts a new line, since the comment would swallow it.
+    pub(crate) fn trailing_run_doc(
+        &self,
+        items: &[TrailingItem<'a>],
+        first_gap: Option<usize>,
+    ) -> Doc {
+        let mut parts = Vec::new();
+        let mut prev: Option<&TrailingItem<'a>> = None;
+        for item in items {
+            // Gap and text go in one Raw: the renderer forgets the previous
+            // token after a whitespace-ending Raw, and the next token would
+            // lose its space.
+            let gap = match prev {
+                None => first_gap.unwrap_or(item.gap).max(1),
+                Some(p) if p.is_line_comment() => {
+                    parts.push(Doc::Hardline);
+                    0
+                }
+                Some(p) => {
+                    let between = &self.source[p.span.end.min(item.span.start)..item.span.start];
+                    if between.contains(&b'\n') {
+                        1
+                    } else {
+                        between.len().max(1)
+                    }
+                }
+            };
+            parts.push(Doc::Raw(format!("{}{}", " ".repeat(gap), item.text)));
+            prev = Some(item);
+        }
+        doc::concat(parts)
+    }
+
+    /// Trailing comments and directives of `node`, in source order.
+    pub(crate) fn trailing_trivia_doc(&self, node: Node<'a>) -> Doc {
+        self.trailing_run_doc(&self.trailing_items(node), None)
+    }
+
+    /// Build a `Doc` for the trailing comments of `node`.
+    pub(crate) fn trailing_comments_doc(&self, node: Node<'a>) -> Doc {
+        let mut items = self.trailing_items(node);
+        items.retain(|item| item.is_comment);
+        self.trailing_run_doc(&items, None)
+    }
+
+    /// The trailing directives of `node` that precede its first trailing
+    /// comment; the rest are emitted together with the comments.
+    pub(crate) fn trailing_directives_before_comments_doc(&self, node: Node<'a>) -> Doc {
+        let mut items = self.trailing_items(node);
+        let first_comment = items.iter().position(|item| item.is_comment);
+        items.truncate(first_comment.unwrap_or(items.len()));
+        self.trailing_run_doc(&items, None)
+    }
+
+    /// The trailing items of `node` from its first trailing comment on.
+    pub(crate) fn trailing_items_from_first_comment(
+        &self,
+        node: Node<'a>,
+    ) -> Vec<TrailingItem<'a>> {
+        let mut items = self.trailing_items(node);
+        let first_comment = items
+            .iter()
+            .position(|item| item.is_comment)
+            .unwrap_or(items.len());
+        items.drain(..first_comment);
+        items
     }
 
     /// Return `true` if `node` has at least one trailing comment and the
@@ -513,15 +681,17 @@ impl<'a> DocBuilder<'a> {
         // child is the actual `+` leaf. Descend to the last non-extra leaf
         // before consulting the comment map.
         let leaf = last_leaf(node);
-        self.comments
-            .trailing_comments(leaf.id())
-            .last()
-            .is_some_and(|c| c.text.trim_start().starts_with("//"))
+        !self.trivia_suppressed.get()
+            && self
+                .comments
+                .trailing_comments(leaf.id())
+                .last()
+                .is_some_and(|c| c.text.trim_start().starts_with("//"))
     }
 
     pub(crate) fn leading_directives_doc(&self, node: Node<'a>) -> Doc {
         let directives = self.directives.leading_directives(node.id());
-        if directives.is_empty() {
+        if directives.is_empty() || self.trivia_suppressed.get() {
             return Doc::Empty;
         }
         let mut parts = Vec::new();
@@ -534,18 +704,9 @@ impl<'a> DocBuilder<'a> {
     }
 
     pub(crate) fn trailing_directives_doc(&self, node: Node<'a>) -> Doc {
-        let directives = self.directives.trailing_directives(node.id());
-        if directives.is_empty() {
-            return Doc::Empty;
-        }
-        let docs: Vec<Doc> = directives
-            .iter()
-            .map(|d| {
-                let gap = if d.gap > 0 { d.gap } else { 1 };
-                Doc::Raw(format!("{}{}", " ".repeat(gap), d.text))
-            })
-            .collect();
-        doc::concat(docs)
+        let mut items = self.trailing_items(node);
+        items.retain(|item| !item.is_comment);
+        self.trailing_run_doc(&items, None)
     }
 
     // ── Utility helpers ──────────────────────────────────────────────

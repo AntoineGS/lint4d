@@ -62,3 +62,50 @@ pub fn idempotency_check_aligned(source: &str) {
         "aligned formatter is not idempotent.\nFirst pass:\n{first}\nSecond pass:\n{second}"
     );
 }
+
+/// Format `source` with alignment enabled but trailing comments not aligned
+/// into their own column (`[format.alignment] comments = false`).
+pub fn format_aligned_without_comment_cells(source: &str) -> String {
+    let info = FileInfo::new(PathBuf::from("test.pas"));
+    let config = fmt4d::config::FmtConfig {
+        alignment: fmt4d::config::AlignmentConfig {
+            enabled: true,
+            comments: false,
+            ..fmt4d::config::AlignmentConfig::default()
+        },
+        ..fmt4d::config::FmtConfig::default()
+    };
+    fmt4d::formatter::format_source(source.as_bytes(), &info, &config, &HashSet::new())
+        .expect("formatting failed")
+}
+
+/// A named way to format a source.
+type Mode = (&'static str, fn(&str) -> String);
+
+const THREE_MODES: [Mode; 3] = [
+    ("plain", format_source),
+    ("aligned", format_aligned),
+    (
+        "aligned, comments = false",
+        format_aligned_without_comment_cells,
+    ),
+];
+
+/// Format `source` in plain, aligned and aligned-without-comment-cells modes.
+pub fn format_three_modes(source: &str) -> [String; 3] {
+    THREE_MODES.map(|(_, format)| format(source))
+}
+
+/// Format `source` in plain, aligned and aligned-without-comment-cells modes,
+/// checking that each mode is idempotent. Returns the three first passes.
+pub fn format_three_modes_idempotent(source: &str) -> [String; 3] {
+    THREE_MODES.map(|(name, format)| {
+        let first = format(source);
+        let second = format(&first);
+        assert_eq!(
+            first, second,
+            "{name}: formatter is not idempotent.\nFirst pass:\n{first}\nSecond pass:\n{second}"
+        );
+        first
+    })
+}

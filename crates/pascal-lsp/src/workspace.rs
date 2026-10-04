@@ -54,6 +54,8 @@ thread_local! {
     static TEST_IMPORT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_CONTEXT_PRUNES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_CONTEXT_PRUNE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_FRESHNESS_OBSERVATION_VISITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -81,6 +83,18 @@ pub(crate) fn test_reset_context_prune_count() {
 #[cfg(test)]
 pub(crate) fn test_context_prune_visit_count() -> usize {
     TEST_CONTEXT_PRUNE_VISITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_freshness_observation_visit() {
+    TEST_FRESHNESS_OBSERVATION_VISITS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Retained source change observations examined by dependency-scoped
+/// freshness checks, and resets the count.
+#[cfg(test)]
+pub(crate) fn test_take_freshness_observation_visits() -> usize {
+    TEST_FRESHNESS_OBSERVATION_VISITS.with(|count| count.replace(0))
 }
 
 mod closure;
@@ -13092,7 +13106,11 @@ impl Workspace {
         } else {
             self.source_change_observations
                 .values()
-                .filter(|change| change.generation > source_generation)
+                .filter(|change| {
+                    #[cfg(test)]
+                    note_freshness_observation_visit();
+                    change.generation > source_generation
+                })
                 .collect::<Vec<_>>()
         };
         let newer_change_hashes = newer_changes
@@ -13101,9 +13119,11 @@ impl Workspace {
             .collect::<HashSet<_>>();
         let changed_since_result = |candidate: &Path| {
             newer_change_hashes.contains(&case_folded_path_hash(candidate))
-                && newer_changes
-                    .iter()
-                    .any(|change| paths_equal_ci(&change.path, candidate))
+                && newer_changes.iter().any(|change| {
+                    #[cfg(test)]
+                    note_freshness_observation_visit();
+                    paths_equal_ci(&change.path, candidate)
+                })
         };
 
         for record in records {
@@ -16734,27 +16754,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // Best of ten spaced runs, so load from parallel tests does not fail
-        // the bound; a regression to per-candidate scans costs over a second.
-        let elapsed = (0..10)
-            .map(|_| {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                let started = std::time::Instant::now();
-                workspace
-                    .dependency_scoped_result_is_fresh(
-                        result_generation,
-                        workspace.configuration_generation,
-                        &records,
-                    )
-                    .expect("unrelated observations keep the result fresh");
-                started.elapsed()
-            })
-            .min()
-            .expect("timed runs");
-        eprintln!("dependency-scoped freshness with {OBSERVATIONS} observations: {elapsed:?}");
-        assert!(
-            elapsed < std::time::Duration::from_millis(10),
-            "freshness must not scan every observation per candidate: {elapsed:?}"
+        super::test_take_freshness_observation_visits();
+        workspace
+            .dependency_scoped_result_is_fresh(
+                result_generation,
+                workspace.configuration_generation,
+                &records,
+            )
+            .expect("unrelated observations keep the result fresh");
+        // One pass collects the newer observations; a per-candidate scan
+        // would examine every observation for each of the 4096 candidates.
+        assert_eq!(
+            super::test_take_freshness_observation_visits(),
+            OBSERVATIONS,
+            "freshness must not scan every observation per candidate"
         );
 
         let mut changed = records.clone();

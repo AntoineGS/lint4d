@@ -502,8 +502,15 @@ mod cache_tests {
         }
     }
 
+    /// A fixture source under the workspace root; Windows file URIs need a
+    /// drive, or `to_file_path` fails and the entry's own path goes unindexed.
+    fn ws_path(name: &str) -> PathBuf {
+        let root = if cfg!(windows) { r"C:\ws" } else { "/ws" };
+        Path::new(root).join(name)
+    }
+
     fn uri(name: &str) -> Url {
-        Url::parse(&format!("file:///ws/{name}")).unwrap()
+        Url::from_file_path(ws_path(name)).unwrap()
     }
 
     #[test]
@@ -770,7 +777,7 @@ mod cache_tests {
     fn interface_entries_from_before_an_invalidation_are_dropped() {
         let cache = ProjectCache::new(usize::MAX);
         let epoch = cache.invalidation_epoch();
-        cache.invalidate_path(Path::new("/ws/Other.pas"));
+        cache.invalidate_path(&ws_path("Other.pas"));
         assert!(!cache.put_interface_imports(
             &uri("Derived.pas"),
             &context("A.dproj"),
@@ -1308,7 +1315,7 @@ mod cache_tests {
         cache.clear_pins();
         assert!(cache.has_room());
         pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
-        cache.invalidate_path(Path::new("/ws/A.pas"));
+        cache.invalidate_path(&ws_path("A.pas"));
         assert!(cache.has_room(), "an evicted pinned entry no longer counts");
     }
 
@@ -1403,8 +1410,8 @@ mod cache_tests {
         let dir = PathBuf::from("/ws/includes");
         store_watching(&cache, "Main.pas", &ctx, &dir);
         store_watching(&cache, "Other.pas", &ctx, &dir);
-        cache.invalidate_path(Path::new("/ws/Main.pas"));
-        cache.invalidate_path(Path::new("/ws/Other.pas"));
+        cache.invalidate_path(&ws_path("Main.pas"));
+        cache.invalidate_path(&ws_path("Other.pas"));
         assert_eq!(
             *calls.lock().unwrap(),
             vec![("watch", dir.clone(), true), ("unwatch", dir, true)],
@@ -1607,7 +1614,7 @@ mod cache_tests {
         let lease = cache.lease_unit(&unit);
         let weak = Arc::downgrade(&unit.parsed);
         drop(unit);
-        cache.invalidate_path(Path::new("/ws/A.pas"));
+        cache.invalidate_path(&ws_path("A.pas"));
         assert!(
             weak.upgrade().is_none(),
             "the lease does not keep the parse"
@@ -1624,7 +1631,7 @@ mod cache_tests {
         let unit = cache
             .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
             .expect("hit");
-        cache.invalidate_path(Path::new("/ws/A.pas"));
+        cache.invalidate_path(&ws_path("A.pas"));
         fill(&cache, "B.pas", &ctx, 1, 10_000 - 10);
 
         let lease = cache.lease_unit(&unit);
@@ -1643,7 +1650,7 @@ mod cache_tests {
         let unit = cache
             .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
             .expect("hit");
-        cache.invalidate_path(Path::new("/ws/A.pas"));
+        cache.invalidate_path(&ws_path("A.pas"));
         assert_eq!(cache.stats().outstanding_bytes, 0);
         drop(unit);
     }
@@ -1657,7 +1664,7 @@ mod cache_tests {
             .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
             .expect("hit");
         let lease = cache.lease_unit(&unit);
-        cache.invalidate_path(Path::new("/ws/A.pas"));
+        cache.invalidate_path(&ws_path("A.pas"));
         assert_eq!(cache.stats().outstanding_bytes, 10);
 
         let Lookup::Compute(claim) =

@@ -371,6 +371,17 @@ impl OverrideSession {
         Ok(())
     }
 
+    /// Force the next lookup of every captured configuration to re-read it
+    /// from disk, for callers that lost track of which files changed.
+    pub fn mark_all_dirty(&self) -> Result<(), String> {
+        let captured = self.captured.lock().map_err(|_| capture_store_poisoned())?;
+        self.dirty
+            .lock()
+            .map_err(|_| capture_store_poisoned())?
+            .extend(captured.keys().cloned());
+        Ok(())
+    }
+
     /// Check whether any already captured, usable layer still matches a fresh
     /// source-stamp baseline. Uncaptured paths remain eligible for their first
     /// read. Cached parse errors retain their established reporting behavior
@@ -1062,6 +1073,36 @@ mod tests {
         assert!(budget.visits.get() > 0, "filesystem probes are charged");
         assert_eq!(budget.bytes.get(), replacement.len());
         assert!(budget.reservation.get() >= replacement.len());
+    }
+
+    #[test]
+    fn mark_all_dirty_re_reads_every_captured_override_on_next_lookup() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let path = root.path().join(super::LOCAL_CONFIG_NAME);
+        fs::write(&path, "[properties]\nName = 'first'\n").expect("initial override");
+        let session = super::OverrideSession::new(None);
+        session.capture_workspace(root.path()).expect("capture");
+        fs::write(&path, "[properties]\nName = 'fresh'\n").expect("updated override");
+        let captured = session
+            .effective_for(Some(root.path()), None)
+            .expect("captured override");
+        assert_eq!(
+            captured.properties.get("name").map(String::as_str),
+            Some("first"),
+            "lookups keep the session capture until told otherwise"
+        );
+
+        session
+            .mark_all_dirty()
+            .expect("mark captured overrides dirty");
+        let effective = session
+            .effective_for(Some(root.path()), None)
+            .expect("re-read override");
+
+        assert_eq!(
+            effective.properties.get("name").map(String::as_str),
+            Some("fresh")
+        );
     }
 
     #[test]

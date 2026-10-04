@@ -37174,7 +37174,7 @@ fn ambiguous_rename_batches_invalidate_and_reject_open_overlays() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow() {
+fn file_operation_batches_bound_uri_bytes_and_discard_on_entry_overflow() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let main = root.path().join("Main.pas");
     write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
@@ -37204,9 +37204,10 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
+    let probe = server.response(&probe_id);
     assert!(
-        server.response(&probe_id).error.is_some(),
-        "in-count URI-byte overflow must fence analysis before dropping its endpoint evidence"
+        probe.error.is_none(),
+        "in-count URI-byte overflow discards derived state without fencing (TASK-97): {probe:?}"
     );
     let byte_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
@@ -37227,9 +37228,10 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
+    let probe = server.response(&count_probe_id);
     assert!(
-        server.response(&count_probe_id).error.is_some(),
-        "an over-limit endpoint list must fence even unrelated document diagnostics"
+        probe.error.is_none(),
+        "an over-limit endpoint list discards derived state without fencing: {probe:?}"
     );
     let count_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
@@ -37247,9 +37249,10 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
+    let probe = server.response(&delete_probe_id);
     assert!(
-        server.response(&delete_probe_id).error.is_some(),
-        "the permanent fence must remain latched for later oversized delete events"
+        probe.error.is_none(),
+        "an oversized delete batch discards derived state without fencing: {probe:?}"
     );
     let delete_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
@@ -37288,9 +37291,10 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
+    let probe = server.response(&rename_probe_id);
     assert!(
-        server.response(&rename_probe_id).error.is_some(),
-        "oversized rename URI batches must not lift an already permanent file-operation fence"
+        probe.error.is_none(),
+        "an oversized rename URI batch discards derived state without fencing: {probe:?}"
     );
     let rename_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
@@ -37308,9 +37312,10 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&main)},"previousResultId":null}),
     );
+    let probe = server.response(&malformed_probe_id);
     assert!(
-        server.response(&malformed_probe_id).error.is_some(),
-        "later malformed events cannot lift the permanent count-overflow fence"
+        probe.error.is_none(),
+        "a duplicate-endpoint create batch is reconciled: {probe:?}"
     );
     let duplicate_create_refresh = server.request("workspace/diagnostic/refresh");
     server.send(Message::Response(Response::new_ok(
@@ -37332,7 +37337,7 @@ fn file_operation_batches_bound_uri_bytes_and_fence_uninspected_entry_overflow()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn uri_byte_overflow_rename_fences_unplanned_move_for_push_and_pull() {
+fn uri_byte_overflow_rename_rejects_unplanned_moved_overlay_for_push_and_pull() {
     for pull_diagnostics in [false, true] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -37449,7 +37454,10 @@ fn uri_byte_overflow_rename_fences_unplanned_move_for_push_and_pull() {
             );
             let response = server.response(&id);
             assert!(
-                response.error.is_some(),
+                response
+                    .result
+                    .as_ref()
+                    .is_none_or(|result| result["kind"] != "unchanged"),
                 "URI-byte overflow must not answer unchanged: {response:?}"
             );
         } else {
@@ -37466,8 +37474,12 @@ fn uri_byte_overflow_rename_fences_unplanned_move_for_push_and_pull() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TOldThing", 0),
         );
+        // TASK-97: the moved overlay at the known old endpoint is rejected,
+        // and no Provider unit remains on disk; nothing is fenced.
+        let old = server.response(&old_id);
+        assert!(old.error.is_none(), "{old:?}");
         assert!(
-            server.response(&old_id).error.is_some(),
+            result_locations(old).is_empty(),
             "old overlay/source must not remain authoritative"
         );
         let new_id = RequestId::from(format!("byte-overflow-rename-new-{pull_diagnostics}"));
@@ -37476,8 +37488,10 @@ fn uri_byte_overflow_rename_fences_unplanned_move_for_push_and_pull() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TNewThing", 0),
         );
+        let new = server.response(&new_id);
+        assert!(new.error.is_none(), "{new:?}");
         assert!(
-            server.response(&new_id).error.is_some(),
+            result_locations(new).is_empty(),
             "destination must not be inferred as authoritative"
         );
         server.send_notification(
@@ -37492,17 +37506,15 @@ fn uri_byte_overflow_rename_fences_unplanned_move_for_push_and_pull() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TNewThing", 0),
         );
-        assert!(
-            server.response(&after_valid).error.is_some(),
-            "later valid event cannot release URI-byte fence"
-        );
+        let after_valid = server.response(&after_valid);
+        assert!(after_valid.error.is_none(), "{after_valid:?}");
         server.shutdown();
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn uri_byte_overflow_delete_fences_closed_provider_before_unlink_for_push_and_pull() {
+fn uri_byte_overflow_delete_drops_closed_provider_without_fencing_for_push_and_pull() {
     for pull_diagnostics in [false, true] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -37573,6 +37585,8 @@ fn uri_byte_overflow_delete_fences_closed_provider_before_unlink_for_push_and_pu
             bytes > 32 * 1024,
             "test batch must overflow URI budget: {bytes}"
         );
+        // TASK-97: didDeleteFiles follows the disk change (LSP spec).
+        fs::remove_file(&provider).expect("client unlink before delete notification");
         server.send_notification("workspace/didDeleteFiles", json!({"files":files}));
 
         if pull_diagnostics {
@@ -37590,9 +37604,13 @@ fn uri_byte_overflow_delete_fences_closed_provider_before_unlink_for_push_and_pu
                     "previousResultId":prior_result_id.unwrap()
                 }),
             );
+            let response = server.response(&id);
             assert!(
-                server.response(&id).error.is_some(),
-                "closed provider pull must not return unchanged"
+                response
+                    .result
+                    .as_ref()
+                    .is_none_or(|result| result["kind"] != "unchanged"),
+                "closed provider pull must not return unchanged: {response:?}"
             );
         } else {
             let clear = server
@@ -37606,11 +37624,12 @@ fn uri_byte_overflow_delete_fences_closed_provider_before_unlink_for_push_and_pu
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TOldThing", 0),
         );
+        let after = server.response(&after_id);
+        assert!(after.error.is_none(), "{after:?}");
         assert!(
-            server.response(&after_id).error.is_some(),
-            "closed provider must not be rediscovered before unlink"
+            result_locations(after).is_empty(),
+            "the deleted closed provider must not be rediscovered"
         );
-        fs::remove_file(&provider).expect("client unlink after delete notification");
         server.shutdown();
     }
 }
@@ -41757,7 +41776,7 @@ fn wait_until_json_bool(path: &Path, field: &str, expected: bool, timeout: Durat
 
 #[cfg(target_os = "linux")]
 #[test]
-fn oversized_watched_file_notifications_permanently_fence_analysis() {
+fn oversized_watched_file_notifications_discard_derived_state_without_fencing() {
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().join("fixture");
     let provider = root.join("Provider.pas");
@@ -41843,6 +41862,9 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         json!({"changes":count_overflow_changes}),
     );
 
+    // TASK-97: file notifications follow the disk change, so an oversized
+    // batch discards derived state instead of fencing; the rewrite with the
+    // same size and mtime must still be observed.
     let old_after_count_id =
         RequestId::from("oversized-watch-old-definition-after-count".to_string());
     server.send_request(
@@ -41850,9 +41872,14 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         "textDocument/definition",
         navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
     );
+    let old_after_count = server.response(&old_after_count_id);
     assert!(
-        server.response(&old_after_count_id).error.is_some(),
-        "analysis must be refused after an oversized watcher batch"
+        old_after_count.error.is_none(),
+        "analysis must answer after an oversized watcher batch: {old_after_count:?}"
+    );
+    assert!(
+        result_locations(old_after_count).is_empty(),
+        "the rewritten provider no longer declares TOldThing"
     );
     let new_after_count_id =
         RequestId::from("oversized-watch-new-definition-after-count".to_string());
@@ -41861,10 +41888,9 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         "textDocument/definition",
         navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
     );
-    assert!(
-        server.response(&new_after_count_id).error.is_some(),
-        "the fence must refuse even apparently fresh provider data"
-    );
+    let new_locations = result_locations(server.response(&new_after_count_id));
+    assert_eq!(new_locations.len(), 1, "rewritten provider binding");
+    assert_eq!(new_locations[0]["uri"], uri(&provider).to_string());
 
     let diagnostic_after_count_id =
         RequestId::from("oversized-watch-diagnostic-after-count".to_string());
@@ -41873,9 +41899,23 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&provider)},"previousResultId":initial_result_id}),
     );
+    let diagnostic_after_count = server.response(&diagnostic_after_count_id);
     assert!(
-        server.response(&diagnostic_after_count_id).error.is_some(),
-        "pull diagnostics must be refused after watcher count overflow"
+        diagnostic_after_count.error.is_none(),
+        "pull diagnostics must answer after watcher count overflow: {diagnostic_after_count:?}"
+    );
+    let diagnostic_after_count = diagnostic_after_count
+        .result
+        .expect("diagnostic after count overflow");
+    assert_eq!(
+        diagnostic_after_count["kind"], "full",
+        "the old result ID must not be reported unchanged: {diagnostic_after_count}"
+    );
+    assert!(
+        !diagnostic_after_count["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "constant-naming")),
+        "the rewritten provider no longer has the bad constant: {diagnostic_after_count}"
     );
     let count_refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
@@ -41916,9 +41956,14 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         "textDocument/definition",
         navigation_params(&new_consumer, new_consumer_source, "TNewThing", 0),
     );
+    let new_after_bytes = server.response(&new_after_bytes_id);
     assert!(
-        server.response(&new_after_bytes_id).error.is_some(),
-        "the count-overflow fence must remain latched through later byte overflow"
+        new_after_bytes.error.is_none(),
+        "analysis must answer after URI-byte overflow: {new_after_bytes:?}"
+    );
+    assert!(
+        result_locations(new_after_bytes).is_empty(),
+        "the reverted provider no longer declares TNewThing"
     );
     let old_after_bytes_id =
         RequestId::from("oversized-watch-old-definition-after-bytes".to_string());
@@ -41927,10 +41972,9 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         "textDocument/definition",
         navigation_params(&old_consumer, old_consumer_source, "TOldThing", 0),
     );
-    assert!(
-        server.response(&old_after_bytes_id).error.is_some(),
-        "a later watcher batch cannot release the analysis fence"
-    );
+    let old_locations = result_locations(server.response(&old_after_bytes_id));
+    assert_eq!(old_locations.len(), 1, "reverted provider binding");
+    assert_eq!(old_locations[0]["uri"], uri(&provider).to_string());
 
     let diagnostic_after_bytes_id =
         RequestId::from("oversized-watch-diagnostic-after-bytes".to_string());
@@ -41939,9 +41983,10 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
         "textDocument/diagnostic",
         json!({"textDocument":{"uri":uri(&provider)},"previousResultId":null}),
     );
+    let diagnostic_after_bytes = server.response(&diagnostic_after_bytes_id);
     assert!(
-        server.response(&diagnostic_after_bytes_id).error.is_some(),
-        "pull diagnostics remain unavailable while fenced"
+        diagnostic_after_bytes.error.is_none(),
+        "pull diagnostics must answer after URI-byte overflow: {diagnostic_after_bytes:?}"
     );
     let bytes_refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", Duration::from_secs(2))
@@ -41955,7 +42000,7 @@ fn oversized_watched_file_notifications_permanently_fence_analysis() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
+fn oversized_watcher_batches_honour_deleted_provider_without_fencing() {
     for overflow_by_count in [true, false] {
         for pull_diagnostics in [true, false] {
             let root = tempfile::tempdir().expect("temporary workspace");
@@ -42052,6 +42097,9 @@ fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
             // Keep the actual Deleted endpoint last: at count overflow it is
             // entry 65, and at byte overflow it follows the long noise URIs.
             changes.push(json!({"uri":uri(&provider),"type":3}));
+            // TASK-97: watcher events follow the disk change (LSP spec), so
+            // the provider is gone before the batch arrives.
+            fs::remove_file(&provider).expect("client unlink before watched Deleted");
             if overflow_by_count {
                 assert_eq!(changes.len(), 65);
             } else {
@@ -42083,8 +42131,11 @@ fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
                 );
                 let response = server.response(&id);
                 assert!(
-                    response.error.is_some(),
-                    "overflow must not produce a current/unchanged closed-provider report: {response:?}"
+                    response
+                        .result
+                        .as_ref()
+                        .is_none_or(|result| result["kind"] != "unchanged"),
+                    "overflow must not produce an unchanged closed-provider report: {response:?}"
                 );
             } else {
                 let clear = server
@@ -42101,12 +42152,16 @@ fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
                 "textDocument/definition",
                 navigation_params(&consumer, consumer_source, "TOldThing", 0),
             );
+            let stale = server.response(&stale_definition);
             assert!(
-                server.response(&stale_definition).error.is_some(),
-                "closed deleted provider must not be rediscovered while its bytes remain on disk"
+                stale.error.is_none(),
+                "analysis must answer after an oversized watcher batch: {stale:?}"
+            );
+            assert!(
+                result_locations(stale).is_empty(),
+                "the deleted provider must not be resolved"
             );
 
-            // A later ordinary event cannot clear the permanent uncertainty.
             server.send_notification(
                 "workspace/didChangeWatchedFiles",
                 json!({"changes":[{"uri":uri(&consumer),"type":2}]}),
@@ -42119,11 +42174,12 @@ fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
                 "textDocument/definition",
                 navigation_params(&consumer, consumer_source, "TOldThing", 0),
             );
+            let after_valid = server.response(&after_valid);
             assert!(
-                server.response(&after_valid).error.is_some(),
-                "later valid watcher event cannot release the overflow fence"
+                after_valid.error.is_none(),
+                "a later valid watcher event is reconciled: {after_valid:?}"
             );
-            fs::remove_file(&provider).expect("client unlink after watched Deleted");
+            assert!(result_locations(after_valid).is_empty());
             server.shutdown();
         }
     }
@@ -42131,7 +42187,7 @@ fn oversized_watcher_batches_fence_late_deleted_provider_before_unlink() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn watcher_changed_on_unplanned_moved_open_provider_is_not_authoritative() {
+fn watcher_changed_on_unplanned_moved_open_provider_keeps_overlay_like_in_envelope_batch() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let moved_provider = root.path().join("MovedProvider.pas");
@@ -42183,10 +42239,12 @@ fn watcher_changed_on_unplanned_moved_open_provider_is_not_authoritative() {
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
-    assert!(
-        server.response(&stale).error.is_some(),
-        "a Changed watcher event cannot disambiguate a client-owned move with a live old overlay"
-    );
+    // TASK-97: an oversized batch behaves like the in-envelope path: a
+    // watcher event never overrides an open document, which stays
+    // authoritative until didClose.
+    let locations = result_locations(server.response(&stale));
+    assert_eq!(locations.len(), 1, "open provider overlay binding");
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
     server.shutdown();
 }
 
@@ -42280,7 +42338,7 @@ fn sixty_four_short_watched_file_events_remain_reconcilable() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn malformed_watched_file_batches_with_any_bad_member_fence() {
+fn malformed_watched_file_batches_with_any_bad_member_discard_without_fencing() {
     for malformed_kind in ["type", "uri", "non-file-uri", "unretainable-uri"] {
         for has_known_endpoint in [false, true] {
             if malformed_kind == "type" && !has_known_endpoint {
@@ -42369,6 +42427,10 @@ fn malformed_watched_file_batches_with_any_bad_member_fence() {
                     _ => unreachable!(),
                 };
                 changes.push(malformed_event);
+                // TASK-97: watcher events follow the disk change (LSP spec).
+                if has_known_endpoint {
+                    fs::remove_file(&provider).expect("client delete before watched Deleted");
+                }
                 assert!(changes.len() <= 64);
                 let uri_bytes: usize = changes
                     .iter()
@@ -42400,13 +42462,21 @@ fn malformed_watched_file_batches_with_any_bad_member_fence() {
                     );
                     let response = server.response(&id);
                     assert!(
-                        response.error.is_some(),
-                        "malformed {malformed_kind} must permanently fence analysis: {response:?}"
+                        response.error.is_none(),
+                        "malformed {malformed_kind} must not fence pull diagnostics: {response:?}"
                     );
+                    // An untouched provider may legitimately report unchanged.
+                    if has_known_endpoint {
+                        assert_ne!(
+                            response.result.as_ref().expect("pull result")["kind"],
+                            "unchanged",
+                            "the deleted provider's prior result must be invalidated"
+                        );
+                    }
                 } else {
                     let clear = server
                         .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
-                        .expect("malformed watcher fence must clear old push diagnostics");
+                        .expect("malformed watcher batch must clear old push diagnostics");
                     assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
                 }
 
@@ -42420,13 +42490,18 @@ fn malformed_watched_file_batches_with_any_bad_member_fence() {
                 );
                 let response = server.response(&after_malformed);
                 assert!(
-                    response.error.is_some(),
-                    "malformed {malformed_kind} must fence all workspace analysis"
+                    response.error.is_none(),
+                    "malformed {malformed_kind} must not fence workspace analysis: {response:?}"
+                );
+                assert_eq!(
+                    result_locations(response).len(),
+                    usize::from(!has_known_endpoint),
+                    "disk decides whether the provider exists ({malformed_kind})"
                 );
 
-                // No later valid event can repair a batch whose complete
-                // endpoint/event evidence was not attributable.
-                fs::remove_file(&provider).expect("client delete after malformed notification");
+                if !has_known_endpoint {
+                    fs::remove_file(&provider).expect("client delete before re-create");
+                }
                 write_file(&provider, provider_source);
                 server.send_notification(
                     "workspace/didChangeWatchedFiles",
@@ -42440,11 +42515,9 @@ fn malformed_watched_file_batches_with_any_bad_member_fence() {
                     "textDocument/definition",
                     navigation_params(&consumer, consumer_source, "TOldThing", 0),
                 );
-                let response = server.response(&after_create);
-                assert!(
-                    response.error.is_some(),
-                    "valid create cannot lift a permanent malformed-batch fence"
-                );
+                let locations = result_locations(server.response(&after_create));
+                assert_eq!(locations.len(), 1, "re-created provider ({malformed_kind})");
+                assert_eq!(locations[0]["uri"], uri(&provider).to_string());
                 server.shutdown();
             }
         }
@@ -42453,7 +42526,7 @@ fn malformed_watched_file_batches_with_any_bad_member_fence() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn mixed_malformed_closed_delete_fences_before_unlink() {
+fn mixed_malformed_closed_delete_discards_without_fencing() {
     for pull_diagnostics in [true, false] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -42509,9 +42582,10 @@ fn mixed_malformed_closed_delete_fences_before_unlink() {
             None
         };
 
-        // The provider's delete is reported before unlink, but that URI is
-        // malformed/unattributable. The unrelated valid member must not make
-        // endpoint recovery look complete.
+        // The provider's delete is reported with a malformed URI. TASK-97:
+        // didDeleteFiles follows the disk change (LSP spec), so the provider
+        // is already gone and disk alone keeps it out after the discard.
+        fs::remove_file(&provider).expect("client-owned unlink before notification");
         server.send_notification(
             "workspace/didDeleteFiles",
             json!({"files":[
@@ -42523,7 +42597,7 @@ fn mixed_malformed_closed_delete_fences_before_unlink() {
         if pull_diagnostics {
             let refresh = server
                 .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-                .expect("permanent delete-batch fence must refresh pull diagnostics");
+                .expect("malformed delete batch must refresh pull diagnostics");
             server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
             let id = RequestId::from("mixed-delete-pull-after".to_string());
             server.send_request(
@@ -42536,13 +42610,16 @@ fn mixed_malformed_closed_delete_fences_before_unlink() {
             );
             let response = server.response(&id);
             assert!(
-                response.error.is_some(),
-                "fenced pull must not be unchanged/full: {response:?}"
+                response
+                    .result
+                    .as_ref()
+                    .is_none_or(|result| result["kind"] != "unchanged"),
+                "pull after a discard must not be unchanged: {response:?}"
             );
         } else {
             let publication = server
                 .diagnostic_with_timeout(&uri(&consumer), IO_TIMEOUT)
-                .expect("permanent delete-batch fence must clear prior push finding");
+                .expect("malformed delete batch must clear prior push finding");
             assert!(
                 publication["diagnostics"]
                     .as_array()
@@ -42550,24 +42627,25 @@ fn mixed_malformed_closed_delete_fences_before_unlink() {
             );
         }
 
-        let before_unlink_id = RequestId::from("mixed-delete-definition-before-unlink".to_string());
+        let after_id = RequestId::from("mixed-delete-definition-after".to_string());
         server.send_request(
-            before_unlink_id.clone(),
+            after_id.clone(),
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TThing", 0),
         );
+        let after = server.response(&after_id);
+        assert!(after.error.is_none(), "analysis must answer: {after:?}");
         assert!(
-            server.response(&before_unlink_id).error.is_some(),
-            "closed provider must not remain resolvable after unbounded delete evidence"
+            result_locations(after).is_empty(),
+            "the deleted closed provider must not remain resolvable"
         );
-        fs::remove_file(&provider).expect("client-owned unlink after notification");
         server.shutdown();
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn malformed_create_missing_uri_and_watcher_unknown_type_fence_unrelated_batches() {
+fn malformed_create_missing_uri_and_watcher_unknown_type_rebuild_from_disk() {
     for malformed_kind in ["create-missing-uri", "watcher-unknown-type"] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -42616,7 +42694,7 @@ fn malformed_create_missing_uri_and_watcher_unknown_type_fence_unrelated_batches
         }
         let refresh = server
             .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-            .expect("unknown batch member must permanently fence and request pull refresh");
+            .expect("unknown batch member must discard derived state and request pull refresh");
         server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
         let id = RequestId::from(format!("{malformed_kind}-pull-after"));
         server.send_request(
@@ -42626,8 +42704,8 @@ fn malformed_create_missing_uri_and_watcher_unknown_type_fence_unrelated_batches
         );
         let pull = server.response(&id);
         assert!(
-            pull.error.is_some(),
-            "unbounded {malformed_kind} batch must fence pull diagnostics: {pull:?}"
+            pull.error.is_none(),
+            "{malformed_kind} batch must not fence pull diagnostics: {pull:?}"
         );
         let after_id = RequestId::from(format!("{malformed_kind}-definition-after"));
         server.send_request(
@@ -42635,17 +42713,22 @@ fn malformed_create_missing_uri_and_watcher_unknown_type_fence_unrelated_batches
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TThing", 0),
         );
-        assert!(
-            server.response(&after_id).error.is_some(),
-            "unknown {malformed_kind} member cannot leave stale/negative provider authority"
+        // TASK-97: notifications follow the disk change, so after the
+        // discard disk alone decides: the provider exists in both cases.
+        let locations = result_locations(server.response(&after_id));
+        assert_eq!(
+            locations.len(),
+            1,
+            "{malformed_kind}: provider rebuilt from disk"
         );
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
         server.shutdown();
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_stays_fenced() {
+fn malformed_watcher_delete_keeps_open_overlay_and_valid_create_reconciles() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let consumer = root.path().join("Consumer.pas");
@@ -42672,6 +42755,8 @@ fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_stays_fenced()
         uri(&provider).to_string()
     );
 
+    // TASK-97: watcher events follow the disk change (LSP spec).
+    fs::remove_file(&provider).expect("client unlink before watched Deleted");
     server.send_notification(
         "workspace/didChangeWatchedFiles",
         json!({"changes":[
@@ -42689,17 +42774,16 @@ fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_stays_fenced()
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
-    let stale_response = server.response(&stale);
-    assert!(
-        stale_response.error.is_some() || result_locations(stale_response).is_empty(),
-        "malformed Deleted endpoint must reject its old open overlay"
-    );
+    // As in an in-envelope batch, a watcher event never overrides an open
+    // document; it stays authoritative until didClose.
+    let stale_locations = result_locations(server.response(&stale));
+    assert_eq!(stale_locations.len(), 1, "open overlay binding");
+    assert_eq!(stale_locations[0]["uri"], uri(&provider).to_string());
 
     server.send_notification(
         "textDocument/didClose",
         json!({"textDocument":{"uri":uri(&provider)}}),
     );
-    fs::remove_file(&provider).expect("client unlink after malformed delete");
     write_file(&provider, new_source);
     server.send_notification(
         "workspace/didChangeWatchedFiles",
@@ -42711,18 +42795,16 @@ fn malformed_watcher_delete_rejects_open_overlay_and_valid_create_stays_fenced()
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TNewThing", 0),
     );
-    let fresh_response = server.response(&fresh);
-    assert!(
-        fresh_response.error.is_some(),
-        "later valid create cannot lift a malformed-batch analysis fence: {fresh_response:?}"
-    );
+    let fresh_locations = result_locations(server.response(&fresh));
+    assert_eq!(fresh_locations.len(), 1, "re-created provider binding");
+    assert_eq!(fresh_locations[0]["uri"], uri(&provider).to_string());
     server.shutdown();
 }
 
 #[cfg(feature = "test-support")]
 #[cfg(target_os = "linux")]
 #[test]
-fn unattributable_malformed_watcher_fences_queued_and_inflight_queries() {
+fn unattributable_malformed_watcher_discards_without_fencing_queued_and_inflight_queries() {
     let environment = tempfile::tempdir().expect("test environment");
     let root = environment.path().join("workspace");
     fs::create_dir_all(&root).expect("workspace directory");
@@ -42758,15 +42840,20 @@ fn unattributable_malformed_watcher_fences_queued_and_inflight_queries() {
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
-    assert!(
-        server.response(&queued_id).error.is_some(),
-        "queued query must be refused by unattributable malformed-event fence"
-    );
+    // TASK-97: the discard rebuilds from disk, where the provider is
+    // unchanged; no query is refused by a fence.
     barrier.release();
-    assert!(
-        server.response(&inflight_id).error.is_some(),
-        "in-flight query must not deliver a result after the permanent fence"
-    );
+    let queued = result_locations(server.response(&queued_id));
+    assert_eq!(queued.len(), 1, "queued query answers from disk");
+    assert_eq!(queued[0]["uri"], uri(&provider).to_string());
+    let inflight = server.response(&inflight_id);
+    // The in-flight query was computed before the discard: it may be
+    // refused as stale, but it must never name anything but the provider.
+    if inflight.error.is_none() {
+        let locations = result_locations(inflight);
+        assert_eq!(locations.len(), 1, "in-flight query result");
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    }
     server.shutdown();
 }
 
@@ -42997,7 +43084,7 @@ fn worker_file_notification_error_after_mutation_recovers_staling_and_overlay_st
 }
 
 #[test]
-fn malformed_file_batch_fences_analysis_and_requests_global_refresh() {
+fn malformed_file_batch_discards_without_fencing_and_requests_global_refresh() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let main = root.path().join("Main.pas");
     write_file(&main, "unit Main;\ninterface\nimplementation\nend.\n");
@@ -43009,7 +43096,7 @@ fn malformed_file_batch_fences_analysis_and_requests_global_refresh() {
     );
     let refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-        .expect("unattributable file notification must fail closed with global refresh");
+        .expect("unattributable file notification must request a global refresh");
     server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
     let diagnostic_id = RequestId::from("prevalidated-malformed-input-diagnostics".to_string());
     server.send_request(
@@ -43019,8 +43106,8 @@ fn malformed_file_batch_fences_analysis_and_requests_global_refresh() {
     );
     let response = server.response(&diagnostic_id);
     assert!(
-        response.error.is_some(),
-        "permanently fenced malformed batch must refuse diagnostics: {response:?}"
+        response.error.is_none(),
+        "a malformed create batch must not fence diagnostics: {response:?}"
     );
     server.shutdown();
 }
@@ -43039,7 +43126,7 @@ fn distinct_long_file_operation_uris(root: &Path, count: usize) -> Vec<Url> {
 }
 
 #[test]
-fn malformed_delete_after_uri_byte_overflow_permanently_fences_analysis() {
+fn malformed_delete_after_uri_byte_overflow_discards_without_fencing() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let provider = root.path().join("Provider.pas");
     let consumer = root.path().join("Consumer.pas");
@@ -43087,16 +43174,17 @@ fn malformed_delete_after_uri_byte_overflow_permanently_fences_analysis() {
         "fixture must exceed byte admission cap"
     );
     let mut files: Vec<Value> = noise.into_iter().map(|uri| json!({"uri":uri})).collect();
-    // The physical unlink happens only after the notification. This endpoint
-    // is deliberately later than the URI-byte cap and immediately before the
-    // malformed member, so dropping bounded evidence resurfaces old bytes.
+    // This endpoint is deliberately later than the URI-byte cap and
+    // immediately before the malformed member. TASK-97: didDeleteFiles
+    // follows the disk change (LSP spec), so the unlink comes first.
     files.push(json!({"uri":uri(&provider)}));
+    fs::remove_file(&provider).expect("client-owned physical unlink");
     files.push(json!({"badEntry":"missing uri"}));
     assert_eq!(files.len(), 64);
     server.send_notification("workspace/didDeleteFiles", json!({"files":files}));
     let refresh = server
         .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-        .expect("overflowed mixed delete must fail closed and refresh");
+        .expect("overflowed mixed delete must discard and refresh");
     server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
 
     let after_id = RequestId::from("late-tombstone-provider-after".to_string());
@@ -43105,9 +43193,11 @@ fn malformed_delete_after_uri_byte_overflow_permanently_fences_analysis() {
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
+    let after = server.response(&after_id);
+    assert!(after.error.is_none(), "analysis must answer: {after:?}");
     assert!(
-        server.response(&after_id).error.is_some(),
-        "malformed over-budget batch must fence analysis rather than partially tombstone"
+        result_locations(after).is_empty(),
+        "the deleted provider must not be resolved"
     );
     let pull_after_id = RequestId::from("late-tombstone-pull-after".to_string());
     server.send_request(
@@ -43120,10 +43210,12 @@ fn malformed_delete_after_uri_byte_overflow_permanently_fences_analysis() {
     );
     let pull_after = server.response(&pull_after_id);
     assert!(
-        pull_after.error.is_some(),
-        "permanent malformed-batch fence must refuse pull diagnostics: {pull_after:?}"
+        pull_after
+            .result
+            .as_ref()
+            .is_none_or(|result| result["kind"] != "unchanged"),
+        "the deleted provider's prior result must be invalidated: {pull_after:?}"
     );
-    fs::remove_file(&provider).expect("client-owned physical unlink");
     server.shutdown();
 }
 
@@ -43151,7 +43243,7 @@ fn settle_diagnostic_refreshes(server: &mut TestServer, label: &str) {
 }
 
 #[test]
-fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
+fn malformed_rename_with_128_and_129_open_documents_keeps_overlays_still_on_disk() {
     for open_count in [128usize, 129] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -43183,7 +43275,7 @@ fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
             );
         }
         // The opens request refreshes of their own; only a refresh after this
-        // point proves the malformed rename fence.
+        // point proves the malformed rename recovery.
         settle_diagnostic_refreshes(&mut server, &format!("open-boundary-{open_count}"));
         server.send_notification(
             "workspace/didRenameFiles",
@@ -43194,7 +43286,7 @@ fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
         );
         let refresh = server
             .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-            .expect("malformed rename fence must request a refresh");
+            .expect("malformed rename recovery must request a refresh");
         server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
         let definition_id = RequestId::from(format!("open-boundary-definition-{open_count}"));
         server.send_request(
@@ -43202,11 +43294,11 @@ fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TThing", 0),
         );
-        let response = server.response(&definition_id);
-        assert!(
-            response.error.is_some(),
-            "known endpoints from a different member cannot bound the malformed member's source identity: {response:?}"
-        );
+        // TASK-97: an unknown rename endpoint rejects only open documents
+        // whose file is gone; every open document here is still on disk.
+        let locations = result_locations(server.response(&definition_id));
+        assert_eq!(locations.len(), 1, "open provider keeps answering");
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
 
         server.send_notification(
             "workspace/didCreateFiles",
@@ -43218,17 +43310,16 @@ fn malformed_rename_with_128_and_129_open_documents_permanently_fences() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TThing", 0),
         );
-        assert!(
-            server.response(&after_id).error.is_some(),
-            "a later valid create must not lift the permanent analysis fence"
-        );
+        let locations = result_locations(server.response(&after_id));
+        assert_eq!(locations.len(), 1, "a later valid create reconciles");
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
         server.shutdown();
     }
 }
 
 #[test]
 #[cfg(feature = "test-support")]
-fn malformed_file_batch_with_unretainable_endpoint_fences_analysis() {
+fn malformed_file_batch_with_unretainable_endpoint_discards_without_fencing() {
     let environment = tempfile::tempdir().expect("temporary workspace");
     let root = environment.path().to_path_buf();
     let provider = root.join("Provider.pas");
@@ -43266,23 +43357,25 @@ fn malformed_file_batch_with_unretainable_endpoint_fences_analysis() {
         .diagnostic_with_timeout(&uri(&provider), Duration::from_secs(2))
         .expect("unretainable endpoint recovery must deliver a bounded push clear");
     assert!(clear["diagnostics"].as_array().is_some_and(Vec::is_empty));
-    let definition_id = RequestId::from("unretainable-endpoint-analysis-fenced".to_string());
+    let definition_id = RequestId::from("unretainable-endpoint-analysis-answers".to_string());
     server.send_request(
         definition_id.clone(),
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TThing", 0),
     );
-    let response = server.response(&definition_id);
-    assert!(
-        response.error.is_some(),
-        "analysis must remain fail-closed when endpoint evidence cannot be retained"
+    let locations = result_locations(server.response(&definition_id));
+    assert_eq!(
+        locations.len(),
+        1,
+        "analysis answers from disk and overlays"
     );
+    assert_eq!(locations[0]["uri"], uri(&provider).to_string());
     server.shutdown();
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
+fn wholly_unattributable_malformed_rename_rejects_overlays_whose_file_is_gone() {
     for (open_provider, pull_diagnostics) in [(true, true), (true, false), (false, true)] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -43355,14 +43448,9 @@ fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
             None
         };
 
-        if open_provider {
-            fs::rename(&provider, &renamed_provider).expect("client-owned provider move");
-            write_file(&renamed_provider, renamed_source);
-        } else {
-            // Keep old A physically visible to model a didRename notification
-            // arriving before the client's unlink has become observable.
-            write_file(&renamed_provider, renamed_source);
-        }
+        // TASK-97: didRenameFiles follows the disk change (LSP spec).
+        fs::rename(&provider, &renamed_provider).expect("client-owned provider move");
+        write_file(&renamed_provider, renamed_source);
         server.send_notification(
             "workspace/didRenameFiles",
             json!({"files":[{"notOldUri":"missing","notNewUri":"missing"}]}),
@@ -43384,7 +43472,10 @@ fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
             );
             let after_diagnostic = server.response(&after_diagnostic_id);
             assert!(
-                after_diagnostic.error.is_some(),
+                after_diagnostic
+                    .result
+                    .as_ref()
+                    .is_none_or(|result| result["kind"] != "unchanged"),
                 "unattributable rename must not return a prior report as unchanged: {after_diagnostic:?}"
             );
         } else {
@@ -43406,10 +43497,16 @@ fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
                 method,
                 navigation_params(&consumer, consumer_source, needle, 0),
             );
+            // The old open overlay's file is gone, so it is rejected; disk
+            // no longer has a Provider unit either.
             let response = server.response(&request_id);
             assert!(
-                response.error.is_some(),
-                "global uncertainty must fence both old and destination provider queries: {response:?}"
+                response.error.is_none(),
+                "analysis must answer after an unattributable rename: {response:?}"
+            );
+            assert!(
+                result_locations(response).is_empty(),
+                "{id}: no provider remains under the old identity"
             );
         }
         let rename_id = RequestId::from(format!(
@@ -43424,13 +43521,16 @@ fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
                 "newName":"TReplacement",
             }),
         );
+        let rename = server.response(&rename_id);
         assert!(
-            server.response(&rename_id).error.is_some(),
-            "a stale provider binding must not produce rename edits"
+            rename.error.is_some()
+                || !rename
+                    .result
+                    .as_ref()
+                    .is_some_and(|edit| edit.to_string().contains("Provider.pas")),
+            "a stale provider binding must not produce rename edits: {rename:?}"
         );
 
-        // A later well-formed event is not proof that the hidden transition
-        // has been reconciled; the workspace-instance fence is permanent.
         server.send_notification(
             "workspace/didCreateFiles",
             json!({"files":[{"uri":uri(&renamed_provider)}]}),
@@ -43443,17 +43543,16 @@ fn wholly_unattributable_malformed_rename_permanently_fences_old_sources() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TOldThing", 0),
         );
-        assert!(
-            server.response(&after_valid_id).error.is_some(),
-            "a later valid event must not silently lift the permanent analysis fence"
-        );
+        let after_valid = server.response(&after_valid_id);
+        assert!(after_valid.error.is_none(), "{after_valid:?}");
+        assert!(result_locations(after_valid).is_empty());
         server.shutdown();
     }
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_identity() {
+fn mixed_malformed_rename_with_unparseable_old_uri_rejects_moved_open_provider() {
     for pull_diagnostics in [false, true] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -43533,7 +43632,7 @@ fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_i
         if pull_diagnostics {
             let refresh = server
                 .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
-                .expect("malformed rename fence must refresh pull diagnostics");
+                .expect("malformed rename must refresh pull diagnostics");
             server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
             let pull_id = RequestId::from("mixed-unparseable-old-pull-after".to_string());
             server.send_request(
@@ -43546,8 +43645,11 @@ fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_i
             );
             let response = server.response(&pull_id);
             assert!(
-                response.error.is_some(),
-                "old provider pull state must be permanently fenced, not returned unchanged: {response:?}"
+                response
+                    .result
+                    .as_ref()
+                    .is_none_or(|result| result["kind"] != "unchanged"),
+                "old provider pull state must not be returned unchanged: {response:?}"
             );
         } else {
             let clear = server
@@ -43565,10 +43667,16 @@ fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_i
                 "textDocument/definition",
                 navigation_params(&consumer, consumer_source, symbol, 0),
             );
+            // TASK-97: the unparseable old endpoint may be any open
+            // document whose file is gone; the moved provider overlay is one.
             let response = server.response(&id);
             assert!(
-                response.error.is_some(),
-                "both old and destination provider identity must be fenced: {response:?}"
+                response.error.is_none(),
+                "analysis must answer after a malformed rename: {response:?}"
+            );
+            assert!(
+                result_locations(response).is_empty(),
+                "{label}: the rejected overlay must not provide the old identity"
             );
         }
         let rename_id =
@@ -43584,8 +43692,12 @@ fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_i
         );
         let rename = server.response(&rename_id);
         assert!(
-            rename.error.is_some(),
-            "an unbounded malformed rename must not produce partial edits: {rename:?}"
+            rename.error.is_some()
+                || !rename
+                    .result
+                    .as_ref()
+                    .is_some_and(|edit| edit.to_string().contains("Provider.pas")),
+            "a malformed rename must not produce edits through the rejected overlay: {rename:?}"
         );
         server.shutdown();
     }
@@ -43594,7 +43706,7 @@ fn mixed_malformed_rename_with_unparseable_old_uri_permanently_fences_provider_i
 #[cfg(feature = "test-support")]
 #[test]
 #[cfg(target_os = "linux")]
-fn mixed_malformed_rename_fences_queued_and_inflight_queries() {
+fn mixed_malformed_rename_rejects_moved_overlay_for_queued_and_inflight_queries() {
     let environment = tempfile::tempdir().expect("test environment");
     let root = environment.path().join("workspace");
     fs::create_dir_all(&root).expect("workspace directory");
@@ -43642,24 +43754,28 @@ fn mixed_malformed_rename_fences_queued_and_inflight_queries() {
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
+    barrier.release();
+    // TASK-97: the moved provider overlay is rejected (its file is gone).
     let queued_response = server.response(&queued_id);
     assert!(
-        queued_response.error.is_some(),
-        "queued post-transition work must be refused by the global fence"
+        queued_response.error.is_none(),
+        "queued query must answer: {queued_response:?}"
     );
-
-    barrier.release();
+    assert!(
+        result_locations(queued_response).is_empty(),
+        "queued post-transition work must not see the rejected overlay"
+    );
     let inflight_response = server.response(&inflight_id);
     assert!(
-        inflight_response.error.is_some(),
-        "pre-fence in-flight work must not deliver a stale definition: {inflight_response:?}"
+        inflight_response.error.is_some() || result_locations(inflight_response.clone()).is_empty(),
+        "pre-discard in-flight work must not deliver a stale definition: {inflight_response:?}"
     );
     server.shutdown();
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fences() {
+fn malformed_mixed_rename_batch_rejects_staged_open_overlay_without_fencing() {
     for pull_diagnostics in [false, true] {
         for overflow_uri_bytes in [false, true] {
             let root = tempfile::tempdir().expect("temporary workspace");
@@ -43770,9 +43886,6 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
             assert_eq!(stale_disk.len(), provider_updated.len());
             write_file(&renamed_provider, &stale_disk);
             restore_mtime(&renamed_provider, &moved_metadata);
-            // Model old-name bytes that remain visible when a delete/rename is
-            // reported before all physical filesystem notifications have settled.
-            write_file(&provider, provider_source);
 
             let prior_result_id = if pull_diagnostics {
                 let pull_id =
@@ -43832,8 +43945,11 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
                 );
                 let response = server.response(&pull_id);
                 assert!(
-                    response.error.is_some(),
-                    "unbounded malformed endpoint evidence must fence pull diagnostics: {response:?}"
+                    response
+                        .result
+                        .as_ref()
+                        .is_none_or(|result| result["kind"] != "unchanged"),
+                    "the rejected overlay's prior result must not be unchanged: {response:?}"
                 );
             } else {
                 let clear = server
@@ -43849,9 +43965,13 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
                 "textDocument/definition",
                 navigation_params(&consumer, &consumer_updated, "TThing", 0),
             );
+            // TASK-97: the known endpoints' overlays are rejected; nothing
+            // is fenced.
+            let rejected = server.response(&rejected_overlay_id);
+            assert!(rejected.error.is_none(), "{rejected:?}");
             assert!(
-                server.response(&rejected_overlay_id).error.is_some(),
-                "permanent fence rejects destination queries"
+                result_locations(rejected).is_empty(),
+                "the rejected destination overlay must not answer"
             );
             let old_overlay_id = RequestId::from(format!(
                 "malformed-move-old-overlay-rejected-{pull_diagnostics}"
@@ -43861,10 +43981,9 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
                 "textDocument/definition",
                 navigation_params(&consumer, &consumer_updated, "TThing", 0),
             );
-            assert!(
-                server.response(&old_overlay_id).error.is_some(),
-                "permanent fence rejects old-provider queries"
-            );
+            let old_overlay = server.response(&old_overlay_id);
+            assert!(old_overlay.error.is_none(), "{old_overlay:?}");
+            assert!(result_locations(old_overlay).is_empty());
             let old_consumer = root.path().join("OldConsumer.pas");
             let old_consumer_source = "unit OldConsumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
             write_file(&old_consumer, old_consumer_source);
@@ -43875,13 +43994,14 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
                 "textDocument/definition",
                 navigation_params(&old_consumer, old_consumer_source, "TThing", 0),
             );
+            let old_source = server.response(&old_source_id);
+            assert!(old_source.error.is_none(), "{old_source:?}");
             assert!(
-                server.response(&old_source_id).error.is_some(),
-                "permanent fence rejects old source queries"
+                result_locations(old_source).is_empty(),
+                "the old provider is gone from disk"
             );
 
-            // A later physically verified create and closing the rejected
-            // overlay cannot reconstruct the hidden source transition proof.
+            // Closing the rejected overlays and a verified create recover.
             server.send_notification(
                 "textDocument/didClose",
                 json!({"textDocument":{"uri":uri(&renamed_provider)}}),
@@ -43903,10 +44023,9 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
                 "textDocument/definition",
                 navigation_params(&consumer, &consumer_updated, "TThing", 0),
             );
-            assert!(
-                server.response(&repaired_id).error.is_some(),
-                "later verified file events must not lift the permanent analysis fence"
-            );
+            let repaired = result_locations(server.response(&repaired_id));
+            assert_eq!(repaired.len(), 1, "provider resolves after recovery");
+            assert_eq!(repaired[0]["uri"], uri(&renamed_provider).to_string());
             server.shutdown();
         }
     }
@@ -43914,7 +44033,7 @@ fn malformed_mixed_rename_batch_rejects_staged_open_overlay_and_permanently_fenc
 
 #[cfg(target_os = "linux")]
 #[test]
-fn oversized_create_and_delete_file_batches_permanently_fence_open_overlays() {
+fn oversized_create_and_delete_file_batches_keep_open_overlays_without_fencing() {
     for (event, pull_diagnostics) in [
         ("workspace/didCreateFiles", false),
         ("workspace/didCreateFiles", true),
@@ -43981,6 +44100,9 @@ fn oversized_create_and_delete_file_batches_permanently_fence_open_overlays() {
         if event == "workspace/didCreateFiles" {
             write_file(&provider, new_source);
             restore_mtime(&provider, &original_metadata);
+        } else {
+            // TASK-97: didDeleteFiles follows the disk change (LSP spec).
+            fs::remove_file(&provider).expect("client physical unlink before notification");
         }
         let mut files: Vec<_> = (0..64)
             .map(|index| json!({"uri":uri(&root.path().join(format!("Noise{index}.pas")))}))
@@ -44004,9 +44126,10 @@ fn oversized_create_and_delete_file_batches_permanently_fence_open_overlays() {
                     "previousResultId":prior_result_id.expect("pull mode ID")
                 }),
             );
+            let response = server.response(&id);
             assert!(
-                server.response(&id).error.is_some(),
-                "oversized {event} must not return a prior diagnostic as unchanged"
+                response.error.is_none(),
+                "oversized {event} must not fence pull diagnostics: {response:?}"
             );
         } else {
             let clear = server
@@ -44021,15 +44144,11 @@ fn oversized_create_and_delete_file_batches_permanently_fence_open_overlays() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TOldThing", 0),
         );
-        assert!(
-            server.response(&after_id).error.is_some(),
-            "oversized {event} must fail closed rather than trust an open provider overlay"
-        );
-        if event == "workspace/didDeleteFiles" {
-            // The file remains physically present through the notification and
-            // fenced request, reproducing delete-before-unlink ordering.
-            fs::remove_file(&provider).expect("client physical unlink after notification");
-        }
+        // As in an in-envelope batch, create/delete never override an open
+        // document; it stays authoritative until didClose.
+        let after = result_locations(server.response(&after_id));
+        assert_eq!(after.len(), 1, "oversized {event} keeps the open overlay");
+        assert_eq!(after[0]["uri"], uri(&provider).to_string());
         server.shutdown();
     }
 }
@@ -44140,28 +44259,36 @@ fn oversized_did_rename_invalidates_pending_open_overlay_without_transferring_it
         "textDocument/definition",
         navigation_params(&consumer, &consumer_updated, "TThing", 0),
     );
+    // TASK-97: an over-limit rename list discards derived state and rejects
+    // the open overlays at its endpoints instead of fencing analysis.
     let response = server.response(&definition_id);
+    assert!(response.error.is_none(), "{response:?}");
     assert!(
-        response.error.is_some(),
-        "an over-limit rename list cannot prove that its staged transition matches the actual move"
+        result_locations(response).is_empty(),
+        "an over-limit rename list cannot transfer its staged overlay"
     );
     server.send_notification(
         "workspace/didCreateFiles",
         json!({"files":[{"uri":uri(&renamed_provider)}]}),
     );
-    let after_create = RequestId::from("oversized-did-rename-permanent-fence".to_string());
+    let after_create = RequestId::from("oversized-did-rename-after-create".to_string());
     server.send_request(
         after_create.clone(),
         "textDocument/definition",
         navigation_params(&consumer, &consumer_updated, "TThing", 0),
     );
-    assert!(server.response(&after_create).error.is_some());
+    let after_create = server.response(&after_create);
+    assert!(after_create.error.is_none(), "{after_create:?}");
+    assert!(
+        result_locations(after_create).is_empty(),
+        "the rejected destination overlay stays rejected until didClose"
+    );
     server.shutdown();
 }
 
 #[test]
 #[cfg(target_os = "linux")]
-fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
+fn oversized_unplanned_rename_rejects_moved_overlay_without_fencing() {
     for pull_diagnostics in [false, true] {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = root.path().join("Provider.pas");
@@ -44253,7 +44380,10 @@ fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
             );
             let response = server.response(&id);
             assert!(
-                response.error.is_some(),
+                response
+                    .result
+                    .as_ref()
+                    .is_none_or(|result| result["kind"] != "unchanged"),
                 "oversized rename must not preserve a prior pull report: {response:?}"
             );
         } else {
@@ -44272,9 +44402,13 @@ fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
                 "textDocument/definition",
                 navigation_params(&consumer, consumer_source, needle, 0),
             );
+            // TASK-97: the moved overlay at the old endpoint is rejected and
+            // no Provider unit remains on disk.
+            let response = server.response(&id);
+            assert!(response.error.is_none(), "{label}: {response:?}");
             assert!(
-                server.response(&id).error.is_some(),
-                "analysis fence must reject {label} provider resolution"
+                result_locations(response).is_empty(),
+                "{label} provider must not resolve"
             );
         }
         let rename_id = RequestId::from(format!(
@@ -44289,7 +44423,15 @@ fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
                 "newName":"TReplacement"
             }),
         );
-        assert!(server.response(&rename_id).error.is_some());
+        let rename = server.response(&rename_id);
+        assert!(
+            rename.error.is_some()
+                || !rename
+                    .result
+                    .as_ref()
+                    .is_some_and(|edit| edit.to_string().contains("Provider.pas")),
+            "a stale provider binding must not produce rename edits: {rename:?}"
+        );
 
         server.send_notification(
             "workspace/didCreateFiles",
@@ -44303,10 +44445,8 @@ fn oversized_unplanned_rename_permanently_fences_stale_provider_state() {
             "textDocument/definition",
             navigation_params(&consumer, consumer_source, "TNewThing", 0),
         );
-        assert!(
-            server.response(&after_valid).error.is_some(),
-            "later bounded file events must not lift the permanent overflow fence"
-        );
+        let after_valid = server.response(&after_valid);
+        assert!(after_valid.error.is_none(), "{after_valid:?}");
         server.shutdown();
     }
 }
@@ -44373,14 +44513,19 @@ fn uri_byte_overflow_rename_rejects_inflight_and_queued_queries() {
         "textDocument/definition",
         navigation_params(&consumer, consumer_source, "TOldThing", 0),
     );
-    assert!(
-        server.response(&queued_id).error.is_some(),
-        "queued query must be rejected by oversized-notification fence"
-    );
     barrier.release();
+    // TASK-97: the moved overlay at the known old endpoint is rejected; the
+    // queued query answers without it instead of hitting a fence.
+    let queued = server.response(&queued_id);
+    assert!(queued.error.is_none(), "{queued:?}");
     assert!(
-        server.response(&inflight_id).error.is_some(),
-        "in-flight query must not deliver a stale old-provider definition"
+        result_locations(queued).is_empty(),
+        "queued query must not see the rejected old provider overlay"
+    );
+    let inflight = server.response(&inflight_id);
+    assert!(
+        inflight.error.is_some() || result_locations(inflight.clone()).is_empty(),
+        "in-flight query must not deliver a stale old-provider definition: {inflight:?}"
     );
     server.shutdown();
 }
@@ -60968,4 +61113,402 @@ fn semantic_tokens_refresh_is_not_sent_without_client_support() {
             .is_none()
     );
     server.shutdown();
+}
+
+// TASK-97: file notifications describe changes already on disk (LSP spec), so
+// a notification the server cannot reconcile entry by entry discards derived
+// state and rebuilds from disk plus open documents; it never fences analysis.
+
+fn definition_locations(
+    server: &mut TestServer,
+    id: &str,
+    path: &Path,
+    source: &str,
+    needle: &str,
+) -> Vec<Value> {
+    let request_id = RequestId::from(id.to_string());
+    server.send_request(
+        request_id.clone(),
+        "textDocument/definition",
+        navigation_params(path, source, needle, 0),
+    );
+    let response = server.response(&request_id);
+    assert!(
+        response.error.is_none(),
+        "{id}: analysis must answer: {response:?}"
+    );
+    result_locations(response)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn git_checkout_sized_watched_batch_keeps_analysis_answering() {
+    // A branch switch or a repo-wide format reaches the server as one large
+    // watcher batch: hundreds of Deleted/Created/Changed events.
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let added = root.path().join("Added.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let old_provider =
+        "unit Provider;\ninterface\ntype TOldThing = class end;\nimplementation\nend.\n";
+    let new_provider =
+        "unit Provider;\ninterface\ntype TNewThing = class end;\nimplementation\nend.\n";
+    assert_eq!(old_provider.len(), new_provider.len());
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider, Added, Gone0;\ntype TOldAlias = Provider.TOldThing;\ntype TNewAlias = Provider.TNewThing;\ntype AddedAlias = Added.TAdded;\ntype GoneAlias = Gone0.TGone;\nimplementation\nend.\n";
+    write_file(&provider, old_provider);
+    write_file(&consumer, consumer_source);
+    let gone: Vec<_> = (0..300)
+        .map(|index| root.path().join(format!("Gone{index}.pas")))
+        .collect();
+    for (index, path) in gone.iter().enumerate() {
+        write_file(
+            path,
+            &format!(
+                "unit Gone{index};\ninterface\ntype TGone = class end;\nimplementation\nend.\n"
+            ),
+        );
+    }
+    let mut server = TestServer::launch();
+    server.initialize_with_pull_diagnostics(root.path());
+    let before = definition_locations(
+        &mut server,
+        "checkout-gone-before",
+        &consumer,
+        consumer_source,
+        "TGone",
+    );
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["uri"], uri(&gone[0]).to_string());
+
+    let metadata = fs::metadata(&provider).expect("provider metadata");
+    write_file(&provider, new_provider);
+    restore_mtime(&provider, &metadata);
+    write_file(
+        &added,
+        "unit Added;\ninterface\ntype TAdded = class end;\nimplementation\nend.\n",
+    );
+    for path in &gone {
+        fs::remove_file(path).expect("checkout removes the unit");
+    }
+    let mut changes: Vec<Value> = gone
+        .iter()
+        .map(|path| json!({"uri":uri(path),"type":3}))
+        .collect();
+    changes.push(json!({"uri":uri(&added),"type":1}));
+    changes.push(json!({"uri":uri(&provider),"type":2}));
+    assert!(
+        changes.len() > 256,
+        "more Deletes than the tombstone capacity"
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":changes}),
+    );
+
+    assert!(
+        definition_locations(
+            &mut server,
+            "checkout-old",
+            &consumer,
+            consumer_source,
+            "TOldThing"
+        )
+        .is_empty()
+    );
+    let new = definition_locations(
+        &mut server,
+        "checkout-new",
+        &consumer,
+        consumer_source,
+        "TNewThing",
+    );
+    assert_eq!(
+        new.len(),
+        1,
+        "rewritten provider with the same size and mtime"
+    );
+    assert_eq!(new[0]["uri"], uri(&provider).to_string());
+    let added_locations = definition_locations(
+        &mut server,
+        "checkout-added",
+        &consumer,
+        consumer_source,
+        "TAdded",
+    );
+    assert_eq!(added_locations.len(), 1);
+    assert_eq!(added_locations[0]["uri"], uri(&added).to_string());
+    assert!(
+        definition_locations(
+            &mut server,
+            "checkout-gone-after",
+            &consumer,
+            consumer_source,
+            "TGone"
+        )
+        .is_empty(),
+        "deleted units must not be resolved"
+    );
+
+    // Ordinary events keep being reconciled afterwards.
+    write_file(
+        &gone[0],
+        "unit Gone0;\ninterface\ntype TGone = class end;\nimplementation\nend.\n",
+    );
+    server.send_notification(
+        "workspace/didChangeWatchedFiles",
+        json!({"changes":[{"uri":uri(&gone[0]),"type":1}]}),
+    );
+    let restored = definition_locations(
+        &mut server,
+        "checkout-gone-restored",
+        &consumer,
+        consumer_source,
+        "TGone",
+    );
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0]["uri"], uri(&gone[0]).to_string());
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn more_than_256_deletes_across_in_envelope_batches_do_not_fence() {
+    // Tombstones persist across batches; filling their capacity must leave
+    // the remaining deletions to disk instead of fencing analysis.
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let provider = root.path().join("Provider.pas");
+    let consumer = root.path().join("Consumer.pas");
+    let provider_source =
+        "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+    let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+    write_file(&provider, provider_source);
+    write_file(&consumer, consumer_source);
+    let gone: Vec<_> = (0..300)
+        .map(|index| root.path().join(format!("Gone{index}.pas")))
+        .collect();
+    for (index, path) in gone.iter().enumerate() {
+        write_file(
+            path,
+            &format!("unit Gone{index}; interface implementation end.\n"),
+        );
+    }
+    let mut server = TestServer::launch();
+    server.initialize(root.path(), Value::Null);
+    for (batch, chunk) in gone.chunks(60).enumerate() {
+        for path in chunk {
+            fs::remove_file(path).expect("client delete before notification");
+        }
+        server.send_notification(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes":chunk.iter().map(|path| json!({"uri":uri(path),"type":3})).collect::<Vec<_>>()}),
+        );
+        let locations = definition_locations(
+            &mut server,
+            &format!("many-deletes-{batch}"),
+            &consumer,
+            consumer_source,
+            "TThing",
+        );
+        assert_eq!(locations.len(), 1, "batch {batch}");
+        assert_eq!(locations[0]["uri"], uri(&provider).to_string());
+    }
+    server.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn notifications_without_an_event_array_discard_without_fencing() {
+    for method in [
+        "workspace/didChangeWatchedFiles",
+        "workspace/didCreateFiles",
+        "workspace/didDeleteFiles",
+        "workspace/didRenameFiles",
+    ] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let moved = root.path().join("Moved.pas");
+        let helper = root.path().join("Helper.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+        let helper_source =
+            "unit Helper;\ninterface\ntype THelper = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider, Helper;\ntype TAlias = Provider.TThing;\ntype HelperAlias = Helper.THelper;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&helper, helper_source);
+        write_file(&consumer, consumer_source);
+        let mut server = TestServer::launch();
+        server.initialize_with_pull_diagnostics(root.path());
+        for (path, source) in [(&provider, provider_source), (&helper, helper_source)] {
+            server.send_notification(
+                "textDocument/didOpen",
+                json!({"textDocument":{"uri":uri(path),"languageId":"pascal","version":1,"text":source}}),
+            );
+        }
+        assert_eq!(
+            definition_locations(
+                &mut server,
+                &format!("{method}-before"),
+                &consumer,
+                consumer_source,
+                "TThing"
+            )
+            .len(),
+            1
+        );
+
+        // The rename case moves the open provider: an unknown rename endpoint
+        // rejects only open documents whose file is gone (Q2).
+        if method == "workspace/didRenameFiles" {
+            fs::rename(&provider, &moved).expect("client-owned move");
+        }
+        server.send_notification(method, json!({}));
+        let refresh = server
+            .request_with_timeout("workspace/diagnostic/refresh", IO_TIMEOUT)
+            .expect("unattributable notification must request a global refresh");
+        server.send(Message::Response(Response::new_ok(refresh.id, Value::Null)));
+
+        let provider_locations = definition_locations(
+            &mut server,
+            &format!("{method}-provider-after"),
+            &consumer,
+            consumer_source,
+            "TThing",
+        );
+        if method == "workspace/didRenameFiles" {
+            assert!(
+                provider_locations.is_empty(),
+                "the open overlay whose file is gone must be rejected"
+            );
+        } else {
+            assert_eq!(
+                provider_locations.len(),
+                1,
+                "{method}: open provider overlay"
+            );
+            assert_eq!(provider_locations[0]["uri"], uri(&provider).to_string());
+        }
+        let helper_locations = definition_locations(
+            &mut server,
+            &format!("{method}-helper-after"),
+            &consumer,
+            consumer_source,
+            "THelper",
+        );
+        assert_eq!(
+            helper_locations.len(),
+            1,
+            "{method}: overlay still on disk is kept"
+        );
+        assert_eq!(helper_locations[0]["uri"], uri(&helper).to_string());
+        server.shutdown();
+    }
+}
+
+#[test]
+fn empty_file_operation_batches_are_no_ops() {
+    for method in [
+        "workspace/didCreateFiles",
+        "workspace/didDeleteFiles",
+        "workspace/didRenameFiles",
+    ] {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = root.path().join("Provider.pas");
+        let consumer = root.path().join("Consumer.pas");
+        let provider_source =
+            "unit Provider;\ninterface\ntype TThing = class end;\nimplementation\nend.\n";
+        let consumer_source = "unit Consumer;\ninterface\nuses Provider;\ntype TAlias = Provider.TThing;\nimplementation\nend.\n";
+        write_file(&provider, provider_source);
+        write_file(&consumer, consumer_source);
+        let mut server = TestServer::launch();
+        server.initialize_with_pull_diagnostics(root.path());
+        settle_diagnostic_refreshes(&mut server, &format!("{method}-empty"));
+        server.send_notification(method, json!({"files":[]}));
+        let locations = definition_locations(
+            &mut server,
+            &format!("{method}-empty-after"),
+            &consumer,
+            consumer_source,
+            "TThing",
+        );
+        assert_eq!(locations.len(), 1, "{method}");
+        assert!(
+            server
+                .request_with_timeout("workspace/diagnostic/refresh", Duration::from_millis(300))
+                .is_none(),
+            "an empty {method} changes nothing and must not invalidate the workspace"
+        );
+        server.shutdown();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn discard_re_reads_captured_override_files() {
+    for unnamed in [true, false] {
+        let environment = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let sdk_a = tempfile::tempdir().unwrap();
+        let sdk_b = tempfile::tempdir().unwrap();
+        let main = root.path().join("Main.pas");
+        let provider_a = sdk_a.path().join("Provider.pas");
+        let provider_b = sdk_b.path().join("Provider.pas");
+        let overrides = root.path().join(".delphi-tools.local.toml");
+        let main_source = "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  ProviderRoutine;\nend;\nend.\n";
+        let provider_source = "unit Provider;\ninterface\nprocedure ProviderRoutine;\nimplementation\nprocedure ProviderRoutine; begin end;\nend.\n";
+        write_file(&main, main_source);
+        write_file(&provider_a, provider_source);
+        write_file(&provider_b, provider_source);
+        write_file(
+            &root.path().join("App.dproj"),
+            "<Project><PropertyGroup><MainSource>Main.pas</MainSource><DCC_UnitSearchPath>C:\\SDK</DCC_UnitSearchPath></PropertyGroup></Project>",
+        );
+        let mapping = |sdk: &Path| {
+            format!(
+                "[[path_mappings]]\nfrom = 'C:\\SDK'\nto = '{}'\n",
+                sdk.display()
+            )
+        };
+        write_file(&overrides, &mapping(sdk_a.path()));
+        let mut server = TestServer::launch_with_environment_path(environment.path());
+        server.initialize(root.path(), Value::Null);
+        let before = definition_locations(
+            &mut server,
+            &format!("override-before-{unnamed}"),
+            &main,
+            main_source,
+            "ProviderRoutine",
+        );
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["uri"], uri(&provider_a).to_string());
+
+        write_file(&overrides, &mapping(sdk_b.path()));
+        if unnamed {
+            // The notification cannot say which files changed.
+            server.send_notification("workspace/didChangeWatchedFiles", json!({}));
+        } else {
+            let mut changes: Vec<Value> = (0..64)
+                .map(|index| json!({"uri":uri(&root.path().join(format!("Noise{index}.pas"))),"type":2}))
+                .collect();
+            changes.push(json!({"uri":uri(&overrides),"type":2}));
+            server.send_notification(
+                "workspace/didChangeWatchedFiles",
+                json!({"changes":changes}),
+            );
+        }
+        let after = definition_locations(
+            &mut server,
+            &format!("override-after-{unnamed}"),
+            &main,
+            main_source,
+            "ProviderRoutine",
+        );
+        assert_eq!(after.len(), 1, "unnamed={unnamed}");
+        assert_eq!(
+            after[0]["uri"],
+            uri(&provider_b).to_string(),
+            "the discard must re-read the changed override file (unnamed={unnamed})"
+        );
+        server.shutdown();
+    }
 }

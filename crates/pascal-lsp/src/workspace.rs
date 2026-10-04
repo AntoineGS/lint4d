@@ -2363,8 +2363,8 @@ pub(crate) enum RecoveryOutcome {
     /// Bounded recovery was refused or interrupted, so derived state was
     /// discarded wholesale and will be rebuilt lazily.
     DiscardedReconstructible,
-    /// Client-reported state (such as a deletion tombstone) could not be
-    /// retained, so the workspace is permanently fenced.
+    /// A rejected editor document could not be retained in the admission
+    /// fence ledger, so the workspace is permanently fenced.
     LostAuthoritativeEditorState,
 }
 
@@ -4553,9 +4553,10 @@ impl Workspace {
     }
 
     /// Drops every derived cache when bounded recovery is refused or
-    /// interrupted. Each container is swapped for an empty one and freed off
-    /// this thread, so the work here is proportional to open documents and
-    /// owners, not to the size of the discarded state. Open editor text
+    /// interrupted, and marks captured override files for re-read. Each
+    /// container is swapped for an empty one and freed off this thread, so the
+    /// work here is proportional to open documents and owners, not to the size
+    /// of the discarded state. Open editor text
     /// survives except at rename endpoints, which are rejected exactly as
     /// bounded recovery rejects them.
     fn discard_reconstructible_state(&mut self, budget: &ReconciliationBudget) {
@@ -4569,6 +4570,11 @@ impl Workspace {
         self.bump_source_generation();
         self.bump_configuration_generation();
         self.mark_global_change();
+        // The captured override files are derived from disk too; a discard
+        // may follow events that changed them without naming them.
+        if let Err(error) = self.overrides.mark_all_dirty() {
+            eprintln!("pascal-lsp: could not mark captured overrides for re-read: {error}");
+        }
         let discarded = DiscardedRecoveryState {
             index: std::mem::replace(&mut self.index, NavigationIndex::new()),
             contexts: std::mem::take(&mut self.contexts),
@@ -4609,10 +4615,10 @@ impl Workspace {
         self.file_cap_warning_sent = false;
         self.total_cap_warning_sent = false;
 
-        // Without the fence, a tombstone must carry the observed disk stamp:
-        // an unstamped one is cleared as soon as the not-yet-removed file is
-        // seen. This costs at most MAX_DELETED_OVERRIDES metadata calls;
-        // beyond that, `remember_deleted` fences instead of stamping.
+        // A tombstone carries the observed disk stamp: an unstamped one is
+        // cleared as soon as the file is seen. This costs at most
+        // MAX_DELETED_OVERRIDES metadata calls; beyond that, `remember_deleted`
+        // leaves the deletion to disk.
         let deleted_uris = budget.deleted_uris.borrow().clone();
         for uri in &deleted_uris {
             self.remember_deleted(uri);
@@ -5159,35 +5165,27 @@ impl Workspace {
         Ok(())
     }
 
-    fn fail_closed_notification_recovery(&mut self, budget: &ReconciliationBudget) {
-        self.rejected_open_fence_permanent = true;
-        self.bump_source_generation();
-        self.bump_configuration_generation();
-        self.mark_global_change();
-        // Preserve ordered deletion evidence without making non-interruptible
-        // metadata calls while the worker is already cancelled or out of its
-        // admitted recovery envelope. A later stamp mismatch clears it.
-        for uri in budget.deleted_uris.borrow().iter() {
-            if self.deleted_overrides.len() >= MAX_DELETED_OVERRIDES
-                && !self.deleted_overrides.contains_key(uri)
-            {
-                // We cannot discard an earlier authoritative negative
-                // observation. The permanent global fence prevents serving
-                // state that could depend on the unretained deletion.
-                continue;
-            }
-            if let Ok(path) = uri.to_file_path() {
-                self.project_cache.invalidate_path(&absolute_path(path));
-            }
-            self.deleted_overrides.insert(uri.clone(), None);
-        }
-    }
-
-    pub(crate) fn permanently_fence_notification_analysis(
+    /// Recovery for a file notification that is malformed or too large to
+    /// reconcile entry by entry. The notification follows the disk change, so
+    /// disk is the truth for every file it did or did not name: drop every
+    /// cached project entry and all derived state. With
+    /// `unknown_rename_endpoints`, open documents whose file no longer exists
+    /// are rejected, since one of them may be the unnamed old endpoint.
+    pub(crate) fn discard_for_unreconciled_file_notification(
         &mut self,
         budget: &ReconciliationBudget,
+        unknown_rename_endpoints: bool,
     ) {
-        self.fail_closed_notification_recovery(budget);
+        self.project_cache.invalidate_after_overflow();
+        if unknown_rename_endpoints {
+            for (uri, document) in &self.open_documents {
+                let on_disk = uri.to_file_path().is_ok_and(|path| path.exists());
+                if document.text.is_some() && !on_disk {
+                    budget.record_rename_endpoint(uri.clone());
+                }
+            }
+        }
+        self.discard_reconstructible_state(budget);
     }
 
     pub(crate) fn unit_rename_position(
@@ -12924,7 +12922,12 @@ impl Workspace {
         if self.deleted_overrides.len() >= MAX_DELETED_OVERRIDES
             && !self.deleted_overrides.contains_key(uri)
         {
-            self.rejected_open_fence_permanent = true;
+            // File notifications follow the disk change, so the file is
+            // already gone: disk alone keeps it out once its cache entries
+            // are dropped.
+            if let Ok(path) = uri.to_file_path() {
+                self.project_cache.invalidate_path(&absolute_path(path));
+            }
             return;
         }
         let stamp = uri
@@ -16495,7 +16498,9 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_capacity_overflow_keeps_global_analysis_fenced() {
+    fn tombstone_capacity_overflow_leaves_the_deletion_to_disk_without_fencing() {
+        // TASK-97: notifications follow the disk change, so a deletion past
+        // the tombstone capacity is already visible on disk.
         let temp = tempfile::tempdir().expect("workspace root");
         let mut workspace =
             test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
@@ -16510,15 +16515,13 @@ mod tests {
             .expect("recovery-batch deleted URI");
         let cancellation = std::sync::Arc::new(AtomicBool::new(true));
         let budget = ReconciliationBudget::new(cancellation);
-        budget.record_file_event(overflow_uri, super::FileChange::Deleted);
+        budget.record_file_event(overflow_uri.clone(), super::FileChange::Deleted);
         let outcome = workspace.invalidate_for_reconciliation_budget(&budget);
 
-        assert_eq!(
-            outcome,
-            super::RecoveryOutcome::LostAuthoritativeEditorState
-        );
-        assert!(workspace.analysis_admission_fenced());
+        assert_eq!(outcome, super::RecoveryOutcome::DiscardedReconstructible);
+        assert!(!workspace.analysis_admission_fenced());
         assert!(workspace.deleted_overrides.contains_key(&first_uri));
+        assert!(!workspace.deleted_overrides.contains_key(&overflow_uri));
         assert_eq!(
             workspace.deleted_overrides.len(),
             super::MAX_DELETED_OVERRIDES
@@ -16526,8 +16529,8 @@ mod tests {
 
         workspace
             .file_event_with_cancel(&first_uri, super::FileChange::Changed, None)
-            .expect("later event is handled without clearing the global fence");
-        assert!(workspace.analysis_admission_fenced());
+            .expect("later event is handled");
+        assert!(!workspace.analysis_admission_fenced());
         assert!(!workspace.deleted_overrides.contains_key(&first_uri));
     }
 

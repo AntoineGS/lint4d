@@ -533,12 +533,7 @@ struct KnownFailure {
     error: &'static str,
 }
 
-const KNOWN_FAILING_FIXTURES: &[KnownFailure] = &[KnownFailure {
-    // `SysUtils;` ending each branch becomes `SysUtils,` plus `{$ENDIF};`.
-    path: "crates/fmt4d/tests/fixtures/ppFragment/bucket_c_uses_semi.pas",
-    task: "TASK-102",
-    error: r#"per configuration ["U,U;", "U,U;"] -> ["U,U,;", "U,U,;"]"#,
-}];
+const KNOWN_FAILING_FIXTURES: &[KnownFailure] = &[];
 
 fn fixture_files() -> Vec<PathBuf> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -605,6 +600,49 @@ fn every_fixture_round_trips() {
         }
     }
     assert!(unexpected.is_empty(), "{}", unexpected.join("\n\n"));
+}
+
+fn format_unsorted(source: &str) -> String {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.sort = false;
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
+}
+
+/// With sorting off the uses fixtures must keep every unit in place, so
+/// the oracle compares their clauses exactly.
+#[test]
+fn every_uses_fixture_round_trips_with_sorting_off() {
+    let files: Vec<PathBuf> = fixture_files()
+        .into_iter()
+        .filter(|p| {
+            p.to_string_lossy()
+                .replace('\\', "/")
+                .contains("fixtures/uses/")
+        })
+        .collect();
+    assert!(!files.is_empty(), "uses fixtures not found");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut failures = Vec::new();
+    for path in &files {
+        let source = std::fs::read_to_string(workspace.join(path)).expect("fixture is readable");
+        let formatted = format_unsorted(&source);
+        let result = check_same_program(&source, &formatted, false).and_then(|()| {
+            (format_unsorted(&formatted) == formatted)
+                .then_some(())
+                .ok_or_else(|| "formatter is not idempotent".to_string())
+        });
+        if let Err(e) = result {
+            failures.push(format!("{}: {e}\n{formatted}", path.display()));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 // ── Round-trip tests ────────────────────────────────────────────

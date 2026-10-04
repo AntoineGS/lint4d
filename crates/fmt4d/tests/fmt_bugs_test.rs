@@ -4114,3 +4114,147 @@ fn file_with_only_trivia_gets_no_leading_space() {
     assert_eq!(result, src);
     idempotency_check(src);
 }
+
+// ── Bug: uses clause punctuation broken around conditional blocks ──
+// Units inside an {$IFDEF} block always got a `,` and the clause's `;`
+// went to the last slot, whatever it was, so some configurations read
+// `uses A, B, ;` or lost the `;` altogether.
+
+fn assert_parses_cleanly(src: &str) {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let (_, diagnostics) =
+        pascal_core::parser::parse_file(&info, src.as_bytes()).expect("parse failed");
+    assert!(
+        diagnostics.is_empty(),
+        "formatted source has parse errors: {diagnostics:?}\n{src}"
+    );
+}
+
+#[test]
+fn uses_clause_terminated_in_each_branch_keeps_its_semicolons() {
+    let src = "\
+unit T;
+interface
+uses
+{$IFDEF VER270}
+  WinAPI.Windows, SysUtils;
+{$ELSE}
+  Windows, SysUtils;
+{$ENDIF}
+implementation
+end.
+";
+    let result = format_source(src);
+    assert!(
+        result.contains(
+            "uses\n  {$IFDEF VER270}\n  WinAPI.Windows,\n  SysUtils;\n  {$ELSE}\n  Windows,\n  SysUtils;\n  {$ENDIF}\n"
+        ),
+        "each branch must end with the clause's `;`:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_clause_ending_in_a_directive_keeps_its_semicolon() {
+    let src = "unit T;\ninterface\nuses A {$I x.inc};\nimplementation\nend.\n";
+    let result = format_source(src);
+    // The `;` follows the directive, as in the source, so the directive
+    // stays inside the clause and keeps its place after `A` (an include
+    // may itself list units).
+    assert!(
+        result.contains("uses\n  A\n  {$I x.inc};\n"),
+        "the clause lost its `;`:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_sorting_never_leaves_a_conditional_block_last() {
+    let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
+    let result = format_source(src);
+    // A plain unit ends the clause, so it reads `A, C, B;` with X defined
+    // and `A, B;` without.
+    assert!(
+        result.contains("uses\n  A,\n  {$IFDEF X}\n  C,\n  {$ENDIF}\n  B;\n"),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_clause_of_only_a_conditional_block_ends_after_endif() {
+    let src =
+        "unit T;\ninterface\nuses {$IFDEF X} A {$ELSE} B, C {$ENDIF};\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains("uses\n  {$IFDEF X}\n  A\n  {$ELSE}\n  B,\n  C\n  {$ENDIF};\n"),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+#[test]
+fn uses_branch_ending_in_a_block_writes_it_comma_first() {
+    // Inside a branch, units keep their order; a block after the branch's
+    // last unit is written comma-first, so `A` alone still ends the branch.
+    let src = "unit T;\ninterface\nuses {$IFDEF X} A {$IFDEF Y}, C {$ENDIF}; {$ELSE} D; {$ENDIF}\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains(
+            "uses\n  {$IFDEF X}\n  A\n  {$IFDEF Y}\n  , C\n  {$ENDIF};\n  {$ELSE}\n  D;\n  {$ENDIF}\n"
+        ),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+
+    let src = "unit T;\ninterface\nuses {$IFDEF X} A {$IFDEF Y}, C {$ENDIF} {$ELSE} D {$ENDIF};\nimplementation\nend.\n";
+    let result = format_source(src);
+    assert!(
+        result.contains(
+            "uses\n  {$IFDEF X}\n  A\n  {$IFDEF Y}\n  , C\n  {$ENDIF}\n  {$ELSE}\n  D\n  {$ENDIF};\n"
+        ),
+        "a configuration of the clause has a dangling comma:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    idempotency_check(src);
+}
+
+fn format_unsorted(source: &str) -> String {
+    let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+    let mut config = fmt4d::config::FmtConfig::default();
+    config.uses.sort = false;
+    fmt4d::formatter::format_source(
+        source.as_bytes(),
+        &info,
+        &config,
+        &std::collections::HashSet::new(),
+    )
+    .expect("formatting failed")
+}
+
+#[test]
+fn uses_trailing_block_keeps_its_place_with_sorting_off() {
+    // Uses order is initialization order and decides which same-named
+    // identifier wins, so with sorting off no unit may move.
+    let src = "unit T;\ninterface\nuses C, A {$IFDEF X}, B{$ENDIF};\nimplementation\nend.\n";
+    let result = format_unsorted(src);
+    assert!(
+        result.contains("uses\n  C,\n  A\n  {$IFDEF X}\n  , B\n  {$ENDIF};\n"),
+        "units were reordered with sorting off:\n{result}"
+    );
+    assert_parses_cleanly(&result);
+    assert_eq!(format_unsorted(&result), result, "not idempotent");
+
+    let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
+    let result = format_unsorted(src);
+    assert!(
+        result.contains("uses\n  B,\n  {$IFDEF X}\n  C,\n  {$ENDIF}\n  A;\n"),
+        "units were reordered with sorting off:\n{result}"
+    );
+    assert_eq!(format_unsorted(&result), result, "not idempotent");
+}

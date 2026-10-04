@@ -22,6 +22,19 @@ use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 thread_local! {
     static TEST_SOURCE_LOADS: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+    static TEST_DISK_READS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Source payload reads from disk on this thread, in order.
+#[cfg(test)]
+pub(crate) fn take_test_disk_reads() -> Vec<PathBuf> {
+    TEST_DISK_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(crate) fn record_test_disk_read(path: &Path) {
+    let path = absolute_path(path.to_path_buf());
+    TEST_DISK_READS.with(|reads| reads.borrow_mut().push(path));
 }
 
 #[cfg(test)]
@@ -332,8 +345,8 @@ impl SourceStore for LspSourceStore {
             return Ok(LoadedSource {
                 id: source_id_for_path(&path),
                 path,
-                bytes: Arc::<[u8]>::from(overlay.text.as_bytes().to_vec()),
-                decoded_text: Some(Arc::<str>::from(overlay.text.clone())),
+                bytes: Arc::<[u8]>::from(overlay.text.clone()),
+                decoded_text: Some(overlay.text.clone()),
                 revision: SourceRevision::Overlay {
                     version: overlay.version,
                     content_hash: content_hash_bytes(overlay.text.as_bytes()),
@@ -349,6 +362,8 @@ impl SourceStore for LspSourceStore {
             return Err(SourceStoreError::NotFound { path });
         }
 
+        #[cfg(test)]
+        record_test_disk_read(&path);
         let Some(context_entry) = self.context.path_entry_for(&path) else {
             if request.legacy_route.is_none() {
                 return Err(SourceStoreError::Unauthorized {

@@ -217,7 +217,8 @@ impl Drop for TestIncludeCancellationGuard {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayInput {
-    pub(crate) text: String,
+    /// Shared with the open document; copies are reference counts.
+    pub(crate) text: Arc<str>,
     pub(crate) version: i32,
 }
 
@@ -543,6 +544,9 @@ pub(crate) struct RenameSnapshot {
     pub(crate) declaration_providers: HashSet<Url>,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
+    /// Keep the cache charging the cached parses in `index` until the
+    /// snapshot is dropped.
+    _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
 }
 
 fn cached_position_index<'a>(
@@ -1764,7 +1768,7 @@ fn revalidate_records(
                 ));
             };
             let text_changed = record.content_hash.map_or_else(
-                || overlay.text != record.text,
+                || *overlay.text != *record.text,
                 |expected| {
                     if record.text.is_empty() {
                         super::content_hash_bytes(overlay.text.as_bytes()) != expected
@@ -1817,7 +1821,7 @@ fn revalidate_records(
         ) || parsed_source_changed(record, &current.text);
         let overlay_changed = overlays
             .get(&record.uri)
-            .is_some_and(|overlay| overlay.text != current.text);
+            .is_some_and(|overlay| *overlay.text != *current.text);
         if (validate_transport_observations && disk_stamp(&path) != record.stamp)
             || content_changed
             || overlay_changed
@@ -2042,7 +2046,7 @@ fn effective_overlay_text_changed(
         return Ok(text_content_hash(&overlay.text) != expected);
     }
     if !record.text.is_empty() {
-        return Ok(overlay.text != record.text);
+        return Ok(*overlay.text != *record.text);
     }
 
     // `content_hash` is deliberately a raw-byte freshness witness.  A
@@ -2074,7 +2078,7 @@ fn effective_overlay_text_changed(
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
-    Ok(overlay.text != current.text)
+    Ok(*overlay.text != *current.text)
 }
 
 fn path_kind_matches(actual: &Option<PathStamp>, expected: &Option<PathStamp>) -> bool {
@@ -2307,10 +2311,10 @@ pub(crate) fn source_for_input_with_cancel(
     }
     if let Some(overlay) = input.overlays.get(&uri) {
         return Ok((
-            overlay.text.clone(),
+            overlay.text.to_string(),
             SourceRecord {
                 uri,
-                text: overlay.text.clone(),
+                text: overlay.text.to_string(),
                 version: Some(overlay.version),
                 stamp: None,
                 open: true,
@@ -2355,10 +2359,10 @@ pub(crate) fn source_for_input_with_owner(
     }
     if let Some(overlay) = input.overlays.get(&uri) {
         return Ok((
-            overlay.text.clone(),
+            overlay.text.to_string(),
             SourceRecord {
                 uri,
-                text: overlay.text.clone(),
+                text: overlay.text.to_string(),
                 version: Some(overlay.version),
                 stamp: None,
                 open: true,
@@ -6082,6 +6086,7 @@ fn build_snapshot_with_policy(
                     declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
                     mode,
+                    _cache_leases: HashMap::new(),
                 });
             }
             contexts
@@ -6275,10 +6280,10 @@ fn build_snapshot_with_policy(
             (seed.record.text.clone(), seed.record.clone(), source_bytes)
         } else if let Some(overlay) = input.overlays.get(&uri) {
             (
-                overlay.text.clone(),
+                overlay.text.to_string(),
                 SourceRecord {
                     uri: uri.clone(),
-                    text: overlay.text.clone(),
+                    text: overlay.text.to_string(),
                     version: Some(overlay.version),
                     stamp: None,
                     open: true,
@@ -6701,6 +6706,7 @@ fn build_snapshot_with_policy(
     }
     index.set_auto_import_unit_providers(auto_import_unit_providers.clone());
     loader.index = index;
+    loader.cache_leases.clear();
     loader.indexed_files = indexed_uris.clone();
     loader.indexed_sizes = indexed_sizes;
     loader.indexed_bytes = loader.indexed_sizes.values().sum();
@@ -6859,6 +6865,7 @@ fn build_snapshot_with_policy(
     let included_uris = loader.include_parents.keys().cloned().collect::<Vec<_>>();
     for included_uri in included_uris {
         loader.index.remove(&included_uri);
+        loader.cache_leases.remove(&included_uri);
     }
     let indexed_uris = loader.indexed_files.clone();
     for uri in indexed_uris {
@@ -6871,10 +6878,10 @@ fn build_snapshot_with_policy(
             .map_err(|_| format!("loaded dependency is not a file URI: {uri}"))?;
         let (source, mut record) = if let Some(overlay) = input.overlays.get(&uri) {
             (
-                overlay.text.clone(),
+                overlay.text.to_string(),
                 SourceRecord {
                     uri: uri.clone(),
-                    text: overlay.text.clone(),
+                    text: overlay.text.to_string(),
                     version: Some(overlay.version),
                     stamp: None,
                     open: true,
@@ -7079,6 +7086,7 @@ fn build_snapshot_with_policy(
         declaration_providers,
         baseline_records,
         mode,
+        _cache_leases: loader.cache_leases,
     })
 }
 
@@ -7179,7 +7187,7 @@ fn retain_expansion_dependencies(
                 });
                 continue;
             };
-            if open_source != &source {
+            if **open_source != *source {
                 *complete = false;
                 incomplete_reason.get_or_insert_with(|| {
                     format!("include source {uri} changed during expansion")
@@ -9912,7 +9920,7 @@ impl IncludeResolver for WorkspaceIncludeResolver<'_> {
             if let Some(text) = &document.text {
                 return Ok(ResolvedInclude {
                     uri: include_uri,
-                    text: text.clone(),
+                    text: text.to_string(),
                     path_entry: Some(path_entry),
                     observations,
                 });
@@ -11468,7 +11476,7 @@ mod tests {
         input.overlays.insert(
             overlay_uri.clone(),
             super::OverlayInput {
-                text: "unit Consumer; interface end.".to_string(),
+                text: "unit Consumer; interface end.".into(),
                 version: 1,
             },
         );

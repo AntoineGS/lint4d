@@ -1,9 +1,9 @@
 //! Project-scoped cache shared by analysis workers and the warmer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, WaitTimeoutResult};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, WaitTimeoutResult};
 use std::time::Duration;
 
 use lsp_types::Url;
@@ -65,6 +65,71 @@ pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usi
                     .map_or(0, |text| text.len()),
             )
     })
+}
+
+fn path_bytes(path: &Path) -> usize {
+    path.as_os_str().len()
+}
+
+fn strings_bytes(strings: &[String]) -> usize {
+    strings
+        .iter()
+        .fold(std::mem::size_of_val(strings), |total, text| {
+            total.saturating_add(text.len())
+        })
+}
+
+fn probes_bytes(probes: &[Probe]) -> usize {
+    probes
+        .iter()
+        .fold(std::mem::size_of_val(probes), |total, probe| {
+            total.saturating_add(match probe {
+                Probe::Stamp { path, .. } | Probe::Content { path, .. } => path_bytes(path),
+                Probe::Overlay { uri, .. } => uri.as_str().len(),
+            })
+        })
+}
+
+fn report_bytes(report: &pascal_core::ResolutionReport) -> usize {
+    use pascal_core::ResolutionObservation as O;
+    let observations = report.observations.iter().fold(
+        std::mem::size_of_val(report.observations.as_slice()),
+        |total, observation| {
+            let path = match observation {
+                O::Directory { path, .. }
+                | O::Candidate { path, .. }
+                | O::Payload { path, .. }
+                | O::Metadata(
+                    pascal_project::MetadataObservation::Stat { path }
+                    | pascal_project::MetadataObservation::Payload { path, .. },
+                ) => path,
+                O::ProjectRead(read) => &read.path,
+            };
+            total.saturating_add(path_bytes(path))
+        },
+    );
+    observations
+        .saturating_add(strings_bytes(&report.warnings))
+        .saturating_add(std::mem::size_of_val(report.incomplete_reasons.as_slice()))
+}
+
+fn expansion_bytes(expansion: &ExpansionResult) -> usize {
+    let mut total = std::mem::size_of::<ExpansionResult>();
+    let _ = expansion.expanded.visit_recovery_payload(&mut |bytes| {
+        total = total.saturating_add(bytes);
+        Ok(())
+    });
+    for include in &expansion.dependencies {
+        total = include.observations.iter().fold(
+            total
+                .saturating_add(std::mem::size_of_val(include))
+                .saturating_add(include.text.len())
+                .saturating_add(include.uri.as_str().len())
+                .saturating_add(std::mem::size_of_val(include.observations.as_slice())),
+            |total, observation| total.saturating_add(path_bytes(&observation.path)),
+        );
+    }
+    total.saturating_add(strings_bytes(&expansion.errors))
 }
 
 /// Converts resolver observations and dependency revisions into probes, and
@@ -210,8 +275,13 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
             }
             match current_stamp(path) {
                 Ok(Some(now)) if Some(&now) == stamp.as_ref() => true,
-                Ok(Some(_)) => std::fs::read(path)
-                    .is_ok_and(|bytes| pascal_project::content_hash_bytes(&bytes) == *content_hash),
+                Ok(Some(_)) => {
+                    #[cfg(test)]
+                    crate::workspace::resolver::record_test_disk_read(path);
+                    std::fs::read(path).is_ok_and(|bytes| {
+                        pascal_project::content_hash_bytes(&bytes) == *content_hash
+                    })
+                }
                 _ => false,
             }
         }
@@ -416,17 +486,17 @@ mod cache_tests {
 
     fn import_value(probes: Vec<Probe>) -> ImportValue {
         ImportValue {
-            resolved: pascal_core::ResolvedImports {
+            resolved: Arc::new(pascal_core::ResolvedImports {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
-            },
-            report: pascal_core::ResolutionReport {
+            }),
+            report: Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],
                 warnings: vec![],
                 complete: true,
                 incomplete_reasons: vec![],
-            },
+            }),
             probes,
             watch_dirs: vec![],
         }
@@ -529,6 +599,7 @@ mod cache_tests {
                     parsed: parsed_unit(name),
                     expansion: None,
                     probes,
+                    disk: None,
                 },
                 1,
                 &no_cancel(),
@@ -1131,6 +1202,481 @@ mod cache_tests {
         assert!(cache.stats().bytes <= 25);
     }
 
+    fn ready(cache: &ProjectCache, name: &str) -> bool {
+        !cache.ready_layers(&uri(name)).is_empty()
+    }
+
+    fn pin_names(cache: &ProjectCache, owner: &str, names: &[&str], ctx: &ProjectContext) {
+        cache.pin(
+            &uri(owner),
+            names
+                .iter()
+                .map(|name| (uri(name), project_context_fingerprint(ctx)))
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn eviction_follows_last_use_across_hits_and_peeks() {
+        let cache = ProjectCache::new(30);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        fill_unit(&cache, "C.pas", &ctx, 1, vec![]);
+        fill(&cache, "D.pas", &ctx, 1, 9);
+        assert!(matches!(
+            cache.imports(&uri("A.pas"), &ctx, 1, &HashMap::new(), &no_cancel()),
+            Lookup::Hit(_)
+        ));
+        assert!(
+            cache
+                .peek_unit(&uri("C.pas"), &ctx, 1, &HashMap::new())
+                .is_some()
+        );
+
+        fill(&cache, "E.pas", &ctx, 1, 11);
+        assert!(!ready(&cache, "B.pas"), "B is the least recently used");
+        assert!(!ready(&cache, "D.pas"), "D is next once B is gone");
+        for name in ["A.pas", "C.pas", "E.pas"] {
+            assert!(ready(&cache, name), "{name} was used more recently");
+        }
+        assert_eq!(cache.stats().bytes, 22);
+    }
+
+    #[test]
+    fn a_pin_protects_every_layer_of_its_unit_until_the_last_owner_unpins() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open1.pas", &["A.pas"], &ctx);
+        pin_names(&cache, "Open2.pas", &["A.pas"], &ctx);
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill_unit(&cache, "A.pas", &ctx, 1, vec![]);
+        fill(&cache, "B.pas", &ctx, 1, 9);
+
+        cache.unpin(&uri("Open1.pas"));
+        fill(&cache, "C.pas", &ctx, 1, 9);
+        assert!(!ready(&cache, "B.pas"));
+        assert_eq!(cache.ready_layers(&uri("A.pas")), vec!["Import", "Unit"]);
+
+        cache.unpin(&uri("Open2.pas"));
+        assert!(
+            ready(&cache, "A.pas"),
+            "unpinning alone stays within budget"
+        );
+        fill(&cache, "D.pas", &ctx, 1, 9);
+        assert_eq!(
+            cache.ready_layers(&uri("A.pas")),
+            vec!["Unit"],
+            "A's import is now the oldest unpinned entry"
+        );
+        assert!(ready(&cache, "C.pas") && ready(&cache, "D.pas"));
+    }
+
+    #[test]
+    fn repinning_an_owner_replaces_its_previous_pins() {
+        let cache = ProjectCache::new(20);
+        let ctx = context("A.dproj");
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        pin_names(&cache, "Open.pas", &["B.pas"], &ctx);
+        fill(&cache, "C.pas", &ctx, 1, 10);
+        assert!(!ready(&cache, "A.pas"));
+        assert!(ready(&cache, "B.pas") && ready(&cache, "C.pas"));
+    }
+
+    #[test]
+    fn pins_only_cover_their_own_project_fingerprint() {
+        let cache = ProjectCache::new(10);
+        let a = context("A.dproj");
+        let b = context("B.dproj");
+        pin_names(&cache, "Open.pas", &["Main.pas"], &b);
+        fill(&cache, "Main.pas", &a, 1, 10);
+        fill(&cache, "Other.pas", &a, 1, 10);
+        assert!(!ready(&cache, "Main.pas"));
+        assert!(ready(&cache, "Other.pas"));
+    }
+
+    #[test]
+    fn pinning_a_ready_entry_counts_it_as_pinned_until_unpinned() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        assert!(cache.has_room());
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        assert!(!cache.has_room());
+        cache.clear_pins();
+        assert!(cache.has_room());
+        pin_names(&cache, "Open.pas", &["A.pas"], &ctx);
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert!(cache.has_room(), "an evicted pinned entry no longer counts");
+    }
+
+    #[test]
+    fn invalidating_one_path_among_ten_thousand_entries_examines_one() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        for index in 0..10_000 {
+            let name = format!("Main{index}.pas");
+            let Lookup::Compute(claim) =
+                cache.imports(&uri(&name), &ctx, 1, &HashMap::new(), &no_cancel())
+            else {
+                panic!("expected a miss for {name}");
+            };
+            let probe = Probe::Content {
+                path: PathBuf::from(format!("/deps/Dep{index}.pas")),
+                stamp: None,
+                content_hash: 0,
+            };
+            cache.store_imports(claim, import_value(vec![probe]), 1, &no_cancel());
+        }
+        cache.reset_examined_entries();
+        assert_eq!(
+            cache.invalidate_path(Path::new("/deps/Dep5000.pas")),
+            vec![uri("Main5000.pas")]
+        );
+        assert_eq!(cache.examined_entries(), 1);
+        assert_eq!(cache.stats().imports, 9_999);
+    }
+
+    #[test]
+    fn evicting_one_entry_among_ten_thousand_examines_one() {
+        let cache = ProjectCache::new(10_000);
+        let ctx = context("A.dproj");
+        for index in 0..10_000 {
+            fill(&cache, &format!("Main{index}.pas"), &ctx, 1, 1);
+        }
+        cache.reset_examined_entries();
+        fill(&cache, "Last.pas", &ctx, 1, 1);
+        assert!(!ready(&cache, "Main0.pas"));
+        assert_eq!(cache.examined_entries(), 1);
+    }
+
+    type WatchCalls = Arc<Mutex<Vec<(&'static str, PathBuf, bool)>>>;
+
+    /// Records each watcher call and whether the cache state was unlocked.
+    struct RecordingWatch {
+        inner: Arc<Inner>,
+        calls: WatchCalls,
+    }
+
+    impl DirectoryWatch for RecordingWatch {
+        fn watch(&mut self, directory: &Path) -> bool {
+            let unlocked = self.inner.state.try_lock().is_ok();
+            let call = ("watch", directory.to_path_buf(), unlocked);
+            self.calls.lock().unwrap().push(call);
+            true
+        }
+
+        fn unwatch(&mut self, directory: &Path) {
+            let unlocked = self.inner.state.try_lock().is_ok();
+            let call = ("unwatch", directory.to_path_buf(), unlocked);
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    fn recording_watcher(cache: &ProjectCache) -> WatchCalls {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        cache.set_watcher(Box::new(RecordingWatch {
+            inner: cache.inner.clone(),
+            calls: calls.clone(),
+        }));
+        calls
+    }
+
+    fn store_watching(cache: &ProjectCache, name: &str, ctx: &ProjectContext, dir: &Path) {
+        let Lookup::Compute(claim) =
+            cache.imports(&uri(name), ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss for {name}");
+        };
+        let mut value = import_value(vec![]);
+        value.watch_dirs.push(dir.to_path_buf());
+        cache.store_imports(claim, value, 1, &no_cancel());
+    }
+
+    #[test]
+    fn watcher_calls_run_without_the_cache_lock() {
+        let cache = ProjectCache::new(1 << 20);
+        let calls = recording_watcher(&cache);
+        let ctx = context("A.dproj");
+        let dir = PathBuf::from("/ws/includes");
+        store_watching(&cache, "Main.pas", &ctx, &dir);
+        store_watching(&cache, "Other.pas", &ctx, &dir);
+        cache.invalidate_path(Path::new("/ws/Main.pas"));
+        cache.invalidate_path(Path::new("/ws/Other.pas"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("watch", dir.clone(), true), ("unwatch", dir, true)],
+            "one registration per directory, made with the cache unlocked"
+        );
+    }
+
+    #[test]
+    fn poison_recovery_releases_watches_without_the_cache_lock() {
+        let cache = ProjectCache::new(1 << 20);
+        let calls = recording_watcher(&cache);
+        let ctx = context("A.dproj");
+        let dir = PathBuf::from("/ws/includes");
+        store_watching(&cache, "Main.pas", &ctx, &dir);
+        cache.poison_state();
+        fill(&cache, "Other.pas", &ctx, 1, 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("watch", dir.clone(), true), ("unwatch", dir, true)]
+        );
+    }
+
+    fn long_probe(name: &str) -> Probe {
+        Probe::Stamp {
+            path: PathBuf::from(format!("/ws/{}/{name}", "deep".repeat(64))),
+            expected: None,
+        }
+    }
+
+    #[test]
+    /// `retained_bytes` takes the parse at the measured factor; that factor
+    /// is calibrated by RSS in `measure_retained_bytes_per_source_byte`, since
+    /// tree-sitter's trees live in C allocations no in-process count sees.
+    /// This checks only what the estimate adds on top of it.
+    fn unit_retained_bytes_add_probes_and_unshared_text_to_the_parse_estimate() {
+        let parsed = parsed_unit("Base.pas");
+        let source_len = parsed.source_text().len();
+        let unit = |probes, disk| UnitValue {
+            parsed: parsed.clone(),
+            expansion: None,
+            probes,
+            disk,
+        };
+        let bare = unit(vec![], None).retained_bytes();
+        assert_eq!(
+            bare,
+            unit_value_bytes(source_len) + std::mem::size_of::<UnitValue>()
+        );
+        assert!(unit(vec![long_probe("A.inc")], None).retained_bytes() >= bare + 256);
+
+        let origin = |text| DiskOrigin {
+            len: 1,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            raw_bytes: 1,
+            text,
+        };
+        let shared = unit(vec![], Some(origin(parsed.source_text().clone())));
+        assert_eq!(
+            shared.retained_bytes(),
+            bare,
+            "the parse's own text is free"
+        );
+        let copied = unit(vec![], Some(origin(Arc::from("x".repeat(1000)))));
+        assert!(copied.retained_bytes() >= bare + 1000);
+    }
+
+    #[test]
+    fn import_retained_bytes_cover_report_probes_and_watch_dirs() {
+        let bare = import_value(vec![]);
+        let base = bare.retained_bytes();
+        assert!(base >= import_value_bytes(&bare.resolved));
+
+        let probed = import_value(vec![long_probe("A.pas")]);
+        assert!(probed.retained_bytes() >= base + 256);
+
+        let mut watching = import_value(vec![]);
+        watching.watch_dirs = vec![PathBuf::from("/ws/".to_string() + &"d".repeat(300))];
+        assert!(watching.retained_bytes() >= base + 300);
+
+        let mut reported = import_value(vec![]);
+        reported.report = Arc::new(pascal_core::ResolutionReport {
+            observations: vec![pascal_core::ResolutionObservation::Metadata(
+                pascal_project::MetadataObservation::Stat {
+                    path: PathBuf::from("/ws/".to_string() + &"m".repeat(300)),
+                },
+            )],
+            warnings: vec!["w".repeat(300)],
+            complete: true,
+            incomplete_reasons: vec![],
+        });
+        assert!(reported.retained_bytes() >= base + 600);
+    }
+
+    #[test]
+    fn interface_retained_bytes_cover_bindings_and_probes() {
+        let bare = interface_value(&[("Base.pas", 1)], true);
+        let base = bare.retained_bytes();
+        assert!(base >= interface_value_bytes(&bare));
+        let mut probed = interface_value(&[("Base.pas", 1)], true);
+        probed.probes = vec![long_probe("Base.pas")];
+        assert!(probed.retained_bytes() >= base + 256);
+    }
+
+    #[test]
+    fn interface_entries_charge_their_probes() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        cache.put_interface_imports(&uri("Bare.pas"), &ctx, 1, interface_value(&[], true), None);
+        let bare = cache.stats().bytes;
+        let mut probed = interface_value(&[], true);
+        probed.probes = vec![long_probe("A.pas"), long_probe("B.pas")];
+        cache.put_interface_imports(&uri("Probed.pas"), &ctx, 1, probed, None);
+        assert!(
+            cache.stats().bytes - bare >= bare + 2 * 256,
+            "probe paths are retained with the entry"
+        );
+    }
+
+    #[test]
+    fn entries_of_one_project_share_its_context() {
+        let cache = ProjectCache::new(usize::MAX);
+        fill(&cache, "A.pas", &context("A.dproj"), 1, 1);
+        fill(&cache, "B.pas", &context("A.dproj"), 1, 1);
+        fill_unit(&cache, "C.pas", &context("A.dproj"), 1, vec![]);
+        let state = lock(&cache.inner);
+        let contexts = state
+            .slots
+            .values()
+            .filter_map(|slot| match slot {
+                Slot::Ready(entry) => Some(entry.context.clone()),
+                Slot::Computing { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contexts.len(), 3);
+        assert!(
+            contexts
+                .iter()
+                .all(|context| Arc::ptr_eq(context, &contexts[0])),
+            "one context copy per project, not per entry"
+        );
+    }
+
+    fn store_unit_bytes(cache: &ProjectCache, name: &str, ctx: &ProjectContext, bytes: usize) {
+        let Lookup::Compute(claim) = cache.unit(&uri(name), ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss for {name}");
+        };
+        let value = UnitValue {
+            parsed: parsed_unit(name),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        };
+        cache.store_unit(claim, value, bytes, &no_cancel());
+    }
+
+    #[test]
+    fn a_leased_parse_stays_charged_after_eviction_until_the_lease_drops() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        // What the request's index keeps.
+        let kept = unit.parsed.clone();
+        drop(unit);
+        assert_eq!(
+            cache.stats().outstanding_bytes,
+            0,
+            "a cached parse is charged once"
+        );
+
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        assert!(!ready(&cache, "A.pas"));
+        assert!(
+            !ready(&cache, "B.pas"),
+            "the leased parse of A still fills the budget"
+        );
+        assert_eq!(cache.stats().outstanding_bytes, 10);
+        assert!(!cache.has_room());
+
+        drop(lease);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        assert!(cache.has_room());
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        assert!(ready(&cache, "B.pas"));
+        drop(kept);
+    }
+
+    #[test]
+    fn a_leased_parse_nothing_keeps_is_not_charged() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        let weak = Arc::downgrade(&unit.parsed);
+        drop(unit);
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert!(
+            weak.upgrade().is_none(),
+            "the lease does not keep the parse"
+        );
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        drop(lease);
+    }
+
+    #[test]
+    fn leasing_a_parse_evicted_after_its_hit_keeps_the_budget() {
+        let cache = ProjectCache::new(10_000);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        fill(&cache, "B.pas", &ctx, 1, 10_000 - 10);
+
+        let lease = cache.lease_unit(&unit);
+        let stats = cache.stats();
+        assert_eq!(stats.outstanding_bytes, unit.retained_bytes());
+        assert!(!ready(&cache, "B.pas"), "the late charge evicts to budget");
+        assert!(stats.bytes + stats.outstanding_bytes <= 10_000);
+        drop(lease);
+    }
+
+    #[test]
+    fn transient_hits_are_not_charged_after_eviction() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        drop(unit);
+    }
+
+    #[test]
+    fn a_re_cached_parse_is_charged_by_its_entry_again() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert_eq!(cache.stats().outstanding_bytes, 10);
+
+        let Lookup::Compute(claim) =
+            cache.unit(&uri("A.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss");
+        };
+        let value = UnitValue {
+            parsed: unit.parsed.clone(),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        };
+        cache.store_unit(claim, value, 10, &no_cancel());
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        drop(lease);
+        assert_eq!(cache.stats().bytes, 10);
+    }
+
     #[test]
     fn unpinned_entries_at_budget_still_allow_room_for_warming() {
         let cache = ProjectCache::new(10);
@@ -1374,15 +1920,32 @@ pub(crate) struct UnitValue {
     #[allow(dead_code)]
     pub(crate) expansion: Option<Arc<ExpansionResult>>,
     pub(crate) probes: Vec<Probe>,
+    /// The closed file the unit was read from, when it was read from disk.
+    pub(crate) disk: Option<DiskOrigin>,
+}
+
+/// A closed source file as it was read. A later load whose `stat` still
+/// shows this length and modification time takes `text` instead of reading
+/// and decoding the file again.
+#[derive(Debug)]
+pub(crate) struct DiskOrigin {
+    pub(crate) len: u64,
+    pub(crate) modified: std::time::SystemTime,
+    /// Raw file size, before decoding.
+    pub(crate) raw_bytes: usize,
+    /// Decoded file text. Without include expansion this is the parse's own
+    /// text, so it costs nothing extra.
+    pub(crate) text: Arc<str>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ImportValue {
+    /// Shared with the request that resolved it, so hits do not copy it.
     #[allow(dead_code)]
-    pub(crate) resolved: pascal_core::ResolvedImports,
+    pub(crate) resolved: Arc<pascal_core::ResolvedImports>,
     #[allow(dead_code)]
-    pub(crate) report: pascal_core::ResolutionReport,
+    pub(crate) report: Arc<pascal_core::ResolutionReport>,
     pub(crate) probes: Vec<Probe>,
     pub(crate) watch_dirs: Vec<PathBuf>,
 }
@@ -1416,6 +1979,69 @@ pub(crate) struct InterfaceImportsValue {
     /// Copied from the unit's import entry. They include a content probe for
     /// every dependency, so a bound unit's hash is verified before use.
     pub(crate) probes: Vec<Probe>,
+}
+
+/// A cached value whose probes decide whether it may be served.
+trait Probed {
+    fn probes(&self) -> &[Probe];
+}
+
+impl Probed for UnitValue {
+    fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
+}
+
+impl Probed for ImportValue {
+    fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
+}
+
+impl Probed for InterfaceImportsValue {
+    fn probes(&self) -> &[Probe] {
+        &self.probes
+    }
+}
+
+impl UnitValue {
+    /// Estimated heap retained by the entry: the parse at the measured
+    /// factor, its include expansion, probes, and file text it does not
+    /// share with the parse.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let unshared_text = self
+            .disk
+            .as_ref()
+            .filter(|disk| !Arc::ptr_eq(&disk.text, self.parsed.source_text()))
+            .map_or(0, |disk| disk.text.len());
+        unit_value_bytes(self.parsed.source_text().len())
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(self.expansion.as_deref().map_or(0, expansion_bytes))
+            .saturating_add(probes_bytes(&self.probes))
+            .saturating_add(unshared_text)
+    }
+}
+
+impl ImportValue {
+    /// Estimated heap retained by the entry: dependency payloads, the
+    /// resolution report, probes and watched directories.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        import_value_bytes(&self.resolved)
+            .saturating_add(std::mem::size_of_val(self.resolved.bindings.as_slice()))
+            .saturating_add(std::mem::size_of_val(self.resolved.dependencies.as_slice()))
+            .saturating_add(report_bytes(&self.report))
+            .saturating_add(probes_bytes(&self.probes))
+            .saturating_add(self.watch_dirs.iter().fold(
+                std::mem::size_of_val(self.watch_dirs.as_slice()),
+                |total, dir| total.saturating_add(path_bytes(dir)),
+            ))
+    }
+}
+
+impl InterfaceImportsValue {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        interface_value_bytes(self).saturating_add(probes_bytes(&self.probes))
+    }
 }
 
 fn interface_value_bytes(value: &InterfaceImportsValue) -> usize {
@@ -1465,11 +2091,41 @@ struct State {
     invalidation_epoch: u64,
     max_bytes: usize,
     pins: HashMap<Url, HashSet<(Url, u64)>>,
+    /// Number of owners in `pins` that pin each `(uri, fingerprint)`.
+    pin_counts: HashMap<Url, HashMap<u64, usize>>,
+    /// Bytes of the ready entries that are pinned.
+    pinned_bytes: usize,
+    /// Unpinned ready entries by `last_used`, oldest first. Clock values are
+    /// unique, so each entry has its own slot.
+    lru: BTreeMap<u64, Key>,
+    /// Ready entries with a stamp or content probe on the path. A change to
+    /// the path, or to a child for a directory probe, invalidates them.
+    observed: HashMap<PathBuf, HashSet<Key>>,
+    /// Ready entries for the source at the path or with an overlay probe on
+    /// it. Only a change to the path itself invalidates them.
+    exact: HashMap<PathBuf, HashSet<Key>>,
+    by_uri: HashMap<Url, HashSet<Key>>,
+    /// One shared copy of each project context, by fingerprint, so entries
+    /// do not each hold their own.
+    contexts: HashMap<u64, Arc<ProjectContext>>,
+    /// Unit entries holding each parse, by `Arc` address, with the entry's
+    /// charge.
+    cached_parses: HashMap<usize, (usize, usize)>,
+    /// Request leases on cached parses, by `Arc` address.
+    leases: HashMap<usize, Lease>,
+    /// Charges of leased parses that no entry holds any more. They stay in
+    /// the budget until the last lease drops.
+    outstanding_bytes: usize,
     watch_counts: HashMap<PathBuf, usize>,
-    watcher: Option<Box<dyn DirectoryWatch>>,
+    /// Directories whose watch count reached or left zero. `sync_watches`
+    /// applies them to the watcher once the state lock is released.
+    watch_changes: Vec<PathBuf>,
     closure_crawl_requests: Vec<Url>,
     /// Each root's uncached closure units at its last snapshot walk.
     closure_misses: HashMap<Url, HashSet<Url>>,
+    /// Ready entries looked at by eviction and invalidation.
+    #[cfg(test)]
+    examined: std::cell::Cell<usize>,
 }
 
 impl Default for State {
@@ -1482,18 +2138,47 @@ impl Default for State {
             invalidation_epoch: 0,
             max_bytes: DEFAULT_MAX_CACHE_BYTES,
             pins: HashMap::new(),
+            pin_counts: HashMap::new(),
+            pinned_bytes: 0,
+            lru: BTreeMap::new(),
+            observed: HashMap::new(),
+            exact: HashMap::new(),
+            by_uri: HashMap::new(),
+            contexts: HashMap::new(),
+            cached_parses: HashMap::new(),
+            leases: HashMap::new(),
+            outstanding_bytes: 0,
             watch_counts: HashMap::new(),
-            watcher: None,
+            watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
             closure_misses: HashMap::new(),
+            #[cfg(test)]
+            examined: std::cell::Cell::new(0),
         }
     }
 }
 
+#[cfg(test)]
+fn note_examined(state: &State) {
+    state.examined.set(state.examined.get() + 1);
+}
+
+/// The directory watcher and the directories it currently watches.
+#[derive(Default)]
+struct WatcherState {
+    watcher: Option<Box<dyn DirectoryWatch>>,
+    registered: HashSet<PathBuf>,
+}
+
+/// Lock order: `watcher` before `state`. Code holding `state` never takes
+/// `watcher`, never calls the watcher and never touches the filesystem; it
+/// queues watch-count changes in `State::watch_changes`, and `sync_watches`
+/// applies them after `state` is released.
 #[derive(Default)]
 struct Inner {
     state: Mutex<State>,
     changed: Condvar,
+    watcher: Mutex<WatcherState>,
     #[cfg(test)]
     validation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -1527,6 +2212,14 @@ impl ProjectCache {
             .collect::<Vec<_>>();
         layers.sort();
         layers
+    }
+
+    fn reset_examined_entries(&self) {
+        lock(&self.inner).examined.set(0);
+    }
+
+    fn examined_entries(&self) -> usize {
+        lock(&self.inner).examined.get()
     }
 
     fn set_validation_hook(&self, hook: impl FnOnce() + Send + 'static) {
@@ -1611,6 +2304,8 @@ pub(crate) struct CacheStats {
     pub units: usize,
     pub imports: usize,
     pub bytes: usize,
+    /// Bytes of removed values that workers still hold.
+    pub outstanding_bytes: usize,
     pub pinned_over_budget: bool,
 }
 
@@ -1621,13 +2316,21 @@ fn recover_poisoned_state<'a>(
     state.slots.clear();
     state.generation = state.generation.wrapping_add(1);
     state.bytes = 0;
-    let watched_directories = state.watch_counts.keys().cloned().collect::<Vec<_>>();
-    if let Some(watcher) = state.watcher.as_mut() {
-        for directory in &watched_directories {
-            watcher.unwatch(directory);
-        }
+    state.pinned_bytes = 0;
+    state.cached_parses.clear();
+    let mut orphaned = 0usize;
+    for lease in state.leases.values_mut().filter(|lease| !lease.evicted) {
+        lease.evicted = true;
+        orphaned = orphaned.saturating_add(lease.bytes);
     }
-    state.watch_counts.clear();
+    state.outstanding_bytes = state.outstanding_bytes.saturating_add(orphaned);
+    state.lru.clear();
+    state.observed.clear();
+    state.exact.clear();
+    state.by_uri.clear();
+    let watched_directories = state.watch_counts.drain().map(|(directory, _)| directory);
+    let watched_directories = watched_directories.collect::<Vec<_>>();
+    state.watch_changes.extend(watched_directories);
     inner.state.clear_poison();
     state
 }
@@ -1691,6 +2394,57 @@ impl ProjectCache {
         let mut state = lock(&self.inner);
         state.max_bytes = max_bytes;
         evict_to_budget(&mut state);
+        self.release(state);
+    }
+
+    /// Releases the state lock, then applies the watch changes it queued.
+    fn release(&self, state: MutexGuard<'_, State>) {
+        let changed = !state.watch_changes.is_empty();
+        drop(state);
+        if changed {
+            self.sync_watches();
+        }
+    }
+
+    /// Brings the watcher in line with the current watch counts of every
+    /// directory queued in `watch_changes`. Changes are applied in the order
+    /// threads take the watcher lock, each against the counts at that time,
+    /// so the last application for a directory always reflects its count.
+    fn sync_watches(&self) {
+        let mut watcher = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let changes = {
+            let mut state = lock(&self.inner);
+            let mut directories = std::mem::take(&mut state.watch_changes);
+            directories.sort();
+            directories.dedup();
+            directories
+                .into_iter()
+                .map(|directory| {
+                    let wanted = state.watch_counts.contains_key(&directory);
+                    (directory, wanted)
+                })
+                .collect::<Vec<_>>()
+        };
+        let WatcherState {
+            watcher: Some(watch),
+            registered,
+        } = &mut *watcher
+        else {
+            return;
+        };
+        for (directory, wanted) in changes {
+            if wanted && !registered.contains(&directory) {
+                if watch.watch(&directory) {
+                    registered.insert(directory);
+                }
+            } else if !wanted && registered.remove(&directory) {
+                watch.unwatch(&directory);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1723,7 +2477,7 @@ impl ProjectCache {
             overlays,
             cancel,
             |value| match value {
-                Value::Unit(unit) => Some((unit.clone(), unit.probes.clone())),
+                Value::Unit(unit) => Some(unit.clone()),
                 _ => None,
             },
         )
@@ -1745,10 +2499,99 @@ impl ProjectCache {
             content_hash,
             overlays,
             |value| match value {
-                Value::Unit(unit) => Some((unit.clone(), unit.probes.clone())),
+                Value::Unit(unit) => Some(unit.clone()),
                 _ => None,
             },
         )
+    }
+
+    /// Leases the parse of a unit hit that a request keeps in its own index,
+    /// so the parse stays charged if its entry is evicted first. A parse
+    /// evicted between the hit and the lease is charged at once.
+    pub(crate) fn lease_unit(&self, unit: &UnitValue) -> CacheLease {
+        self.lease_parse(&unit.parsed, unit.retained_bytes(), false)
+            .expect("an uncached parse is leased when not required to be cached")
+    }
+
+    /// Leases a parse the request just stored, only if the cache took it.
+    pub(crate) fn lease_stored_parse(
+        &self,
+        parsed: &Arc<ParsedDocument>,
+        bytes: usize,
+    ) -> Option<CacheLease> {
+        self.lease_parse(parsed, bytes, true)
+    }
+
+    fn lease_parse(
+        &self,
+        parsed: &Arc<ParsedDocument>,
+        bytes: usize,
+        require_cached: bool,
+    ) -> Option<CacheLease> {
+        let payload = Arc::as_ptr(parsed) as *const () as usize;
+        let mut state = lock(&self.inner);
+        if let Some(lease) = state.leases.get_mut(&payload) {
+            lease.holders += 1;
+        } else {
+            let cached = state.cached_parses.get(&payload).map(|(_, bytes)| *bytes);
+            if cached.is_none() && require_cached {
+                return None;
+            }
+            let bytes = cached.unwrap_or(bytes);
+            state.leases.insert(
+                payload,
+                Lease {
+                    holders: 1,
+                    bytes,
+                    evicted: cached.is_none(),
+                    parsed: Arc::downgrade(parsed),
+                },
+            );
+            if cached.is_none() {
+                state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
+                evict_to_budget(&mut state);
+            }
+        }
+        self.release(state);
+        Some(CacheLease {
+            inner: self.inner.clone(),
+            payload,
+            _parsed: Arc::downgrade(parsed),
+        })
+    }
+
+    /// A verified unit entry read from a closed file whose length and
+    /// modification time are still `len` and `modified`, with the raw content
+    /// hash that keys it. Lets a load skip reading the file; never claims.
+    pub(crate) fn peek_unit_from_disk(
+        &self,
+        uri: &Url,
+        context: &ProjectContext,
+        len: u64,
+        modified: std::time::SystemTime,
+        overlays: &HashMap<Url, OverlayInput>,
+    ) -> Option<(Arc<UnitValue>, u64)> {
+        let same_file = |unit: &UnitValue| {
+            unit.disk
+                .as_ref()
+                .is_some_and(|disk| disk.len == len && disk.modified == modified)
+        };
+        let key = Key {
+            layer: Layer::Unit,
+            uri: uri.clone(),
+            fingerprint: project_context_fingerprint(context),
+        };
+        let content_hash = match lock(&self.inner).slots.get(&key) {
+            Some(Slot::Ready(Entry {
+                value: Value::Unit(unit),
+                context: entry_context,
+                input_hash,
+                ..
+            })) if entry_context.as_ref() == context && same_file(unit) => *input_hash,
+            _ => return None,
+        };
+        let unit = self.peek_unit(uri, context, content_hash, overlays)?;
+        same_file(&unit).then_some((unit, content_hash))
     }
 
     /// A verified interface-imports entry, or `None`, under the same rules as
@@ -1767,7 +2610,7 @@ impl ProjectCache {
             content_hash,
             overlays,
             |value| match value {
-                Value::Interface(interface) => Some((interface.clone(), interface.probes.clone())),
+                Value::Interface(interface) => Some(interface.clone()),
                 _ => None,
             },
         )
@@ -1807,39 +2650,37 @@ impl ProjectCache {
                 && old.bindings == value.bindings
                 && old.complete == value.complete
         );
-        let bytes = interface_value_bytes(&value);
+        let bytes = value.retained_bytes();
         state.clock += 1;
         let entry = Entry {
             value: Value::Interface(Arc::new(value)),
-            context: Arc::new(context.clone()),
+            context: intern_context(&mut state, key.fingerprint, context),
             input_hash: content_hash,
             bytes,
             last_used: state.clock,
         };
         // Replace even an unchanged entry: its probes may be fresher.
-        if let Some(Slot::Ready(old)) = state.slots.insert(key, Slot::Ready(entry)) {
-            state.bytes = state.bytes.saturating_sub(old.bytes);
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
+        insert_ready(&mut state, key, entry);
         evict_to_budget(&mut state);
+        self.release(state);
         !unchanged
     }
 
-    fn peek<V>(
+    fn peek<V: Probed>(
         &self,
         layer: Layer,
         uri: &Url,
         context: &ProjectContext,
         input_hash: u64,
         overlays: &HashMap<Url, OverlayInput>,
-        extract: impl Fn(&Value) -> Option<(Arc<V>, Vec<Probe>)>,
+        extract: impl Fn(&Value) -> Option<Arc<V>>,
     ) -> Option<Arc<V>> {
         let key = Key {
             layer,
             uri: uri.clone(),
             fingerprint: project_context_fingerprint(context),
         };
-        let (value, probes) = {
+        let value = {
             let state = lock(&self.inner);
             match state.slots.get(&key) {
                 Some(Slot::Ready(entry))
@@ -1850,16 +2691,14 @@ impl ProjectCache {
                 _ => return None,
             }
         };
-        if !probes_hold(&probes, overlays) {
+        if !probes_hold(value.probes(), overlays) {
             return None;
         }
         let mut state = lock(&self.inner);
-        state.clock += 1;
-        let clock = state.clock;
-        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key)
-            && extract(&entry.value).is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
+        if let Some(Slot::Ready(entry)) = state.slots.get(&key)
+            && extract(&entry.value).is_some_and(|current| Arc::ptr_eq(&current, &value))
         {
-            entry.last_used = clock;
+            touch(&mut state, &key);
         }
         Some(value)
     }
@@ -1872,12 +2711,13 @@ impl ProjectCache {
         content_hash: u64,
     ) -> Option<Option<String>> {
         let state = lock(&self.inner);
-        state.slots.iter().find_map(|(key, slot)| match slot {
-            Slot::Ready(Entry {
+        let keys = state.by_uri.get(uri)?;
+        keys.iter().find_map(|key| match state.slots.get(key) {
+            Some(Slot::Ready(Entry {
                 value: Value::Unit(unit),
                 input_hash,
                 ..
-            }) if key.uri == *uri && *input_hash == content_hash => {
+            })) if *input_hash == content_hash => {
                 Some(Some(unit.parsed.unit_name().to_string()).filter(|name| !name.is_empty()))
             }
             _ => None,
@@ -1892,13 +2732,7 @@ impl ProjectCache {
         bytes: usize,
         cancel: &AtomicBool,
     ) {
-        self.store(
-            claim,
-            Value::Unit(Arc::new(value)),
-            bytes,
-            Vec::new(),
-            cancel,
-        );
+        self.store(claim, Value::Unit(Arc::new(value)), bytes, cancel);
     }
 
     pub(crate) fn imports(
@@ -1930,7 +2764,7 @@ impl ProjectCache {
             overlays,
             cancel,
             |value| match value {
-                Value::Import(imports) => Some((imports.clone(), imports.probes.clone())),
+                Value::Import(imports) => Some(imports.clone()),
                 _ => None,
             },
         )
@@ -1943,18 +2777,11 @@ impl ProjectCache {
         bytes: usize,
         cancel: &AtomicBool,
     ) {
-        let watch_dirs = value.watch_dirs.clone();
-        self.store(
-            claim,
-            Value::Import(Arc::new(value)),
-            bytes,
-            watch_dirs,
-            cancel,
-        );
+        self.store(claim, Value::Import(Arc::new(value)), bytes, cancel);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn lookup<V>(
+    fn lookup<V: Probed>(
         &self,
         layer: Layer,
         uri: &Url,
@@ -1963,7 +2790,7 @@ impl ProjectCache {
         snapshot_epoch: Option<u64>,
         overlays: &HashMap<Url, OverlayInput>,
         cancel: &AtomicBool,
-        extract: impl Fn(&Value) -> Option<(Arc<V>, Vec<Probe>)>,
+        extract: impl Fn(&Value) -> Option<Arc<V>>,
     ) -> Lookup<V> {
         let key = Key {
             layer,
@@ -2022,11 +2849,11 @@ impl ProjectCache {
                 Some(Slot::Ready(entry))
                     if entry.context.as_ref() == context && entry.input_hash == input_hash =>
                 {
-                    let Some((value, probes)) = extract(&entry.value) else {
+                    let Some(value) = extract(&entry.value) else {
                         break;
                     };
                     drop(state);
-                    let probes_hold = probes_hold(&probes, overlays);
+                    let probes_hold = probes_hold(value.probes(), overlays);
                     #[cfg(test)]
                     if probes_hold {
                         self.run_validation_hook();
@@ -2038,7 +2865,7 @@ impl ProjectCache {
                                 && entry.input_hash == input_hash =>
                         {
                             extract(&entry.value)
-                                .is_some_and(|(current, _)| Arc::ptr_eq(&current, &value))
+                                .is_some_and(|current| Arc::ptr_eq(&current, &value))
                         }
                         _ => false,
                     };
@@ -2046,11 +2873,7 @@ impl ProjectCache {
                         continue;
                     }
                     if probes_hold {
-                        state.clock += 1;
-                        let clock = state.clock;
-                        if let Some(Slot::Ready(entry)) = state.slots.get_mut(&key) {
-                            entry.last_used = clock;
-                        }
+                        touch(&mut state, &key);
                         return Lookup::Hit(value);
                     }
                     break;
@@ -2058,10 +2881,7 @@ impl ProjectCache {
                 _ => break,
             }
         }
-        if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-            state.bytes = state.bytes.saturating_sub(entry.bytes);
-            release_watches(&mut state, &entry);
-        }
+        remove_ready(&mut state, &key);
         let generation = state.generation;
         state.slots.insert(
             key.clone(),
@@ -2070,58 +2890,342 @@ impl ProjectCache {
                 input_hash,
             },
         );
+        let invalidation_epoch = snapshot_epoch.unwrap_or(state.invalidation_epoch);
+        let context = intern_context(&mut state, key.fingerprint, context);
+        self.release(state);
         Lookup::Compute(Claim {
             inner: self.inner.clone(),
             key,
             generation,
-            context: Arc::new(context.clone()),
+            context,
             input_hash,
-            invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
+            invalidation_epoch,
             detached: false,
         })
     }
 }
 
+const LAYERS: [Layer; 3] = [Layer::Unit, Layer::Import, Layer::Interface];
+
 fn is_pinned(state: &State, key: &Key) -> bool {
     state
-        .pins
-        .values()
-        .any(|pins| pins.contains(&(key.uri.clone(), key.fingerprint)))
+        .pin_counts
+        .get(&key.uri)
+        .is_some_and(|fingerprints| fingerprints.contains_key(&key.fingerprint))
 }
 
-fn pinned_bytes(state: &State) -> usize {
-    state
-        .slots
-        .iter()
-        .filter_map(|(key, slot)| match slot {
-            Slot::Ready(entry) if is_pinned(state, key) => Some(entry.bytes),
-            _ => None,
-        })
-        .fold(0usize, |bytes, entry_bytes| {
-            bytes.saturating_add(entry_bytes)
-        })
+fn value_probes(value: &Value) -> &[Probe] {
+    match value {
+        Value::Unit(unit) => &unit.probes,
+        Value::Import(imports) => &imports.probes,
+        Value::Interface(interface) => &interface.probes,
+    }
+}
+
+/// The paths whose change invalidates the entry: `true` marks a stamp or
+/// content probe, which a change to a child also invalidates.
+fn indexed_paths(key: &Key, entry: &Entry) -> Vec<(bool, PathBuf)> {
+    let mut paths = Vec::new();
+    if let Ok(own) = key.uri.to_file_path() {
+        paths.push((false, own));
+    }
+    for probe in value_probes(&entry.value) {
+        match probe {
+            Probe::Stamp { path, .. } | Probe::Content { path, .. } => {
+                paths.push((true, path.clone()));
+            }
+            Probe::Overlay { uri, .. } => {
+                if let Ok(path) = uri.to_file_path() {
+                    paths.push((false, path));
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn index_insert<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at: K, key: &Key) {
+    map.entry(at).or_default().insert(key.clone());
+}
+
+fn index_remove<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at: &K, key: &Key) {
+    if let Some(keys) = map.get_mut(at) {
+        keys.remove(key);
+        if keys.is_empty() {
+            map.remove(at);
+        }
+    }
+}
+
+/// Stores a ready entry, replacing any ready entry under the key, and keeps
+/// every index in step with it.
+fn insert_ready(state: &mut State, key: Key, entry: Entry) {
+    remove_ready(state, &key);
+    state.bytes = state.bytes.saturating_add(entry.bytes);
+    if let Some(address) = parse_address(&entry.value) {
+        hold_parse(state, address, entry.bytes);
+    }
+    if is_pinned(state, &key) {
+        state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);
+    } else {
+        state.lru.insert(entry.last_used, key.clone());
+    }
+    for (observed, path) in indexed_paths(&key, &entry) {
+        let map = if observed {
+            &mut state.observed
+        } else {
+            &mut state.exact
+        };
+        index_insert(map, path, &key);
+    }
+    index_insert(&mut state.by_uri, key.uri.clone(), &key);
+    if let Value::Import(imports) = &entry.value {
+        for directory in &imports.watch_dirs {
+            acquire_watch(state, directory);
+        }
+    }
+    state.slots.insert(key, Slot::Ready(entry));
+}
+
+#[derive(Debug)]
+struct Lease {
+    holders: usize,
+    bytes: usize,
+    /// Whether no cache entry holds the parse, so `bytes` are outstanding.
+    evicted: bool,
+    /// Outstanding bytes are charged only while the parse is alive.
+    parsed: std::sync::Weak<ParsedDocument>,
+}
+
+/// A request's hold on a cached parse it put into its own index. While a
+/// lease exists, no entry holds the parse and the parse is still alive, the
+/// entry's charge stays in the budget as outstanding bytes. Transient hits
+/// are not leased.
+pub(crate) struct CacheLease {
+    inner: Arc<Inner>,
+    payload: usize,
+    /// Keeps the address from being reused while the lease exists, without
+    /// keeping the parse alive once the request's index drops it.
+    _parsed: std::sync::Weak<ParsedDocument>,
+}
+
+impl std::fmt::Debug for CacheLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheLease")
+            .field("payload", &self.payload)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        let mut state = lock(&self.inner);
+        let Some(lease) = state.leases.get_mut(&self.payload) else {
+            return;
+        };
+        lease.holders -= 1;
+        if lease.holders > 0 {
+            return;
+        }
+        let Some(lease) = state.leases.remove(&self.payload) else {
+            return;
+        };
+        if lease.evicted {
+            state.outstanding_bytes = state.outstanding_bytes.saturating_sub(lease.bytes);
+        }
+    }
+}
+
+fn parse_address(value: &Value) -> Option<usize> {
+    match value {
+        Value::Unit(unit) => Some(Arc::as_ptr(&unit.parsed) as *const () as usize),
+        _ => None,
+    }
+}
+
+/// Records that an entry holds a parse; a leased parse stops being
+/// outstanding.
+fn hold_parse(state: &mut State, address: usize, bytes: usize) {
+    let (refs, _) = state.cached_parses.entry(address).or_insert((0, bytes));
+    *refs += 1;
+    if let Some(lease) = state.leases.get_mut(&address)
+        && lease.evicted
+    {
+        lease.evicted = false;
+        state.outstanding_bytes = state.outstanding_bytes.saturating_sub(lease.bytes);
+    }
+}
+
+/// Records that an entry released a parse; a leased parse no entry holds
+/// becomes outstanding.
+fn release_parse(state: &mut State, address: usize) {
+    let Some((refs, _)) = state.cached_parses.get_mut(&address) else {
+        return;
+    };
+    *refs -= 1;
+    if *refs > 0 {
+        return;
+    }
+    state.cached_parses.remove(&address);
+    if let Some(lease) = state.leases.get_mut(&address)
+        && !lease.evicted
+    {
+        lease.evicted = true;
+        state.outstanding_bytes = state.outstanding_bytes.saturating_add(lease.bytes);
+    }
+}
+
+/// The shared copy of `context`, so entries of one project hold one copy.
+fn intern_context(
+    state: &mut State,
+    fingerprint: u64,
+    context: &ProjectContext,
+) -> Arc<ProjectContext> {
+    if let Some(shared) = state.contexts.get(&fingerprint)
+        && shared.as_ref() == context
+    {
+        return shared.clone();
+    }
+    let shared = Arc::new(context.clone());
+    state.contexts.insert(fingerprint, shared.clone());
+    shared
+}
+
+/// Forgets the shared context once no entry or claim holds it.
+fn release_context(state: &mut State, fingerprint: u64) {
+    if state
+        .contexts
+        .get(&fingerprint)
+        .is_some_and(|shared| Arc::strong_count(shared) == 1)
+    {
+        state.contexts.remove(&fingerprint);
+    }
+}
+
+/// Removes a ready entry and its index records. A computing slot stays.
+fn remove_ready(state: &mut State, key: &Key) -> bool {
+    if !matches!(state.slots.get(key), Some(Slot::Ready(_))) {
+        return false;
+    }
+    let Some(Slot::Ready(entry)) = state.slots.remove(key) else {
+        return false;
+    };
+    state.bytes = state.bytes.saturating_sub(entry.bytes);
+    if is_pinned(state, key) {
+        state.pinned_bytes = state.pinned_bytes.saturating_sub(entry.bytes);
+    } else {
+        state.lru.remove(&entry.last_used);
+    }
+    for (observed, path) in indexed_paths(key, &entry) {
+        let map = if observed {
+            &mut state.observed
+        } else {
+            &mut state.exact
+        };
+        index_remove(map, &path, key);
+    }
+    index_remove(&mut state.by_uri, &key.uri, key);
+    release_watches(state, &entry);
+    if let Some(address) = parse_address(&entry.value) {
+        release_parse(state, address);
+    }
+    drop(entry);
+    release_context(state, key.fingerprint);
+    true
+}
+
+/// Marks a ready entry as the most recently used.
+fn touch(state: &mut State, key: &Key) {
+    state.clock += 1;
+    let clock = state.clock;
+    let pinned = is_pinned(state, key);
+    let Some(Slot::Ready(entry)) = state.slots.get_mut(key) else {
+        return;
+    };
+    let previous = std::mem::replace(&mut entry.last_used, clock);
+    if !pinned {
+        state.lru.remove(&previous);
+        state.lru.insert(clock, key.clone());
+    }
+}
+
+/// Moves the ready entries of a `(uri, fingerprint)` between the LRU order
+/// and the pinned total when its first owner pins it or its last unpins it.
+fn set_pinned(state: &mut State, uri: &Url, fingerprint: u64, pinned: bool) {
+    for layer in LAYERS {
+        let key = Key {
+            layer,
+            uri: uri.clone(),
+            fingerprint,
+        };
+        let Some(Slot::Ready(entry)) = state.slots.get(&key) else {
+            continue;
+        };
+        let (bytes, last_used) = (entry.bytes, entry.last_used);
+        if pinned {
+            state.lru.remove(&last_used);
+            state.pinned_bytes = state.pinned_bytes.saturating_add(bytes);
+        } else {
+            state.lru.insert(last_used, key);
+            state.pinned_bytes = state.pinned_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+fn add_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
+    let count = state
+        .pin_counts
+        .entry(uri.clone())
+        .or_default()
+        .entry(*fingerprint)
+        .or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        set_pinned(state, uri, *fingerprint, true);
+    }
+}
+
+fn remove_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
+    let Some(fingerprints) = state.pin_counts.get_mut(uri) else {
+        return;
+    };
+    let Some(count) = fingerprints.get_mut(fingerprint) else {
+        return;
+    };
+    *count -= 1;
+    if *count > 0 {
+        return;
+    }
+    fingerprints.remove(fingerprint);
+    if fingerprints.is_empty() {
+        state.pin_counts.remove(uri);
+    }
+    set_pinned(state, uri, *fingerprint, false);
+}
+
+/// Stops charging leased parses that nothing holds any more.
+fn prune_dead_leases(state: &mut State) {
+    let mut released = 0usize;
+    state.leases.retain(|_, lease| {
+        let alive = lease.parsed.strong_count() > 0;
+        if !alive && lease.evicted {
+            released = released.saturating_add(lease.bytes);
+        }
+        alive
+    });
+    state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
 }
 
 fn evict_to_budget(state: &mut State) {
-    while state.bytes > state.max_bytes {
-        let victim = state
-            .slots
-            .iter()
-            .filter_map(|(key, slot)| match slot {
-                Slot::Ready(entry) if !is_pinned(state, key) => {
-                    Some((entry.last_used, key.clone()))
-                }
-                _ => None,
-            })
-            .min_by_key(|(last_used, _)| *last_used)
-            .map(|(_, key)| key);
-        let Some(key) = victim else {
+    prune_dead_leases(state);
+    while state.bytes.saturating_add(state.outstanding_bytes) > state.max_bytes {
+        let Some((_, key)) = state.lru.pop_first() else {
             return;
         };
-        if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-            state.bytes = state.bytes.saturating_sub(entry.bytes);
-            release_watches(state, &entry);
-        }
+        #[cfg(test)]
+        note_examined(state);
+        remove_ready(state, &key);
     }
 }
 
@@ -2131,10 +3235,8 @@ fn acquire_watch(state: &mut State, directory: &Path) {
         .entry(directory.to_path_buf())
         .or_insert(0);
     *count += 1;
-    if *count == 1
-        && let Some(watcher) = state.watcher.as_mut()
-    {
-        let _ = watcher.watch(directory);
+    if *count == 1 {
+        state.watch_changes.push(directory.to_path_buf());
     }
 }
 
@@ -2149,23 +3251,14 @@ fn release_watches(state: &mut State, entry: &Entry) {
         *count -= 1;
         if *count == 0 {
             state.watch_counts.remove(directory);
-            if let Some(watcher) = state.watcher.as_mut() {
-                watcher.unwatch(directory);
-            }
+            state.watch_changes.push(directory.clone());
         }
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ProjectCache {
-    fn store(
-        &self,
-        claim: Claim,
-        value: Value,
-        bytes: usize,
-        watch_dirs: Vec<PathBuf>,
-        cancel: &AtomicBool,
-    ) {
+    fn store(&self, claim: Claim, value: Value, bytes: usize, cancel: &AtomicBool) {
         let mut state = lock(&self.inner);
         let current = !claim.detached
             && !cancel.load(Ordering::Relaxed)
@@ -2181,14 +3274,10 @@ impl ProjectCache {
                 bytes,
                 last_used: state.clock,
             };
-            for directory in &watch_dirs {
-                acquire_watch(&mut state, directory);
-            }
-            state.slots.insert(claim.key.clone(), Slot::Ready(entry));
-            state.bytes = state.bytes.saturating_add(bytes);
+            insert_ready(&mut state, claim.key.clone(), entry);
             evict_to_budget(&mut state);
         }
-        drop(state);
+        self.release(state);
         drop(claim); // Removes the slot only when it is still Computing.
     }
 
@@ -2236,21 +3325,39 @@ impl ProjectCache {
     }
 
     pub(crate) fn pin(&self, owner: &Url, keys: Vec<(Url, u64)>) {
-        lock(&self.inner)
-            .pins
-            .insert(owner.clone(), keys.into_iter().collect());
+        let mut state = lock(&self.inner);
+        let keys = keys.into_iter().collect::<HashSet<_>>();
+        // Count the new set first so keys in both sets stay pinned throughout.
+        for key in &keys {
+            add_pin(&mut state, key);
+        }
+        if let Some(previous) = state.pins.insert(owner.clone(), keys) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
     }
 
     pub(crate) fn unpin(&self, owner: &Url) {
         let mut state = lock(&self.inner);
-        state.pins.remove(owner);
+        if let Some(previous) = state.pins.remove(owner) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
         evict_to_budget(&mut state);
+        self.release(state);
     }
 
     pub(crate) fn clear_pins(&self) {
         let mut state = lock(&self.inner);
-        state.pins.clear();
+        for (_, previous) in std::mem::take(&mut state.pins) {
+            for key in &previous {
+                remove_pin(&mut state, key);
+            }
+        }
         evict_to_budget(&mut state);
+        self.release(state);
     }
 
     /// Evicts every entry that depends on `path` and returns the affected URIs.
@@ -2268,44 +3375,26 @@ impl ProjectCache {
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
-        let parent = path.parent();
+        let parent = path.parent().filter(|_| include_parent);
         let doomed = state
-            .slots
-            .iter()
-            .filter_map(|(key, slot)| {
-                let Slot::Ready(entry) = slot else {
-                    return None;
-                };
-                let probes = match &entry.value {
-                    Value::Unit(unit) => &unit.probes,
-                    Value::Import(imports) => &imports.probes,
-                    Value::Interface(interface) => &interface.probes,
-                };
-                let own_path = key.uri.to_file_path().ok();
-                let hit = own_path.as_deref() == Some(path)
-                    || probes.iter().any(|probe| match probe {
-                        Probe::Stamp { path: observed, .. }
-                        | Probe::Content { path: observed, .. } => {
-                            observed == path
-                                || (include_parent && Some(observed.as_path()) == parent)
-                        }
-                        Probe::Overlay { uri, .. } => {
-                            uri.to_file_path().ok().as_deref() == Some(path)
-                        }
-                    });
-                hit.then(|| key.clone())
-            })
-            .collect::<Vec<_>>();
+            .exact
+            .get(path)
+            .into_iter()
+            .chain(state.observed.get(path))
+            .chain(parent.and_then(|parent| state.observed.get(parent)))
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut affected = Vec::new();
+        let mut seen = HashSet::new();
         for key in doomed {
-            if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-                state.bytes = state.bytes.saturating_sub(entry.bytes);
-                release_watches(&mut state, &entry);
-                if !affected.contains(&key.uri) {
-                    affected.push(key.uri);
-                }
+            #[cfg(test)]
+            note_examined(&state);
+            if remove_ready(&mut state, &key) && seen.insert(key.uri.clone()) {
+                affected.push(key.uri);
             }
         }
+        self.release(state);
         affected
     }
 
@@ -2321,13 +3410,10 @@ impl ProjectCache {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in doomed {
-            if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-                state.bytes = state.bytes.saturating_sub(entry.bytes);
-                release_watches(&mut state, &entry);
-            }
+            remove_ready(&mut state, &key);
         }
         state.closure_misses.clear();
-        drop(state);
+        self.release(state);
         self.inner.changed.notify_all();
     }
 
@@ -2341,18 +3427,21 @@ impl ProjectCache {
             .cloned()
             .collect::<Vec<_>>();
         for key in doomed {
-            if let Some(Slot::Ready(entry)) = state.slots.remove(&key) {
-                state.bytes = state.bytes.saturating_sub(entry.bytes);
-                release_watches(&mut state, &entry);
+            if !remove_ready(&mut state, &key) {
+                state.slots.remove(&key);
             }
         }
-        drop(state);
+        state
+            .contexts
+            .retain(|fingerprint, _| keep.contains(fingerprint));
+        self.release(state);
         self.inner.changed.notify_all();
     }
 
     pub(crate) fn has_room(&self) -> bool {
-        let state = lock(&self.inner);
-        pinned_bytes(&state) < state.max_bytes
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
+        state.pinned_bytes.saturating_add(state.outstanding_bytes) < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -2360,7 +3449,8 @@ impl ProjectCache {
     }
 
     pub(crate) fn stats(&self) -> CacheStats {
-        let state = lock(&self.inner);
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
         let count = |layer| {
             state
                 .slots
@@ -2372,12 +3462,19 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
-            pinned_over_budget: pinned_bytes(&state) > state.max_bytes,
+            outstanding_bytes: state.outstanding_bytes,
+            pinned_over_budget: state.pinned_bytes > state.max_bytes,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn set_watcher(&self, watcher: Box<dyn DirectoryWatch>) {
-        lock(&self.inner).watcher = Some(watcher);
+        let mut state = self
+            .inner
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.watcher = Some(watcher);
+        state.registered.clear();
     }
 }

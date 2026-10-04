@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +125,7 @@ pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<
     match event {
         WatchEvent::Modified(paths) | WatchEvent::Changed(paths) => {
             let mut affected = Vec::new();
+            let mut seen = HashSet::new();
             for path in paths {
                 let invalidated = if include_parent {
                     cache.invalidate_path(&path)
@@ -131,7 +133,7 @@ pub(crate) fn apply_watch_event(cache: &ProjectCache, event: WatchEvent) -> Vec<
                     cache.invalidate_file_contents(&path)
                 };
                 for uri in invalidated {
-                    if !affected.contains(&uri) {
+                    if seen.insert(uri.clone()) {
                         affected.push(uri);
                     }
                 }
@@ -161,17 +163,17 @@ mod tests {
         cache.store_imports(
             claim,
             ImportValue {
-                resolved: pascal_core::ResolvedImports {
+                resolved: std::sync::Arc::new(pascal_core::ResolvedImports {
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
-                },
-                report: pascal_core::ResolutionReport {
+                }),
+                report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],
                     warnings: vec![],
                     complete: true,
                     incomplete_reasons: vec![],
-                },
+                }),
                 probes,
                 watch_dirs: vec![],
             },
@@ -352,17 +354,17 @@ mod tests {
         let context = pascal_project::ProjectContext::default();
         let main = lsp_types::Url::from_file_path(temp.path().join("Main.pas")).unwrap();
         let empty = || ImportValue {
-            resolved: pascal_core::ResolvedImports {
+            resolved: std::sync::Arc::new(pascal_core::ResolvedImports {
                 bindings: vec![],
                 dependencies: vec![],
                 complete: true,
-            },
-            report: pascal_core::ResolutionReport {
+            }),
+            report: std::sync::Arc::new(pascal_core::ResolutionReport {
                 observations: vec![],
                 warnings: vec![],
                 complete: true,
                 incomplete_reasons: vec![],
-            },
+            }),
             probes: vec![Probe::Stamp {
                 path: temp.path().to_path_buf(),
                 expected: pascal_project::path_stamp_result(temp.path())

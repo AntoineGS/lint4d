@@ -160,6 +160,7 @@ fn insert_provider(
     {
         return Insertion::Skipped;
     }
+    loader.lease_cached_parse(&binding.uri, &unit);
     if let Some(record) = path_record_at(
         path,
         Some(stamp.clone()),

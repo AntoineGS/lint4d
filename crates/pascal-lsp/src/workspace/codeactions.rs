@@ -4105,7 +4105,7 @@ fn interface_post_edit_proves_obligation(
     proof_input.overlays.insert(
         uri.clone(),
         OverlayInput {
-            text: updated_source.clone(),
+            text: updated_source.as_str().into(),
             version: target_record.version.unwrap_or_default(),
         },
     );
@@ -4264,7 +4264,7 @@ fn missing_unit_binding_proof(
     proof_input.overlays.insert(
         uri.clone(),
         OverlayInput {
-            text: updated_source.clone(),
+            text: updated_source.as_str().into(),
             version: target_record.version.unwrap_or_default(),
         },
     );

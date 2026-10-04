@@ -1876,7 +1876,7 @@ fn expected_renamed_document_text(
 
 #[derive(Debug)]
 struct OpenDocument {
-    text: Option<String>,
+    text: Option<Arc<str>>,
     version: i32,
     rejection: Option<String>,
     /// Source-generation watermark for this particular open-document
@@ -2334,7 +2334,7 @@ pub(crate) struct CompiledContentSnapshot {
     importer_source_hash: u64,
     context_fingerprint: u64,
     context: ContextState,
-    open_source: Option<String>,
+    open_source: Option<Arc<str>>,
     unit: AuthorizedCompiledUnit,
 }
 
@@ -2349,7 +2349,7 @@ impl CompiledContentSnapshot {
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.context.retained_payload_bytes())
-            .saturating_add(self.open_source.as_ref().map_or(0, String::len))
+            .saturating_add(self.open_source.as_ref().map_or(0, |source| source.len()))
             .saturating_add(self.unit.retained_payload_bytes())
             .saturating_add(self.uri.as_str().len())
             .saturating_add(self.importer.as_str().len())
@@ -2749,6 +2749,12 @@ pub struct Workspace {
     index: NavigationIndex,
     cached_documents: HashMap<Url, rename::CachedDocument>,
     open_documents: HashMap<Url, OpenDocument>,
+    /// The last map built by `overlay_inputs`, reused while it matches.
+    overlay_inputs: Mutex<Option<Arc<HashMap<Url, rename::OverlayInput>>>>,
+    /// Leases on cached parses this request workspace keeps in its index.
+    /// Leases on cached parses this request workspace keeps in its index, by
+    /// URI. Removing or replacing a URI's parse drops its lease.
+    cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
     rejected_open_fence_uris: HashSet<Url>,
     rejected_open_fence_permanent: bool,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
@@ -3253,6 +3259,7 @@ impl Workspace {
         self.include_parents.clear();
 
         self.index = NavigationIndex::new();
+        self.cache_leases.clear();
         self.indexed_files.clear();
         self.indexed_sizes.clear();
         self.indexed_content_hashes.clear();
@@ -4010,8 +4017,11 @@ impl Workspace {
             return Ok(());
         }
 
-        let previous_text_len = previous_text.as_ref().map_or(0, String::len);
-        let mut candidate = previous_text.unwrap_or_default();
+        let previous_text_len = previous_text.as_deref().map_or(0, str::len);
+        let mut candidate = previous_text
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_default();
         let mut full_replacement_seen = false;
         for change in changes {
             let Some(range) = change.range else {
@@ -4241,7 +4251,8 @@ impl Workspace {
         self.bump_source_generation();
         self.mark_source_change(&uri, !had_overlay);
         let text_len = text.len();
-        let source_for_index = text.clone();
+        let shared_text = Arc::<str>::from(text.as_str());
+        let source_for_index = text;
         if let Some(previous) = self.open_documents.get(&uri)
             && let Some(previous_text) = &previous.text
         {
@@ -4260,7 +4271,7 @@ impl Workspace {
         self.open_documents.insert(
             uri.clone(),
             OpenDocument {
-                text: Some(text),
+                text: Some(shared_text),
                 version,
                 rejection: None,
                 identity_generation,
@@ -4315,8 +4326,8 @@ impl Workspace {
         let previous_open_bytes = self
             .open_documents
             .get(uri)
-            .and_then(|document| document.text.as_ref())
-            .map_or(0, String::len);
+            .and_then(|document| document.text.as_deref())
+            .map_or(0, str::len);
         self.validate_candidate_text(uri, previous_open_bytes, text.len())
     }
 
@@ -4361,8 +4372,8 @@ impl Workspace {
         let previous = self
             .open_documents
             .get(uri)
-            .and_then(|document| document.text.as_ref())
-            .map_or(0, String::len);
+            .and_then(|document| document.text.as_deref())
+            .map_or(0, str::len);
         self.open_text_bytes
             .saturating_sub(previous)
             .saturating_add(incoming_len)
@@ -5089,6 +5100,7 @@ impl Workspace {
         self.pending_unit_file_rename_bytes = 0;
         budget.charge_recovery_work(self.index.document_count(), 0)?;
         self.index = NavigationIndex::new();
+        self.cache_leases.clear();
         self.indexed_bytes = 0;
         self.file_cap_warning_sent = false;
         self.total_cap_warning_sent = false;
@@ -6178,7 +6190,8 @@ impl Workspace {
             }
             document
                 .text
-                .clone()
+                .as_deref()
+                .map(str::to_owned)
                 .expect("accepted open documents retain their text")
         } else {
             let entry = context_path_entry(&context, &path)
@@ -6591,7 +6604,7 @@ impl Workspace {
                 return Err(format!("document rejected: {uri}"));
             };
             self.record_open_analysis_source(uri, &source, version);
-            source
+            source.to_string()
         } else {
             let entry = context_path_entry(&context, &path)
                 .or_else(|| {
@@ -6994,8 +7007,8 @@ impl Workspace {
         let (resolved, cached_report, cached_probes, import_claim, mut resolver) =
             match import_lookup {
                 crate::project_cache::Lookup::Hit(hit) => (
-                    hit.resolved.clone(),
-                    Some(hit.report.clone()),
+                    std::sync::Arc::clone(&hit.resolved),
+                    Some(std::sync::Arc::clone(&hit.report)),
                     Some(hit.probes.clone()),
                     None,
                     None,
@@ -7057,17 +7070,22 @@ impl Workspace {
                                 error.to_string()
                             }
                         })?;
-                    (resolved, None, None, Some(claim), Some(resolver))
+                    (
+                        std::sync::Arc::new(resolved),
+                        None,
+                        None,
+                        Some(claim),
+                        Some(resolver),
+                    )
                 }
                 crate::project_cache::Lookup::Cancelled => {
                     return Err(CANCELLATION_MESSAGE.to_string());
                 }
             };
-        let resolved_for_cache = import_claim.as_ref().map(|_| resolved.clone());
-        let import_bytes = resolved_for_cache
+        let resolved_for_cache = import_claim
             .as_ref()
-            .map(crate::project_cache::import_value_bytes);
-        let mut dependency_units = resolved.dependencies;
+            .map(|_| std::sync::Arc::clone(&resolved));
+        let mut dependency_units = resolved.dependencies.iter().collect::<Vec<_>>();
         if self.dependency_hook.is_some() {
             // Warm workspace units before library units: they are small and
             // are where navigation usually lands.
@@ -7192,10 +7210,12 @@ impl Workspace {
         check_workspace_cancel(cancel)?;
         let report = match cached_report {
             Some(report) => report,
-            None => resolver
-                .take()
-                .expect("a resolver is present when imports were computed")
-                .finish(),
+            None => std::sync::Arc::new(
+                resolver
+                    .take()
+                    .expect("a resolver is present when imports were computed")
+                    .finish(),
+            ),
         };
         let rejected_dependency = report
             .warnings
@@ -7226,22 +7246,18 @@ impl Workspace {
                 interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
             self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
         }
-        if graph_complete
-            && let (Some(claim), Some(resolved), Some(bytes)) =
-                (import_claim, resolved_for_cache, import_bytes)
+        if graph_complete && let (Some(claim), Some(resolved)) = (import_claim, resolved_for_cache)
         {
             let (probes, watch_dirs) = crate::project_cache::report_probes(&report, &resolved);
-            self.project_cache.store_imports(
-                claim,
-                crate::project_cache::ImportValue {
-                    resolved,
-                    report: report.clone(),
-                    probes,
-                    watch_dirs,
-                },
-                bytes,
-                cancel.unwrap_or(&no_cancel),
-            );
+            let value = crate::project_cache::ImportValue {
+                resolved,
+                report: std::sync::Arc::clone(&report),
+                probes,
+                watch_dirs,
+            };
+            let bytes = value.retained_bytes();
+            self.project_cache
+                .store_imports(claim, value, bytes, cancel.unwrap_or(&no_cancel));
         }
 
         // Source providers resolved above always win. Only unresolved imports
@@ -7654,7 +7670,8 @@ impl Workspace {
             }
             let indexed = self.index_source_with_budget(
                 uri,
-                source.clone(),
+                source.to_string(),
+                None,
                 None,
                 None,
                 context_key,
@@ -7699,14 +7716,24 @@ impl Workspace {
             }
             return Ok(true);
         }
-        let source = match read_disk_source_with_budget(
-            &path,
-            self.options.limits.max_file_bytes,
-            &context.read_policy,
-            &entry,
-            verified_legacy_payload,
-            cancel,
-            budget,
+        let cached_source = if verified_legacy_payload {
+            None
+        } else {
+            self.cached_closed_source(uri, &path, &context, &current_stamp, cancel, budget)?
+        };
+        let source = match cached_source.map_or_else(
+            || {
+                read_disk_source_with_budget(
+                    &path,
+                    self.options.limits.max_file_bytes,
+                    &context.read_policy,
+                    &entry,
+                    verified_legacy_payload,
+                    cancel,
+                    budget,
+                )
+            },
+            Ok,
         ) {
             Ok(source) => source,
             Err(error)
@@ -7732,6 +7759,7 @@ impl Workspace {
             text.clone(),
             Some(bytes),
             Some(content_hash),
+            Some(&stamp),
             context_key,
             pinned,
             cancel,
@@ -7782,6 +7810,7 @@ impl Workspace {
             source,
             disk_size,
             raw_content_hash,
+            None,
             context_key,
             pinned,
             cancel,
@@ -7796,6 +7825,7 @@ impl Workspace {
         source: String,
         disk_size: Option<usize>,
         raw_content_hash: Option<u64>,
+        disk_stamp: Option<&DiskStamp>,
         context_key: &ContextKey,
         pinned: &HashSet<Url>,
         cancel: Option<&AtomicBool>,
@@ -7936,6 +7966,11 @@ impl Workspace {
             self.warn(format!("cannot index {uri}: {error}"));
             return Ok(false);
         }
+        // The index now holds this source's new parse; an older lease is stale.
+        self.cache_leases.remove(uri);
+        if let Some(unit) = &cached_unit {
+            self.lease_cached_parse(uri, unit);
+        }
         check_workspace_cancel(cancel)?;
         let cached_expansion = if claim.is_some() {
             expansion.clone()
@@ -7961,6 +7996,17 @@ impl Workspace {
         }
         self.index.clear_import_bindings(uri);
         self.touch(uri);
+        // The parse holds the expanded text when includes were expanded, so
+        // the disk origin then keeps its own copy of the file text.
+        let disk_origin = match (&claim, disk_stamp, disk_size) {
+            (Some(_), Some(stamp), Some(raw_bytes)) => stamp.modified.map(|modified| {
+                let text = expansion
+                    .as_ref()
+                    .map(|_| std::sync::Arc::<str>::from(source.as_str()));
+                (stamp.bytes, modified, raw_bytes, text)
+            }),
+            _ => None,
+        };
         if let Some(expansion) = expansion {
             self.store_expansion_with_control(uri, context_key, source, expansion, cancel, budget)?;
             let context = self
@@ -7984,33 +8030,142 @@ impl Workspace {
                 .as_ref()
                 .map(crate::project_cache::expansion_probes)
                 .unwrap_or_default();
-            self.project_cache.store_unit(
-                claim,
-                crate::project_cache::UnitValue {
-                    parsed,
-                    expansion: cached_expansion.map(std::sync::Arc::new),
-                    probes,
-                },
-                crate::project_cache::unit_value_bytes(indexed_source.len()),
-                cancel.unwrap_or(&lookup_cancel),
-            );
+            let disk = disk_origin.map(|(len, modified, raw_bytes, text)| {
+                crate::project_cache::DiskOrigin {
+                    len,
+                    modified,
+                    raw_bytes,
+                    text: text.unwrap_or_else(|| parsed.source_text().clone()),
+                }
+            });
+            let value = crate::project_cache::UnitValue {
+                parsed,
+                expansion: cached_expansion.map(std::sync::Arc::new),
+                probes,
+                disk,
+            };
+            let bytes = value.retained_bytes();
+            let parsed = value.parsed.clone();
+            self.project_cache
+                .store_unit(claim, value, bytes, cancel.unwrap_or(&lookup_cancel));
+            if self.cache_epoch.is_some()
+                && let Some(lease) = self.project_cache.lease_stored_parse(&parsed, bytes)
+            {
+                self.cache_leases.insert(uri.clone(), lease);
+            }
         }
         Ok(true)
     }
 
-    fn overlay_inputs(&self) -> HashMap<Url, rename::OverlayInput> {
-        self.open_documents
-            .iter()
-            .filter_map(|(uri, document)| {
-                Some((
-                    canonical_file_uri(uri),
-                    rename::OverlayInput {
-                        text: document.text.clone()?,
-                        version: document.version,
-                    },
-                ))
-            })
-            .collect()
+    /// The text of a closed source whose cached parse was read from a file
+    /// with `stamp`, so a warm load needs no read or decode. Symlinks and
+    /// oversized files take the full read path, which checks them.
+    fn cached_closed_source(
+        &self,
+        uri: &Url,
+        path: &Path,
+        context: &ProjectContext,
+        stamp: &DiskStamp,
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Option<DiskSource>, String> {
+        let Some(modified) = stamp.modified else {
+            return Ok(None);
+        };
+        if stamp.bytes > self.options.limits.max_file_bytes as u64 {
+            return Ok(None);
+        }
+        // Charged like the read path's own symlink check.
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
+        if fs::symlink_metadata(path).map_or(true, |metadata| metadata.file_type().is_symlink()) {
+            return Ok(None);
+        }
+        let Some((unit, content_hash)) = self.project_cache.peek_unit_from_disk(
+            uri,
+            context,
+            stamp.bytes,
+            modified,
+            &self.overlay_inputs(),
+        ) else {
+            return Ok(None);
+        };
+        let Some(origin) = unit.disk.as_ref() else {
+            return Ok(None);
+        };
+        if origin.text.len() > self.options.limits.max_file_bytes {
+            return Ok(None);
+        }
+        Ok(Some(DiskSource {
+            text: origin.text.to_string(),
+            bytes: origin.raw_bytes,
+            stamp: stamp.clone(),
+            content_hash,
+        }))
+    }
+
+    /// Request workspaces lease the cached parses they keep, so the cache
+    /// keeps charging them after eviction. The long-lived workspace does not:
+    /// its index is bounded by its own source limits.
+    pub(super) fn lease_cached_parse(&mut self, uri: &Url, unit: &crate::project_cache::UnitValue) {
+        if self.cache_epoch.is_some()
+            && self
+                .index
+                .parsed_document(uri)
+                .is_some_and(|parsed| Arc::ptr_eq(&parsed, &unit.parsed))
+        {
+            self.cache_leases
+                .insert(uri.clone(), self.project_cache.lease_unit(unit));
+        }
+    }
+
+    /// Open-document overlays for cache probes and lookups. The map is
+    /// rebuilt only when an open document's text or version changed since
+    /// the last call, and its text is always shared with the open document.
+    fn overlay_inputs(&self) -> Arc<HashMap<Url, rename::OverlayInput>> {
+        let mut cached = self
+            .overlay_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(overlays) = cached.as_ref()
+            && self.overlays_are_current(overlays)
+        {
+            return overlays.clone();
+        }
+        let overlays = Arc::new(
+            self.open_documents
+                .iter()
+                .filter_map(|(uri, document)| {
+                    Some((
+                        canonical_file_uri(uri),
+                        rename::OverlayInput {
+                            text: document.text.clone()?,
+                            version: document.version,
+                        },
+                    ))
+                })
+                .collect::<HashMap<_, _>>(),
+        );
+        *cached = Some(overlays.clone());
+        overlays
+    }
+
+    fn overlays_are_current(&self, overlays: &HashMap<Url, rename::OverlayInput>) -> bool {
+        let mut open = 0usize;
+        self.open_documents.iter().all(|(uri, document)| {
+            let Some(text) = &document.text else {
+                return true;
+            };
+            open += 1;
+            overlays
+                .get(uri)
+                .or_else(|| overlays.get(&canonical_file_uri(uri)))
+                .is_some_and(|overlay| {
+                    overlay.version == document.version && Arc::ptr_eq(&overlay.text, text)
+                })
+        }) && open == overlays.len()
     }
 
     fn include_expansion_limits(&self) -> ExpansionLimits {
@@ -8235,7 +8390,7 @@ impl Workspace {
                         .map(|source| (source.clone(), document.version))
                 })
             {
-                if open_source != source {
+                if *open_source != *source {
                     return Err(format!("include source {uri} changed during diagnostics"));
                 }
                 self.record_open_analysis_source(&uri, &open_source, open_version);
@@ -8336,7 +8491,7 @@ impl Workspace {
                     .as_ref()
                     .map(|source| (source.clone(), document.version))
             }) {
-                if source != dependency.text {
+                if *source != *dependency.text {
                     return Err(format!(
                         "include source {uri} changed during document-link resolution"
                     ));
@@ -8563,7 +8718,7 @@ impl Workspace {
         if let Some(document) = self.open_documents.get(uri)
             && let Some(text) = &document.text
         {
-            return Some(text.clone());
+            return Some(text.to_string());
         }
         if let Some(expansion) = self.expansions.get(uri) {
             return Some(expansion.physical_source.clone());
@@ -10694,6 +10849,7 @@ impl Workspace {
                 }
             }
             self.index.remove(uri);
+            self.cache_leases.remove(uri);
             self.indexed_files.remove(uri);
             self.last_used.remove(uri);
             self.document_contexts.remove(uri);
@@ -10860,6 +11016,7 @@ impl Workspace {
                 }
             }
             self.index.remove(uri);
+            self.cache_leases.remove(uri);
             self.indexed_files.remove(uri);
             self.last_used.remove(uri);
             self.document_contexts.remove(uri);
@@ -12512,6 +12669,7 @@ impl Workspace {
         }
         self.remove_expansion_with_control(uri, cancel, budget)?;
         self.index.remove(uri);
+        self.cache_leases.remove(uri);
         self.indexed_files.remove(uri);
         self.last_used.remove(uri);
         self.document_contexts.remove(uri);
@@ -13506,10 +13664,10 @@ impl Workspace {
             ) else {
                 continue;
             };
-            let Some(&start) = normalized.raw_offsets.get(normalized_range.start) else {
+            let Some(start) = normalized.raw_offset(normalized_range.start) else {
                 continue;
             };
-            let Some(&end) = normalized.raw_offsets.get(normalized_range.end) else {
+            let Some(end) = normalized.raw_offset(normalized_range.end) else {
                 continue;
             };
             if start >= end {
@@ -13919,7 +14077,7 @@ impl Workspace {
                 &mut expansion,
                 &conditional,
             );
-            self.store_expansion(&root_uri, &context_key, source, expansion);
+            self.store_expansion(&root_uri, &context_key, source.to_string(), expansion);
             self.record_expansion_analysis_sources(&root_uri, &context, cancel)?;
         }
         Ok(())
@@ -14694,41 +14852,46 @@ impl<'a> DiagnosticLineIndex<'a> {
 
 struct NormalizedSource {
     text: String,
-    /// For every byte boundary in `text`, the corresponding byte boundary in
-    /// the original source.  CRLF therefore maps one normalized byte to two
-    /// physical bytes while all other UTF-8 scalars retain their boundaries.
-    raw_offsets: Vec<usize>,
+    /// Offsets in `text` of each `\n` that replaced a CRLF pair, ascending.
+    /// Every other byte keeps its width, so a normalized offset maps to the
+    /// original source by adding the number of pairs that end before it.
+    collapsed_pairs: Vec<usize>,
+}
+
+impl NormalizedSource {
+    /// The byte boundary in the original source for a byte boundary in
+    /// `text`. CRLF maps one normalized byte to two physical bytes.
+    fn raw_offset(&self, offset: usize) -> Option<usize> {
+        (offset <= self.text.len())
+            .then(|| offset + self.collapsed_pairs.partition_point(|&pair| pair < offset))
+    }
 }
 
 fn normalize_line_endings_with_offsets(source: &str) -> NormalizedSource {
     let bytes = source.as_bytes();
     let mut text = String::with_capacity(source.len());
-    let mut raw_offsets = vec![0];
+    let mut collapsed_pairs = Vec::new();
+    let mut start = 0;
     let mut raw = 0;
     while raw < bytes.len() {
-        if bytes[raw] == b'\r' {
-            text.push('\n');
+        if bytes[raw] != b'\r' {
             raw += 1;
-            if bytes.get(raw) == Some(&b'\n') {
-                raw += 1;
-            }
-            raw_offsets.push(raw);
             continue;
         }
-
-        let character = source[raw..]
-            .chars()
-            .next()
-            .expect("raw offset is inside the source");
-        let width = character.len_utf8();
-        text.push(character);
-        for offset in 1..width {
-            raw_offsets.push(raw + offset);
+        text.push_str(&source[start..raw]);
+        if bytes.get(raw + 1) == Some(&b'\n') {
+            collapsed_pairs.push(text.len());
+            raw += 1;
         }
-        raw += width;
-        raw_offsets.push(raw);
+        text.push('\n');
+        raw += 1;
+        start = raw;
     }
-    NormalizedSource { text, raw_offsets }
+    text.push_str(&source[start..]);
+    NormalizedSource {
+        text,
+        collapsed_pairs,
+    }
 }
 
 fn normalize_line_endings(source: &str) -> String {
@@ -14856,6 +15019,8 @@ fn read_disk_source_with_budget(
         ));
     }
 
+    #[cfg(test)]
+    resolver::record_test_disk_read(path);
     let bytes = if allow_legacy_payload {
         read_policy.read_legacy_payload_bytes(entry, max_bytes as u64)
     } else {
@@ -14895,6 +15060,8 @@ fn closed_source_content_hash(
     read_policy: &pascal_project::ReadPolicy,
     entry: &ProjectPathEntry,
 ) -> u64 {
+    #[cfg(test)]
+    resolver::record_test_disk_read(&entry.path);
     let bytes = if matches!(entry.provenance, ProjectPathProvenance::LegacyNative) {
         read_policy.read_legacy_payload_bytes(entry, max_bytes as u64)
     } else {
@@ -15987,7 +16154,7 @@ mod tests {
             workspace.open_documents.insert(
                 uri.clone(),
                 OpenDocument {
-                    text: Some(text.to_owned()),
+                    text: Some(text.into()),
                     version: 4,
                     rejection: None,
                     identity_generation: 9,
@@ -16614,7 +16781,7 @@ mod tests {
             workspace.open_documents.insert(
                 consumer_uri.clone(),
                 OpenDocument {
-                    text: Some("unit Consumer; interface implementation end.".to_owned()),
+                    text: Some("unit Consumer; interface implementation end.".into()),
                     version: 1,
                     rejection: None,
                     identity_generation: 0,
@@ -16710,7 +16877,7 @@ mod tests {
         workspace.open_documents.insert(
             consumer_uri.clone(),
             OpenDocument {
-                text: Some("unit Consumer; interface implementation end.".to_owned()),
+                text: Some("unit Consumer; interface implementation end.".into()),
                 version: 1,
                 rejection: None,
                 identity_generation: 0,
@@ -16976,6 +17143,92 @@ mod tests {
         let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
 
         assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn a_request_that_drops_a_leased_parse_releases_it_and_its_charge() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        let cache = fixture.workspace.project_cache().clone();
+        let mut worker = worker_view(&fixture.workspace);
+        worker
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm from the cache");
+        let parsed = std::sync::Arc::downgrade(
+            &worker
+                .index
+                .parsed_document(&fixture.derived)
+                .expect("Derived indexed from its cached parse"),
+        );
+
+        cache.invalidate_after_overflow();
+        let held = cache.stats().outstanding_bytes;
+        assert!(held > 0, "the request still holds Derived's parse");
+
+        worker.remove_indexed(&fixture.derived);
+        assert!(
+            parsed.upgrade().is_none(),
+            "nothing keeps a parse both the request and the cache dropped"
+        );
+        assert!(
+            cache.stats().outstanding_bytes < held,
+            "dropping the parse releases its charge"
+        );
+        drop(worker);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    #[test]
+    fn parses_a_cold_request_stores_stay_charged_while_it_keeps_them() {
+        let fixture = inherited_fixture("Base");
+        let cache = fixture.workspace.project_cache().clone();
+        let mut worker = worker_view(&fixture.workspace);
+        worker
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("cold warm");
+        assert!(
+            cache
+                .ready_layers(&fixture.derived)
+                .contains(&"Unit".to_string())
+        );
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+
+        cache.invalidate_after_overflow();
+        assert!(
+            cache.stats().outstanding_bytes
+                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            "the worker still holds the parses it stored"
+        );
+        drop(worker);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    #[test]
+    fn parses_a_snapshot_took_from_the_cache_stay_charged_after_eviction() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        let cache = fixture.workspace.project_cache().clone();
+        let snapshot = fixture.snapshot();
+        assert!(
+            snapshot.declaration_providers.contains(&fixture.base),
+            "the closure walk inserts Base's cached parse: {:?}",
+            snapshot.declaration_providers
+        );
+        assert_eq!(
+            cache.stats().outstanding_bytes,
+            0,
+            "cached parses are charged once"
+        );
+
+        cache.invalidate_after_overflow();
+        let held = cache.stats().outstanding_bytes;
+        assert!(
+            held >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            "the snapshot still holds Base's parse: {held} bytes charged"
+        );
+
+        drop(snapshot);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
     }
 
     #[test]
@@ -19117,6 +19370,162 @@ mod tests {
         super::test_reset_import_resolution_count();
         worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
         assert_eq!(super::test_import_resolution_count(), 0);
+    }
+
+    #[test]
+    fn open_document_text_is_shared_by_inputs_workers_and_lookups() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uris = (0..50)
+            .map(|index| Url::from_file_path(temp.path().join(format!("U{index}.pas"))).unwrap())
+            .collect::<Vec<_>>();
+        for (index, uri) in uris.iter().enumerate() {
+            workspace
+                .open_document(
+                    uri.clone(),
+                    format!("unit U{index};\ninterface\nimplementation\nend.\n"),
+                    1,
+                )
+                .expect("open");
+        }
+        let text = |document: &OpenDocument| document.text.as_deref().unwrap().as_ptr();
+
+        let first = workspace.overlay_inputs();
+        let second = workspace.overlay_inputs();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "one overlay map per revision"
+        );
+        let input = workspace.analysis_input();
+        let worker = Workspace::from_analysis_input(&input);
+        let worker_overlays = worker.overlay_inputs();
+        for uri in &uris {
+            let owned = text(&workspace.open_documents[uri]);
+            for (place, overlays) in [
+                ("first lookup", std::borrow::Borrow::borrow(&first)),
+                ("second lookup", std::borrow::Borrow::borrow(&second)),
+                ("analysis input", &input.overlays),
+                (
+                    "worker lookup",
+                    std::borrow::Borrow::borrow(&worker_overlays),
+                ),
+            ] {
+                assert_eq!(overlays[uri].text.as_ptr(), owned, "{place} copied {uri}");
+            }
+            assert_eq!(
+                text(&worker.open_documents[uri]),
+                owned,
+                "worker copied {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_inputs_follow_document_changes() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uri = Url::from_file_path(temp.path().join("A.pas")).unwrap();
+        workspace
+            .open_document(uri.clone(), "unit A;\nend.\n".to_string(), 1)
+            .expect("open");
+        let before = workspace.overlay_inputs();
+
+        workspace
+            .change_document(uri.clone(), "unit A;\n\nend.\n".to_string(), 2)
+            .expect("change");
+        let changed = workspace.overlay_inputs();
+        assert_eq!(&*changed[&uri].text, "unit A;\n\nend.\n");
+        assert_eq!(changed[&uri].version, 2);
+        assert_eq!(
+            &*before[&uri].text, "unit A;\nend.\n",
+            "old maps stay valid"
+        );
+
+        workspace.advance_document_version(&uri, 3);
+        assert_eq!(workspace.overlay_inputs()[&uri].version, 3);
+
+        workspace.close_document(&uri);
+        assert!(workspace.overlay_inputs().is_empty());
+    }
+
+    #[test]
+    fn the_warm_closed_source_check_charges_its_stat_and_honours_cancellation() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, _) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+        let mut worker = worker_view(&main);
+        let context_key = worker
+            .context_for_uri_with_cancel(&main_uri, None)
+            .expect("context");
+        let context = worker.contexts[&context_key].context.clone();
+        let path = main_uri.to_file_path().unwrap();
+        let stamp = super::disk_stamp(&path).expect("stamp");
+
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        let cached = worker
+            .cached_closed_source(&main_uri, &path, &context, &stamp, None, Some(&budget))
+            .expect("warm check");
+        assert!(cached.is_some(), "the first navigation cached Main");
+        assert_eq!(budget.used.get().filesystem_path_visits, 1);
+
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            worker
+                .cached_closed_source(&main_uri, &path, &context, &stamp, Some(&cancelled), None)
+                .err()
+                .as_deref(),
+            Some(super::CANCELLATION_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn second_definition_on_a_closed_unit_reads_no_files() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, provider_uri) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let definition = || {
+            super::queries::navigation_from_input(
+                main.analysis_input(),
+                &main_uri,
+                Position::new(6, 2),
+                NavigationTarget::Definition,
+                &AtomicBool::new(false),
+            )
+            .value
+            .expect("definition")
+            .locations
+        };
+        let first = definition();
+        assert_eq!(
+            first.first().map(|location| &location.uri),
+            Some(&provider_uri)
+        );
+        assert!(!super::resolver::take_test_disk_reads().is_empty());
+
+        let second = definition();
+        assert_eq!(second, first);
+        assert_eq!(
+            super::resolver::take_test_disk_reads(),
+            Vec::<PathBuf>::new(),
+            "a warm definition request must not read sources again"
+        );
+
+        let main_path = main_uri.to_file_path().unwrap();
+        fs::write(
+            &main_path,
+            "unit Main;\ninterface\nuses Provider;\nimplementation\nprocedure Run;\nbegin\n  Hello; Hello;\nend;\nend.\n",
+        )
+        .unwrap();
+        let edited = definition();
+        assert_eq!(
+            edited.first().map(|location| &location.uri),
+            Some(&provider_uri)
+        );
+        assert!(
+            super::resolver::take_test_disk_reads().contains(&main_path),
+            "a changed stamp must read the file"
+        );
     }
 
     #[test]
@@ -21882,17 +22291,17 @@ BDS = '/fake/37'
         workspace.project_cache.store_imports(
             claim,
             crate::project_cache::ImportValue {
-                resolved: pascal_core::ResolvedImports {
+                resolved: std::sync::Arc::new(pascal_core::ResolvedImports {
                     bindings: vec![],
                     dependencies: vec![],
                     complete: true,
-                },
-                report: pascal_core::ResolutionReport {
+                }),
+                report: std::sync::Arc::new(pascal_core::ResolutionReport {
                     observations: vec![],
                     warnings: vec![],
                     complete: true,
                     incomplete_reasons: vec![],
-                },
+                }),
                 probes: vec![],
                 watch_dirs: vec![],
             },
@@ -22207,7 +22616,7 @@ BDS = '/fake/37'
         overlays.insert(
             uri.clone(),
             super::rename::OverlayInput {
-                text: overlay_source.to_owned(),
+                text: overlay_source.into(),
                 version: 7,
             },
         );
@@ -22779,7 +23188,7 @@ BDS = '/fake/37'
             .analysis_input()
             .overlays
             .get(uri)
-            .map(|overlay| overlay.text.clone())
+            .map(|overlay| overlay.text.to_string())
     }
 
     #[test]
@@ -23416,6 +23825,82 @@ BDS = '/fake/37'
         };
 
         assert!(!owner.has_legacy_route(Path::new("/external/helper.pas")));
+    }
+
+    /// The per-byte map `normalize_line_endings_with_offsets` used to build,
+    /// kept as the oracle for the sparse one.
+    fn per_byte_normalized_offsets(source: &str) -> (String, Vec<usize>) {
+        let bytes = source.as_bytes();
+        let mut text = String::new();
+        let mut raw_offsets = vec![0];
+        let mut raw = 0;
+        while raw < bytes.len() {
+            if bytes[raw] == b'\r' {
+                text.push('\n');
+                raw += 1;
+                if bytes.get(raw) == Some(&b'\n') {
+                    raw += 1;
+                }
+                raw_offsets.push(raw);
+                continue;
+            }
+            let character = source[raw..].chars().next().unwrap();
+            text.push(character);
+            for offset in 1..character.len_utf8() {
+                raw_offsets.push(raw + offset);
+            }
+            raw += character.len_utf8();
+            raw_offsets.push(raw);
+        }
+        (text, raw_offsets)
+    }
+
+    fn normalized_raw_offset(normalized: &super::NormalizedSource, offset: usize) -> Option<usize> {
+        normalized.raw_offset(offset)
+    }
+
+    fn normalized_map_bytes(normalized: &super::NormalizedSource) -> usize {
+        normalized.collapsed_pairs.capacity() * std::mem::size_of::<usize>()
+    }
+
+    #[test]
+    fn sparse_line_ending_map_agrees_with_per_byte_map() {
+        const PIECES: [&str; 8] = ["a", "\n", "\r", "\r\n", "é", "中", "😀", "\r\r\n"];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..400 {
+            let mut source = String::new();
+            for _ in 0..round % 40 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                source.push_str(PIECES[(state % PIECES.len() as u64) as usize]);
+            }
+            let (text, raw_offsets) = per_byte_normalized_offsets(&source);
+            let normalized = super::normalize_line_endings_with_offsets(&source);
+            assert_eq!(normalized.text, text, "{source:?}");
+            for offset in 0..=text.len() + 1 {
+                assert_eq!(
+                    normalized_raw_offset(&normalized, offset),
+                    raw_offsets.get(offset).copied(),
+                    "offset {offset} in {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lf_only_line_ending_map_allocates_nothing_per_byte() {
+        // 8 MiB keeps the default test run light; a per-byte map would
+        // already be 64 MiB here.
+        let source = format!("{}\n", "x".repeat(99)).repeat(8 * 1024 * 1024 / 100);
+        let normalized = super::normalize_line_endings_with_offsets(&source);
+        assert_eq!(normalized.text.len(), source.len());
+        assert!(
+            normalized_map_bytes(&normalized) < 1024 * 1024,
+            "{} map bytes for {} source bytes",
+            normalized_map_bytes(&normalized),
+            source.len()
+        );
     }
 
     #[test]

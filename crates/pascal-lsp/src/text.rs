@@ -146,8 +146,9 @@ pub fn offset_to_position(source: &str, offset: usize) -> Option<Position> {
 /// Cached byte and UTF-16 offsets for one source document.
 ///
 /// Symbol requests convert many declaration spans from one immutable source.
-/// Keeping line boundaries and per-line UTF-16 prefixes avoids rescanning the
-/// complete prefix of the source for every span.
+/// Keeping line boundaries avoids rescanning the complete prefix of the
+/// source for every span. Byte and UTF-16 offsets agree on ASCII text, so
+/// only lines with non-ASCII scalars keep a list of corrections.
 #[derive(Debug, Clone)]
 pub(crate) struct PositionIndex {
     source_len: usize,
@@ -166,11 +167,21 @@ thread_local! {
 struct IndexedLine {
     start: usize,
     end: usize,
-    break_start: usize,
-    break_end: usize,
-    byte_offsets: Vec<usize>,
-    utf16_offsets: Vec<usize>,
+    /// One entry per non-ASCII scalar on the line, in order. Empty for ASCII
+    /// lines.
+    corrections: Box<[Correction]>,
 }
+
+/// A non-ASCII scalar: where it ends, relative to the line start, and how
+/// many more UTF-8 bytes than UTF-16 units the line has used up to there.
+#[derive(Debug, Clone, Copy)]
+struct Correction {
+    byte_end: usize,
+    excess: usize,
+}
+
+/// Cancellation is checked once per this many scanned bytes.
+const CANCEL_CHECK_BYTES: usize = 4096;
 
 impl PositionIndex {
     pub(crate) fn owned_bytes_upper_bound_with_cancel(
@@ -178,39 +189,29 @@ impl PositionIndex {
         cancel: &AtomicBool,
     ) -> Result<usize, ()> {
         let mut line_count = 1usize;
-        let mut content_char_count = 0usize;
+        let mut non_ascii_count = 0usize;
         let bytes = source.as_bytes();
         let mut index = 0usize;
         while index < bytes.len() {
-            if is_cancelled(Some(cancel)) {
+            if index.is_multiple_of(CANCEL_CHECK_BYTES) && is_cancelled(Some(cancel)) {
                 return Err(());
             }
-            let break_len = match bytes[index] {
-                b'\n' => 1,
-                b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
-                b'\r' => 1,
-                _ => {
-                    let width = source[index..].chars().next().ok_or(())?.len_utf8();
-                    content_char_count = content_char_count.saturating_add(1);
-                    index = index.saturating_add(width);
-                    continue;
+            match bytes[index] {
+                b'\n' => line_count = line_count.saturating_add(1),
+                b'\r' if bytes.get(index + 1) != Some(&b'\n') => {
+                    line_count = line_count.saturating_add(1);
                 }
-            };
-            line_count = line_count.saturating_add(1);
-            index = index.saturating_add(break_len);
+                byte if !byte.is_ascii() && source.is_char_boundary(index) => {
+                    non_ascii_count = non_ascii_count.saturating_add(1);
+                }
+                _ => {}
+            }
+            index += 1;
         }
+        // The line vector may grow to twice its final length while building.
         Ok(line_count
-            .saturating_mul(std::mem::size_of::<IndexedLine>())
-            .saturating_add(
-                content_char_count
-                    .saturating_add(line_count)
-                    .saturating_mul(std::mem::size_of::<usize>() * 2),
-            )
-            .saturating_add(
-                line_count
-                    .saturating_mul(2)
-                    .saturating_mul(2 * std::mem::size_of::<usize>()),
-            )
+            .saturating_mul(2 * std::mem::size_of::<IndexedLine>())
+            .saturating_add(non_ascii_count.saturating_mul(std::mem::size_of::<Correction>()))
             .saturating_add(2 * std::mem::size_of::<usize>()))
     }
 
@@ -225,62 +226,59 @@ impl PositionIndex {
     }
 
     fn build(source: &str, cancel: Option<&AtomicBool>) -> Result<Self, ()> {
-        let bytes = source.as_bytes();
-        let mut line_count = 1usize;
-        let mut line_scan = 0usize;
-        while line_scan < bytes.len() {
-            if is_cancelled(cancel) {
-                return Err(());
-            }
-            let break_len = match bytes[line_scan] {
-                b'\n' => 1,
-                b'\r' if bytes.get(line_scan + 1) == Some(&b'\n') => 2,
-                b'\r' => 1,
-                _ => {
-                    line_scan += 1;
-                    continue;
-                }
-            };
-            line_count = line_count.saturating_add(1);
-            line_scan += break_len;
+        if is_cancelled(cancel) {
+            return Err(());
         }
-        let mut lines = Vec::with_capacity(line_count);
+        let bytes = source.as_bytes();
+        let mut lines = Vec::new();
+        let mut corrections = Vec::new();
+        let mut excess = 0usize;
         let mut start = 0;
         let mut index = 0;
+        let mut next_check = CANCEL_CHECK_BYTES;
 
         while index < bytes.len() {
-            if is_cancelled(cancel) {
-                return Err(());
+            if index >= next_check {
+                if is_cancelled(cancel) {
+                    return Err(());
+                }
+                next_check = index.saturating_add(CANCEL_CHECK_BYTES);
             }
             let break_len = match bytes[index] {
                 b'\n' => 1,
                 b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
                 b'\r' => 1,
+                byte if !byte.is_ascii() => {
+                    let character = source[index..].chars().next().ok_or(())?;
+                    excess += character.len_utf8() - character.len_utf16();
+                    index += character.len_utf8();
+                    corrections.push(Correction {
+                        byte_end: index - start,
+                        excess,
+                    });
+                    continue;
+                }
                 _ => {
                     index += 1;
                     continue;
                 }
             };
-            lines.push(build_line(
-                source,
+            lines.push(IndexedLine {
                 start,
-                index,
-                index,
-                index + break_len,
-                cancel,
-            )?);
+                end: index,
+                corrections: std::mem::take(&mut corrections).into_boxed_slice(),
+            });
+            excess = 0;
             start = index + break_len;
             index += break_len;
         }
 
-        lines.push(build_line(
-            source,
+        lines.push(IndexedLine {
             start,
-            source.len(),
-            source.len(),
-            source.len(),
-            cancel,
-        )?);
+            end: source.len(),
+            corrections: corrections.into_boxed_slice(),
+        });
+        lines.shrink_to_fit();
         Ok(Self {
             source_len: source.len(),
             lines,
@@ -302,15 +300,18 @@ impl PositionIndex {
         let line = self.lines.get(line_index)?;
         if line.start <= offset && offset <= line.end {
             let relative = offset - line.start;
-            let offset_index = line.byte_offsets.binary_search(&relative).ok()?;
+            let corrected = line
+                .corrections
+                .partition_point(|correction| correction.byte_end <= relative);
+            let excess = corrected
+                .checked_sub(1)
+                .map_or(0, |last| line.corrections[last].excess);
             return Some(Position {
                 line: u32::try_from(line_index).ok()?,
-                character: u32::try_from(line.utf16_offsets[offset_index]).ok()?,
+                character: u32::try_from(relative - excess).ok()?,
             });
         }
-        if line.break_start < offset && offset < line.break_end {
-            return None;
-        }
+        // The offset is inside a line break, such as between CR and LF.
         None
     }
 
@@ -321,47 +322,30 @@ impl PositionIndex {
         let line_index = usize::try_from(position.line).ok()?;
         let character = usize::try_from(position.character).ok()?;
         let line = self.lines.get(line_index)?;
-        let offset_index = line.utf16_offsets.binary_search(&character).ok()?;
-        Some(line.start + line.byte_offsets[offset_index])
+        let corrected = line
+            .corrections
+            .partition_point(|correction| correction.byte_end - correction.excess <= character);
+        let excess = corrected
+            .checked_sub(1)
+            .map_or(0, |last| line.corrections[last].excess);
+        // Between corrections the line is ASCII, so the offset follows the
+        // character; one that lands inside a scalar, including between the
+        // two units of a surrogate pair, is not a position.
+        let offset = line.start.checked_add(character)?.checked_add(excess)?;
+        (offset <= line.end && source.is_char_boundary(offset)).then_some(offset)
     }
 }
 
-fn build_line(
-    source: &str,
-    start: usize,
-    end: usize,
-    break_start: usize,
-    break_end: usize,
-    cancel: Option<&AtomicBool>,
-) -> Result<IndexedLine, ()> {
-    let mut character_count = 0usize;
-    for _character in source[start..end].chars() {
-        if is_cancelled(cancel) {
-            return Err(());
-        }
-        character_count = character_count.saturating_add(1);
+#[cfg(test)]
+impl PositionIndex {
+    fn heap_bytes(&self) -> usize {
+        self.lines.capacity() * std::mem::size_of::<IndexedLine>()
+            + self
+                .lines
+                .iter()
+                .map(|line| line.corrections.len() * std::mem::size_of::<Correction>())
+                .sum::<usize>()
     }
-    let mut byte_offsets = Vec::with_capacity(character_count.saturating_add(1));
-    let mut utf16_offsets = Vec::with_capacity(character_count.saturating_add(1));
-    byte_offsets.push(0);
-    utf16_offsets.push(0);
-    let mut utf16 = 0;
-    for (relative, character) in source[start..end].char_indices() {
-        if is_cancelled(cancel) {
-            return Err(());
-        }
-        utf16 += character.len_utf16();
-        byte_offsets.push(relative + character.len_utf8());
-        utf16_offsets.push(utf16);
-    }
-    Ok(IndexedLine {
-        start,
-        end,
-        break_start,
-        break_end,
-        byte_offsets,
-        utf16_offsets,
-    })
 }
 
 fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
@@ -397,6 +381,153 @@ mod tests {
 
         let cancelled = AtomicBool::new(true);
         assert!(PositionIndex::new_with_cancel(source, &cancelled).is_err());
+    }
+
+    /// The per-character index this module used before the sparse one,
+    /// kept as the oracle for `sparse_index_agrees_with_per_character_index`.
+    struct OldPositionIndex {
+        lines: Vec<OldLine>,
+    }
+
+    struct OldLine {
+        start: usize,
+        end: usize,
+        break_start: usize,
+        break_end: usize,
+        byte_offsets: Vec<usize>,
+        utf16_offsets: Vec<usize>,
+    }
+
+    impl OldPositionIndex {
+        fn new(source: &str) -> Self {
+            let bytes = source.as_bytes();
+            let mut lines = Vec::new();
+            let mut start = 0;
+            let mut index = 0;
+            let line = |start: usize, end: usize, break_end: usize| {
+                let mut byte_offsets = vec![0];
+                let mut utf16_offsets = vec![0];
+                let mut utf16 = 0;
+                for (relative, character) in source[start..end].char_indices() {
+                    utf16 += character.len_utf16();
+                    byte_offsets.push(relative + character.len_utf8());
+                    utf16_offsets.push(utf16);
+                }
+                OldLine {
+                    start,
+                    end,
+                    break_start: end,
+                    break_end,
+                    byte_offsets,
+                    utf16_offsets,
+                }
+            };
+            while index < bytes.len() {
+                let break_len = match bytes[index] {
+                    b'\n' => 1,
+                    b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
+                    b'\r' => 1,
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                lines.push(line(start, index, index + break_len));
+                start = index + break_len;
+                index += break_len;
+            }
+            lines.push(line(start, source.len(), source.len()));
+            Self { lines }
+        }
+
+        fn offset_to_position(&self, source: &str, offset: usize) -> Option<Position> {
+            if offset > source.len() || !source.is_char_boundary(offset) {
+                return None;
+            }
+            let line_index = self
+                .lines
+                .partition_point(|line| line.start <= offset)
+                .saturating_sub(1);
+            let line = self.lines.get(line_index)?;
+            if line.start <= offset && offset <= line.end {
+                let offset_index = line
+                    .byte_offsets
+                    .binary_search(&(offset - line.start))
+                    .ok()?;
+                return Some(Position::new(
+                    u32::try_from(line_index).ok()?,
+                    u32::try_from(line.utf16_offsets[offset_index]).ok()?,
+                ));
+            }
+            let _ = (line.break_start, line.break_end);
+            None
+        }
+
+        fn position_to_offset(&self, position: Position) -> Option<usize> {
+            let line = self.lines.get(position.line as usize)?;
+            let offset_index = line
+                .utf16_offsets
+                .binary_search(&(position.character as usize))
+                .ok()?;
+            Some(line.start + line.byte_offsets[offset_index])
+        }
+    }
+
+    /// Deterministic mixed-content sources: ASCII, LF, CR, CRLF, two- and
+    /// three-byte scalars, and supplementary scalars (UTF-16 pairs).
+    fn mixed_sources() -> impl Iterator<Item = String> {
+        const PIECES: [&str; 9] = ["a", "Zq", "\n", "\r", "\r\n", "é", "中", "😀", " "];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..400).map(move |round| {
+            let len = round % 40;
+            let mut source = String::new();
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                source.push_str(PIECES[(state % PIECES.len() as u64) as usize]);
+            }
+            source
+        })
+    }
+
+    #[test]
+    fn sparse_index_agrees_with_per_character_index() {
+        for source in mixed_sources() {
+            let old = OldPositionIndex::new(&source);
+            let new = PositionIndex::new(&source);
+            for offset in 0..=source.len() + 1 {
+                assert_eq!(
+                    new.offset_to_position(&source, offset),
+                    old.offset_to_position(&source, offset),
+                    "offset {offset} in {source:?}"
+                );
+            }
+            let widest = source.encode_utf16().count() + 2;
+            for line in 0..=old.lines.len() as u32 {
+                for character in 0..=widest as u32 {
+                    let position = Position::new(line, character);
+                    assert_eq!(
+                        new.position_to_offset(&source, position),
+                        old.position_to_offset(position),
+                        "{position:?} in {source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_lines_store_no_per_character_offsets() {
+        let line = format!("{}\n", "x".repeat(63));
+        let source = line.repeat(16 * 1024);
+        let index = PositionIndex::new(&source);
+        assert!(
+            index.heap_bytes() < source.len(),
+            "{} index bytes for {} ASCII source bytes",
+            index.heap_bytes(),
+            source.len()
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::comments::CommentMap;
 use crate::config::UsesConfig;
+use crate::directive_map::DirectiveMap;
 use crate::doc_builder::{first_leaf, last_leaf};
 use pascal_core::node_kind as K;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -415,7 +416,47 @@ fn parse_pp_uses_block(
     block
 }
 
-/// Extract all items from a `declUses` node into a `Vec<UsesItem>`.
+/// The contents of a `declUses` node.
+#[derive(Debug, Default)]
+pub(crate) struct UsesClause {
+    pub items: Vec<UsesItem>,
+    /// Comments and directives after the clause's end on its line, from
+    /// the first directive on. They lie outside the clause, so they stay
+    /// after its end whatever moves inside it.
+    pub after: Vec<String>,
+}
+
+/// The trivia trailing `end`, the clause's last leaf, from its first
+/// directive on, in source order, and how many of them are comments.
+fn after_clause_trivia(
+    end: tree_sitter::Node,
+    comments: &CommentMap,
+    directives: &DirectiveMap,
+) -> (Vec<String>, usize) {
+    if end.is_missing() || !matches!(end.kind(), K::SEMICOLON | K::PP_END_IF) {
+        return (Vec::new(), 0);
+    }
+    let directives = directives.trailing_directives(end.id());
+    let Some(cut) = directives.iter().map(|d| d.span.start).min() else {
+        return (Vec::new(), 0);
+    };
+    let later_comments: Vec<_> = comments
+        .trailing_comments(end.id())
+        .iter()
+        .filter(|c| c.span.start > cut)
+        .map(|c| (c.span.start, c.text.clone()))
+        .collect();
+    let count = later_comments.len();
+    let mut trivia: Vec<(usize, String)> = directives
+        .iter()
+        .map(|d| (d.span.start, d.text.clone()))
+        .chain(later_comments)
+        .collect();
+    trivia.sort_by_key(|(start, _)| *start);
+    (trivia.into_iter().map(|(_, text)| text).collect(), count)
+}
+
+/// Extract the items of a `declUses` node, and the trivia after its end.
 ///
 /// Comments come from `comments`; those attached to the `uses` keyword
 /// are left to the caller.
@@ -423,7 +464,15 @@ pub(crate) fn extract_uses_items(
     node: tree_sitter::Node,
     source: &[u8],
     comments: &CommentMap,
-) -> Vec<UsesItem> {
+    directives: &DirectiveMap,
+) -> UsesClause {
+    let end = last_leaf(node);
+    let (after, after_comments) = after_clause_trivia(end, comments, directives);
+    // The comments in `after` also trail `end`, last: leave them out.
+    let without_after = |mut texts: Vec<String>| {
+        texts.truncate(texts.len().saturating_sub(after_comments));
+        texts
+    };
     let mut items = Vec::new();
     for child in node.children(&mut node.walk()) {
         match child.kind() {
@@ -436,6 +485,9 @@ pub(crate) fn extract_uses_items(
                 );
                 let mut block = parse_pp_uses_block(child, source, comments);
                 block.terminated = child.kind() == K::PP_USES_BLOCK_WITH_SEMI;
+                if last_leaf(child).id() == end.id() {
+                    block.trailing = without_after(block.trailing);
+                }
                 items.push(UsesItem::IfDefBlock(block));
             }
             K::PP_DIRECTIVE => {
@@ -444,11 +496,17 @@ pub(crate) fn extract_uses_items(
                     items.push(UsesItem::Directive(text));
                 }
             }
-            K::COMMA | K::SEMICOLON => attach_after(&mut items, punctuation_texts(child, comments)),
+            K::COMMA | K::SEMICOLON => {
+                let mut texts = punctuation_texts(child, comments);
+                if child.id() == end.id() {
+                    texts = without_after(texts);
+                }
+                attach_after(&mut items, texts);
+            }
             _ => {} // skip kUses keyword, comments, etc.
         }
     }
-    items
+    UsesClause { items, after }
 }
 
 /// Format a list of `UsesItem`s with anchor-based pinning for directives/ifdef blocks.
@@ -468,7 +526,7 @@ pub fn format_uses_items(
     indent: &str,
     external_units: &HashSet<String>,
 ) -> String {
-    layout_uses_items(items, config, indent, external_units)
+    layout_uses_items(items, &[], config, indent, external_units)
         .into_iter()
         .map(|line| line + "\n")
         .collect()
@@ -478,10 +536,12 @@ pub fn format_uses_items(
 type UnitComments<'a> = (&'a [String], &'a [String]);
 
 /// Like [`format_uses_items`], but return the output lines without their
-/// newlines. An empty line separates groups; a line holding a multi-line
-/// block comment contains its inner newlines.
+/// newlines, with `after` (see [`UsesClause::after`]) following the
+/// clause's end. An empty line separates groups; a line holding a
+/// multi-line block comment contains its inner newlines.
 pub(crate) fn layout_uses_items(
     items: &[UsesItem],
+    after: &[String],
     config: &UsesConfig,
     indent: &str,
     external_units: &HashSet<String>,
@@ -658,7 +718,14 @@ pub(crate) fn layout_uses_items(
     let ordered: Vec<Option<&UsesItem>> = ordered.iter().map(Option::as_ref).collect();
 
     let mut lines = Vec::new();
-    emit_list(&ordered, indent, ItemEnd::Semicolon, false, &mut lines);
+    emit_list(
+        &ordered,
+        indent,
+        ItemEnd::Semicolon,
+        false,
+        after,
+        &mut lines,
+    );
     lines
 }
 
@@ -810,18 +877,20 @@ fn emit_branch_items(
     lines: &mut Vec<String>,
 ) {
     let items: Vec<Option<&UsesItem>> = items.iter().map(Some).collect();
-    emit_list(&items, indent, end, lead, lines);
+    emit_list(&items, indent, end, lead, &[], lines);
 }
 
 /// Emit a list of items (`None` is a group separator) ending with `end`,
 /// comma-first if `lead`. Comments after a directive carrying the `;` stay
 /// on its line, so they remain inside the clause. A list with nothing to
-/// carry a `;` gets it alone on a line.
+/// carry a `;` gets it alone on a line. `after` follows the `;` on its
+/// line (see [`with_after`]).
 fn emit_list(
     items: &[Option<&UsesItem>],
     indent: &str,
     end: ItemEnd,
     lead: bool,
+    after: &[String],
     lines: &mut Vec<String>,
 ) {
     let roles: Vec<ItemRole> = items
@@ -831,22 +900,50 @@ fn emit_list(
     let puncts = list_puncts(&roles, end, lead);
     let mut idx = 0;
     while idx < items.len() {
+        let ends_clause = puncts[idx].end == ItemEnd::Semicolon;
         match items[idx] {
             None => lines.push(String::new()),
-            Some(UsesItem::Directive(text)) if puncts[idx].end == ItemEnd::Semicolon => {
+            Some(UsesItem::Directive(text)) if ends_clause => {
                 let mut trailing = Vec::new();
                 while let Some(Some(UsesItem::Comment(comment))) = items.get(idx + 1) {
                     trailing.push(comment.clone());
                     idx += 1;
                 }
+                let trailing = with_after(&trailing, after);
                 push_with_trailing(format!("{indent}{text};"), &trailing, indent, lines);
+            }
+            Some(UsesItem::Unit {
+                name,
+                leading,
+                trailing,
+            }) if ends_clause => {
+                let trailing = with_after(trailing, after);
+                emit_unit(name, leading, &trailing, indent, puncts[idx], lines);
+            }
+            Some(UsesItem::IfDefBlock(block)) if ends_clause => {
+                let block = IfDefBlock {
+                    trailing: with_after(&block.trailing, after),
+                    ..block.clone()
+                };
+                emit_ifdef_block(&block, indent, puncts[idx], lines);
             }
             Some(item) => emit_uses_item(item, indent, puncts[idx], lines),
         }
         idx += 1;
     }
     if end == ItemEnd::Semicolon && !puncts.iter().any(|p| p.end == ItemEnd::Semicolon) {
-        lines.push(format!("{indent};"));
+        push_with_trailing(format!("{indent};"), after, indent, lines);
+    }
+}
+
+/// The comments of the item ending a clause, then `after`, the trivia
+/// after the clause's end; `after` goes first when a `//` comment among
+/// them would swallow it.
+fn with_after(trailing: &[String], after: &[String]) -> Vec<String> {
+    if trailing.iter().any(|c| c.starts_with("//")) {
+        after.iter().chain(trailing).cloned().collect()
+    } else {
+        trailing.iter().chain(after).cloned().collect()
     }
 }
 
@@ -1288,7 +1385,7 @@ mod tests {
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let items = extract_uses_items(uses_node, &bytes, &comments);
+        let items = extract_uses_items(uses_node, &bytes, &comments, &DirectiveMap::empty()).items;
         assert_eq!(items.len(), 2);
         match &items[0] {
             UsesItem::Unit { name, .. } => assert_eq!(name, "SysUtils"),
@@ -1315,7 +1412,7 @@ mod tests {
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let items = extract_uses_items(uses_node, &bytes, &comments);
+        let items = extract_uses_items(uses_node, &bytes, &comments, &DirectiveMap::empty()).items;
 
         // Expect: Unit(SysUtils), IfDefBlock(...), Unit(Classes)
         assert_eq!(items.len(), 3);
@@ -1358,7 +1455,7 @@ mod tests {
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let items = extract_uses_items(uses_node, &bytes, &comments);
+        let items = extract_uses_items(uses_node, &bytes, &comments, &DirectiveMap::empty()).items;
 
         // ppDirective is an extra — it may appear before SysUtils
         let directive_items: Vec<_> = items
@@ -1390,7 +1487,7 @@ mod tests {
         let (tree, bytes) = parse_source(src);
         let uses_node = find_decl_uses(tree.root_node()).expect("no declUses");
         let comments = CommentMap::build(tree.root_node(), &bytes);
-        let items = extract_uses_items(uses_node, &bytes, &comments);
+        let items = extract_uses_items(uses_node, &bytes, &comments, &DirectiveMap::empty()).items;
 
         // Find the outer IfDefBlock
         let outer_block = items.iter().find_map(|i| match i {
@@ -1718,7 +1815,7 @@ mod tests {
         let (tree, _) = pascal_core::parser::parse_file(&info, src).unwrap();
         let uses_node = find_decl_uses(tree.root_node()).unwrap();
         let comments = CommentMap::build(tree.root_node(), src);
-        let items = extract_uses_items(uses_node, src, &comments);
+        let items = extract_uses_items(uses_node, src, &comments, &DirectiveMap::empty()).items;
         // IfDefBlock + Classes
         assert_eq!(items.len(), 2);
         if let UsesItem::IfDefBlock(block) = &items[0] {

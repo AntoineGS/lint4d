@@ -4173,6 +4173,52 @@ fn uses_clause_ending_in_a_directive_keeps_its_semicolon() {
     idempotency_check(src);
 }
 
+// ── Bug: a directive after a uses clause on its line is dropped (TASK-114) ──
+// It trails the clause's last leaf, outside `declUses`, and the uses
+// layout only read comments, so nothing emitted it.
+
+fn uses_source(clause: &str) -> String {
+    format!("unit T;\ninterface\n{clause}\nimplementation\nend.\n")
+}
+
+#[test]
+fn directive_after_uses_clause_on_its_line_is_kept() {
+    for (clause, expected) in [
+        ("uses A; {$I d.inc}", "uses\n  A; {$I d.inc}\n"),
+        (
+            "uses {$IFDEF X} A; {$ELSE} C; {$ENDIF} {$I d.inc}",
+            "uses\n  {$IFDEF X}\n  A;\n  {$ELSE}\n  C;\n  {$ENDIF} {$I d.inc}\n",
+        ),
+        (
+            "uses {$IFDEF X} A {$ELSE} C {$ENDIF}; {$I d.inc}",
+            "uses\n  {$IFDEF X}\n  A\n  {$ELSE}\n  C\n  {$ENDIF}; {$I d.inc}\n",
+        ),
+        (
+            "uses A; { c } {$I d.inc} // e",
+            "uses\n  A; { c } {$I d.inc} // e\n",
+        ),
+        // With sorting the directive stays at the clause's end.
+        ("uses B, A; {$I d.inc}", "uses\n  A,\n  B; {$I d.inc}\n"),
+        // A `//` comment of the unit ending the clause goes after it.
+        ("uses A // c\n; {$I d.inc}", "uses\n  A; {$I d.inc} // c\n"),
+        (
+            "uses Zeta, // z\n  Alpha; {$I d.inc}",
+            "uses\n  Alpha,\n  Zeta; {$I d.inc} // z\n",
+        ),
+    ] {
+        let src = uses_source(clause);
+        for result in [format_source(&src), format_unsorted(&src)] {
+            assert_eq!(result.matches("{$I d.inc}").count(), 1, "{result}");
+            assert_parses_cleanly(&result);
+        }
+        let result = format_source(&src);
+        assert!(result.contains(expected), "{clause:?}:\n{result}");
+        idempotency_check(&src);
+        let unsorted = format_unsorted(&src);
+        assert_eq!(format_unsorted(&unsorted), unsorted, "not idempotent");
+    }
+}
+
 #[test]
 fn uses_sorting_never_leaves_a_conditional_block_last() {
     let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";

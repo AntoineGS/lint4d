@@ -776,10 +776,12 @@ impl<'a> DocBuilder<'a> {
     }
 
     fn build_uses(&self, node: Node<'a>) -> Doc {
-        let items = crate::uses::extract_uses_items(node, self.source, self.comments);
+        let clause =
+            crate::uses::extract_uses_items(node, self.source, self.comments, self.directives);
         let indent_str = " ".repeat(self.config.indent_size);
         let lines = crate::uses::layout_uses_items(
-            &items,
+            &clause.items,
+            &clause.after,
             &self.config.uses,
             &indent_str,
             self.external_units,

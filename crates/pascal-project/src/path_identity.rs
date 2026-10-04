@@ -113,6 +113,7 @@ mod volume_case {
 /// `LINT4D_CASE_SENSITIVE_TMPDIR` (macOS CI mounts a case-sensitive volume
 /// there). `None` means the test cannot run on this host; under CI that is
 /// a failure instead, so a missing volume does not skip tests silently.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn case_sensitive_test_dir() -> Option<PathBuf> {
     let candidates = std::env::var_os("LINT4D_CASE_SENSITIVE_TMPDIR")

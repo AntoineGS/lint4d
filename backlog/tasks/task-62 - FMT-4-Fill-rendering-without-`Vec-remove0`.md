@@ -1,11 +1,11 @@
 ---
 id: TASK-62
 title: 'FMT-4: Fill rendering without `Vec::remove(0)`'
-status: Deferred
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 21:55'
+updated_date: '2026-10-04 02:39'
 labels:
   - arch-review
   - fmt
@@ -40,7 +40,7 @@ stack.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A 5,000-element expression chain renders in linear time.
+- [x] #1 A 5,000-element expression chain renders in linear time.
 - [x] #2 The tests listed under Tests first were written before the change, failed (or recorded the old behaviour) on the original code, and pass now.
 <!-- AC:END -->
 
@@ -69,6 +69,12 @@ Correction (controller, from task review): the timing test that landed is an 80,
 Merged into master as 676a678 (no-ff), 2026-10-03. Merged master tree is identical to the verified integration tree: cargo fmt --check clean, clippy --workspace --all-targets -D warnings clean, cargo test --workspace 3256 passed / 0 failed / 9 ignored.
 
 Deferred: the Fill renderer change is merged and AC #2 is met. AC #1 (a 5,000-element chain renders in linear time end to end) is blocked by TASK-105 (Node::parent() in build_leaf is O(depth)). Unblock: land TASK-105, then add the end-to-end chain timing test and check AC #1.
+
+AC #1 proven end to end by TASK-105 (branch fix/fmt-chain-perf, eefb9e9): fmt_perf_test::long_binary_chain_formats_in_linear_time formats a 20,000-operand chain in 0.24 s (19.3 s before the builder fix). TASK-62's renderer code was already merged (676a678); only this AC was open. Done once TASK-105 merges.
+
+Status note (controller): AC #1 is proven by the TASK-105 timing test on branch fix/fmt-chain-perf (eefb9e9, reviewed and approved). Kept In Progress until that branch merges; set Done then.
+
+Merged into master as 559838c (branch fix/fmt-chain-perf, via integration/2026-10-03, fast-forwarded 2026-10-03). Merged tree verified (identical to integration/2026-10-03 aebf633): cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean (also --all-features); cargo test --workspace 3603 passed / 0 failed / 9 ignored; pascal-lsp protocol + protocol_barriers with test-support 914/916 (the two TASK-1.2 shutdown/cancel timing tests fail identically on d55c0f6); fmt corpus gate 326 files idempotent; Windows/macOS/Linux CI green on PR #6/#7.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

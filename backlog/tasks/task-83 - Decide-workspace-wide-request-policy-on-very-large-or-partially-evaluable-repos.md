@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-02 23:28'
-updated_date: '2026-10-02 23:28'
+updated_date: '2026-10-03 22:04'
 labels:
   - agent-todos
   - workspace-perf
@@ -38,4 +38,6 @@ Today references/rename on public symbols cannot work on `multidev`.
 Related review task: TASK-6 (LSP-1). Check it before starting to avoid duplicate work.
 
 Related review task: TASK-33 (LSP-16). Check it before starting to avoid duplicate work.
+
+Decision (user, 2026-10-03): workspace-wide requests return partial results marked incomplete (the TASK-6 / LSP-1 direction) rather than failing. The user is also considering a persistent on-disk cache (files or SQLite) for very large repos such as multidev, so that full results become reachable across sessions; that design is not settled and needs a brainstorming session with the user before any work.
 <!-- SECTION:NOTES:END -->

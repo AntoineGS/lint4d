@@ -1,11 +1,11 @@
 ---
 id: TASK-63
 title: 'FMT-5: Round-trip oracle compares token content'
-status: Deferred
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-02 23:23'
-updated_date: '2026-10-03 21:55'
+updated_date: '2026-10-04 02:39'
 labels:
   - arch-review
   - fmt
@@ -46,7 +46,7 @@ cases.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The oracle fails on an injected identifier change (sanity test) and passes on all fixtures.
+- [x] #1 The oracle fails on an injected identifier change (sanity test) and passes on all fixtures.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -96,6 +96,14 @@ Fix round 1 verification: `cargo test -p fmt4d` all green (fmt_roundtrip_test 26
 Merged into master as 4d694bf (no-ff), 2026-10-03. Merged master tree is identical to the verified integration tree: cargo fmt --check clean, clippy --workspace --all-targets -D warnings clean, cargo test --workspace 3256 passed / 0 failed / 9 ignored.
 
 Deferred: the stronger oracle is merged. AC #1 (passes on all fixtures) is blocked by TASK-102: bucket_c_uses_semi.pas is in KNOWN_FAILING_FIXTURES. Unblock: fix TASK-102, remove the allow-list entry, check AC #1.
+
+AC #1 completed on branch fix/fmt-uses-fixes: TASK-102 fixed in commit c91a21a, which also removes bucket_c_uses_semi.pas from KNOWN_FAILING_FIXTURES (now empty). `CARGO_BUILD_JOBS=2 cargo test -p fmt4d --test fmt_roundtrip_test` 26 passed at 7b4aab9: every_fixture_round_trips passes over every fixture (now including the new crates/fmt4d/tests/fixtures/uses/*.pas), oracle_rejects_an_identifier_change passes. Status set to Done per the controller's dispatch; the change lands with branch fix/fmt-uses-fixes (awaiting review and merge).
+
+Correction: the TASK-108 commit was amended to 02a46e9 (comment-only change); fmt_roundtrip_test re-verified green there.
+
+Status note (controller): AC #1 is met on branch fix/fmt-uses-fixes (KNOWN_FAILING_FIXTURES emptied by the TASK-102 fix), which is in review and unmerged. Kept In Progress until that branch merges; set Done then.
+
+Merged into master as c492d6a (branch fix/fmt-uses-fixes, via integration/2026-10-03, fast-forwarded 2026-10-03). Merged tree verified (identical to integration/2026-10-03 aebf633): cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean (also --all-features); cargo test --workspace 3603 passed / 0 failed / 9 ignored; pascal-lsp protocol + protocol_barriers with test-support 914/916 (the two TASK-1.2 shutdown/cancel timing tests fail identically on d55c0f6); fmt corpus gate 326 files idempotent; Windows/macOS/Linux CI green on PR #6/#7.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
@@ -125,4 +133,6 @@ Known limits:
 - The oracle checks comment text and order only, not comment position relative to code.
 - Both sides are parsed with parse_file, not the patched parse that format_source uses (unchanged from the old test).
 - More than 4096 branch configurations in one clause is reported as an error rather than compared.
+
+Update (branch fix/fmt-uses-fixes): TASK-102 is fixed (commit c91a21a) and KNOWN_FAILING_FIXTURES is empty; every fixture passes the oracle, so AC #1 is now checked and the task is Done. The 'Status: AC #1 is NOT checked' line above is superseded.
 <!-- SECTION:FINAL_SUMMARY:END -->

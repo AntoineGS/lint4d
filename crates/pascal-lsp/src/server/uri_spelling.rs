@@ -198,6 +198,12 @@ mod tests {
         ))
     }
 
+    /// A file URI for a Unix-style fixture path; Windows paths need a drive.
+    fn uri(path: &str) -> String {
+        let drive = if cfg!(windows) { "/C:" } else { "" };
+        format!("file://{drive}{path}")
+    }
+
     fn params(message: &Message) -> &Value {
         match message {
             Message::Notification(notification) => &notification.params,
@@ -210,17 +216,17 @@ mod tests {
     fn percent_encoded_and_literal_at_sign_canonicalise_to_one_uri() {
         let mut spellings = UriSpellings::default();
         let mut encoded = notification(json!({
-            "textDocument": {"uri": "file:///home/user%40host/Main.pas", "text": "file:///a%40b"}
+            "textDocument": {"uri": uri("/home/user%40host/Main.pas"), "text": uri("/a%40b")}
         }));
         let mut literal = notification(json!({
-            "textDocument": {"uri": "file:///home/user@host/Main.pas"}
+            "textDocument": {"uri": uri("/home/user@host/Main.pas")}
         }));
         spellings.canonicalize_inbound(&mut encoded);
         let canonical = params(&encoded)["textDocument"]["uri"].clone();
-        assert_eq!(canonical, "file:///home/user@host/Main.pas");
+        assert_eq!(canonical, uri("/home/user@host/Main.pas"));
         assert_eq!(
             params(&encoded)["textDocument"]["text"],
-            "file:///a%40b",
+            uri("/a%40b"),
             "document text is never rewritten"
         );
 
@@ -234,17 +240,17 @@ mod tests {
         ));
         spellings.restore_outbound(&mut response);
         let restored = params(&response);
-        assert_eq!(restored["uri"], "file:///home/user%40host/Main.pas");
+        assert_eq!(restored["uri"], uri("/home/user%40host/Main.pas"));
         assert_eq!(
             restored["items"][0]["targetUri"],
-            "file:///home/user%40host/Main.pas"
+            uri("/home/user%40host/Main.pas")
         );
         assert_eq!(restored["items"][0]["newText"], canonical);
         assert!(
             restored["changes"]
                 .as_object()
                 .expect("changes")
-                .contains_key("file:///home/user%40host/Main.pas")
+                .contains_key(&uri("/home/user%40host/Main.pas"))
         );
 
         spellings.canonicalize_inbound(&mut literal);
@@ -271,25 +277,25 @@ mod tests {
         }
         let mut spellings = UriSpellings::default();
         let mut message = notification(json!({
-            "settings": {"éé": "file:///a%40b/X.pas", "a😀": {"uri": "file:///a%40b/X.pas"}}
+            "settings": {"éé": uri("/a%40b/X.pas"), "a😀": {"uri": uri("/a%40b/X.pas")}}
         }));
         spellings.canonicalize_inbound(&mut message);
-        assert_eq!(params(&message)["settings"]["éé"], "file:///a%40b/X.pas");
+        assert_eq!(params(&message)["settings"]["éé"], uri("/a%40b/X.pas"));
         assert_eq!(
             params(&message)["settings"]["a😀"]["uri"],
-            "file:///a@b/X.pas"
+            uri("/a@b/X.pas")
         );
         spellings.restore_outbound(&mut message);
         assert_eq!(
             params(&message)["settings"]["a😀"]["uri"],
-            "file:///a%40b/X.pas"
+            uri("/a%40b/X.pas")
         );
     }
 
     #[test]
     fn related_document_report_keys_use_the_client_spelling() {
         let mut spellings = UriSpellings::default();
-        let mut open = notification(json!({"textDocument": {"uri": "file:///a%40b/Dep.pas"}}));
+        let mut open = notification(json!({"textDocument": {"uri": uri("/a%40b/Dep.pas")}}));
         spellings.canonicalize_inbound(&mut open);
         let mut report = Message::Response(Response::new_ok(
             RequestId::from(1),
@@ -297,10 +303,10 @@ mod tests {
                 "kind": "full",
                 "items": [],
                 "relatedDocuments": {
-                    "file:///a@b/Dep.pas": {"kind": "full", "items": [{
-                        "relatedInformation": [{"location": {"uri": "file:///a@b/Dep.pas"}}]
+                    uri("/a@b/Dep.pas"): {"kind": "full", "items": [{
+                        "relatedInformation": [{"location": {"uri": uri("/a@b/Dep.pas")}}]
                     }]},
-                    "file:///other/X.pas": {"kind": "unchanged", "resultId": "1"},
+                    uri("/other/X.pas"): {"kind": "unchanged", "resultId": "1"},
                 },
             }),
         ));
@@ -309,12 +315,13 @@ mod tests {
             .as_object()
             .expect("related documents");
         let keys = related.keys().map(String::as_str).collect::<Vec<_>>();
-        assert!(keys.contains(&"file:///a%40b/Dep.pas"), "{keys:?}");
-        assert!(keys.contains(&"file:///other/X.pas"), "{keys:?}");
+        assert!(keys.contains(&uri("/a%40b/Dep.pas").as_str()), "{keys:?}");
+        assert!(keys.contains(&uri("/other/X.pas").as_str()), "{keys:?}");
         assert_eq!(keys.len(), 2);
         assert_eq!(
-            related["file:///a%40b/Dep.pas"]["items"][0]["relatedInformation"][0]["location"]["uri"],
-            "file:///a%40b/Dep.pas"
+            related[uri("/a%40b/Dep.pas").as_str()]["items"][0]["relatedInformation"][0]["location"]
+                ["uri"],
+            uri("/a%40b/Dep.pas")
         );
     }
 

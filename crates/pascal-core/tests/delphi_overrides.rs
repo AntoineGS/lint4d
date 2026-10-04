@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use pascal_core::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, MAX_CONFIG_BYTES, OverrideLayer, OverrideSession,
-    user_config_path,
+    user_config_path, user_home_dir,
 };
 
 #[test]
@@ -494,6 +494,37 @@ fn delphi_overrides_user_config_path_prefers_absolute_xdg_and_falls_back_to_home
             .join("delphi-tools")
             .join("config.toml")
     );
+}
+
+#[test]
+fn delphi_overrides_user_home_falls_back_to_userprofile() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let profile = root.path().join("profile");
+    fn env<'a>(
+        home: Option<&'a Path>,
+        profile: Option<&'a Path>,
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| match name {
+            "HOME" => home.map(|path| path.as_os_str().to_os_string()),
+            "USERPROFILE" => profile.map(|path| path.as_os_str().to_os_string()),
+            _ => None,
+        }
+    }
+
+    assert_eq!(
+        user_home_dir(env(Some(&home), Some(&profile))),
+        Some(home.clone())
+    );
+    assert_eq!(
+        user_home_dir(env(None, Some(&profile))),
+        Some(profile.clone())
+    );
+    assert_eq!(
+        user_home_dir(env(Some(Path::new("")), Some(&profile))),
+        Some(profile.clone())
+    );
+    assert_eq!(user_home_dir(env(None, None)), None);
 }
 
 #[test]

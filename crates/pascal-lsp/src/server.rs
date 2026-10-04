@@ -20414,7 +20414,7 @@ mod tests {
     #[test]
     fn warm_progress_finishing_before_create_response_still_reports_and_ends() {
         let (connection, client) = Connection::memory();
-        let uri = Url::parse("file:///workspace/Main.pas").expect("warm URI");
+        let uri = Url::from_file_path(std::env::temp_dir().join("Main.pas")).expect("warm URI");
         let mut progress = crate::warmer::WarmProgress::new(true);
         progress
             .handle(

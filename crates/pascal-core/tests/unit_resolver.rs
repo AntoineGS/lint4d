@@ -493,7 +493,9 @@ fn explicit_mapping_wins_and_alias_is_applied_once() {
     assert_eq!(found.declared_name, "Vendor.Errors");
 }
 
+// Errors.pas and errors.PAS cannot coexist on a case-insensitive volume.
 #[test]
+#[cfg(not(windows))]
 fn ambiguity_at_current_tier_blocks_search_path_fallback() {
     let mut context = fixture_context();
     context.search_path_entries = vec![
@@ -1846,6 +1848,91 @@ fn descendant_overlay_does_not_enter_an_immediate_directory_tier() {
     ));
 }
 
+// A client may spell an open file differently from the disk (VS Code sends
+// a lowercase drive letter); on a case-insensitive volume it is one file.
+#[test]
+#[cfg(windows)]
+fn overlay_under_another_letter_case_replaces_the_disk_file() {
+    let directory = tempdir().expect("overlay root");
+    let root = directory.path();
+    fs::create_dir_all(root.join("later")).expect("search path");
+    fs::write(
+        root.join("later/Errors.pas"),
+        "unit Errors; interface implementation end.",
+    )
+    .expect("disk unit");
+    let mut context = configured_disk_context(root);
+    context.search_path_entries = vec![ProjectPathEntry {
+        path: root.join("later"),
+        provenance: ProjectPathProvenance::Configured,
+    }];
+    let mut store = FilesystemSourceStore::new();
+    store.insert_overlay(
+        PathBuf::from(
+            root.join("later/Errors.pas")
+                .to_string_lossy()
+                .to_lowercase(),
+        ),
+        7,
+        b"unit Errors; interface const Overlay = 1; implementation end.".to_vec(),
+    );
+    let mut resolver =
+        UnitResolver::new(context, vec![root.to_path_buf()], store, Default::default());
+
+    let outcome = resolver.resolve_unit(
+        UnitResolveRequest {
+            requested_name: "Errors",
+            importer_path: &root.join("Main.pas"),
+            legacy_route: None,
+        },
+        &NoCancellation,
+    );
+
+    assert!(
+        matches!(
+            &outcome.result,
+            Resolution::Found(unit)
+                if matches!(unit.source.revision, SourceRevision::Overlay { version: 7, .. })
+        ),
+        "{:?}",
+        outcome.result
+    );
+}
+
+// An unsaved file has no on-disk spelling; every spelling of it must share
+// the overlay's identity.
+#[test]
+#[cfg(windows)]
+fn unsaved_overlay_has_one_identity_under_every_spelling() {
+    let directory = tempdir().expect("overlay root");
+    let root = directory.path();
+    let overlay = root.join("New.pas");
+    let mut store = FilesystemSourceStore::new();
+    store.insert_overlay(
+        &overlay,
+        1,
+        b"unit New; interface implementation end.".to_vec(),
+    );
+    let mut resolver = UnitResolver::new(
+        configured_disk_context(root),
+        vec![root.to_path_buf()],
+        store,
+        Default::default(),
+    );
+
+    let mut load = |path: PathBuf| {
+        resolver
+            .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+            .expect("overlay loads")
+    };
+    let exact = load(overlay.clone());
+    let lower = load(root.join("new.pas"));
+    let upper = load(root.join("NEW.PAS"));
+    assert_eq!(lower.id, exact.id);
+    assert_eq!(upper.id, exact.id);
+    assert_eq!(upper.path, overlay);
+}
+
 #[test]
 fn qualifiers_name_the_selected_alias_and_declaration_only() {
     let mut context = fixture_context();
@@ -2585,6 +2672,11 @@ fn fixture_resolver(context: ProjectContext) -> UnitResolver<MemoryStore> {
     )
 }
 
+/// Memory fixture paths are written with `/`; Windows requests use `\`.
+fn memory_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[derive(Default)]
 struct MemoryStore {
     sources: HashMap<String, Vec<u8>>,
@@ -2611,10 +2703,7 @@ impl SourceStore for MemoryStore {
         request: DirectoryRequest<'_>,
         _cancel: &dyn CancellationToken,
     ) -> Result<DirectoryListing, SourceStoreError> {
-        let prefix = format!(
-            "{}/",
-            request.directory.to_string_lossy().trim_end_matches('/')
-        );
+        let prefix = format!("{}/", memory_key(request.directory).trim_end_matches('/'));
         let files = self
             .sources
             .keys()
@@ -2638,7 +2727,7 @@ impl SourceStore for MemoryStore {
         request: SourceRequest<'_>,
         _cancel: &dyn CancellationToken,
     ) -> Result<LoadedSource, SourceStoreError> {
-        let key = request.path.to_string_lossy().to_string();
+        let key = memory_key(request.path);
         let bytes = self
             .sources
             .get(&key)

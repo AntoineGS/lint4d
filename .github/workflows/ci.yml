@@ -39,9 +39,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Source-project support does not work on Windows yet (backlog TASK-94);
-    # its test failures are reported but do not fail the workflow.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,6 +50,15 @@ jobs:
       - name: Resolve TMPDIR symlinks
         if: runner.os == 'macOS'
         run: echo "TMPDIR=$(cd "$TMPDIR" && pwd -P)/" >> "$GITHUB_ENV"
+      # The runner's TEMP is an 8.3 short name (C:\Users\RUNNER~1\...).
+      # Resolution reports long names, so tests that compare a resolved
+      # path with the fixture path need fixtures under a long name.
+      - name: Use a long-name TEMP
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: cargo test --workspace --no-fail-fast
 
   clippy:

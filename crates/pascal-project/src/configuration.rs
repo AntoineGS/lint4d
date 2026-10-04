@@ -282,9 +282,10 @@ fn resolve_path(path: &Path) -> Result<PathBuf, String> {
     let mut current = absolute.as_path();
     loop {
         match fs::canonicalize(current) {
-            Ok(mut resolved) => {
+            Ok(resolved) => {
                 // Canonicalize every existing prefix so `..` follows the
                 // filesystem's symlink semantics instead of lexical spelling.
+                let mut resolved = crate::path_identity::without_verbatim_prefix(resolved);
                 for component in unresolved.iter().rev() {
                     resolved.push(component);
                 }

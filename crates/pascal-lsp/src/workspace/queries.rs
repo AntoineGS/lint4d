@@ -1827,7 +1827,7 @@ pub(crate) fn document_links_from_input(
                 continue;
             };
             let real_path = if let Ok(real_path) = target_path.canonicalize() {
-                real_path
+                pascal_project::path_identity::without_verbatim_prefix(real_path)
             } else if input.overlays.contains_key(&target) {
                 let Some((directory, name)) = target_path.parent().zip(target_path.file_name())
                 else {
@@ -1836,7 +1836,7 @@ pub(crate) fn document_links_from_input(
                 let Ok(directory) = directory.canonicalize() else {
                     continue;
                 };
-                directory.join(name)
+                pascal_project::path_identity::without_verbatim_prefix(directory).join(name)
             } else {
                 continue;
             };

@@ -438,7 +438,14 @@ fn position_at_offset(source: &[u8], offset: usize) -> Option<(usize, usize)> {
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    lexical_absolute(left) == lexical_absolute(right)
+    use pascal_project::path_identity::{on_disk_spelling, paths_equal};
+    // The CFG target carries the on-disk spelling; the lint file may be named
+    // through 8.3 short names or another letter case.
+    let spelled = |path: &Path| {
+        let path = lexical_absolute(path);
+        on_disk_spelling(&path).unwrap_or(path)
+    };
+    paths_equal(&spelled(left), &spelled(right))
 }
 
 fn lexical_absolute(path: &Path) -> PathBuf {

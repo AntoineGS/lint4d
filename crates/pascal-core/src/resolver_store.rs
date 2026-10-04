@@ -6,7 +6,7 @@ use super::{
     SourceStoreError, canonical_path, content_hash_bytes, path_equivalent, path_key,
     path_starts_with, source_id_for_path,
 };
-use pascal_project::path_stamp_result;
+use pascal_project::{path_identity, path_stamp_result};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -80,10 +80,27 @@ impl FilesystemSourceStore {
 
     fn overlay_for(&self, path: &Path) -> Option<(PathBuf, OverlaySource)> {
         let path = canonical_path(path);
+        if let Some(overlay) = self.overlays.get(&path) {
+            return Some((path, overlay.clone()));
+        }
+        // A client may spell a path differently from the disk, e.g. with a
+        // lowercase drive letter; on a case-insensitive volume it is the same
+        // file. A file on disk keeps the on-disk spelling `load` found; an
+        // unsaved one has only the overlay's spelling.
+        if !path_identity::is_case_insensitive(&path) {
+            return None;
+        }
         self.overlays
-            .get(&path)
-            .cloned()
-            .map(|overlay| (path, overlay))
+            .iter()
+            .find(|(overlay_path, _)| path_equivalent(overlay_path, &path))
+            .map(|(overlay_path, overlay)| {
+                let identity = if fs::symlink_metadata(&path).is_ok() {
+                    path
+                } else {
+                    overlay_path.clone()
+                };
+                (identity, overlay.clone())
+            })
     }
 }
 
@@ -221,10 +238,10 @@ impl SourceStore for FilesystemSourceStore {
             }
         }
         for path in self.overlays.keys() {
-            if path.parent().is_some_and(|parent| parent == directory)
-                && !files
-                    .iter()
-                    .any(|existing| canonical_path(existing) == *path)
+            if path
+                .parent()
+                .is_some_and(|parent| path_equivalent(parent, &directory))
+                && !files.iter().any(|existing| path_equivalent(existing, path))
             {
                 files.push(path.clone());
             }
@@ -275,6 +292,9 @@ impl SourceStore for FilesystemSourceStore {
                 reason: "source and authorization entry identify different paths".to_string(),
             });
         }
+        // On a case-insensitive volume any spelling opens the file; report and
+        // authorize the one on disk so a file has one identity.
+        let path = path_identity::on_disk_spelling(&path).unwrap_or(path);
         let entry = ProjectPathEntry {
             path: path.clone(),
             provenance: request.entry.provenance.clone(),

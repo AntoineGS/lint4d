@@ -369,11 +369,21 @@ mod tests {
     use super::lenses_for_source;
     use lsp_types::Url;
 
+    /// A file URI under a fixture workspace; Windows paths need a drive.
+    fn workspace_uri(name: &str) -> Url {
+        let root = if cfg!(windows) {
+            "file:///C:/workspace/"
+        } else {
+            "file:///workspace/"
+        };
+        Url::parse(&format!("{root}{name}")).unwrap()
+    }
+
     const SOURCE: &str = "unit Provider;\ninterface\nprocedure PublicRoutine;\nimplementation\nprocedure PublicRoutine;\nbegin\nend;\nend.\n";
 
     #[test]
     fn advertised_procedure_has_lazy_reference_and_implementation_lenses() {
-        let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
+        let uri = workspace_uri("Provider.pas");
         let lenses = lenses_for_source(&uri, SOURCE, 7, 3).unwrap();
         assert_eq!(lenses.len(), 2);
         assert!(
@@ -406,7 +416,7 @@ mod tests {
 
     #[test]
     fn ambiguous_or_unimplemented_procedure_has_no_lens() {
-        let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
+        let uri = workspace_uri("Provider.pas");
         let overload = SOURCE.replace(
             "procedure PublicRoutine;\nimplementation",
             "procedure PublicRoutine;\nprocedure PublicRoutine(A: Integer);\nimplementation",
@@ -418,21 +428,21 @@ mod tests {
 
     #[test]
     fn ordinary_comments_do_not_hide_a_unique_exported_procedure() {
-        let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
+        let uri = workspace_uri("Provider.pas");
         let commented = SOURCE.replace("interface\n", "interface\n// Public API\n");
         assert_eq!(lenses_for_source(&uri, &commented, 7, 3).unwrap().len(), 2);
     }
 
     #[test]
     fn simple_procedure_spacing_does_not_hide_the_same_binding() {
-        let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
+        let uri = workspace_uri("Provider.pas");
         let spaced = SOURCE.replace("procedure PublicRoutine;", "procedure   PublicRoutine ;");
         assert_eq!(lenses_for_source(&uri, &spaced, 7, 3).unwrap().len(), 2);
     }
 
     #[test]
     fn comment_between_header_and_body_preserves_implementation_lens() {
-        let uri = Url::parse("file:///workspace/Provider.pas").unwrap();
+        let uri = workspace_uri("Provider.pas");
         let commented = SOURCE.replace(
             "procedure PublicRoutine;\nbegin",
             "procedure PublicRoutine;\n{ This is the implementation. }\nbegin",
@@ -442,7 +452,7 @@ mod tests {
 
     #[test]
     fn too_many_procedures_withholds_all_lenses_instead_of_an_arbitrary_subset() {
-        let uri = Url::parse("file:///workspace/Bulk.pas").unwrap();
+        let uri = workspace_uri("Bulk.pas");
         let mut source = "unit Bulk;\ninterface\n".to_owned();
         for index in 0..65 {
             source.push_str(&format!("procedure P{index};\n"));

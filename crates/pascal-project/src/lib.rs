@@ -20,6 +20,7 @@ pub mod delphi_overrides;
 pub mod installation_config;
 #[allow(dead_code)]
 pub mod installations;
+pub mod path_identity;
 pub mod path_issues;
 pub mod rtl_constants;
 
@@ -35,7 +36,6 @@ pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
     EffectiveOverrides, LOCAL_CONFIG_NAME, OverrideSession, PathMapping, ResolvedPath,
-    user_config_path,
 };
 use crate::installations::{
     IdePaths, InstallationEvidence, evaluate_ide_paths, load_installation, select_installation,
@@ -1945,9 +1945,7 @@ pub fn discover(
 }
 
 fn production_override_session() -> (OverrideSession, Vec<String>) {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match user_config_path(xdg.as_deref(), home.as_deref()) {
+    match delphi_overrides::user_config_path_from_env() {
         Ok(path) => (OverrideSession::new(Some(path)), Vec::new()),
         Err(error) => (OverrideSession::new(None), vec![error]),
     }
@@ -6744,7 +6742,16 @@ fn resolve_existing_path_status(
     if fs::symlink_metadata(&absolute).is_ok() {
         return ExistingPathStatus::Found(absolute);
     }
-    let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+    // Windows reports the on-disk spelling (long names, letter case) of an
+    // existing path; when it is the spelling asked for, no walk is needed.
+    // Symlinks, junctions and other spellings take the walk.
+    #[cfg(windows)]
+    if fs::canonicalize(&absolute)
+        .is_ok_and(|canonical| path_identity::without_verbatim_prefix(canonical) == absolute)
+    {
+        return ExistingPathStatus::Found(absolute);
+    }
+    let mut current = path_identity::walk_root(&absolute);
     for component in absolute.components() {
         let Component::Normal(component) = component else {
             continue;
@@ -6771,6 +6778,10 @@ fn resolve_existing_path_status(
         };
         let folded_wanted = wanted.to_ascii_lowercase();
         let Some(matches) = entries.case_insensitive_names.get(&folded_wanted) else {
+            if let Some(name) = short_name_alias_target(&current, component, &entries) {
+                current.push(name);
+                continue;
+            }
             return ExistingPathStatus::Missing;
         };
         if let Some(index) = matches
@@ -6792,6 +6803,43 @@ fn resolve_existing_path_status(
     ExistingPathStatus::Found(current)
 }
 
+/// The listed name that `component` aliases when it is not itself listed,
+/// such as the long name behind a Windows 8.3 short name (`RUNNER~1`). A
+/// symlinked component is kept as is, never replaced by its target's name.
+#[cfg(windows)]
+fn short_name_alias_target(
+    directory: &Path,
+    component: &std::ffi::OsStr,
+    entries: &PathResolutionDirectoryEntries,
+) -> Option<std::ffi::OsString> {
+    let candidate = directory.join(component);
+    if fs::symlink_metadata(&candidate)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let name = fs::canonicalize(&candidate)
+        .ok()?
+        .file_name()?
+        .to_os_string();
+    entries
+        .names
+        .iter()
+        .any(|listed| listed == &name)
+        .then_some(name)
+}
+
+#[cfg(not(windows))]
+fn short_name_alias_target(
+    _directory: &Path,
+    _component: &std::ffi::OsStr,
+    _entries: &PathResolutionDirectoryEntries,
+) -> Option<std::ffi::OsString> {
+    None
+}
+
 #[cfg(test)]
 // Keep the former walk available to the ignored benchmark for a same-process baseline.
 fn resolve_existing_path_status_legacy(
@@ -6799,7 +6847,7 @@ fn resolve_existing_path_status_legacy(
     warnings: &mut Vec<String>,
     kind: &str,
 ) -> ExistingPathStatus {
-    let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+    let mut current = path_identity::walk_root(absolute);
     for component in absolute.components() {
         let Component::Normal(component) = component else {
             continue;
@@ -9826,10 +9874,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
     // (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn path_resolution_prefers_an_exact_component_over_case_variants() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let exact = temp.path().join("Foo");
@@ -10025,10 +10073,10 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
+    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
     // (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn path_resolution_rejects_ambiguous_case_insensitive_matches() {
         let temp = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(temp.path().join("Foo")).expect("first case variant");
@@ -10149,6 +10197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn path_resolution_rejects_windows_absolute_paths_on_linux() {
         let requested = std::path::Path::new(r"C:\Delphi\Unit.pas");
         let mut warnings = Vec::new();
@@ -10165,8 +10214,8 @@ mod tests {
         );
     }
 
-    // Only Linux resolves exact paths without listing directories; elsewhere
-    // the on-disk spelling is found by a component walk (backlog TASK-74).
+    // Linux and Windows resolve exact paths without listing directories; on
+    // macOS the on-disk spelling is found by a component walk (backlog TASK-74).
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn path_resolution_does_not_list_directories_for_exact_paths() {
@@ -10247,9 +10296,15 @@ mod tests {
                 expected.display()
             );
         }
+        // The walk lists the filesystem root, each directory down to `root`,
+        // then Tools and Units.
+        let root_listings = 1 + root
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count();
         assert_eq!(
             read_dir_calls,
-            root.components().count() + 2,
+            root_listings + 2,
             "shared case-insensitive prefixes should be listed once"
         );
     }
@@ -10455,7 +10510,7 @@ mod tests {
             .collect::<Vec<_>>();
         let key_bytes = paths
             .iter()
-            .map(|path| path.to_string_lossy().len())
+            .map(|path| super::project_path_materialization_bytes(path.as_os_str()).unwrap())
             .sum::<usize>();
         let admitted_pre_sort_work = CANDIDATES * 4 + key_bytes;
         let budget = TestProjectWorkBudget::limited_path_visits(admitted_pre_sort_work);
@@ -11475,6 +11530,92 @@ mod tests {
         assert!(
             !policy.allows_legacy_payload_entry(&entry),
             "legacy payload compatibility must not bypass configured exclusions"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::{ExistingPathStatus, path_identity, resolve_existing_path_status};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn path_resolution_keeps_the_drive_and_fixes_spelling() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let unit = temp.path().join("Unit1.pas");
+        fs::write(&unit, b"").expect("unit file");
+        let long = path_identity::without_verbatim_prefix(fs::canonicalize(&unit).unwrap());
+        let requested = PathBuf::from(unit.to_string_lossy().to_ascii_uppercase());
+        let mut warnings = Vec::new();
+        let status = resolve_existing_path_status(&requested, &mut warnings, "unit");
+        assert!(
+            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
+            "{status:?} {warnings:?}"
+        );
+    }
+
+    /// The 8.3 short name of `path`, when the volume generates one.
+    fn windows_short_path(path: &Path) -> Option<PathBuf> {
+        use std::os::windows::process::CommandExt;
+        // cmd does not parse the quoting `Command::arg` applies.
+        let output = std::process::Command::new("cmd")
+            .raw_arg(format!(
+                "/C for %I in (\"{}\") do @echo %~sI",
+                path.display()
+            ))
+            .output()
+            .ok()?;
+        let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        (short.as_os_str() != path.as_os_str() && short.exists()).then_some(short)
+    }
+
+    #[test]
+    fn path_resolution_reports_the_long_name_for_a_short_name() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let directory = temp.path().join("Long Directory Name");
+        fs::create_dir(&directory).expect("directory");
+        let unit = directory.join("LongUnitName.pas");
+        fs::write(&unit, b"").expect("unit file");
+        let long = path_identity::without_verbatim_prefix(fs::canonicalize(&unit).unwrap());
+        let Some(short) = windows_short_path(&unit) else {
+            eprintln!("skipped: the volume does not generate 8.3 names");
+            return;
+        };
+        let mut warnings = Vec::new();
+        let status = resolve_existing_path_status(&short, &mut warnings, "unit");
+        assert!(
+            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
+            "{} -> {status:?} {warnings:?}",
+            short.display()
+        );
+    }
+
+    // CI's temporary directory may sit on a volume without 8.3 names; the
+    // system volume normally has them.
+    #[test]
+    fn path_resolution_reports_the_long_name_for_a_system_short_name() {
+        let Some(program_files) = std::env::var_os("ProgramFiles").map(PathBuf::from) else {
+            return;
+        };
+        let long =
+            path_identity::without_verbatim_prefix(fs::canonicalize(&program_files).unwrap());
+        let Some(short) = windows_short_path(&long) else {
+            // GitHub's Windows runners have 8.3 names on the system volume,
+            // so CI must not skip this silently.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no 8.3 name for {}",
+                long.display()
+            );
+            return;
+        };
+        let mut warnings = Vec::new();
+        let status = resolve_existing_path_status(&short, &mut warnings, "directory");
+        assert!(
+            matches!(&status, ExistingPathStatus::Found(found) if found == &long),
+            "{} -> {status:?} {warnings:?}",
+            short.display()
         );
     }
 }

@@ -584,7 +584,9 @@ fn profiles_inherit_shared_values_and_keep_independent_direct_appdata_roots() {
     assert_eq!(seven.overrides.properties["bds"], "/sdk/7");
 }
 
+// Path mappings with Unix destinations, which Windows refuses.
 #[test]
+#[cfg(not(windows))]
 fn profiles_merge_properties_and_mapping_origins_by_layer_and_profile() {
     let temp = tempfile::tempdir().unwrap();
     let user = temp.path().join("config.toml");

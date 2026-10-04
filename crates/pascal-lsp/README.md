@@ -751,7 +751,7 @@ The layers below are merged in order. A missing file is an empty layer.
 | Layer | Location |
 | --- | --- |
 | User | `$XDG_CONFIG_HOME/delphi-tools/config.toml`, when `XDG_CONFIG_HOME` is nonempty and absolute |
-| User fallback | `$HOME/.config/delphi-tools/config.toml` otherwise, when `HOME` is nonempty and absolute |
+| User fallback | `$HOME/.config/delphi-tools/config.toml` otherwise, when `HOME` (or, when `HOME` is unset or empty, `USERPROFILE`) is nonempty and absolute |
 | Workspace | `<workspace-root>/.delphi-tools.local.toml` |
 | Project | `<project-directory>/.delphi-tools.local.toml` |
 

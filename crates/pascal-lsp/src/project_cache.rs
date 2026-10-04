@@ -1474,6 +1474,8 @@ mod cache_tests {
             .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
             .expect("hit");
         let lease = cache.lease_unit(&unit);
+        // What the request's index keeps.
+        let kept = unit.parsed.clone();
         drop(unit);
         assert_eq!(
             cache.stats().outstanding_bytes,
@@ -1495,6 +1497,46 @@ mod cache_tests {
         assert!(cache.has_room());
         fill(&cache, "B.pas", &ctx, 1, 10);
         assert!(ready(&cache, "B.pas"));
+        drop(kept);
+    }
+
+    #[test]
+    fn a_leased_parse_nothing_keeps_is_not_charged() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        let weak = Arc::downgrade(&unit.parsed);
+        drop(unit);
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert!(
+            weak.upgrade().is_none(),
+            "the lease does not keep the parse"
+        );
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        drop(lease);
+    }
+
+    #[test]
+    fn leasing_a_parse_evicted_after_its_hit_keeps_the_budget() {
+        let cache = ProjectCache::new(10_000);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        fill(&cache, "B.pas", &ctx, 1, 10_000 - 10);
+
+        let lease = cache.lease_unit(&unit);
+        let stats = cache.stats();
+        assert_eq!(stats.outstanding_bytes, unit.retained_bytes());
+        assert!(!ready(&cache, "B.pas"), "the late charge evicts to budget");
+        assert!(stats.bytes + stats.outstanding_bytes <= 10_000);
+        drop(lease);
     }
 
     #[test]
@@ -2329,32 +2371,58 @@ impl ProjectCache {
     }
 
     /// Leases the parse of a unit hit that a request keeps in its own index,
-    /// so the parse stays charged if its entry is evicted first.
+    /// so the parse stays charged if its entry is evicted first. A parse
+    /// evicted between the hit and the lease is charged at once.
     pub(crate) fn lease_unit(&self, unit: &UnitValue) -> CacheLease {
-        let payload = Arc::as_ptr(&unit.parsed) as *const () as usize;
+        self.lease_parse(&unit.parsed, unit.retained_bytes(), false)
+            .expect("an uncached parse is leased when not required to be cached")
+    }
+
+    /// Leases a parse the request just stored, only if the cache took it.
+    pub(crate) fn lease_stored_parse(
+        &self,
+        parsed: &Arc<ParsedDocument>,
+        bytes: usize,
+    ) -> Option<CacheLease> {
+        self.lease_parse(parsed, bytes, true)
+    }
+
+    fn lease_parse(
+        &self,
+        parsed: &Arc<ParsedDocument>,
+        bytes: usize,
+        require_cached: bool,
+    ) -> Option<CacheLease> {
+        let payload = Arc::as_ptr(parsed) as *const () as usize;
         let mut state = lock(&self.inner);
         if let Some(lease) = state.leases.get_mut(&payload) {
             lease.holders += 1;
         } else {
             let cached = state.cached_parses.get(&payload).map(|(_, bytes)| *bytes);
-            let bytes = cached.unwrap_or_else(|| unit.retained_bytes());
-            if cached.is_none() {
-                state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
+            if cached.is_none() && require_cached {
+                return None;
             }
+            let bytes = cached.unwrap_or(bytes);
             state.leases.insert(
                 payload,
                 Lease {
                     holders: 1,
                     bytes,
                     evicted: cached.is_none(),
+                    parsed: Arc::downgrade(parsed),
                 },
             );
+            if cached.is_none() {
+                state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
+                evict_to_budget(&mut state);
+            }
         }
-        CacheLease {
+        self.release(state);
+        Some(CacheLease {
             inner: self.inner.clone(),
             payload,
-            _parsed: unit.parsed.clone(),
-        }
+            _parsed: Arc::downgrade(parsed),
+        })
     }
 
     /// A verified unit entry read from a closed file whose length and
@@ -2747,15 +2815,20 @@ struct Lease {
     bytes: usize,
     /// Whether no cache entry holds the parse, so `bytes` are outstanding.
     evicted: bool,
+    /// Outstanding bytes are charged only while the parse is alive.
+    parsed: std::sync::Weak<ParsedDocument>,
 }
 
 /// A request's hold on a cached parse it put into its own index. While a
-/// lease is alive and no entry holds the parse, the entry's charge stays in
-/// the budget as outstanding bytes. Transient hits are not leased.
+/// lease exists, no entry holds the parse and the parse is still alive, the
+/// entry's charge stays in the budget as outstanding bytes. Transient hits
+/// are not leased.
 pub(crate) struct CacheLease {
     inner: Arc<Inner>,
     payload: usize,
-    _parsed: Arc<ParsedDocument>,
+    /// Keeps the address from being reused while the lease exists, without
+    /// keeping the parse alive once the request's index drops it.
+    _parsed: std::sync::Weak<ParsedDocument>,
 }
 
 impl std::fmt::Debug for CacheLease {
@@ -2953,7 +3026,21 @@ fn remove_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
     set_pinned(state, uri, *fingerprint, false);
 }
 
+/// Stops charging leased parses that nothing holds any more.
+fn prune_dead_leases(state: &mut State) {
+    let mut released = 0usize;
+    state.leases.retain(|_, lease| {
+        let alive = lease.parsed.strong_count() > 0;
+        if !alive && lease.evicted {
+            released = released.saturating_add(lease.bytes);
+        }
+        alive
+    });
+    state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
+}
+
 fn evict_to_budget(state: &mut State) {
+    prune_dead_leases(state);
     while state.bytes.saturating_add(state.outstanding_bytes) > state.max_bytes {
         let Some((_, key)) = state.lru.pop_first() else {
             return;
@@ -3173,7 +3260,8 @@ impl ProjectCache {
     }
 
     pub(crate) fn has_room(&self) -> bool {
-        let state = lock(&self.inner);
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
         state.pinned_bytes.saturating_add(state.outstanding_bytes) < state.max_bytes
     }
 
@@ -3182,7 +3270,8 @@ impl ProjectCache {
     }
 
     pub(crate) fn stats(&self) -> CacheStats {
-        let state = lock(&self.inner);
+        let mut state = lock(&self.inner);
+        prune_dead_leases(&mut state);
         let count = |layer| {
             state
                 .slots

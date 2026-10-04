@@ -542,7 +542,7 @@ pub(crate) struct RenameSnapshot {
     pub(crate) mode: SnapshotMode,
     /// Keep the cache charging the cached parses in `index` until the
     /// snapshot is dropped.
-    _cache_leases: Vec<crate::project_cache::CacheLease>,
+    _cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
 }
 
 fn cached_position_index<'a>(
@@ -6075,7 +6075,7 @@ fn build_snapshot_with_policy(
                     declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
                     mode,
-                    _cache_leases: Vec::new(),
+                    _cache_leases: HashMap::new(),
                 });
             }
             contexts
@@ -6691,6 +6691,7 @@ fn build_snapshot_with_policy(
     }
     index.set_auto_import_unit_providers(auto_import_unit_providers.clone());
     loader.index = index;
+    loader.cache_leases.clear();
     loader.indexed_files = indexed_uris.clone();
     loader.indexed_sizes = indexed_sizes;
     loader.indexed_bytes = loader.indexed_sizes.values().sum();
@@ -6849,6 +6850,7 @@ fn build_snapshot_with_policy(
     let included_uris = loader.include_parents.keys().cloned().collect::<Vec<_>>();
     for included_uri in included_uris {
         loader.index.remove(&included_uri);
+        loader.cache_leases.remove(&included_uri);
     }
     let indexed_uris = loader.indexed_files.clone();
     for uri in indexed_uris {

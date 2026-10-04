@@ -2736,7 +2736,9 @@ pub struct Workspace {
     /// The last map built by `overlay_inputs`, reused while it matches.
     overlay_inputs: Mutex<Option<Arc<HashMap<Url, rename::OverlayInput>>>>,
     /// Leases on cached parses this request workspace keeps in its index.
-    cache_leases: Vec<crate::project_cache::CacheLease>,
+    /// Leases on cached parses this request workspace keeps in its index, by
+    /// URI. Removing or replacing a URI's parse drops its lease.
+    cache_leases: HashMap<Url, crate::project_cache::CacheLease>,
     rejected_open_fence_uris: HashSet<Url>,
     rejected_open_fence_permanent: bool,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
@@ -3241,6 +3243,7 @@ impl Workspace {
         self.include_parents.clear();
 
         self.index = NavigationIndex::new();
+        self.cache_leases.clear();
         self.indexed_files.clear();
         self.indexed_sizes.clear();
         self.indexed_content_hashes.clear();
@@ -5065,6 +5068,7 @@ impl Workspace {
         self.pending_unit_file_rename_bytes = 0;
         budget.charge_recovery_work(self.index.document_count(), 0)?;
         self.index = NavigationIndex::new();
+        self.cache_leases.clear();
         self.indexed_bytes = 0;
         self.file_cap_warning_sent = false;
         self.total_cap_warning_sent = false;
@@ -7924,6 +7928,8 @@ impl Workspace {
             self.warn(format!("cannot index {uri}: {error}"));
             return Ok(false);
         }
+        // The index now holds this source's new parse; an older lease is stale.
+        self.cache_leases.remove(uri);
         if let Some(unit) = &cached_unit {
             self.lease_cached_parse(uri, unit);
         }
@@ -8001,8 +8007,14 @@ impl Workspace {
                 disk,
             };
             let bytes = value.retained_bytes();
+            let parsed = value.parsed.clone();
             self.project_cache
                 .store_unit(claim, value, bytes, cancel.unwrap_or(&lookup_cancel));
+            if self.cache_epoch.is_some()
+                && let Some(lease) = self.project_cache.lease_stored_parse(&parsed, bytes)
+            {
+                self.cache_leases.insert(uri.clone(), lease);
+            }
         }
         Ok(true)
     }
@@ -8066,7 +8078,8 @@ impl Workspace {
                 .parsed_document(uri)
                 .is_some_and(|parsed| Arc::ptr_eq(&parsed, &unit.parsed))
         {
-            self.cache_leases.push(self.project_cache.lease_unit(unit));
+            self.cache_leases
+                .insert(uri.clone(), self.project_cache.lease_unit(unit));
         }
     }
 
@@ -10798,6 +10811,7 @@ impl Workspace {
                 }
             }
             self.index.remove(uri);
+            self.cache_leases.remove(uri);
             self.indexed_files.remove(uri);
             self.last_used.remove(uri);
             self.document_contexts.remove(uri);
@@ -10964,6 +10978,7 @@ impl Workspace {
                 }
             }
             self.index.remove(uri);
+            self.cache_leases.remove(uri);
             self.indexed_files.remove(uri);
             self.last_used.remove(uri);
             self.document_contexts.remove(uri);
@@ -12618,6 +12633,7 @@ impl Workspace {
         }
         self.remove_expansion_with_control(uri, cancel, budget)?;
         self.index.remove(uri);
+        self.cache_leases.remove(uri);
         self.indexed_files.remove(uri);
         self.last_used.remove(uri);
         self.document_contexts.remove(uri);
@@ -17008,6 +17024,64 @@ mod tests {
         let tokens = body_line_token_kinds(&fixture.workspace, &fixture.main);
 
         assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
+    }
+
+    #[test]
+    fn a_request_that_drops_a_leased_parse_releases_it_and_its_charge() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        let cache = fixture.workspace.project_cache().clone();
+        let mut worker = worker_view(&fixture.workspace);
+        worker
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("warm from the cache");
+        let parsed = std::sync::Arc::downgrade(
+            &worker
+                .index
+                .parsed_document(&fixture.derived)
+                .expect("Derived indexed from its cached parse"),
+        );
+
+        cache.invalidate_after_overflow();
+        let held = cache.stats().outstanding_bytes;
+        assert!(held > 0, "the request still holds Derived's parse");
+
+        worker.remove_indexed(&fixture.derived);
+        assert!(
+            parsed.upgrade().is_none(),
+            "nothing keeps a parse both the request and the cache dropped"
+        );
+        assert!(
+            cache.stats().outstanding_bytes < held,
+            "dropping the parse releases its charge"
+        );
+        drop(worker);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    #[test]
+    fn parses_a_cold_request_stores_stay_charged_while_it_keeps_them() {
+        let fixture = inherited_fixture("Base");
+        let cache = fixture.workspace.project_cache().clone();
+        let mut worker = worker_view(&fixture.workspace);
+        worker
+            .warm_with_cancel(&fixture.main, &AtomicBool::new(false))
+            .expect("cold warm");
+        assert!(
+            cache
+                .ready_layers(&fixture.derived)
+                .contains(&"Unit".to_string())
+        );
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+
+        cache.invalidate_after_overflow();
+        assert!(
+            cache.stats().outstanding_bytes
+                >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            "the worker still holds the parses it stored"
+        );
+        drop(worker);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
     }
 
     #[test]

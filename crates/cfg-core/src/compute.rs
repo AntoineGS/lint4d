@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn compute_leaf_function_summary() {
-        let free_helper = ProcId::new("TestUnit", "FreeHelper");
+        let free_helper = ProcId::new("TestUnit", "FreeHelper", 0..10);
         let mut cfgs = HashMap::new();
         cfgs.insert(free_helper.clone(), minimal_cfg("FreeHelper"));
 
@@ -160,8 +160,8 @@ mod tests {
 
     #[test]
     fn compute_transitive_summary() {
-        let free_helper = ProcId::new("TestUnit", "FreeHelper");
-        let cleanup = ProcId::new("TestUnit", "Cleanup");
+        let free_helper = ProcId::new("TestUnit", "FreeHelper", 0..10);
+        let cleanup = ProcId::new("TestUnit", "Cleanup", 20..30);
 
         let mut cfgs = HashMap::new();
         cfgs.insert(free_helper.clone(), minimal_cfg("FreeHelper"));
@@ -189,9 +189,9 @@ mod tests {
 
     #[test]
     fn compute_unknown_callee_conservative() {
-        let do_stuff = ProcId::new("TestUnit", "DoStuff");
+        let do_stuff = ProcId::new("TestUnit", "DoStuff", 0..10);
         // OtherUnit.SomeProc has no CFG entry — it's an unknown callee.
-        let other_proc = ProcId::new("OtherUnit", "SomeProc");
+        let other_proc = ProcId::new("OtherUnit", "SomeProc", 0..10);
 
         let mut cfgs = HashMap::new();
         cfgs.insert(do_stuff.clone(), minimal_cfg("DoStuff"));

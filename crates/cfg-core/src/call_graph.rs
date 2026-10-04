@@ -80,11 +80,11 @@ mod tests {
     use super::*;
 
     fn form_create() -> ProcId {
-        ProcId::new("MainForm", "TMainForm.FormCreate")
+        ProcId::new("MainForm", "TMainForm.FormCreate", 100..200)
     }
 
     fn free_helper() -> ProcId {
-        ProcId::new("MainForm", "TMainForm.FreeHelper")
+        ProcId::new("MainForm", "TMainForm.FreeHelper", 300..400)
     }
 
     #[test]
@@ -104,6 +104,23 @@ mod tests {
         let callers = cg.callers(&free_helper());
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0], &form_create());
+    }
+
+    #[test]
+    fn call_graph_keeps_overloads_apart() {
+        let mut cg = CallGraph::new();
+        let by_integer = ProcId::new("MainForm", "TMainForm.Load", 500..600);
+        let by_string = ProcId::new("MainForm", "TMainForm.Load", 700..800);
+        cg.add_call(CallSite {
+            caller: form_create(),
+            callee: by_string.clone(),
+            byte_range: 150..160,
+        });
+        cg.add_proc(by_integer.clone());
+
+        assert_eq!(cg.graph.node_count(), 3);
+        assert_eq!(cg.callees(&form_create()), vec![&by_string]);
+        assert!(cg.callers(&by_integer).is_empty());
     }
 
     #[test]

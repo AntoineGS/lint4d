@@ -1,16 +1,24 @@
 use std::ops::Range;
 
+/// Identity of one routine definition.
+///
+/// Overloads share `unit_name` and `qualified_name`, so the routine's byte
+/// range in its unit's source (the same range as [`crate::types::Cfg::byte_range`])
+/// is part of the identity. Lookups that only have a name, such as resolving
+/// a call, must compare the name fields and handle several matches.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProcId {
     pub unit_name: String,
     pub qualified_name: String,
+    pub byte_range: Range<usize>,
 }
 
 impl ProcId {
-    pub fn new(unit_name: &str, qualified_name: &str) -> Self {
+    pub fn new(unit_name: &str, qualified_name: &str, byte_range: Range<usize>) -> Self {
         Self {
             unit_name: unit_name.to_string(),
             qualified_name: qualified_name.to_string(),
+            byte_range,
         }
     }
 }

@@ -301,3 +301,36 @@ fn unchecked_nil_flags_interface_without_check() {
         matches
     );
 }
+
+#[test]
+fn unchecked_nil_flags_call_when_every_overload_can_return_nil() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/bad_overloaded_function_return_nil.pas",
+        &project,
+    );
+    let lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .map(|d| d.line)
+        .collect();
+    assert_eq!(lines, vec![24], "Both overloads can return nil");
+}
+
+#[test]
+fn unchecked_nil_treats_call_to_disagreeing_overloads_as_unanalyzable() {
+    let project = project_with_tobject();
+    let diagnostics = lint_nil_check(
+        "tests/fixtures/nil_check/good_ambiguous_overloaded_function_return.pas",
+        &project,
+    );
+    let matches: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.rule_id == "unchecked-nil")
+        .collect();
+    assert!(
+        matches.is_empty(),
+        "A by-name call cannot tell which overload runs, so it is not analyzed: {:?}",
+        matches
+    );
+}

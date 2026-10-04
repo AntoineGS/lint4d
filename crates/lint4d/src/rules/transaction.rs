@@ -4,15 +4,13 @@ use std::ops::Range;
 use pascal_core::node_kind as K;
 use tree_sitter::{Node, Tree};
 
-use cfg_core::types::Cfg;
 use cfg_pascal::calls::{TransactionCallKind, TransactionOp, lookup_transaction_method};
-use cfg_pascal::cfg_core;
 
 use crate::cfg::analysis::AnalysisContext;
 use crate::dcu::ProjectContext;
 use crate::engine::{Diagnostic, FileInfo, Severity};
 use crate::rules::helpers::{
-    build_var_type_map, byte_offset_to_line_col, extract_uses_clauses, node_text,
+    build_var_type_map, byte_offset_to_line_col, extract_uses_clauses, find_def_proc_at, node_text,
 };
 use crate::rules::{LintContext, Rule, RuleCategory, RuleMeta};
 
@@ -595,93 +593,6 @@ fn analyze_procedure(
     findings
 }
 
-/// Extract the qualified proc name from a `defProc` node.
-///
-/// AST structure: `defProc header:(declProc name:(identifier))`
-/// For methods: `defProc header:(declProc (genericDot (identifier) (identifier)))`
-fn extract_defproc_name(def_proc: Node, source: &[u8]) -> Option<String> {
-    // Get the `header` field (which is a `declProc` node)
-    let decl_proc = if let Some(h) = def_proc.child_by_field_name("header") {
-        h
-    } else {
-        // Fallback: find the first `declProc` child
-        let mut cursor = def_proc.walk();
-        let found = def_proc
-            .children(&mut cursor)
-            .find(|c| c.kind() == K::DECL_PROC);
-        drop(cursor);
-        found?
-    };
-
-    // Try `genericDot` first (for method implementations like `TClass.Method`)
-    let mut cursor = decl_proc.walk();
-    if let Some(generic_dot) = decl_proc
-        .children(&mut cursor)
-        .find(|c| c.kind() == K::GENERIC_DOT)
-    {
-        let idents: Vec<Node> = generic_dot
-            .children(&mut generic_dot.walk())
-            .filter(|c| c.kind() == K::IDENTIFIER)
-            .collect();
-        if idents.len() >= 2 {
-            return Some(format!(
-                "{}.{}",
-                node_text(idents[0], source),
-                node_text(idents[1], source)
-            ));
-        }
-        if !idents.is_empty() {
-            return Some(node_text(idents[0], source));
-        }
-    }
-
-    // Try the `name` field on `declProc`
-    if let Some(name_node) = decl_proc.child_by_field_name("name") {
-        return Some(node_text(name_node, source));
-    }
-
-    // Fallback: first direct `identifier` child of `declProc`
-    let mut cursor2 = decl_proc.walk();
-    for child in decl_proc.children(&mut cursor2) {
-        if child.kind() == K::IDENTIFIER {
-            return Some(node_text(child, source));
-        }
-    }
-
-    None
-}
-
-/// Find defProc nodes in the AST and match them to CFGs by proc_name.
-fn find_proc_node_for_cfg<'a>(tree: &'a Tree, source: &[u8], cfg: &Cfg) -> Option<Node<'a>> {
-    fn walk<'a>(node: Node<'a>, source: &[u8], target_name: &str) -> Option<Node<'a>> {
-        if node.kind() == K::DEF_PROC
-            && let Some(name) = extract_defproc_name(node, source)
-            && name.eq_ignore_ascii_case(target_name)
-        {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(found) = walk(child, source, target_name) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    // The proc_name in the CFG may be qualified (e.g. "TFoo.Bar").
-    // Try matching the full name first, then just the method part.
-    let result = walk(tree.root_node(), source, &cfg.proc_name);
-    if result.is_some() {
-        return result;
-    }
-    if let Some(dot_pos) = cfg.proc_name.rfind('.') {
-        let method_name = &cfg.proc_name[dot_pos + 1..];
-        return walk(tree.root_node(), source, method_name);
-    }
-    None
-}
-
 /// Shared implementation: run analysis for all CFGs and collect findings.
 fn run_transaction_analysis(
     tree: &Tree,
@@ -692,7 +603,7 @@ fn run_transaction_analysis(
     let mut all_findings = Vec::new();
 
     for cfg in analysis.cfgs.values() {
-        let proc_node = match find_proc_node_for_cfg(tree, source, cfg) {
+        let proc_node = match find_def_proc_at(tree.root_node(), cfg.byte_range.start) {
             Some(n) => n,
             None => continue,
         };

@@ -211,3 +211,46 @@ fn use_after_free_allows_freeing_inline_var_for_in_variable() {
         matches
     );
 }
+
+fn use_after_free_line_numbers(fixture_path: &str) -> Vec<usize> {
+    use_after_free_lines(fixture_path)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+#[test]
+fn use_after_free_flags_double_free_in_first_of_two_overloads() {
+    let lines = use_after_free_line_numbers(
+        "tests/fixtures/use_after_free/bad_double_free_in_first_overload.pas",
+    );
+    assert_eq!(
+        lines,
+        vec![14],
+        "Each overload has its own CFG; the first one double-frees"
+    );
+}
+
+#[test]
+fn use_after_free_flags_double_free_in_first_of_two_overloaded_methods() {
+    let lines = use_after_free_line_numbers(
+        "tests/fixtures/use_after_free/bad_double_free_in_overloaded_method.pas",
+    );
+    assert_eq!(
+        lines,
+        vec![18],
+        "TFoo.Bar(A: Integer) double-frees; TFoo.Bar(S: string) is clean"
+    );
+}
+
+#[test]
+fn use_after_free_flags_double_free_in_forward_declared_overload() {
+    let lines = use_after_free_line_numbers(
+        "tests/fixtures/use_after_free/bad_double_free_in_forward_overload.pas",
+    );
+    assert_eq!(
+        lines,
+        vec![15],
+        "Forward declarations have no body; both definitions get a CFG"
+    );
+}

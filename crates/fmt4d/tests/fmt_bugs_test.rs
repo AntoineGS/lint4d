@@ -4219,6 +4219,53 @@ fn directive_after_uses_clause_on_its_line_is_kept() {
     }
 }
 
+// ── Bug: the `,` before a directive ending a uses list is dropped (TASK-128) ──
+// With directives after a list's last unit, the unit lost its punctuation
+// whether or not a `,` followed it in the source. The include is opaque:
+// in `uses A, {$I u.inc};` it lists more units, and needs the `,`.
+
+#[test]
+fn comma_before_a_directive_ending_a_uses_list_is_kept() {
+    for (clause, expected) in [
+        ("uses A, {$I units.inc};", "uses\n  A,\n  {$I units.inc};\n"),
+        (
+            "uses A, {$I a.inc}, {$I b.inc};",
+            "uses\n  A,\n  {$I a.inc},\n  {$I b.inc};\n",
+        ),
+        (
+            "uses A, B, {$I u.inc};",
+            "uses\n  A,\n  B,\n  {$I u.inc};\n",
+        ),
+        (
+            "uses A, { c } {$I u.inc};",
+            "uses\n  A, { c }\n  {$I u.inc};\n",
+        ),
+        (
+            "uses {$IFDEF X} A, {$I u.inc} {$ENDIF};",
+            "uses\n  {$IFDEF X}\n  A,\n  {$I u.inc}\n  {$ENDIF};\n",
+        ),
+        (
+            "uses {$IFDEF X} A, {$I u.inc}; {$ELSE} B; {$ENDIF}",
+            "uses\n  {$IFDEF X}\n  A,\n  {$I u.inc};\n  {$ELSE}\n  B;\n  {$ENDIF}\n",
+        ),
+        // Without a `,` in the source, the unit still gets none.
+        ("uses A {$I x.inc};", "uses\n  A\n  {$I x.inc};\n"),
+        (
+            "uses A, {$I a.inc} {$I b.inc};",
+            "uses\n  A,\n  {$I a.inc}\n  {$I b.inc};\n",
+        ),
+    ] {
+        let src = uses_source(clause);
+        for result in [format_source(&src), format_unsorted(&src)] {
+            assert!(result.contains(expected), "{clause:?}:\n{result}");
+            assert_parses_cleanly(&result);
+        }
+        idempotency_check(&src);
+        let unsorted = format_unsorted(&src);
+        assert_eq!(format_unsorted(&unsorted), unsorted, "not idempotent");
+    }
+}
+
 #[test]
 fn uses_sorting_never_leaves_a_conditional_block_last() {
     let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";

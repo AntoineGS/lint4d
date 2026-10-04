@@ -28,7 +28,13 @@ pub enum UsesItem {
     /// An {$IFDEF}...{$ENDIF} block — pinned in position, contents untouched.
     IfDefBlock(IfDefBlock),
     /// A standalone directive ({$I ...}, {$HINTS OFF}, etc.) — pinned in position.
-    Directive(String),
+    Directive {
+        text: String,
+        /// A `,` came right before it in the source. An include is opaque,
+        /// so the item before it keeps that `,` (the include goes on with
+        /// a unit).
+        after_comma: bool,
+    },
     /// A comment with no unit to attach to — pinned in position.
     Comment(String),
 }
@@ -40,6 +46,14 @@ impl UsesItem {
             name: name.into(),
             leading: Vec::new(),
             trailing: Vec::new(),
+        }
+    }
+
+    /// A directive with no `,` before it.
+    pub fn directive(text: impl Into<String>) -> Self {
+        UsesItem::Directive {
+            text: text.into(),
+            after_comma: false,
         }
     }
 }
@@ -171,7 +185,7 @@ fn collect_items_units(items: &[UsesItem], out: &mut Vec<String>) {
         match item {
             UsesItem::Unit { name, .. } => out.push(name.clone()),
             UsesItem::IfDefBlock(block) => collect_ifdef_units(block, out),
-            UsesItem::Directive(_) | UsesItem::Comment(_) => {}
+            UsesItem::Directive { .. } | UsesItem::Comment(_) => {}
         }
     }
 }
@@ -348,8 +362,13 @@ fn parse_pp_uses_block(
     // Which conditional branch we are currently appending items into.
     let mut state = BranchState::If;
     let mut ended = false;
+    let mut after_comma = false;
 
     for child in node.children(&mut node.walk()) {
+        let comma_before = after_comma;
+        if child.kind() != K::COMMENT {
+            after_comma = child.kind() == K::COMMA;
+        }
         match child.kind() {
             K::PP_IF => {
                 block.if_branch.directive = node_text(child, source);
@@ -399,7 +418,10 @@ fn parse_pp_uses_block(
             }
             K::PP_DIRECTIVE => {
                 let text = node_text(child, source);
-                branch_items(&mut block, state).push(UsesItem::Directive(text));
+                branch_items(&mut block, state).push(UsesItem::Directive {
+                    text,
+                    after_comma: comma_before,
+                });
             }
             K::COMMA | K::SEMICOLON => {
                 let texts = punctuation_texts(child, comments);
@@ -474,7 +496,12 @@ pub(crate) fn extract_uses_items(
         texts
     };
     let mut items = Vec::new();
+    let mut after_comma = false;
     for child in node.children(&mut node.walk()) {
+        let comma_before = after_comma;
+        if child.kind() != K::COMMENT {
+            after_comma = child.kind() == K::COMMA;
+        }
         match child.kind() {
             K::MODULE_NAME => items.extend(unit_item(child, source, comments)),
             K::PP_USES_BLOCK | K::PP_USES_BLOCK_WITH_SEMI => {
@@ -493,7 +520,10 @@ pub(crate) fn extract_uses_items(
             K::PP_DIRECTIVE => {
                 let text = node_text(child, source);
                 if !text.is_empty() {
-                    items.push(UsesItem::Directive(text));
+                    items.push(UsesItem::Directive {
+                        text,
+                        after_comma: comma_before,
+                    });
                 }
             }
             K::COMMA | K::SEMICOLON => {
@@ -581,7 +611,7 @@ pub(crate) fn layout_uses_items(
                     pinned.push((last_unit.clone(), item.clone()));
                 }
             }
-            UsesItem::IfDefBlock(_) | UsesItem::Directive(_) | UsesItem::Comment(_) => {
+            UsesItem::IfDefBlock(_) | UsesItem::Directive { .. } | UsesItem::Comment(_) => {
                 pinned.push((last_unit.clone(), item.clone()));
             }
         }
@@ -757,7 +787,9 @@ enum ItemRole {
     Block {
         terminated: bool,
     },
-    Directive,
+    Directive {
+        after_comma: bool,
+    },
     /// Comments and group separators.
     Other,
 }
@@ -769,7 +801,9 @@ impl ItemRole {
             UsesItem::IfDefBlock(block) => ItemRole::Block {
                 terminated: block.terminated,
             },
-            UsesItem::Directive(_) => ItemRole::Directive,
+            UsesItem::Directive { after_comma, .. } => ItemRole::Directive {
+                after_comma: *after_comma,
+            },
             UsesItem::Comment(_) => ItemRole::Other,
         }
     }
@@ -799,7 +833,9 @@ impl Punct {
 /// gets nothing and those blocks are written comma-first, the last of them
 /// taking `end`. When directives follow the item taking a `;`, the `;` is
 /// written after the last of them instead, so they stay inside the clause
-/// in their source order (an `{$I}` may itself list units).
+/// in their source order (an `{$I}` may itself list units). An item left
+/// without punctuation before a directive that followed a `,` in the
+/// source gets that `,` back.
 fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
     if lead {
         return roles
@@ -814,13 +850,14 @@ fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
         .iter()
         .map(|role| match role {
             ItemRole::Unit | ItemRole::Block { .. } => Punct::plain(ItemEnd::Comma),
-            ItemRole::Directive | ItemRole::Other => Punct::plain(ItemEnd::Open),
+            ItemRole::Directive { .. } | ItemRole::Other => Punct::plain(ItemEnd::Open),
         })
         .collect();
     let Some(last) = roles
         .iter()
         .rposition(|role| matches!(role, ItemRole::Unit | ItemRole::Block { .. }))
     else {
+        restore_commas_before_directives(roles, &mut puncts);
         return puncts;
     };
     if end != ItemEnd::Comma
@@ -843,12 +880,32 @@ fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
         && roles[last] != (ItemRole::Block { terminated: true })
         && let Some(offset) = roles[last + 1..]
             .iter()
-            .rposition(|role| *role == ItemRole::Directive)
+            .rposition(|role| matches!(role, ItemRole::Directive { .. }))
     {
         puncts[last].end = ItemEnd::Open;
         puncts[last + 1 + offset].end = ItemEnd::Semicolon;
     }
+    restore_commas_before_directives(roles, &mut puncts);
     puncts
+}
+
+/// Give a `,` to each unit, block or directive left without punctuation
+/// right before (comments and group separators aside) a directive that
+/// followed a `,` in the source. A pinned directive stays after the item
+/// it followed, so that is where the source had the `,`.
+fn restore_commas_before_directives(roles: &[ItemRole], puncts: &mut [Punct]) {
+    for (idx, role) in roles.iter().enumerate() {
+        if *role != (ItemRole::Directive { after_comma: true }) {
+            continue;
+        }
+        if let Some(prev) = roles[..idx]
+            .iter()
+            .rposition(|role| *role != ItemRole::Other)
+            && puncts[prev] == Punct::plain(ItemEnd::Open)
+        {
+            puncts[prev].end = ItemEnd::Comma;
+        }
+    }
 }
 
 /// Recursively emit a single `UsesItem` into `lines`.
@@ -859,9 +916,10 @@ fn emit_uses_item(item: &UsesItem, indent: &str, punct: Punct, lines: &mut Vec<S
             leading,
             trailing,
         } => emit_unit(name, leading, trailing, indent, punct, lines),
-        UsesItem::Directive(text) | UsesItem::Comment(text) => {
-            lines.push(format!("{indent}{text}"));
+        UsesItem::Directive { text, .. } => {
+            lines.push(format!("{indent}{text}{}", punct.end.text()));
         }
+        UsesItem::Comment(text) => lines.push(format!("{indent}{text}")),
         UsesItem::IfDefBlock(block) => {
             emit_ifdef_block(block, indent, punct, lines);
         }
@@ -903,7 +961,7 @@ fn emit_list(
         let ends_clause = puncts[idx].end == ItemEnd::Semicolon;
         match items[idx] {
             None => lines.push(String::new()),
-            Some(UsesItem::Directive(text)) if ends_clause => {
+            Some(UsesItem::Directive { text, .. }) if ends_clause => {
                 let mut trailing = Vec::new();
                 while let Some(Some(UsesItem::Comment(comment))) = items.get(idx + 1) {
                     trailing.push(comment.clone());
@@ -1333,9 +1391,9 @@ mod tests {
 
     #[test]
     fn uses_item_directive_constructable() {
-        let item = UsesItem::Directive("{$I compilers.inc}".to_string());
+        let item = UsesItem::directive("{$I compilers.inc}");
         match item {
-            UsesItem::Directive(text) => assert_eq!(text, "{$I compilers.inc}"),
+            UsesItem::Directive { text, .. } => assert_eq!(text, "{$I compilers.inc}"),
             _ => panic!("wrong variant"),
         }
     }
@@ -1460,14 +1518,14 @@ mod tests {
         // ppDirective is an extra — it may appear before SysUtils
         let directive_items: Vec<_> = items
             .iter()
-            .filter(|i| matches!(i, UsesItem::Directive(_)))
+            .filter(|i| matches!(i, UsesItem::Directive { .. }))
             .collect();
         assert!(
             !directive_items.is_empty(),
             "expected at least one Directive"
         );
         match &directive_items[0] {
-            UsesItem::Directive(text) => assert!(text.contains("compilers.inc")),
+            UsesItem::Directive { text, .. } => assert!(text.contains("compilers.inc")),
             _ => panic!("expected Directive"),
         }
     }
@@ -1585,7 +1643,7 @@ mod tests {
         };
 
         let items = vec![
-            UsesItem::Directive("{$I compilers.inc}".to_string()),
+            UsesItem::directive("{$I compilers.inc}"),
             UsesItem::unit("SysUtils"),
             UsesItem::unit("Classes"),
         ];
@@ -1615,7 +1673,7 @@ mod tests {
 
         let items = vec![
             UsesItem::unit("SysUtils"),
-            UsesItem::Directive("{$I myinc.inc}".to_string()),
+            UsesItem::directive("{$I myinc.inc}"),
             UsesItem::unit("Classes"),
         ];
 
@@ -1627,8 +1685,8 @@ mod tests {
     #[test]
     fn format_items_multiple_directives_at_start_preserve_order() {
         let items = vec![
-            UsesItem::Directive("{$I a.inc}".to_string()),
-            UsesItem::Directive("{$I b.inc}".to_string()),
+            UsesItem::directive("{$I a.inc}"),
+            UsesItem::directive("{$I b.inc}"),
             UsesItem::unit("SysUtils"),
         ];
         let output = format_uses_items(&items, &default_config(), "  ", &HashSet::new());

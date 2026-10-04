@@ -4527,6 +4527,82 @@ fn var_list_with_several_comma_items_is_idempotent() {
     }
 }
 
+// ── Bug: a `//` comment before the `:` swallows it (TASK-112) ──
+// The comment trailing the last name of a declaration runs to the end of
+// the line, and the `: Type` was written after it on the same line.
+
+/// In every mode the output parses, `comment` appears once and ends its
+/// line, and the next line starts with the declaration's `:`.
+fn assert_colon_follows_line_comment(src: &str, comment: &str) {
+    for result in format_three_modes_idempotent(src) {
+        assert_parses_cleanly(&result);
+        assert_eq!(result.matches(comment).count(), 1, "{result}");
+        let lines = trimmed_lines(&result);
+        let at = lines
+            .iter()
+            .position(|l| l.ends_with(comment))
+            .unwrap_or_else(|| panic!("{comment:?} does not end a line:\n{result}"));
+        assert!(lines[at + 1].starts_with(':'), "{result}");
+    }
+}
+
+#[test]
+fn line_comment_before_colon_does_not_swallow_a_var_type() {
+    let src = var_list_source("  Bcd: Byte;\n  A, B // why\n    : Integer;\n  C: Byte;\n");
+    assert!(
+        format_source(&src)
+            .contains("  Bcd: Byte;\n  A: Integer;\n  B // why\n  : Integer;\n  C: Byte;\n"),
+        "{}",
+        format_source(&src)
+    );
+    assert_colon_follows_line_comment(&src, "// why");
+    // Aligned, the identifiers before the last still get rows of their own.
+    let aligned = format_aligned(&src);
+    assert!(aligned.contains("  A  : Integer;\n"), "{aligned}");
+    let src = var_list_source("  Bcd: Byte;\n  A // why\n    : Integer;\n  C: Byte;\n");
+    assert_colon_follows_line_comment(&src, "// why");
+    let src = var_list_source(
+        "  Bcd: Byte;\n  A, {x}\n  // own\n  B // why\n    : Integer; // end\n  C: Byte;\n",
+    );
+    assert_colon_follows_line_comment(&src, "// why");
+    for result in format_three_modes_idempotent(&src) {
+        for c in ["{x}", "// own", "// end"] {
+            assert_eq!(result.matches(c).count(), 1, "{c} in:\n{result}");
+        }
+    }
+}
+
+#[test]
+fn line_comment_before_colon_does_not_swallow_a_parameter_type() {
+    let src =
+        "unit T;\ninterface\nprocedure P(A, B // c\n  : Integer; C: Byte);\nimplementation\nend.\n";
+    assert!(
+        format_source(src).contains("  A, B // c\n  : Integer;\n  C: Byte\n"),
+        "{}",
+        format_source(src)
+    );
+    assert_colon_follows_line_comment(src, "// c");
+}
+
+#[test]
+fn line_comment_before_colon_does_not_swallow_a_field_type() {
+    for fields in [
+        "    Bcd: Byte;\n    A, B // c\n      : Integer;\n    C: Byte;\n",
+        "    Bcd: Byte;\n    A // c\n      : Integer;\n    C: Byte;\n",
+    ] {
+        let src = format!(
+            "unit T;\ninterface\ntype\n  R = record\n{fields}  end;\nimplementation\nend.\n"
+        );
+        assert_colon_follows_line_comment(&src, "// c");
+    }
+    let src = "unit T;\ninterface\ntype\n  R = record\n    A, B // c\n      : Integer;\n  end;\nimplementation\nend.\n";
+    assert!(
+        format_source(src).contains("    A, B // c\n    : Integer;\n"),
+        "{}",
+        format_source(src)
+    );
+}
+
 // ── Bug: end-of-file trivia in an unclosed {$FMT.OFF} is re-laid-out ──
 
 #[test]

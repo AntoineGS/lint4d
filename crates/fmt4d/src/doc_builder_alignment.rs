@@ -8,7 +8,15 @@ use tree_sitter::Node;
 pub(crate) struct VarListRow {
     /// Docs emitted above the row (leading comments and directives).
     pub(crate) leading: Vec<Doc>,
-    pub(crate) cells: Vec<AlignCell>,
+    pub(crate) body: RowBody,
+}
+
+/// The content of a [`VarListRow`].
+pub(crate) enum RowBody {
+    Cells(Vec<AlignCell>),
+    /// A declaration laid out without alignment: its identifier ends in a
+    /// `//` comment, so its `: T;` starts the next line.
+    Plain(Doc),
 }
 
 impl<'a> DocBuilder<'a> {
@@ -125,8 +133,14 @@ impl<'a> DocBuilder<'a> {
         // An aligned cell renders on a single line; folding a `//` comment into
         // a single line would let it swallow every following name (silent
         // declaration deletion). Returning None makes the caller fall back to
-        // the multi-line non-aligned renderer, which forces hardlines.
-        if name_list_has_line_comment(self.source, &children[..colon_idx]) {
+        // the multi-line non-aligned renderer, which forces hardlines. A
+        // comment trailing the last name lies outside the list's source
+        // span, and would swallow the `:`.
+        if name_list_has_line_comment(self.source, &children[..colon_idx])
+            || colon_idx
+                .checked_sub(1)
+                .is_some_and(|i| self.has_trailing_line_comment(children[i]))
+        {
             return None;
         }
 
@@ -274,6 +288,15 @@ impl<'a> DocBuilder<'a> {
             carried = trivia.rest;
             let mut moved = trivia.inline;
 
+            // The last identifier keeps its `//` comment, which would
+            // swallow the `:` of an aligned row.
+            if is_last && self.has_trailing_line_comment(*ident) {
+                let suffix = self.suffix_doc(&children[colon_idx..]);
+                let body = RowBody::Plain(doc::concat(vec![name_doc, Doc::Hardline, suffix]));
+                rows.push(VarListRow { leading, body });
+                continue;
+            }
+
             let (row_type, row_value) = if is_last {
                 (type_doc.clone(), value_doc.clone())
             } else {
@@ -323,7 +346,10 @@ impl<'a> DocBuilder<'a> {
             };
             cells.extend(comment_cell);
 
-            rows.push(VarListRow { leading, cells });
+            rows.push(VarListRow {
+                leading,
+                body: RowBody::Cells(cells),
+            });
         }
 
         Some(rows)
@@ -745,8 +771,19 @@ impl<'a> DocBuilder<'a> {
                 let expanded_len = expanded.len();
                 for (i, row) in expanded.into_iter().enumerate() {
                     group_items.extend(row.leading);
-                    let mut cells = row.cells;
                     let is_last = i == expanded_len.saturating_sub(1);
+                    let mut cells = match row.body {
+                        RowBody::Cells(cells) => cells,
+                        RowBody::Plain(plain) => {
+                            // Laid out as a non-row item, see below.
+                            group_items.push(Doc::LineStart(String::new()));
+                            group_items.push(plain);
+                            if is_last {
+                                group_items.push(trailing_dir.clone());
+                            }
+                            continue;
+                        }
+                    };
                     if is_last
                         && !matches!(trailing_dir, Doc::Empty)
                         && let Some(last) = cells.last_mut()

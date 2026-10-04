@@ -418,6 +418,11 @@ impl<'a> DocBuilder<'a> {
                     let (ident_doc, moved) =
                         self.var_list_ident(before_colon, *ident, is_last, false);
                     parts.push(ident_doc);
+                    // The last identifier keeps its `//` comment, which
+                    // would swallow the `:`.
+                    if is_last && self.has_trailing_line_comment(*ident) {
+                        parts.push(Doc::Hardline);
+                    }
                     parts.push(if is_last {
                         suffix.clone()
                     } else {
@@ -489,6 +494,14 @@ impl<'a> DocBuilder<'a> {
             }
         }
 
+        // A `//` comment after the last identifier would swallow the `:`.
+        if !from_colon.is_empty()
+            && ident_list
+                .last()
+                .is_some_and(|n| self.has_trailing_line_comment(*n))
+        {
+            ident_parts.push(Doc::Hardline);
+        }
         let suffix_docs: Vec<Doc> = from_colon.iter().map(|c| self.doc_for_node(*c)).collect();
 
         doc::group(doc::concat(vec![
@@ -501,7 +514,7 @@ impl<'a> DocBuilder<'a> {
     /// The `: Type;` part of a `declVar` (children from the colon on).
     /// Declarations other than the last of an expanded list build it under
     /// [`Self::without_trivia`], so its comments are emitted once.
-    fn suffix_doc(&self, from_colon: &[Node<'a>]) -> Doc {
+    pub(crate) fn suffix_doc(&self, from_colon: &[Node<'a>]) -> Doc {
         doc::concat(from_colon.iter().map(|c| self.doc_for_node(*c)).collect())
     }
 

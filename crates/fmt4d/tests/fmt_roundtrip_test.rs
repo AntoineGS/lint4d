@@ -1126,3 +1126,33 @@ end.
         assert_same_program(source, &formatted);
     }
 }
+
+#[test]
+fn roundtrip_line_comment_before_colon_in_three_modes() {
+    let source = "\
+unit T;
+interface
+type
+  R = record
+    A, B // c
+      : Integer;
+    D // d
+      : Byte;
+  end;
+procedure Q(A, B // q
+  : Integer; C: Byte);
+implementation
+procedure P;
+var
+  A, B // why
+    : Integer;
+  E // e
+    : Byte;
+begin
+end;
+end.
+";
+    for formatted in common::format_three_modes(source) {
+        assert_same_program(source, &formatted);
+    }
+}

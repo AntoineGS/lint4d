@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-04 22:49'
+updated_date: '2026-10-04 22:58'
 labels:
   - fmt
   - correctness
@@ -28,6 +29,7 @@ TASK-128 keeps a ',' that sat before a directive (UsesItem::Directive.after_comm
 - 'uses {$I u.inc}, B;' -> '{$I u.inc}' / 'B;' (same: the ',' after the directive is lost).
 - 'uses A {$I u.inc}, B;' -> 'A,' / '{$I u.inc}' / 'B;'. If u.inc holds ', X' the source reads 'A, X, B' and the output 'A, , X B'.
 - Sorting: 'uses B, A, {$I u.inc};' -> 'A,' / '{$I u.inc}' / 'B;'. The directive is pinned after its anchor A, so B now follows it without a ','. Source 'B, A, X;' becomes 'A, X B;'.
+- Sorting: 'uses A {$IFDEF X}, B, {$I u.inc} {$ENDIF};' moves the block in front of A (layout_uses_items) -> '{$IFDEF X}' / 'B,' / '{$I u.inc}' / '{$ENDIF}' / 'A;', which reads 'B, U A;' with X defined. With sorting off it is correct since TASK-128 review round 1 (', {$I u.inc}').
 
 Likely shape of the fix: record the punctuation after each directive too (comma_after), give a directive followed by a unit or block its source ','; do not add a ',' to a unit before a directive that had none in the source; under sorting, keep a directive that ended the source list at the end of the clause (like the block handling in layout_uses_items), so its ';' context is kept.
 

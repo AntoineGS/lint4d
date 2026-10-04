@@ -823,6 +823,11 @@ impl Punct {
     fn plain(end: ItemEnd) -> Self {
         Punct { lead: false, end }
     }
+
+    /// What goes before the item.
+    fn lead_text(self) -> &'static str {
+        if self.lead { ", " } else { "" }
+    }
 }
 
 /// The punctuation of each item of a list that ends with `end`; `lead`
@@ -833,18 +838,20 @@ impl Punct {
 /// gets nothing and those blocks are written comma-first, the last of them
 /// taking `end`. When directives follow the item taking a `;`, the `;` is
 /// written after the last of them instead, so they stay inside the clause
-/// in their source order (an `{$I}` may itself list units). An item left
-/// without punctuation before a directive that followed a `,` in the
-/// source gets that `,` back.
+/// in their source order (an `{$I}` may itself list units). A directive
+/// that followed a `,` in the source gets that `,` back (see
+/// [`restore_commas_before_directives`]).
 fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
     if lead {
-        return roles
+        let mut puncts: Vec<Punct> = roles
             .iter()
-            .map(|_| Punct {
-                lead: true,
+            .map(|role| Punct {
+                lead: !matches!(role, ItemRole::Directive { .. }),
                 end: ItemEnd::Open,
             })
             .collect();
+        restore_commas_before_directives(roles, &mut puncts, true);
+        return puncts;
     }
     let mut puncts: Vec<Punct> = roles
         .iter()
@@ -857,7 +864,7 @@ fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
         .iter()
         .rposition(|role| matches!(role, ItemRole::Unit | ItemRole::Block { .. }))
     else {
-        restore_commas_before_directives(roles, &mut puncts);
+        restore_commas_before_directives(roles, &mut puncts, false);
         return puncts;
     };
     if end != ItemEnd::Comma
@@ -885,25 +892,28 @@ fn list_puncts(roles: &[ItemRole], end: ItemEnd, lead: bool) -> Vec<Punct> {
         puncts[last].end = ItemEnd::Open;
         puncts[last + 1 + offset].end = ItemEnd::Semicolon;
     }
-    restore_commas_before_directives(roles, &mut puncts);
+    restore_commas_before_directives(roles, &mut puncts, false);
     puncts
 }
 
-/// Give a `,` to each unit, block or directive left without punctuation
-/// right before (comments and group separators aside) a directive that
-/// followed a `,` in the source. A pinned directive stays after the item
-/// it followed, so that is where the source had the `,`.
-fn restore_commas_before_directives(roles: &[ItemRole], puncts: &mut [Punct]) {
+/// Give back the `,` that came before a directive in the source. The item
+/// right before it (comments and group separators aside) gets it when that
+/// item has no punctuation; when there is no such item, or it is written
+/// comma-first, or the whole list is (`comma_first`), the directive is
+/// written comma-first instead. A pinned directive stays after the item it
+/// followed, so that is where the source had the `,`.
+fn restore_commas_before_directives(roles: &[ItemRole], puncts: &mut [Punct], comma_first: bool) {
     for (idx, role) in roles.iter().enumerate() {
         if *role != (ItemRole::Directive { after_comma: true }) {
             continue;
         }
-        if let Some(prev) = roles[..idx]
+        let prev = roles[..idx]
             .iter()
-            .rposition(|role| *role != ItemRole::Other)
-            && puncts[prev] == Punct::plain(ItemEnd::Open)
-        {
-            puncts[prev].end = ItemEnd::Comma;
+            .rposition(|role| *role != ItemRole::Other);
+        match prev {
+            Some(prev) if puncts[prev].end != ItemEnd::Open => {}
+            Some(prev) if !comma_first && !puncts[prev].lead => puncts[prev].end = ItemEnd::Comma,
+            _ => puncts[idx].lead = true,
         }
     }
 }
@@ -917,7 +927,11 @@ fn emit_uses_item(item: &UsesItem, indent: &str, punct: Punct, lines: &mut Vec<S
             trailing,
         } => emit_unit(name, leading, trailing, indent, punct, lines),
         UsesItem::Directive { text, .. } => {
-            lines.push(format!("{indent}{text}{}", punct.end.text()));
+            lines.push(format!(
+                "{indent}{}{text}{}",
+                punct.lead_text(),
+                punct.end.text()
+            ));
         }
         UsesItem::Comment(text) => lines.push(format!("{indent}{text}")),
         UsesItem::IfDefBlock(block) => {
@@ -968,7 +982,8 @@ fn emit_list(
                     idx += 1;
                 }
                 let trailing = with_after(&trailing, after);
-                push_with_trailing(format!("{indent}{text};"), &trailing, indent, lines);
+                let lead = puncts[idx].lead_text();
+                push_with_trailing(format!("{indent}{lead}{text};"), &trailing, indent, lines);
             }
             Some(UsesItem::Unit {
                 name,
@@ -1017,9 +1032,8 @@ fn emit_unit(
     for comment in leading {
         lines.push(format!("{indent}{comment}"));
     }
-    let lead = if punct.lead { ", " } else { "" };
     push_with_trailing(
-        format!("{indent}{lead}{name}{}", punct.end.text()),
+        format!("{indent}{}{name}{}", punct.lead_text(), punct.end.text()),
         trailing,
         indent,
         lines,

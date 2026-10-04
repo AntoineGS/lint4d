@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 23:40'
-updated_date: '2026-10-04 22:49'
+updated_date: '2026-10-04 22:58'
 labels:
   - fmt
   - correctness
@@ -67,6 +67,12 @@ Change: uses.rs UsesItem::Directive is now { text, after_comma } (UsesItem::dire
 GREEN: cargo test -p fmt4d 507 passed, 0 failed; clippy -p fmt4d --all-targets -D warnings and fmt --check clean. Corpus gate (347 files, plain and aligned, base master 9322cce): only the two new uses fixtures differ (TASK-114 and TASK-128), 0 non-idempotent.
 Branch verification (all three commits): cargo fmt --check clean; cargo clippy --workspace --all-targets -D warnings clean; cargo test --workspace 3609 passed / 0 failed / 9 ignored; pascal-lsp protocol_barriers (test-support) 913/916: the two TASK-1.2 timing tests (cancel_/shutdown_after_sixty_sixth_ordinary_frame_is_reached_by_worker_deadline) and sixty_four_project_metadata_changes_share_the_notification_budget_and_stale_pull_results (receive timeout under full-suite load; passes 3/3 alone). None touch fmt4d.
 Follow-up filed: TASK-137 for the ',' after a directive followed by a unit, and sorting moving a unit after a trailing include (out of scope here).
+
+Review round 1 (code-reviewer subagent on 9322cce..bf881df; TASK-112 and TASK-114 judged sound): in a comma-first list the ',' before a directive was still lost. list_puncts returned early for 'lead' lists, and the restore rule only handled a predecessor with no punctuation, not one written comma-first. 'uses A {$IFDEF X}, B, {$I u.inc} {$ENDIF};' (sorting off) gave '{$IFDEF X}' / ', B' / '{$I u.inc}', which reads 'A, B U' with X defined.
+RED: comma_before_a_directive_in_a_comma_first_list_is_kept failed ('{$I u.inc}' without the ',').
+Fix: restore_commas_before_directives(roles, puncts, comma_first) writes the directive comma-first (', {$I u.inc}') when it has no item before it, when that item is written comma-first, or when the whole list is; the item before it gets the ',' otherwise; an item that already ends in punctuation is left alone. Directives honour Punct.lead (Punct::lead_text, also used by emit_unit).
+GREEN: cargo test -p fmt4d 508 passed; cargo test --workspace 3610 passed / 0 failed / 9 ignored; clippy --workspace -D warnings and fmt --check clean; corpus gate 347 files, only the two new uses fixtures differ, 0 non-idempotent.
+Declined from the review, filed under TASK-137: with sorting on, the same clause moves the block in front of A, and the include then precedes A without a ',' (directive followed by a unit).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
@@ -81,4 +87,6 @@ Tests: fmt_bugs_test.rs comma_before_a_directive_ending_a_uses_list_is_kept (eig
 Verification of the branch: fmt --check, clippy --workspace -D warnings clean; cargo test --workspace 3609/0/9; protocol_barriers 913/916 (timing tests only, see notes); corpus gate 347 files, only the new fixtures differ, none non-idempotent.
 
 Out of scope, filed as a follow-up: a directive followed by a unit ('A, {$I u}, B;', '{$I u}, B;', 'A {$I u}, B;') and sorting moving a unit after a trailing include ('uses B, A, {$I u};').
+
+Review round 1: a directive that followed a ',' in a comma-first list (blocks after the last unit, written ', B') is now written comma-first (', {$I u.inc}') instead of losing its ','. Test: comma_before_a_directive_in_a_comma_first_list_is_kept (five shapes, sorting off). cargo test --workspace 3610/0/9 after the fix.
 <!-- SECTION:FINAL_SUMMARY:END -->

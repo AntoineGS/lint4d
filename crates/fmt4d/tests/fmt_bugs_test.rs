@@ -4267,6 +4267,41 @@ fn comma_before_a_directive_ending_a_uses_list_is_kept() {
 }
 
 #[test]
+fn comma_before_a_directive_in_a_comma_first_list_is_kept() {
+    // Units keep their order with sorting off, so the blocks after the
+    // last unit stay there and are written comma-first; so is a directive
+    // that followed a `,`.
+    for (clause, expected) in [
+        (
+            "uses A {$IFDEF X}, B, {$I u.inc} {$ENDIF};",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  , {$I u.inc}\n  {$ENDIF};\n",
+        ),
+        (
+            "uses A, {$IFDEF X} B, {$I u.inc} {$ENDIF};",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  , {$I u.inc}\n  {$ENDIF};\n",
+        ),
+        (
+            "uses A {$IFDEF X}, B, {$I a.inc}, {$I b.inc} {$ENDIF};",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  , {$I a.inc}\n  , {$I b.inc}\n  {$ENDIF};\n",
+        ),
+        (
+            "uses A {$IFDEF X}, B {$ENDIF}, {$I u.inc};",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  {$ENDIF}\n  , {$I u.inc};\n",
+        ),
+        (
+            "uses A {$IFDEF X}, B {$I u.inc} {$ENDIF};",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  {$I u.inc}\n  {$ENDIF};\n",
+        ),
+    ] {
+        let src = uses_source(clause);
+        let result = format_unsorted(&src);
+        assert!(result.contains(expected), "{clause:?}:\n{result}");
+        assert_parses_cleanly(&result);
+        assert_eq!(format_unsorted(&result), result, "not idempotent");
+    }
+}
+
+#[test]
 fn uses_sorting_never_leaves_a_conditional_block_last() {
     let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";
     let result = format_source(src);

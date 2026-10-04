@@ -24223,10 +24223,14 @@ BDS = '/fake/37'
         );
     }
 
-    #[cfg(windows)]
+    // Runs wherever the temporary volume ignores letter case (Windows, and
+    // macOS by default).
     #[test]
-    fn mapped_read_authorization_is_case_insensitive_and_excludes_case_variants_on_windows() {
+    fn mapped_read_authorization_is_case_insensitive_and_excludes_case_variants() {
         let temp = tempfile::tempdir().expect("temporary directory");
+        if !pascal_project::path_identity::is_case_insensitive(temp.path()) {
+            return;
+        }
         let mapped_root = temp.path().join("sdk");
         let source = mapped_root.join("Source/Provider.pas");
         let case_variant = temp.path().join("SDK/source/provider.pas");

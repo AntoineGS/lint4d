@@ -1530,12 +1530,12 @@ recovered as a whole: known endpoints are invalidated/tombstoned and implicated
 open overlays are rejected rather than partially transferred. A later,
 separate notification reusing the same URI pair is processed normally; there is
 no URI-pair-only duplicate suppression. Bounded ambiguity recovery applies only
-to fully parsed rename pairs. Malformed batches across any of the four
-file-notification families permanently fence analysis before per-entry effects,
-rather than silently dropping a physical event or recovering only a subset.
-The cumulative UTF-8 length of canonical file
-URIs in a notification batch is limited to 32 KiB; in-range batches are
-validated before per-entry mutations. A pending, successful unit `willRenameFiles`
+to fully parsed rename pairs. Malformed or oversized batches across any of the
+four file-notification families are recovered by discarding derived state (see
+below) rather than silently dropping a physical event or recovering only a
+subset. The cumulative UTF-8 length of canonical file URIs in a notification
+batch is limited to 32 KiB; in-range batches are validated before per-entry
+mutations. A pending, successful unit `willRenameFiles`
 plan accepts an open overlay only when the exact planned text and version/identity
 transition can be proved. This supports a monotonic old-URI `didChange` followed
 by `didClose`, client move, and exact new-URI `didOpen` before the file-operation
@@ -1552,39 +1552,31 @@ Unverified/mismatched transitions fail closed and require reopening. A delayed
 late rename notifications invalidate old/new path state conservatively.
 All four file-notification families (`didCreateFiles`, `didDeleteFiles`,
 `didRenameFiles`, and `didChangeWatchedFiles`) validate the entire batch before
-processing any member. If any member's URI, rename endpoint, or watched-file
-change kind cannot be parsed and attributed to a file event, the server
-permanently fences workspace analysis before invalidation—even when other
-members are valid or some endpoints of the malformed member are known. This
-prevents partial recovery from leaving an unreported create/delete/move as
-authoritative (including a closed indexed source deleted before physical unlink)
-or from publishing partial candidate results. Later valid file events do not
-lift the fence; restart the workspace/server instance to resume analysis.
-Fully parsed in-range batches remain functional. Fully parsed exact rename
-duplicate pairs are deduplicated; conflicting endpoint reuse and chained pairs
-retain bounded ambiguity recovery. Oversized batches, excessive canonical URI
-bytes, and unretainable recovery endpoints permanently fence analysis rather
-than partially applying entries.
-Oversized `didChangeWatchedFiles`, `didCreateFiles`, `didDeleteFiles`, and
-`didRenameFiles` notifications are not silently discarded. A watched-file batch
-over 64 events or over 32 KiB of cumulative canonical URI bytes permanently
-fences workspace analysis before invalidation: the event list is not partially
-applied, because an uninspected late `Deleted` endpoint may still have readable
-old bytes or a `Changed` event may not explain an open overlay's move. The
-fence requests diagnostic cleanup/refresh, discards queued diagnostic
-publications, and is not lifted by later valid file events; restart the
-workspace/server instance to resume analysis.
-An over-64-entry create, delete, or rename file-operation batch, or an in-limit
-batch whose cumulative canonical URI bytes exceed 32 KiB, permanently fences
-analysis for that workspace instance before invalidation. The endpoint list
-may contain a delete-before-unlink or client-owned rename affecting an open
-overlay or selected provider; byte-overflow batches are therefore not treated
-as attributable merely because their bounded entries were parsed. These
-batches request diagnostic cleanup/refresh but are not applied entry-by-entry;
-later valid file events do not lift the fence. Restart the workspace/server
-instance to resume analysis. In-limit batches (up to 64 entries and 32 KiB of
-canonical URI bytes) continue through endpoint validation and normal bounded
-reconciliation. Pending
+processing any member. As the LSP specification states, these notifications
+describe changes that are already on disk: a watched `Deleted` event or a
+`didDeleteFiles`/`didRenameFiles` entry is sent after the file was removed or
+moved. Disk plus the client's open documents is therefore enough to rebuild
+everything the server derives, and no file notification disables analysis.
+A batch that cannot be reconciled entry by entry is recovered as a whole
+instead: a missing event array, a member whose URI, rename endpoint, or change
+kind cannot be parsed, more than 64 entries, more than 32 KiB of cumulative
+canonical URI bytes, or a rename endpoint over the 4 KiB open-document URI cap.
+The server records every member it could parse (deletions as stamped
+tombstones, at most 256; further deletions are left to disk), then discards
+every cached project entry and all derived state, marks the captured override
+files for re-read, requests diagnostic cleanup/refresh, and discards queued
+diagnostic publications. Watched-file, create, and delete events never override
+an open document, which stays authoritative until `didClose`, exactly as in an
+in-limit batch. Open documents at known rename endpoints are rejected until
+reopened. When a rename batch has a malformed member, the moved file cannot be
+named, so every open document whose file no longer exists on disk (including a
+never-saved buffer) is rejected; the client re-sends it. Large batches are
+realistic: a `git checkout` or a repository-wide format run reaches the server
+as one watched-file batch of hundreds of events. Empty `didCreateFiles`,
+`didDeleteFiles`, `didRenameFiles`, and `didChangeWatchedFiles` batches are
+no-ops, and a rename entry whose old and new URIs are equal is skipped.
+In-limit batches (up to 64 entries and 32 KiB of canonical URI bytes) continue
+through endpoint validation and normal bounded reconciliation. Pending
 unit-rename transitions are invalidated, and any open old/new endpoint overlay
 whose transition can no longer be proved is rejected until reopened. Ordinary
 file-event discovery and dependent-diagnostic fan-out run on a serialized

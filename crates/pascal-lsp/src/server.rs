@@ -95,9 +95,6 @@ const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
 const MAX_WORKSPACE_MUTATION_DEFERRED_BYTES: usize = 1024 * 1024;
 const MAX_FILE_OPERATION_BATCH_ENTRIES: usize = 64;
 const MAX_FILE_OPERATION_BATCH_URI_BYTES: usize = 32 * 1024;
-const MAX_FILE_OPERATION_RECOVERY_ENDPOINTS: usize = 2 * MAX_FILE_OPERATION_BATCH_ENTRIES;
-const MAX_FILE_OPERATION_RECOVERY_ENDPOINT_BYTES: usize =
-    MAX_FILE_OPERATION_RECOVERY_ENDPOINTS * MAX_OPEN_DOCUMENT_URI_BYTES;
 // Keep one slot available for an authoritative state-changing notification
 // even when only retryable feature requests are arriving.
 const MAX_CONFIGURATION_DEFERRED_REQUESTS: usize =
@@ -13510,84 +13507,30 @@ fn invalidate_ambiguous_file_notification(
     effect
 }
 
-fn invalidate_malformed_file_notification(
+/// A file notification that is malformed or exceeds the per-entry
+/// reconciliation envelope. File notifications describe changes that are
+/// already on disk, so disk plus the client's open documents can rebuild
+/// everything: record the events that could be read, then discard all
+/// derived state instead of reconciling entry by entry. With
+/// `unknown_rename_endpoints`, a rename moved files the server cannot name;
+/// open documents whose file is gone are rejected so the client re-sends them.
+fn recover_unreconciled_file_notification(
     workspace: &mut Workspace,
     budget: Option<&ReconciliationBudget>,
-    known_endpoints: impl IntoIterator<Item = Url>,
+    events: Vec<(Url, FileChange)>,
+    rename_endpoints: Vec<Url>,
+    unknown_rename_endpoints: bool,
     push_diagnostics_supported: bool,
 ) -> DiagnosticNotificationEffect {
     let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
     let budget = budget.unwrap_or(&fallback_budget);
-    let mut endpoints = Vec::new();
-    let mut unique = HashSet::new();
-    if endpoints
-        .try_reserve(MAX_FILE_OPERATION_RECOVERY_ENDPOINTS)
-        .is_err()
-        || unique
-            .try_reserve(MAX_FILE_OPERATION_RECOVERY_ENDPOINTS)
-            .is_err()
-    {
-        return permanently_fence_file_notification_analysis(
-            workspace,
-            Some(budget),
-            push_diagnostics_supported,
-        );
+    for (uri, kind) in events {
+        budget.record_file_event(uri, kind);
     }
-    let mut endpoint_bytes = 0usize;
-    for uri in known_endpoints {
-        if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
-            return permanently_fence_file_notification_analysis(
-                workspace,
-                Some(budget),
-                push_diagnostics_supported,
-            );
-        }
-        if !unique.insert(uri.clone()) {
-            continue;
-        }
-        let Some(next_bytes) = endpoint_bytes.checked_add(uri.as_str().len()) else {
-            return permanently_fence_file_notification_analysis(
-                workspace,
-                Some(budget),
-                push_diagnostics_supported,
-            );
-        };
-        if endpoints.len() >= MAX_FILE_OPERATION_RECOVERY_ENDPOINTS
-            || next_bytes > MAX_FILE_OPERATION_RECOVERY_ENDPOINT_BYTES
-        {
-            return permanently_fence_file_notification_analysis(
-                workspace,
-                Some(budget),
-                push_diagnostics_supported,
-            );
-        }
-        endpoint_bytes = next_bytes;
-        endpoints.push(uri);
+    for uri in rename_endpoints {
+        budget.record_rename_endpoint(uri);
     }
-    invalidate_ambiguous_file_notification(
-        workspace,
-        Some(budget),
-        endpoints,
-        push_diagnostics_supported,
-    )
-}
-
-fn permanently_fence_file_notification_analysis(
-    workspace: &mut Workspace,
-    budget: Option<&ReconciliationBudget>,
-    push_diagnostics_supported: bool,
-) -> DiagnosticNotificationEffect {
-    // Endpoint evidence was not inspected or cannot fit the explicit
-    // notification-recovery envelope. Latch the workspace-wide refusal before
-    // emitting any global invalidation effect; never continue with a truncated
-    // or unavailable endpoint set.
-    let fallback_budget = ReconciliationBudget::new(Arc::new(AtomicBool::new(false)));
-    let budget = budget.unwrap_or(&fallback_budget);
-    // Latch before recovery is allowed to clear any derived cache. Even if
-    // bounded invalidation refuses or is cancelled, this workspace instance
-    // cannot serve a result based on unattributable notification state.
-    workspace.permanently_fence_notification_analysis(budget);
-    workspace.invalidate_for_reconciliation_budget(budget);
+    workspace.discard_for_unreconciled_file_notification(budget, unknown_rename_endpoints);
     let mut effect = DiagnosticNotificationEffect::default();
     effect.refresh_all_diagnostics();
     effect.discard_all_queued_diagnostics = true;
@@ -13988,27 +13931,21 @@ fn handle_notification_with_control_inner(
         "workspace/didChangeWatchedFiles" => {
             let Some(changes) = notification.params.get("changes").and_then(Value::as_array) else {
                 eprintln!(
-                    "pascal-lsp: malformed watched-file batch has no attributable endpoint; fencing workspace analysis"
+                    "pascal-lsp: malformed watched-file batch has no attributable endpoint; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
+                    Vec::new(),
+                    Vec::new(),
+                    false,
                     push_diagnostics_supported,
                 ));
             };
             if changes.is_empty() {
                 return Ok(DiagnosticNotificationEffect::default());
             }
-            if changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
-                eprintln!(
-                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; fencing workspace analysis"
-                );
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
-                    push_diagnostics_supported,
-                ));
-            }
+            let oversized_batch = changes.len() > MAX_FILE_OPERATION_BATCH_ENTRIES;
             let mut total_uri_bytes = 0usize;
             let mut parsed_changes = Vec::with_capacity(changes.len());
             let mut oversized_uri_bytes = false;
@@ -14043,23 +13980,16 @@ fn handle_notification_with_control_inner(
                 };
                 parsed_changes.push((uri, kind));
             }
-            if malformed_batch {
+            if malformed_batch || oversized_batch || oversized_uri_bytes {
                 eprintln!(
-                    "pascal-lsp: malformed watched-file member has unknown batch attribution; fencing workspace analysis"
+                    "pascal-lsp: watched-file batch is malformed or exceeds {MAX_FILE_OPERATION_BATCH_ENTRIES} entries or {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
-                    push_diagnostics_supported,
-                ));
-            }
-            if oversized_uri_bytes {
-                eprintln!(
-                    "pascal-lsp: watched-file batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
-                );
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
+                    parsed_changes,
+                    Vec::new(),
+                    false,
                     push_diagnostics_supported,
                 ));
             }
@@ -14097,34 +14027,28 @@ fn handle_notification_with_control_inner(
         }
         "workspace/didCreateFiles" | "workspace/didDeleteFiles" => {
             let created = notification.method == "workspace/didCreateFiles";
+            let change = if created {
+                FileChange::Created
+            } else {
+                FileChange::Deleted
+            };
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 eprintln!(
-                    "pascal-lsp: malformed file-operation batch has unknown endpoint attribution; fencing workspace analysis"
+                    "pascal-lsp: malformed file-operation batch has unknown endpoint attribution; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
+                    Vec::new(),
+                    Vec::new(),
+                    false,
                     push_diagnostics_supported,
                 ));
             };
             if files.is_empty() {
-                return Ok(invalidate_malformed_file_notification(
-                    workspace,
-                    budget,
-                    [],
-                    push_diagnostics_supported,
-                ));
+                return Ok(DiagnosticNotificationEffect::default());
             }
-            if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
-                eprintln!(
-                    "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; fencing workspace analysis"
-                );
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
-                    push_diagnostics_supported,
-                ));
-            }
+            let oversized_batch = files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES;
             let mut uris = Vec::with_capacity(files.len());
             let mut unique = HashSet::with_capacity(files.len());
             let mut total_uri_bytes = 0usize;
@@ -14155,36 +14079,22 @@ fn handle_notification_with_control_inner(
                     uris.push(uri);
                 }
             }
-            if malformed_batch {
+            if malformed_batch || oversized_batch || oversized_uri_bytes {
                 eprintln!(
-                    "pascal-lsp: malformed file-operation member has unknown batch attribution; fencing workspace analysis"
+                    "pascal-lsp: file-operation batch is malformed or exceeds {MAX_FILE_OPERATION_BATCH_ENTRIES} entries or {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
-                    push_diagnostics_supported,
-                ));
-            }
-            if oversized_uri_bytes {
-                eprintln!(
-                    "pascal-lsp: file-operation batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
-                );
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
+                    uris.into_iter().map(|uri| (uri, change)).collect(),
+                    Vec::new(),
+                    false,
                     push_diagnostics_supported,
                 ));
             }
             if let Some(budget) = budget {
                 for uri in &uris {
-                    budget.record_file_event(
-                        uri.clone(),
-                        if created {
-                            FileChange::Created
-                        } else {
-                            FileChange::Deleted
-                        },
-                    );
+                    budget.record_file_event(uri.clone(), change);
                 }
             }
             let mut effect = DiagnosticNotificationEffect::default();
@@ -14192,11 +14102,6 @@ fn handle_notification_with_control_inner(
                 if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
                     return Err(rename::CANCELLATION_MESSAGE.to_string());
                 }
-                let change = if created {
-                    FileChange::Created
-                } else {
-                    FileChange::Deleted
-                };
                 for affected in workspace.file_event_with_control(&uri, change, cancel, budget)? {
                     effect.refresh_uri_with_budget(affected, budget)?;
                 }
@@ -14208,36 +14113,27 @@ fn handle_notification_with_control_inner(
         "workspace/didRenameFiles" => {
             let Some(files) = notification.params.get("files").and_then(Value::as_array) else {
                 eprintln!(
-                    "pascal-lsp: malformed file-rename batch has no attributable endpoint; fencing workspace analysis"
+                    "pascal-lsp: malformed file-rename batch has no attributable endpoint; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
                     push_diagnostics_supported,
                 ));
             };
             if files.is_empty() {
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
-                    push_diagnostics_supported,
-                ));
+                return Ok(DiagnosticNotificationEffect::default());
             }
-            if files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES {
-                eprintln!(
-                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; fencing workspace analysis"
-                );
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
-                    push_diagnostics_supported,
-                ));
-            }
+            let oversized_batch = files.len() > MAX_FILE_OPERATION_BATCH_ENTRIES;
             let mut renames = Vec::with_capacity(files.len());
             let mut old_uris = HashSet::with_capacity(files.len());
             let mut new_uris = HashSet::with_capacity(files.len());
             let mut unique_renames = HashSet::with_capacity(files.len());
             let mut recoverable_endpoints = Vec::with_capacity(files.len().saturating_mul(2));
+            let mut recovery_events = Vec::with_capacity(files.len().saturating_mul(2));
             let mut total_uri_bytes = 0usize;
             let mut oversized_uri_bytes = false;
             let mut ambiguous_batch = false;
@@ -14254,12 +14150,22 @@ fn handle_notification_with_control_inner(
                     .and_then(|value| serde_json::from_value::<Url>(value).ok());
                 let old_uri = old_uri.map(|uri| canonical_file_uri(&uri));
                 let new_uri = new_uri.map(|uri| canonical_file_uri(&uri));
-                for uri in [old_uri.as_ref(), new_uri.as_ref()].into_iter().flatten() {
-                    if uri.to_file_path().is_ok()
-                        && uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES
-                    {
+                if old_uri.is_some() && old_uri == new_uri {
+                    // Not a transition: nothing moved.
+                    continue;
+                }
+                for (uri, kind) in [
+                    (old_uri.as_ref(), FileChange::Deleted),
+                    (new_uri.as_ref(), FileChange::Created),
+                ] {
+                    let Some(uri) = uri.filter(|uri| uri.to_file_path().is_ok()) else {
+                        continue;
+                    };
+                    recovery_events.push((uri.clone(), kind));
+                    if uri.as_str().len() > MAX_OPEN_DOCUMENT_URI_BYTES {
+                        // Such a URI can never be an open document.
                         unretainable_endpoint = true;
-                    } else if uri.to_file_path().is_ok() {
+                    } else {
                         recoverable_endpoints.push(uri.clone());
                     }
                 }
@@ -14277,10 +14183,6 @@ fn handle_notification_with_control_inner(
                 {
                     oversized_uri_bytes = true;
                 }
-                if old_uri == new_uri {
-                    malformed_batch = true;
-                    continue;
-                }
                 if !unique_renames.insert((old_uri.clone(), new_uri.clone())) {
                     // Replaying the exact same move in one batch is
                     // idempotent; distinct reuse of either endpoint below is
@@ -14292,23 +14194,18 @@ fn handle_notification_with_control_inner(
                 }
                 renames.push((old_uri, new_uri));
             }
-            if unretainable_endpoint {
+            if malformed_batch || oversized_batch || unretainable_endpoint {
                 eprintln!(
-                    "pascal-lsp: file-rename endpoint cannot be retained; fencing workspace analysis"
+                    "pascal-lsp: file-rename batch is malformed or exceeds {MAX_FILE_OPERATION_BATCH_ENTRIES} entries; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                // A malformed member moved a file the server cannot name, so
+                // an open document may still claim that file's identity.
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
-                    push_diagnostics_supported,
-                ));
-            }
-            if malformed_batch {
-                eprintln!(
-                    "pascal-lsp: malformed file-rename member has unbounded source identity; fencing workspace analysis"
-                );
-                return Ok(permanently_fence_file_notification_analysis(
-                    workspace,
-                    budget,
+                    recovery_events,
+                    recoverable_endpoints,
+                    malformed_batch,
                     push_diagnostics_supported,
                 ));
             }
@@ -14328,11 +14225,14 @@ fn handle_notification_with_control_inner(
             }
             if oversized_uri_bytes {
                 eprintln!(
-                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; fencing workspace analysis"
+                    "pascal-lsp: file-rename batch exceeded {MAX_FILE_OPERATION_BATCH_URI_BYTES} URI bytes; discarding derived workspace state"
                 );
-                return Ok(permanently_fence_file_notification_analysis(
+                return Ok(recover_unreconciled_file_notification(
                     workspace,
                     budget,
+                    recovery_events,
+                    recoverable_endpoints,
+                    false,
                     push_diagnostics_supported,
                 ));
             }

@@ -345,8 +345,8 @@ impl SourceStore for LspSourceStore {
             return Ok(LoadedSource {
                 id: source_id_for_path(&path),
                 path,
-                bytes: Arc::<[u8]>::from(overlay.text.as_bytes().to_vec()),
-                decoded_text: Some(Arc::<str>::from(overlay.text.clone())),
+                bytes: Arc::<[u8]>::from(overlay.text.clone()),
+                decoded_text: Some(overlay.text.clone()),
                 revision: SourceRevision::Overlay {
                     version: overlay.version,
                     content_hash: content_hash_bytes(overlay.text.as_bytes()),

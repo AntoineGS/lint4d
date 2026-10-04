@@ -3310,7 +3310,7 @@ mod tests {
             .overlays
             .get_mut(&main_uri)
             .expect("main overlay")
-            .text = empty_source.clone();
+            .text = empty_source.as_str().into();
         let cancel = AtomicBool::new(false);
 
         let completion = completion_from_input(
@@ -3342,7 +3342,8 @@ mod tests {
             .expect("provider overlay");
         provider_overlay.text = provider_overlay
             .text
-            .replace("OverlayMember", "ChangedMember");
+            .replace("OverlayMember", "ChangedMember")
+            .into();
         provider_overlay.version = provider_overlay.version.saturating_add(1);
         revalidate_input(&changed_input, &completion.records, &cancel)
             .expect_err("empty completion must retain the provider read set");
@@ -3440,7 +3441,7 @@ mod tests {
             .overlays
             .get_mut(&main_uri)
             .expect("main overlay")
-            .text = empty_source.clone();
+            .text = empty_source.as_str().into();
         let cancel = AtomicBool::new(false);
 
         let completion = completion_from_input(

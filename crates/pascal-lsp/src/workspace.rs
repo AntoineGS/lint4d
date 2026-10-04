@@ -1876,7 +1876,7 @@ fn expected_renamed_document_text(
 
 #[derive(Debug)]
 struct OpenDocument {
-    text: Option<String>,
+    text: Option<Arc<str>>,
     version: i32,
     rejection: Option<String>,
     /// Source-generation watermark for this particular open-document
@@ -2334,7 +2334,7 @@ pub(crate) struct CompiledContentSnapshot {
     importer_source_hash: u64,
     context_fingerprint: u64,
     context: ContextState,
-    open_source: Option<String>,
+    open_source: Option<Arc<str>>,
     unit: AuthorizedCompiledUnit,
 }
 
@@ -2349,7 +2349,7 @@ impl CompiledContentSnapshot {
     pub(crate) fn retained_payload_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.context.retained_payload_bytes())
-            .saturating_add(self.open_source.as_ref().map_or(0, String::len))
+            .saturating_add(self.open_source.as_ref().map_or(0, |source| source.len()))
             .saturating_add(self.unit.retained_payload_bytes())
             .saturating_add(self.uri.as_str().len())
             .saturating_add(self.importer.as_str().len())
@@ -2733,6 +2733,8 @@ pub struct Workspace {
     index: NavigationIndex,
     cached_documents: HashMap<Url, rename::CachedDocument>,
     open_documents: HashMap<Url, OpenDocument>,
+    /// The last map built by `overlay_inputs`, reused while it matches.
+    overlay_inputs: Mutex<Option<Arc<HashMap<Url, rename::OverlayInput>>>>,
     rejected_open_fence_uris: HashSet<Url>,
     rejected_open_fence_permanent: bool,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
@@ -3978,8 +3980,11 @@ impl Workspace {
             return Ok(());
         }
 
-        let previous_text_len = previous_text.as_ref().map_or(0, String::len);
-        let mut candidate = previous_text.unwrap_or_default();
+        let previous_text_len = previous_text.as_deref().map_or(0, str::len);
+        let mut candidate = previous_text
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_default();
         let mut full_replacement_seen = false;
         for change in changes {
             let Some(range) = change.range else {
@@ -4209,7 +4214,8 @@ impl Workspace {
         self.bump_source_generation();
         self.mark_source_change(&uri, !had_overlay);
         let text_len = text.len();
-        let source_for_index = text.clone();
+        let shared_text = Arc::<str>::from(text.as_str());
+        let source_for_index = text;
         if let Some(previous) = self.open_documents.get(&uri)
             && let Some(previous_text) = &previous.text
         {
@@ -4228,7 +4234,7 @@ impl Workspace {
         self.open_documents.insert(
             uri.clone(),
             OpenDocument {
-                text: Some(text),
+                text: Some(shared_text),
                 version,
                 rejection: None,
                 identity_generation,
@@ -4283,8 +4289,8 @@ impl Workspace {
         let previous_open_bytes = self
             .open_documents
             .get(uri)
-            .and_then(|document| document.text.as_ref())
-            .map_or(0, String::len);
+            .and_then(|document| document.text.as_deref())
+            .map_or(0, str::len);
         self.validate_candidate_text(uri, previous_open_bytes, text.len())
     }
 
@@ -4329,8 +4335,8 @@ impl Workspace {
         let previous = self
             .open_documents
             .get(uri)
-            .and_then(|document| document.text.as_ref())
-            .map_or(0, String::len);
+            .and_then(|document| document.text.as_deref())
+            .map_or(0, str::len);
         self.open_text_bytes
             .saturating_sub(previous)
             .saturating_add(incoming_len)
@@ -6146,7 +6152,8 @@ impl Workspace {
             }
             document
                 .text
-                .clone()
+                .as_deref()
+                .map(str::to_owned)
                 .expect("accepted open documents retain their text")
         } else {
             let entry = context_path_entry(&context, &path)
@@ -6559,7 +6566,7 @@ impl Workspace {
                 return Err(format!("document rejected: {uri}"));
             };
             self.record_open_analysis_source(uri, &source, version);
-            source
+            source.to_string()
         } else {
             let entry = context_path_entry(&context, &path)
                 .or_else(|| {
@@ -7619,7 +7626,7 @@ impl Workspace {
             }
             let indexed = self.index_source_with_budget(
                 uri,
-                source.clone(),
+                source.to_string(),
                 None,
                 None,
                 None,
@@ -8030,19 +8037,51 @@ impl Workspace {
         })
     }
 
-    fn overlay_inputs(&self) -> HashMap<Url, rename::OverlayInput> {
-        self.open_documents
-            .iter()
-            .filter_map(|(uri, document)| {
-                Some((
-                    canonical_file_uri(uri),
-                    rename::OverlayInput {
-                        text: document.text.clone()?,
-                        version: document.version,
-                    },
-                ))
-            })
-            .collect()
+    /// Open-document overlays for cache probes and lookups. The map is
+    /// rebuilt only when an open document's text or version changed since
+    /// the last call, and its text is always shared with the open document.
+    fn overlay_inputs(&self) -> Arc<HashMap<Url, rename::OverlayInput>> {
+        let mut cached = self
+            .overlay_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(overlays) = cached.as_ref()
+            && self.overlays_are_current(overlays)
+        {
+            return overlays.clone();
+        }
+        let overlays = Arc::new(
+            self.open_documents
+                .iter()
+                .filter_map(|(uri, document)| {
+                    Some((
+                        canonical_file_uri(uri),
+                        rename::OverlayInput {
+                            text: document.text.clone()?,
+                            version: document.version,
+                        },
+                    ))
+                })
+                .collect::<HashMap<_, _>>(),
+        );
+        *cached = Some(overlays.clone());
+        overlays
+    }
+
+    fn overlays_are_current(&self, overlays: &HashMap<Url, rename::OverlayInput>) -> bool {
+        let mut open = 0usize;
+        self.open_documents.iter().all(|(uri, document)| {
+            let Some(text) = &document.text else {
+                return true;
+            };
+            open += 1;
+            overlays
+                .get(uri)
+                .or_else(|| overlays.get(&canonical_file_uri(uri)))
+                .is_some_and(|overlay| {
+                    overlay.version == document.version && Arc::ptr_eq(&overlay.text, text)
+                })
+        }) && open == overlays.len()
     }
 
     fn include_expansion_limits(&self) -> ExpansionLimits {
@@ -8267,7 +8306,7 @@ impl Workspace {
                         .map(|source| (source.clone(), document.version))
                 })
             {
-                if open_source != source {
+                if *open_source != *source {
                     return Err(format!("include source {uri} changed during diagnostics"));
                 }
                 self.record_open_analysis_source(&uri, &open_source, open_version);
@@ -8368,7 +8407,7 @@ impl Workspace {
                     .as_ref()
                     .map(|source| (source.clone(), document.version))
             }) {
-                if source != dependency.text {
+                if *source != *dependency.text {
                     return Err(format!(
                         "include source {uri} changed during document-link resolution"
                     ));
@@ -8595,7 +8634,7 @@ impl Workspace {
         if let Some(document) = self.open_documents.get(uri)
             && let Some(text) = &document.text
         {
-            return Some(text.clone());
+            return Some(text.to_string());
         }
         if let Some(expansion) = self.expansions.get(uri) {
             return Some(expansion.physical_source.clone());
@@ -13943,7 +13982,7 @@ impl Workspace {
                 &mut expansion,
                 &conditional,
             );
-            self.store_expansion(&root_uri, &context_key, source, expansion);
+            self.store_expansion(&root_uri, &context_key, source.to_string(), expansion);
             self.record_expansion_analysis_sources(&root_uri, &context, cancel)?;
         }
         Ok(())
@@ -16036,7 +16075,7 @@ mod tests {
             workspace.open_documents.insert(
                 uri.clone(),
                 OpenDocument {
-                    text: Some(text.to_owned()),
+                    text: Some(text.into()),
                     version: 4,
                     rejection: None,
                     identity_generation: 9,
@@ -16574,7 +16613,7 @@ mod tests {
             workspace.open_documents.insert(
                 consumer_uri.clone(),
                 OpenDocument {
-                    text: Some("unit Consumer; interface implementation end.".to_owned()),
+                    text: Some("unit Consumer; interface implementation end.".into()),
                     version: 1,
                     rejection: None,
                     identity_generation: 0,
@@ -16670,7 +16709,7 @@ mod tests {
         workspace.open_documents.insert(
             consumer_uri.clone(),
             OpenDocument {
-                text: Some("unit Consumer; interface implementation end.".to_owned()),
+                text: Some("unit Consumer; interface implementation end.".into()),
                 version: 1,
                 rejection: None,
                 identity_generation: 0,
@@ -19038,6 +19077,82 @@ mod tests {
         super::test_reset_import_resolution_count();
         worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
         assert_eq!(super::test_import_resolution_count(), 0);
+    }
+
+    #[test]
+    fn open_document_text_is_shared_by_inputs_workers_and_lookups() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uris = (0..50)
+            .map(|index| Url::from_file_path(temp.path().join(format!("U{index}.pas"))).unwrap())
+            .collect::<Vec<_>>();
+        for (index, uri) in uris.iter().enumerate() {
+            workspace
+                .open_document(
+                    uri.clone(),
+                    format!("unit U{index};\ninterface\nimplementation\nend.\n"),
+                    1,
+                )
+                .expect("open");
+        }
+        let text = |document: &OpenDocument| document.text.as_deref().unwrap().as_ptr();
+
+        let first = workspace.overlay_inputs();
+        let second = workspace.overlay_inputs();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "one overlay map per revision"
+        );
+        let input = workspace.analysis_input();
+        let worker = Workspace::from_analysis_input(&input);
+        let worker_overlays = worker.overlay_inputs();
+        for uri in &uris {
+            let owned = text(&workspace.open_documents[uri]);
+            for (place, overlays) in [
+                ("first lookup", std::borrow::Borrow::borrow(&first)),
+                ("second lookup", std::borrow::Borrow::borrow(&second)),
+                ("analysis input", &input.overlays),
+                (
+                    "worker lookup",
+                    std::borrow::Borrow::borrow(&worker_overlays),
+                ),
+            ] {
+                assert_eq!(overlays[uri].text.as_ptr(), owned, "{place} copied {uri}");
+            }
+            assert_eq!(
+                text(&worker.open_documents[uri]),
+                owned,
+                "worker copied {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_inputs_follow_document_changes() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let mut workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uri = Url::from_file_path(temp.path().join("A.pas")).unwrap();
+        workspace
+            .open_document(uri.clone(), "unit A;\nend.\n".to_string(), 1)
+            .expect("open");
+        let before = workspace.overlay_inputs();
+
+        workspace
+            .change_document(uri.clone(), "unit A;\n\nend.\n".to_string(), 2)
+            .expect("change");
+        let changed = workspace.overlay_inputs();
+        assert_eq!(&*changed[&uri].text, "unit A;\n\nend.\n");
+        assert_eq!(changed[&uri].version, 2);
+        assert_eq!(
+            &*before[&uri].text, "unit A;\nend.\n",
+            "old maps stay valid"
+        );
+
+        workspace.advance_document_version(&uri, 3);
+        assert_eq!(workspace.overlay_inputs()[&uri].version, 3);
+
+        workspace.close_document(&uri);
+        assert!(workspace.overlay_inputs().is_empty());
     }
 
     #[test]
@@ -22140,7 +22255,7 @@ BDS = '/fake/37'
         overlays.insert(
             uri.clone(),
             super::rename::OverlayInput {
-                text: overlay_source.to_owned(),
+                text: overlay_source.into(),
                 version: 7,
             },
         );
@@ -22712,7 +22827,7 @@ BDS = '/fake/37'
             .analysis_input()
             .overlays
             .get(uri)
-            .map(|overlay| overlay.text.clone())
+            .map(|overlay| overlay.text.to_string())
     }
 
     #[test]

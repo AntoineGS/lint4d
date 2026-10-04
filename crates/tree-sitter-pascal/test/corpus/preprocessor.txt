@@ -1,0 +1,1431 @@
+===
+Line Comments
+===
+
+// Hello
+// World
+var
+  i: integer; // Hello
+  j: integer;
+
+---
+
+(root
+  (comment)
+  (comment)
+  (declVars
+    (kVar)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))))
+
+===
+Block Comments 1
+===
+
+{ Hello
+  World }
+var
+  i: { hello }integer; { World }
+  j: integer;
+
+{ { { { {{ { { { {{{
+
+ {  { { 
+// { {{ { {{ {e/{ {/ /{}
+  k: integer;
+
+---
+
+(root
+  (comment)
+  (declVars
+    (kVar)
+    (declVar
+      (identifier)
+      (comment)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))))
+
+===
+Block Comments 2
+===
+
+(* Hello
+  World *)
+var
+  i: (* hello *)integer; (* World *)
+  j: integer;
+(* * * * * *  ** * * * ** (* (* (* (* * )
+) ) { * ****)
+  k: integer;
+
+  (**)
+  l: integer;
+
+  {(**)}
+  n: integer;
+  {(*)}
+  m: integer;
+  (*{}*)
+
+---
+
+(root
+  (comment)
+  (declVars
+    (kVar)
+    (declVar
+      (identifier)
+      (comment)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier))))
+    (comment)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (identifier)))))
+  (comment))
+
+===
+Preprocessor directives 1
+===
+
+{$mode delphi}
+{$define foo}
+{$ifdef foo}
+{$m+}
+{$I source.inc}
+{$endif}
+
+---
+
+(root
+  (ppDirective)
+  (ppDirective)
+  (ppBlock
+    (ppIf)
+    (ppDirective)
+    (ppDirective)
+    (ppEndIf)))
+
+===
+Preprocessor directives 2
+===
+
+procedure foo(a: integer{$if 1}; b: float{$endif});
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier)
+      (declArgs
+        (declArg
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (ppDirective)
+        (declArg
+          (identifier)
+          (type
+            (typeref
+              (identifier))))
+        (ppDirective)))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Preprocessor directives 3
+===
+
+procedure foo(a: {$if 1}integer{$else}float{$endif});
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier)
+      (declArgs
+        (declArg
+          (identifier)
+          (type
+            (typeref
+              (ppFragmentExpr))))))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Preprocessor directives 4
+===
+
+procedure a;
+begin
+  {$if 1}
+  if true then
+    WriteLn('Hello');
+  {$elseif 1}
+  while true do
+    WriteLn('World');
+  {$else}
+  WriteLn('Foo');
+  {$endif}
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (ppBlock
+        (ppIf)
+        (if
+          (kIf)
+          (kTrue)
+          (kThen)
+          (statement
+            (exprCall
+              (identifier)
+              (exprArgs
+                (literalString)))))
+        (ppElse)
+        (while
+          (kWhile)
+          (kTrue)
+          (kDo)
+          (statement
+            (exprCall
+              (identifier)
+              (exprArgs
+                (literalString)))))
+        (ppElse)
+        (statement
+          (exprCall
+            (identifier)
+            (exprArgs
+              (literalString))))
+        (ppEndIf))
+      (kEnd))))
+
+===
+Preprocessor directives 5
+===
+
+procedure a;
+{$ifdef WIN32}
+begin
+end;
+{$else}
+begin
+end;
+{$endif}
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppIf)
+    (block
+      (kBegin)
+      (kEnd))
+    (ppElse)
+    (block
+      (kBegin)
+      (kEnd))
+    (ppEndIf)))
+
+===
+Preprocessor directives 6
+===
+
+var
+  a: {$if 1}b{$else}c{$endif};
+
+type
+  a = {$if 1}b{$else}c{$endif};
+
+---
+
+(root
+  (declVars
+    (kVar)
+    (declVar
+      (identifier)
+      (type
+        (typeref
+          (ppFragmentExpr)))))
+  (declTypes
+    (kType)
+    (declType
+      (identifier)
+      (kEq)
+      (type
+        (typeref
+          (ppFragmentExpr))))))
+
+===
+Preprocessor directives in uses clause
+===
+
+unit a;
+interface
+uses
+  SysUtils,
+  {$IFDEF FOO}
+  SpecialUnit,
+  {$ELSE}
+  OtherUnit,
+  {$ENDIF}
+  Classes;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declUses
+        (kUses)
+        (moduleName
+          (identifier))
+        (ppUsesBlock
+          (ppIf)
+          (moduleName
+            (identifier))
+          (ppElse)
+          (moduleName
+            (identifier))
+          (ppEndIf))
+        (moduleName
+          (identifier))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Standalone directive in uses clause
+===
+
+unit a;
+interface
+uses
+  {$I compilers.inc}
+  SysUtils,
+  Classes;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declUses
+        (kUses)
+        (ppDirective)
+        (moduleName
+          (identifier))
+        (moduleName
+          (identifier))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Nested IFDEF in uses clause
+===
+
+unit a;
+interface
+uses
+  {$IFDEF WIN}
+  Windows,
+  {$IFDEF XE6}
+  ibx.IBSQL,
+  {$ELSE}
+  IBSQL,
+  {$ENDIF}
+  {$ENDIF}
+  Classes;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declUses
+        (kUses)
+        (ppUsesBlock
+          (ppIf)
+          (moduleName
+            (identifier))
+          (ppUsesBlock
+            (ppIf)
+            (moduleName
+              (identifier)
+              (kDot)
+              (identifier))
+            (ppElse)
+            (moduleName
+              (identifier))
+            (ppEndIf))
+          (ppEndIf))
+        (moduleName
+          (identifier))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+ppBlock in var section
+===
+
+var
+  x: Integer;
+  {$IFDEF WIN}
+  y: Integer;
+  {$ENDIF}
+
+---
+
+(root
+  (declVars
+    (kVar)
+    (declVar
+      name: (identifier)
+      type: (type
+        (typeref
+          (identifier)))))
+  (ppBlock
+    (ppIf)
+    (declVar
+      name: (identifier)
+      type: (type
+        (typeref
+          (identifier))))
+    (ppEndIf)))
+
+===
+ppBlock in const section with ELSE
+===
+
+const
+  {$IFDEF WIN}
+  MyConst: Integer = 1;
+  {$ELSE}
+  MyConst: Integer = 2;
+  {$ENDIF}
+
+---
+
+(root
+  (declConsts
+    (kConst))
+  (ppBlock
+    (ppIf)
+    (declVar
+      name: (identifier)
+      type: (type
+        (typeref
+          (identifier)))
+      defaultValue: (defaultValue
+        (kEq)
+        (literalNumber)))
+    (ppElse)
+    (declVar
+      name: (identifier)
+      type: (type
+        (typeref
+          (identifier)))
+      defaultValue: (defaultValue
+        (kEq)
+        (literalNumber)))
+    (ppEndIf)))
+
+===
+ppBlock in statements (falls through to ppDirective extras)
+===
+
+begin
+  {$HINTS OFF}
+  x := 1;
+  {$HINTS ON}
+end
+
+---
+
+(root
+  (blockTr
+    (kBegin)
+    (ppDirective)
+    (assignment
+      lhs: (identifier)
+      operator: (kAssign)
+      rhs: (literalNumber))
+    (ppDirective)
+    (kEnd)))
+
+===
+ppBlock in begin..end statements
+===
+
+procedure a;
+begin
+  x;
+  {$IFDEF LOG}
+  y;
+  {$ENDIF}
+  z;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (statement
+        (identifier))
+      (ppBlock
+        (ppIf)
+        (statement
+          (identifier))
+        (ppEndIf))
+      (statement
+        (identifier))
+      (kEnd))))
+
+===
+ppFragmentExpr in function return type
+===
+
+function Foo: {$IFDEF X}AnsiString{$ELSE}string{$ENDIF};
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kFunction)
+      (identifier)
+      (typeref
+        (ppFragmentExpr)))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+ppFragmentExpr as assignment LHS prefix
+===
+
+procedure a;
+begin
+  {$ifdef X}FormatSettings.{$endif}DecimalSeparator := '.';
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (assignment
+        (ppFragmentExpr)
+        (kAssign)
+        (literalString))
+      (kEnd))))
+
+===
+ppFragmentStmt wrapping whole statement
+===
+
+procedure a;
+begin
+  {$IFDEF DEBUG}x := 1;{$ENDIF}
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (ppFragmentStmt)
+      (kEnd))))
+
+===
+ppFragmentExpr wrapping cast in expression
+===
+
+procedure a;
+begin
+  x := {$IFDEF Y}AnsiString(v){$ELSE}v{$ENDIF};
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (assignment
+        (identifier)
+        (kAssign)
+        (ppFragmentExpr))
+      (kEnd))))
+
+===
+ppFragmentExpr in exception handler type
+===
+
+procedure a;
+begin
+  try
+  except
+    on E: {$IFDEF X}System.{$ENDIF}SysUtils.Exception do
+      ;
+  end;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (try
+        (kTry)
+        (kExcept)
+        (exceptionHandler
+          (kOn)
+          (identifier)
+          (typeref
+            (ppFragmentExpr))
+          (kDo))
+        (kEnd))
+      (kEnd))))
+
+===
+ppBlock in class fields
+===
+
+type
+  TFoo = class
+  private
+    FBar: Integer;
+    {$IFDEF WIN}
+    FWin: Integer;
+    {$ENDIF}
+  end;
+
+---
+
+(root
+  (declTypes
+    (kType)
+    (declType
+      name: (identifier)
+      (kEq)
+      type: (declClass
+        (kClass)
+        (declSection
+          (kPrivate)
+          (declField
+            name: (identifier)
+            type: (type
+              (typeref
+                (identifier))))
+          (ppBlock
+            (ppIf)
+            (declVar
+              name: (identifier)
+              type: (type
+                (typeref
+                  (identifier))))
+            (ppEndIf)))
+        (kEnd)))))
+
+===
+Nested ppBlock in var section
+===
+
+var
+  {$IFDEF WIN}
+  x: Integer;
+  {$IFDEF WIN64}
+  y: Integer;
+  {$ENDIF}
+  {$ENDIF}
+
+---
+
+(root
+  (declVars
+    (kVar))
+  (ppBlock
+    (ppIf)
+    (declVar
+      name: (identifier)
+      type: (type
+        (typeref
+          (identifier))))
+    (ppBlock
+      (ppIf)
+      (declVar
+        name: (identifier)
+        type: (type
+          (typeref
+            (identifier))))
+      (ppEndIf))
+    (ppEndIf)))
+
+===
+ppBlock in interface declarations
+===
+
+unit a;
+interface
+{$IFDEF WIN}
+var
+  x: Integer;
+{$ENDIF}
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (ppBlock
+        (ppIf)
+        (varDef
+          (kVar)
+          (identifier)
+          type: (typeref
+            (identifier)))
+        (ppEndIf)))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Standalone ppDirective remains ppDirective extra
+===
+
+{$R *.dfm}
+var
+  x: Integer;
+
+---
+
+(root
+  (ppDirective)
+  (declVars
+    (kVar)
+    (declVar
+      name: (identifier)
+      type: (type
+        (typeref
+          (identifier))))))
+
+===
+Preprocessor fragment with space padding (const)
+===
+
+const
+  x = {$if 1} 100 {$else} 200 {$endif};
+
+---
+
+(root
+  (declConsts
+    (kConst)
+    (declConst
+      (identifier)
+      (defaultValue
+        (kEq)
+        (ppFragmentExpr)))))
+
+===
+Preprocessor fragment with space padding (assignment RHS)
+===
+
+procedure p;
+var n: integer;
+begin
+  n := {$if 1} 10 {$else} 200 {$endif};
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (assignment
+        (identifier)
+        (kAssign)
+        (ppFragmentExpr))
+      (kEnd))))
+
+===
+Preprocessor fragment with space padding (call argument)
+===
+
+procedure p;
+begin
+  f(a, {$if 1} 1 {$else} 2 {$endif});
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (statement
+        (exprCall
+          (identifier)
+          (exprArgs
+            (identifier)
+            (ppFragmentExpr))))
+      (kEnd))))
+
+===
+ppFragmentStmt in non-trailing position
+===
+
+procedure a;
+begin
+  Foo := 1;
+  {$IFDEF DEBUG}FWSDebugLogs := True;{$ENDIF}
+  Bar := 2;
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (assignment
+        (identifier)
+        (kAssign)
+        (literalNumber))
+      (ppFragmentStmt)
+      (assignment
+        (identifier)
+        (kAssign)
+        (literalNumber))
+      (kEnd))))
+
+===
+ppFragmentExpr wins when body has no top-level semicolon
+===
+
+procedure a;
+begin
+  {$IFDEF DEBUG}Foo{$ENDIF};
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (statement
+        (ppFragmentExpr))
+      (kEnd))))
+
+===
+Uses clause whole body wrapped in directive with semi inside branches
+===
+
+unit Foo;
+interface
+uses
+{$IFDEF VER270}
+  WinAPI.Windows, SysUtils;
+{$ELSE}
+  Windows, SysUtils;
+{$ENDIF}
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declUses
+        (kUses)
+        (ppUsesBlockWithSemi
+          (ppIf)
+          (moduleName
+            (identifier)
+            (kDot)
+            (identifier))
+          (moduleName
+            (identifier))
+          (ppElse)
+          (moduleName
+            (identifier))
+          (moduleName
+            (identifier))
+          (ppEndIf))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Class body with directive-wrapped visibility specifier
+===
+
+unit Foo;
+interface
+type
+  TFoo = class(TBase)
+  public
+    procedure Assign(Source: TPersistent);
+  {$IFDEF UNITTEST}
+  published
+  {$ENDIF}
+    property Bar: integer read FBar;
+  end;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declTypes
+        (kType)
+        (declType
+          (identifier)
+          (kEq)
+          (declClass
+            (kClass)
+            (typeref
+              (identifier))
+            (declSection
+              (kPublic)
+              (declProc
+                (kProcedure)
+                (identifier)
+                (declArgs
+                  (declArg
+                    (identifier)
+                    (type
+                      (typeref
+                        (identifier)))))))
+            (ppDeclSection
+              (ppIf)
+              (kPublished)
+              (ppEndIf)
+              (declProp
+                (kProperty)
+                (identifier)
+                (type
+                  (typeref
+                    (identifier)))
+                (kRead)
+                (identifier)))
+            (kEnd)))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+ppBlock wrapping the first local declaration section
+===
+
+procedure Foo;
+{$IFDEF DEBUG}
+var
+  X: Integer;
+{$ENDIF}
+begin
+end;
+
+procedure Bar;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppBlock
+      (ppIf)
+      (declVars
+        (kVar)
+        (declVar
+          (identifier)
+          (type
+            (typeref
+              (identifier)))))
+      (ppEndIf))
+    (block
+      (kBegin)
+      (kEnd)))
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+ppBlock with else branch before routine body
+===
+
+procedure Foo;
+{$IFDEF DEBUG}
+var
+  X: Integer;
+{$ELSE}
+const
+  Y = 1;
+{$ENDIF}
+var
+  Z: Integer;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppBlock
+      (ppIf)
+      (declVars
+        (kVar)
+        (declVar
+          (identifier)
+          (type
+            (typeref
+              (identifier)))))
+      (ppElse)
+      (declConsts
+        (kConst)
+        (declConst
+          (identifier)
+          (defaultValue
+            (kEq)
+            (literalNumber))))
+      (ppEndIf))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Directive-wrapped routine body after local declarations
+===
+
+procedure Foo;
+var
+  X: Integer;
+{$IFDEF ASM}
+asm
+  nop
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (ppIf)
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier))
+      (kEnd))
+    (ppElse)
+    (block
+      (kBegin)
+      (kEnd))
+    (ppEndIf)))
+
+===
+Nested directive-wrapped routine bodies
+===
+
+procedure Foo;
+{$IFDEF ASM}
+{$IFDEF CPUX86}
+asm
+  nop
+end;
+{$ELSE}
+var
+  X: Integer;
+asm
+  nop
+end;
+{$ENDIF}
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+procedure Bar;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (ppIf)
+    (ppIf)
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier))
+      (kEnd))
+    (ppElse)
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (asm
+      (kAsm)
+      (asmBody
+        (identifier))
+      (kEnd))
+    (ppEndIf)
+    (ppElse)
+    (block
+      (kBegin)
+      (kEnd))
+    (ppEndIf))
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Directive-wrapped routine headers
+===
+
+{$IFDEF UNICODE}
+function Foo(const S: string): Integer;
+{$ELSE}
+function Foo(const S: WideString): Integer;
+{$ENDIF}
+var
+  X: Integer;
+begin
+end;
+
+---
+
+(root
+  (defProc
+    (ppIf)
+    (declProc
+      (kFunction)
+      (identifier)
+      (declArgs
+        (declArg
+          (kConst)
+          (identifier)
+          (type
+            (declString
+              (kString)))))
+      (typeref
+        (identifier)))
+    (ppElse)
+    (declProc
+      (kFunction)
+      (identifier)
+      (declArgs
+        (declArg
+          (kConst)
+          (identifier)
+          (type
+            (typeref
+              (identifier)))))
+      (typeref
+        (identifier)))
+    (ppEndIf)
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (kEnd))))
+
+===
+Directive-wrapped interface headers stay declarations
+===
+
+unit U;
+interface
+{$IFDEF UNICODE}
+function Foo(const S: string): Integer;
+{$ELSE}
+function Foo(const S: WideString): Integer;
+{$ENDIF}
+function Bar: Integer;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (ppBlock
+        (ppIf)
+        (declProc
+          (kFunction)
+          (identifier)
+          (declArgs
+            (declArg
+              (kConst)
+              (identifier)
+              (type
+                (declString
+                  (kString)))))
+          (typeref
+            (identifier)))
+        (ppElse)
+        (declProc
+          (kFunction)
+          (identifier)
+          (declArgs
+            (declArg
+              (kConst)
+              (identifier)
+              (type
+                (typeref
+                  (identifier)))))
+          (typeref
+            (identifier)))
+        (ppEndIf))
+      (declProc
+        (kFunction)
+        (identifier)
+        (typeref
+          (identifier))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
+Routine directive fragment inside a directive block
+===
+
+{$IFDEF X86}
+function G: Integer; {$IFDEF FPC} assembler; nostackframe; {$ENDIF}
+asm
+  nop
+end;
+{$ENDIF}
+
+---
+
+(root
+  (ppBlock
+    (ppIf)
+    (defProc
+      (declProc
+        (kFunction)
+        (identifier)
+        (typeref
+          (identifier))
+        (ppIf)
+        (procAttribute (kAssembler))
+        (procAttribute (kNostackframe))
+        (ppEndIf))
+      (asm
+        (kAsm)
+        (asmBody
+          (identifier))
+        (kEnd)))
+    (ppEndIf)))

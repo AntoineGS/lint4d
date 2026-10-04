@@ -5,6 +5,9 @@ members = [
     "crates/fmt4d",
     "crates/pascal-lsp",
     "crates/pascal-project",
+    "crates/tree-sitter-pascal",
+    "crates/cfg-core",
+    "crates/cfg-pascal",
 ]
 resolver = "2"
 
@@ -70,7 +73,7 @@ license = "MIT"
 repository = "https://github.com/AntoineGS/lint4d"
 homepage = "https://github.com/AntoineGS/lint4d"
 authors = ["Antoine Gaudreau Simard"]
-# Internal crates with git dependencies; never published to crates.io.
+# Internal crates; never published to crates.io.
 publish = false
 
 

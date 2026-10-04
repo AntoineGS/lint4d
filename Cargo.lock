@@ -142,9 +142,9 @@ dependencies = [
 [[package]]
 name = "cfg-core"
 version = "0.1.0"
-source = "git+https://github.com/AntoineGS/cfg-core.git?rev=b4131e61a939e0685194712689d1fd1497a41492#b4131e61a939e0685194712689d1fd1497a41492"
 dependencies = [
  "petgraph",
+ "serde",
 ]
 
 [[package]]
@@ -156,7 +156,6 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cfg-pascal"
 version = "0.1.0"
-source = "git+https://github.com/AntoineGS/cfg-pascal.git?rev=dd64c7587cabf2bd3c4d4b3bed10e30743defcfc#dd64c7587cabf2bd3c4d4b3bed10e30743defcfc"
 dependencies = [
  "cfg-core",
  "tree-sitter",
@@ -996,6 +995,8 @@ checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
 dependencies = [
  "fixedbitset",
  "indexmap",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1455,9 +1456,10 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 [[package]]
 name = "tree-sitter-pascal"
 version = "0.11.0"
-source = "git+https://github.com/AntoineGS/tree-sitter-pascal.git?rev=22cf861dc87bde0dd0b0d6397dd85dbef375006e#22cf861dc87bde0dd0b0d6397dd85dbef375006e"
 dependencies = [
  "cc",
+ "streaming-iterator",
+ "tree-sitter",
  "tree-sitter-language",
 ]
 

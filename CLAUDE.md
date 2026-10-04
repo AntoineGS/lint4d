@@ -2,16 +2,24 @@
 
 ## Editable dependencies
 
-Local sibling checkouts — edit upstream instead of working around bugs:
+The grammar and CFG crates live in this workspace (merged with `git subtree`,
+see `docs/decisions/0001-monorepo.md`); fix bugs in them directly instead of
+working around them, in the same commit as the code that needs the fix:
 
-- `../tree-sitter-pascal` — git dep (`github.com/AntoineGS/tree-sitter-pascal`; grammar, parser, queries); edit, push, bump the rev in `crates/lint4d` and `crates/pascal-core` (kept per crate: cargo-deny cannot resolve git workspace dependencies). cfg-pascal parses with the same grammar, so it must pin the **same** rev: bump it in cfg-pascal first, push, then bump the pins here
-- `../cfg-core` — git dep (`github.com/AntoineGS/cfg-core`); edit, push, bump rev
-- `../cfg-pascal` — git dep (`github.com/AntoineGS/cfg-pascal`); same flow
+- `crates/tree-sitter-pascal` — grammar (`grammar.js`), generated parser
+  (`src/parser.c`, `src/grammar.json`, `src/node-types.json`), external scanner
+  (`src/scanner.c`) and queries. After editing `grammar.js`, run
+  `tree-sitter generate` and `tree-sitter test` in that directory with
+  tree-sitter CLI 0.24 (ABI 14; `npm install` there provides it as
+  `npx tree-sitter`), and commit the regenerated `src/` files with the
+  grammar change
+- `crates/cfg-core` — language-agnostic CFG and interprocedural analysis
+- `crates/cfg-pascal` — Pascal CFG builder; lint4d uses cfg-core only through
+  its `cfg_pascal::cfg_core` re-export
 
-A gitignored `.cargo/config.toml` may build against these checkouts via `paths`
-overrides, which leave `Cargo.lock` on the pinned revs; CI always uses the pins.
-Overrides cannot change a crate's dependency list: when a sibling adds or
-removes a dependency, push it and bump the pin first.
+All three are path dependencies, so there are no revs to bump and no
+`.cargo/config.toml` overrides. The old `github.com/AntoineGS/{tree-sitter-pascal,cfg-core,cfg-pascal}`
+repositories are no longer used by the build; do not add git dependencies on them.
 
 ## Backlog (required)
 

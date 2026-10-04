@@ -182,14 +182,9 @@ cargo build --release --locked -p pascal-lsp
 ./target/release/pascal-lsp --version
 ```
 
-The workspace currently requires your `tree-sitter-pascal` checkout beside
-`lint4d`, because `pascal-core` uses a local path dependency. cfg-core and
-cfg-pascal are fetched from the Git revisions in Cargo.lock. Building in a nested
-worktree requires the grammar at that worktree's sibling path as well.
-
-The grammar checkout must include `tree-sitter-pascal` commit `6881c9b`
-(conditional method attributes) for the unit/type navigation regression tests
-and affected Delphi units to parse correctly.
+The grammar (`crates/tree-sitter-pascal`), cfg-core and cfg-pascal are
+workspace crates, so a plain checkout of this repository is all the build
+needs.
 
 To install the executable into Cargo's bin directory:
 

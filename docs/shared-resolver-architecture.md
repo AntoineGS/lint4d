@@ -230,16 +230,10 @@ semantic classifications when include resolution is uncertain.
 
 ## Dependency identity
 
-The current lint4d `Cargo.toml` pins cfg-pascal to Git revision
-`208d6743c61e0b391195958270a5e04e3a4328d4`. `cfg-pascal` publicly re-exports
-its cfg-core dependency as `cfg_pascal::cfg_core`; lint4d intentionally has no
-direct `cfg-core` dependency and imports those types through that re-export.
-The locked cfg-core source is revision
-`b4131e61a939e0685194712689d1fd1497a41492`, and
-`cargo tree --locked -p lint4d -i cfg-core` reports one cfg-core crate identity
-through cfg-pascal. Keeping the re-export and lockfile identity aligned avoids
-duplicate cfg-core types at the adapter boundary.
-
-The cfg-pascal revision is an upstream Git pin for this integration; it should
-not be read as a claim that the lint4d adapter, or these worktree changes, are
-already part of a released upstream package.
+cfg-core and cfg-pascal are workspace crates (`crates/cfg-core`,
+`crates/cfg-pascal`) reached by path dependency. `cfg-pascal` publicly
+re-exports its cfg-core dependency as `cfg_pascal::cfg_core`; lint4d
+intentionally has no direct `cfg-core` dependency and imports those types
+through that re-export. `cargo tree --locked -p lint4d -i cfg-core` reports one
+cfg-core crate identity through cfg-pascal. Keeping the re-export as the only
+route avoids duplicate cfg-core types at the adapter boundary.

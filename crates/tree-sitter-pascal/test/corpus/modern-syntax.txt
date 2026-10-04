@@ -1,0 +1,256 @@
+===
+Binary integers and character codes
+===
+const
+  Mask = %101001;
+  Empty = %0;
+  Letter = #%1000001;
+  Negative = -%11;
+
+---
+
+(root
+  (declConsts (kConst)
+    (declConst (identifier) (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier) (defaultValue (kEq) (literalNumber)))
+    (declConst (identifier) (defaultValue (kEq) (literalString (literalChar))))
+    (declConst (identifier) (defaultValue (kEq) (exprUnary (kSub) (literalNumber))))))
+
+===
+Compound operator precedence and keyword boundaries
+===
+begin
+  Allowed := (Item is not TWidget) and Ready;
+  Allowed := Item is not TWidget = Ready;
+  Allowed := Item is notification;
+  Allowed := notifier in Items;
+  Allowed := isnot
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (assignment (identifier) (kAssign)
+      (exprBinary (exprParens (exprBinary (identifier) (kIs) (kNot) (identifier)))
+        (kAnd) (identifier)))
+    (assignment (identifier) (kAssign)
+      (exprBinary (exprBinary (identifier) (kIs) (kNot) (identifier)) (kEq) (identifier)))
+    (assignment (identifier) (kAssign) (exprBinary (identifier) (kIs) (identifier)))
+    (assignment (identifier) (kAssign) (exprBinary (identifier) (kIn) (identifier)))
+    (assignment (identifier) (kAssign) (identifier))
+    (kEnd)))
+
+===
+Binary literals in ranges and arithmetic
+===
+begin
+  Bits := [%0..%11];
+  Bits := %10 + %1
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (assignment (identifier) (kAssign)
+      (exprBrackets (range (literalNumber) (literalNumber))))
+    (assignment (identifier) (kAssign)
+      (exprBinary (literalNumber) (kAdd) (literalNumber)))
+    (kEnd)))
+
+===
+Conditional expression precedence and nesting
+===
+begin
+  Size := if Ready then 8 else 3 + 4;
+  Size := (if Ready then 8 else 3) + 4;
+  Size := if Ready then if Cached then 8 else 6 else 3;
+  Size := if Ready then 8 else if Cached then 6 else 3
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (assignment (identifier) (kAssign)
+      (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse)
+        (exprBinary (literalNumber) (kAdd) (literalNumber))))
+    (assignment (identifier) (kAssign)
+      (exprBinary
+        (exprParens (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse) (literalNumber)))
+        (kAdd) (literalNumber)))
+    (assignment (identifier) (kAssign)
+      (exprConditional (kIf) (identifier) (kThen)
+        (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse) (literalNumber))
+        (kElse) (literalNumber)))
+    (assignment (identifier) (kAssign)
+      (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse)
+        (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse) (literalNumber))))
+    (kEnd)))
+
+===
+Conditional expressions inside statements and arguments
+===
+begin
+  if Enabled then
+    if Visible then Size := if Ready then 8 else 3
+    else Size := 0;
+  Send(if Count < 2 then Count else 2, 9);
+  var Capacity := if Ready then 8 else 3;
+  if (if Ready then Enabled else Visible) then Send(Capacity)
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (if (kIf) (identifier) (kThen)
+      (ifElse (kIf) (identifier) (kThen)
+        (assignment (identifier) (kAssign)
+          (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse) (literalNumber)))
+        (kElse) (assignment (identifier) (kAssign) (literalNumber))))
+    (statement (exprCall (identifier)
+      (exprArgs
+        (exprConditional (kIf) (exprBinary (identifier) (kLt) (literalNumber))
+          (kThen) (identifier) (kElse) (literalNumber))
+        (literalNumber))))
+    (assignment (varAssignDef (kVar) (identifier)) (kAssign)
+      (exprConditional (kIf) (identifier) (kThen) (literalNumber) (kElse) (literalNumber)))
+    (if (kIf)
+      (exprParens (exprConditional (kIf) (identifier) (kThen) (identifier) (kElse) (identifier)))
+      (kThen) (statement (exprCall (identifier) (exprArgs (identifier)))))
+    (kEnd)))
+
+===
+Negated membership and type tests
+===
+begin
+  Allowed := Code not in [2, 4];
+  Allowed := Item is not TWidget;
+  Allowed := not (Code not in Codes);
+  Allowed := Code + 1 NOT {membership} IN Codes;
+  Allowed := Item IS (*type test*) NOT TWidget
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (assignment (identifier) (kAssign)
+      (exprBinary (identifier) (kNot) (kIn) (exprBrackets (literalNumber) (literalNumber))))
+    (assignment (identifier) (kAssign)
+      (exprBinary (identifier) (kIs) (kNot) (identifier)))
+    (assignment (identifier) (kAssign)
+      (exprUnary (kNot) (exprParens (exprBinary (identifier) (kNot) (kIn) (identifier)))))
+    (assignment (identifier) (kAssign)
+      (exprBinary (exprBinary (identifier) (kAdd) (literalNumber))
+        (kNot) (comment) (kIn) (identifier)))
+    (assignment (identifier) (kAssign)
+      (exprBinary (identifier) (kIs) (comment) (kNot) (identifier)))
+    (kEnd)))
+
+===
+Otherwise case fallback with multiple and empty statements
+===
+begin
+  case Code of
+    1: Hit;
+    otherwise Miss; Reset
+  end;
+  case Code of
+    2: Hit
+    OTHERWISE
+  end
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (case (kCase) (identifier) (kOf)
+      (caseCase (caseLabel (literalNumber)) (statement (identifier)))
+      (kOtherwise) (statement (identifier)) (statement (identifier)) (kEnd))
+    (case (kCase) (identifier) (kOf)
+      (caseCase (caseLabel (literalNumber)) (statement (identifier)))
+      (kOtherwise) (kEnd))
+    (kEnd)))
+
+===
+Managed record operators and const reference parameters
+===
+type
+  TLease = record
+    class operator Initialize(out Target: TLease);
+    class operator Finalize(var Target: TLease);
+    class operator Assign(var Target: TLease; const [ref] Source: TLease);
+  end;
+
+class operator TLease.Initialize(out Target: TLease);
+begin
+end;
+
+class operator TLease.Finalize(var Target: TLease);
+begin
+end;
+
+class operator TLease.Assign(var Target: TLease; const [ref] Source: TLease);
+begin
+end;
+
+---
+
+(root
+  (declTypes (kType)
+    (declType (identifier) (kEq)
+      (declClass (kRecord)
+        (declProc (kClass) (kOperator) (identifier)
+          (declArgs (declArg (kOut) (identifier) (type (typeref (identifier))))))
+        (declProc (kClass) (kOperator) (identifier)
+          (declArgs (declArg (kVar) (identifier) (type (typeref (identifier))))))
+        (declProc (kClass) (kOperator) (identifier)
+          (declArgs
+            (declArg (kVar) (identifier) (type (typeref (identifier))))
+            (declArg (kConst) (rttiAttributes (identifier)) (identifier) (type (typeref (identifier))))))
+        (kEnd))))
+  (defProc
+    (declProc (kClass) (kOperator) (genericDot (identifier) (kDot) (identifier))
+      (declArgs (declArg (kOut) (identifier) (type (typeref (identifier))))))
+    (block (kBegin) (kEnd)))
+  (defProc
+    (declProc (kClass) (kOperator) (genericDot (identifier) (kDot) (identifier))
+      (declArgs (declArg (kVar) (identifier) (type (typeref (identifier))))))
+    (block (kBegin) (kEnd)))
+  (defProc
+    (declProc (kClass) (kOperator) (genericDot (identifier) (kDot) (identifier))
+      (declArgs
+        (declArg (kVar) (identifier) (type (typeref (identifier))))
+        (declArg (kConst) (rttiAttributes (identifier)) (identifier) (type (typeref (identifier))))))
+    (block (kBegin) (kEnd))))
+
+===
+Inline for-in iterators with inferred and explicit types
+===
+begin
+  for var Entry in Entries do Visit(Entry);
+  for var Code: Integer in Codes do
+  begin
+    Visit(Code)
+  end
+end
+
+---
+
+(root
+  (blockTr (kBegin)
+    (foreach (kFor)
+      (varAssignDef (kVar) (identifier))
+      (kIn) (identifier) (kDo)
+      (statement (exprCall (identifier) (exprArgs (identifier)))))
+    (foreach (kFor)
+      (varAssignDef (kVar) (identifier) (typeref (identifier)))
+      (kIn) (identifier) (kDo)
+      (block (kBegin)
+        (statement (exprCall (identifier) (exprArgs (identifier))))
+        (kEnd)))
+    (kEnd)))

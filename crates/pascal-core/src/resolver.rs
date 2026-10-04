@@ -389,7 +389,7 @@ pub struct UnitResolver<S> {
     report: ResolutionReport,
     loaded: HashMap<SourceId, LoadedSource>,
     directories: HashMap<DirectoryCacheKey, DirectoryListing>,
-    package_catalogues: HashMap<String, Arc<Catalogue>>,
+    package_catalogues: HashMap<PathBuf, Arc<Catalogue>>,
     session_cache: Option<ResolverSessionCache>,
     unit_cache: HashMap<UnitCacheKey, ResolvedUnit>,
     legacy_routes: HashMap<SourceId, LegacyRoute>,
@@ -1634,7 +1634,7 @@ impl<S: SourceStore> UnitResolver<S> {
         self.check_cancel(cancel)?;
         let key = canonical_path(directory);
         let cache_key = DirectoryCacheKey {
-            path: path_key(&key),
+            path: path_identity::path_lookup_key(&key),
             entry: entry.clone(),
             read_policy: self.context.read_policy.clone(),
             missing_is_incomplete,
@@ -2214,9 +2214,9 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Arc<Catalogue>, ResolverError> {
         let root = canonical_path(root);
-        // Keyed by `path_key`: every spelling of a directory on a
-        // case-insensitive volume is one catalogue.
-        let root_key = path_key(&root);
+        // Every spelling of a directory on a case-insensitive volume is one
+        // catalogue; distinct directories never share one.
+        let root_key = path_identity::path_lookup_key(&root);
         if let Some(catalogue) = self.package_catalogues.get(&root_key).cloned() {
             return Ok(catalogue);
         }
@@ -2257,7 +2257,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut catalogue_entries = 0usize;
         while let Some(directory) = queue.pop_front() {
             self.check_cancel(cancel)?;
-            if !visited.insert(path_key(&directory)) {
+            if !visited.insert(path_identity::path_lookup_key(&directory)) {
                 continue;
             }
             let Some(entry) = self.context.path_entry_for(&directory) else {
@@ -2909,8 +2909,8 @@ struct CandidateGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DirectoryCacheKey {
-    /// `path_key` of the directory: one entry for every spelling of it.
-    path: String,
+    /// `path_lookup_key` of the directory: one entry for every spelling of it.
+    path: PathBuf,
     entry: ProjectPathEntry,
     read_policy: ReadPolicy,
     missing_is_incomplete: bool,
@@ -2952,7 +2952,7 @@ pub struct ResolverSessionCache {
 #[derive(Debug, Default)]
 struct ResolverSessionCacheState {
     scope: Option<ResolverSessionCacheScope>,
-    catalogues: HashMap<String, CachedCatalogue>,
+    catalogues: HashMap<PathBuf, CachedCatalogue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2987,7 +2987,7 @@ impl ResolverSessionCache {
         }
     }
 
-    fn get(&self, root: &str) -> Option<CachedCatalogue> {
+    fn get(&self, root: &Path) -> Option<CachedCatalogue> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2996,7 +2996,7 @@ impl ResolverSessionCache {
             .cloned()
     }
 
-    fn insert(&self, root: String, catalogue: CachedCatalogue, maximum: usize) {
+    fn insert(&self, root: PathBuf, catalogue: CachedCatalogue, maximum: usize) {
         let mut state = self
             .state
             .lock()
@@ -3711,5 +3711,155 @@ mod tests {
             assert!(resolver.report.incomplete_reasons.is_empty());
             assert_eq!(resolver.store.listings, 1, "one listing for both spellings");
         });
+    }
+
+    #[derive(Default)]
+    struct TreeStore {
+        directories: HashMap<PathBuf, (Vec<PathBuf>, Vec<PathBuf>)>,
+        listed: Vec<PathBuf>,
+    }
+
+    impl SourceStore for TreeStore {
+        fn list_directory(
+            &mut self,
+            request: DirectoryRequest<'_>,
+            _cancel: &dyn CancellationToken,
+        ) -> Result<DirectoryListing, SourceStoreError> {
+            self.listed.push(request.directory.to_path_buf());
+            let (files, directories) = self
+                .directories
+                .get(request.directory)
+                .cloned()
+                .unwrap_or_default();
+            Ok(DirectoryListing {
+                files,
+                directories,
+                stamp: None,
+                complete: true,
+            })
+        }
+
+        fn overlay_candidates(&self, _roots: &[PathBuf], _names: &[String]) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn load(
+            &mut self,
+            request: SourceRequest<'_>,
+            _cancel: &dyn CancellationToken,
+        ) -> Result<LoadedSource, SourceStoreError> {
+            Err(SourceStoreError::NotFound {
+                path: request.path.to_path_buf(),
+            })
+        }
+    }
+
+    // `\` is an ordinary name byte off Windows, and names need not be UTF-8;
+    // directories whose names only print alike are still distinct.
+    #[cfg(unix)]
+    #[test]
+    fn directories_that_only_print_alike_keep_their_own_listings_and_catalogues() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = PathBuf::from("/workspace");
+        let package = root.join("pkg");
+        let backslash = package.join("a\\b");
+        let nested = package.join("a").join("b");
+        let latin1_y = package.join(OsStr::from_bytes(b"lib\xff"));
+        let latin1_p = package.join(OsStr::from_bytes(b"lib\xfe"));
+        let mut store = TreeStore::default();
+        store.directories.insert(
+            package.clone(),
+            (
+                Vec::new(),
+                vec![
+                    backslash.clone(),
+                    package.join("a"),
+                    latin1_y.clone(),
+                    latin1_p.clone(),
+                ],
+            ),
+        );
+        store
+            .directories
+            .insert(package.join("a"), (Vec::new(), vec![nested.clone()]));
+        for (directory, unit) in [
+            (&backslash, "Backslash.pas"),
+            (&nested, "Nested.pas"),
+            (&latin1_y, "LatinY.pas"),
+            (&latin1_p, "LatinP.pas"),
+        ] {
+            store
+                .directories
+                .insert(directory.clone(), (vec![directory.join(unit)], Vec::new()));
+        }
+        let context = ProjectContext {
+            discovery_complete: true,
+            search_paths: vec![root.clone()],
+            search_path_entries: vec![ProjectPathEntry {
+                path: root.clone(),
+                provenance: ProjectPathProvenance::LegacyNative,
+            }],
+            ..ProjectContext::default()
+        };
+        let mut resolver =
+            UnitResolver::new(context, vec![root.clone()], store, Default::default());
+
+        let catalogue = resolver
+            .catalogue(&package, &NoCancellation)
+            .expect("package catalogue");
+        let mut units = catalogue.entries.keys().cloned().collect::<Vec<_>>();
+        units.sort();
+        assert_eq!(
+            units,
+            ["backslash.pas", "latinp.pas", "latiny.pas", "nested.pas"],
+            "{:?}",
+            resolver.report
+        );
+
+        let entry = ProjectPathEntry {
+            path: root.clone(),
+            provenance: ProjectPathProvenance::LegacyNative,
+        };
+        let listed_before = resolver.store.listed.len();
+        for (first, second) in [(&backslash, &nested), (&latin1_y, &latin1_p)] {
+            for directory in [first, second] {
+                let entry = ProjectPathEntry {
+                    path: directory.clone(),
+                    ..entry.clone()
+                };
+                resolver
+                    .list_directory(directory, &entry, None, &NoCancellation, false)
+                    .expect("listing");
+            }
+        }
+        assert_eq!(
+            resolver.store.listed.len() - listed_before,
+            4,
+            "each directory needs its own listing"
+        );
+
+        let limits = ResolverLimits {
+            max_package_catalogues: 2,
+            ..Default::default()
+        };
+        let mut resolver = UnitResolver::new(
+            resolver.context.clone(),
+            vec![root.clone()],
+            TreeStore {
+                directories: resolver.store.directories.clone(),
+                listed: Vec::new(),
+            },
+            limits,
+        );
+        let first = resolver
+            .catalogue(&latin1_y, &NoCancellation)
+            .expect("first catalogue");
+        let second = resolver
+            .catalogue(&latin1_p, &NoCancellation)
+            .expect("second catalogue");
+        assert!(first.entries.contains_key("latiny.pas"));
+        assert!(second.entries.contains_key("latinp.pas"));
     }
 }

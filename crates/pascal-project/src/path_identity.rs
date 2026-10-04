@@ -176,6 +176,25 @@ pub fn path_key(path: &Path) -> String {
     }
 }
 
+/// A lossless lookup key for `path` that is equal for every spelling of it
+/// on this host: the path itself on case-sensitive volumes, and with ASCII
+/// letters lowercased per component on case-insensitive ones. Unlike
+/// [`path_key`], names keep every byte (non-UTF-8 names stay distinct), and
+/// keys compare by component, so `\` is a separator only where the host
+/// says so.
+pub fn path_lookup_key(path: &Path) -> PathBuf {
+    if !is_case_insensitive(path) {
+        return path.to_path_buf();
+    }
+    path.components()
+        .map(|component| {
+            let mut name = component.as_os_str().to_os_string();
+            name.make_ascii_lowercase();
+            name
+        })
+        .collect()
+}
+
 /// The directory a component-by-component walk of `absolute` starts from:
 /// its prefix and root (`C:\`, `\\server\share\`, `/`). Starting from the
 /// bare separator instead would drop a Windows drive or share.
@@ -321,6 +340,42 @@ mod tests {
                 "{}",
                 volume.display()
             );
+        }
+    }
+
+    #[test]
+    fn lookup_keys_fold_letter_case_only_on_case_insensitive_volumes() {
+        let upper = std::env::temp_dir().join("Lib").join("Unit1.pas");
+        let lower = std::env::temp_dir().join("lib").join("unit1.pas");
+        assert_eq!(
+            path_lookup_key(&upper) == path_lookup_key(&lower),
+            is_case_insensitive(&upper)
+        );
+        with_case_insensitive_volumes(|| {
+            assert_eq!(path_lookup_key(&upper), path_lookup_key(&lower));
+        });
+    }
+
+    // `\` is an ordinary name byte off Windows, and names need not be UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn lookup_keys_keep_names_that_only_print_alike_apart() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new("/workspace");
+        let pairs = [
+            (root.join("a\\b"), root.join("a").join("b")),
+            (
+                root.join(OsStr::from_bytes(b"lib\xff")),
+                root.join(OsStr::from_bytes(b"lib\xfe")),
+            ),
+        ];
+        for (left, right) in &pairs {
+            assert_ne!(path_lookup_key(left), path_lookup_key(right));
+            with_case_insensitive_volumes(|| {
+                assert_ne!(path_lookup_key(left), path_lookup_key(right));
+            });
         }
     }
 

@@ -14187,10 +14187,10 @@ fn merge_project_read_observations(
     }
 }
 
-type ProjectPathLookupKey = String;
+type ProjectPathLookupKey = PathBuf;
 
 fn project_path_lookup_key(path: &Path) -> ProjectPathLookupKey {
-    pascal_project::path_identity::path_key(path)
+    pascal_project::path_identity::path_lookup_key(path)
 }
 
 fn path_ci_lookup_key(path: &Path) -> String {
@@ -20694,6 +20694,42 @@ BDS = '/fake/37'
             WATCHED + 1,
             "charge the context and each compared watched path"
         );
+    }
+
+    // `\` is an ordinary name byte off Windows, and names need not be UTF-8;
+    // reads of files whose paths only print alike are all kept.
+    #[cfg(unix)]
+    #[test]
+    fn merged_read_observations_keep_paths_that_only_print_alike() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = PathBuf::from("/workspace");
+        let observation = |path: PathBuf| ProjectReadObservation {
+            path,
+            stamp: ProjectReadStamp {
+                bytes: 1,
+                modified: None,
+                is_dir: false,
+                is_symlink: false,
+            },
+            content_hash: 0,
+            content_bytes: None,
+        };
+        let existing = [
+            observation(root.join("a\\b.dproj")),
+            observation(root.join(OsStr::from_bytes(b"lib\xff.dproj"))),
+        ];
+        let incoming = [
+            observation(root.join("a").join("b.dproj")),
+            observation(root.join(OsStr::from_bytes(b"lib\xfe.dproj"))),
+        ];
+
+        let merged =
+            super::merge_project_read_observations_indexed(&existing, &incoming, None, None)
+                .expect("merge");
+
+        assert_eq!(merged.len(), 4, "{merged:?}");
     }
 
     #[test]

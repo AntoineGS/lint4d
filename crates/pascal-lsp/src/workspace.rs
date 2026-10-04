@@ -2735,6 +2735,8 @@ pub struct Workspace {
     open_documents: HashMap<Url, OpenDocument>,
     /// The last map built by `overlay_inputs`, reused while it matches.
     overlay_inputs: Mutex<Option<Arc<HashMap<Url, rename::OverlayInput>>>>,
+    /// Leases on cached parses this request workspace keeps in its index.
+    cache_leases: Vec<crate::project_cache::CacheLease>,
     rejected_open_fence_uris: HashSet<Url>,
     rejected_open_fence_permanent: bool,
     pending_unit_file_renames: HashMap<Url, PendingUnitFileRename>,
@@ -7675,7 +7677,7 @@ impl Workspace {
         let cached_source = if verified_legacy_payload {
             None
         } else {
-            self.cached_closed_source(uri, &path, &context, &current_stamp)
+            self.cached_closed_source(uri, &path, &context, &current_stamp, cancel, budget)?
         };
         let source = match cached_source.map_or_else(
             || {
@@ -7922,6 +7924,9 @@ impl Workspace {
             self.warn(format!("cannot index {uri}: {error}"));
             return Ok(false);
         }
+        if let Some(unit) = &cached_unit {
+            self.lease_cached_parse(uri, unit);
+        }
         check_workspace_cancel(cancel)?;
         let cached_expansion = if claim.is_some() {
             expansion.clone()
@@ -8011,30 +8016,58 @@ impl Workspace {
         path: &Path,
         context: &ProjectContext,
         stamp: &DiskStamp,
-    ) -> Option<DiskSource> {
-        let modified = stamp.modified?;
-        if stamp.bytes > self.options.limits.max_file_bytes as u64
-            || fs::symlink_metadata(path).ok()?.file_type().is_symlink()
-        {
-            return None;
+        cancel: Option<&AtomicBool>,
+        budget: Option<&ReconciliationBudget>,
+    ) -> Result<Option<DiskSource>, String> {
+        let Some(modified) = stamp.modified else {
+            return Ok(None);
+        };
+        if stamp.bytes > self.options.limits.max_file_bytes as u64 {
+            return Ok(None);
         }
-        let (unit, content_hash) = self.project_cache.peek_unit_from_disk(
+        // Charged like the read path's own symlink check.
+        check_workspace_cancel(cancel)?;
+        if let Some(budget) = budget {
+            budget.charge_path_visits(1)?;
+        }
+        if fs::symlink_metadata(path).map_or(true, |metadata| metadata.file_type().is_symlink()) {
+            return Ok(None);
+        }
+        let Some((unit, content_hash)) = self.project_cache.peek_unit_from_disk(
             uri,
             context,
             stamp.bytes,
             modified,
             &self.overlay_inputs(),
-        )?;
-        let origin = unit.disk.as_ref()?;
+        ) else {
+            return Ok(None);
+        };
+        let Some(origin) = unit.disk.as_ref() else {
+            return Ok(None);
+        };
         if origin.text.len() > self.options.limits.max_file_bytes {
-            return None;
+            return Ok(None);
         }
-        Some(DiskSource {
+        Ok(Some(DiskSource {
             text: origin.text.to_string(),
             bytes: origin.raw_bytes,
             stamp: stamp.clone(),
             content_hash,
-        })
+        }))
+    }
+
+    /// Request workspaces lease the cached parses they keep, so the cache
+    /// keeps charging them after eviction. The long-lived workspace does not:
+    /// its index is bounded by its own source limits.
+    pub(super) fn lease_cached_parse(&mut self, uri: &Url, unit: &crate::project_cache::UnitValue) {
+        if self.cache_epoch.is_some()
+            && self
+                .index
+                .parsed_document(uri)
+                .is_some_and(|parsed| Arc::ptr_eq(&parsed, &unit.parsed))
+        {
+            self.cache_leases.push(self.project_cache.lease_unit(unit));
+        }
     }
 
     /// Open-document overlays for cache probes and lookups. The map is
@@ -16978,6 +17011,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_snapshot_took_from_the_cache_stay_charged_after_eviction() {
+        let fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main, &fixture.derived]);
+        let cache = fixture.workspace.project_cache().clone();
+        let snapshot = fixture.snapshot();
+        assert!(
+            snapshot.declaration_providers.contains(&fixture.base),
+            "the closure walk inserts Base's cached parse: {:?}",
+            snapshot.declaration_providers
+        );
+        assert_eq!(
+            cache.stats().outstanding_bytes,
+            0,
+            "cached parses are charged once"
+        );
+
+        cache.invalidate_after_overflow();
+        let held = cache.stats().outstanding_bytes;
+        assert!(
+            held >= crate::project_cache::unit_value_bytes(INHERITED_BASE.len()),
+            "the snapshot still holds Base's parse: {held} bytes charged"
+        );
+
+        drop(snapshot);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+    }
+
+    #[test]
     fn hover_resolves_members_inherited_through_a_warm_closure() {
         let fixture = inherited_fixture("Base");
         fixture.warm(&[&fixture.main, &fixture.derived]);
@@ -19153,6 +19214,37 @@ mod tests {
 
         workspace.close_document(&uri);
         assert!(workspace.overlay_inputs().is_empty());
+    }
+
+    #[test]
+    fn the_warm_closed_source_check_charges_its_stat_and_honours_cancellation() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let (main_uri, _) = provider_fixture(temp.path());
+        let main = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        worker_view(&main).navigate(&main_uri, Position::new(6, 2), NavigationTarget::Definition);
+        let mut worker = worker_view(&main);
+        let context_key = worker
+            .context_for_uri_with_cancel(&main_uri, None)
+            .expect("context");
+        let context = worker.contexts[&context_key].context.clone();
+        let path = main_uri.to_file_path().unwrap();
+        let stamp = super::disk_stamp(&path).expect("stamp");
+
+        let budget = ReconciliationBudget::new(std::sync::Arc::new(AtomicBool::new(false)));
+        let cached = worker
+            .cached_closed_source(&main_uri, &path, &context, &stamp, None, Some(&budget))
+            .expect("warm check");
+        assert!(cached.is_some(), "the first navigation cached Main");
+        assert_eq!(budget.used.get().filesystem_path_visits, 1);
+
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            worker
+                .cached_closed_source(&main_uri, &path, &context, &stamp, Some(&cancelled), None)
+                .err()
+                .as_deref(),
+            Some(super::CANCELLATION_MESSAGE)
+        );
     }
 
     #[test]
@@ -23529,7 +23621,9 @@ BDS = '/fake/37'
 
     #[test]
     fn lf_only_line_ending_map_allocates_nothing_per_byte() {
-        let source = format!("{}\n", "x".repeat(99)).repeat(100 * 1024 * 1024 / 100);
+        // 8 MiB keeps the default test run light; a per-byte map would
+        // already be 64 MiB here.
+        let source = format!("{}\n", "x".repeat(99)).repeat(8 * 1024 * 1024 / 100);
         let normalized = super::normalize_line_endings_with_offsets(&source);
         assert_eq!(normalized.text.len(), source.len());
         assert!(

@@ -540,6 +540,9 @@ pub(crate) struct RenameSnapshot {
     pub(crate) declaration_providers: HashSet<Url>,
     pub(crate) baseline_records: Vec<SourceRecord>,
     pub(crate) mode: SnapshotMode,
+    /// Keep the cache charging the cached parses in `index` until the
+    /// snapshot is dropped.
+    _cache_leases: Vec<crate::project_cache::CacheLease>,
 }
 
 fn cached_position_index<'a>(
@@ -6072,6 +6075,7 @@ fn build_snapshot_with_policy(
                     declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
                     mode,
+                    _cache_leases: Vec::new(),
                 });
             }
             contexts
@@ -7064,6 +7068,7 @@ fn build_snapshot_with_policy(
         declaration_providers,
         baseline_records,
         mode,
+        _cache_leases: loader.cache_leases,
     })
 }
 

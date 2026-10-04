@@ -1339,7 +1339,11 @@ mod cache_tests {
     }
 
     #[test]
-    fn unit_retained_bytes_cover_parse_probes_and_unshared_text() {
+    /// `retained_bytes` takes the parse at the measured factor; that factor
+    /// is calibrated by RSS in `measure_retained_bytes_per_source_byte`, since
+    /// tree-sitter's trees live in C allocations no in-process count sees.
+    /// This checks only what the estimate adds on top of it.
+    fn unit_retained_bytes_add_probes_and_unshared_text_to_the_parse_estimate() {
         let parsed = parsed_unit("Base.pas");
         let source_len = parsed.source_text().len();
         let unit = |probes, disk| UnitValue {
@@ -1349,10 +1353,9 @@ mod cache_tests {
             disk,
         };
         let bare = unit(vec![], None).retained_bytes();
-        assert!(bare >= unit_value_bytes(source_len));
-        assert!(
-            bare <= unit_value_bytes(source_len) * 6 / 5,
-            "a bare parse stays within 20% of the measured factor"
+        assert_eq!(
+            bare,
+            unit_value_bytes(source_len) + std::mem::size_of::<UnitValue>()
         );
         assert!(unit(vec![long_probe("A.inc")], None).retained_bytes() >= bare + 256);
 
@@ -1448,29 +1451,92 @@ mod cache_tests {
         );
     }
 
+    fn store_unit_bytes(cache: &ProjectCache, name: &str, ctx: &ProjectContext, bytes: usize) {
+        let Lookup::Compute(claim) = cache.unit(&uri(name), ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss for {name}");
+        };
+        let value = UnitValue {
+            parsed: parsed_unit(name),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        };
+        cache.store_unit(claim, value, bytes, &no_cancel());
+    }
+
     #[test]
-    fn evicted_values_held_by_a_worker_stay_charged_until_dropped() {
+    fn a_leased_parse_stays_charged_after_eviction_until_the_lease_drops() {
         let cache = ProjectCache::new(10);
         let ctx = context("A.dproj");
-        fill(&cache, "A.pas", &ctx, 1, 10);
-        let Lookup::Hit(held) =
-            cache.imports(&uri("A.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
-        else {
-            panic!("expected a hit");
-        };
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        drop(unit);
+        assert_eq!(
+            cache.stats().outstanding_bytes,
+            0,
+            "a cached parse is charged once"
+        );
 
         fill(&cache, "B.pas", &ctx, 1, 10);
         assert!(!ready(&cache, "A.pas"));
         assert!(
             !ready(&cache, "B.pas"),
-            "the worker's copy of A still fills the budget"
+            "the leased parse of A still fills the budget"
         );
+        assert_eq!(cache.stats().outstanding_bytes, 10);
         assert!(!cache.has_room());
 
-        drop(held);
+        drop(lease);
+        assert_eq!(cache.stats().outstanding_bytes, 0);
         assert!(cache.has_room());
         fill(&cache, "B.pas", &ctx, 1, 10);
         assert!(ready(&cache, "B.pas"));
+    }
+
+    #[test]
+    fn transient_hits_are_not_charged_after_eviction() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        drop(unit);
+    }
+
+    #[test]
+    fn a_re_cached_parse_is_charged_by_its_entry_again() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        store_unit_bytes(&cache, "A.pas", &ctx, 10);
+        let unit = cache
+            .peek_unit(&uri("A.pas"), &ctx, 1, &HashMap::new())
+            .expect("hit");
+        let lease = cache.lease_unit(&unit);
+        cache.invalidate_path(Path::new("/ws/A.pas"));
+        assert_eq!(cache.stats().outstanding_bytes, 10);
+
+        let Lookup::Compute(claim) =
+            cache.unit(&uri("A.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a miss");
+        };
+        let value = UnitValue {
+            parsed: unit.parsed.clone(),
+            expansion: None,
+            probes: vec![],
+            disk: None,
+        };
+        cache.store_unit(claim, value, 10, &no_cancel());
+        assert_eq!(cache.stats().outstanding_bytes, 0);
+        drop(lease);
+        assert_eq!(cache.stats().bytes, 10);
     }
 
     #[test]
@@ -1904,9 +1970,13 @@ struct State {
     /// One shared copy of each project context, by fingerprint, so entries
     /// do not each hold their own.
     contexts: HashMap<u64, Arc<ProjectContext>>,
-    /// Values removed while a worker still held them. Their bytes stay in the
-    /// budget until the last holder drops them.
-    outstanding: Vec<(Held, usize)>,
+    /// Unit entries holding each parse, by `Arc` address, with the entry's
+    /// charge.
+    cached_parses: HashMap<usize, (usize, usize)>,
+    /// Request leases on cached parses, by `Arc` address.
+    leases: HashMap<usize, Lease>,
+    /// Charges of leased parses that no entry holds any more. They stay in
+    /// the budget until the last lease drops.
     outstanding_bytes: usize,
     watch_counts: HashMap<PathBuf, usize>,
     /// Directories whose watch count reached or left zero. `sync_watches`
@@ -1937,7 +2007,8 @@ impl Default for State {
             exact: HashMap::new(),
             by_uri: HashMap::new(),
             contexts: HashMap::new(),
-            outstanding: Vec::new(),
+            cached_parses: HashMap::new(),
+            leases: HashMap::new(),
             outstanding_bytes: 0,
             watch_counts: HashMap::new(),
             watch_changes: Vec::new(),
@@ -2095,6 +2166,13 @@ fn recover_poisoned_state<'a>(
     state.generation = state.generation.wrapping_add(1);
     state.bytes = 0;
     state.pinned_bytes = 0;
+    state.cached_parses.clear();
+    let mut orphaned = 0usize;
+    for lease in state.leases.values_mut().filter(|lease| !lease.evicted) {
+        lease.evicted = true;
+        orphaned = orphaned.saturating_add(lease.bytes);
+    }
+    state.outstanding_bytes = state.outstanding_bytes.saturating_add(orphaned);
     state.lru.clear();
     state.observed.clear();
     state.exact.clear();
@@ -2248,6 +2326,35 @@ impl ProjectCache {
                 _ => None,
             },
         )
+    }
+
+    /// Leases the parse of a unit hit that a request keeps in its own index,
+    /// so the parse stays charged if its entry is evicted first.
+    pub(crate) fn lease_unit(&self, unit: &UnitValue) -> CacheLease {
+        let payload = Arc::as_ptr(&unit.parsed) as *const () as usize;
+        let mut state = lock(&self.inner);
+        if let Some(lease) = state.leases.get_mut(&payload) {
+            lease.holders += 1;
+        } else {
+            let cached = state.cached_parses.get(&payload).map(|(_, bytes)| *bytes);
+            let bytes = cached.unwrap_or_else(|| unit.retained_bytes());
+            if cached.is_none() {
+                state.outstanding_bytes = state.outstanding_bytes.saturating_add(bytes);
+            }
+            state.leases.insert(
+                payload,
+                Lease {
+                    holders: 1,
+                    bytes,
+                    evicted: cached.is_none(),
+                },
+            );
+        }
+        CacheLease {
+            inner: self.inner.clone(),
+            payload,
+            _parsed: unit.parsed.clone(),
+        }
     }
 
     /// A verified unit entry read from a closed file whose length and
@@ -2609,6 +2716,9 @@ fn index_remove<K: std::hash::Hash + Eq>(map: &mut HashMap<K, HashSet<Key>>, at:
 fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     remove_ready(state, &key);
     state.bytes = state.bytes.saturating_add(entry.bytes);
+    if let Some(address) = parse_address(&entry.value) {
+        hold_parse(state, address, entry.bytes);
+    }
     if is_pinned(state, &key) {
         state.pinned_bytes = state.pinned_bytes.saturating_add(entry.bytes);
     } else {
@@ -2631,48 +2741,88 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     state.slots.insert(key, Slot::Ready(entry));
 }
 
-/// A removed value that a worker may still hold.
-enum Held {
-    Unit(std::sync::Weak<UnitValue>),
-    Import(std::sync::Weak<ImportValue>),
-    Interface(std::sync::Weak<InterfaceImportsValue>),
+#[derive(Debug)]
+struct Lease {
+    holders: usize,
+    bytes: usize,
+    /// Whether no cache entry holds the parse, so `bytes` are outstanding.
+    evicted: bool,
 }
 
-impl Held {
-    /// The value, when someone other than the removed entry holds it.
-    fn of(value: &Value) -> Option<Self> {
-        match value {
-            Value::Unit(unit) => {
-                (Arc::strong_count(unit) > 1).then(|| Self::Unit(Arc::downgrade(unit)))
-            }
-            Value::Import(imports) => {
-                (Arc::strong_count(imports) > 1).then(|| Self::Import(Arc::downgrade(imports)))
-            }
-            Value::Interface(interface) => (Arc::strong_count(interface) > 1)
-                .then(|| Self::Interface(Arc::downgrade(interface))),
-        }
-    }
+/// A request's hold on a cached parse it put into its own index. While a
+/// lease is alive and no entry holds the parse, the entry's charge stays in
+/// the budget as outstanding bytes. Transient hits are not leased.
+pub(crate) struct CacheLease {
+    inner: Arc<Inner>,
+    payload: usize,
+    _parsed: Arc<ParsedDocument>,
+}
 
-    fn alive(&self) -> bool {
-        match self {
-            Self::Unit(unit) => unit.strong_count() > 0,
-            Self::Import(imports) => imports.strong_count() > 0,
-            Self::Interface(interface) => interface.strong_count() > 0,
-        }
+impl std::fmt::Debug for CacheLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheLease")
+            .field("payload", &self.payload)
+            .finish_non_exhaustive()
     }
 }
 
-/// Stops charging removed values whose last holder has dropped them.
-fn prune_outstanding(state: &mut State) {
-    let mut released = 0usize;
-    state.outstanding.retain(|(held, bytes)| {
-        let alive = held.alive();
-        if !alive {
-            released = released.saturating_add(*bytes);
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        let mut state = lock(&self.inner);
+        let Some(lease) = state.leases.get_mut(&self.payload) else {
+            return;
+        };
+        lease.holders -= 1;
+        if lease.holders > 0 {
+            return;
         }
-        alive
-    });
-    state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
+        let Some(lease) = state.leases.remove(&self.payload) else {
+            return;
+        };
+        if lease.evicted {
+            state.outstanding_bytes = state.outstanding_bytes.saturating_sub(lease.bytes);
+        }
+    }
+}
+
+fn parse_address(value: &Value) -> Option<usize> {
+    match value {
+        Value::Unit(unit) => Some(Arc::as_ptr(&unit.parsed) as *const () as usize),
+        _ => None,
+    }
+}
+
+/// Records that an entry holds a parse; a leased parse stops being
+/// outstanding.
+fn hold_parse(state: &mut State, address: usize, bytes: usize) {
+    let (refs, _) = state.cached_parses.entry(address).or_insert((0, bytes));
+    *refs += 1;
+    if let Some(lease) = state.leases.get_mut(&address)
+        && lease.evicted
+    {
+        lease.evicted = false;
+        state.outstanding_bytes = state.outstanding_bytes.saturating_sub(lease.bytes);
+    }
+}
+
+/// Records that an entry released a parse; a leased parse no entry holds
+/// becomes outstanding.
+fn release_parse(state: &mut State, address: usize) {
+    let Some((refs, _)) = state.cached_parses.get_mut(&address) else {
+        return;
+    };
+    *refs -= 1;
+    if *refs > 0 {
+        return;
+    }
+    state.cached_parses.remove(&address);
+    if let Some(lease) = state.leases.get_mut(&address)
+        && !lease.evicted
+    {
+        lease.evicted = true;
+        state.outstanding_bytes = state.outstanding_bytes.saturating_add(lease.bytes);
+    }
 }
 
 /// The shared copy of `context`, so entries of one project hold one copy.
@@ -2726,9 +2876,8 @@ fn remove_ready(state: &mut State, key: &Key) -> bool {
     }
     index_remove(&mut state.by_uri, &key.uri, key);
     release_watches(state, &entry);
-    if let Some(held) = Held::of(&entry.value) {
-        state.outstanding.push((held, entry.bytes));
-        state.outstanding_bytes = state.outstanding_bytes.saturating_add(entry.bytes);
+    if let Some(address) = parse_address(&entry.value) {
+        release_parse(state, address);
     }
     drop(entry);
     release_context(state, key.fingerprint);
@@ -2805,7 +2954,6 @@ fn remove_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
 }
 
 fn evict_to_budget(state: &mut State) {
-    prune_outstanding(state);
     while state.bytes.saturating_add(state.outstanding_bytes) > state.max_bytes {
         let Some((_, key)) = state.lru.pop_first() else {
             return;
@@ -3025,8 +3173,7 @@ impl ProjectCache {
     }
 
     pub(crate) fn has_room(&self) -> bool {
-        let mut state = lock(&self.inner);
-        prune_outstanding(&mut state);
+        let state = lock(&self.inner);
         state.pinned_bytes.saturating_add(state.outstanding_bytes) < state.max_bytes
     }
 
@@ -3035,8 +3182,7 @@ impl ProjectCache {
     }
 
     pub(crate) fn stats(&self) -> CacheStats {
-        let mut state = lock(&self.inner);
-        prune_outstanding(&mut state);
+        let state = lock(&self.inner);
         let count = |layer| {
             state
                 .slots

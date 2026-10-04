@@ -329,55 +329,31 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn path_starts_with(path: &Path, root: &Path) -> bool {
-    let path_components = path.components().collect::<Vec<_>>();
-    let root_components = root.components().collect::<Vec<_>>();
-    path_components.len() >= root_components.len()
-        && path_components
-            .iter()
-            .zip(root_components.iter())
-            .all(|(path, root)| components_equal(*path, *root))
+    crate::path_identity::path_starts_with(path, root)
 }
 
 fn add_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if !paths.iter().any(|path| paths_equal(path, &candidate)) {
+    if !paths
+        .iter()
+        .any(|path| crate::path_identity::paths_equal(path, &candidate))
+    {
         paths.push(candidate);
     }
 }
 
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    let left_components = left.components().collect::<Vec<_>>();
-    let right_components = right.components().collect::<Vec<_>>();
-    left_components.len() == right_components.len()
-        && left_components
-            .iter()
-            .zip(right_components.iter())
-            .all(|(left, right)| components_equal(*left, *right))
-}
-
-fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
-    #[cfg(windows)]
-    {
-        left.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left.as_os_str() == right.as_os_str()
-    }
-}
-
-// Needs case-distinct paths: not on Windows, and not on macOS volumes,
-// which are usually case-insensitive (backlog TASK-74).
-#[cfg(not(any(windows, target_os = "macos")))]
+// Needs case-distinct paths, which Windows volumes cannot hold.
+#[cfg(not(windows))]
 #[cfg(test)]
 mod tests {
     use super::add_unique_path;
     use std::path::PathBuf;
 
     #[test]
-    fn case_distinct_linux_directories_are_not_deduplicated() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+    fn case_distinct_directories_are_not_deduplicated_on_a_case_sensitive_volume() {
+        let Some(base) = crate::path_identity::case_sensitive_test_dir() else {
+            return;
+        };
+        let temp = tempfile::tempdir_in(base).expect("temporary directory");
         let upper = temp.path().join("Root");
         let lower = temp.path().join("root");
         std::fs::create_dir(&upper).expect("upper directory");

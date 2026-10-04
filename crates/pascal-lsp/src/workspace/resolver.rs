@@ -924,13 +924,7 @@ fn source_id_for_path(path: &Path) -> SourceId {
 }
 
 fn path_key(path: &Path) -> String {
-    let mut key = absolute_path(path.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/");
-    if cfg!(windows) {
-        key = key.to_ascii_lowercase();
-    }
-    key
+    pascal_project::path_identity::path_key(&absolute_path(path.to_path_buf())).replace('\\', "/")
 }
 
 fn path_equivalent(left: &Path, right: &Path) -> bool {
@@ -938,21 +932,8 @@ fn path_equivalent(left: &Path, right: &Path) -> bool {
 }
 
 fn path_starts_with(path: &Path, root: &Path) -> bool {
-    let path = absolute_path(path.to_path_buf());
-    let root = absolute_path(root.to_path_buf());
-    let path_components = path.components().collect::<Vec<_>>();
-    let root_components = root.components().collect::<Vec<_>>();
-    path_components.len() >= root_components.len()
-        && path_components
-            .iter()
-            .zip(root_components.iter())
-            .all(|(path, root)| {
-                if cfg!(windows) {
-                    path.as_os_str()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&root.as_os_str().to_string_lossy())
-                } else {
-                    path == root
-                }
-            })
+    pascal_project::path_identity::path_starts_with(
+        &absolute_path(path.to_path_buf()),
+        &absolute_path(root.to_path_buf()),
+    )
 }

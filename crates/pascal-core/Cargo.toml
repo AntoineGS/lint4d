@@ -25,6 +25,7 @@ quick-xml = "0.42"
 winreg = "0.52"
 
 [dev-dependencies]
+pascal-project = { path = "../pascal-project", features = ["test-support"] }
 tempfile = "3"
 
 [lints]

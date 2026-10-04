@@ -5408,12 +5408,14 @@ fn document_links_reject_an_ancestor_symlink_inserted_while_delivery_waits() {
 }
 
 // Needs a case-sensitive volume, where the include needs a directory scan;
-// Windows opens it directly, and macOS volumes are usually case-insensitive
-// (backlog TASK-74).
+// Windows volumes open it directly.
 #[test]
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(windows))]
 fn document_links_refuse_case_insensitive_lookup_over_directory_scan_limit() {
-    let temp = tempfile::tempdir().expect("temporary workspace");
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(base).expect("temporary workspace");
     let main = temp.path().join("Main.pas");
     write_file(
         &main,
@@ -54028,12 +54030,14 @@ fn public_rename_applies_retained_limits_only_to_relevant_sources() {
     server.shutdown();
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
-// (backlog TASK-74).
-#[cfg(all(not(windows), not(target_os = "macos")))]
+// Needs case-distinct paths, which Windows volumes cannot hold.
+#[cfg(not(windows))]
 #[test]
-fn public_rename_never_deduplicates_case_distinct_linux_source_paths() {
-    let temp = tempfile::tempdir().expect("temporary workspace");
+fn public_rename_never_deduplicates_case_distinct_source_paths() {
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(base).expect("temporary workspace");
     let root = temp.path().join("fixture");
     let provider = root.join("Provider.pas");
     let filename_upper = root.join("Consumer.pas");

@@ -493,10 +493,13 @@ fn explicit_mapping_wins_and_alias_is_applied_once() {
     assert_eq!(found.declared_name, "Vendor.Errors");
 }
 
-// Errors.pas and errors.PAS cannot coexist on a case-insensitive volume.
+// Errors.pas and errors.PAS cannot coexist on a case-insensitive volume, and
+// the identity of these in-memory paths follows the volume holding them.
 #[test]
-#[cfg(not(windows))]
 fn ambiguity_at_current_tier_blocks_search_path_fallback() {
+    if pascal_project::path_identity::is_case_insensitive(Path::new("/workspace")) {
+        return;
+    }
     let mut context = fixture_context();
     context.search_path_entries = vec![
         ProjectPathEntry::legacy(PathBuf::from("/workspace/App")),
@@ -1851,10 +1854,12 @@ fn descendant_overlay_does_not_enter_an_immediate_directory_tier() {
 // A client may spell an open file differently from the disk (VS Code sends
 // a lowercase drive letter); on a case-insensitive volume it is one file.
 #[test]
-#[cfg(windows)]
 fn overlay_under_another_letter_case_replaces_the_disk_file() {
     let directory = tempdir().expect("overlay root");
     let root = directory.path();
+    if !pascal_project::path_identity::is_case_insensitive(root) {
+        return;
+    }
     fs::create_dir_all(root.join("later")).expect("search path");
     fs::write(
         root.join("later/Errors.pas"),
@@ -1902,10 +1907,12 @@ fn overlay_under_another_letter_case_replaces_the_disk_file() {
 // An unsaved file has no on-disk spelling; every spelling of it must share
 // the overlay's identity.
 #[test]
-#[cfg(windows)]
 fn unsaved_overlay_has_one_identity_under_every_spelling() {
     let directory = tempdir().expect("overlay root");
     let root = directory.path();
+    if !pascal_project::path_identity::is_case_insensitive(root) {
+        return;
+    }
     let overlay = root.join("New.pas");
     let mut store = FilesystemSourceStore::new();
     store.insert_overlay(
@@ -2096,10 +2103,8 @@ fn exact_restricted_provenance_is_not_downgraded_by_directory_candidates() {
     assert!(!resolver.finish().complete);
 }
 
-// macOS volumes are usually case-insensitive, which path identity does not
-// handle yet (backlog TASK-74).
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn case_adjusted_include_reapplies_exact_restricted_provenance() {
     let directory = tempdir().expect("restricted include root");
     let root = directory.path();
@@ -2191,10 +2196,7 @@ fn case_adjusted_mapped_include_retains_mapping_restriction() {
     );
 }
 
-// macOS volumes are usually case-insensitive, which path identity does not
-// handle yet (backlog TASK-74).
 #[test]
-#[cfg(not(target_os = "macos"))]
 fn authorized_parent_relative_and_absolute_include_case_adjustment_is_preserved() {
     let directory = tempdir().expect("include root");
     let root = directory.path();

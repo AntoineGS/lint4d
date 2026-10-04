@@ -389,7 +389,7 @@ pub struct UnitResolver<S> {
     report: ResolutionReport,
     loaded: HashMap<SourceId, LoadedSource>,
     directories: HashMap<DirectoryCacheKey, DirectoryListing>,
-    package_catalogues: HashMap<PathBuf, Arc<Catalogue>>,
+    package_catalogues: HashMap<String, Arc<Catalogue>>,
     session_cache: Option<ResolverSessionCache>,
     unit_cache: HashMap<UnitCacheKey, ResolvedUnit>,
     legacy_routes: HashMap<SourceId, LegacyRoute>,
@@ -1634,7 +1634,7 @@ impl<S: SourceStore> UnitResolver<S> {
         self.check_cancel(cancel)?;
         let key = canonical_path(directory);
         let cache_key = DirectoryCacheKey {
-            path: key.clone(),
+            path: path_key(&key),
             entry: entry.clone(),
             read_policy: self.context.read_policy.clone(),
             missing_is_incomplete,
@@ -2214,7 +2214,10 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Arc<Catalogue>, ResolverError> {
         let root = canonical_path(root);
-        if let Some(catalogue) = self.package_catalogues.get(&root).cloned() {
+        // Keyed by `path_key`: every spelling of a directory on a
+        // case-insensitive volume is one catalogue.
+        let root_key = path_key(&root);
+        if let Some(catalogue) = self.package_catalogues.get(&root_key).cloned() {
             return Ok(catalogue);
         }
         if self.package_catalogue_count >= self.limits.max_package_catalogues {
@@ -2229,7 +2232,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         self.package_catalogue_count += 1;
         if let Some(session_cache) = &self.session_cache
-            && let Some(cached) = session_cache.get(&root)
+            && let Some(cached) = session_cache.get(&root_key)
         {
             for observation in cached.observations.iter().cloned() {
                 self.record_observation(observation);
@@ -2241,7 +2244,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 self.mark_incomplete(reason);
             }
             self.package_catalogues
-                .insert(root, Arc::clone(&cached.catalogue));
+                .insert(root_key, Arc::clone(&cached.catalogue));
             return Ok(cached.catalogue);
         }
         let observations_before = self.report.observations.len();
@@ -2254,7 +2257,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut catalogue_entries = 0usize;
         while let Some(directory) = queue.pop_front() {
             self.check_cancel(cancel)?;
-            if !visited.insert(directory.clone()) {
+            if !visited.insert(path_key(&directory)) {
                 continue;
             }
             let Some(entry) = self.context.path_entry_for(&directory) else {
@@ -2320,9 +2323,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 .into(),
         };
         self.package_catalogues
-            .insert(root.clone(), Arc::clone(&catalogue));
+            .insert(root_key.clone(), Arc::clone(&catalogue));
         if let Some(session_cache) = &self.session_cache {
-            session_cache.insert(root, cached, self.limits.max_package_catalogues);
+            session_cache.insert(root_key, cached, self.limits.max_package_catalogues);
         }
         Ok(catalogue)
     }
@@ -2906,7 +2909,8 @@ struct CandidateGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DirectoryCacheKey {
-    path: PathBuf,
+    /// `path_key` of the directory: one entry for every spelling of it.
+    path: String,
     entry: ProjectPathEntry,
     read_policy: ReadPolicy,
     missing_is_incomplete: bool,
@@ -2948,7 +2952,7 @@ pub struct ResolverSessionCache {
 #[derive(Debug, Default)]
 struct ResolverSessionCacheState {
     scope: Option<ResolverSessionCacheScope>,
-    catalogues: HashMap<PathBuf, CachedCatalogue>,
+    catalogues: HashMap<String, CachedCatalogue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2983,7 +2987,7 @@ impl ResolverSessionCache {
         }
     }
 
-    fn get(&self, root: &Path) -> Option<CachedCatalogue> {
+    fn get(&self, root: &str) -> Option<CachedCatalogue> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2992,7 +2996,7 @@ impl ResolverSessionCache {
             .cloned()
     }
 
-    fn insert(&self, root: PathBuf, catalogue: CachedCatalogue, maximum: usize) {
+    fn insert(&self, root: String, catalogue: CachedCatalogue, maximum: usize) {
         let mut state = self
             .state
             .lock()
@@ -3635,5 +3639,77 @@ mod tests {
                 "{name} must be parsed once per resolver"
             );
         }
+    }
+
+    #[derive(Default)]
+    struct CountingStore {
+        listings: usize,
+    }
+
+    impl SourceStore for CountingStore {
+        fn list_directory(
+            &mut self,
+            _request: DirectoryRequest<'_>,
+            _cancel: &dyn CancellationToken,
+        ) -> Result<DirectoryListing, SourceStoreError> {
+            self.listings += 1;
+            Ok(DirectoryListing {
+                files: Vec::new(),
+                directories: Vec::new(),
+                stamp: None,
+                complete: true,
+            })
+        }
+
+        fn overlay_candidates(&self, _roots: &[PathBuf], _names: &[String]) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn load(
+            &mut self,
+            request: SourceRequest<'_>,
+            _cancel: &dyn CancellationToken,
+        ) -> Result<LoadedSource, SourceStoreError> {
+            Err(SourceStoreError::NotFound {
+                path: request.path.to_path_buf(),
+            })
+        }
+    }
+
+    #[test]
+    fn spellings_of_one_directory_share_a_listing_and_a_catalogue_on_case_insensitive_volumes() {
+        path_identity::with_case_insensitive_volumes(|| {
+            let root = PathBuf::from("/workspace");
+            let context = ProjectContext {
+                discovery_complete: true,
+                search_paths: vec![root.clone()],
+                search_path_entries: vec![ProjectPathEntry {
+                    path: root.clone(),
+                    provenance: ProjectPathProvenance::LegacyNative,
+                }],
+                ..ProjectContext::default()
+            };
+            let limits = ResolverLimits {
+                max_package_catalogues: 1,
+                ..Default::default()
+            };
+            let mut resolver = UnitResolver::new(
+                context,
+                vec![root.clone()],
+                CountingStore::default(),
+                limits,
+            );
+
+            let lower = resolver
+                .catalogue(&root.join("vendor"), &NoCancellation)
+                .expect("first catalogue");
+            let upper = resolver
+                .catalogue(&root.join("VENDOR"), &NoCancellation)
+                .expect("second spelling");
+
+            assert!(lower.complete && upper.complete, "{:?}", resolver.report);
+            assert!(resolver.report.incomplete_reasons.is_empty());
+            assert_eq!(resolver.store.listings, 1, "one listing for both spellings");
+        });
     }
 }

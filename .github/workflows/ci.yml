@@ -50,6 +50,16 @@ jobs:
       - name: Resolve TMPDIR symlinks
         if: runner.os == 'macOS'
         run: echo "TMPDIR=$(cd "$TMPDIR" && pwd -P)/" >> "$GITHUB_ENV"
+      # The default macOS volume ignores letter case. Tests that need
+      # case-distinct entries (Foo beside FOO) create them on a mounted
+      # case-sensitive APFS volume instead (path_identity::case_sensitive_test_dir).
+      - name: Mount a case-sensitive volume
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -size 2g -type SPARSE -fs "Case-sensitive APFS" -volname CaseSensitive "$RUNNER_TEMP/case-sensitive-image"
+          mkdir -p "$RUNNER_TEMP/case-sensitive"
+          hdiutil attach -nobrowse -mountpoint "$RUNNER_TEMP/case-sensitive" "$RUNNER_TEMP/case-sensitive-image.sparseimage"
+          echo "LINT4D_CASE_SENSITIVE_TMPDIR=$RUNNER_TEMP/case-sensitive" >> "$GITHUB_ENV"
       # The runner's TEMP is an 8.3 short name (C:\Users\RUNNER~1\...).
       # Resolution reports long names, so tests that compare a resolved
       # path with the fixture path need fixtures under a long name.

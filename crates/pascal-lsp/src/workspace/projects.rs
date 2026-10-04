@@ -1559,15 +1559,7 @@ fn file_uri(path: &Path) -> Option<Url> {
 }
 
 fn project_paths_equal(left: &Path, right: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
+    pascal_project::path_identity::paths_equal(left, right)
 }
 
 #[cfg(test)]

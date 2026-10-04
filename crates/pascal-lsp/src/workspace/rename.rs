@@ -8008,14 +8008,8 @@ fn capture_consumed_configuration_baseline(
     Ok(())
 }
 
-#[cfg(windows)]
 fn path_key(path: &Path) -> String {
-    path.to_string_lossy().to_ascii_lowercase()
-}
-
-#[cfg(not(windows))]
-fn path_key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    pascal_project::path_identity::path_key(path)
 }
 
 fn is_project_metadata_path(path: &Path) -> bool {
@@ -9483,7 +9477,12 @@ fn resolve_include_path_with_overrides_and_overlay(
         }
         match metadata {
             Ok(metadata) if metadata.is_file() => {
-                selected = Some(candidate);
+                // A case-insensitive volume also opens other letter case;
+                // report the spelling on disk.
+                selected = Some(
+                    pascal_project::path_identity::on_disk_spelling(&candidate)
+                        .unwrap_or(candidate),
+                );
                 selected_directory = Some(directory.clone());
                 selected_route = route;
                 break;

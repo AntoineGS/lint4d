@@ -67,6 +67,71 @@ pub(crate) fn import_value_bytes(resolved: &pascal_core::ResolvedImports) -> usi
     })
 }
 
+fn path_bytes(path: &Path) -> usize {
+    path.as_os_str().len()
+}
+
+fn strings_bytes(strings: &[String]) -> usize {
+    strings
+        .iter()
+        .fold(std::mem::size_of_val(strings), |total, text| {
+            total.saturating_add(text.len())
+        })
+}
+
+fn probes_bytes(probes: &[Probe]) -> usize {
+    probes
+        .iter()
+        .fold(std::mem::size_of_val(probes), |total, probe| {
+            total.saturating_add(match probe {
+                Probe::Stamp { path, .. } | Probe::Content { path, .. } => path_bytes(path),
+                Probe::Overlay { uri, .. } => uri.as_str().len(),
+            })
+        })
+}
+
+fn report_bytes(report: &pascal_core::ResolutionReport) -> usize {
+    use pascal_core::ResolutionObservation as O;
+    let observations = report.observations.iter().fold(
+        std::mem::size_of_val(report.observations.as_slice()),
+        |total, observation| {
+            let path = match observation {
+                O::Directory { path, .. }
+                | O::Candidate { path, .. }
+                | O::Payload { path, .. }
+                | O::Metadata(
+                    pascal_project::MetadataObservation::Stat { path }
+                    | pascal_project::MetadataObservation::Payload { path, .. },
+                ) => path,
+                O::ProjectRead(read) => &read.path,
+            };
+            total.saturating_add(path_bytes(path))
+        },
+    );
+    observations
+        .saturating_add(strings_bytes(&report.warnings))
+        .saturating_add(std::mem::size_of_val(report.incomplete_reasons.as_slice()))
+}
+
+fn expansion_bytes(expansion: &ExpansionResult) -> usize {
+    let mut total = std::mem::size_of::<ExpansionResult>();
+    let _ = expansion.expanded.visit_recovery_payload(&mut |bytes| {
+        total = total.saturating_add(bytes);
+        Ok(())
+    });
+    for include in &expansion.dependencies {
+        total = include.observations.iter().fold(
+            total
+                .saturating_add(std::mem::size_of_val(include))
+                .saturating_add(include.text.len())
+                .saturating_add(include.uri.as_str().len())
+                .saturating_add(std::mem::size_of_val(include.observations.as_slice())),
+            |total, observation| total.saturating_add(path_bytes(&observation.path)),
+        );
+    }
+    total.saturating_add(strings_bytes(&expansion.errors))
+}
+
 /// Converts resolver observations and dependency revisions into probes, and
 /// lists the directories whose watches protect the entry.
 pub(crate) fn report_probes(
@@ -1266,6 +1331,148 @@ mod cache_tests {
         );
     }
 
+    fn long_probe(name: &str) -> Probe {
+        Probe::Stamp {
+            path: PathBuf::from(format!("/ws/{}/{name}", "deep".repeat(64))),
+            expected: None,
+        }
+    }
+
+    #[test]
+    fn unit_retained_bytes_cover_parse_probes_and_unshared_text() {
+        let parsed = parsed_unit("Base.pas");
+        let source_len = parsed.source_text().len();
+        let unit = |probes, disk| UnitValue {
+            parsed: parsed.clone(),
+            expansion: None,
+            probes,
+            disk,
+        };
+        let bare = unit(vec![], None).retained_bytes();
+        assert!(bare >= unit_value_bytes(source_len));
+        assert!(
+            bare <= unit_value_bytes(source_len) * 6 / 5,
+            "a bare parse stays within 20% of the measured factor"
+        );
+        assert!(unit(vec![long_probe("A.inc")], None).retained_bytes() >= bare + 256);
+
+        let origin = |text| DiskOrigin {
+            len: 1,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            raw_bytes: 1,
+            text,
+        };
+        let shared = unit(vec![], Some(origin(parsed.source_text().clone())));
+        assert_eq!(
+            shared.retained_bytes(),
+            bare,
+            "the parse's own text is free"
+        );
+        let copied = unit(vec![], Some(origin(Arc::from("x".repeat(1000)))));
+        assert!(copied.retained_bytes() >= bare + 1000);
+    }
+
+    #[test]
+    fn import_retained_bytes_cover_report_probes_and_watch_dirs() {
+        let bare = import_value(vec![]);
+        let base = bare.retained_bytes();
+        assert!(base >= import_value_bytes(&bare.resolved));
+
+        let probed = import_value(vec![long_probe("A.pas")]);
+        assert!(probed.retained_bytes() >= base + 256);
+
+        let mut watching = import_value(vec![]);
+        watching.watch_dirs = vec![PathBuf::from("/ws/".to_string() + &"d".repeat(300))];
+        assert!(watching.retained_bytes() >= base + 300);
+
+        let mut reported = import_value(vec![]);
+        reported.report = Arc::new(pascal_core::ResolutionReport {
+            observations: vec![pascal_core::ResolutionObservation::Metadata(
+                pascal_project::MetadataObservation::Stat {
+                    path: PathBuf::from("/ws/".to_string() + &"m".repeat(300)),
+                },
+            )],
+            warnings: vec!["w".repeat(300)],
+            complete: true,
+            incomplete_reasons: vec![],
+        });
+        assert!(reported.retained_bytes() >= base + 600);
+    }
+
+    #[test]
+    fn interface_retained_bytes_cover_bindings_and_probes() {
+        let bare = interface_value(&[("Base.pas", 1)], true);
+        let base = bare.retained_bytes();
+        assert!(base >= interface_value_bytes(&bare));
+        let mut probed = interface_value(&[("Base.pas", 1)], true);
+        probed.probes = vec![long_probe("Base.pas")];
+        assert!(probed.retained_bytes() >= base + 256);
+    }
+
+    #[test]
+    fn interface_entries_charge_their_probes() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        cache.put_interface_imports(&uri("Bare.pas"), &ctx, 1, interface_value(&[], true), None);
+        let bare = cache.stats().bytes;
+        let mut probed = interface_value(&[], true);
+        probed.probes = vec![long_probe("A.pas"), long_probe("B.pas")];
+        cache.put_interface_imports(&uri("Probed.pas"), &ctx, 1, probed, None);
+        assert!(
+            cache.stats().bytes - bare >= bare + 2 * 256,
+            "probe paths are retained with the entry"
+        );
+    }
+
+    #[test]
+    fn entries_of_one_project_share_its_context() {
+        let cache = ProjectCache::new(usize::MAX);
+        fill(&cache, "A.pas", &context("A.dproj"), 1, 1);
+        fill(&cache, "B.pas", &context("A.dproj"), 1, 1);
+        fill_unit(&cache, "C.pas", &context("A.dproj"), 1, vec![]);
+        let state = lock(&cache.inner);
+        let contexts = state
+            .slots
+            .values()
+            .filter_map(|slot| match slot {
+                Slot::Ready(entry) => Some(entry.context.clone()),
+                Slot::Computing { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contexts.len(), 3);
+        assert!(
+            contexts
+                .iter()
+                .all(|context| Arc::ptr_eq(context, &contexts[0])),
+            "one context copy per project, not per entry"
+        );
+    }
+
+    #[test]
+    fn evicted_values_held_by_a_worker_stay_charged_until_dropped() {
+        let cache = ProjectCache::new(10);
+        let ctx = context("A.dproj");
+        fill(&cache, "A.pas", &ctx, 1, 10);
+        let Lookup::Hit(held) =
+            cache.imports(&uri("A.pas"), &ctx, 1, &HashMap::new(), &no_cancel())
+        else {
+            panic!("expected a hit");
+        };
+
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        assert!(!ready(&cache, "A.pas"));
+        assert!(
+            !ready(&cache, "B.pas"),
+            "the worker's copy of A still fills the budget"
+        );
+        assert!(!cache.has_room());
+
+        drop(held);
+        assert!(cache.has_room());
+        fill(&cache, "B.pas", &ctx, 1, 10);
+        assert!(ready(&cache, "B.pas"));
+    }
+
     #[test]
     fn unpinned_entries_at_budget_still_allow_room_for_warming() {
         let cache = ProjectCache::new(10);
@@ -1593,6 +1800,46 @@ impl Probed for InterfaceImportsValue {
     }
 }
 
+impl UnitValue {
+    /// Estimated heap retained by the entry: the parse at the measured
+    /// factor, its include expansion, probes, and file text it does not
+    /// share with the parse.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let unshared_text = self
+            .disk
+            .as_ref()
+            .filter(|disk| !Arc::ptr_eq(&disk.text, self.parsed.source_text()))
+            .map_or(0, |disk| disk.text.len());
+        unit_value_bytes(self.parsed.source_text().len())
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(self.expansion.as_deref().map_or(0, expansion_bytes))
+            .saturating_add(probes_bytes(&self.probes))
+            .saturating_add(unshared_text)
+    }
+}
+
+impl ImportValue {
+    /// Estimated heap retained by the entry: dependency payloads, the
+    /// resolution report, probes and watched directories.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        import_value_bytes(&self.resolved)
+            .saturating_add(std::mem::size_of_val(self.resolved.bindings.as_slice()))
+            .saturating_add(std::mem::size_of_val(self.resolved.dependencies.as_slice()))
+            .saturating_add(report_bytes(&self.report))
+            .saturating_add(probes_bytes(&self.probes))
+            .saturating_add(self.watch_dirs.iter().fold(
+                std::mem::size_of_val(self.watch_dirs.as_slice()),
+                |total, dir| total.saturating_add(path_bytes(dir)),
+            ))
+    }
+}
+
+impl InterfaceImportsValue {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        interface_value_bytes(self).saturating_add(probes_bytes(&self.probes))
+    }
+}
+
 fn interface_value_bytes(value: &InterfaceImportsValue) -> usize {
     value.bindings.iter().fold(256usize, |total, binding| {
         total
@@ -1654,6 +1901,13 @@ struct State {
     /// it. Only a change to the path itself invalidates them.
     exact: HashMap<PathBuf, HashSet<Key>>,
     by_uri: HashMap<Url, HashSet<Key>>,
+    /// One shared copy of each project context, by fingerprint, so entries
+    /// do not each hold their own.
+    contexts: HashMap<u64, Arc<ProjectContext>>,
+    /// Values removed while a worker still held them. Their bytes stay in the
+    /// budget until the last holder drops them.
+    outstanding: Vec<(Held, usize)>,
+    outstanding_bytes: usize,
     watch_counts: HashMap<PathBuf, usize>,
     /// Directories whose watch count reached or left zero. `sync_watches`
     /// applies them to the watcher once the state lock is released.
@@ -1682,6 +1936,9 @@ impl Default for State {
             observed: HashMap::new(),
             exact: HashMap::new(),
             by_uri: HashMap::new(),
+            contexts: HashMap::new(),
+            outstanding: Vec::new(),
+            outstanding_bytes: 0,
             watch_counts: HashMap::new(),
             watch_changes: Vec::new(),
             closure_crawl_requests: Vec::new(),
@@ -1825,6 +2082,8 @@ pub(crate) struct CacheStats {
     pub units: usize,
     pub imports: usize,
     pub bytes: usize,
+    /// Bytes of removed values that workers still hold.
+    pub outstanding_bytes: usize,
     pub pinned_over_budget: bool,
 }
 
@@ -2081,11 +2340,11 @@ impl ProjectCache {
                 && old.bindings == value.bindings
                 && old.complete == value.complete
         );
-        let bytes = interface_value_bytes(&value);
+        let bytes = value.retained_bytes();
         state.clock += 1;
         let entry = Entry {
             value: Value::Interface(Arc::new(value)),
-            context: Arc::new(context.clone()),
+            context: intern_context(&mut state, key.fingerprint, context),
             input_hash: content_hash,
             bytes,
             last_used: state.clock,
@@ -2280,12 +2539,13 @@ impl ProjectCache {
             .slots
             .insert(key.clone(), Slot::Computing { generation });
         let invalidation_epoch = snapshot_epoch.unwrap_or(state.invalidation_epoch);
+        let context = intern_context(&mut state, key.fingerprint, context);
         self.release(state);
         Lookup::Compute(Claim {
             inner: self.inner.clone(),
             key,
             generation,
-            context: Arc::new(context.clone()),
+            context,
             input_hash,
             invalidation_epoch,
         })
@@ -2371,13 +2631,84 @@ fn insert_ready(state: &mut State, key: Key, entry: Entry) {
     state.slots.insert(key, Slot::Ready(entry));
 }
 
+/// A removed value that a worker may still hold.
+enum Held {
+    Unit(std::sync::Weak<UnitValue>),
+    Import(std::sync::Weak<ImportValue>),
+    Interface(std::sync::Weak<InterfaceImportsValue>),
+}
+
+impl Held {
+    /// The value, when someone other than the removed entry holds it.
+    fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Unit(unit) => {
+                (Arc::strong_count(unit) > 1).then(|| Self::Unit(Arc::downgrade(unit)))
+            }
+            Value::Import(imports) => {
+                (Arc::strong_count(imports) > 1).then(|| Self::Import(Arc::downgrade(imports)))
+            }
+            Value::Interface(interface) => (Arc::strong_count(interface) > 1)
+                .then(|| Self::Interface(Arc::downgrade(interface))),
+        }
+    }
+
+    fn alive(&self) -> bool {
+        match self {
+            Self::Unit(unit) => unit.strong_count() > 0,
+            Self::Import(imports) => imports.strong_count() > 0,
+            Self::Interface(interface) => interface.strong_count() > 0,
+        }
+    }
+}
+
+/// Stops charging removed values whose last holder has dropped them.
+fn prune_outstanding(state: &mut State) {
+    let mut released = 0usize;
+    state.outstanding.retain(|(held, bytes)| {
+        let alive = held.alive();
+        if !alive {
+            released = released.saturating_add(*bytes);
+        }
+        alive
+    });
+    state.outstanding_bytes = state.outstanding_bytes.saturating_sub(released);
+}
+
+/// The shared copy of `context`, so entries of one project hold one copy.
+fn intern_context(
+    state: &mut State,
+    fingerprint: u64,
+    context: &ProjectContext,
+) -> Arc<ProjectContext> {
+    if let Some(shared) = state.contexts.get(&fingerprint)
+        && shared.as_ref() == context
+    {
+        return shared.clone();
+    }
+    let shared = Arc::new(context.clone());
+    state.contexts.insert(fingerprint, shared.clone());
+    shared
+}
+
+/// Forgets the shared context once no entry or claim holds it.
+fn release_context(state: &mut State, fingerprint: u64) {
+    if state
+        .contexts
+        .get(&fingerprint)
+        .is_some_and(|shared| Arc::strong_count(shared) == 1)
+    {
+        state.contexts.remove(&fingerprint);
+    }
+}
+
 /// Removes a ready entry and its index records. A computing slot stays.
-fn remove_ready(state: &mut State, key: &Key) -> Option<Entry> {
+fn remove_ready(state: &mut State, key: &Key) -> bool {
     if !matches!(state.slots.get(key), Some(Slot::Ready(_))) {
-        return None;
+        return false;
     }
     let Some(Slot::Ready(entry)) = state.slots.remove(key) else {
-        return None;
+        return false;
     };
     state.bytes = state.bytes.saturating_sub(entry.bytes);
     if is_pinned(state, key) {
@@ -2395,7 +2726,13 @@ fn remove_ready(state: &mut State, key: &Key) -> Option<Entry> {
     }
     index_remove(&mut state.by_uri, &key.uri, key);
     release_watches(state, &entry);
-    Some(entry)
+    if let Some(held) = Held::of(&entry.value) {
+        state.outstanding.push((held, entry.bytes));
+        state.outstanding_bytes = state.outstanding_bytes.saturating_add(entry.bytes);
+    }
+    drop(entry);
+    release_context(state, key.fingerprint);
+    true
 }
 
 /// Marks a ready entry as the most recently used.
@@ -2468,7 +2805,8 @@ fn remove_pin(state: &mut State, (uri, fingerprint): &(Url, u64)) {
 }
 
 fn evict_to_budget(state: &mut State) {
-    while state.bytes > state.max_bytes {
+    prune_outstanding(state);
+    while state.bytes.saturating_add(state.outstanding_bytes) > state.max_bytes {
         let Some((_, key)) = state.lru.pop_first() else {
             return;
         };
@@ -2638,7 +2976,7 @@ impl ProjectCache {
         for key in doomed {
             #[cfg(test)]
             note_examined(&state);
-            if remove_ready(&mut state, &key).is_some() && seen.insert(key.uri.clone()) {
+            if remove_ready(&mut state, &key) && seen.insert(key.uri.clone()) {
                 affected.push(key.uri);
             }
         }
@@ -2675,17 +3013,21 @@ impl ProjectCache {
             .cloned()
             .collect::<Vec<_>>();
         for key in doomed {
-            if remove_ready(&mut state, &key).is_none() {
+            if !remove_ready(&mut state, &key) {
                 state.slots.remove(&key);
             }
         }
+        state
+            .contexts
+            .retain(|fingerprint, _| keep.contains(fingerprint));
         self.release(state);
         self.inner.changed.notify_all();
     }
 
     pub(crate) fn has_room(&self) -> bool {
-        let state = lock(&self.inner);
-        state.pinned_bytes < state.max_bytes
+        let mut state = lock(&self.inner);
+        prune_outstanding(&mut state);
+        state.pinned_bytes.saturating_add(state.outstanding_bytes) < state.max_bytes
     }
 
     pub(crate) fn invalidation_epoch(&self) -> u64 {
@@ -2693,7 +3035,8 @@ impl ProjectCache {
     }
 
     pub(crate) fn stats(&self) -> CacheStats {
-        let state = lock(&self.inner);
+        let mut state = lock(&self.inner);
+        prune_outstanding(&mut state);
         let count = |layer| {
             state
                 .slots
@@ -2705,6 +3048,7 @@ impl ProjectCache {
             units: count(Layer::Unit),
             imports: count(Layer::Import),
             bytes: state.bytes,
+            outstanding_bytes: state.outstanding_bytes,
             pinned_over_budget: state.pinned_bytes > state.max_bytes,
         }
     }

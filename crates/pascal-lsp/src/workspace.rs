@@ -7034,9 +7034,6 @@ impl Workspace {
         let resolved_for_cache = import_claim
             .as_ref()
             .map(|_| std::sync::Arc::clone(&resolved));
-        let import_bytes = resolved_for_cache
-            .as_deref()
-            .map(crate::project_cache::import_value_bytes);
         let mut dependency_units = resolved.dependencies.iter().collect::<Vec<_>>();
         if self.dependency_hook.is_some() {
             // Warm workspace units before library units: they are small and
@@ -7198,22 +7195,18 @@ impl Workspace {
                 interface_bindings(&resolved.bindings, &resolved_urls, &resolved_revisions);
             self.store_interface_imports(uri, &context, bindings, graph_complete, probes);
         }
-        if graph_complete
-            && let (Some(claim), Some(resolved), Some(bytes)) =
-                (import_claim, resolved_for_cache, import_bytes)
+        if graph_complete && let (Some(claim), Some(resolved)) = (import_claim, resolved_for_cache)
         {
             let (probes, watch_dirs) = crate::project_cache::report_probes(&report, &resolved);
-            self.project_cache.store_imports(
-                claim,
-                crate::project_cache::ImportValue {
-                    resolved,
-                    report: std::sync::Arc::clone(&report),
-                    probes,
-                    watch_dirs,
-                },
-                bytes,
-                cancel.unwrap_or(&no_cancel),
-            );
+            let value = crate::project_cache::ImportValue {
+                resolved,
+                report: std::sync::Arc::clone(&report),
+                probes,
+                watch_dirs,
+            };
+            let bytes = value.retained_bytes();
+            self.project_cache
+                .store_imports(claim, value, bytes, cancel.unwrap_or(&no_cancel));
         }
 
         // Source providers resolved above always win. Only unresolved imports
@@ -7989,17 +7982,15 @@ impl Workspace {
                     text: text.unwrap_or_else(|| parsed.source_text().clone()),
                 }
             });
-            self.project_cache.store_unit(
-                claim,
-                crate::project_cache::UnitValue {
-                    parsed,
-                    expansion: cached_expansion.map(std::sync::Arc::new),
-                    probes,
-                    disk,
-                },
-                crate::project_cache::unit_value_bytes(indexed_source.len()),
-                cancel.unwrap_or(&lookup_cancel),
-            );
+            let value = crate::project_cache::UnitValue {
+                parsed,
+                expansion: cached_expansion.map(std::sync::Arc::new),
+                probes,
+                disk,
+            };
+            let bytes = value.retained_bytes();
+            self.project_cache
+                .store_unit(claim, value, bytes, cancel.unwrap_or(&lookup_cancel));
         }
         Ok(true)
     }

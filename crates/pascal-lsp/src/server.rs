@@ -19105,7 +19105,7 @@ mod tests {
                     Range::new(Position::new(line, 0), Position::new(line, 1)),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
         let connection = RecordingSender::default();
         let id = RequestId::from("fifty-chunks".to_string());
         let mut jobs = AnalysisJobs::new();
@@ -19117,7 +19117,9 @@ mod tests {
                 source_generation: workspace.source_generation(),
                 configuration_generation: workspace.configuration_generation(),
                 records: Vec::new(),
-                value: AnalysisResultValue::References(Ok(locations)),
+                value: AnalysisResultValue::References(Ok(crate::coverage::Partial::complete(
+                    locations,
+                ))),
             },
             vec![super::ClientRecipient {
                 id: id.clone(),

@@ -3713,12 +3713,14 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct TreeStore {
         directories: HashMap<PathBuf, (Vec<PathBuf>, Vec<PathBuf>)>,
         listed: Vec<PathBuf>,
     }
 
+    #[cfg(unix)]
     impl SourceStore for TreeStore {
         fn list_directory(
             &mut self,

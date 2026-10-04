@@ -1700,7 +1700,12 @@ fn fix_all_plan_from_input(
     }
     // Select a deterministic coherent subset. Each trial is rebound as one
     // transformed semantic state; an edit is never retained merely because
-    // its individual original-state rename proof succeeded.
+    // its individual original-state rename proof succeeded. Candidates are
+    // tried as one batch, and a batch that fails is split in halves, so
+    // compatible candidates cost one validation and each incompatible one
+    // a logarithmic number. Batches are taken in candidate order and each
+    // trial includes everything already retained, so the last successful
+    // trial proves the final set.
     budget.require_owned_bytes(
         proven_candidates.len().saturating_mul(std::mem::size_of::<(
             NamingCandidate,
@@ -1708,15 +1713,19 @@ fn fix_all_plan_from_input(
         )>()),
         cancel,
     )?;
-    let mut retained = Vec::with_capacity(proven_candidates.len());
+    let mut untried = proven_candidates.into_iter().map(Some).collect::<Vec<_>>();
+    let mut retained = Vec::with_capacity(untried.len());
     let mut selected_raw_edits = Vec::new();
-    for candidate in proven_candidates {
+    let mut batches = Vec::new();
+    batches.push(0..untried.len());
+    while let Some(batch) = batches.pop() {
         if is_cancelled(cancel) {
             return Err(CANCELLATION_MESSAGE.to_string());
         }
         budget.require_work(1, cancel)?;
-        retained.push(candidate);
-        let Some(trial_edits) = validate_fix_all_subset(
+        let retained_before = retained.len();
+        retained.extend(untried[batch.clone()].iter_mut().filter_map(Option::take));
+        if let Some(trial_edits) = validate_fix_all_subset(
             &snapshot,
             uri,
             source,
@@ -1725,12 +1734,21 @@ fn fix_all_plan_from_input(
             &original_identifiers,
             cancel,
             budget,
-        )?
-        else {
-            retained.pop();
+        )? {
+            selected_raw_edits = trial_edits;
             continue;
-        };
-        selected_raw_edits = trial_edits;
+        }
+        for (slot, candidate) in untried[batch.clone()]
+            .iter_mut()
+            .zip(retained.drain(retained_before..))
+        {
+            *slot = Some(candidate);
+        }
+        if batch.len() > 1 {
+            let middle = batch.start + batch.len() / 2;
+            batches.push(middle..batch.end);
+            batches.push(batch.start..middle);
+        }
     }
     if retained.is_empty() || selected_raw_edits.is_empty() {
         return Ok((None, Vec::new()));
@@ -2019,6 +2037,11 @@ fn collect_candidate_edits_bounded(
     Ok(result)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FIX_ALL_SUBSET_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_fix_all_subset(
     snapshot: &RenameSnapshot,
@@ -2030,6 +2053,8 @@ fn validate_fix_all_subset(
     cancel: &AtomicBool,
     budget: &mut AssistanceBudget,
 ) -> Result<Option<Vec<FixAllEditIdentity>>, String> {
+    #[cfg(test)]
+    FIX_ALL_SUBSET_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let semantic_edits = normalize_fix_all_edit_identities_bounded(
         collect_candidate_edits_bounded(candidates, cancel, budget)?,
         source,
@@ -7119,11 +7144,11 @@ fn validate_fix_all_action_data(
 mod tests {
     use super::{
         AssistanceBudget, CANCELLATION_MESSAGE, CONSTANT_RULE, ClientActionFeatures, Config,
-        FIX_ALL_CONSTANT_CODE_ACTION_KIND, FixAllEditIdentity, MAX_FIX_ALL_BUDGET_BYTES,
-        MAX_FIX_ALL_CANDIDATES, MAX_FIX_ALL_WORK, OrganizeImportsProvider, code_actions_from_input,
-        lint_configuration_for_input, naming_candidates_bounded, normalize_fix_all_edit_identities,
-        resolve_from_input, selected_provider_order_is_safe, set_after_lint_configuration_hook,
-        source_hash,
+        FIX_ALL_CONSTANT_CODE_ACTION_KIND, FIX_ALL_SUBSET_VALIDATIONS, FixAllEditIdentity,
+        MAX_FIX_ALL_BUDGET_BYTES, MAX_FIX_ALL_CANDIDATES, MAX_FIX_ALL_WORK,
+        OrganizeImportsProvider, code_actions_from_input, lint_configuration_for_input,
+        naming_candidates_bounded, normalize_fix_all_edit_identities, resolve_from_input,
+        selected_provider_order_is_safe, set_after_lint_configuration_hook, source_hash,
     };
     use crate::navigation::UnitOrderSafety;
     use crate::workspace::Workspace;
@@ -7141,6 +7166,145 @@ mod tests {
 
     fn test_workspace(roots: Vec<std::path::PathBuf>, options: WorkspaceOptions) -> Workspace {
         Workspace::with_override_session(roots, options, OverrideSession::new(None))
+    }
+
+    /// Run the eager `source.fixAll` action on `source` and return the
+    /// source it produces, with the number of subset validations it took.
+    fn fix_all_result(lint_config: &str, source: &str) -> (Option<String>, usize) {
+        let temp = tempfile::tempdir().expect("fix-all workspace");
+        let root = temp.path().to_path_buf();
+        let path = root.join("Main.pas");
+        fs::write(root.join(".lint4d.toml"), lint_config).expect("lint configuration");
+        fs::write(&path, source).expect("source");
+        let uri = Url::from_file_path(&path).expect("source URI");
+        let input = test_workspace(vec![root], Default::default()).analysis_input();
+        let params: lsp_types::CodeActionParams = serde_json::from_value(json!({
+            "textDocument": {"uri": uri},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.fixAll"]}
+        }))
+        .expect("code action parameters");
+        FIX_ALL_SUBSET_VALIDATIONS.with(|count| count.set(0));
+        let actions = code_actions_from_input(
+            input,
+            params,
+            ClientActionFeatures {
+                resolve: false,
+                document_changes: false,
+                disabled: false,
+            },
+            &AtomicBool::new(false),
+        )
+        .value
+        .expect("fix-all request");
+        let validations = FIX_ALL_SUBSET_VALIDATIONS.with(std::cell::Cell::get);
+        let Some(CodeActionOrCommand::CodeAction(action)) = actions.into_iter().next() else {
+            return (None, validations);
+        };
+        let mut edits = action
+            .edit
+            .expect("eager fix-all edit")
+            .changes
+            .expect("plain changes")
+            .remove(&uri)
+            .expect("edits for the document");
+        edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+        let mut updated = source.to_string();
+        for edit in edits.iter().rev() {
+            let start = crate::text::position_to_offset(&updated, edit.range.start).unwrap();
+            let end = crate::text::position_to_offset(&updated, edit.range.end).unwrap();
+            updated.replace_range(start..end, &edit.new_text);
+        }
+        (Some(updated), validations)
+    }
+
+    const PASCAL_CASE_LOCALS: &str = "[rules.naming]\nlocal_variable_style = \"PascalCase\"\n";
+
+    /// Captured from the prefix-validation implementation before LSP-20.
+    #[test]
+    fn fix_all_output_matches_the_prefix_validation_on_existing_fixtures() {
+        let cases = [
+            (
+                concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure Work;\nvar\n  my_var: Integer;\n  my__var: Integer;\n",
+                    "begin\n  my_var := my__var;\nend;\nend.\n"
+                ),
+                Some(concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure Work;\nvar\n  MyVar: Integer;\n  my__var: Integer;\n",
+                    "begin\n  MyVar := my__var;\nend;\nend.\n"
+                )),
+            ),
+            (
+                concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure Work;\nvar my_var: Integer;\n",
+                    "  procedure Nested;\n  var my__var: Integer;\n",
+                    "  begin\n    my__var := 2;\n    my_var := my_var + my__var;\n",
+                    "  end;\nbegin\n  my_var := 1;\n  Nested;\nend;\nend.\n"
+                ),
+                Some(concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure Work;\nvar MyVar: Integer;\n",
+                    "  procedure Nested;\n  var my__var: Integer;\n",
+                    "  begin\n    my__var := 2;\n    MyVar := MyVar + my__var;\n",
+                    "  end;\nbegin\n  MyVar := 1;\n  Nested;\nend;\nend.\n"
+                )),
+            ),
+            (
+                concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure First;\nvar my_var: Integer;\nbegin\n  my_var := 1;\nend;\n",
+                    "procedure Second;\nvar my__var: Integer;\nbegin\n  my__var := 2;\nend;\n",
+                    "end.\n"
+                ),
+                Some(concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure First;\nvar MyVar: Integer;\nbegin\n  MyVar := 1;\nend;\n",
+                    "procedure Second;\nvar MyVar: Integer;\nbegin\n  MyVar := 2;\nend;\n",
+                    "end.\n"
+                )),
+            ),
+            (
+                concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure Work;\nvar\n  first_value: Integer;\n  my_var: Integer;\n",
+                    "  my__var: Integer;\n  last_value: Integer;\n",
+                    "begin\n  first_value := my_var + my__var;\n  last_value := first_value;\nend;\nend.\n"
+                ),
+                Some(concat!(
+                    "unit Main;\ninterface\nimplementation\n",
+                    "procedure Work;\nvar\n  FirstValue: Integer;\n  MyVar: Integer;\n",
+                    "  my__var: Integer;\n  LastValue: Integer;\n",
+                    "begin\n  FirstValue := MyVar + my__var;\n  LastValue := FirstValue;\nend;\nend.\n"
+                )),
+            ),
+        ];
+        for (source, expected) in cases {
+            let (updated, _) = fix_all_result(PASCAL_CASE_LOCALS, source);
+            assert_eq!(updated.as_deref(), expected, "{source}");
+        }
+    }
+
+    /// 150 is the most the per-candidate rename proofs fit in the fix-all
+    /// work budget; with prefix validation the budget ran out after 56
+    /// growing validations and no action was offered.
+    #[test]
+    fn fix_all_validates_compatible_candidates_once() {
+        let mut source = String::from("unit Main;\ninterface\nconst\n");
+        for index in 0..150 {
+            source.push_str(&format!("  badConst{index} = {index};\n"));
+        }
+        source.push_str("implementation\nend.\n");
+
+        let (updated, validations) =
+            fix_all_result("[rules.naming]\nconstant_style = \"UPPER_CASE\"\n", &source);
+
+        assert_eq!(validations, 1);
+        let updated = updated.expect("a fix-all action for 150 candidates");
+        assert!(updated.contains("  BAD_CONST0 = 0;"), "{updated}");
+        assert!(updated.contains("  BAD_CONST149 = 149;"), "{updated}");
     }
 
     #[test]

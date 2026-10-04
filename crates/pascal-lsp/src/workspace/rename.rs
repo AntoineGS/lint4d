@@ -15,6 +15,7 @@ use super::{
     paths_equal_ci, read_disk_source, read_disk_source_with_cancel,
 };
 use crate::NavigationIndex;
+use crate::coverage::Coverage;
 use crate::include_expansion::{
     self, ExpansionLimits, ExpansionResult, IncludeObservation as ExpansionIncludeObservation,
     IncludeResolver, ResolvedInclude,
@@ -532,6 +533,9 @@ pub(crate) struct RenameSnapshot {
     pub(crate) unsupported_directive_owners: Vec<Url>,
     /// Whether `include_errors` has failures besides unsupported directives.
     pub(crate) other_include_errors: bool,
+    /// Sources indexed under an ambiguous or incomplete project context:
+    /// their defines and search paths, and so their bindings, are unproven.
+    pub(crate) incomplete_context_sources: Vec<Url>,
     /// Units inserted from the cached interface closure. They supply
     /// declarations only: they are never audited, never sources, and never
     /// queried.
@@ -858,12 +862,15 @@ impl RenameSnapshot {
         Ok(edits)
     }
 
+    /// Read-only references. Occurrences that cannot be proven are left out
+    /// and recorded in `gaps`; the response bound still fails the request.
     pub(crate) fn binding_locations(
         &self,
         uri: &Url,
         position: Position,
         include_declaration: bool,
         cancel: &AtomicBool,
+        gaps: &mut Coverage,
     ) -> Result<Vec<Location>, String> {
         let mut locations = Vec::new();
         let mut seen = HashSet::new();
@@ -881,14 +888,17 @@ impl RenameSnapshot {
             self.virtual_query_positions_with_budget(uri, position, &mut budget)?;
         for (query_uri, query_position) in query_positions {
             resolution_budget.charge()?;
-            let query_locations = self.index.binding_locations_with_cancel_and_work_budget(
-                &query_uri,
-                query_position,
-                include_declaration,
-                cancel,
-                &mut resolution_budget,
-                &mut semantic_budget,
-            )?;
+            let query_locations = self
+                .index
+                .partial_binding_locations_with_cancel_and_work_budget(
+                    &query_uri,
+                    query_position,
+                    include_declaration,
+                    cancel,
+                    &mut resolution_budget,
+                    &mut semantic_budget,
+                    gaps,
+                )?;
             for location in query_locations {
                 for mapped in self.map_location_with_budget(
                     location,
@@ -6068,6 +6078,7 @@ fn build_snapshot_with_policy(
                     include_errors: Vec::new(),
                     unsupported_directive_owners: Vec::new(),
                     other_include_errors: false,
+                    incomplete_context_sources: Vec::new(),
                     declaration_providers: HashSet::new(),
                     baseline_records: Vec::new(),
                     mode,
@@ -6178,6 +6189,7 @@ fn build_snapshot_with_policy(
     let mut include_errors = Vec::new();
     let mut unsupported_directive_owners = Vec::new();
     let mut other_include_errors = false;
+    let mut incomplete_context_sources = Vec::new();
     let candidate_names_are_ascii = candidate_names
         .iter()
         .all(|name| name.trim_start_matches('&').is_ascii());
@@ -6212,6 +6224,7 @@ fn build_snapshot_with_policy(
             incomplete_reason.get_or_insert_with(|| {
                 format!("project context is ambiguous or incomplete for {uri}")
             });
+            incomplete_context_sources.push(uri.clone());
         }
     }
     for enumerated in paths {
@@ -6547,6 +6560,7 @@ fn build_snapshot_with_policy(
                         incomplete_reason.get_or_insert_with(|| {
                             format!("project context is ambiguous or incomplete for {uri}")
                         });
+                        incomplete_context_sources.push(uri.clone());
                     }
                 }
 
@@ -6617,6 +6631,7 @@ fn build_snapshot_with_policy(
                 incomplete_reason.get_or_insert_with(|| {
                     format!("project context is ambiguous or incomplete for {uri}")
                 });
+                incomplete_context_sources.push(uri.clone());
             }
         }
         let conditional_context = contexts
@@ -7060,6 +7075,7 @@ fn build_snapshot_with_policy(
         include_errors,
         unsupported_directive_owners,
         other_include_errors,
+        incomplete_context_sources,
         declaration_providers,
         baseline_records,
         mode,
@@ -11254,7 +11270,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_queries_reject_an_incomplete_non_priority_consumer_context() {
+    fn workspace_queries_withhold_an_incomplete_non_priority_consumer_context() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().join("workspace");
         let provider_root = root.join("provider");
@@ -11298,9 +11314,24 @@ mod tests {
             true,
             &cancel,
         );
+        let references = references
+            .value
+            .expect("references keep the proven provider declaration");
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
         assert!(
-            references.value.is_err(),
-            "references must fail rather than bind an ambiguous consumer: {references:?}"
+            references
+                .value
+                .iter()
+                .all(|location| location.uri == provider_uri),
+            "references must not bind an ambiguous consumer: {references:?}"
+        );
+        assert!(
+            references
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&consumer_uri)),
+            "the withheld consumer is named: {references:?}"
         );
 
         let rename = rename_from_input(
@@ -11318,7 +11349,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_queries_reject_a_missing_optset_in_a_non_priority_consumer_context() {
+    fn workspace_queries_withhold_a_missing_optset_non_priority_consumer_context() {
         let temp = tempfile::tempdir().expect("temporary workspace");
         let root = temp.path().join("workspace");
         let provider_root = root.join("provider");
@@ -11360,9 +11391,24 @@ mod tests {
             true,
             &cancel,
         );
+        let references = references
+            .value
+            .expect("references keep the proven provider declaration");
+        let consumer_uri = Url::from_file_path(&consumer).expect("consumer URI");
         assert!(
-            references.value.is_err(),
-            "references must fail rather than bind a missing-optset consumer: {references:?}"
+            references
+                .value
+                .iter()
+                .all(|location| location.uri == provider_uri),
+            "references must not bind a missing-optset consumer: {references:?}"
+        );
+        assert!(
+            references
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap.uri.as_ref() == Some(&consumer_uri)),
+            "the withheld consumer is named: {references:?}"
         );
 
         let rename = rename_from_input(

@@ -5,6 +5,7 @@ mod project_prompts;
 #[path = "server/uri_spelling.rs"]
 mod uri_spelling;
 
+use crate::coverage::{Coverage, Partial};
 #[cfg(test)]
 use crate::navigation::CompletionResolutionSeed;
 use crate::navigation::{
@@ -33,10 +34,10 @@ use lsp_types::{
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
     DocumentFormattingParams, DocumentHighlightParams, FileSystemWatcher, FoldingRangeParams,
     GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
-    Location, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse, ProgressToken,
-    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, RelativePattern,
-    SelectionRangeParams, ServerInfo, ShowMessageParams, SignatureHelpParams, SymbolInformation,
-    TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams,
+    Location, LogMessageParams, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse,
+    ProgressToken, PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams,
+    RelativePattern, SelectionRangeParams, ServerInfo, ShowMessageParams, SignatureHelpParams,
+    SymbolInformation, TextDocumentIdentifier, Url, WatchKind, WorkDoneProgressCancelParams,
     WorkspaceDiagnosticParams, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::de::DeserializeOwned;
@@ -2358,8 +2359,8 @@ enum AnalysisResultValue {
         hierarchical: bool,
         value: Result<Vec<lsp_types::DocumentSymbol>, String>,
     },
-    WorkspaceSymbols(Result<Vec<lsp_types::SymbolInformation>, String>),
-    References(Result<Vec<lsp_types::Location>, String>),
+    WorkspaceSymbols(Result<Partial<Vec<lsp_types::SymbolInformation>>, String>),
+    References(Result<Partial<Vec<lsp_types::Location>>, String>),
     DocumentHighlights(Result<Vec<lsp_types::DocumentHighlight>, String>),
     SelectionRanges(Result<Vec<lsp_types::SelectionRange>, String>),
     SemanticTokens(Result<lsp_types::SemanticTokens, String>),
@@ -2429,6 +2430,7 @@ struct WorkspaceDiagnosticsAnalysis {
     previous_result_ids: Vec<(Url, String)>,
     publications: Vec<queries::DiagnosticPublication>,
     dependencies: HashMap<Url, DiagnosticDependency>,
+    coverage: Coverage,
 }
 
 /// Worker-prepared evidence for one effective diagnostic report.  The full
@@ -4275,13 +4277,54 @@ fn partial_payload_from_result(
 ) -> Option<Result<PartialResultPayload, String>> {
     match value {
         AnalysisResultValue::WorkspaceSymbols(value) => {
-            Some(value.map(|value| PartialResultPayload::WorkspaceSymbols(Arc::new(value))))
+            Some(value.map(|value| PartialResultPayload::WorkspaceSymbols(Arc::new(value.value))))
         }
         AnalysisResultValue::References(value) => {
-            Some(value.map(|value| PartialResultPayload::References(Arc::new(value))))
+            Some(value.map(|value| PartialResultPayload::References(Arc::new(value.value))))
         }
         AnalysisResultValue::WorkspaceDiagnostics(_) => None,
         _ => None,
+    }
+}
+
+/// The coverage of a read-only result that may leave out unproven items.
+fn analysis_result_coverage(value: &AnalysisResultValue) -> Option<(&'static str, &Coverage)> {
+    match value {
+        AnalysisResultValue::References(Ok(value)) => {
+            Some(("textDocument/references", &value.coverage))
+        }
+        AnalysisResultValue::WorkspaceSymbols(Ok(value)) => {
+            Some(("workspace/symbol", &value.coverage))
+        }
+        AnalysisResultValue::WorkspaceDiagnostics(Ok(analysis)) => {
+            Some(("workspace/diagnostic", &analysis.coverage))
+        }
+        _ => None,
+    }
+}
+
+/// An incomplete read-only result is still answered with the plain LSP
+/// result type, which has no completeness flag; one `window/logMessage`
+/// line names what was left out.
+fn log_incomplete_coverage(
+    connection: &dyn ProtocolSender,
+    method: &str,
+    coverage: &Coverage,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if coverage.is_complete() {
+        return Ok(());
+    }
+    let message = Message::Notification(Notification::new(
+        "window/logMessage".to_string(),
+        LogMessageParams {
+            typ: MessageType::WARNING,
+            message: coverage.summary(method),
+        },
+    ));
+    match connection.send_control(message) {
+        Err(OutputError::Disconnected) => Err(OutputError::Disconnected.into()),
+        // The log is advisory; never fail the answer over it.
+        Ok(()) | Err(_) => Ok(()),
     }
 }
 
@@ -6137,6 +6180,7 @@ impl AnalysisJobs {
                                                     previous_result_ids,
                                                     publications: result.publications,
                                                     dependencies,
+                                                    coverage: result.coverage,
                                                 })
                                             });
                                         let records = if value.is_ok() {
@@ -8092,6 +8136,9 @@ impl AnalysisJobs {
             value,
             ..
         } = result;
+        if let Some((method, coverage)) = analysis_result_coverage(&value) {
+            log_incomplete_coverage(connection, method, coverage)?;
+        }
         let payload = match value {
             AnalysisResultValue::WorkspaceDiagnostics(value) => {
                 let analysis = match value {
@@ -9611,13 +9658,27 @@ fn deliver_analysis_result_with_store(
             }
         },
         AnalysisResultValue::WorkspaceSymbols(value) => match value {
-            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Ok(value) => {
+                log_incomplete_coverage(connection, "workspace/symbol", &value.coverage)?;
+                send_ok(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    value.value,
+                )
+            }
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
         AnalysisResultValue::References(value) => match value {
-            Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
+            Ok(value) => {
+                log_incomplete_coverage(connection, "textDocument/references", &value.coverage)?;
+                send_ok(
+                    connection,
+                    client_id.clone().expect("client result"),
+                    value.value,
+                )
+            }
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
@@ -9838,6 +9899,7 @@ fn send_workspace_diagnostics(
     analysis: WorkspaceDiagnosticsAnalysis,
     client_id: RequestId,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    log_incomplete_coverage(connection, "workspace/diagnostic", &analysis.coverage)?;
     let items = match workspace_diagnostic_items(workspace, diagnostic_results, analysis) {
         Ok(items) => items,
         Err(error) => {
@@ -17874,7 +17936,7 @@ mod tests {
         match &result.value {
             AnalysisResultValue::WorkspaceSymbols(Ok(symbols)) => {
                 assert!(
-                    !symbols.is_empty(),
+                    !symbols.value.is_empty(),
                     "the computed symbol result must not be empty"
                 );
             }
@@ -19673,7 +19735,7 @@ mod tests {
         let control = receive_analysis_result(&mut jobs, &control_id);
         assert!(matches!(
             &control.value,
-            AnalysisResultValue::References(Ok(locations)) if locations.len() == 1
+            AnalysisResultValue::References(Ok(locations)) if locations.value.len() == 1
         ));
         deliver_successfully(&mut workspace, control_id, control);
 
@@ -19693,7 +19755,7 @@ mod tests {
         match &result.value {
             AnalysisResultValue::References(Ok(locations)) => {
                 assert_eq!(
-                    locations.len(),
+                    locations.value.len(),
                     1,
                     "reference result must be completed before mutation"
                 );
@@ -19906,7 +19968,7 @@ mod tests {
         let reference_control = receive_analysis_result(&mut jobs, &reference_control_id);
         assert!(matches!(
             &reference_control.value,
-            AnalysisResultValue::References(Ok(locations)) if locations.len() == 2
+            AnalysisResultValue::References(Ok(locations)) if locations.value.len() == 2
         ));
         deliver_successfully(&mut workspace, reference_control_id, reference_control);
 
@@ -19958,7 +20020,7 @@ mod tests {
         let reference = receive_analysis_result(&mut jobs, &reference_id);
         assert!(matches!(
             &reference.value,
-            AnalysisResultValue::References(Ok(locations)) if locations.len() == 2
+            AnalysisResultValue::References(Ok(locations)) if locations.value.len() == 2
         ));
 
         let highlight_id = RequestId::from("project-highlight-stale".to_string());
@@ -20092,7 +20154,9 @@ mod tests {
                 source_generation: source_generation.wrapping_add(1),
                 configuration_generation,
                 records: Vec::new(),
-                value: AnalysisResultValue::WorkspaceSymbols(Ok(Vec::new())),
+                value: AnalysisResultValue::WorkspaceSymbols(Ok(
+                    crate::coverage::Partial::complete(Vec::new()),
+                )),
             },
             Some(id.clone()),
         )
@@ -20143,7 +20207,9 @@ mod tests {
                 source_generation: workspace.source_generation(),
                 configuration_generation: workspace.configuration_generation(),
                 records: Vec::new(),
-                value: AnalysisResultValue::WorkspaceSymbols(Ok(Vec::new())),
+                value: AnalysisResultValue::WorkspaceSymbols(Ok(
+                    crate::coverage::Partial::complete(Vec::new()),
+                )),
             })
             .expect("queue orphaned result");
         let (server, client) = Connection::memory();

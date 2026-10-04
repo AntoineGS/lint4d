@@ -24033,10 +24033,14 @@ BDS = '/fake/37'
         );
     }
 
+    // Needs case-distinct paths, which Windows volumes cannot hold.
     #[cfg(not(windows))]
     #[test]
-    fn install_context_keeps_case_distinct_linux_metadata_paths() {
-        let temp = tempfile::tempdir().expect("temporary workspace");
+    fn install_context_keeps_case_distinct_metadata_paths_on_a_case_sensitive_volume() {
+        let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+            return;
+        };
+        let temp = tempfile::tempdir_in(base).expect("temporary workspace");
         let root = temp.path().join("workspace");
         let source_dir = root.join("src");
         fs::create_dir_all(&source_dir).expect("source directory");
@@ -24154,10 +24158,11 @@ BDS = '/fake/37'
             !workspace.mapped_path_is_readable(&mapped_a.join("escape/Provider.pas"), &key_a),
             "symlink escapes must not be authorized"
         );
-        assert!(
-            !workspace
+        assert_eq!(
+            workspace
                 .mapped_path_is_readable(&temp.path().join("SDK-A/source/Provider.pas"), &key_a),
-            "Linux containment must remain case-sensitive"
+            pascal_project::path_identity::is_case_insensitive(temp.path()),
+            "containment follows the volume's letter-case rule"
         );
     }
 

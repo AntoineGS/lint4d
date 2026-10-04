@@ -4,7 +4,8 @@ use crate::directive_map::DirectiveMap;
 use crate::doc::{self, Doc};
 use pascal_core::FormatOffRegion;
 use pascal_core::node_kind as K;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use tree_sitter::Node;
 
@@ -54,6 +55,9 @@ pub struct DocBuilder<'a> {
     pub(crate) external_units: &'a HashSet<String>,
     /// Ascending 0-based rows of newline-terminated, whitespace-only lines.
     blank_line_rows: Vec<u32>,
+    /// Parent kind of every node, by node id, filled by [`Self::build`].
+    /// `Node::parent()` is O(depth) and a long binary chain is that deep.
+    parent_kinds: RefCell<HashMap<usize, &'static str>>,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -73,17 +77,49 @@ impl<'a> DocBuilder<'a> {
             format_regions,
             external_units,
             blank_line_rows: blank_line_rows(source),
+            parent_kinds: RefCell::new(HashMap::new()),
         }
     }
 
     /// Entry point: build a `Doc` for the entire AST rooted at `root`.
     pub fn build(&self, root: Node<'a>) -> Doc {
+        self.index_parent_kinds(root);
         let body = self.doc_for_node(root);
         if self.is_in_format_off_region(root) {
             // The verbatim root text already spans the end-of-file trivia.
             return body;
         }
         doc::concat(vec![body, self.eof_trivia_doc(root)])
+    }
+
+    /// Record the parent kind of every node under `root` in one walk.
+    fn index_parent_kinds(&self, root: Node<'a>) {
+        let mut kinds = self.parent_kinds.borrow_mut();
+        kinds.clear();
+        let mut cursor = root.walk();
+        let mut parents: Vec<&'static str> = Vec::new();
+        'walk: loop {
+            let node = cursor.node();
+            kinds.insert(node.id(), parents.last().copied().unwrap_or(""));
+            if cursor.goto_first_child() {
+                parents.push(node.kind());
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
+                parents.pop();
+            }
+        }
+    }
+
+    /// Kind of `node`'s parent: from the index when built, else `parent()`.
+    fn parent_kind(&self, node: Node<'a>) -> &'static str {
+        match self.parent_kinds.borrow().get(&node.id()) {
+            Some(kind) => kind,
+            None => node.parent().map(|p| p.kind()).unwrap_or(""),
+        }
     }
 
     /// Comments and directives after the file's last leaf, laid out as in
@@ -330,7 +366,7 @@ impl<'a> DocBuilder<'a> {
                 // structural sub-parsing — fmt4d does not interpret the branches.
                 let text = self.node_text(node);
                 let kind = node.kind();
-                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                let parent_kind = self.parent_kind(node);
                 doc::token(text, kind, parent_kind)
             }
             _ if node.child_count() == 0 && !node.is_extra() => self.build_leaf(node),
@@ -350,7 +386,7 @@ impl<'a> DocBuilder<'a> {
     pub(crate) fn build_leaf(&self, node: Node<'a>) -> Doc {
         let text = self.node_text(node);
         let kind = node.kind();
-        let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+        let parent_kind = self.parent_kind(node);
         doc::token(text, kind, parent_kind)
     }
 
@@ -359,7 +395,7 @@ impl<'a> DocBuilder<'a> {
     fn build_verbatim_leaf(&self, node: Node<'a>) -> Doc {
         let text = self.node_text(node);
         let kind = node.kind();
-        let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+        let parent_kind = self.parent_kind(node);
         doc::token(text, kind, parent_kind)
     }
 

@@ -44,3 +44,33 @@ fn aligned_declaration_only_unit_formats_in_linear_time() {
     assert!(out.contains(&format!("V{}", DECL_LINES / 2 - 1)));
     assert!(elapsed < BOUND, "took {elapsed:?}, expected < {BOUND:?}");
 }
+
+const CHAIN_OPERANDS: usize = 20_000;
+
+fn chain_unit() -> String {
+    let operands: Vec<String> = (0..CHAIN_OPERANDS).map(|i| format!("V{i}")).collect();
+    format!(
+        "unit Big;\n\ninterface\n\nimplementation\n\nprocedure P;\nbegin\n  X := {};\nend;\n\nend.\n",
+        operands.join(" + ")
+    )
+}
+
+/// Runs `f` on a thread with a large stack: debug builds recurse deeply on a
+/// left-nested chain this long.
+fn on_big_stack(f: impl FnOnce() -> String + Send + 'static) -> (String, Duration) {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || timed(f))
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn long_binary_chain_formats_in_linear_time() {
+    let src = chain_unit();
+    let (out, elapsed) = on_big_stack(move || format_source(&src));
+    eprintln!("{CHAIN_OPERANDS}-operand chain: {elapsed:?}");
+    assert!(out.contains(&format!("V{}", CHAIN_OPERANDS - 1)));
+    assert!(elapsed < BOUND, "took {elapsed:?}, expected < {BOUND:?}");
+}

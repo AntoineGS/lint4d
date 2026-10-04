@@ -3395,19 +3395,35 @@ impl Workspace {
         // Validate freshness before pair deduplication. Otherwise an older
         // `(importer, provider)` entry can shadow a fresh binding with the same
         // pair; the old hash is then rejected and the current authorization is
-        // lost as well.
+        // lost as well. Context freshness stats files and the importer hash
+        // reads its source, so each is computed once per context or importer
+        // rather than once per binding.
+        let mut context_checks = HashMap::<&ContextKey, (u64, Option<bool>)>::new();
+        let mut importer_hashes = HashMap::<Url, Option<u64>>::new();
         compiled_provider_bindings.retain(|binding| {
-            self.document_contexts
+            let Some((key, state)) = self
+                .document_contexts
                 .get(&binding.importer)
-                .and_then(|key| self.contexts.get(key))
-                .is_some_and(|state| {
-                    crate::navigation::compiled_dcu::project_context_fingerprint(&state.context)
-                        == binding.context_fingerprint
-                        && context_state_is_fresh_with_cancel(state, None, None)
-                            .is_ok_and(|fresh| fresh)
-                })
-                && self
-                    .current_importer_source_hash(&binding.importer)
+                .and_then(|key| self.contexts.get(key).map(|state| (key, state)))
+            else {
+                return false;
+            };
+            let (fingerprint, fresh) = context_checks.entry(key).or_insert_with(|| {
+                (
+                    crate::navigation::compiled_dcu::project_context_fingerprint(&state.context),
+                    None,
+                )
+            });
+            if *fingerprint != binding.context_fingerprint {
+                return false;
+            }
+            let fresh = *fresh.get_or_insert_with(|| {
+                context_state_is_fresh_with_cancel(state, None, None).is_ok_and(|fresh| fresh)
+            });
+            fresh
+                && importer_hashes
+                    .entry(binding.importer.clone())
+                    .or_insert_with(|| self.current_importer_source_hash(&binding.importer))
                     .is_some_and(|hash| hash == binding.importer_source_hash)
         });
         compiled_provider_bindings.sort_by(|left, right| {
@@ -6985,6 +7001,12 @@ impl Workspace {
                     None,
                 ),
                 crate::project_cache::Lookup::Compute(claim) => {
+                    #[cfg(feature = "test-support")]
+                    if !claim.is_detached()
+                        && !crate::project_cache::claim_waits_are_limited_on_this_thread()
+                    {
+                        wait_at_import_claim_test_barrier();
+                    }
                     let input = self.analysis_input();
                     let mut resolver = resolver::resolver_for_context_with_session_cache(
                         context.clone(),
@@ -12901,38 +12923,48 @@ impl Workspace {
             .iter()
             .flat_map(|record| record.auto_import_scopes.iter())
             .collect::<Vec<_>>();
+        // Only observations newer than the result can stale it, and candidate
+        // paths are looked up in a case-folded index of those, so the cost is
+        // one pass over the retained observations rather than one per candidate.
+        let newer_changes = if source_generation >= self.source_generation {
+            Vec::new()
+        } else {
+            self.source_change_observations
+                .values()
+                .filter(|change| change.generation > source_generation)
+                .collect::<Vec<_>>()
+        };
+        let newer_change_hashes = newer_changes
+            .iter()
+            .map(|change| case_folded_path_hash(&change.path))
+            .collect::<HashSet<_>>();
+        let changed_since_result = |candidate: &Path| {
+            newer_change_hashes.contains(&case_folded_path_hash(candidate))
+                && newer_changes
+                    .iter()
+                    .any(|change| paths_equal_ci(&change.path, candidate))
+        };
 
         for record in records {
             let dependency_uri = source_record_dependency_uri(record);
             let missing_provider_candidate_changed = record.missing_provider_candidate
-                && record.path.as_deref().is_some_and(|candidate| {
-                    self.source_change_observations.values().any(|change| {
-                        change.generation > source_generation
-                            && paths_equal_ci(&change.path, candidate)
-                    })
-                });
+                && record.path.as_deref().is_some_and(changed_since_result);
             let missing_provider_scope_changed =
                 record.missing_provider_scope.as_ref().is_some_and(|scope| {
-                    self.source_change_observations.values().any(|change| {
+                    newer_changes.iter().any(|change| {
                         let path = change.path.as_path();
-                        let matches = scope.matches(path);
-                        let allows = scope.allows_without_filesystem(path);
-                        let accepted = self.scope_path_is_accepted(path, scope);
-                        change.generation > source_generation && matches && allows && accepted
+                        scope.matches(path)
+                            && scope.allows_without_filesystem(path)
+                            && self.scope_path_is_accepted(path, scope)
                     })
                 });
-            let candidate_observation_changed =
-                record.candidate_observations.iter().any(|candidate| {
-                    self.source_change_observations.values().any(|change| {
-                        change.generation > source_generation
-                            && paths_equal_ci(&change.path, &candidate.path)
-                    })
-                });
+            let candidate_observation_changed = !newer_changes.is_empty()
+                && record
+                    .candidate_observations
+                    .iter()
+                    .any(|candidate| changed_since_result(&candidate.path));
             let auto_import_scope_changed = record.auto_import_scopes.iter().any(|scope| {
-                self.source_change_observations.values().any(|change| {
-                    if change.generation <= source_generation {
-                        return false;
-                    }
+                newer_changes.iter().any(|change| {
                     let path = change.path.as_path();
                     if !scope.matches_path(path) || !scope.path_is_accepted(self, path) {
                         return false;
@@ -15072,6 +15104,40 @@ fn add_configuration_watch_directories(
     }
 }
 
+/// Holds a thread whose import-cache claim other lookups would wait on, so
+/// protocol tests can check that interactive work does not wait it out.
+#[cfg(feature = "test-support")]
+fn wait_at_import_claim_test_barrier() {
+    use std::io::Write as _;
+
+    let Ok(spec) = std::env::var("PASCAL_LSP_TEST_IMPORT_CLAIM_BARRIER") else {
+        return;
+    };
+    let Some((entered, release)) = spec.split_once('|') else {
+        return;
+    };
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(entered)
+    {
+        let _ = marker.write_all(b"x");
+    }
+    while !Path::new(release).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// FNV-1a over the ASCII-folded path text: paths that `paths_equal_ci`
+/// considers equal hash equal, without allocating.
+fn case_folded_path_hash(path: &Path) -> u64 {
+    path.to_string_lossy()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
 fn paths_equal_ci(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
@@ -16441,6 +16507,95 @@ mod tests {
         assert_eq!(budget.used.get().filesystem_path_visits, 8);
         assert!(workspace.contexts.contains_key(&key));
         assert_eq!(workspace.contexts[&key].watched_paths.len(), 128);
+    }
+
+    #[test]
+    fn dependency_scoped_freshness_with_4000_retained_observations_is_cheap() {
+        const OBSERVATIONS: usize = 4_000;
+        let temp = tempfile::tempdir().expect("workspace root");
+        let mut workspace =
+            test_workspace(vec![temp.path().to_path_buf()], WorkspaceOptions::default());
+        let result_generation = workspace.source_generation;
+        for index in 0..OBSERVATIONS {
+            let path = temp.path().join(format!("Changed{index:04}.pas"));
+            workspace.source_change_observations.insert(
+                path.clone(),
+                super::SourceChangeObservation {
+                    path,
+                    generation: result_generation + 1,
+                },
+            );
+        }
+        workspace.source_generation = result_generation + 1;
+        let records = (0..64)
+            .map(|record_index| {
+                let path = temp.path().join(format!("Consumer{record_index}.pas"));
+                super::rename::SourceRecord {
+                    uri: Url::from_file_path(&path).expect("consumer URI"),
+                    text: String::new(),
+                    version: None,
+                    stamp: None,
+                    open: false,
+                    path: Some(path),
+                    path_stamp: None,
+                    content_hash: None,
+                    parsed_text_hash: None,
+                    content_bytes: None,
+                    candidate_membership: None,
+                    candidate_observations: (0..64)
+                        .map(|index| super::rename::ResolverCandidateObservation {
+                            path: temp
+                                .path()
+                                .join(format!("Candidate{record_index}-{index}.pas")),
+                            present: false,
+                        })
+                        .collect(),
+                    read_policy: None,
+                    path_entry: None,
+                    include_payload: false,
+                    missing_provider_candidate: true,
+                    document_link_missing_candidate: false,
+                    directory_observation: false,
+                    document_link_ancestor: false,
+                    missing_provider_scope: None,
+                    auto_import_provider_observation: false,
+                    auto_import_scopes: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Best of ten spaced runs, so load from parallel tests does not fail
+        // the bound; a regression to per-candidate scans costs over a second.
+        let elapsed = (0..10)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                let started = std::time::Instant::now();
+                workspace
+                    .dependency_scoped_result_is_fresh(
+                        result_generation,
+                        workspace.configuration_generation,
+                        &records,
+                    )
+                    .expect("unrelated observations keep the result fresh");
+                started.elapsed()
+            })
+            .min()
+            .expect("timed runs");
+        eprintln!("dependency-scoped freshness with {OBSERVATIONS} observations: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "freshness must not scan every observation per candidate: {elapsed:?}"
+        );
+
+        let mut changed = records.clone();
+        changed[63].candidate_observations[63].path = temp.path().join("CHANGED3999.PAS");
+        workspace
+            .dependency_scoped_result_is_fresh(
+                result_generation,
+                workspace.configuration_generation,
+                &changed,
+            )
+            .expect_err("a newer observation of a candidate path stales the result");
     }
 
     #[test]

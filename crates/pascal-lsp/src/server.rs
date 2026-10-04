@@ -66,6 +66,9 @@ const MAX_GENERAL_ANALYSIS_JOBS: usize = 2;
 // One additional slot is reserved for interactive work. Bulk analysis and
 // diagnostics must never occupy all workers while a navigation request waits.
 const MAX_ANALYSIS_JOBS: usize = MAX_GENERAL_ANALYSIS_JOBS + 1;
+/// How long an interactive worker waits for a cache slot that a bulk job or
+/// the warmer is computing before it computes the slot itself, uncached.
+const INTERACTIVE_CLAIM_WAIT: Duration = Duration::from_millis(50);
 /// Maximum number of accepted analysis requests waiting for a worker.
 ///
 /// Queued requests retain only their parsed request parameters, never a
@@ -91,6 +94,8 @@ const WORKSPACE_NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_WATCHER_REGISTRATION_RETRIES: usize = 3;
 const ANALYSIS_QUEUE_FULL_MESSAGE: &str = "analysis queue is full; retry the request";
 const ANALYSIS_SUPERSEDED_MESSAGE: &str = "request superseded by a newer document version";
+const ANALYSIS_REPLACED_MESSAGE: &str =
+    "request superseded by a newer request of the same kind for the document";
 const OPEN_ADMISSION_FENCE_MESSAGE: &str = "analysis is disabled because an editor document could not be tracked; close the rejected document or restart the workspace";
 const MAX_CONFIGURATION_DEFERRED_MESSAGES: usize = 64;
 const MAX_WORKSPACE_MUTATION_DEFERRED_BYTES: usize = 1024 * 1024;
@@ -955,7 +960,6 @@ impl AnalysisPriority {
         match request {
             AnalysisRequest::Hover { .. }
             | AnalysisRequest::ProjectContext { .. }
-            | AnalysisRequest::ListProjects { .. }
             | AnalysisRequest::InstallationContext { .. }
             | AnalysisRequest::BuildContext { .. }
             | AnalysisRequest::SelectInstallation { .. }
@@ -970,8 +974,6 @@ impl AnalysisPriority {
             | AnalysisRequest::PrepareCallHierarchy { .. }
             | AnalysisRequest::PrepareTypeHierarchy { .. }
             | AnalysisRequest::TypeHierarchySupertypes { .. }
-            | AnalysisRequest::TypeHierarchySubtypes { .. }
-            | AnalysisRequest::IncomingCalls { .. }
             | AnalysisRequest::OutgoingCalls { .. }
             | AnalysisRequest::CodeActions(_)
             | AnalysisRequest::Resolve(_)
@@ -979,9 +981,13 @@ impl AnalysisPriority {
             | AnalysisRequest::ResolveCodeLens(_)
             | AnalysisRequest::DocumentHighlights { .. }
             | AnalysisRequest::SelectionRanges { .. } => Self::Interactive,
-            AnalysisRequest::DocumentLinks { .. } | AnalysisRequest::CodeLenses { .. } => {
-                Self::Bulk
-            }
+            // Repository listing and the reverse-edge hierarchy requests scan
+            // the workspace; they must not take the interactive slot.
+            AnalysisRequest::DocumentLinks { .. }
+            | AnalysisRequest::CodeLenses { .. }
+            | AnalysisRequest::ListProjects { .. }
+            | AnalysisRequest::TypeHierarchySubtypes { .. }
+            | AnalysisRequest::IncomingCalls { .. } => Self::Bulk,
             AnalysisRequest::Diagnostics { .. }
             | AnalysisRequest::DocumentDiagnostics { .. }
             | AnalysisRequest::WorkspaceDiagnostics { .. } => Self::Diagnostics,
@@ -4157,6 +4163,12 @@ struct PartialDeliveryRecipient {
     next_item: usize,
 }
 
+/// Read-set validation for one partial delivery. Chunks are guarded by the
+/// generation token captured when the delivery starts (an integer compare per
+/// chunk); this filesystem pass runs before a successful final response and
+/// covers every chunk sent before it started. It runs again only when chunks
+/// were sent after the previous pass started, so an unnotified disk change
+/// before a recipient's last chunk still fails that request closed.
 #[derive(Debug)]
 struct PartialDeliveryValidation {
     input: Arc<rename::RevalidationInput>,
@@ -4165,6 +4177,13 @@ struct PartialDeliveryValidation {
     cancellation: Arc<AtomicBool>,
     receiver: Option<Receiver<Result<(), String>>>,
     handle: Option<JoinHandle<()>>,
+    /// Chunks sent so far, the count when the running pass started, and the
+    /// count the last successful pass covers.
+    chunks_sent: u64,
+    started_at: u64,
+    passed_at: Option<u64>,
+    #[cfg(test)]
+    runs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PartialDeliveryValidation {
@@ -4172,17 +4191,46 @@ impl PartialDeliveryValidation {
         input: Arc<rename::RevalidationInput>,
         records: Arc<Vec<SourceRecord>>,
         test_barriers: TestBarrierConfig,
-    ) -> Result<Self, String> {
-        let mut validation = Self {
+    ) -> Self {
+        Self {
             input,
             records,
             test_barriers,
             cancellation: Arc::new(AtomicBool::new(false)),
             receiver: None,
             handle: None,
-        };
-        validation.request()?;
-        Ok(validation)
+            chunks_sent: 0,
+            started_at: 0,
+            passed_at: None,
+            #[cfg(test)]
+            runs: Arc::default(),
+        }
+    }
+
+    fn note_chunk_sent(&mut self) {
+        self.chunks_sent = self.chunks_sent.saturating_add(1);
+    }
+
+    /// Starts a pass unless one already covers every chunk sent, and reports
+    /// its outcome; `None` while a pass is running.
+    fn check(&mut self) -> Option<Result<(), String>> {
+        if self.passed_at == Some(self.chunks_sent) {
+            return Some(Ok(()));
+        }
+        if !self.is_running() {
+            self.started_at = self.chunks_sent;
+            if let Err(error) = self.request() {
+                return Some(Err(error));
+            }
+        }
+        let result = self.poll()?;
+        if result.is_ok() {
+            self.passed_at = Some(self.started_at);
+            if self.started_at != self.chunks_sent {
+                return self.check();
+            }
+        }
+        Some(result)
     }
 
     fn request(&mut self) -> Result<(), String> {
@@ -4194,9 +4242,13 @@ impl PartialDeliveryValidation {
         let records = Arc::clone(&self.records);
         let cancellation = Arc::clone(&self.cancellation);
         let test_barriers = self.test_barriers.clone();
+        #[cfg(test)]
+        let runs = Arc::clone(&self.runs);
         let handle = thread::Builder::new()
             .name("PascalLspPartialValidation".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                runs.fetch_add(1, Ordering::Relaxed);
                 let result = match wait_at_uninterruptible_test_barrier(
                     TestBarrier::PartialValidation,
                     &test_barriers,
@@ -5123,6 +5175,21 @@ impl ObservationKey {
         self.same_query(newer)
             && matches!((self.version, newer.version), (Some(old), Some(new)) if new > old)
     }
+
+    /// Cursor-following requests a client discards once it asks again for
+    /// the same document: a queued one is cancelled instead of computed.
+    fn is_replaced_by(&self, newer: &Self) -> bool {
+        matches!(
+            self.method,
+            ObservationMethod::Hover { .. }
+                | ObservationMethod::SignatureHelp { .. }
+                | ObservationMethod::DocumentHighlights
+                | ObservationMethod::Prepare
+        ) && self.method == newer.method
+            && self.uri.is_some()
+            && self.uri == newer.uri
+            && !self.same_query(newer)
+    }
 }
 
 #[derive(Debug)]
@@ -5309,6 +5376,12 @@ struct AnalysisJobs {
     next_computation_id: u64,
     shutting_down: bool,
     configuration_watch_sync_pending: bool,
+    /// Results received while a file-notification worker owned the workspace
+    /// that could not be delivered without it; polled before `receiver`.
+    held_results: VecDeque<AnalysisResult>,
+    /// Navigation state of results delivered during reconciliation, applied
+    /// after the commit only if the result is still fresh.
+    held_navigation_states: Vec<AnalysisResult>,
 }
 
 #[derive(Clone)]
@@ -5511,6 +5584,8 @@ impl AnalysisJobs {
             next_computation_id: 0,
             shutting_down: false,
             configuration_watch_sync_pending: false,
+            held_results: VecDeque::new(),
+            held_navigation_states: Vec::new(),
         }
     }
 
@@ -5788,6 +5863,11 @@ impl AnalysisJobs {
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
             .spawn(move || {
+                if priority == AnalysisPriority::Interactive {
+                    crate::project_cache::limit_claim_waits_on_this_thread(Some(
+                        INTERACTIVE_CLAIM_WAIT,
+                    ));
+                }
                 let validation_input = input.clone();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
@@ -7256,6 +7336,17 @@ impl AnalysisJobs {
 
         let title = progress_title(&request).to_string();
         let key = ObservationKey::for_request(&request, workspace);
+        // Queued requests this one replaces are cancelled only once it is
+        // admitted, so a rejected request does not cost the client both answers.
+        let replaced = key.as_ref().map_or_else(Vec::new, |key| {
+            self.observation_jobs
+                .iter()
+                .filter(|(existing, id)| {
+                    existing.is_replaced_by(key) && !self.pending.contains_key(id)
+                })
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>()
+        });
         if let Some(key) = key.as_ref() {
             let superseded = self
                 .observation_jobs
@@ -7264,7 +7355,7 @@ impl AnalysisJobs {
                 .map(|(_, id)| *id)
                 .collect::<Vec<_>>();
             for primary_id in superseded {
-                self.supersede_client(&primary_id, connection)?;
+                self.supersede_client(&primary_id, connection, ANALYSIS_SUPERSEDED_MESSAGE)?;
             }
 
             if let Some(primary_id) = self.observation_jobs.get(key).cloned() {
@@ -7295,6 +7386,9 @@ impl AnalysisJobs {
                             AnalysisJobId::Client(primary_id),
                             &recipient.id,
                         )?;
+                    }
+                    for primary_id in replaced {
+                        self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
                     }
                     return Ok(());
                 }
@@ -7340,6 +7434,9 @@ impl AnalysisJobs {
             &recipient,
             &title,
         )?;
+        for primary_id in replaced {
+            self.supersede_client(&primary_id, connection, ANALYSIS_REPLACED_MESSAGE)?;
+        }
         let failures = self.pump(workspace, connection);
         self.handle_dispatch_failures(failures, connection)
     }
@@ -7457,6 +7554,7 @@ impl AnalysisJobs {
         &mut self,
         primary_id: &AnalysisComputationId,
         connection: Option<&dyn ProtocolSender>,
+        message: &str,
     ) -> Result<(), String> {
         if let Some(QueuedAnalysis::Client(job)) = self.queue.remove_first(
             |queued| matches!(queued, QueuedAnalysis::Client(job) if &job.id == primary_id),
@@ -7471,12 +7569,7 @@ impl AnalysisJobs {
             for id in &request_ids {
                 self.remove_client_mapping(id, primary_id);
             }
-            Self::send_client_error(
-                connection,
-                request_ids,
-                ErrorCode::RequestCanceled,
-                ANALYSIS_SUPERSEDED_MESSAGE,
-            )?;
+            Self::send_client_error(connection, request_ids, ErrorCode::RequestCanceled, message)?;
             for recipient in job.recipients {
                 self.release_partial_token(&recipient);
                 self.progress.finish_recipient(
@@ -7505,12 +7598,7 @@ impl AnalysisJobs {
         for id in &request_ids {
             self.remove_client_mapping(id, primary_id);
         }
-        Self::send_client_error(
-            connection,
-            request_ids,
-            ErrorCode::RequestCanceled,
-            ANALYSIS_SUPERSEDED_MESSAGE,
-        )?;
+        Self::send_client_error(connection, request_ids, ErrorCode::RequestCanceled, message)?;
         for recipient in recipients {
             self.release_partial_token(&recipient);
             self.progress.finish_recipient(
@@ -8324,31 +8412,11 @@ impl AnalysisJobs {
                     "partial result delivery capacity is full; retry the request",
                 );
             }
-            let records = Arc::new(records);
-            let validation = match PartialDeliveryValidation::new(
+            let validation = PartialDeliveryValidation::new(
                 revalidation_input,
-                records,
+                Arc::new(records),
                 self.test_barriers.clone(),
-            ) {
-                Ok(validation) => validation,
-                Err(error) => {
-                    let recipients = partial_recipients
-                        .into_iter()
-                        .map(|recipient| ClientRecipient {
-                            id: recipient.id,
-                            work_done_token: None,
-                            partial_result_token: Some(recipient.token),
-                        })
-                        .collect();
-                    return self.fail_client_recipients(
-                        connection,
-                        primary_id,
-                        recipients,
-                        ErrorCode::RequestFailed,
-                        &error,
-                    );
-                }
-            };
+            );
             let retrigger_on_stale =
                 matches!(&payload, PartialResultPayload::WorkspaceDiagnostics(_));
             self.partial_deliveries.push_back(PartialDelivery {
@@ -8372,10 +8440,16 @@ impl AnalysisJobs {
         workspace: &Workspace,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.reap_retired_partial_validations();
-        for _ in 0..MAX_PARTIAL_RESULT_CHUNKS_PER_TURN {
+        let mut sent = 0;
+        let mut inspected = 0;
+        // A delivery waiting for its read-set validation rotates to the back so
+        // it does not hold up chunks of the other deliveries.
+        while sent < MAX_PARTIAL_RESULT_CHUNKS_PER_TURN && inspected < self.partial_deliveries.len()
+        {
             let Some(mut delivery) = self.partial_deliveries.pop_front() else {
                 return Ok(());
             };
+            inspected += 1;
             if workspace.analysis_admission_fenced()
                 || delivery.source_generation != workspace.source_generation()
                 || delivery.configuration_generation != workspace.configuration_generation()
@@ -8399,31 +8473,34 @@ impl AnalysisJobs {
             if delivery.recipients.is_empty() {
                 continue;
             }
-            match delivery.validation.poll() {
-                None => {
-                    self.partial_deliveries.push_front(delivery);
-                    return Ok(());
-                }
-                Some(Err(error)) => {
-                    let message =
-                        format!("analysis result became stale during partial delivery: {error}");
-                    if delivery.retrigger_on_stale {
-                        self.fail_partial_delivery_with_retrigger(connection, delivery, &message)?;
-                    } else {
-                        self.fail_partial_delivery(
-                            connection,
-                            delivery,
-                            ErrorCode::RequestFailed,
-                            &message,
-                        )?;
-                    }
-                    continue;
-                }
-                Some(Ok(())) => {}
-            }
             let recipient_index = delivery.next_recipient % delivery.recipients.len();
             let next_item = delivery.recipients[recipient_index].next_item;
             if next_item >= delivery.payload.len() {
+                match delivery.validation.check() {
+                    None => {
+                        self.partial_deliveries.push_back(delivery);
+                        continue;
+                    }
+                    Some(Err(error)) => {
+                        let message = format!(
+                            "analysis result became stale during partial delivery: {error}"
+                        );
+                        if delivery.retrigger_on_stale {
+                            self.fail_partial_delivery_with_retrigger(
+                                connection, delivery, &message,
+                            )?;
+                        } else {
+                            self.fail_partial_delivery(
+                                connection,
+                                delivery,
+                                ErrorCode::RequestFailed,
+                                &message,
+                            )?;
+                        }
+                        continue;
+                    }
+                    Some(Ok(())) => {}
+                }
                 let recipient = delivery.recipients.remove(recipient_index);
                 send_ok(
                     connection,
@@ -8431,9 +8508,9 @@ impl AnalysisJobs {
                     delivery.payload.empty_result(),
                 )?;
                 self.finish_partial_recipient(connection, delivery.job_id, &recipient)?;
+                sent += 1;
                 if !delivery.recipients.is_empty() {
                     delivery.next_recipient %= delivery.recipients.len();
-                    delivery.validation.request()?;
                     self.partial_deliveries.push_back(delivery);
                 }
                 continue;
@@ -8453,16 +8530,14 @@ impl AnalysisJobs {
             };
             let token = delivery.recipients[recipient_index].token.clone();
             if !send_partial_result_chunk(connection, &token, value)? {
-                delivery.validation.request()?;
                 self.partial_deliveries.push_front(delivery);
                 return Ok(());
             }
+            sent += 1;
+            delivery.validation.note_chunk_sent();
             delivery.recipients[recipient_index].next_item = end;
-            if !delivery.recipients.is_empty() {
-                delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
-                delivery.validation.request()?;
-                self.partial_deliveries.push_back(delivery);
-            }
+            delivery.next_recipient = (recipient_index + 1) % delivery.recipients.len();
+            self.partial_deliveries.push_back(delivery);
         }
         Ok(())
     }
@@ -8540,7 +8615,11 @@ impl AnalysisJobs {
                 job.analysis.cancellation.store(true, Ordering::Relaxed);
             }
         }
-        while let Ok(result) = self.receiver.try_recv() {
+        while let Some(result) = self
+            .held_results
+            .pop_front()
+            .or_else(|| self.receiver.try_recv().ok())
+        {
             match result.id {
                 AnalysisJobId::Diagnostic(id) => {
                     let Some(job) = self.diagnostics.remove(&id) else {
@@ -8885,6 +8964,113 @@ impl AnalysisJobs {
         Ok(())
     }
 
+    /// Runs while a file-notification worker owns the workspace. A completed
+    /// client result whose generations equal the revision the worker started
+    /// from is exactly as fresh as it would have been just before the batch:
+    /// the batch is not applied yet and every later workspace message is
+    /// deferred behind it. Such results are delivered now when their delivery
+    /// is read-only; everything else is held for the post-commit poll.
+    fn deliver_during_reconciliation(
+        &mut self,
+        connection: &dyn ProtocolSender,
+        revision: WorkspaceRevision,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        while let Ok(mut result) = self.receiver.try_recv() {
+            let AnalysisJobId::Client(primary_id) = result.id else {
+                self.held_results.push_back(result);
+                continue;
+            };
+            if !self.is_deliverable_during_reconciliation(primary_id, &result, revision) {
+                self.held_results.push_back(result);
+                continue;
+            }
+            let job = self
+                .pending
+                .remove(&primary_id)
+                .expect("deliverable result has a pending job");
+            self.publish_interactive_load();
+            self.compiled_content_payload_budget.release(&primary_id);
+            let _ = job.handle.join();
+            self.remove_observation(job.key.as_ref(), &primary_id);
+            if let AnalysisResultValue::Navigation(navigation) = &mut result.value
+                && let Some(state) = navigation.state.take()
+            {
+                self.held_navigation_states.push(AnalysisResult {
+                    id: result.id,
+                    source_generation: result.source_generation,
+                    configuration_generation: result.configuration_generation,
+                    records: result.records.clone(),
+                    value: AnalysisResultValue::Navigation(NavigationAnalysis {
+                        value: Ok(Vec::new()),
+                        state: Some(state),
+                    }),
+                });
+            }
+            for recipient in &job.recipients {
+                send_read_only_analysis_result(
+                    connection,
+                    &mut self.completion_resolutions,
+                    result.clone(),
+                    Some(recipient.id.clone()),
+                )?;
+                self.remove_client_mapping(&recipient.id, &primary_id);
+                self.release_partial_token(recipient);
+                self.progress
+                    .finish_recipient(
+                        Some(connection),
+                        AnalysisJobId::Client(primary_id),
+                        &recipient.id,
+                        None,
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_deliverable_during_reconciliation(
+        &self,
+        primary_id: AnalysisComputationId,
+        result: &AnalysisResult,
+        revision: WorkspaceRevision,
+    ) -> bool {
+        let Some(job) = self.pending.get(&primary_id) else {
+            return false;
+        };
+        revision.admits(result)
+            && is_read_only_delivery(&result.value)
+            && !job.recipients.is_empty()
+            && !job.cancellation.load(Ordering::Relaxed)
+            && !(is_partial_result_value(&result.value)
+                && job
+                    .recipients
+                    .iter()
+                    .any(|recipient| recipient.partial_result_token.is_some()))
+            && !job.recipients.iter().any(|recipient| {
+                self.automatic_discovery_requests
+                    .contains_key(&recipient.id)
+                    || self.automatic_apply_requests.contains_key(&recipient.id)
+                    || self.automatic_answer_requests.contains_key(&recipient.id)
+                    || self.manual_selection_requests.contains_key(&recipient.id)
+            })
+    }
+
+    /// Applies navigation state held by `deliver_during_reconciliation` once
+    /// the reconciled workspace is committed, under the same freshness rule
+    /// as ordinary delivery.
+    fn apply_held_navigation_states(&mut self, workspace: &mut Workspace) {
+        for mut result in std::mem::take(&mut self.held_navigation_states) {
+            if analysis_result_is_stale(workspace, &result) {
+                continue;
+            }
+            if let AnalysisResultValue::Navigation(navigation) = &mut result.value
+                && let Some(state) = navigation.state.take()
+            {
+                workspace.apply_navigation_state(state);
+            }
+        }
+    }
+
     fn take_configuration_watch_sync_pending(&mut self) -> bool {
         std::mem::take(&mut self.configuration_watch_sync_pending)
     }
@@ -9189,6 +9375,32 @@ fn is_dependency_scoped_result(value: &AnalysisResultValue, records: &[SourceRec
         )
 }
 
+/// The workspace revision a result can be compared with when the workspace
+/// itself is unavailable: equal generations and no admission fence mean the
+/// protocol loop has observed no change since the result's input was captured.
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceRevision {
+    source_generation: u64,
+    configuration_generation: u64,
+    fenced: bool,
+}
+
+impl WorkspaceRevision {
+    fn of(workspace: &Workspace) -> Self {
+        Self {
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            fenced: workspace.analysis_admission_fenced(),
+        }
+    }
+
+    fn admits(&self, result: &AnalysisResult) -> bool {
+        !self.fenced
+            && result.source_generation == self.source_generation
+            && result.configuration_generation == self.configuration_generation
+    }
+}
+
 fn analysis_result_is_stale(workspace: &Workspace, result: &AnalysisResult) -> bool {
     if workspace.analysis_admission_fenced() {
         return true;
@@ -9296,6 +9508,10 @@ fn deliver_analysis_result_with_store(
         && let Some(state) = navigation.state.take()
     {
         workspace.apply_navigation_state(state);
+    }
+    if is_read_only_delivery(&result.value) {
+        send_read_only_analysis_result(connection, completion_resolutions, result, client_id)?;
+        return Ok(false);
     }
     let mut selection_committed = false;
     match result.value {
@@ -9416,6 +9632,139 @@ fn deliver_analysis_result_with_store(
                 ),
             }
         }
+        AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
+            Ok(publications) => {
+                send_diagnostic_publications(connection, workspace, &diagnostics.uri, publications)
+            }
+            Err(error) if error == rename::CANCELLATION_MESSAGE => {
+                workspace.reschedule_diagnostics(diagnostics.uri);
+                Ok(())
+            }
+            Err(error) => {
+                let uri = diagnostics.uri;
+                let version = diagnostics.version;
+                let updates = workspace
+                    .stage_diagnostic_publications(
+                        &uri,
+                        std::iter::once(queries::DiagnosticPublication {
+                            uri: uri.clone(),
+                            version,
+                            diagnostics: vec![crate::workspace::server_diagnostic(
+                                &error,
+                                lsp_types::DiagnosticSeverity::ERROR,
+                            )],
+                        }),
+                    )
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+                if updates.incomplete {
+                    workspace.mark_pending_diagnostic_publication_incomplete();
+                }
+                Ok(())
+            }
+        },
+        AnalysisResultValue::DocumentDiagnostics(value) => match value {
+            Ok(analysis) => send_document_diagnostics(
+                connection,
+                workspace,
+                diagnostic_results,
+                analysis,
+                client_id.expect("client result"),
+            ),
+            Err(error) => {
+                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::WorkspaceDiagnostics(value) => match value {
+            Ok(analysis) => send_workspace_diagnostics(
+                connection,
+                workspace,
+                diagnostic_results,
+                analysis,
+                client_id.expect("client result"),
+            ),
+            Err(error) => {
+                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
+            }
+        },
+        AnalysisResultValue::Rename {
+            value,
+            unit_file_move,
+        } => match *value {
+            Ok(value) => {
+                if let Some((old_uri, new_uri)) = unit_file_move {
+                    if let Err(error) = workspace.stage_unit_file_rename(&old_uri, &new_uri, &value)
+                    {
+                        send_analysis_error(
+                            connection,
+                            client_id.clone().expect("client result"),
+                            error,
+                        )?;
+                        return Ok(false);
+                    }
+                    let response =
+                        send_ok(connection, client_id.clone().expect("client result"), value);
+                    if response.is_err() {
+                        workspace.cancel_staged_unit_file_rename(&old_uri, &new_uri);
+                    }
+                    response
+                } else {
+                    send_ok(connection, client_id.clone().expect("client result"), value)
+                }
+            }
+            Err(error) => {
+                send_analysis_error(connection, client_id.clone().expect("client result"), error)
+            }
+        },
+        _ => unreachable!("read-only results are sent above"),
+    }?;
+    Ok(selection_committed)
+}
+
+/// Results whose delivery writes only protocol output and the completion
+/// resolution store, never the workspace.
+fn is_read_only_delivery(value: &AnalysisResultValue) -> bool {
+    matches!(
+        value,
+        AnalysisResultValue::CompiledContent(_)
+            | AnalysisResultValue::Hover(_)
+            | AnalysisResultValue::Completion(_)
+            | AnalysisResultValue::ResolveCompletion(_)
+            | AnalysisResultValue::SignatureHelp(_)
+            | AnalysisResultValue::Navigation(_)
+            | AnalysisResultValue::Formatting(_)
+            | AnalysisResultValue::DocumentLinks(_)
+            | AnalysisResultValue::CodeLenses(_)
+            | AnalysisResultValue::ResolveCodeLens(_)
+            | AnalysisResultValue::TypeDefinitions(_)
+            | AnalysisResultValue::Prepare(_)
+            | AnalysisResultValue::CodeActions(_)
+            | AnalysisResultValue::Resolve(_)
+            | AnalysisResultValue::DocumentSymbols { .. }
+            | AnalysisResultValue::WorkspaceSymbols(_)
+            | AnalysisResultValue::References(_)
+            | AnalysisResultValue::DocumentHighlights(_)
+            | AnalysisResultValue::SelectionRanges(_)
+            | AnalysisResultValue::SemanticTokens(_)
+            | AnalysisResultValue::FoldingRanges(_)
+            | AnalysisResultValue::InlayHints(_)
+            | AnalysisResultValue::PrepareCallHierarchy(_)
+            | AnalysisResultValue::PrepareTypeHierarchy(_)
+            | AnalysisResultValue::TypeHierarchySupertypes(_)
+            | AnalysisResultValue::TypeHierarchySubtypes(_)
+            | AnalysisResultValue::IncomingCalls(_)
+            | AnalysisResultValue::OutgoingCalls(_)
+    )
+}
+
+/// Sends a result accepted by `is_read_only_delivery`. Navigation state must
+/// already have been taken out by the caller.
+fn send_read_only_analysis_result(
+    connection: &dyn ProtocolSender,
+    completion_resolutions: &mut CompletionResolutionStore,
+    result: AnalysisResult,
+    client_id: Option<RequestId>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    match result.value {
         AnalysisResultValue::CompiledContent(value) => match value {
             Ok(Some(text)) => send_ok(
                 connection,
@@ -9529,60 +9878,6 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-        AnalysisResultValue::Diagnostics(diagnostics) => match diagnostics.value {
-            Ok(publications) => {
-                send_diagnostic_publications(connection, workspace, &diagnostics.uri, publications)
-            }
-            Err(error) if error == rename::CANCELLATION_MESSAGE => {
-                workspace.reschedule_diagnostics(diagnostics.uri);
-                Ok(())
-            }
-            Err(error) => {
-                let uri = diagnostics.uri;
-                let version = diagnostics.version;
-                let updates = workspace
-                    .stage_diagnostic_publications(
-                        &uri,
-                        std::iter::once(queries::DiagnosticPublication {
-                            uri: uri.clone(),
-                            version,
-                            diagnostics: vec![crate::workspace::server_diagnostic(
-                                &error,
-                                lsp_types::DiagnosticSeverity::ERROR,
-                            )],
-                        }),
-                    )
-                    .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
-                if updates.incomplete {
-                    workspace.mark_pending_diagnostic_publication_incomplete();
-                }
-                Ok(())
-            }
-        },
-        AnalysisResultValue::DocumentDiagnostics(value) => match value {
-            Ok(analysis) => send_document_diagnostics(
-                connection,
-                workspace,
-                diagnostic_results,
-                analysis,
-                client_id.expect("client result"),
-            ),
-            Err(error) => {
-                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
-            }
-        },
-        AnalysisResultValue::WorkspaceDiagnostics(value) => match value {
-            Ok(analysis) => send_workspace_diagnostics(
-                connection,
-                workspace,
-                diagnostic_results,
-                analysis,
-                client_id.expect("client result"),
-            ),
-            Err(error) => {
-                send_diagnostic_analysis_error(connection, client_id.expect("client result"), error)
-            }
-        },
         AnalysisResultValue::TypeDefinitions(value) => match value {
             Ok(value) => send_ok(
                 connection,
@@ -9595,35 +9890,6 @@ fn deliver_analysis_result_with_store(
         },
         AnalysisResultValue::Prepare(value) => match value {
             Ok(value) => send_ok(connection, client_id.clone().expect("client result"), value),
-            Err(error) => {
-                send_analysis_error(connection, client_id.clone().expect("client result"), error)
-            }
-        },
-        AnalysisResultValue::Rename {
-            value,
-            unit_file_move,
-        } => match *value {
-            Ok(value) => {
-                if let Some((old_uri, new_uri)) = unit_file_move {
-                    if let Err(error) = workspace.stage_unit_file_rename(&old_uri, &new_uri, &value)
-                    {
-                        send_analysis_error(
-                            connection,
-                            client_id.clone().expect("client result"),
-                            error,
-                        )?;
-                        return Ok(false);
-                    }
-                    let response =
-                        send_ok(connection, client_id.clone().expect("client result"), value);
-                    if response.is_err() {
-                        workspace.cancel_staged_unit_file_rename(&old_uri, &new_uri);
-                    }
-                    response
-                } else {
-                    send_ok(connection, client_id.clone().expect("client result"), value)
-                }
-            }
             Err(error) => {
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
@@ -9739,8 +10005,8 @@ fn deliver_analysis_result_with_store(
                 send_analysis_error(connection, client_id.clone().expect("client result"), error)
             }
         },
-    }?;
-    Ok(selection_committed)
+        _ => unreachable!("only read-only results are sent without the workspace"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10553,6 +10819,8 @@ struct WorkspaceFileNotificationWorker {
     deadline_expired: Arc<AtomicBool>,
     deadline: Instant,
     join: Option<JoinHandle<()>>,
+    /// The revision the worker took the workspace at.
+    revision: WorkspaceRevision,
 }
 
 impl WorkspaceFileNotificationWorker {
@@ -10654,6 +10922,7 @@ fn spawn_workspace_file_notification(
     let worker_cancellation = Arc::clone(&cancellation);
     let deadline_expired = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + workspace_notification_deadline();
+    let revision = WorkspaceRevision::of(workspace);
     let owned_workspace = std::mem::take(workspace);
     let join = thread::Builder::new()
         .name("PascalLspWorkspaceMutation".to_string())
@@ -10710,6 +10979,7 @@ fn spawn_workspace_file_notification(
         deadline_expired,
         deadline,
         join: Some(join),
+        revision,
     }
 }
 
@@ -10886,6 +11156,7 @@ fn event_loop(
                         result = Ok(effect);
                     }
                     *workspace = completed_workspace;
+                    jobs.apply_held_navigation_states(workspace);
                     match result {
                         Ok(effect) => {
                             if !pull_diagnostics_supported {
@@ -10997,6 +11268,7 @@ fn event_loop(
                         );
                         worker.cancellation.store(true, Ordering::Release);
                     }
+                    jobs.deliver_during_reconciliation(connection, worker.revision)?;
                 }
             }
         }
@@ -15400,15 +15672,15 @@ mod tests {
         DocumentationFormat, FileWatcherRegistration, MAX_ANALYSIS_QUEUE,
         MAX_CLIENT_ANALYSIS_RECIPIENTS, MAX_COMPLETION_RESOLUTION_CONTEXT_BYTES,
         MAX_COMPLETION_RESOLUTION_DATA_BYTES, MAX_COMPLETION_RESOLUTION_RECORDS,
-        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK, MAX_PAYLOAD_BYTES,
-        MAX_PENDING_OUTBOUND_CONTROL_BYTES, MAX_PENDING_OUTBOUND_CONTROL_MESSAGES,
-        MAX_PENDING_OUTBOUND_DATA_MESSAGES, MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass,
-        OutboundQueue, OutputError, PartialDelivery, PartialDeliveryRecipient,
-        PartialDeliveryValidation, PartialResultPayload, PendingAnalysis, PriorityQueue,
-        ProtocolSender, TestBarrierConfig, deliver_analysis_result, event_loop_receive_timeout,
-        handle_request, invalidate_analysis_result, pump_pending_diagnostic_publications,
-        select_workspace_event_message, supports_diagnostic_refresh,
-        supports_workspace_diagnostic_reports,
+        MAX_CONFIGURATION_WATCH_PATHS, MAX_PARTIAL_RESULT_BYTES_PER_CHUNK,
+        MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK, MAX_PAYLOAD_BYTES, MAX_PENDING_OUTBOUND_CONTROL_BYTES,
+        MAX_PENDING_OUTBOUND_CONTROL_MESSAGES, MAX_PENDING_OUTBOUND_DATA_MESSAGES,
+        MAX_WATCHER_REGISTRATION_RETRIES, OutboundClass, OutboundQueue, OutputError,
+        PartialDelivery, PartialDeliveryRecipient, PartialDeliveryValidation, PartialResultPayload,
+        PendingAnalysis, PriorityQueue, ProtocolSender, TestBarrierConfig, deliver_analysis_result,
+        event_loop_receive_timeout, handle_request, invalidate_analysis_result,
+        pump_pending_diagnostic_publications, select_workspace_event_message,
+        supports_diagnostic_refresh, supports_workspace_diagnostic_reports,
     };
     use crate::workspace::queries::DiagnosticPublication;
     use crate::workspace::rename::{SourceRecord, install_snapshot_priority_barrier};
@@ -18592,6 +18864,86 @@ mod tests {
     }
 
     #[test]
+    fn rejected_newer_hover_does_not_cancel_the_queued_one() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let root = temp.path().to_path_buf();
+        let workspace = test_workspace(vec![root.clone()], Default::default());
+        let uri = Url::from_file_path(root.join("Main.pas")).expect("source URI");
+        let hover = |line| AnalysisRequest::Hover {
+            uri: uri.clone(),
+            position: Position::new(line, 0),
+            format: MarkupKind::PlainText,
+        };
+        let mut jobs = AnalysisJobs::new();
+        let older_id = RequestId::from("older-queued-hover".to_string());
+        let older_job = AnalysisComputationId(1);
+        let older_key = super::ObservationKey::for_request(&hover(0), &workspace);
+        jobs.observation_jobs
+            .insert(older_key.clone().expect("hover key"), older_job);
+        jobs.request_to_job.insert(older_id.clone(), older_job);
+        jobs.queue.push(
+            AnalysisPriority::Interactive,
+            super::QueuedAnalysis::Client(super::QueuedClientAnalysis {
+                id: older_job,
+                request: hover(0),
+                features: symbol_client_features(),
+                recipients: vec![super::ClientRecipient {
+                    id: older_id.clone(),
+                    work_done_token: None,
+                    partial_result_token: None,
+                }],
+                key: older_key,
+            }),
+        );
+        // Fill the rest of the recipient admission budget.
+        jobs.partial_deliveries.push_back(PartialDelivery {
+            job_id: AnalysisComputationId(0),
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            payload: PartialResultPayload::References(Arc::new(Vec::new())),
+            retrigger_on_stale: false,
+            recipients: (1..MAX_CLIENT_ANALYSIS_RECIPIENTS)
+                .map(|index| PartialDeliveryRecipient {
+                    id: RequestId::from(format!("delivering-{index}")),
+                    token: lsp_types::ProgressToken::String(format!("partial-{index}")),
+                    next_item: 0,
+                })
+                .collect(),
+            next_recipient: 0,
+            retained_bytes: 1,
+            validation: PartialDeliveryValidation::new(
+                Arc::new(workspace.revalidation_input()),
+                Arc::new(Vec::new()),
+                TestBarrierConfig::disabled(),
+            ),
+        });
+        let connection = RecordingSender::default();
+
+        let error = jobs
+            .enqueue_client(
+                RequestId::from("newer-rejected-hover".to_string()),
+                hover(1),
+                &workspace,
+                symbol_client_features(),
+                None,
+                Some(&connection),
+            )
+            .expect_err("the full admission budget rejects the newer hover");
+
+        assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
+        assert!(
+            connection
+                .messages
+                .lock()
+                .expect("recorded messages")
+                .is_empty(),
+            "the older hover must not be cancelled for a rejected request"
+        );
+        assert_eq!(jobs.request_to_job.get(&older_id), Some(&older_job));
+        assert_eq!(jobs.queue.len(), 1);
+    }
+
+    #[test]
     fn delivering_recipients_consume_the_global_admission_bound() {
         let temp = tempfile::tempdir().expect("workspace");
         let root = temp.path().to_path_buf();
@@ -18603,8 +18955,7 @@ mod tests {
             Arc::new(workspace.revalidation_input()),
             Arc::clone(&records),
             TestBarrierConfig::disabled(),
-        )
-        .expect("validation worker");
+        );
         let recipients = (0..MAX_CLIENT_ANALYSIS_RECIPIENTS)
             .map(|index| PartialDeliveryRecipient {
                 id: RequestId::from(format!("delivering-{index}")),
@@ -18643,6 +18994,181 @@ mod tests {
         assert_eq!(error, ANALYSIS_QUEUE_FULL_MESSAGE);
     }
 
+    #[derive(Default)]
+    struct RecordingSender {
+        messages: Mutex<Vec<Message>>,
+    }
+
+    impl ProtocolSender for RecordingSender {
+        fn send_control(&self, message: Message) -> Result<(), OutputError> {
+            self.messages
+                .lock()
+                .expect("recorded messages")
+                .push(message);
+            Ok(())
+        }
+
+        fn send_result(&self, message: Message) -> Result<(), OutputError> {
+            self.send_control(message)
+        }
+
+        fn send_data(&self, message: Message) -> Result<bool, OutputError> {
+            self.send_control(message).map(|()| true)
+        }
+    }
+
+    #[test]
+    fn chunks_sent_after_a_validation_started_are_validated_again() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).expect("source URI");
+        let locations = (0..2 * MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK)
+            .map(|line| {
+                let line = u32::try_from(line).expect("line");
+                Location::new(
+                    uri.clone(),
+                    Range::new(Position::new(line, 0), Position::new(line, 1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let validation = PartialDeliveryValidation::new(
+            Arc::new(workspace.revalidation_input()),
+            Arc::new(Vec::new()),
+            TestBarrierConfig::disabled(),
+        );
+        let runs = Arc::clone(&validation.runs);
+        let finished = RequestId::from("finished-recipient".to_string());
+        let behind = RequestId::from("behind-recipient".to_string());
+        let mut jobs = AnalysisJobs::new();
+        jobs.partial_deliveries.push_back(PartialDelivery {
+            job_id: AnalysisComputationId(0),
+            source_generation: workspace.source_generation(),
+            configuration_generation: workspace.configuration_generation(),
+            payload: PartialResultPayload::References(Arc::new(locations.clone())),
+            retrigger_on_stale: false,
+            recipients: vec![
+                PartialDeliveryRecipient {
+                    id: finished.clone(),
+                    token: lsp_types::ProgressToken::String("finished".to_string()),
+                    next_item: locations.len(),
+                },
+                PartialDeliveryRecipient {
+                    id: behind.clone(),
+                    token: lsp_types::ProgressToken::String("behind".to_string()),
+                    next_item: 0,
+                },
+            ],
+            next_recipient: 0,
+            retained_bytes: 1,
+            validation,
+        });
+        let connection = RecordingSender::default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !jobs.partial_deliveries.is_empty() {
+            assert!(Instant::now() < deadline, "partial delivery must finish");
+            let sent = connection.messages.lock().expect("recorded messages").len();
+            jobs.pump_partial_deliveries(&connection, &workspace)
+                .expect("pump partial delivery");
+            if connection.messages.lock().expect("recorded messages").len() == sent {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let messages = connection.messages.lock().expect("recorded messages");
+        let responses = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Response(response) => Some(response),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().all(|response| response.error.is_none()));
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "chunks sent after the first validation started need their own validation"
+        );
+    }
+
+    #[test]
+    fn fifty_chunk_partial_delivery_validates_the_read_set_once() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = test_workspace(vec![temp.path().to_path_buf()], Default::default());
+        let uri = Url::from_file_path(temp.path().join("Main.pas")).expect("source URI");
+        let chunks = 50;
+        let locations = (0..chunks * MAX_PARTIAL_RESULT_ITEMS_PER_CHUNK)
+            .map(|line| {
+                let line = u32::try_from(line).expect("line");
+                Location::new(
+                    uri.clone(),
+                    Range::new(Position::new(line, 0), Position::new(line, 1)),
+                )
+            })
+            .collect();
+        let connection = RecordingSender::default();
+        let id = RequestId::from("fifty-chunks".to_string());
+        let mut jobs = AnalysisJobs::new();
+        jobs.start_partial_delivery(
+            &connection,
+            &workspace,
+            AnalysisResult {
+                id: AnalysisJobId::Client(AnalysisComputationId(0)),
+                source_generation: workspace.source_generation(),
+                configuration_generation: workspace.configuration_generation(),
+                records: Vec::new(),
+                value: AnalysisResultValue::References(Ok(locations)),
+            },
+            vec![super::ClientRecipient {
+                id: id.clone(),
+                work_done_token: None,
+                partial_result_token: Some(lsp_types::ProgressToken::String(
+                    "fifty-chunks".to_string(),
+                )),
+            }],
+            AnalysisComputationId(0),
+        )
+        .expect("start partial delivery");
+        let runs = Arc::clone(
+            &jobs
+                .partial_deliveries
+                .front()
+                .expect("partial delivery")
+                .validation
+                .runs,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !jobs.partial_deliveries.is_empty() {
+            assert!(Instant::now() < deadline, "partial delivery must finish");
+            let sent = connection.messages.lock().expect("recorded messages").len();
+            jobs.pump_partial_deliveries(&connection, &workspace)
+                .expect("pump partial delivery");
+            if connection.messages.lock().expect("recorded messages").len() == sent {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let messages = connection.messages.lock().expect("recorded messages");
+        let progress = messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::Notification(notification) if notification.method == "$/progress")
+            })
+            .count();
+        assert_eq!(progress, chunks);
+        let Some(Message::Response(response)) = messages.last() else {
+            panic!("final response expected: {:?}", messages.last());
+        };
+        assert_eq!(response.id, id);
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the read set is validated once per delivery, not once per chunk"
+        );
+    }
+
     #[cfg(feature = "test-support")]
     #[test]
     fn retired_partial_validation_keeps_worker_and_bytes_until_reaped() {
@@ -18652,13 +19178,13 @@ mod tests {
         fs::create_dir_all(&barrier_directory).expect("barrier directory");
         let entered = barrier_directory.join("entered");
         let release = barrier_directory.join("release");
-        let validation = PartialDeliveryValidation::new(
+        let mut validation = PartialDeliveryValidation::new(
             Arc::new(workspace.revalidation_input()),
             Arc::new(Vec::new()),
             TestBarrierConfig::default()
                 .with_partial_validation(Some((entered.clone(), release.clone()))),
-        )
-        .expect("validation worker");
+        );
+        validation.request().expect("validation worker");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !entered.exists() {
@@ -19158,6 +19684,54 @@ mod tests {
     }
 
     #[test]
+    fn reverse_hierarchy_requests_do_not_take_the_interactive_slot() {
+        let uri = Url::parse("file:///Main.pas").unwrap();
+        let range = Range::new(Position::new(0, 0), Position::new(0, 1));
+        let call_item = lsp_types::CallHierarchyItem {
+            name: "Run".to_string(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: uri.clone(),
+            range,
+            selection_range: range,
+            data: None,
+        };
+        let type_item = lsp_types::TypeHierarchyItem {
+            name: "TBase".to_string(),
+            kind: SymbolKind::CLASS,
+            tags: None,
+            detail: None,
+            uri,
+            range,
+            selection_range: range,
+            data: None,
+        };
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::IncomingCalls {
+                item: call_item.clone()
+            }),
+            AnalysisPriority::Bulk
+        );
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::TypeHierarchySubtypes {
+                item: type_item.clone()
+            }),
+            AnalysisPriority::Bulk
+        );
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::OutgoingCalls { item: call_item }),
+            AnalysisPriority::Interactive
+        );
+        assert_eq!(
+            AnalysisPriority::for_request(&AnalysisRequest::TypeHierarchySupertypes {
+                item: type_item
+            }),
+            AnalysisPriority::Interactive
+        );
+    }
+
+    #[test]
     fn superseding_queued_interactive_request_releases_warmer_gate() {
         let mut jobs = AnalysisJobs::new();
         let computation_id = AnalysisComputationId(1);
@@ -19186,7 +19760,7 @@ mod tests {
         assert!(!jobs.interactive_gate.try_wait_idle(&AtomicBool::new(false)));
 
         let (server, _client) = Connection::memory();
-        jobs.supersede_client(&computation_id, Some(&server))
+        jobs.supersede_client(&computation_id, Some(&server), ANALYSIS_SUPERSEDED_MESSAGE)
             .expect("supersede the queued interactive request");
 
         assert!(

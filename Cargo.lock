@@ -974,6 +974,7 @@ name = "pascal-project"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "libc",
  "quick-xml",
  "serde",
  "serde_json",

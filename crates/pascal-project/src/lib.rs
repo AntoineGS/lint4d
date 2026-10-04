@@ -244,7 +244,36 @@ pub struct ReadPolicy {
     authorized_files: Arc<Vec<PathBuf>>,
     exclusions: Vec<String>,
     exclusion_bases: Vec<PathBuf>,
-    compiled_exclusions: Arc<Option<globset::GlobSet>>,
+    compiled_exclusions: Arc<Option<CompiledExclusions>>,
+}
+
+/// Exclusion globs as written, plus a letter-case-folding variant compiled
+/// the first time a path on a case-insensitive volume is checked.
+#[derive(Debug)]
+struct CompiledExclusions {
+    patterns: Vec<String>,
+    exact: globset::GlobSet,
+    case_insensitive: std::sync::OnceLock<Option<globset::GlobSet>>,
+}
+
+impl CompiledExclusions {
+    fn new(patterns: &[String]) -> Option<Self> {
+        Some(Self {
+            exact: compile_exclude_patterns(patterns, false)?,
+            patterns: patterns.to_vec(),
+            case_insensitive: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn for_case(&self, case_insensitive: bool) -> Option<&globset::GlobSet> {
+        if case_insensitive {
+            self.case_insensitive
+                .get_or_init(|| compile_exclude_patterns(&self.patterns, true))
+                .as_ref()
+        } else {
+            Some(&self.exact)
+        }
+    }
 }
 
 impl PartialEq for ReadPolicy {
@@ -376,7 +405,7 @@ impl ReadPolicy {
             authorized_files: Arc::new(Vec::new()),
             exclusions: exclusions.to_vec(),
             exclusion_bases: unique_exclusion_bases,
-            compiled_exclusions: Arc::new(compile_exclude_patterns(exclusions)),
+            compiled_exclusions: Arc::new(CompiledExclusions::new(exclusions)),
         }
     }
 
@@ -693,7 +722,12 @@ impl ReadPolicy {
     }
 
     fn is_excluded_authorized_file(&self, path: &Path) -> bool {
-        if path.components().any(is_default_excluded_component) || self.is_excluded(path) {
+        let case_insensitive = path_identity::is_case_insensitive(path);
+        if path
+            .components()
+            .any(|component| is_default_excluded_component(component, case_insensitive))
+            || self.is_excluded(path)
+        {
             return true;
         }
 
@@ -711,7 +745,7 @@ impl ReadPolicy {
             .collect::<Vec<_>>();
         (0..components.len()).any(|start| {
             let relative = components[start..].iter().collect::<PathBuf>();
-            self.matches_exclusion_patterns_for_relative(&relative)
+            self.matches_exclusion_patterns_for_relative(&relative, case_insensitive)
         })
     }
 
@@ -724,38 +758,51 @@ impl ReadPolicy {
     }
 
     fn is_excluded_for_root(&self, path: &Path, root: &AuthorizedReadRoot) -> bool {
-        project_relative_path(path, &root.path)
-            .is_some_and(|relative| relative.components().any(is_default_excluded_component))
+        has_default_excluded_component_under(path, &root.path)
             || self.matches_exclusion_patterns(path, &root.pattern_exclusion_bases)
     }
 
     fn is_excluded_for_mapped_root(&self, path: &Path, root: &Path) -> bool {
-        project_relative_path(path, root)
-            .is_some_and(|relative| relative.components().any(is_default_excluded_component))
+        has_default_excluded_component_under(path, root)
             || self.matches_exclusion_patterns(path, &self.exclusion_bases)
     }
 
     fn is_excluded_under_bases(&self, path: &Path, bases: &[PathBuf]) -> bool {
+        let case_insensitive = path_identity::is_case_insensitive(path);
         bases.iter().any(|base| {
             let Some(relative) = project_relative_path(path, base) else {
                 return false;
             };
-            if relative.components().any(is_default_excluded_component) {
+            if relative
+                .components()
+                .any(|component| is_default_excluded_component(component, case_insensitive))
+            {
                 return true;
             }
-            self.matches_exclusion_patterns_for_relative(&relative)
+            self.matches_exclusion_patterns_for_relative(&relative, case_insensitive)
         })
     }
 
     fn matches_exclusion_patterns(&self, path: &Path, bases: &[PathBuf]) -> bool {
+        let case_insensitive = path_identity::is_case_insensitive(path);
         bases.iter().any(|base| {
-            project_relative_path(path, base)
-                .is_some_and(|relative| self.matches_exclusion_patterns_for_relative(&relative))
+            project_relative_path(path, base).is_some_and(|relative| {
+                self.matches_exclusion_patterns_for_relative(&relative, case_insensitive)
+            })
         })
     }
 
-    fn matches_exclusion_patterns_for_relative(&self, relative: &Path) -> bool {
-        let Some(patterns) = self.compiled_exclusions.as_ref() else {
+    fn matches_exclusion_patterns_for_relative(
+        &self,
+        relative: &Path,
+        case_insensitive: bool,
+    ) -> bool {
+        let Some(patterns) = self
+            .compiled_exclusions
+            .as_ref()
+            .as_ref()
+            .and_then(|compiled| compiled.for_case(case_insensitive))
+        else {
             return false;
         };
         let mut prefix = PathBuf::new();
@@ -821,23 +868,17 @@ impl MetadataObservation {
     }
 }
 
-fn compile_exclude_patterns(patterns: &[String]) -> Option<globset::GlobSet> {
+fn compile_exclude_patterns(
+    patterns: &[String],
+    case_insensitive: bool,
+) -> Option<globset::GlobSet> {
     let mut builder = globset::GlobSetBuilder::new();
     let mut valid_pattern_count = 0;
     for pattern in patterns {
         let normalized = pattern.replace('\\', "/");
-        let glob = {
-            #[cfg(windows)]
-            {
-                globset::GlobBuilder::new(&normalized)
-                    .case_insensitive(true)
-                    .build()
-            }
-            #[cfg(not(windows))]
-            {
-                globset::Glob::new(&normalized)
-            }
-        };
+        let glob = globset::GlobBuilder::new(&normalized)
+            .case_insensitive(case_insensitive)
+            .build();
         if let Ok(glob) = glob {
             builder.add(glob);
             valid_pattern_count += 1;
@@ -851,11 +892,7 @@ fn compile_exclude_patterns(patterns: &[String]) -> Option<globset::GlobSet> {
 fn project_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
     let path_components = path.components().collect::<Vec<_>>();
     let root_components = root.components().collect::<Vec<_>>();
-    if path_components.len() < root_components.len()
-        || !path_components
-            .iter()
-            .zip(root_components.iter())
-            .all(|(path, root)| project_components_equal(*path, *root))
+    if path_components.len() < root_components.len() || !path_identity::path_starts_with(path, root)
     {
         return None;
     }
@@ -866,7 +903,16 @@ fn project_relative_path(path: &Path, root: &Path) -> Option<PathBuf> {
     Some(relative)
 }
 
-fn is_default_excluded_component(component: Component<'_>) -> bool {
+fn has_default_excluded_component_under(path: &Path, root: &Path) -> bool {
+    let case_insensitive = path_identity::is_case_insensitive(path);
+    project_relative_path(path, root).is_some_and(|relative| {
+        relative
+            .components()
+            .any(|component| is_default_excluded_component(component, case_insensitive))
+    })
+}
+
+fn is_default_excluded_component(component: Component<'_>, case_insensitive: bool) -> bool {
     let Component::Normal(name) = component else {
         return false;
     };
@@ -886,14 +932,11 @@ fn is_default_excluded_component(component: Component<'_>) -> bool {
         "build",
         "coverage",
     ];
-    #[cfg(windows)]
-    {
+    if case_insensitive {
         DEFAULT_EXCLUDED_COMPONENTS
             .iter()
             .any(|excluded| name.eq_ignore_ascii_case(excluded))
-    }
-    #[cfg(not(windows))]
-    {
+    } else {
         DEFAULT_EXCLUDED_COMPONENTS.contains(&name)
     }
 }
@@ -3032,9 +3075,6 @@ pub fn project_candidate_membership_with_deleted_paths_and_budget(
     })
 }
 
-#[cfg(windows)]
-type ProjectPathIdentity = Vec<String>;
-#[cfg(not(windows))]
 type ProjectPathIdentity = Vec<std::ffi::OsString>;
 
 fn project_path_identity(
@@ -3042,6 +3082,7 @@ fn project_path_identity(
     cancel: Option<&AtomicBool>,
     work_budget: Option<&dyn ProjectWorkBudget>,
 ) -> Result<ProjectPathIdentity, String> {
+    let case_insensitive = path_identity::is_case_insensitive(path);
     let mut identity = Vec::new();
     for component in path.components() {
         check_project_scan_cancel(cancel)?;
@@ -3050,14 +3091,13 @@ fn project_path_identity(
             budget.charge_path_visits(1)?;
             budget.charge_path_bytes(project_path_materialization_bytes(component.as_os_str())?)?;
         }
-        #[cfg(windows)]
-        {
+        if case_insensitive {
             let mut key = component.as_os_str().to_string_lossy().into_owned();
             key.make_ascii_lowercase();
-            identity.push(key);
+            identity.push(key.into());
+        } else {
+            identity.push(component.as_os_str().to_os_string());
         }
-        #[cfg(not(windows))]
-        identity.push(component.as_os_str().to_os_string());
     }
     Ok(identity)
 }
@@ -3211,42 +3251,17 @@ fn sort_project_candidates(
 }
 
 fn project_path_starts_with(path: &Path, root: &Path) -> bool {
-    let path_components = path.components().collect::<Vec<_>>();
-    let root_components = root.components().collect::<Vec<_>>();
-    path_components.len() >= root_components.len()
-        && path_components
-            .iter()
-            .zip(root_components.iter())
-            .all(|(path, root)| project_components_equal(*path, *root))
+    path_identity::path_starts_with(path, root)
 }
 
 fn project_paths_equal(left: &Path, right: &Path) -> bool {
-    let left_components = left.components().collect::<Vec<_>>();
-    let right_components = right.components().collect::<Vec<_>>();
-    left_components.len() == right_components.len()
-        && left_components
-            .iter()
-            .zip(right_components.iter())
-            .all(|(left, right)| project_components_equal(*left, *right))
+    path_identity::paths_equal(left, right)
 }
 
 fn is_deleted_path(path: &Path, deleted_paths: &[PathBuf]) -> bool {
     deleted_paths
         .iter()
         .any(|deleted| project_paths_equal(path, deleted))
-}
-
-fn project_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
-    #[cfg(windows)]
-    {
-        left.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left.as_os_str() == right.as_os_str()
-    }
 }
 
 fn project_directory_entries(
@@ -4354,12 +4369,7 @@ fn source_ownership(
             identity_unverified = true;
             continue;
         };
-        let matches = if cfg!(windows) {
-            paths_equal_ci(&identity, &target_identity)
-        } else {
-            identity == target_identity
-        };
-        owns_source |= matches;
+        owns_source |= path_identity::paths_equal(&identity, &target_identity);
     }
     (owns_source, identity_unverified)
 }
@@ -6735,20 +6745,21 @@ fn resolve_existing_path_status(
     if TEST_USE_LEGACY_PATH_RESOLUTION.with(std::cell::Cell::get) {
         return resolve_existing_path_status_legacy(&absolute, warnings, kind);
     }
-    // Linux follows intermediate directory symlinks but keeps a final symlink
-    // as an entry, matching the component walk below. This also lets paths
-    // through execute-only directories resolve without requiring a listing.
-    #[cfg(target_os = "linux")]
-    if fs::symlink_metadata(&absolute).is_ok() {
-        return ExistingPathStatus::Found(absolute);
-    }
-    // Windows reports the on-disk spelling (long names, letter case) of an
-    // existing path; when it is the spelling asked for, no walk is needed.
-    // Symlinks, junctions and other spellings take the walk.
-    #[cfg(windows)]
-    if fs::canonicalize(&absolute)
-        .is_ok_and(|canonical| path_identity::without_verbatim_prefix(canonical) == absolute)
-    {
+    if path_identity::is_case_insensitive(&absolute) {
+        // Windows and macOS report the on-disk spelling (letter case, and
+        // long names on Windows) of an existing path; when it is the
+        // spelling asked for, no walk is needed. Symlinks, junctions and
+        // other spellings take the walk.
+        if fs::canonicalize(&absolute)
+            .is_ok_and(|canonical| path_identity::without_verbatim_prefix(canonical) == absolute)
+        {
+            return ExistingPathStatus::Found(absolute);
+        }
+    } else if fs::symlink_metadata(&absolute).is_ok() {
+        // An exact entry on a case-sensitive volume needs no walk. Like the
+        // walk, this follows intermediate directory symlinks but keeps a
+        // final symlink as an entry, and it lets paths through execute-only
+        // directories resolve without requiring a listing.
         return ExistingPathStatus::Found(absolute);
     }
     let mut current = path_identity::walk_root(&absolute);
@@ -9874,12 +9885,14 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
-    // (backlog TASK-74).
+    // Needs case-distinct paths, which Windows volumes cannot hold.
     #[test]
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     fn path_resolution_prefers_an_exact_component_over_case_variants() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let Some(base) = crate::path_identity::case_sensitive_test_dir() else {
+            return;
+        };
+        let temp = tempfile::tempdir_in(base).expect("temporary directory");
         let exact = temp.path().join("Foo");
         fs::create_dir(&exact).expect("exact directory");
         fs::create_dir(temp.path().join("FOO")).expect("case variant directory");
@@ -10073,12 +10086,14 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
-    // (backlog TASK-74).
+    // Needs case-distinct paths, which Windows volumes cannot hold.
     #[test]
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     fn path_resolution_rejects_ambiguous_case_insensitive_matches() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let Some(base) = crate::path_identity::case_sensitive_test_dir() else {
+            return;
+        };
+        let temp = tempfile::tempdir_in(base).expect("temporary directory");
         fs::create_dir(temp.path().join("Foo")).expect("first case variant");
         fs::create_dir(temp.path().join("FOO")).expect("second case variant");
         let requested = temp.path().join("foo");
@@ -10214,10 +10229,7 @@ mod tests {
         );
     }
 
-    // Linux and Windows resolve exact paths without listing directories; on
-    // macOS the on-disk spelling is found by a component walk (backlog TASK-74).
     #[test]
-    #[cfg(not(target_os = "macos"))]
     fn path_resolution_does_not_list_directories_for_exact_paths() {
         const PATHS: usize = 24;
         let temp = tempfile::tempdir().expect("temporary directory");

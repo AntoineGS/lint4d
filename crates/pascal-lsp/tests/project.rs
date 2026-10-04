@@ -791,12 +791,14 @@ fn incomplete_configured_candidate_does_not_establish_a_unique_owner() {
     );
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
-// (backlog TASK-74).
-#[cfg(all(unix, not(target_os = "macos")))]
+// Needs case-distinct paths, which Windows volumes cannot hold.
+#[cfg(unix)]
 #[test]
 fn case_distinct_external_project_does_not_inherit_workspace_overrides() {
-    let root = tempfile::tempdir().unwrap();
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let root = tempfile::tempdir_in(base).unwrap();
     let workspace = root.path().join("repo/ws");
     let external = root.path().join("repo/WS/app");
     let source = external.join("Main.dpr");
@@ -1480,12 +1482,14 @@ fn tainted_condition_comparisons_remain_unknown() {
     );
 }
 
-// Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
-// (backlog TASK-74).
+// Needs case-distinct paths, which Windows volumes cannot hold.
 #[test]
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(windows))]
 fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
-    let temp = tempfile::tempdir().expect("temporary fixture");
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(base).expect("temporary fixture");
     let root = temp.path();
     write(
         root.join("ws/src/U.pas").as_path(),
@@ -1515,12 +1519,14 @@ fn ambiguous_workspace_root_never_allows_project_discovery_outside_it() {
     );
 }
 
-// Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
-// (backlog TASK-74).
+// Needs case-distinct paths, which Windows volumes cannot hold.
 #[test]
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(windows))]
 fn case_distinct_workspace_roots_keep_relative_project_ambiguity() {
-    let temp = tempfile::tempdir().expect("temporary fixture");
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(base).expect("temporary fixture");
     let root = temp.path();
     write(
         root.join("ws/App.dproj").as_path(),
@@ -2335,12 +2341,14 @@ fn metadata_limit_prevents_automatic_exclusion() {
     );
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
-// (backlog TASK-74).
-#[cfg(all(unix, not(target_os = "macos")))]
+// Needs case-distinct paths, which Windows volumes cannot hold.
+#[cfg(unix)]
 #[test]
 fn case_distinct_candidate_is_preserved_in_the_ownership_readset() {
-    let temp = tempfile::tempdir().expect("temporary fixture");
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(base).expect("temporary fixture");
     let root = temp.path();
     write(
         root.join("src/Shared.pas").as_path(),
@@ -3024,13 +3032,15 @@ fn mapped_include_paths_remain_separate_from_unit_search_paths() {
     assert_eq!(context.include_paths, vec![include]);
 }
 
-// Needs case-distinct paths; macOS volumes are usually case-insensitive
-// (backlog TASK-74).
-#[cfg(all(unix, not(target_os = "macos")))]
+// Needs case-distinct paths, which Windows volumes cannot hold.
+#[cfg(unix)]
 #[test]
 fn mapped_native_lookup_prefers_exact_case_and_rejects_ambiguous_fallback() {
-    let root = tempfile::tempdir().unwrap();
-    let sdk = tempfile::tempdir().unwrap();
+    let Some(base) = pascal_project::path_identity::case_sensitive_test_dir() else {
+        return;
+    };
+    let root = tempfile::tempdir_in(&base).unwrap();
+    let sdk = tempfile::tempdir_in(&base).unwrap();
     let exact = sdk.path().join("Provider.pas");
     let ambiguous = sdk.path().join("provider.pas");
     let main = root.path().join("App.dpr");

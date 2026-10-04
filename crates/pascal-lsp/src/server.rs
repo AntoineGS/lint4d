@@ -14708,15 +14708,7 @@ fn send_file_watcher_registration(
 }
 
 fn watcher_path_key(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('\\', "/");
-    #[cfg(windows)]
-    {
-        path.to_ascii_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        path
-    }
+    pascal_project::path_identity::path_key(path).replace('\\', "/")
 }
 
 fn parse_params<T: DeserializeOwned>(request: &Request) -> Result<T, String> {

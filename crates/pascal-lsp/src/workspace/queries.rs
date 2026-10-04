@@ -2423,6 +2423,40 @@ mod tests {
         assert!(error.contains("symlink"), "unexpected refusal: {error}");
     }
 
+    // On a case-insensitive volume the requested spelling also opens the
+    // file; the link still targets the spelling on disk.
+    #[test]
+    fn include_document_link_targets_the_on_disk_spelling() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let root = pascal_project::path_identity::without_verbatim_prefix(
+            fs::canonicalize(temp.path()).expect("canonical workspace"),
+        );
+        let main = root.join("Main.pas");
+        fs::write(
+            &main,
+            "unit Main;\ninterface\nimplementation\n{$I SELECTED.INC}\nend.\n",
+        )
+        .expect("main source");
+        fs::write(root.join("Selected.inc"), "const Selected = 1;\n").expect("include");
+        let workspace = test_workspace(vec![root.clone()], WorkspaceOptions::default());
+
+        let computed = super::document_links_from_input(
+            workspace.analysis_input(),
+            &source_uri(&main),
+            &AtomicBool::new(false),
+        );
+
+        let links = computed.value.expect("document links");
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(
+            links[0]
+                .target
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok()),
+            Some(root.join("Selected.inc"))
+        );
+    }
+
     fn nested_resource_links(root: &Path) -> Computed<Vec<lsp_types::DocumentLink>> {
         let main = root.join("Main.pas");
         fs::create_dir_all(root.join("assets")).expect("assets directory");

@@ -654,11 +654,8 @@ mod tests {
         assert_eq!(paths.library[0].path, sdk.join("lib"));
     }
 
-    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
-    // (backlog TASK-74).
     #[test]
-    #[cfg(not(any(windows, target_os = "macos")))]
-    fn copied_envoptions_source_path_resolves_case_insensitively_on_linux() {
+    fn copied_envoptions_source_path_resolves_case_insensitively() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
         let ide = temp.path().join("ide");
@@ -701,9 +698,6 @@ mod tests {
         assert_eq!(paths.library[0].path, physical);
     }
 
-    // Needs case-distinct paths; macOS volumes are usually case-insensitive
-    // (backlog TASK-74).
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn reconciliation_accepts_case_correction_in_a_directory_with_over_256_entries() {
         let temp = tempfile::tempdir().unwrap();
@@ -754,12 +748,14 @@ mod tests {
         );
     }
 
-    // Needs case-distinct paths; Windows volumes and usually macOS volumes are case-insensitive
-    // (backlog TASK-74).
+    // Needs case-distinct paths, which Windows volumes cannot hold.
     #[test]
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     fn reconciliation_rejects_ambiguous_case_insensitive_components() {
-        let temp = tempfile::tempdir().unwrap();
+        let Some(base) = crate::path_identity::case_sensitive_test_dir() else {
+            return;
+        };
+        let temp = tempfile::tempdir_in(base).unwrap();
         let root = temp.path().join("sdk");
         fs::create_dir_all(root.join("source/unit")).unwrap();
         fs::create_dir_all(root.join("SOURCE/unit")).unwrap();
@@ -1584,7 +1580,11 @@ fn reconcile_ide_path(
         };
         current = selected;
     }
-    Ok(Some(current))
+    // On a case-insensitive volume the exact probes above also accept other
+    // letter case; report the spelling on disk.
+    Ok(Some(
+        crate::path_identity::on_disk_spelling(&current).unwrap_or(current),
+    ))
 }
 
 fn checked_symlink_metadata(

@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-02 23:22'
-updated_date: '2026-10-04 02:39'
+updated_date: '2026-10-04 04:10'
 labels:
   - arch-review
   - lsp
@@ -74,6 +74,8 @@ Verification: pascal-lsp lib (test-support) 694 passed, 1 ignored; protocol_barr
 Implemented on branch perf/lsp-protocol-commits (worktree .worktrees/lsp-protocol-commits), awaiting review and merge.
 
 Merged into master as 153ab6b (branch perf/lsp-protocol-commits, via integration/2026-10-03, fast-forwarded 2026-10-03). Merged tree verified (identical to integration/2026-10-03 aebf633): cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean (also --all-features); cargo test --workspace 3603 passed / 0 failed / 9 ignored; pascal-lsp protocol + protocol_barriers with test-support 914/916 (the two TASK-1.2 shutdown/cancel timing tests fail identically on d55c0f6); fmt corpus gate 326 files idempotent; Windows/macOS/Linux CI green on PR #6/#7.
+
+2026-10-04 (TASK-135, branch fix/windows-lsp-tests 678f6f3, PR #8): the AC #1 test no longer asserts a 10 ms wall-clock bound measured with Instant; that bound failed on Windows debug CI at 10.65 ms. It now counts the observations dependency_scoped_result_is_fresh examines through a #[cfg(test)] counter and asserts exactly 4000. With the hash prefilter removed the count is 16,644,000, so it guards the same complexity property deterministically. The counter covers the filter pass and the paths_equal_ci loop only.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

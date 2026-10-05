@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 23:40'
-updated_date: '2026-10-05 00:50'
+updated_date: '2026-10-05 01:07'
 labels:
   - fmt
   - correctness
@@ -77,6 +77,8 @@ Declined from the review, filed under TASK-137: with sorting on, the same clause
 Merged into master by fast-forward to a6850d2 (branch fix/fmt-punctuation-trivia, 2026-10-04). Merged tree verified: cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean; cargo test --workspace 3610 passed / 0 failed / 9 ignored.
 
 Regression found during TASK-137: restore_commas_before_directives applied to every directive, so with sorting 'uses B, {$R+} A;' became 'A,' / 'B,' / '{$R+};' (reads 'uses A, B, ;'). Fixed on branch fix/fmt-uses-include-punctuation by TASK-137, which replaces the restore rule: clauses holding an include keep the source's punctuation, and other directives never move punctuation. Regression test: uses_sorting_around_other_directives_keeps_the_clause_valid.
+
+The {$R+} regression fix (TASK-137) merged into master at bee2969.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

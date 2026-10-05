@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-04 22:49'
-updated_date: '2026-10-05 00:57'
+updated_date: '2026-10-05 01:07'
 labels:
   - fmt
   - correctness
@@ -75,6 +75,8 @@ Review round 1 (code-reviewer subagent on b867a60..1c50c48; approach judged soun
 1. A branch holding only a ',' lost it in source mode: 'uses A {$IFDEF X}, {$ELSE}, {$ENDIF} {$I u.inc};' (reads 'A, U' either way) came out with empty branches ('A U'). RED: new shape in uses_clause_with_an_include_keeps_its_order_and_punctuation. Fix: emit_list writes a list's leading ',' on its own line when the list has no item to put it before. GREEN.
 2. '(*$I u.inc*)' never switches a clause to source mode: the grammar parses the '(*$' spelling as a comment (so do (*$IFDEF*) blocks), so fmt4d formats it as a comment everywhere. Not fixable in the uses layout alone (comments are placed after a unit's punctuation). is_include_directive no longer claims to accept '(*$'; filed TASK-138 for the grammar.
 After the fixes: cargo test -p fmt4d 512 passed; cargo test --workspace 3614 / 0 / 9; clippy -D warnings, fmt --check clean; corpus gate: only the include fixtures differ, 0 non-idempotent.
+
+Merged into master by fast-forward to bee2969 (branch fix/fmt-uses-include-punctuation, 2026-10-04). Merged tree verified: cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean; cargo test --workspace --no-fail-fast 3614 passed / 0 failed / 9 ignored. A first run had one pascal-lsp protocol receive timeout (source_bearing_mixed_roots_and_repeated_includes_deduplicate_physical_results) under full-suite load; it passed 3/3 alone and in the rerun (timing family of TASK-1.2, no fmt4d involvement).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

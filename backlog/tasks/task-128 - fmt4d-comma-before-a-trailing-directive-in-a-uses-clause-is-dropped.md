@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 23:40'
-updated_date: '2026-10-04 22:58'
+updated_date: '2026-10-05 00:24'
 labels:
   - fmt
   - correctness
@@ -73,6 +73,8 @@ RED: comma_before_a_directive_in_a_comma_first_list_is_kept failed ('{$I u.inc}'
 Fix: restore_commas_before_directives(roles, puncts, comma_first) writes the directive comma-first (', {$I u.inc}') when it has no item before it, when that item is written comma-first, or when the whole list is; the item before it gets the ',' otherwise; an item that already ends in punctuation is left alone. Directives honour Punct.lead (Punct::lead_text, also used by emit_unit).
 GREEN: cargo test -p fmt4d 508 passed; cargo test --workspace 3610 passed / 0 failed / 9 ignored; clippy --workspace -D warnings and fmt --check clean; corpus gate 347 files, only the two new uses fixtures differ, 0 non-idempotent.
 Declined from the review, filed under TASK-137: with sorting on, the same clause moves the block in front of A, and the include then precedes A without a ',' (directive followed by a unit).
+
+Merged into master by fast-forward to a6850d2 (branch fix/fmt-punctuation-trivia, 2026-10-04). Merged tree verified: cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean; cargo test --workspace 3610 passed / 0 failed / 9 ignored.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

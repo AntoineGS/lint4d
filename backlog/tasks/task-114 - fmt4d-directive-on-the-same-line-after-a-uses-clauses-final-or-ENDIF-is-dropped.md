@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 22:18'
-updated_date: '2026-10-04 22:39'
+updated_date: '2026-10-05 00:24'
 labels:
   - fmt
   - correctness
@@ -62,6 +62,8 @@ RED (master src): directive_after_uses_clause_on_its_line_is_kept failed ('{$I d
 Ruling: the trivia after the clause's end stays on the end's line ('A; {$I d.inc}', '{$ENDIF} {$I d.inc}', '{$ENDIF}; {$I d.inc}'), after the comments of the item that now ends the clause; when those hold a '//' comment it goes before them ('A; {$I d.inc} // c'), which reorders that comment and the directive but keeps both on the line. On its own line the directive would lead the next declaration on a second run, so it would not be idempotent. With sorting the directive stays at the clause's end ('uses B, A; {$I d.inc}' -> 'A,' / 'B; {$I d.inc}').
 Change: uses.rs UsesClause / after_clause_trivia, extract_uses_items(.., directives) -> UsesClause, layout_uses_items(items, after, ..), emit_list(.., after, ..) and with_after; doc_builder.rs build_uses passes the DirectiveMap and the trivia. The uses.rs unit tests pass DirectiveMap::empty().
 GREEN: cargo test -p fmt4d all pass (fmt_bugs_test 173, fmt_roundtrip_test 31, lib 113); clippy -p fmt4d --all-targets -D warnings and fmt --check clean. Corpus gate (346 files, plain and aligned, base master 9322cce): only the new fixture differs (base drops its directives), 0 non-idempotent.
+
+Merged into master by fast-forward to a6850d2 (branch fix/fmt-punctuation-trivia, 2026-10-04). Merged tree verified: cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean; cargo test --workspace 3610 passed / 0 failed / 9 ignored.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

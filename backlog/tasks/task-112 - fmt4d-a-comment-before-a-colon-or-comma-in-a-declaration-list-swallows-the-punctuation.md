@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-03 22:14'
-updated_date: '2026-10-04 22:34'
+updated_date: '2026-10-05 00:24'
 labels:
   - fmt
   - correctness
@@ -79,6 +79,8 @@ RED (master src): line_comment_before_colon_does_not_swallow_a_var_type / _a_par
 Ruling: the line breaks before the ':' ('B // why' / ': Integer;'), the layout the formatter already gave a single-identifier declaration in plain mode; the comment is not moved after the ';' because the suffix may carry its own trailing comments, whose order would change.
 Change: doc_builder_decls.rs build_comma_ident_decl adds a Hardline before the suffix when the last identifier trails a '//' comment (DECL_VAR expansion and DECL_ARG/DECL_FIELD group); doc_builder_alignment.rs decompose_var_or_field also bails out when the name right before the ':' trails a '//' comment (name_list_has_line_comment only scans up to the last name's end), and expand_comma_var_rows lays out only that last identifier unaligned (RowBody::Plain, emitted like other non-row items).
 GREEN: cargo test -p fmt4d all pass (fmt_bugs_test 172, fmt_roundtrip_test 31, lib 113); clippy -p fmt4d --all-targets -D warnings and cargo fmt --check clean. Corpus gate (/tmp/fmtx/gate.sh: 345 files = repo .pas fixtures + /tmp/fmtrev/corp, plain and aligned, base = master 9322cce): 0 differences from base, 0 non-idempotent.
+
+Merged into master by fast-forward to a6850d2 (branch fix/fmt-punctuation-trivia, 2026-10-04). Merged tree verified: cargo fmt --check clean; clippy --workspace --all-targets -D warnings clean; cargo test --workspace 3610 passed / 0 failed / 9 ignored.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

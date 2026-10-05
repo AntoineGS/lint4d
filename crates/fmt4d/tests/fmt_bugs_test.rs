@@ -4333,6 +4333,11 @@ fn uses_clause_with_an_include_keeps_its_order_and_punctuation() {
             "uses {$IFDEF X} B, {$I u.inc} {$ENDIF}, C;",
             "uses\n  {$IFDEF X}\n  B,\n  {$I u.inc}\n  {$ENDIF},\n  C;\n",
         ),
+        // A branch holding only a `,` keeps it.
+        (
+            "uses A {$IFDEF X}, {$ELSE}, {$ENDIF} {$I u.inc};",
+            "uses\n  A\n  {$IFDEF X}\n  ,\n  {$ELSE}\n  ,\n  {$ENDIF}\n  {$I u.inc};\n",
+        ),
         (
             "uses {$IFDEF X} B {$I u.inc} {$ENDIF}, C;",
             "uses\n  {$IFDEF X}\n  B\n  {$I u.inc}\n  {$ENDIF},\n  C;\n",

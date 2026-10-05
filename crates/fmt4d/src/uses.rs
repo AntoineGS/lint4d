@@ -81,9 +81,10 @@ impl UsesItem {
 }
 
 /// An `{$I file}` or `{$INCLUDE file}` directive (not the `{$I+}` switch),
-/// whose file is read in its place.
+/// whose file is read in its place. The grammar parses the `(*$I file*)`
+/// spelling as a comment.
 fn is_include_directive(text: &str) -> bool {
-    let Some(body) = text.strip_prefix("{$").or_else(|| text.strip_prefix("(*$")) else {
+    let Some(body) = text.strip_prefix("{$") else {
         return false;
     };
     let name_end = body
@@ -1107,6 +1108,10 @@ fn emit_list(
         ListStyle::Source { lead } => source_puncts(items, end, lead),
     };
     let source = matches!(style, ListStyle::Source { .. });
+    // A `,` that starts a list with no item to write it before gets a line.
+    if style == (ListStyle::Source { lead: true }) && !puncts.iter().any(|p| p.lead) {
+        lines.push(format!("{indent},"));
+    }
     let mut idx = 0;
     while idx < items.len() {
         let ends_clause = puncts[idx].end == ItemEnd::Semicolon;
@@ -1884,12 +1889,7 @@ mod tests {
 
     #[test]
     fn include_directives_are_recognised() {
-        for text in [
-            "{$I a.inc}",
-            "{$i 'b c.inc'}",
-            "{$INCLUDE a.inc}",
-            "(*$I a.inc*)",
-        ] {
+        for text in ["{$I a.inc}", "{$i 'b c.inc'}", "{$INCLUDE a.inc}"] {
             assert!(is_include_directive(text), "{text}");
         }
         for text in ["{$I+}", "{$I-}", "{$IFDEF X}", "{$HINTS OFF}", "{$R *.res}"] {

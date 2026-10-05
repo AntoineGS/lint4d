@@ -6161,7 +6161,7 @@
               "value": 5,
               "content": {
                 "type": "PATTERN",
-                "value": "\\{\\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\\}",
+                "value": "\\{\\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(ifdef|ifndef|if)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
                 "flags": "i"
               }
             }
@@ -6203,7 +6203,7 @@
                     "value": 5,
                     "content": {
                       "type": "PATTERN",
-                      "value": "\\{\\$(elseif|else)([^a-zA-Z_}][^}]*)?\\}",
+                      "value": "\\{\\$(elseif|else)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(elseif|else)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
                       "flags": "i"
                     }
                   }
@@ -6243,7 +6243,7 @@
               "value": 5,
               "content": {
                 "type": "PATTERN",
-                "value": "\\{\\$(endif|ifend)([^a-zA-Z_}][^}]*)?\\}",
+                "value": "\\{\\$(endif|ifend)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(endif|ifend)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
                 "flags": "i"
               }
             }
@@ -6265,7 +6265,7 @@
               "value": 5,
               "content": {
                 "type": "PATTERN",
-                "value": "\\{\\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\\}",
+                "value": "\\{\\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(ifdef|ifndef|if)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
                 "flags": "i"
               }
             }
@@ -6311,7 +6311,7 @@
                     "value": 5,
                     "content": {
                       "type": "PATTERN",
-                      "value": "\\{\\$(elseif|else)([^a-zA-Z_}][^}]*)?\\}",
+                      "value": "\\{\\$(elseif|else)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(elseif|else)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
                       "flags": "i"
                     }
                   }
@@ -6355,7 +6355,7 @@
               "value": 5,
               "content": {
                 "type": "PATTERN",
-                "value": "\\{\\$(endif|ifend)([^a-zA-Z_}][^}]*)?\\}",
+                "value": "\\{\\$(endif|ifend)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(endif|ifend)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
                 "flags": "i"
               }
             }
@@ -6372,7 +6372,7 @@
         "value": 5,
         "content": {
           "type": "PATTERN",
-          "value": "\\{\\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\\}",
+          "value": "\\{\\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(ifdef|ifndef|if)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
           "flags": "i"
         }
       }
@@ -6384,7 +6384,7 @@
         "value": 5,
         "content": {
           "type": "PATTERN",
-          "value": "\\{\\$(elseif|else)([^a-zA-Z_}][^}]*)?\\}",
+          "value": "\\{\\$(elseif|else)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(elseif|else)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
           "flags": "i"
         }
       }
@@ -6396,7 +6396,7 @@
         "value": 5,
         "content": {
           "type": "PATTERN",
-          "value": "\\{\\$(endif|ifend)([^a-zA-Z_}][^}]*)?\\}",
+          "value": "\\{\\$(endif|ifend)([^a-zA-Z_}][^}]*)?\\}|\\(\\*\\$(endif|ifend)([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)",
           "flags": "i"
         }
       }
@@ -12355,8 +12355,17 @@
         "type": "PREC",
         "value": -1,
         "content": {
-          "type": "PATTERN",
-          "value": "\\{\\$[^}]*\\}"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "PATTERN",
+              "value": "\\{\\$[^}]*\\}"
+            },
+            {
+              "type": "PATTERN",
+              "value": "\\(\\*\\$[^*]*(\\*+[^*)][^*]*)*\\*+\\)"
+            }
+          ]
         }
       }
     },
@@ -12397,7 +12406,7 @@
           },
           {
             "type": "PATTERN",
-            "value": "[(][*]([^*]*[*]+[^)*])*[^*]*[*]+[)]"
+            "value": "[(][*]([^$*][^*]*)?[*]+([^)*][^*]*[*]+)*[)]"
           }
         ]
       }

@@ -4367,6 +4367,30 @@ fn uses_sorting_around_other_directives_keeps_the_clause_valid() {
     }
 }
 
+// ── Bug: `(*$ ... *)` directives were read as comments (TASK-138) ──
+
+#[test]
+fn paren_star_directives_in_a_uses_clause_are_directives() {
+    for (clause, expected) in [
+        // An include keeps the clause in source order.
+        (
+            "uses B, A, (*$I u.inc*), C;",
+            "uses\n  B,\n  A,\n  (*$I u.inc*),\n  C;\n",
+        ),
+        // A conditional is a block: its units stay inside it.
+        (
+            "uses C, (*$IFDEF X*) B, (*$ELSE*) D, (*$ENDIF*) A;",
+            "uses\n  A,\n  (*$IFDEF X*)\n  B,\n  (*$ELSE*)\n  D,\n  (*$ENDIF*)\n  C;\n",
+        ),
+    ] {
+        let src = uses_source(clause);
+        let result = format_source(&src);
+        assert!(result.contains(expected), "{clause:?}:\n{result}");
+        assert_parses_cleanly(&result);
+        idempotency_check(&src);
+    }
+}
+
 #[test]
 fn uses_sorting_never_leaves_a_conditional_block_last() {
     let src = "unit T;\ninterface\nuses B, {$IFDEF X} C, {$ENDIF} A;\nimplementation\nend.\n";

@@ -602,6 +602,68 @@ fn every_fixture_round_trips() {
     assert!(unexpected.is_empty(), "{}", unexpected.join("\n\n"));
 }
 
+/// `source` with every directive `{$x}` respelled `(*$x*)`, or the reverse
+/// (`to_paren_star` false). Strings and comments are not told apart: the
+/// fixtures hold neither spelling inside them.
+fn respell_directives(source: &str, to_paren_star: bool) -> String {
+    let (open, close, new_open, new_close) = if to_paren_star {
+        ("{$", "}", "(*$", "*)")
+    } else {
+        ("(*$", "*)", "{$", "}")
+    };
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find(open) {
+        let body = &rest[start + open.len()..];
+        let Some(end) = body.find(close) else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(new_open);
+        out.push_str(&body[..end]);
+        out.push_str(new_close);
+        rest = &body[end + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn every_fixture_formats_alike_in_either_directive_spelling() {
+    // `(*$x*)` is the same directive as `{$x}` (TASK-138).
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut differ = Vec::new();
+    let mut checked = 0;
+    for path in fixture_files() {
+        let source = std::fs::read_to_string(workspace.join(&path)).expect("fixture is readable");
+        if !source.contains("{$") || source.contains("(*$") {
+            continue;
+        }
+        checked += 1;
+        let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
+        let format = |src: &str| {
+            fmt4d::formatter::format_source(
+                src.as_bytes(),
+                &info,
+                &fmt4d::config::FmtConfig::default(),
+                &std::collections::HashSet::new(),
+            )
+            .map_err(|e| format!("{e:?}"))
+        };
+        let brace = format(&source);
+        let paren_star =
+            format(&respell_directives(&source, true)).map(|out| respell_directives(&out, false));
+        if brace != paren_star {
+            differ.push(format!(
+                "{}:\n--- {{$\n{brace:?}\n--- (*$\n{paren_star:?}",
+                path.display()
+            ));
+        }
+    }
+    assert!(checked >= 20, "fixtures with directives not found");
+    assert!(differ.is_empty(), "{}", differ.join("\n\n"));
+}
+
 fn format_unsorted(source: &str) -> String {
     let info = pascal_core::FileInfo::new(PathBuf::from("test.pas"));
     let mut config = fmt4d::config::FmtConfig::default();

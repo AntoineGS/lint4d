@@ -225,17 +225,17 @@ fn scan_directive_pairs(source: &[u8]) -> Option<Vec<Pair>> {
         if cursor >= source.len() {
             break;
         }
-        if source[cursor] != b'{' || cursor + 1 >= source.len() || source[cursor + 1] != b'$' {
+        let Some(keyword) = directive_keyword_start(source, cursor) else {
             cursor += 1;
             continue;
-        }
-        // cursor is at `{$`. Classify the directive keyword.
-        let kind = directive_keyword_kind(source, cursor + 2);
+        };
+        // cursor is at `{$` or `(*$`. Classify the directive keyword.
+        let kind = directive_keyword_kind(source, keyword);
         match kind {
             DirectiveKind::If => {
                 has_any = true;
                 let opening_start = cursor;
-                let opening_end = find_close_brace(source, cursor)?;
+                let opening_end = find_directive_end(source, cursor)?;
                 match scan_to_endif(source, opening_end) {
                     Some((closing_start, closing_end, has_else)) => {
                         pairs.push(Pair {
@@ -253,7 +253,7 @@ fn scan_directive_pairs(source: &[u8]) -> Option<Vec<Pair>> {
                 }
             }
             _ => {
-                cursor = find_close_brace(source, cursor).unwrap_or(cursor + 1);
+                cursor = find_directive_end(source, cursor).unwrap_or(cursor + 1);
             }
         }
     }
@@ -299,44 +299,63 @@ fn scan_to_endif(source: &[u8], opening_end: usize) -> Option<(usize, usize, boo
         if cursor >= source.len() {
             return None;
         }
-        if source[cursor] != b'{' || cursor + 1 >= source.len() || source[cursor + 1] != b'$' {
+        let Some(keyword) = directive_keyword_start(source, cursor) else {
             cursor += 1;
             continue;
-        }
-        let kind = directive_keyword_kind(source, cursor + 2);
+        };
+        let kind = directive_keyword_kind(source, keyword);
         match kind {
             DirectiveKind::If => {
                 depth += 1;
-                cursor = find_close_brace(source, cursor)?;
+                cursor = find_directive_end(source, cursor)?;
             }
             DirectiveKind::Else if depth == 1 => {
                 saw_else = true;
-                cursor = find_close_brace(source, cursor)?;
+                cursor = find_directive_end(source, cursor)?;
             }
             DirectiveKind::Else => {
-                cursor = find_close_brace(source, cursor)?;
+                cursor = find_directive_end(source, cursor)?;
             }
             DirectiveKind::Endif => {
                 depth -= 1;
                 let closing_start = cursor;
-                let closing_end = find_close_brace(source, cursor)?;
+                let closing_end = find_directive_end(source, cursor)?;
                 if depth == 0 {
                     return Some((closing_start, closing_end, saw_else));
                 }
                 cursor = closing_end;
             }
             DirectiveKind::Other => {
-                cursor = find_close_brace(source, cursor).unwrap_or(cursor + 1);
+                cursor = find_directive_end(source, cursor).unwrap_or(cursor + 1);
             }
         }
     }
     None
 }
 
-/// Starting at a `{`, find the byte just after the matching `}`. Directives
-/// are single-line in Delphi practice but may contain nested content — for
-/// our purposes we scan to the **next** `}` which is the directive terminator.
-fn find_close_brace(source: &[u8], start: usize) -> Option<usize> {
+/// If a directive starts at `cursor`, spelled `{$...}` or `(*$...*)`, the
+/// byte where its keyword starts.
+fn directive_keyword_start(source: &[u8], cursor: usize) -> Option<usize> {
+    let rest = &source[cursor..];
+    if rest.starts_with(b"{$") {
+        Some(cursor + 2)
+    } else if rest.starts_with(b"(*$") {
+        Some(cursor + 3)
+    } else {
+        None
+    }
+}
+
+/// Starting at a directive, find the byte just after its end: the **next**
+/// `}`, or `*)` for the `(*$...*)` spelling.
+fn find_directive_end(source: &[u8], start: usize) -> Option<usize> {
+    if source[start] == b'(' {
+        debug_assert!(source[start..].starts_with(b"(*$"));
+        return source[start + 3..]
+            .windows(2)
+            .position(|pair| pair == b"*)")
+            .map(|offset| start + 3 + offset + 2);
+    }
     debug_assert_eq!(source[start], b'{');
     let mut cursor = start + 1;
     while cursor < source.len() {
@@ -350,8 +369,8 @@ fn find_close_brace(source: &[u8], start: usize) -> Option<usize> {
 
 /// Advance `cursor` past any whitespace, comment, or string literal,
 /// returning the position of the next lexically-significant byte (or
-/// `source.len()` if we fall off the end). Directives `{$...}` are NOT
-/// treated as comments — they are lexically significant.
+/// `source.len()` if we fall off the end). Directives `{$...}` and
+/// `(*$...*)` are NOT treated as comments — they are lexically significant.
 fn skip_lexical_noise(source: &[u8], mut cursor: usize) -> usize {
     loop {
         if cursor >= source.len() {
@@ -364,7 +383,9 @@ fn skip_lexical_noise(source: &[u8], mut cursor: usize) -> usize {
             b'/' if cursor + 1 < source.len() && source[cursor + 1] == b'/' => {
                 cursor = skip_line_comment(source, cursor);
             }
-            b'(' if cursor + 1 < source.len() && source[cursor + 1] == b'*' => {
+            b'(' if source[cursor..].starts_with(b"(*")
+                && !source[cursor..].starts_with(b"(*$") =>
+            {
                 cursor = skip_paren_star_comment(source, cursor);
             }
             b'{' if cursor + 1 < source.len() && source[cursor + 1] != b'$' => {
@@ -515,11 +536,15 @@ fn find_matching_open_brace_comment(body: &[u8], close_pos: usize) -> Option<usi
 }
 
 fn find_matching_paren_star(body: &[u8], star_paren_pos: usize) -> Option<usize> {
-    // Walk backward looking for `(*`.
+    // Walk backward looking for `(*` that does not open `(*$...*)`.
     let mut cursor = star_paren_pos + 1;
     while cursor >= 2 {
         cursor -= 1;
         if body[cursor - 1] == b'(' && body[cursor] == b'*' {
+            if body.get(cursor + 1) == Some(&b'$') {
+                // Directive, not a comment — give up.
+                return None;
+            }
             return Some(cursor - 1);
         }
     }
@@ -549,26 +574,21 @@ fn bytes_to_lossy_string(bytes: &[u8]) -> String {
 }
 
 /// Returns true iff `source[opening_start..]` begins with a `{$IF}` directive
-/// opener — i.e., `{$IF` followed by a non-alphabetic byte. This distinguishes
-/// `{$IF}` from `{$IFDEF}`, `{$IFNDEF}`, `{$IFOPT}`, `{$IFEND}`, and `{$ENDIF}`.
+/// opener (or `(*$IF`) — i.e., `{$IF` followed by a non-alphabetic byte. This
+/// distinguishes `{$IF}` from `{$IFDEF}`, `{$IFNDEF}`, `{$IFOPT}`, `{$IFEND}`,
+/// and `{$ENDIF}`.
 ///
 /// Case-insensitive on the keyword itself.
 fn is_if_opener(source: &[u8], opening_start: usize) -> bool {
-    let prefix = &source[opening_start..];
-    if prefix.len() < 4 {
+    let Some(keyword) = directive_keyword_start(source, opening_start) else {
         return false;
-    }
-    if prefix[0] != b'{' || prefix[1] != b'$' {
-        return false;
-    }
-    if !(prefix[2] == b'i' || prefix[2] == b'I') {
-        return false;
-    }
-    if !(prefix[3] == b'f' || prefix[3] == b'F') {
+    };
+    let prefix = &source[keyword..];
+    if prefix.len() < 2 || !prefix[..2].eq_ignore_ascii_case(b"if") {
         return false;
     }
     // Character after "if" must not be alphabetic (else it's ifdef, ifend, etc.)
-    let next = prefix.get(4).copied().unwrap_or(b' ');
+    let next = prefix.get(2).copied().unwrap_or(b' ');
     !next.is_ascii_alphabetic()
 }
 
@@ -713,6 +733,23 @@ mod tests {
     fn rewrite_trailing_do() {
         let src = ascii("{$IFNDEF X} while cond do {$ENDIF}\n  DoThing;\n");
         assert_eq!(patches_of(&src).len(), 1);
+    }
+
+    #[test]
+    fn rewrite_paren_star_spelling() {
+        let src = ascii("(*$IFNDEF X*) if (* c *) cond then (*$ENDIF*)\n  DoThing;\n");
+        let (rewritten, patches) = rewrite_partial_control_flow(&src);
+        assert_eq!(patches.len(), 1, "expected one patch");
+        let m = patches[0].expect_markers();
+        assert_eq!(m.opening_text, "(*$IFNDEF X*)");
+        assert_eq!(m.closing_text, "(*$ENDIF*)");
+        assert_eq!(
+            &rewritten[..],
+            &b"              if (* c *) cond then           \n  DoThing;\n"[..]
+        );
+        // An else branch in either spelling still counts.
+        let src = ascii("(*$IFDEF A*) if a then {$ELSE} if b then (*$ENDIF*)\n  DoThing;\n");
+        assert_eq!(patches_of(&src).len(), 0);
     }
 
     #[test]
@@ -1063,6 +1100,23 @@ mod tests {
     fn f_u8_empty_body_is_not_patched() {
         let src = b"unit X;\ninterface\nimplementation\n\
                     {$IF DEFINED(X)}{$IFEND}\nend.\n";
+        assert_eq!(opaque_patches_of(src).len(), 0);
+    }
+
+    #[test]
+    fn f_u10_paren_star_spelling() {
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    (*$IF A*)\nrappel: developper en 32 bits\n(*$IFEND*)\nend.\n";
+        let patches = opaque_patches_of(src);
+        assert_eq!(patches.len(), 1);
+        let o = patches[0].expect_opaque();
+        assert_eq!(
+            o.text,
+            "(*$IF A*)\nrappel: developper en 32 bits\n(*$IFEND*)"
+        );
+        // `(*$IFDEF*)` is out of Bucket F scope in this spelling too.
+        let src = b"unit X;\ninterface\nimplementation\n\
+                    (*$IFDEF X*)\nrappel: developper\n(*$ENDIF*)\nend.\n";
         assert_eq!(opaque_patches_of(src).len(), 0);
     }
 

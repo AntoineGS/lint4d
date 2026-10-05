@@ -81,10 +81,9 @@ impl UsesItem {
 }
 
 /// An `{$I file}` or `{$INCLUDE file}` directive (not the `{$I+}` switch),
-/// whose file is read in its place. The grammar parses the `(*$I file*)`
-/// spelling as a comment.
+/// also spelled `(*$I file*)`, whose file is read in its place.
 fn is_include_directive(text: &str) -> bool {
-    let Some(body) = text.strip_prefix("{$") else {
+    let Some(body) = text.strip_prefix("{$").or_else(|| text.strip_prefix("(*$")) else {
         return false;
     };
     let name_end = body
@@ -154,8 +153,10 @@ pub struct IfDefBlock {
     pub if_branch: CondBranch,
     /// Zero or more {$ELSEIF ...} branches.
     pub else_if_branches: Vec<CondBranch>,
-    /// Optional {$ELSE} fallback branch (units only, directive text is implicit "{$ELSE}").
+    /// Optional {$ELSE} fallback branch.
     pub else_branch: Option<Vec<UsesItem>>,
+    /// The {$ELSE} directive text.
+    pub else_directive: String,
     /// Comments on the `{$ELSE}` line.
     pub else_trailing: Vec<String>,
     /// The closing directive text, e.g. "{$ENDIF}".
@@ -497,6 +498,7 @@ fn parse_pp_uses_block(
                 } else {
                     // It's a plain {$ELSE}
                     block.else_branch = Some(Vec::new());
+                    block.else_directive = text;
                     block.else_trailing = trailing;
                     state = BranchState::Else;
                 }
@@ -749,7 +751,7 @@ pub(crate) fn layout_uses_items(
     #[derive(Debug)]
     enum Slot {
         Unit { name: String },
-        Pinned(UsesItem),
+        Pinned(Box<UsesItem>),
         GroupSep,
     }
 
@@ -783,7 +785,7 @@ pub(crate) fn layout_uses_items(
             }
         }
         for (_, block_item) in &blocks {
-            slots.push(Slot::Pinned(block_item.clone()));
+            slots.push(Slot::Pinned(Box::new(block_item.clone())));
         }
     }
 
@@ -797,7 +799,7 @@ pub(crate) fn layout_uses_items(
             None => {
                 // Insert at none_insert_pos and advance it so the next None-anchor
                 // item is placed after the previous one, preserving original order.
-                slots.insert(none_insert_pos, Slot::Pinned(pinned_item));
+                slots.insert(none_insert_pos, Slot::Pinned(Box::new(pinned_item)));
                 none_insert_pos += 1;
             }
             Some(anchor_name) => {
@@ -818,12 +820,12 @@ pub(crate) fn layout_uses_items(
                                 break;
                             }
                         }
-                        slots.insert(insert_at, Slot::Pinned(pinned_item));
+                        slots.insert(insert_at, Slot::Pinned(Box::new(pinned_item)));
                     }
                     None => {
                         // Anchor unit was not in the sorted list (e.g. it was inside an
                         // IfDefBlock). Append at the end.
-                        slots.push(Slot::Pinned(pinned_item));
+                        slots.push(Slot::Pinned(Box::new(pinned_item)));
                     }
                 }
             }
@@ -837,9 +839,9 @@ pub(crate) fn layout_uses_items(
     // Without sorting the units keep their source order.
     if config.sort
         && let Some(last_unit) = slots.iter().rposition(|s| matches!(s, Slot::Unit { .. }))
-        && let Some(last_block) = slots
-            .iter()
-            .rposition(|s| matches!(s, Slot::Pinned(UsesItem::IfDefBlock(_))))
+        && let Some(last_block) = slots.iter().rposition(
+            |s| matches!(s, Slot::Pinned(item) if matches!(**item, UsesItem::IfDefBlock(_))),
+        )
         && last_block > last_unit
     {
         let moved: Vec<Slot> = slots
@@ -866,7 +868,7 @@ pub(crate) fn layout_uses_items(
                     comma_after: false,
                 })
             }
-            Slot::Pinned(item) => Some(item),
+            Slot::Pinned(item) => Some(*item),
         })
         .collect();
     let ordered: Vec<Option<&UsesItem>> = ordered.iter().map(Option::as_ref).collect();
@@ -1264,7 +1266,7 @@ fn emit_ifdef_block(
     // Emit else branch
     if let Some(else_items) = &block.else_branch {
         push_with_trailing(
-            format!("{indent}{{$ELSE}}"),
+            format!("{indent}{}", block.else_directive),
             &block.else_trailing,
             indent,
             lines,
@@ -1773,6 +1775,7 @@ mod tests {
             },
             else_if_branches: Vec::new(),
             else_branch: Some(vec![UsesItem::unit("OtherUnit")]),
+            else_directive: "{$ELSE}".to_string(),
             endif: "{$ENDIF}".to_string(),
             ..IfDefBlock::default()
         };
@@ -1889,10 +1892,22 @@ mod tests {
 
     #[test]
     fn include_directives_are_recognised() {
-        for text in ["{$I a.inc}", "{$i 'b c.inc'}", "{$INCLUDE a.inc}"] {
+        for text in [
+            "{$I a.inc}",
+            "{$i 'b c.inc'}",
+            "{$INCLUDE a.inc}",
+            "(*$I a.inc*)",
+        ] {
             assert!(is_include_directive(text), "{text}");
         }
-        for text in ["{$I+}", "{$I-}", "{$IFDEF X}", "{$HINTS OFF}", "{$R *.res}"] {
+        for text in [
+            "{$I+}",
+            "{$I-}",
+            "{$IFDEF X}",
+            "{$HINTS OFF}",
+            "{$R *.res}",
+            "(*$I+*)",
+        ] {
             assert!(!is_include_directive(text), "{text}");
         }
     }

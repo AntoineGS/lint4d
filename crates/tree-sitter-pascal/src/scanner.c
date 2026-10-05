@@ -1,6 +1,7 @@
 // External scanner for tree-sitter-pascal.
 //
-// Recognizes single-line `{$ifdef ...}...{$endif}` directive pairs and
+// Recognizes single-line `{$ifdef ...}...{$endif}` directive pairs (also
+// spelled `(*$ifdef ...*)...(*$endif*)`) and
 // consumes the whole paired span as ONE opaque token — either
 // `ppFragmentExpr` (the default, valid in expression and typeref
 // positions) or `ppFragmentStmt` (when the body contains a top-level `;`
@@ -66,12 +67,16 @@ static bool is_routine_directive(const char *word, size_t len) {
     return false;
 }
 
-// Skip input up to and including the next `}`. Returns false on EOF.
-static bool skip_to_close_brace(TSLexer *lexer) {
+// Skip input up to and including the end of a directive: the next `}`, or
+// the next `*)` if it is spelled `(*$...*)`. Returns false on EOF.
+static bool skip_to_directive_end(TSLexer *lexer, bool paren_star) {
     while (lexer->lookahead != 0) {
         int32_t c = lexer->lookahead;
         lexer->advance(lexer, false);
-        if (c == '}') {
+        if (paren_star ? c == '*' && lexer->lookahead == ')' : c == '}') {
+            if (paren_star) {
+                lexer->advance(lexer, false);
+            }
             return true;
         }
     }
@@ -163,11 +168,18 @@ bool tree_sitter_pascal_external_scanner_scan(
         return false;
     }
 
-    // Must start with `{$`.
-    if (lexer->lookahead != '{') {
+    // Must start with `{$` or `(*$`.
+    bool paren_star = lexer->lookahead == '(';
+    if (lexer->lookahead != '{' && !paren_star) {
         return false;
     }
     lexer->advance(lexer, false);
+    if (paren_star) {
+        if (lexer->lookahead != '*') {
+            return false;
+        }
+        lexer->advance(lexer, false);
+    }
     if (lexer->lookahead != '$') {
         return false;
     }
@@ -184,8 +196,8 @@ bool tree_sitter_pascal_external_scanner_scan(
         return false;
     }
 
-    // Consume up to and including the closing `}` of the opening directive.
-    if (!skip_to_close_brace(lexer)) {
+    // Consume up to and including the end of the opening directive.
+    if (!skip_to_directive_end(lexer, paren_star)) {
         return false;
     }
 
@@ -208,7 +220,8 @@ bool tree_sitter_pascal_external_scanner_scan(
         if (lexer->lookahead == 0) {
             return false; // Unterminated fragment — give up, let regex handle it.
         }
-        if (lexer->lookahead != '{') {
+        bool inner_paren_star = lexer->lookahead == '(';
+        if (lexer->lookahead != '{' && !inner_paren_star) {
             if (depth == 1 && is_ascii_letter(lexer->lookahead)) {
                 char word[16] = {0};
                 size_t word_len = read_ascii_keyword(lexer, word, sizeof(word) - 1);
@@ -235,6 +248,13 @@ bool tree_sitter_pascal_external_scanner_scan(
             continue;
         }
         lexer->advance(lexer, false);
+        if (inner_paren_star) {
+            if (lexer->lookahead != '*') {
+                directives_only = false; // A parenthesis.
+                continue;
+            }
+            lexer->advance(lexer, false);
+        }
         if (lexer->lookahead != '$') {
             directives_only = false; // A comment or nested text.
             continue;
@@ -257,7 +277,7 @@ bool tree_sitter_pascal_external_scanner_scan(
             depth--;
         }
 
-        if (!skip_to_close_brace(lexer)) {
+        if (!skip_to_directive_end(lexer, inner_paren_star)) {
             return false;
         }
     }

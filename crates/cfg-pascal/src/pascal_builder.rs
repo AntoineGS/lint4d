@@ -1650,8 +1650,15 @@ fn preprocessor_branches<'tree>(node: Node<'tree>, source: &[u8]) -> (Vec<Vec<No
 fn is_unconditional_preprocessor_else(node: Node, source: &[u8]) -> bool {
     let directive = node_text(node, source);
     let directive = directive.trim();
-    let directive = directive.strip_prefix("{$").unwrap_or(directive);
-    let directive = directive.strip_suffix('}').unwrap_or(directive);
+    let directive = directive
+        .strip_prefix("{$")
+        .and_then(|body| body.strip_suffix('}'))
+        .or_else(|| {
+            directive
+                .strip_prefix("(*$")
+                .and_then(|body| body.strip_suffix("*)"))
+        })
+        .unwrap_or(directive);
     directive
         .split_whitespace()
         .next()

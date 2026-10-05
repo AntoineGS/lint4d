@@ -460,6 +460,81 @@ end.
     (kEndDot)))
 
 ===
+Parenthesis-star directives
+===
+
+(*$mode delphi*)
+(*$ifdef foo*)
+(*$I source.inc*)
+(*$else*)
+{$m+}
+(*$endif*)
+(**)
+(**$x*)
+(* $x *)
+
+---
+
+(root
+  (ppDirective)
+  (ppBlock
+    (ppIf)
+    (ppDirective)
+    (ppElse)
+    (ppDirective)
+    (ppEndIf))
+  (comment)
+  (comment)
+  (comment))
+
+===
+Parenthesis-star directives in uses clause
+===
+
+unit a;
+interface
+uses
+  B,
+  (*$I units.inc*),
+  (*$IFDEF FOO*)
+  SpecialUnit,
+  (*$ELSE*)
+  OtherUnit,
+  (*$ENDIF*)
+  Classes;
+implementation
+end.
+
+---
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declUses
+        (kUses)
+        (moduleName
+          (identifier))
+        (ppDirective)
+        (ppUsesBlock
+          (ppIf)
+          (moduleName
+            (identifier))
+          (ppElse)
+          (moduleName
+            (identifier))
+          (ppEndIf))
+        (moduleName
+          (identifier))))
+    (implementation
+      (kImplementation))
+    (kEnd)
+    (kEndDot)))
+
+===
 ppBlock in var section
 ===
 
@@ -645,6 +720,41 @@ end;
     (block
       (kBegin)
       (ppFragmentStmt)
+      (kEnd))))
+
+===
+Parenthesis-star directive fragments
+===
+
+procedure a(b: (*$if 1*)c(*$else*)d(*$endif*));
+begin
+  (*$IFDEF DEBUG*)x := 1;(*$ENDIF*)
+  e := (*$IFDEF X*)System.(*$ENDIF*)SysUtils.F((*$IFDEF Y*)(* y *)g(*$ELSE*)h(*$ENDIF*));
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier)
+      (declArgs
+        (declArg
+          (identifier)
+          (type
+            (typeref
+              (ppFragmentExpr))))))
+    (block
+      (kBegin)
+      (ppFragmentStmt)
+      (assignment
+        (identifier)
+        (kAssign)
+        (exprCall
+          (ppFragmentExpr)
+          (exprArgs
+            (ppFragmentExpr))))
       (kEnd))))
 
 ===

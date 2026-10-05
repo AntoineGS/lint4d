@@ -462,6 +462,51 @@ end.
 }
 
 #[test]
+fn preprocessor_else_closes_the_no_match_path_in_either_spelling() {
+    let source = br#"
+unit ConditionalElse;
+interface
+implementation
+
+procedure BraceElse;
+begin
+  {$IFDEF FIRST}
+  Exit;
+  {$ELSE}
+  Exit;
+  {$ENDIF}
+  AfterBrace;
+end;
+
+procedure ParenStarElse;
+begin
+  (*$IFDEF FIRST*)
+  Exit;
+  (*$ELSE*)
+  Exit;
+  (*$ENDIF*)
+  AfterParenStar;
+end;
+
+end.
+"#
+    .to_vec();
+    let tree = parse_clean(&source);
+    let cfgs = build_file_cfgs(&tree, &source);
+    for (routine, after) in [
+        ("BraceElse", "AfterBrace"),
+        ("ParenStarElse", "AfterParenStar"),
+    ] {
+        let cfg = cfg_for(&cfgs, routine);
+        let after = block_with_stmt(cfg, &source, "statement", after);
+        assert!(
+            !cfg.is_reachable(cfg.entry, after),
+            "{routine}: every branch exits, so nothing after the conditional runs"
+        );
+    }
+}
+
+#[test]
 fn preprocessor_branch_labels_keep_local_and_external_targets() {
     let source = br#"
 unit ConditionalLabels;

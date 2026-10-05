@@ -83,6 +83,20 @@ function varName($) {
 	);
 }
 
+// A compiler directive named one of `names` (a regex alternation), in either
+// spelling: `{$name ...}` or `(*$name ...*)`.
+function ppKeyword(names) {
+	return new RegExp(
+		`\\{\\$(${names})([^a-zA-Z_}][^}]*)?\\}` +
+		`|\\(\\*\\$(${names})([^a-zA-Z_*][^*]*(\\*+[^*)][^*]*)*)?\\*+\\)`,
+		'i'
+	);
+}
+
+const ppIfToken    = ppKeyword('ifdef|ifndef|if');
+const ppElseToken  = ppKeyword('elseif|else');
+const ppEndIfToken = ppKeyword('endif|ifend');
+
 // Preprocessor wrapper: `if[def] ... [else[if] ...]* endif` around a rule.
 // It is inteded for code like this:
 //
@@ -861,29 +875,29 @@ module.exports = grammar({
 		_usesClauseEntry: $ => choice($.moduleName, $.ppUsesBlock, ','),
 
 		ppUsesBlock: $ => seq(
-			alias(token(prec(5, /\{\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\}/i)), $.ppIf),
+			alias(token(prec(5, ppIfToken)), $.ppIf),
 			repeat(choice($.moduleName, $.ppUsesBlock, ',')),
 			repeat(seq(
-				alias(token(prec(5, /\{\$(elseif|else)([^a-zA-Z_}][^}]*)?\}/i)), $.ppElse),
+				alias(token(prec(5, ppElseToken)), $.ppElse),
 				repeat(choice($.moduleName, $.ppUsesBlock, ','))
 			)),
-			alias(token(prec(5, /\{\$(endif|ifend)([^a-zA-Z_}][^}]*)?\}/i)), $.ppEndIf)
+			alias(token(prec(5, ppEndIfToken)), $.ppEndIf)
 		),
 
 		ppUsesBlockWithSemi: $ => seq(
-			alias(token(prec(5, /\{\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\}/i)), $.ppIf),
+			alias(token(prec(5, ppIfToken)), $.ppIf),
 			repeat(choice($.moduleName, $.ppUsesBlock, ',')), ';',
 			repeat(seq(
-				alias(token(prec(5, /\{\$(elseif|else)([^a-zA-Z_}][^}]*)?\}/i)), $.ppElse),
+				alias(token(prec(5, ppElseToken)), $.ppElse),
 				repeat(choice($.moduleName, $.ppUsesBlock, ',')), ';'
 			)),
-			alias(token(prec(5, /\{\$(endif|ifend)([^a-zA-Z_}][^}]*)?\}/i)), $.ppEndIf)
+			alias(token(prec(5, ppEndIfToken)), $.ppEndIf)
 		),
 		// Shared terminals let the parser distinguish a conditional attribute
 		// from a directive-wrapped class section using the following token.
-		_ppIf:    $ => token(prec(5, /\{\$(ifdef|ifndef|if)([^a-zA-Z_}][^}]*)?\}/i)),
-		_ppElse:  $ => token(prec(5, /\{\$(elseif|else)([^a-zA-Z_}][^}]*)?\}/i)),
-		_ppEndIf: $ => token(prec(5, /\{\$(endif|ifend)([^a-zA-Z_}][^}]*)?\}/i)),
+		_ppIf:    $ => token(prec(5, ppIfToken)),
+		_ppElse:  $ => token(prec(5, ppElseToken)),
+		_ppEndIf: $ => token(prec(5, ppEndIfToken)),
 
 		ppBlock: $ => ppIn($,
 			// Declaration items
@@ -1481,11 +1495,15 @@ module.exports = grammar({
 		labelNumber:       $ => token(prec(1, /[0-9]+/)),
 
 	  	_space:            $ => /[\s\r\n\t]+/,
-		ppDirective:       $ => token(prec(-1, /\{\$[^}]*\}/)),
+		ppDirective:       $ => token(prec(-1, choice(
+			/\{\$[^}]*\}/,
+			/\(\*\$[^*]*(\*+[^*)][^*]*)*\*+\)/
+		))),
+		// A `{$` or `(*$` starts a directive, not a comment.
 		comment:           $ => token(choice(
 			seq('//', /[^\r\n]*/),
 			seq('{', /([^$}][^}]*)?/, '}'),
-			/[(][*]([^*]*[*]+[^)*])*[^*]*[*]+[)]/
+			/[(][*]([^$*][^*]*)?[*]+([^)*][^*]*[*]+)*[)]/
 		)),
 	}
 });

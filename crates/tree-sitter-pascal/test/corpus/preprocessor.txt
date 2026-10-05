@@ -758,6 +758,40 @@ end;
       (kEnd))))
 
 ===
+Directive text in strings and comments inside fragments
+===
+
+procedure a;
+begin
+  a := {$IFDEF X}b { (*$ENDIF*) } {$ELSE}c{$ENDIF};
+  a := {$IFDEF X}'(*$ENDIF*)'{$ELSE}'{$ENDIF}'{$ENDIF};
+  a := (*$IFDEF X*)b (* {$ENDIF} *) (*$ELSE*)c(*$ENDIF*);
+end;
+
+---
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (block
+      (kBegin)
+      (assignment
+        (identifier)
+        (kAssign)
+        (ppFragmentExpr))
+      (assignment
+        (identifier)
+        (kAssign)
+        (ppFragmentExpr))
+      (assignment
+        (identifier)
+        (kAssign)
+        (ppFragmentExpr))
+      (kEnd))))
+
+===
 ppFragmentExpr wrapping cast in expression
 ===
 

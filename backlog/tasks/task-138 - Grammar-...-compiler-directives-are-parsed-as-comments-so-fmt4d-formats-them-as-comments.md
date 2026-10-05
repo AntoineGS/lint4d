@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-05 00:57'
-updated_date: '2026-10-05 11:16'
+updated_date: '2026-10-05 11:25'
 labels:
   - fmt
   - grammar
@@ -79,4 +79,6 @@ Change:
 - fmt4d uses.rs: is_include_directive accepts '(*$'; IfDefBlock.else_directive keeps the else text instead of writing '{$ELSE}'. Slot::Pinned boxes its item (clippy large_enum_variant after the new field).
 GREEN: tree-sitter test 174/174, examples parse as before (same two pre-existing ERRORs); cargo test --workspace --no-fail-fast 3619 passed / 0 failed / 9 ignored; clippy --workspace --all-targets -D warnings and fmt --check clean. fmt corpus gate (348 files, base = master fmt4d): no output differences, none non-idempotent. Spelling differential over the 83 corpus files that hold '{$': 82 identical, 1 differs only because the longer spelling pushes a line past 120 columns (x_DUnitX.Exceptions.pas).
 Not covered, unchanged: textual scanners that only know '{$' (pascal-core conditional.rs directive collection, pascal-core directives.rs {$FMT.OFF}/{$FMT.ON}, pascal-lsp queries.rs include expansion from the raw directive).
+
+Review round 1 (code-reviewer subagent on 49e6365..b9b67a6): one Important finding. The fragment scanner now counted '(*$ENDIF*)' text inside a string or comment within a '{$' fragment as a directive, so 'a := {$IFDEF X}b { (*$ENDIF*) } {$ELSE}c{$ENDIF};' and 'a := {$IFDEF X}'(*$ENDIF*)'{$ELSE}'b'{$ENDIF};' went from parsing to ERROR (fmt4d refused the file). The old scanner had the same blind spot for '{$...}' text in strings. RED: corpus case 'Directive text in strings and comments inside fragments' (both spellings, plus '{$ENDIF}' in a string). Fix (scanner.c): the fragment walk skips strings, '//' comments and '{ }' / '(* *)' comments (skip_to_close, noting line breaks), so neither directives nor ';' inside them count. GREEN: tree-sitter test 175/175; cargo test --workspace 3619/0/9; clippy and fmt clean; fmt corpus gate vs master: no differences, none non-idempotent; spelling differential unchanged (82/83, the other a line-width break).
 <!-- SECTION:NOTES:END -->

@@ -67,12 +67,16 @@ static bool is_routine_directive(const char *word, size_t len) {
     return false;
 }
 
-// Skip input up to and including the end of a directive: the next `}`, or
-// the next `*)` if it is spelled `(*$...*)`. Returns false on EOF.
-static bool skip_to_directive_end(TSLexer *lexer, bool paren_star) {
+// Skip input up to and including the end of a directive or comment: the
+// next `}`, or the next `*)` if it opened with `(*`. Sets `*saw_newline`
+// (when not NULL) if a line break is skipped. Returns false on EOF.
+static bool skip_to_close(TSLexer *lexer, bool paren_star, bool *saw_newline) {
     while (lexer->lookahead != 0) {
         int32_t c = lexer->lookahead;
         lexer->advance(lexer, false);
+        if (saw_newline && (c == '\n' || c == '\r')) {
+            *saw_newline = true;
+        }
         if (paren_star ? c == '*' && lexer->lookahead == ')' : c == '}') {
             if (paren_star) {
                 lexer->advance(lexer, false);
@@ -197,7 +201,7 @@ bool tree_sitter_pascal_external_scanner_scan(
     }
 
     // Consume up to and including the end of the opening directive.
-    if (!skip_to_directive_end(lexer, paren_star)) {
+    if (!skip_to_close(lexer, paren_star, NULL)) {
         return false;
     }
 
@@ -235,13 +239,37 @@ bool tree_sitter_pascal_external_scanner_scan(
             if (lexer->lookahead != ';' && !is_space_or_newline(lexer->lookahead)) {
                 directives_only = false;
             }
+            if (lexer->lookahead == '\'') {
+                // A string: what it holds is not a directive. A line break
+                // ends an unterminated one.
+                lexer->advance(lexer, false);
+                while (lexer->lookahead != '\'' && lexer->lookahead != 0 &&
+                       lexer->lookahead != '\n' && lexer->lookahead != '\r') {
+                    lexer->advance(lexer, false);
+                }
+                if (lexer->lookahead == '\'') {
+                    lexer->advance(lexer, false);
+                }
+                continue;
+            }
+            if (lexer->lookahead == '/') {
+                lexer->advance(lexer, false);
+                if (lexer->lookahead == '/') {
+                    // A `//` comment runs to the line break.
+                    while (lexer->lookahead != 0 && lexer->lookahead != '\n' &&
+                           lexer->lookahead != '\r') {
+                        lexer->advance(lexer, false);
+                    }
+                }
+                continue;
+            }
             if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
                 saw_newline = true;
             } else if (lexer->lookahead == ';' && depth == 1) {
-                // Deliberately naive: no filtering for `;` inside strings,
-                // comments, or parens. A Multidev corpus probe (247 single-line
-                // fragment spans across 301 .pas files) found zero such cases,
-                // so the added complexity has no ROI.
+                // Deliberately naive: no filtering for `;` inside parens. A
+                // Multidev corpus probe (247 single-line fragment spans across
+                // 301 .pas files) found zero such cases, so the added
+                // complexity has no ROI.
                 saw_top_level_semi = true;
             }
             lexer->advance(lexer, false);
@@ -256,7 +284,11 @@ bool tree_sitter_pascal_external_scanner_scan(
             lexer->advance(lexer, false);
         }
         if (lexer->lookahead != '$') {
-            directives_only = false; // A comment or nested text.
+            // A comment: what it holds is not a directive.
+            directives_only = false;
+            if (!skip_to_close(lexer, inner_paren_star, &saw_newline)) {
+                return false;
+            }
             continue;
         }
         lexer->advance(lexer, false);
@@ -277,7 +309,7 @@ bool tree_sitter_pascal_external_scanner_scan(
             depth--;
         }
 
-        if (!skip_to_directive_end(lexer, inner_paren_star)) {
+        if (!skip_to_close(lexer, inner_paren_star, NULL)) {
             return false;
         }
     }

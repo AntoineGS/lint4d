@@ -4268,25 +4268,24 @@ fn comma_before_a_directive_ending_a_uses_list_is_kept() {
 
 #[test]
 fn comma_before_a_directive_in_a_comma_first_list_is_kept() {
-    // Units keep their order with sorting off, so the blocks after the
-    // last unit stay there and are written comma-first; so is a directive
-    // that followed a `,`.
+    // A clause holding an include is written with the source's
+    // punctuation (TASK-137), comma-first branches included.
     for (clause, expected) in [
         (
             "uses A {$IFDEF X}, B, {$I u.inc} {$ENDIF};",
-            "uses\n  A\n  {$IFDEF X}\n  , B\n  , {$I u.inc}\n  {$ENDIF};\n",
+            "uses\n  A\n  {$IFDEF X}\n  , B,\n  {$I u.inc}\n  {$ENDIF};\n",
         ),
         (
             "uses A, {$IFDEF X} B, {$I u.inc} {$ENDIF};",
-            "uses\n  A\n  {$IFDEF X}\n  , B\n  , {$I u.inc}\n  {$ENDIF};\n",
+            "uses\n  A,\n  {$IFDEF X}\n  B,\n  {$I u.inc}\n  {$ENDIF};\n",
         ),
         (
             "uses A {$IFDEF X}, B, {$I a.inc}, {$I b.inc} {$ENDIF};",
-            "uses\n  A\n  {$IFDEF X}\n  , B\n  , {$I a.inc}\n  , {$I b.inc}\n  {$ENDIF};\n",
+            "uses\n  A\n  {$IFDEF X}\n  , B,\n  {$I a.inc},\n  {$I b.inc}\n  {$ENDIF};\n",
         ),
         (
             "uses A {$IFDEF X}, B {$ENDIF}, {$I u.inc};",
-            "uses\n  A\n  {$IFDEF X}\n  , B\n  {$ENDIF}\n  , {$I u.inc};\n",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  {$ENDIF},\n  {$I u.inc};\n",
         ),
         (
             "uses A {$IFDEF X}, B {$I u.inc} {$ENDIF};",
@@ -4298,6 +4297,68 @@ fn comma_before_a_directive_in_a_comma_first_list_is_kept() {
         assert!(result.contains(expected), "{clause:?}:\n{result}");
         assert_parses_cleanly(&result);
         assert_eq!(format_unsorted(&result), result, "not idempotent");
+    }
+}
+
+// ── Bug: punctuation after an include in a uses clause (TASK-137) ──
+// What an include lists is unknown, so the separators around it must be
+// the source's, and units cannot be sorted around it: a clause holding an
+// include keeps its order.
+
+#[test]
+fn uses_clause_with_an_include_keeps_its_order_and_punctuation() {
+    for (clause, expected) in [
+        (
+            "uses A, {$I u.inc}, B;",
+            "uses\n  A,\n  {$I u.inc},\n  B;\n",
+        ),
+        ("uses {$I u.inc}, B;", "uses\n  {$I u.inc},\n  B;\n"),
+        ("uses A {$I u.inc}, B;", "uses\n  A\n  {$I u.inc},\n  B;\n"),
+        ("uses A, {$I u.inc} B;", "uses\n  A,\n  {$I u.inc}\n  B;\n"),
+        (
+            "uses B, A, {$I u.inc};",
+            "uses\n  B,\n  A,\n  {$I u.inc};\n",
+        ),
+        (
+            "uses A {$IFDEF X}, B, {$I u.inc} {$ENDIF};",
+            "uses\n  A\n  {$IFDEF X}\n  , B,\n  {$I u.inc}\n  {$ENDIF};\n",
+        ),
+        // Next to a block, the include's neighbour depends on X: only the
+        // source's punctuation reads the same either way.
+        (
+            "uses A {$IFDEF X}, B {$ENDIF} {$I u.inc}, C;",
+            "uses\n  A\n  {$IFDEF X}\n  , B\n  {$ENDIF}\n  {$I u.inc},\n  C;\n",
+        ),
+        (
+            "uses {$IFDEF X} B, {$I u.inc} {$ENDIF}, C;",
+            "uses\n  {$IFDEF X}\n  B,\n  {$I u.inc}\n  {$ENDIF},\n  C;\n",
+        ),
+        (
+            "uses {$IFDEF X} B {$I u.inc} {$ENDIF}, C;",
+            "uses\n  {$IFDEF X}\n  B\n  {$I u.inc}\n  {$ENDIF},\n  C;\n",
+        ),
+    ] {
+        let src = uses_source(clause);
+        for result in [format_source(&src), format_unsorted(&src)] {
+            assert!(result.contains(expected), "{clause:?}:\n{result}");
+            assert_parses_cleanly(&result);
+        }
+        idempotency_check(&src);
+    }
+}
+
+#[test]
+fn uses_sorting_around_other_directives_keeps_the_clause_valid() {
+    // Other directives list nothing, so they leave the punctuation alone.
+    for (clause, expected) in [
+        ("uses B, {$R+} A;", "uses\n  A,\n  B\n  {$R+};\n"),
+        ("uses C, {$R+} A, B;", "uses\n  A,\n  B,\n  C\n  {$R+};\n"),
+    ] {
+        let src = uses_source(clause);
+        let result = format_source(&src);
+        assert!(result.contains(expected), "{clause:?}:\n{result}");
+        assert_parses_cleanly(&result);
+        idempotency_check(&src);
     }
 }
 

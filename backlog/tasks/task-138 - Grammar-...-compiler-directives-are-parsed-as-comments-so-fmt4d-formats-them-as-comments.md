@@ -3,7 +3,7 @@ id: TASK-138
 title: >-
   Grammar: (*$ ... *) compiler directives are parsed as comments, so fmt4d
   formats them as comments
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-05 00:57'
@@ -82,3 +82,17 @@ Not covered, unchanged: textual scanners that only know '{$' (pascal-core condit
 
 Review round 1 (code-reviewer subagent on 49e6365..b9b67a6): one Important finding. The fragment scanner now counted '(*$ENDIF*)' text inside a string or comment within a '{$' fragment as a directive, so 'a := {$IFDEF X}b { (*$ENDIF*) } {$ELSE}c{$ENDIF};' and 'a := {$IFDEF X}'(*$ENDIF*)'{$ELSE}'b'{$ENDIF};' went from parsing to ERROR (fmt4d refused the file). The old scanner had the same blind spot for '{$...}' text in strings. RED: corpus case 'Directive text in strings and comments inside fragments' (both spellings, plus '{$ENDIF}' in a string). Fix (scanner.c): the fragment walk skips strings, '//' comments and '{ }' / '(* *)' comments (skip_to_close, noting line breaks), so neither directives nor ';' inside them count. GREEN: tree-sitter test 175/175; cargo test --workspace 3619/0/9; clippy and fmt clean; fmt corpus gate vs master: no differences, none non-idempotent; spelling differential unchanged (82/83, the other a line-width break).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Problem: the grammar parsed the '(*$ ... *)' spelling of compiler directives as comments. fmt4d therefore sorted a '(*$I u.inc*)' along with a unit in a uses clause, '(*$IFDEF X*)...(*$ENDIF*)' was not a conditional anywhere, and the CFG treated such code as plain statements.
+
+Fix (branch fix/grammar-paren-star-directives, commits b9b67a6 and 9c0264e): the grammar's directive tokens (ppDirective, ppIf/ppElse/ppEndIf, the ppUsesBlock tokens) accept both spellings, and the '(*' comment no longer matches '(*$'. The external scanner's single-line fragments and pascal-core's fragment rewrite also accept both spellings. The scanner now skips strings and comments inside a fragment, which also fixes '{$...}' text inside a string ending a fragment early. cfg-pascal recognises '(*$ELSE*)'. fmt4d treats '(*$I file*)' as an include, and a uses block keeps its else directive's own text (a lowercase '{$else}' is no longer uppercased).
+
+Tests: grammar corpus (4 cases); fmt_bugs_test paren_star_directives_in_a_uses_clause_are_directives; fmt_roundtrip_test every_fixture_formats_alike_in_either_directive_spelling (every fixture with directives formats the same in both spellings); cfg-pascal preprocessor_else_closes_the_no_match_path_in_either_spelling; pascal-core rewrite tests.
+
+Verification: tree-sitter test 175/175; cargo test --workspace 3619 passed, 0 failed, 9 ignored; clippy -D warnings and fmt clean; fmt corpus gate against master shows no output differences and nothing non-idempotent.
+
+Not covered: textual scanners that only know '{$': pascal-core conditional.rs, the {$FMT.OFF}/{$FMT.ON} detection, and pascal-lsp include expansion.
+<!-- SECTION:FINAL_SUMMARY:END -->

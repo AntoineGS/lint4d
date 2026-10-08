@@ -57,6 +57,7 @@ pub struct CompileTimeState {
     pub(super) scopes: Vec<Scope>,
     stack: Vec<ScopeId>,
     pub(super) declarations: Vec<Declaration>,
+    pub(super) unit_name: Option<String>,
     definition_count: usize,
     field_count: usize,
     variant_count: usize,
@@ -95,6 +96,13 @@ pub(super) fn limit(
 }
 
 impl CompileTimeState {
+    pub(super) fn type_admission_sequence(&self) -> Result<Sequence, IncompleteReason> {
+        self.sequence
+            .0
+            .checked_add(u64::from(self.section == Section::Types))
+            .map(Sequence)
+            .ok_or(IncompleteReason::MalformedSource)
+    }
     pub(super) fn finished_for_directive(&self) -> bool {
         self.finished
     }
@@ -167,6 +175,7 @@ impl CompileTimeState {
             }],
             stack: vec![ScopeId(0)],
             declarations: Vec::new(),
+            unit_name: None,
             definition_count: 0,
             field_count: 0,
             variant_count: 0,
@@ -576,6 +585,38 @@ impl CompileTimeState {
         &mut self,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
+        if self.section == Section::None && self.unit_name.is_none() && self.sequence.0 == 0 {
+            let suffix = " interface implementation end.";
+            let len = self.pending.len() + suffix.len();
+            budget.charge(1, len, len)?;
+            let mut source = String::with_capacity(len);
+            source.push_str(&self.pending);
+            source.push_str(suffix);
+            let result = crate::parser::PARSER.with(|cell| {
+                let tree = cell
+                    .borrow_mut()
+                    .parse(&source, None)
+                    .ok_or(IncompleteReason::MalformedSource)?;
+                if tree.root_node().has_error() {
+                    return Ok(());
+                }
+                if let Some(unit) = find_node(tree.root_node(), "unit", budget)? {
+                    if let Some(name) = find_node(unit, "moduleName", budget)? {
+                        let text = name
+                            .utf8_text(source.as_bytes())
+                            .map_err(|_| IncompleteReason::MalformedSource)?;
+                        budget.charge(1, text.len(), text.len())?;
+                        let mut name: String =
+                            text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                        name.make_ascii_lowercase();
+                        self.unit_name = Some(name);
+                    }
+                }
+                Ok(())
+            });
+            budget.release(len);
+            result?;
+        }
         let (prefix, suffix, kind) = match self.section {
             Section::Types => (
                 "unit T; interface type ",
@@ -676,6 +717,7 @@ impl CompileTimeState {
         valid: bool,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
+        let group_site = self.site();
         let mut cursor = node.walk();
         for name in node.children_by_field_name("name", &mut cursor) {
             if !name.is_named() {
@@ -773,11 +815,17 @@ impl CompileTimeState {
                     scope: site.scope,
                 },
                 site,
+                type_site: if is_type {
+                    self.site()
+                } else {
+                    group_site.clone()
+                },
                 ty,
                 is_type,
                 // As in the existing conditional scanner, typed constants are
                 // lexical blockers, not proven values without coercion evidence.
                 is_constant: valid && node.kind() == "declConst" && ty_node.is_none(),
+                is_routine: node.kind() == "declProc",
                 settings: self.settings_at_logical(logical_name, budget)?.clone(),
                 provenance,
                 initializer: initializer.map(str::to_owned),
@@ -955,6 +1003,7 @@ impl CompileTimeState {
     pub fn fingerprint(&self) -> u64 {
         let mut h = DefaultHasher::new();
         self.context.hash(&mut h);
+        self.unit_name.hash(&mut h);
         self.scopes.hash(&mut h);
         self.stack.hash(&mut h);
         self.spans.hash(&mut h);
@@ -984,9 +1033,11 @@ impl CompileTimeState {
             d.name.hash(&mut h);
             d.key.hash(&mut h);
             d.site.hash(&mut h);
+            d.type_site.hash(&mut h);
             d.ty.hash(&mut h);
             d.is_type.hash(&mut h);
             d.is_constant.hash(&mut h);
+            d.is_routine.hash(&mut h);
             d.provenance.hash(&mut h);
             d.settings.hash(&mut h);
             d.initializer.hash(&mut h);
@@ -999,6 +1050,9 @@ impl CompileTimeState {
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
         visit(size_of::<Self>())?;
+        if let Some(name) = &self.unit_name {
+            visit(name.len())?;
+        }
         self.context.visit_recovery_payload(visit)?;
         let entries = self
             .context
@@ -1092,12 +1146,31 @@ pub(super) fn type_expr(
         budget.charge(1, 0, 0)?;
         n = n.named_child(0).unwrap();
     }
-    if n.kind() == "identifier" {
+    let qualified = n.kind() == "typerefDot" && find_node(n, "typerefTpl", budget)?.is_none();
+    let node_text = n.utf8_text(bytes).unwrap_or("");
+    // Equal prefix/dot precedence can put ^Unit.Type under typerefDot in the
+    // parser tree. The parser-validated leading hat still denotes a pointer,
+    // not a declared identifier literally called "^unit.type".
+    if n.kind() == "typerefPtr" || (qualified && node_text.trim_start().starts_with('^')) {
+        let text = node_text
+            .trim()
+            .strip_prefix('^')
+            .unwrap_or(node_text)
+            .trim();
+        budget.charge(1, text.len(), text.len())?;
+        let mut pointee: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        pointee.make_ascii_lowercase();
+        Ok(TypeExpr::Pointer(pointee))
+    } else if qualified {
+        let text = n.utf8_text(bytes).unwrap_or("");
+        budget.charge(1, text.len(), text.len())?;
+        let mut name: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        name.make_ascii_lowercase();
+        Ok(TypeExpr::Named(name))
+    } else if n.kind() == "identifier" {
         let mut name = retain(n.utf8_text(bytes).unwrap_or(""), budget)?;
         name.make_ascii_lowercase();
         Ok(TypeExpr::Named(name))
-    } else if n.kind() == "typerefPtr" {
-        Ok(TypeExpr::Pointer(retain(raw, budget)?))
     } else if n.kind() == "declString" && n.named_child_count() == 1 {
         Ok(TypeExpr::Named(retain("string", budget)?))
     } else if n.kind() == "declArray" {

@@ -2390,6 +2390,16 @@ fn evaluate_typed_expression_with_lookup<'a>(
     complete: &mut bool,
     lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
 ) -> Value {
+    parse_bound_expression(expression, environment, complete, lookup, false)
+}
+
+fn parse_bound_expression<'a>(
+    expression: &str,
+    environment: &'a ConditionalEnvironment,
+    complete: &mut bool,
+    lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
+    static_only: bool,
+) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
         return Value::Unknown;
@@ -2407,6 +2417,7 @@ fn evaluate_typed_expression_with_lookup<'a>(
         malformed: false,
         depth: 0,
         work: 0,
+        static_only,
     };
     let result = parser.parse_comparison();
     if !matches!(parser.peek(), ExprToken::End) {
@@ -2432,6 +2443,34 @@ pub(crate) fn evaluate_bound_expression(
         &mut crate::compile_time::CompileTimeBudget<'_>,
     )
         -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    bound_expression_mode(expression, budget, lookup, false)
+}
+
+/// Type-only interpretation of the existing expression grammar. Number(0),
+/// Truth(Unknown), String and EnumOrdinal(0,key) are category carriers here,
+/// never variable values. No numeric operation or callable is evaluated.
+pub(crate) fn type_bound_expression(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut dyn FnMut(
+        &str,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    )
+        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    bound_expression_mode(expression, budget, lookup, true)
+}
+
+fn bound_expression_mode(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut dyn FnMut(
+        &str,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    )
+        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+    static_only: bool,
 ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
     use crate::compile_time::IncompleteReason;
     if expression.len() > MAX_EXPRESSION_BYTES {
@@ -2469,11 +2508,12 @@ pub(crate) fn evaluate_bound_expression(
             }
         };
         let mut complete = true;
-        let value = evaluate_typed_expression_with_lookup(
+        let value = parse_bound_expression(
             expression,
             &environment,
             &mut complete,
             Some(&mut bounded_lookup),
+            static_only,
         );
         if complete { value } else { Value::Unknown }
     };
@@ -2490,7 +2530,11 @@ pub(crate) fn evaluate_bound_expression(
     };
     let output_charge = budget.charge(1, output_bytes, output_bytes);
     let output = if failure.is_none() && output_charge.is_ok() {
-        result.to_bound_value()
+        if static_only && matches!(result, Value::Truth(_)) {
+            Some(BoundValue::Constant(ConstantValue::Boolean(false)))
+        } else {
+            result.to_bound_value()
+        }
     } else {
         None
     };
@@ -2688,6 +2732,25 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
     tokens
 }
 
+/// Reserve tokenizer scratch before the shared lexical count; no index grammar
+/// or payload normalization is added by the operand parser.
+pub(crate) fn expression_token_count(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<usize, crate::compile_time::IncompleteReason> {
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(crate::compile_time::IncompleteReason::Limit {
+            name: "max_expression_bytes",
+            maximum: MAX_EXPRESSION_BYTES,
+        });
+    }
+    let scratch = (expression.len() + 1) * (4 * std::mem::size_of::<ExprToken>() + 8);
+    budget.charge(expression.len() + 1, expression.len(), scratch)?;
+    let count = tokenize_expression(expression).len();
+    budget.release(scratch);
+    Ok(count)
+}
+
 struct ExpressionParser<'a> {
     tokens: Vec<ExprToken>,
     index: usize,
@@ -2696,6 +2759,7 @@ struct ExpressionParser<'a> {
     malformed: bool,
     depth: usize,
     work: usize,
+    static_only: bool,
 }
 
 impl ExpressionParser<'_> {
@@ -2739,11 +2803,20 @@ impl ExpressionParser<'_> {
             };
             self.take();
             let right = self.parse_multiplicative();
-            value = match operator {
-                BinaryAdditive::Add => value.add(right),
-                BinaryAdditive::Subtract => value.subtract(right),
-                BinaryAdditive::Or => value.or(right),
-                BinaryAdditive::Xor => value.xor(right),
+            value = if self.static_only {
+                static_binary(
+                    value,
+                    right,
+                    matches!(operator, BinaryAdditive::Or | BinaryAdditive::Xor),
+                    false,
+                )
+            } else {
+                match operator {
+                    BinaryAdditive::Add => value.add(right),
+                    BinaryAdditive::Subtract => value.subtract(right),
+                    BinaryAdditive::Or => value.or(right),
+                    BinaryAdditive::Xor => value.xor(right),
+                }
             };
         }
         value
@@ -2780,7 +2853,18 @@ impl ExpressionParser<'_> {
             let right = self.parse_unary();
             // Bound evaluation must not turn discarded shift bits into a
             // cardinality. Leave legacy conditional shift semantics unchanged.
-            value = if self.lookup.is_some() && matches!(operator, BinaryArithmetic::ShiftLeft) {
+            value = if self.static_only {
+                if matches!(operator, BinaryArithmetic::RealDivide) {
+                    Value::Error
+                } else {
+                    static_binary(
+                        value,
+                        right,
+                        matches!(operator, BinaryArithmetic::And),
+                        false,
+                    )
+                }
+            } else if self.lookup.is_some() && matches!(operator, BinaryArithmetic::ShiftLeft) {
                 match (value, right) {
                     (Value::Number(left), Value::Number(right)) => u32::try_from(right)
                         .ok()
@@ -2800,7 +2884,16 @@ impl ExpressionParser<'_> {
 
     fn parse_unary(&mut self) -> Value {
         if self.consume_identifier("not") {
-            self.parse_unary().not()
+            let value = self.parse_unary();
+            if self.static_only {
+                match value {
+                    Value::Number(_) => Value::Number(0),
+                    Value::Truth(_) => Value::Truth(Truth::Unknown),
+                    _ => Value::Error,
+                }
+            } else {
+                value.not()
+            }
         } else if matches!(self.peek(), ExprToken::Plus) {
             self.take();
             match self.parse_unary() {
@@ -2811,7 +2904,15 @@ impl ExpressionParser<'_> {
             }
         } else if matches!(self.peek(), ExprToken::Minus) {
             self.take();
-            self.parse_unary().negate()
+            let value = self.parse_unary();
+            if self.static_only {
+                match value {
+                    Value::Number(_) => Value::Number(0),
+                    _ => Value::Error,
+                }
+            } else {
+                value.negate()
+            }
         } else {
             self.parse_primary()
         }
@@ -2858,11 +2959,39 @@ impl ExpressionParser<'_> {
         };
         self.take();
         let right = self.parse_additive();
-        left = compare_values(left, right, operator);
+        left = if self.static_only {
+            static_binary(left, right, false, true)
+        } else {
+            compare_values(left, right, operator)
+        };
         left
     }
 
     fn parse_value(&mut self) -> Value {
+        if self.static_only {
+            return match self.take() {
+                ExprToken::Number(_) => Value::Number(0),
+                ExprToken::String(s) if s.chars().count() == 1 => Value::String(s),
+                ExprToken::Identifier(name) if matches!(self.peek(), ExprToken::LParen) => {
+                    // Calls, casts and conditional intrinsics are not type proof.
+                    let _ = name;
+                    Value::Error
+                }
+                ExprToken::Identifier(name) => {
+                    // A lexical binding can block a familiar literal spelling.
+                    if let Some(value) = self.lookup.as_mut().and_then(|lookup| lookup(&name)) {
+                        Value::from_bound_value(value)
+                    } else if name.eq_ignore_ascii_case("true")
+                        || name.eq_ignore_ascii_case("false")
+                    {
+                        Value::Truth(Truth::Unknown)
+                    } else {
+                        Value::Unknown
+                    }
+                }
+                _ => Value::Error,
+            };
+        }
         match self.take() {
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("defined") => {
                 if !matches!(self.peek(), ExprToken::LParen) {
@@ -3071,6 +3200,7 @@ enum Value {
     String(String),
     Version(CompilerVersion),
     EnumOrdinal(i64, crate::compile_time::DefinitionKey),
+    StaticCharacter(crate::compile_time::BuiltinType),
     Unknown,
     Error,
 }
@@ -3081,6 +3211,30 @@ enum Value {
 pub(crate) enum BoundValue {
     Constant(ConstantValue),
     EnumOrdinal(i64, crate::compile_time::DefinitionKey),
+    StaticCharacter(crate::compile_time::BuiltinType),
+    /// Visible lexical binding without a supported expression type. In static
+    /// mode this must block literal/intrinsic fallback rather than look absent.
+    InvalidType,
+}
+
+fn static_binary(left: Value, right: Value, logical: bool, comparison: bool) -> Value {
+    let compatible = match (&left, &right) {
+        (Value::Number(_), Value::Number(_)) => true,
+        (Value::Truth(_), Value::Truth(_)) => logical || comparison,
+        (Value::String(a), Value::String(b)) => {
+            comparison && a.chars().count() == 1 && b.chars().count() == 1
+        }
+        (Value::EnumOrdinal(_, a), Value::EnumOrdinal(_, b)) => comparison && a == b,
+        (Value::StaticCharacter(a), Value::StaticCharacter(b)) => comparison && a == b,
+        _ => false,
+    };
+    if !compatible {
+        Value::Error
+    } else if comparison || matches!(left, Value::Truth(_)) {
+        Value::Truth(Truth::Unknown)
+    } else {
+        Value::Number(0)
+    }
 }
 
 impl Value {
@@ -3088,6 +3242,8 @@ impl Value {
         match value {
             BoundValue::Constant(value) => Self::from_constant(value),
             BoundValue::EnumOrdinal(value, identity) => Self::EnumOrdinal(value, identity),
+            BoundValue::StaticCharacter(ty) => Self::StaticCharacter(ty),
+            BoundValue::InvalidType => Self::Error,
         }
     }
 
@@ -3096,6 +3252,7 @@ impl Value {
             Self::EnumOrdinal(value, identity) => {
                 Some(BoundValue::EnumOrdinal(*value, identity.clone()))
             }
+            Self::StaticCharacter(ty) => Some(BoundValue::StaticCharacter(*ty)),
             _ => self.to_constant().map(BoundValue::Constant),
         }
     }
@@ -3115,9 +3272,11 @@ impl Value {
         match self {
             Self::Truth(Truth::True) => Some(ConstantValue::Boolean(true)),
             Self::Truth(Truth::False) => Some(ConstantValue::Boolean(false)),
-            Self::Truth(Truth::Unknown) | Self::Unknown | Self::Error | Self::EnumOrdinal(..) => {
-                None
-            }
+            Self::Truth(Truth::Unknown)
+            | Self::Unknown
+            | Self::Error
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_) => None,
             Self::Number(value) => Some(ConstantValue::Integer(*value)),
             Self::String(value) => Some(ConstantValue::String(value.clone())),
             Self::Version(value) => Some(ConstantValue::Version(*value)),
@@ -3131,6 +3290,7 @@ impl Value {
             | Self::String(_)
             | Self::Version(_)
             | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_)
             | Self::Unknown
             | Self::Error => Truth::Unknown,
         }
@@ -3140,7 +3300,11 @@ impl Value {
         match self {
             Self::Truth(value) => Some(*value),
             Self::Unknown => Some(Truth::Unknown),
-            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::EnumOrdinal(..) => None,
+            Self::Number(_)
+            | Self::String(_)
+            | Self::Version(_)
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_) => None,
             Self::Error => None,
         }
     }
@@ -3290,7 +3454,10 @@ impl Value {
         match self {
             Self::Truth(value) => Self::Truth(value.not()),
             Self::Number(value) => Self::Number(!value),
-            Self::String(_) | Self::Version(_) | Self::EnumOrdinal(..) => Self::Error,
+            Self::String(_)
+            | Self::Version(_)
+            | Self::EnumOrdinal(..)
+            | Self::StaticCharacter(_) => Self::Error,
             Self::Unknown => Self::Unknown,
             Self::Error => Self::Error,
         }

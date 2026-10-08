@@ -12,6 +12,155 @@ use std::mem::size_of;
 
 type Domain = (i64, i64);
 
+/// Validate dimension count/domains and expression *types*, not variable values.
+pub(super) fn operand_indices<'a>(
+    state: &CompileTimeState,
+    declaration_site: &BindingSite,
+    query_site: &BindingSite,
+    dimensions: &[IndexExpr],
+    indices: impl Iterator<Item = &'a str>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let before = budget.snapshot().retained_bytes;
+    let result = (|| {
+        if !dimensions.is_empty()
+            && !matches!(
+                array_count(state, declaration_site, dimensions, 0, budget)?,
+                Fact::Known(_)
+            )
+        {
+            return Ok(false);
+        }
+        let mut count = 0;
+        for expression in indices {
+            budget.charge(1, 0, 0)?;
+            let expected = if dimensions.is_empty() {
+                if count > 0 {
+                    return Ok(false);
+                }
+                Some(OrdinalKind::Integer)
+            } else {
+                let Some(dimension) = dimensions.get(count) else {
+                    return Ok(false);
+                };
+                match dimension {
+                    IndexExpr::Domain(name) => {
+                        budget.charge(1, name.len(), name.len() + size_of::<TypeExpr>())?;
+                        let ty = TypeExpr::Named(name.to_ascii_lowercase());
+                        let kind = selector_kind(state, declaration_site, &ty, None, 0, budget)?;
+                        budget.release(name.len() + size_of::<TypeExpr>());
+                        kind
+                    }
+                    IndexExpr::Bounds { lower, .. } => {
+                        ordinal_expression(state, declaration_site, lower, 0, budget)?
+                            .map(|(_, kind)| kind)
+                    }
+                }
+            };
+            let Some(expected) = expected else {
+                return Ok(false);
+            };
+            let value = crate::conditional::type_bound_expression(
+                expression,
+                budget,
+                &mut |name, budget| {
+                    let Some(binding) = lookup(state, query_site, name, budget)? else {
+                        return Ok(None);
+                    };
+                    match binding {
+                        Binding::Declaration(decl) if decl.is_routine => {
+                            Ok(Some(BoundValue::InvalidType))
+                        }
+                        Binding::EnumMember { owner, .. } => {
+                            let bytes =
+                                size_of::<DefinitionKey>() + owner.key.anchor.source.as_str().len();
+                            budget.charge(1, bytes * MAX_EXPRESSION_TOKENS, bytes)?;
+                            Ok(Some(BoundValue::EnumOrdinal(0, owner.key.clone())))
+                        }
+                        Binding::Declaration(decl) if !decl.is_type && decl.is_constant => {
+                            Ok(Some(
+                                constant_expression(
+                                    state,
+                                    &decl.site,
+                                    initializer_expression(
+                                        decl.initializer.as_deref().unwrap_or(""),
+                                    ),
+                                    0,
+                                    budget,
+                                )?
+                                .unwrap_or(BoundValue::InvalidType),
+                            ))
+                        }
+                        Binding::Declaration(decl) if !decl.is_type => {
+                            // Domain admission excludes floats, strings and pointers even
+                            // when selector_kind's broad intrinsic category is integer.
+                            if type_domain(state, &decl.type_site, &decl.ty, 0, budget)?.is_none() {
+                                return Ok(Some(BoundValue::InvalidType));
+                            }
+                            let Some(kind) = selector_kind(
+                                state,
+                                &decl.type_site,
+                                &decl.ty,
+                                Some(&decl.key),
+                                0,
+                                budget,
+                            )?
+                            else {
+                                return Ok(Some(BoundValue::InvalidType));
+                            };
+                            let value = match &kind {
+                                OrdinalKind::Integer => {
+                                    BoundValue::Constant(ConstantValue::Integer(0))
+                                }
+                                OrdinalKind::Boolean => {
+                                    BoundValue::Constant(ConstantValue::Boolean(false))
+                                }
+                                OrdinalKind::Character(ty) => BoundValue::StaticCharacter(*ty),
+                                OrdinalKind::Enum(key) => {
+                                    let bytes = size_of::<DefinitionKey>()
+                                        + key.anchor.source.as_str().len();
+                                    budget.charge(1, bytes * MAX_EXPRESSION_TOKENS, bytes)?;
+                                    BoundValue::EnumOrdinal(0, key.clone())
+                                }
+                            };
+                            kind.release(budget);
+                            Ok(Some(value))
+                        }
+                        _ => Ok(Some(BoundValue::InvalidType)),
+                    }
+                },
+            )?;
+            let actual = match value {
+                Some(BoundValue::Constant(ConstantValue::Integer(_))) => Some(OrdinalKind::Integer),
+                Some(BoundValue::Constant(ConstantValue::Boolean(_))) => Some(OrdinalKind::Boolean),
+                Some(BoundValue::Constant(ConstantValue::String(s))) => {
+                    let kind = character_ordinal(state, &s, budget)?.map(|(_, kind)| kind);
+                    budget.release(s.len());
+                    kind
+                }
+                Some(BoundValue::EnumOrdinal(_, key)) => Some(OrdinalKind::Enum(key)),
+                Some(BoundValue::StaticCharacter(ty)) => Some(OrdinalKind::Character(ty)),
+                _ => None,
+            };
+            let valid = if let Some(actual) = actual {
+                let valid = expected.compatible(&actual, budget)?;
+                actual.release(budget);
+                valid
+            } else {
+                false
+            };
+            expected.release(budget);
+            if !valid {
+                return Ok(false);
+            }
+            count += 1;
+        }
+        Ok(count == dimensions.len().max(1))
+    })();
+    budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+    result
+}
+
 enum OrdinalKind {
     Integer,
     Boolean,

@@ -42,9 +42,13 @@ pub(crate) struct Declaration {
     pub name: String,
     pub key: DefinitionKey,
     pub site: BindingSite,
+    /// Type names bind before a grouped value declaration admits its names.
+    pub type_site: BindingSite,
     pub ty: TypeExpr,
     pub is_type: bool,
     pub is_constant: bool,
+    /// Routine result syntax is not a variable's declared static type.
+    pub is_routine: bool,
     pub settings: LayoutSettings,
     pub provenance: Vec<SourceAnchor>,
     /// Unevaluated initializer for the later bounded constant-expression owner.
@@ -201,6 +205,28 @@ pub(super) fn lookup<'a>(
             }
         }
         scope = state.scopes[id.0 as usize].parent;
+    }
+    // Only a parser-proven current-unit prefix is admitted before the resource
+    // provider owner. Never strip a familiar external/System suffix.
+    if let Some(unit) = &state.unit_name {
+        if name.len() > unit.len() && name.as_bytes().get(unit.len()) == Some(&b'.') {
+            let Some(prefix) = name.get(..unit.len()) else {
+                return Ok(None);
+            };
+            budget.charge(1, unit.len(), 0)?;
+            if same_name(prefix, unit) {
+                let root = prefix.split('.').next().unwrap_or(prefix);
+                let suffix = &name[unit.len() + 1..];
+                budget.charge(suffix.len(), suffix.len(), 0)?;
+                if !suffix.contains('.') && lookup(state, site, root, budget)?.is_none() {
+                    let global = BindingSite {
+                        scope: ScopeId(0),
+                        sequence: site.sequence,
+                    };
+                    return lookup(state, &global, suffix, budget);
+                }
+            }
+        }
     }
     Ok(None)
 }

@@ -41,6 +41,70 @@ struct Alternative {
     parts: Vec<Part>,
 }
 
+/// Bind every admitted field, including nested variants. Invalid admission or
+/// duplicate variant names cannot be repaired by selecting a convenient field.
+pub(super) fn operand_field<'a>(
+    state: &'a CompileTimeState,
+    record: &'a Record,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<(&'a TypeExpr, &'a BindingSite, &'a LayoutSettings)>, IncompleteReason> {
+    if !record_element_valid(state, record, &mut Vec::new(), 0, budget)? {
+        return Ok(None);
+    }
+    fn scan<'a>(
+        parts: &'a [Part],
+        name: &str,
+        found: &mut Option<(&'a TypeExpr, &'a LayoutSettings)>,
+        ambiguous: &mut bool,
+        depth: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+        for part in parts {
+            budget.charge(1, 0, 0)?;
+            let (field_name, ty, settings) = match part {
+                Part::Field {
+                    name, ty, settings, ..
+                } => (Some(name.as_str()), ty, settings),
+                Part::Variant {
+                    name, ty, settings, ..
+                } => (name.as_deref(), ty, settings),
+            };
+            if let Some(field_name) = field_name {
+                budget.charge(1, field_name.len().min(name.len()), 0)?;
+                if same_name(field_name, name) {
+                    if found.is_some() {
+                        *ambiguous = true;
+                    }
+                    *found = Some((ty, settings));
+                }
+            }
+            if let Part::Variant { alternatives, .. } = part {
+                for alternative in alternatives {
+                    scan(
+                        &alternative.parts,
+                        name,
+                        found,
+                        ambiguous,
+                        depth + 1,
+                        budget,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut found = None;
+    let mut ambiguous = false;
+    scan(&record.parts, name, &mut found, &mut ambiguous, 0, budget)?;
+    Ok(if ambiguous {
+        None
+    } else {
+        found.map(|(ty, settings)| (ty, &record.site, settings))
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct LayoutChange {
     pub(super) logical: usize,
@@ -110,15 +174,10 @@ pub(super) fn parse_record(
     let mut site = state
         .site_at(&anchor.source, anchor.occurrence, anchor.range.start)
         .ok_or(IncompleteReason::MalformedSource)?;
-    // The enclosing declaration is admitted immediately after this parse. Include
-    // it for recursive-by-value cycle detection, never later declarations.
-    site.sequence = Sequence(
-        state
-            .sequence
-            .0
-            .checked_add(1)
-            .ok_or(IncompleteReason::MalformedSource)?,
-    );
+    // Include an enclosing type for recursive-by-value cycle detection, never
+    // later declarations. Value/parameter names cannot shadow their own fields'
+    // declared types during this admission.
+    site.sequence = state.type_admission_sequence()?;
     budget.release(size_of::<SourceAnchor>() + anchor.source.as_str().len());
     let end = logical
         .checked_add(node.end_byte() - node.start_byte())

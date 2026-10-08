@@ -7,10 +7,12 @@ mod bindings;
 mod budget;
 mod declarations;
 mod model;
+mod operands;
 mod records;
 mod scalars;
 
 pub use budget::{CompileTimeBudget, CompileTimeLimits};
 pub use declarations::CompileTimeState;
 pub use model::*;
+pub use operands::{SizeOfOperand, parse_sizeof_operand};
 pub use scalars::{BuiltinType, builtin_layout};

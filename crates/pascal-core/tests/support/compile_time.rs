@@ -100,6 +100,23 @@ impl Harness {
         assert_eq!(self.text.matches(marker).count(), 1);
         self.at(self.text.find(marker).unwrap(), name)
     }
+    pub fn query(&self, marker: &str, operand: &str) -> Fact<KnownLayout> {
+        assert_eq!(self.text.matches(marker).count(), 1);
+        let site = self
+            .state
+            .site_at(
+                &self.root.id,
+                OccurrenceId(0),
+                self.text.find(marker).unwrap(),
+            )
+            .unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        match parse_sizeof_operand(operand, &mut budget) {
+            Fact::Known(operand) => self.state.layout_operand(site, &operand, &mut budget),
+            Fact::Unknown(reason) => Fact::Unknown(reason),
+            Fact::Incomplete(reason) => Fact::Incomplete(reason),
+        }
+    }
     fn at(&self, offset: usize, name: &str) -> Option<u64> {
         let site = self.state.site_at(&self.root.id, OccurrenceId(0), offset)?;
         self.state

@@ -20,6 +20,7 @@ pub mod delphi_overrides;
 pub mod installation_config;
 #[allow(dead_code)]
 pub mod installations;
+pub mod layout;
 pub mod path_identity;
 pub mod path_issues;
 pub mod rtl_constants;
@@ -32,6 +33,7 @@ pub use conditional::{
 pub use conditional_closure::{ConditionalClosure, OpenReason, SourceOrigin};
 pub use configuration::{ConfigRead, config_directories, read_config};
 pub use installations::{InstallationOrigin, InstallationSelection};
+pub use layout::{LayoutContext, LayoutPlatform, LayoutSettings};
 pub use path_issues::{ProjectPathIssue, ProjectPathIssueKind};
 
 use crate::delphi_overrides::{
@@ -5410,6 +5412,39 @@ fn build_project_context(
         &mut builder.warnings,
     );
 
+    // Target parsing alone is not build-selection validation: it also accepts
+    // undeclared/custom names. Do not change legacy selection/closure semantics.
+    let invalid_layout_target = platform_selection.mode == BuildSelectionMode::Invalid
+        || platform_selection
+            .selected
+            .as_ref()
+            .is_some_and(|selected| {
+                !platform_selection.candidates.is_empty()
+                    && !platform_selection
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(selected))
+            })
+        || builder.unknown_properties.contains("platform");
+    let layout_target = (!invalid_layout_target)
+        .then_some(target_platform.as_ref())
+        .flatten();
+    let library_layout = LayoutContext::for_target(version, layout_target);
+    let mut project_layout = library_layout.clone();
+    apply_project_layout_properties(&mut project_layout.defaults, &builder);
+    conditional_context.layout = selected_layout(
+        project_layout,
+        &options.conditional_context,
+        invalid_layout_target,
+    );
+    library_conditional_context.layout = selected_layout(
+        library_layout,
+        &options.conditional_context,
+        invalid_layout_target,
+    );
+    conditional_context.layout_explicit = options.conditional_context.layout_explicit;
+    library_conditional_context.layout_explicit = options.conditional_context.layout_explicit;
+
     let discovery_complete = !builder.incomplete
         && ide_path_warnings.is_empty()
         && !project_context_warnings_incomplete(&builder.warnings, explicit);
@@ -5523,6 +5558,14 @@ fn build_standalone_context(
     let console_target = ConditionalFact::Unknown;
     let mut conditional_context = options.conditional_context.clone();
     let target_platform = platform.as_deref().and_then(TargetPlatform::parse);
+    conditional_context.layout = selected_layout(
+        LayoutContext::for_target(
+            conditional_context.compiler_version,
+            target_platform.as_ref(),
+        ),
+        &options.conditional_context,
+        false,
+    );
     let predefined = crate::compiler_defines::predefined_defines(
         conditional_context.compiler_version,
         target_platform.as_ref(),
@@ -5958,6 +6001,61 @@ fn parse_conditional_fact(value: &str) -> Option<ConditionalFact> {
         "0" | "false" | "no" | "off" | "-" => Some(ConditionalFact::False),
         "" => None,
         _ => Some(ConditionalFact::Unknown),
+    }
+}
+
+/// Whole-layout overrides retain unknown fields; contradictory build targets
+/// cannot establish either profile. Invalid selections cannot be repaired by an
+/// override. The compiler version remains solely in ConditionalContext.
+fn selected_layout(
+    inferred: LayoutContext,
+    caller: &ConditionalContext,
+    invalid_target: bool,
+) -> LayoutContext {
+    if !caller.layout_explicit {
+        return inferred;
+    }
+    if invalid_target
+        || matches!(
+            (&inferred.platform, &caller.layout.platform),
+            (Some(build), Some(explicit)) if build != explicit
+        )
+    {
+        return LayoutContext::default();
+    }
+    caller.layout.clone()
+}
+
+fn apply_project_layout_properties(settings: &mut LayoutSettings, builder: &ProjectBuilder) {
+    // Reads use the already bounded, ordered metadata evaluator. A tainted or
+    // malformed setting invalidates just that setting, not unrelated facts.
+    // An unknown import can have supplied an otherwise absent setting.
+    let property = |name: &str| -> Option<Option<String>> {
+        if builder.unknown_properties.contains(name) {
+            return Some(None);
+        }
+        match builder.property(name) {
+            Some(raw) if !raw.contains(UNRESOLVED_MARKER) => Some(Some(raw)),
+            Some(_) => Some(None),
+            None if builder.unknown_import_taint => Some(None),
+            None => None,
+        }
+    };
+    if let Some(raw) = property("dcc_alignment") {
+        // ALIGN 16 applicability is not independently verified for our targets.
+        settings.record_alignment = raw
+            .and_then(|raw| raw.trim().parse::<u8>().ok())
+            .filter(|value| matches!(value, 1 | 2 | 4 | 8));
+    }
+    if let Some(raw) = property("dcc_minimumenumsize") {
+        settings.minimum_enum_size = raw
+            .and_then(|raw| raw.trim().parse::<u8>().ok())
+            .filter(|value| matches!(value, 1 | 2 | 4));
+    }
+    if let Some(raw) = property("dcc_longstrings") {
+        settings.long_strings = raw
+            .and_then(|raw| parse_conditional_fact(&raw))
+            .unwrap_or(ConditionalFact::Unknown);
     }
 }
 

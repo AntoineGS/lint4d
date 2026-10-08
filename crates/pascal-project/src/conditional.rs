@@ -266,6 +266,10 @@ pub enum ConstantValue {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConditionalContext {
     pub compiler_version: Option<CompilerVersion>,
+    pub layout: crate::LayoutContext,
+    /// Whole-layout caller override, including explicitly unproven settings.
+    /// Inferred project layouts leave this false. Use `with_layout` to set it.
+    pub layout_explicit: bool,
     pub defines: BTreeMap<String, ConditionalFact>,
     pub options: BTreeMap<String, ConditionalFact>,
     pub constants: BTreeMap<String, ConstantValue>,
@@ -281,6 +285,8 @@ impl Default for ConditionalContext {
     fn default() -> Self {
         Self {
             compiler_version: None,
+            layout: crate::LayoutContext::default(),
+            layout_explicit: false,
             defines: BTreeMap::new(),
             options: BTreeMap::new(),
             constants: BTreeMap::new(),
@@ -295,6 +301,9 @@ impl ConditionalContext {
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
+        if let Some(crate::LayoutPlatform::Other(name)) = &self.layout.platform {
+            visit(name.len())?;
+        }
         for name in self.defines.keys() {
             visit(name.len())?;
         }
@@ -320,6 +329,13 @@ impl ConditionalContext {
 
     pub fn with_compiler_version(mut self, version: CompilerVersion) -> Self {
         self.compiler_version = Some(version);
+        self
+    }
+
+    /// Supply a whole-layout override without filling its unknown fields later.
+    pub fn with_layout(mut self, layout: crate::LayoutContext) -> Self {
+        self.layout = layout;
+        self.layout_explicit = true;
         self
     }
 
@@ -414,6 +430,10 @@ impl ConditionalContext {
         self.absent_define.hash(&mut hasher);
         5_u8.hash(&mut hasher);
         self.rtl_constants_known.hash(&mut hasher);
+        6_u8.hash(&mut hasher);
+        self.layout.hash(&mut hasher);
+        7_u8.hash(&mut hasher);
+        self.layout_explicit.hash(&mut hasher);
         hasher.finish()
     }
 }

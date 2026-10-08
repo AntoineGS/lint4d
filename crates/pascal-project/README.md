@@ -52,6 +52,35 @@ candidates are retained for freshness and invalidation.
 For the resolver, CFG adapter, CLI, and LSP ownership boundary, see the
 [shared resolver integration guide](../../docs/shared-resolver-architecture.md).
 
+## Layout context (data only)
+
+`layout::{LayoutContext, LayoutSettings, LayoutPlatform}` (also re-exported at
+the crate root) records the selected Delphi target separately from mutable
+conditional defines. `ConditionalContext::with_layout` supplies a whole-layout
+caller override and sets `layout_explicit`; even its unknown fields remain
+unknown rather than being filled from metadata. Contradictory caller/build
+targets and invalid build-platform selections cannot establish a target profile.
+Default contexts never assume a compiler, target, or host ABI.
+
+`conditional_context_for` keeps project and library source defaults separate.
+Resolved project `DCC_Alignment` (1/2/4/8), `DCC_MinimumEnumSize` (1/2/4), and
+`DCC_LongStrings` settings apply only to project sources; library sources start
+independently from compiler defaults. Unknown expressions/conditions and invalid
+values retain uncertainty for the affected setting. Explicit validated settings
+can be recorded without a verified compiler profile, but are not proof of a
+storage layout. Discovery does not execute compiler targets or solve layouts.
+
+Only the Delphi 12 Athens / CompilerVersion 36.0 Windows profile currently has
+referenced defaults: alignment 8 and long strings on, from the official indexed
+default statements in [Align fields (Delphi)](https://docwiki.embarcadero.com/RADStudio/Athens/en/Align_fields_(Delphi))
+and [Long strings (Delphi)](https://docwiki.embarcadero.com/RADStudio/Athens/en/Long_strings_(Delphi)).
+Full-page retrieval was unavailable (HTTP 403). Enum-size, `OLDTYPELAYOUT`, and
+`REALCOMPATIBILITY` defaults remain unproven. ALIGN 16 applicability, other
+targets, and other compiler versions (including Florence/37) are not inferred
+from Athens documentation. Unsupported target names are retained explicitly,
+with unknown defaults. These evidence limits must also be respected by future
+layout consumers.
+
 ## Delphi installation profiles
 
 Project discovery can combine project metadata with locally installed Delphi

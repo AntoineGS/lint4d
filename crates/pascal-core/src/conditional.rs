@@ -365,6 +365,8 @@ impl ConditionalEnvironment {
     pub fn to_context(&self) -> ConditionalContext {
         ConditionalContext {
             compiler_version: self.compiler_version,
+            layout: Default::default(),
+            layout_explicit: false,
             defines: self
                 .values
                 .iter()

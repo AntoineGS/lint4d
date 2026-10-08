@@ -17,6 +17,7 @@ pub(crate) enum TypeExpr {
     },
     Range(IndexExpr),
     Enum(Vec<EnumMember>),
+    Record(super::records::Record),
     /// Parser-validated nominal record/class/interface binding, not a layout.
     OpaqueNominal(String),
     /// Complete parser-validated syntax retained for later composite owners.
@@ -160,7 +161,7 @@ pub(super) fn layout_name(
             state,
             &site,
             &name,
-            &state.context.layout.defaults,
+            state.settings_at_sequence(site.sequence, budget)?,
             &mut Vec::new(),
             0,
             budget,
@@ -285,6 +286,9 @@ pub(super) fn storage_type<'a>(
         TypeExpr::Array { .. } => Ok(Fact::Unknown(UnknownReason::UnsupportedLayout)),
         TypeExpr::Range(_) | TypeExpr::Enum(_) => {
             super::arrays::ordinal_layout(state, site, ty, settings, depth, budget)
+        }
+        TypeExpr::Record(record) => {
+            super::records::record_layout(state, site, record, settings, visited, depth, budget)
         }
         TypeExpr::OpaqueNominal(_) | TypeExpr::Unsupported(_) => {
             Ok(Fact::Unknown(UnknownReason::UnsupportedLayout))

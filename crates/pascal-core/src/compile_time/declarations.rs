@@ -58,6 +58,11 @@ pub struct CompileTimeState {
     stack: Vec<ScopeId>,
     pub(super) declarations: Vec<Declaration>,
     definition_count: usize,
+    field_count: usize,
+    variant_count: usize,
+    pub(super) settings: pascal_project::LayoutSettings,
+    pub(super) settings_stack: Vec<Option<pascal_project::LayoutSettings>>,
+    pub(super) settings_history: Vec<super::records::LayoutChange>,
     spans: Vec<Span>,
     pub(super) sequence: Sequence,
     logical: usize,
@@ -90,6 +95,22 @@ pub(super) fn limit(
 }
 
 impl CompileTimeState {
+    pub(super) fn finished_for_directive(&self) -> bool {
+        self.finished
+    }
+    pub(super) fn layout_logical_position(&self) -> usize {
+        self.logical
+    }
+    pub(super) fn node_logical_position(
+        &self,
+        start: usize,
+        prefix: usize,
+    ) -> Result<usize, IncompleteReason> {
+        start
+            .checked_sub(prefix)
+            .and_then(|n| self.pending_start.checked_add(n))
+            .ok_or(IncompleteReason::MalformedSource)
+    }
     pub fn new(
         context: &ConditionalContext,
         root: &LoadedSource,
@@ -147,6 +168,11 @@ impl CompileTimeState {
             stack: vec![ScopeId(0)],
             declarations: Vec::new(),
             definition_count: 0,
+            field_count: 0,
+            variant_count: 0,
+            settings: context.layout.defaults.clone(),
+            settings_stack: Vec::new(),
+            settings_history: Vec::new(),
             spans: Vec::new(),
             sequence: Sequence(0),
             logical: 0,
@@ -701,6 +727,8 @@ impl CompileTimeState {
                 name_text.len() + ty_text.len() + initializer_len,
                 size_of::<Declaration>() + name_text.len() + initializer_len,
             )?;
+            let mut field_count = self.field_count;
+            let mut variant_count = self.variant_count;
             let mut ty = if valid {
                 type_expr(
                     self,
@@ -711,6 +739,8 @@ impl CompileTimeState {
                     node.kind() == "declArg",
                     0,
                     &mut definition_count,
+                    &mut field_count,
+                    &mut variant_count,
                     budget,
                 )?
             } else {
@@ -748,11 +778,13 @@ impl CompileTimeState {
                 // As in the existing conditional scanner, typed constants are
                 // lexical blockers, not proven values without coercion evidence.
                 is_constant: valid && node.kind() == "declConst" && ty_node.is_none(),
-                settings: self.context.layout.defaults.clone(),
+                settings: self.settings_at_logical(logical_name, budget)?.clone(),
                 provenance,
                 initializer: initializer.map(str::to_owned),
             });
             self.definition_count = definition_count;
+            self.field_count = field_count;
+            self.variant_count = variant_count;
         }
         Ok(())
     }
@@ -928,6 +960,11 @@ impl CompileTimeState {
         self.spans.hash(&mut h);
         self.sequence.hash(&mut h);
         self.definition_count.hash(&mut h);
+        self.field_count.hash(&mut h);
+        self.variant_count.hash(&mut h);
+        self.settings.hash(&mut h);
+        self.settings_stack.hash(&mut h);
+        self.settings_history.hash(&mut h);
         self.logical.hash(&mut h);
         self.pending_start.hash(&mut h);
         self.pending.hash(&mut h);
@@ -980,6 +1017,8 @@ impl CompileTimeState {
         )?;
         visit(self.scopes.len() * size_of::<Scope>())?;
         visit(self.stack.len() * size_of::<ScopeId>())?;
+        visit(self.settings_stack.len() * size_of::<Option<pascal_project::LayoutSettings>>())?;
+        visit(self.settings_history.len() * size_of::<super::records::LayoutChange>())?;
         visit(self.pending.len())?;
         visit(self.word.len())?;
         for s in &self.spans {
@@ -1030,7 +1069,7 @@ fn find_node<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn type_expr(
+pub(super) fn type_expr(
     state: &CompileTimeState,
     prefix: usize,
     node: Option<Node<'_>>,
@@ -1039,6 +1078,8 @@ fn type_expr(
     argument: bool,
     depth: usize,
     definition_count: &mut usize,
+    field_count: &mut usize,
+    variant_count: &mut usize,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<TypeExpr, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
@@ -1057,6 +1098,8 @@ fn type_expr(
         Ok(TypeExpr::Named(name))
     } else if n.kind() == "typerefPtr" {
         Ok(TypeExpr::Pointer(retain(raw, budget)?))
+    } else if n.kind() == "declString" && n.named_child_count() == 1 {
+        Ok(TypeExpr::Named(retain("string", budget)?))
     } else if n.kind() == "declArray" {
         let mut dimensions = Vec::new();
         let mut element = None;
@@ -1096,6 +1139,8 @@ fn type_expr(
             false,
             depth + 1,
             definition_count,
+            field_count,
+            variant_count,
             budget,
         )?);
         Ok(TypeExpr::Array {
@@ -1106,6 +1151,19 @@ fn type_expr(
         })
     } else if n.kind() == "declSubRange" {
         Ok(TypeExpr::Range(index_expr(n, bytes, budget)?))
+    } else if n.kind() == "declClass" && super::records::is_record(n, budget)? {
+        super::records::parse_record(
+            state,
+            prefix,
+            n,
+            bytes,
+            depth,
+            definition_count,
+            field_count,
+            variant_count,
+            budget,
+        )
+        .map(TypeExpr::Record)
     } else if matches!(n.kind(), "declClass" | "declIntf") {
         Ok(TypeExpr::OpaqueNominal(retain(raw, budget)?))
     } else if n.kind() == "declEnum" {
@@ -1215,11 +1273,12 @@ fn visit_index_payload(
     }
 }
 
-fn visit_type_payload(
+pub(super) fn visit_type_payload(
     ty: &TypeExpr,
     visit: &mut dyn FnMut(usize) -> Result<(), String>,
 ) -> Result<(), String> {
     match ty {
+        TypeExpr::Record(record) => super::records::visit_payload(record, visit),
         TypeExpr::Named(s)
         | TypeExpr::StrongAlias(s)
         | TypeExpr::Pointer(s)

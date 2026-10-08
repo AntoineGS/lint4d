@@ -566,3 +566,19 @@ fn fix_i1_invalid_element_cardinality_is_not_a_valid_type_shape() {
     );
     assert_eq!(h.size("A"), None);
 }
+
+#[test]
+fn record_element_stride_includes_nested_and_final_padding() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let mut c = context(platform);
+        c.layout.defaults.record_alignment = Some(8);
+        c.layout.defaults.old_type_layout = pascal_project::ConditionalFact::False;
+        let h = Harness::plain(
+            "unit T; interface type R=record I:LongWord; B:Byte; end; N=record B:Byte; R1:R; end; A=array[1..3] of R; B=array[-1..0] of N; P=packed record X:Byte; I:LongWord; end; PA=array[0..2] of P; implementation end.",
+            c,
+        );
+        assert_eq!(h.size("A"), Some(24));
+        assert_eq!(h.size("B"), Some(24));
+        assert_eq!(h.size("PA"), Some(15));
+    }
+}

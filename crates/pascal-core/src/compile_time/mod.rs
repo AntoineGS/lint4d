@@ -7,6 +7,7 @@ mod bindings;
 mod budget;
 mod declarations;
 mod model;
+mod records;
 mod scalars;
 
 pub use budget::{CompileTimeBudget, CompileTimeLimits};

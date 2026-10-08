@@ -177,6 +177,7 @@ fn element_valid<'a>(
             result
         }
         TypeExpr::OpaqueNominal(_) | TypeExpr::Pointer(_) => Ok(true),
+        TypeExpr::Record(record) => Ok(record.is_valid()),
         TypeExpr::Array {
             dimensions,
             element,
@@ -379,7 +380,7 @@ fn index_domain(
     }
 }
 
-fn type_domain(
+pub(super) fn type_domain(
     state: &CompileTimeState,
     site: &BindingSite,
     ty: &TypeExpr,

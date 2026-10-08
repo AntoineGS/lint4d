@@ -61,6 +61,9 @@ impl Harness {
         h
     }
     pub fn feed(&mut self, text: &str) {
+        self.feed_activity(text, Truth::True);
+    }
+    pub fn feed_activity(&mut self, text: &str, activity: Truth) {
         assert!(!self.finished);
         self.state
             .feed(
@@ -70,7 +73,7 @@ impl Harness {
                     physical_start: self.text.len(),
                     text,
                 },
-                Truth::True,
+                activity,
                 &mut self.budget,
             )
             .unwrap();
@@ -80,6 +83,15 @@ impl Harness {
         assert!(!self.finished);
         self.state.finish_root(&mut self.budget).unwrap();
         self.finished = true;
+    }
+    pub fn with_layout(&mut self, body: &str) {
+        self.with_layout_activity(body, Truth::True);
+    }
+    pub fn with_layout_activity(&mut self, body: &str, activity: Truth) {
+        assert!(!self.finished);
+        self.state
+            .apply_layout_directive(body, activity, &mut self.budget)
+            .unwrap();
     }
     pub fn size(&self, name: &str) -> Option<u64> {
         self.at(self.text.len(), name)

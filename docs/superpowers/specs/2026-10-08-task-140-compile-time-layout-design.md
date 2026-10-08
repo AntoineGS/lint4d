@@ -17,7 +17,7 @@ user-defined aliases, records, arrays, and variables. The agreed design includes
 scope and imported-type resolution, record packing/alignment/variant sections,
 and field, indexed, and dereferenced variable operands.
 
-Work stays in the current checkout. Preserve TASK-139's uncommitted project-name
+Work stays in the current checkout. Preserve TASK-139's project-name
 fix and tests. Do not change the real ChainDriveAPI sources, Delphi installation
 sources, editor configuration, or installation mappings. Obsolete project
 references remain separate work. This spec changes no product code and does not

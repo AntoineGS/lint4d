@@ -2281,6 +2281,7 @@ pub(crate) struct Claim {
     /// The slot is computed by another claim; this one computes without
     /// caching, so storing and dropping it leave the slot alone.
     detached: bool,
+    started: std::time::Instant,
 }
 
 impl Claim {
@@ -2643,8 +2644,18 @@ impl ProjectCache {
         };
         let mut state = lock(&self.inner);
         if snapshot_epoch.is_some_and(|epoch| epoch != state.invalidation_epoch) {
+            crate::trace::trace!(
+                "  cache rejected Interface {} from epoch {snapshot_epoch:?} at epoch {}",
+                uri.path().rsplit('/').next().unwrap_or_default(),
+                state.invalidation_epoch
+            );
             return false;
         }
+        crate::trace::trace!(
+            "  cache put Interface {} under {:x}",
+            uri.path().rsplit('/').next().unwrap_or_default(),
+            key.fingerprint
+        );
         let unchanged = matches!(
             state.slots.get(&key),
             Some(Slot::Ready(Entry {
@@ -2695,10 +2706,55 @@ impl ProjectCache {
                 {
                     extract(&entry.value)?
                 }
-                _ => return None,
+                slot => {
+                    crate::trace::count(|counters| counters.peek_misses += 1);
+                    if crate::trace::enabled() {
+                        let reason = match slot {
+                            None => {
+                                let others = state
+                                    .by_uri
+                                    .get(uri)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|other| other.layer == layer)
+                                    .map(|other| format!("{:x}", other.fingerprint))
+                                    .collect::<Vec<_>>();
+                                format!(
+                                    "absent; same layer under fingerprints [{}]",
+                                    others.join(", ")
+                                )
+                            }
+                            Some(Slot::Computing { .. }) => "computing".to_string(),
+                            Some(Slot::Ready(entry)) if entry.input_hash != input_hash => {
+                                format!("hash {:x} != {:x}", entry.input_hash, input_hash)
+                            }
+                            Some(Slot::Ready(_)) => "context differs".to_string(),
+                        };
+                        crate::trace::trace!(
+                            "  peek miss {layer:?} {} under {:x}: {reason}",
+                            uri.path().rsplit('/').next().unwrap_or_default(),
+                            key.fingerprint
+                        );
+                    }
+                    return None;
+                }
             }
         };
-        if !probes_hold(value.probes(), overlays) {
+        let probing = std::time::Instant::now();
+        let held = probes_hold(value.probes(), overlays);
+        crate::trace::count(|counters| {
+            counters.probes += probing.elapsed();
+            if held {
+                counters.peek_hits += 1;
+            } else {
+                counters.peek_misses += 1;
+            }
+        });
+        if !held {
+            crate::trace::trace!(
+                "  peek miss {layer:?} {}: probes failed",
+                uri.path().rsplit('/').next().unwrap_or_default()
+            );
             return None;
         }
         let mut state = lock(&self.inner);
@@ -2806,6 +2862,7 @@ impl ProjectCache {
         };
         let wait_limit = CLAIM_WAIT_LIMIT.with(std::cell::Cell::get);
         let mut waiting_since = None;
+        let mut wait_started: Option<std::time::Instant> = None;
         let mut state = lock(&self.inner);
         loop {
             match state.slots.get(&key) {
@@ -2813,6 +2870,7 @@ impl ProjectCache {
                     generation,
                     input_hash: claimed_input,
                 }) => {
+                    wait_started.get_or_insert_with(std::time::Instant::now);
                     if cancel.load(Ordering::Relaxed) {
                         return Lookup::Cancelled;
                     }
@@ -2826,6 +2884,11 @@ impl ProjectCache {
                     // this thread may not wait longer: compute without
                     // caching instead of waiting on it.
                     if *claimed_input != input_hash || waited_out {
+                        crate::trace::count(|counters| {
+                            counters.detached += 1;
+                            counters.wait +=
+                                wait_started.map_or(Duration::ZERO, |since| since.elapsed());
+                        });
                         return Lookup::Compute(Claim {
                             inner: self.inner.clone(),
                             key: key.clone(),
@@ -2834,6 +2897,7 @@ impl ProjectCache {
                             input_hash,
                             invalidation_epoch: snapshot_epoch.unwrap_or(state.invalidation_epoch),
                             detached: true,
+                            started: std::time::Instant::now(),
                         });
                     }
                     #[cfg(test)]
@@ -2860,7 +2924,9 @@ impl ProjectCache {
                         break;
                     };
                     drop(state);
+                    let probing = std::time::Instant::now();
                     let probes_hold = probes_hold(value.probes(), overlays);
+                    crate::trace::count(|counters| counters.probes += probing.elapsed());
                     #[cfg(test)]
                     if probes_hold {
                         self.run_validation_hook();
@@ -2881,12 +2947,42 @@ impl ProjectCache {
                     }
                     if probes_hold {
                         touch(&mut state, &key);
+                        crate::trace::count(|counters| {
+                            counters.hits += 1;
+                            counters.wait +=
+                                wait_started.map_or(Duration::ZERO, |since| since.elapsed());
+                        });
                         return Lookup::Hit(value);
                     }
                     break;
                 }
                 _ => break,
             }
+        }
+        crate::trace::count(|counters| {
+            counters.computes += 1;
+            counters.wait += wait_started.map_or(Duration::ZERO, |since| since.elapsed());
+        });
+        if crate::trace::enabled() {
+            let reason = match state.slots.get(&key) {
+                None => "absent".to_string(),
+                Some(Slot::Ready(entry)) if entry.input_hash != input_hash => {
+                    "input changed".to_string()
+                }
+                Some(Slot::Ready(entry)) if entry.context.as_ref() != context => {
+                    format!(
+                        "context differs in {}",
+                        context_differences(&entry.context, context)
+                    )
+                }
+                Some(Slot::Ready(_)) => "probes failed".to_string(),
+                Some(Slot::Computing { .. }) => "computing".to_string(),
+            };
+            crate::trace::trace!(
+                "  cache compute {layer:?} {} under {:x}: {reason}",
+                uri.path().rsplit('/').next().unwrap_or_default(),
+                key.fingerprint
+            );
         }
         remove_ready(&mut state, &key);
         let generation = state.generation;
@@ -2908,8 +3004,146 @@ impl ProjectCache {
             input_hash,
             invalidation_epoch,
             detached: false,
+            started: std::time::Instant::now(),
         })
     }
+}
+
+/// Names the fields in which two contexts with one fingerprint differ.
+fn context_differences(left: &ProjectContext, right: &ProjectContext) -> String {
+    let mut fields = Vec::new();
+    if left.discovery_complete != right.discovery_complete {
+        fields.push("discovery_complete".to_string());
+    }
+    if left.binding_metadata_complete != right.binding_metadata_complete {
+        fields.push("binding_metadata_complete".to_string());
+    }
+    if left.path_issues != right.path_issues {
+        fields.push("path_issues".to_string());
+    }
+    if left.project_file != right.project_file {
+        fields.push("project_file".to_string());
+    }
+    if left.installation_evidence != right.installation_evidence {
+        fields.push("installation_evidence".to_string());
+    }
+    if left.installation_selection != right.installation_selection {
+        fields.push("installation_selection".to_string());
+    }
+    if left.main_source != right.main_source {
+        fields.push("main_source".to_string());
+    }
+    if left.search_paths != right.search_paths {
+        fields.push("search_paths".to_string());
+    }
+    if left.search_path_entries != right.search_path_entries {
+        fields.push("search_path_entries".to_string());
+    }
+    if left.browsing_path_entries != right.browsing_path_entries {
+        fields.push("browsing_path_entries".to_string());
+    }
+    if left.debug_dcu_path_entries != right.debug_dcu_path_entries {
+        fields.push("debug_dcu_path_entries".to_string());
+    }
+    if left.main_source_entry != right.main_source_entry {
+        fields.push("main_source_entry".to_string());
+    }
+    if left.explicit_unit_entries != right.explicit_unit_entries {
+        fields.push("explicit_unit_entries".to_string());
+    }
+    if left.include_paths != right.include_paths {
+        fields.push("include_paths".to_string());
+    }
+    if left.include_path_entries != right.include_path_entries {
+        fields.push("include_path_entries".to_string());
+    }
+    if left.explicit_units != right.explicit_units {
+        fields.push("explicit_units".to_string());
+    }
+    if left.unit_namespaces != right.unit_namespaces {
+        fields.push("unit_namespaces".to_string());
+    }
+    if left.unit_aliases != right.unit_aliases {
+        fields.push("unit_aliases".to_string());
+    }
+    if left.defines != right.defines {
+        fields.push("defines".to_string());
+    }
+    if left.conditional_context != right.conditional_context {
+        fields.push("conditional_context".to_string());
+    }
+    if left.conditional_closure != right.conditional_closure {
+        fields.push("conditional_closure".to_string());
+    }
+    if left.library_conditional_context != right.library_conditional_context {
+        fields.push("library_conditional_context".to_string());
+    }
+    if left.project_source_roots != right.project_source_roots {
+        fields.push("project_source_roots".to_string());
+    }
+    if left.config != right.config {
+        fields.push("config".to_string());
+    }
+    if left.platform != right.platform {
+        fields.push("platform".to_string());
+    }
+    if left.config_selection != right.config_selection {
+        fields.push("config_selection".to_string());
+    }
+    if left.platform_selection != right.platform_selection {
+        fields.push("platform_selection".to_string());
+    }
+    if left.overrides != right.overrides {
+        fields.push("overrides".to_string());
+    }
+    if left.read_policy != right.read_policy {
+        fields.push("read_policy".to_string());
+    }
+    if left.packages != right.packages {
+        fields.push("packages".to_string());
+    }
+    if left.metadata_files != right.metadata_files {
+        let only_left = left
+            .metadata_files
+            .iter()
+            .filter(|path| !right.metadata_files.contains(path))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let only_right = right
+            .metadata_files
+            .iter()
+            .filter(|path| !left.metadata_files.contains(path))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        fields.push(format!(
+            "metadata_files ({} vs {}; only stored: {only_left:?}; only looked up: {only_right:?})",
+            left.metadata_files.len(),
+            right.metadata_files.len()
+        ));
+    }
+    if left.metadata_observations != right.metadata_observations {
+        fields.push(format!(
+            "metadata_observations ({} vs {})",
+            left.metadata_observations.len(),
+            right.metadata_observations.len()
+        ));
+    }
+    if left.installation_config_files != right.installation_config_files {
+        fields.push("installation_config_files".to_string());
+    }
+    if left.system_pas_searches != right.system_pas_searches {
+        fields.push("system_pas_searches".to_string());
+    }
+    if left.metadata_observations != right.metadata_observations {
+        fields.push("metadata_observations".to_string());
+    }
+    if left.warnings != right.warnings {
+        fields.push("warnings".to_string());
+    }
+    if left.override_error != right.override_error {
+        fields.push("override_error".to_string());
+    }
+    fields.join(", ")
 }
 
 const LAYERS: [Layer; 3] = [Layer::Unit, Layer::Import, Layer::Interface];
@@ -3272,6 +3506,13 @@ impl ProjectCache {
             && claim.invalidation_epoch == state.invalidation_epoch
             && matches!(state.slots.get(&claim.key),
             Some(Slot::Computing { generation, .. }) if *generation == claim.generation && claim.generation == state.generation);
+        crate::trace::trace!(
+            "  cache {} {:?} {} after {:.1} ms",
+            if current { "stored" } else { "discarded" },
+            claim.key.layer,
+            claim.key.uri.path().rsplit('/').next().unwrap_or_default(),
+            claim.started.elapsed().as_secs_f64() * 1000.0
+        );
         if current {
             state.clock += 1;
             let entry = Entry {
@@ -3313,6 +3554,25 @@ impl ProjectCache {
             && !state.closure_misses.contains_key(root)
         {
             state.closure_misses.clear();
+        }
+        if new_miss {
+            let previous = state.closure_misses.get(root);
+            let fresh = missed
+                .iter()
+                .filter(|uri| previous.is_none_or(|previous| !previous.contains(uri)))
+                .map(|uri| {
+                    uri.path()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            crate::trace::trace!(
+                "closure misses for {root}: {} uncached, new: {}",
+                missed.len(),
+                crate::trace::short(fresh.join(", "), 400)
+            );
         }
         state.closure_misses.insert(root.clone(), missed);
         drop(state);
@@ -3382,6 +3642,11 @@ impl ProjectCache {
     fn invalidate_path_with_parent(&self, path: &Path, include_parent: bool) -> Vec<Url> {
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
+        crate::trace::trace!(
+            "cache invalidate {} (parent: {include_parent}) -> epoch {}",
+            path.display(),
+            state.invalidation_epoch
+        );
         let parent = path.parent().filter(|_| include_parent);
         let doomed = state
             .exact
@@ -3402,6 +3667,9 @@ impl ProjectCache {
             }
         }
         self.release(state);
+        if !affected.is_empty() {
+            crate::trace::trace!("  evicted entries of {} uris", affected.len());
+        }
         affected
     }
 
@@ -3410,6 +3678,10 @@ impl ProjectCache {
     pub(crate) fn invalidate_after_overflow(&self) {
         let mut state = lock(&self.inner);
         state.invalidation_epoch = state.invalidation_epoch.wrapping_add(1);
+        crate::trace::trace!(
+            "cache invalidate all after overflow -> epoch {}",
+            state.invalidation_epoch
+        );
         let doomed = state
             .slots
             .iter()
@@ -3426,6 +3698,7 @@ impl ProjectCache {
 
     pub(crate) fn retain_fingerprints(&self, keep: &HashSet<u64>) {
         let mut state = lock(&self.inner);
+        crate::trace::trace!("cache retain fingerprints {keep:?}");
         state.generation = state.generation.wrapping_add(1);
         let doomed = state
             .slots

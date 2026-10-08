@@ -5860,6 +5860,12 @@ impl AnalysisJobs {
         let handle = thread::Builder::new()
             .name("PascalLspAnalysis".to_string())
             .spawn(move || {
+                let _span = crate::trace::Span::new(|| {
+                    format!(
+                        "analysis {priority:?} {}",
+                        crate::trace::short(format!("{request:?}"), 240)
+                    )
+                });
                 if priority == AnalysisPriority::Interactive {
                     crate::project_cache::limit_claim_waits_on_this_thread(Some(
                         INTERACTIVE_CLAIM_WAIT,

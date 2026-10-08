@@ -5932,6 +5932,17 @@ fn build_snapshot_with_policy(
     if is_cancelled(cancel) {
         return Err(CANCELLATION_MESSAGE.to_string());
     }
+    let _span = crate::trace::Span::new(|| {
+        format!(
+            "snapshot {mode:?} for {} ({} candidate names)",
+            priority
+                .iter()
+                .map(|uri| uri.path().rsplit('/').next().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", "),
+            candidate_names.len()
+        )
+    });
     let _project_discovery_cache_scope = if matches!(
         mode,
         SnapshotMode::Workspace | SnapshotMode::WorkspaceSymbols
@@ -5997,6 +6008,7 @@ fn build_snapshot_with_policy(
         let context_key = snapshot_context_for_uri(&mut loader, uri, cancel, false)?;
         priority_contexts.insert(uri.clone(), context_key);
     }
+    crate::trace::trace!("  snapshot priority contexts resolved");
     #[cfg(test)]
     wait_at_snapshot_priority_barrier(&priority);
     if !input.project_selections.is_empty() {
@@ -6131,6 +6143,7 @@ fn build_snapshot_with_policy(
         cancel,
     )?;
     enumeration.sort_paths(&priority);
+    crate::trace::trace!("  snapshot enumerated {} paths", enumeration.paths.len());
     let auto_import_complete = enumeration.auto_import_complete;
     let paths = enumeration.paths;
     let mut auto_import_unit_providers = enumeration.auto_import_unit_providers;
@@ -6718,6 +6731,7 @@ fn build_snapshot_with_policy(
     let mut pins: HashSet<Url> = indexed_uris;
     let mut direct_dependencies = Vec::new();
     let mut declaration_providers = HashSet::new();
+    crate::trace::trace!("  snapshot indexed {} sources", uris.len());
     if mode != SnapshotMode::WorkspaceSymbols {
         for uri in uris {
             if is_cancelled(cancel) {
@@ -6759,12 +6773,21 @@ fn build_snapshot_with_policy(
                     .bind_imports(&uri, std::iter::empty::<(String, Url)>());
             }
         }
+        crate::trace::trace!(
+            "  snapshot loaded {} direct dependencies",
+            direct_dependencies.len()
+        );
         let closure = super::closure::walk_interface_closure(
             &mut loader,
             &direct_dependencies,
             &owned_sources,
             cancel,
         )?;
+        crate::trace::trace!(
+            "  snapshot closure walked: {} providers, {} missed",
+            closure.providers.len(),
+            closure.missed.len()
+        );
         for root in &priority {
             loader
                 .project_cache

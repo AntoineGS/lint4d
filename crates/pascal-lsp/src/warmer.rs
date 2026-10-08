@@ -452,6 +452,7 @@ impl Warmer {
             self.open_epochs.insert(uri.clone(), self.next_open_epoch);
             self.next_open_epoch
         };
+        crate::trace::trace!("warm open {uri} (epoch {open_epoch})");
         self.open_order.retain(|opened| opened != &uri);
         self.open_order.push_front(uri.clone());
         let already_queued = self.queue.queued.contains(&uri);
@@ -467,6 +468,7 @@ impl Warmer {
     /// Schedules another attempt for an already-open file without changing
     /// its identity. Watcher invalidations are not document reopenings.
     pub(crate) fn rewarm(&mut self, uri: Url) {
+        crate::trace::trace!("warm rewarm {uri}");
         self.queue.push_front(uri);
     }
 
@@ -481,8 +483,15 @@ impl Warmer {
             .is_some_and(|(busy_uri, _)| busy_uri == &uri)
             && self.dispatched_epochs.get(&uri) == Some(&invalidation_epoch);
         if in_flight || self.crawled_epochs.get(&uri) == Some(&invalidation_epoch) {
+            crate::trace::trace!(
+                "warm closure crawl for {uri} skipped (in flight: {in_flight}, epoch {invalidation_epoch})"
+            );
             return;
         }
+        crate::trace::trace!(
+            "warm closure crawl for {uri} requested at epoch {invalidation_epoch} (last crawled at {:?})",
+            self.crawled_epochs.get(&uri)
+        );
         self.rewarm(uri);
     }
 
@@ -502,6 +511,7 @@ impl Warmer {
         open: impl IntoIterator<Item = Url>,
         cache: &crate::project_cache::ProjectCache,
     ) {
+        crate::trace::trace!("warm reset (configuration changed)");
         self.cancel.store(true, Ordering::Relaxed);
         cache.clear_pins();
         self.cancel = Arc::new(AtomicBool::new(false));
@@ -524,6 +534,15 @@ impl Warmer {
     pub(crate) fn poll(&mut self, workspace: &Workspace) -> Vec<WarmEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.events.try_recv() {
+            match &event {
+                WarmEvent::Progress { .. } => {}
+                WarmEvent::End { uri, pins, .. } => crate::trace::trace!(
+                    "warm end {uri}: {} pins, cache epoch {}",
+                    pins.len(),
+                    workspace.project_cache().invalidation_epoch()
+                ),
+                other => crate::trace::trace!("warm event {other:?}"),
+            }
             if self.accept_event(&event, workspace.project_cache()) {
                 events.push(event);
             }
@@ -550,6 +569,10 @@ impl Warmer {
                     .as_ref()
                     .is_some_and(|jobs| jobs.send(job).is_ok())
                 {
+                    crate::trace::trace!(
+                        "warm dispatch {busy_uri} at cache epoch {}",
+                        workspace.project_cache().invalidation_epoch()
+                    );
                     self.busy = true;
                     self.busy_attempt = Some((busy_uri, open_epoch));
                 }
@@ -680,6 +703,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     if !gate.wait_idle(&job.cancel) {
         return end(None, Vec::new());
     }
+    let _span = crate::trace::Span::new(|| format!("warm crawl {}", job.uri));
     let mut workspace = Workspace::from_analysis_input(&job.input);
     let hook_events = events.clone();
     let hook_uri = job.uri.clone();
@@ -689,7 +713,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
     let hook_gate = gate.clone();
     let paused = Arc::new(AtomicBool::new(false));
     let hook_paused = paused.clone();
-    workspace.set_dependency_hook(Arc::new(move |_, done, total| {
+    workspace.set_dependency_hook(Arc::new(move |unit, done, total| {
         if done == 0 {
             let _ = hook_events.send(WarmEvent::Begin {
                 uri: hook_uri.clone(),
@@ -706,6 +730,7 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
                 open_epoch: hook_open_epoch,
             });
         }
+        crate::trace::trace!("  warm unit {done}/{total} {}", unit_name(unit));
         // Pause between units while interactive requests run.
         if done == total || hook_gate.try_wait_idle(&hook_cancel) {
             Ok(())
@@ -749,6 +774,10 @@ fn run_job(job: WarmJob, gate: Arc<InteractiveGate>, events: &Sender<WarmEvent>)
         }
         Err(_) => end(None, Vec::new()),
     }
+}
+
+fn unit_name(uri: &Url) -> &str {
+    uri.path().rsplit('/').next().unwrap_or_default()
 }
 
 #[cfg(target_os = "linux")]

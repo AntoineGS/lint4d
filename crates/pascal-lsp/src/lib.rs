@@ -12,6 +12,7 @@ pub mod navigation;
 mod project_cache;
 pub mod server;
 pub mod text;
+pub(crate) mod trace;
 pub(crate) mod warmer;
 pub mod workspace;
 

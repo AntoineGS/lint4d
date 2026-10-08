@@ -34,6 +34,12 @@ ordered property assignments and boolean/comparison conditions; it does not
 execute targets or expand wildcard imports. Unsupported functions, unknown
 conditions, and unauthorized imports are not treated as proven false.
 
+Root `.dproj` evaluation supplies `MSBuildProjectName` from the project filename
+without its extension. The name remains unchanged in imported option sets and
+cannot be replaced by project XML; an explicit configured property still takes
+precedence. Standard `Exists('$(MSBuildProjectName).deployproj')` conditions are
+evaluated without executing or reading unsupported deployment imports.
+
 Project discovery loads the nearest `.delphilsp.json` (version `1`) from the
 source directory up to the supplied workspace root. Supported properties are
 `project`, `sourcePaths`, `defines`, and `buildConfiguration`; paths are

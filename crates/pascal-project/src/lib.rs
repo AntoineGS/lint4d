@@ -7991,6 +7991,24 @@ impl ProjectBuilder {
                 .map_err(|error| format!("could not read project {}: {error}", path.display()))?;
         self.record_payload_observation(observation);
         let operations = parse_xml_operations(&contents, path)?;
+        // MSBuild's project identity belongs to the root project, not to an
+        // imported option set. Keep explicit globals at their existing priority.
+        let key = "msbuildprojectname";
+        if !self.global_properties.contains(key)
+            && let Some(name) = path.file_stem()
+        {
+            self.set_property(
+                key,
+                name.to_string_lossy().into_owned(),
+                false,
+                Vec::new(),
+                false,
+                Vec::new(),
+                &entry.provenance,
+                path,
+            );
+            self.global_properties.insert(key.to_owned());
+        }
         self.process_operations(operations, path, tracker, &entry.provenance)?;
         Ok(())
     }

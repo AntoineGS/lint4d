@@ -2546,6 +2546,49 @@ fn conditional_alternative_paths_are_not_exclusion_proof_for_automatic_selection
 }
 
 #[test]
+fn msbuild_project_name_deployment_import_keeps_unit_definition_navigation() {
+    for deployment_exists in [false, true] {
+        let temp = tempfile::tempdir().expect("temporary fixture");
+        let root = temp.path();
+        let main = root.join("Main.pas");
+        let provider = root.join("units/Provider.pas");
+        let source = "unit Main;\ninterface\nuses Provider;\nimplementation\nend.\n";
+        write(&main, source);
+        write(&provider, "unit Provider; interface implementation end.");
+        write(
+            &root.join("App.dproj"),
+            r#"<Project><PropertyGroup><MainSource>Main.pas</MainSource></PropertyGroup>
+            <ItemGroup><DCCReference Include="units/Provider.pas"/></ItemGroup>
+            <Import Project="$(MSBuildProjectName).deployproj"
+                    Condition="Exists('$(MSBuildProjectName).deployproj')"/>
+            </Project>"#,
+        );
+        if deployment_exists {
+            write(&root.join("App.deployproj"), "not valid XML");
+        }
+        let source_uri = Url::from_file_path(&main).expect("source URI");
+        let mut workspace = Workspace::with_override_session(
+            vec![root.to_path_buf()],
+            WorkspaceOptions::default(),
+            OverrideSession::new(None),
+        );
+        workspace
+            .open_document(source_uri.clone(), source.to_owned(), 1)
+            .expect("open project source");
+
+        let locations = workspace.navigate(
+            &source_uri,
+            Position::new(2, 7),
+            pascal_lsp::NavigationTarget::Definition,
+        );
+
+        assert_eq!(locations.len(), 1, "deployment exists: {deployment_exists}");
+        assert_eq!(locations[0].uri, Url::from_file_path(&provider).unwrap());
+        assert_eq!(locations[0].range.start, Position::new(0, 5));
+    }
+}
+
+#[test]
 fn project_defines_select_the_active_navigation_branch_without_inventing_versions() {
     let temp = tempfile::tempdir().expect("temporary fixture");
     let root = temp.path();

@@ -56,6 +56,110 @@ fn effective_conditional_context_is_open_even_when_stored_context_is_closed() {
 }
 
 #[test]
+fn msbuild_project_name_absent_deployment_import_keeps_bindings_available() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write(&root.join("App.dpr"), "program App; begin end.");
+    write(
+        &root.join("Good.pas"),
+        "unit Good; interface implementation end.",
+    );
+    write(
+        &root.join("App.dproj"),
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource></PropertyGroup>
+        <ItemGroup><DCCReference Include="Good.pas"/></ItemGroup>
+        <Import Project="$(MSBuildProjectName).deployproj"
+                Condition="Exists('$(MSBuildProjectName).deployproj')"/>
+        </Project>"#,
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("Good.pas"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+
+    assert!(context.discovery_complete, "{:?}", context.warnings);
+    assert!(context.can_resolve_units());
+    assert_eq!(context.explicit_units["good"], [root.join("Good.pas")]);
+    assert!(
+        context
+            .metadata_files
+            .contains(&root.join("App.deployproj"))
+    );
+}
+
+#[test]
+fn msbuild_project_name_present_deployment_import_is_not_evaluated() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write(&root.join("App.dpr"), "program App; begin end.");
+    // Unsupported deployment metadata must never be read as project XML.
+    write(&root.join("App.deployproj"), "not valid XML");
+    write(
+        &root.join("App.dproj"),
+        r#"<Project><PropertyGroup><MainSource>App.dpr</MainSource>
+        <DCC_Define>KNOWN</DCC_Define></PropertyGroup>
+        <Import Project="$(MSBuildProjectName).deployproj"
+                Condition="Exists('$(MSBuildProjectName).deployproj')"/>
+        </Project>"#,
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("App.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+
+    assert!(context.discovery_complete, "{:?}", context.warnings);
+    assert_eq!(context.defines, ["KNOWN"]);
+    assert!(context.warnings.iter().any(|warning| {
+        warning.contains("ignored unsupported MSBuild import") && warning.contains("deployproj")
+    }));
+    assert!(!context.metadata_observations.iter().any(|observation| {
+        matches!(observation, MetadataObservation::Payload { path, .. }
+            if path == &root.join("App.deployproj"))
+    }));
+}
+
+#[test]
+fn msbuild_project_name_stays_the_root_identity_in_imported_properties() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write(&root.join("Shop.Service.dpr"), "program Shop; begin end.");
+    write(
+        &root.join("Shop.Service.dproj"),
+        r#"<Project><PropertyGroup>
+        <MainSource>$(MSBuildProjectName).dpr</MainSource>
+        </PropertyGroup><Import Project="options/Nested.props"/>
+        </Project>"#,
+    );
+    write(
+        &root.join("options/Nested.props"),
+        r#"<Project><PropertyGroup>
+        <MSBuildProjectName>Wrong</MSBuildProjectName>
+        <DCC_Define Condition="'$(MSBuildProjectName)'=='Shop.Service'">ROOT_NAME</DCC_Define>
+        </PropertyGroup></Project>"#,
+    );
+
+    let context = ProjectContext::discover_with_overrides(
+        &root.join("Shop.Service.dpr"),
+        &[root.to_path_buf()],
+        &ProjectOptions::default(),
+        &OverrideSession::new(None),
+    )
+    .unwrap();
+
+    assert!(context.discovery_complete, "{:?}", context.warnings);
+    assert_eq!(context.main_source, Some(root.join("Shop.Service.dpr")));
+    assert_eq!(context.defines, ["ROOT_NAME"]);
+}
+
+#[test]
 fn missing_reference_keeps_independent_metadata_usable() {
     let temp = tempdir().unwrap();
     let root = temp.path();

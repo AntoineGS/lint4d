@@ -270,8 +270,12 @@ pub(crate) fn probes_hold(probes: &[Probe], overlays: &HashMap<Url, OverlayInput
             stamp,
             content_hash,
         } => {
-            if Url::from_file_path(path).is_ok_and(|uri| overlays.contains_key(&uri)) {
-                return false;
+            // An open document's overlay is authoritative over the disk file.
+            if let Some(overlay) = Url::from_file_path(path)
+                .ok()
+                .and_then(|uri| overlays.get(&uri))
+            {
+                return overlay_content_hash(&overlay.text) == *content_hash;
             }
             match current_stamp(path) {
                 Ok(Some(now)) if Some(&now) == stamp.as_ref() => true,
@@ -424,7 +428,7 @@ mod probe_tests {
     }
 
     #[test]
-    fn disk_content_probe_fails_once_the_file_is_open() {
+    fn disk_content_probe_follows_the_overlay_once_the_file_is_open() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("A.pas");
         std::fs::write(&file, "unit A;").unwrap();
@@ -433,14 +437,18 @@ mod probe_tests {
             stamp: stamp(&file),
             content_hash: pascal_project::content_hash_bytes(b"unit A;"),
         }];
-        let overlays = HashMap::from([(
-            Url::from_file_path(&file).unwrap(),
-            OverlayInput {
-                text: "unit A;".into(),
-                version: 1,
-            },
-        )]);
-        assert!(!probes_hold(&probes, &overlays));
+        let open = |text: &str| {
+            HashMap::from([(
+                Url::from_file_path(&file).unwrap(),
+                OverlayInput {
+                    text: text.into(),
+                    version: 1,
+                },
+            )])
+        };
+        assert!(probes_hold(&probes, &open("unit A;")));
+        // The overlay is authoritative even while the disk bytes still match.
+        assert!(!probes_hold(&probes, &open("unit B;")));
     }
 
     #[test]

@@ -4222,7 +4222,10 @@ impl Workspace {
         self.forget_diagnostic_dependencies(uri);
         if was_open || cleared_rejected_fence {
             self.bump_source_generation();
-            self.mark_source_change(uri, true);
+            // Closing a file listed on disk leaves its directory listing as
+            // it was; entries that recorded its overlay are still evicted.
+            let listed_on_disk = self.is_listed_on_disk(uri);
+            self.mark_source_change(uri, !listed_on_disk);
             self.open_document_contexts.remove(uri);
             if let Some(context_key) = retained_context {
                 // Include invalidation removes the indexed document and its
@@ -4257,13 +4260,25 @@ impl Workspace {
             ));
         }
         // Overlays are part of directory listings, so only replacing an
-        // existing overlay's text leaves the parent's listing unchanged.
+        // existing overlay's text, or opening a file that is listed on disk,
+        // leaves the parent's listing unchanged. Cached entries hold for an
+        // overlay with the disk file's bytes, so opening one keeps them all.
         let had_overlay = self
             .open_documents
             .get(&uri)
             .is_some_and(|document| document.text.is_some());
+        let listed_on_disk = self.is_listed_on_disk(&uri);
+        let cache = if had_overlay {
+            CacheInvalidation::Contents
+        } else if !listed_on_disk {
+            CacheInvalidation::Listing
+        } else if disk_bytes_equal(&uri, text.as_bytes()) {
+            CacheInvalidation::Unchanged
+        } else {
+            CacheInvalidation::Contents
+        };
         self.bump_source_generation();
-        self.mark_source_change(&uri, !had_overlay);
+        let _ = self.mark_source_change_with_control(&uri, cache, None, None);
         let text_len = text.len();
         let shared_text = Arc::<str>::from(text.as_str());
         let source_for_index = text;
@@ -4445,8 +4460,12 @@ impl Workspace {
         }
         if !override_changed {
             self.bump_source_generation();
-            diagnostic_uris
-                .extend(self.mark_source_change_with_control(uri, true, cancel, budget)?);
+            diagnostic_uris.extend(self.mark_source_change_with_control(
+                uri,
+                CacheInvalidation::Listing,
+                cancel,
+                budget,
+            )?);
         }
         let configuration_changed = is_configuration_path(uri);
         if configuration_changed || (override_changed && budget.is_some()) {
@@ -13299,6 +13318,15 @@ impl Workspace {
             )
     }
 
+    /// Whether `uri` is a file on disk that no client delete has tombstoned,
+    /// so it belongs to its directory listing with or without an overlay.
+    fn is_listed_on_disk(&self, uri: &Url) -> bool {
+        !self.deleted_overrides.contains_key(uri)
+            && uri
+                .to_file_path()
+                .is_ok_and(|path| absolute_path(path).is_file())
+    }
+
     fn bump_source_generation(&mut self) {
         self.source_generation = self.source_generation.wrapping_add(1);
     }
@@ -13311,23 +13339,32 @@ impl Workspace {
     /// directory listing (including its open overlays) unchanged, which keeps
     /// cache entries that only observed that listing.
     fn mark_source_change(&mut self, uri: &Url, include_parent: bool) -> Vec<Url> {
-        self.mark_source_change_with_control(uri, include_parent, None, None)
+        let cache = if include_parent {
+            CacheInvalidation::Listing
+        } else {
+            CacheInvalidation::Contents
+        };
+        self.mark_source_change_with_control(uri, cache, None, None)
             .unwrap_or_default()
     }
 
     fn mark_source_change_with_control(
         &mut self,
         uri: &Url,
-        include_parent: bool,
+        cache: CacheInvalidation,
         cancel: Option<&AtomicBool>,
         budget: Option<&ReconciliationBudget>,
     ) -> Result<Vec<Url>, String> {
         if let Ok(path) = uri.to_file_path() {
             let path = absolute_path(path);
-            if include_parent {
-                self.project_cache.invalidate_path(&path);
-            } else {
-                self.project_cache.invalidate_file_contents(&path);
+            match cache {
+                CacheInvalidation::Listing => {
+                    self.project_cache.invalidate_path(&path);
+                }
+                CacheInvalidation::Contents => {
+                    self.project_cache.invalidate_file_contents(&path);
+                }
+                CacheInvalidation::Unchanged => {}
             }
         }
         let dependent_diagnostics =
@@ -15094,6 +15131,28 @@ fn closed_source_content_hash(
         Ok(bytes) if resolver::decode_source_bytes(&bytes) == text => content_hash_bytes(&bytes),
         _ => content_hash_bytes(text.as_bytes()),
     }
+}
+
+/// How a source change reaches the project cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheInvalidation {
+    /// The file and its parent directory's listing changed.
+    Listing,
+    /// Only the file's content changed.
+    Contents,
+    /// Entries computed from the file still hold.
+    Unchanged,
+}
+
+/// Whether the file behind `uri` holds exactly `bytes`. The length is
+/// compared first so a differing file is usually not read.
+fn disk_bytes_equal(uri: &Url, bytes: &[u8]) -> bool {
+    let Ok(path) = uri.to_file_path() else {
+        return false;
+    };
+    let path = absolute_path(path);
+    fs::metadata(&path).is_ok_and(|metadata| metadata.len() == bytes.len() as u64)
+        && fs::read(&path).is_ok_and(|disk| disk == bytes)
 }
 
 fn disk_stamp(path: &Path) -> Option<DiskStamp> {
@@ -17567,6 +17626,116 @@ mod tests {
 
         assert!(tokens.contains(&(6, 5, "method".to_string())), "{tokens:?}");
         assert!(cache.take_closure_crawl_requests().is_empty());
+    }
+
+    fn has_layer(cache: &crate::project_cache::ProjectCache, uri: &Url, layer: &str) -> bool {
+        cache.ready_layers(uri).iter().any(|ready| ready == layer)
+    }
+
+    #[test]
+    fn opening_an_unchanged_dependency_keeps_cached_entries_and_requests_no_crawl() {
+        let mut fixture = inherited_fixture("Base");
+        fixture
+            .workspace
+            .open_document(
+                fixture.main.clone(),
+                INHERITED_THROUGH_DEPENDENCY_MAIN.to_string(),
+                1,
+            )
+            .expect("open Main");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(cache.take_closure_crawl_requests().is_empty());
+        let epoch = cache.invalidation_epoch();
+
+        // Go to definition into `Base` opens it with its disk text.
+        fixture
+            .workspace
+            .open_document(fixture.base.clone(), INHERITED_BASE.to_string(), 1)
+            .expect("open Base");
+
+        assert_eq!(
+            cache.invalidation_epoch(),
+            epoch,
+            "an unchanged open must not stale the other files' crawls"
+        );
+        assert!(has_layer(&cache, &fixture.main, "Import"));
+        assert!(has_layer(&cache, &fixture.derived, "Interface"));
+        body_line_token_kinds(&fixture.workspace, &fixture.main);
+        assert!(
+            cache.take_closure_crawl_requests().is_empty(),
+            "the warm closure must survive opening an unchanged unit"
+        );
+    }
+
+    #[test]
+    fn opening_a_dependency_with_other_text_still_evicts_its_dependents() {
+        let mut fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        assert!(has_layer(&cache, &fixture.derived, "Interface"));
+        let epoch = cache.invalidation_epoch();
+
+        fixture
+            .workspace
+            .open_document(
+                fixture.base.clone(),
+                INHERITED_BASE.replace("Open", "Close"),
+                1,
+            )
+            .expect("open Base");
+
+        assert_ne!(cache.invalidation_epoch(), epoch);
+        assert!(!has_layer(&cache, &fixture.derived, "Interface"));
+    }
+
+    #[test]
+    fn opening_a_document_missing_on_disk_still_evicts_directory_observers() {
+        let mut fixture = inherited_fixture("Base");
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        assert!(has_layer(&cache, &fixture.main, "Import"));
+
+        let created = Url::from_file_path(fixture.root.join("Created.pas")).unwrap();
+        fixture
+            .workspace
+            .open_document(
+                created,
+                "unit Created;\ninterface\nimplementation\nend.\n".to_string(),
+                1,
+            )
+            .expect("open Created");
+
+        assert!(
+            !has_layer(&cache, &fixture.main, "Import"),
+            "an overlay without a disk file changes its directory listing"
+        );
+    }
+
+    #[test]
+    fn closing_a_document_listed_on_disk_keeps_entries_that_only_observed_its_directory() {
+        let mut fixture = inherited_fixture("Base");
+        fixture
+            .workspace
+            .open_document(fixture.base.clone(), INHERITED_BASE.to_string(), 1)
+            .expect("open Base");
+        // Computed while `Base` is open, so `Derived`'s entries record its overlay.
+        fixture.warm(&[&fixture.main]);
+        let cache = fixture.workspace.project_cache().clone();
+        assert!(has_layer(&cache, &fixture.main, "Import"));
+        assert!(has_layer(&cache, &fixture.derived, "Interface"));
+
+        assert!(fixture.workspace.close_document(&fixture.base));
+
+        assert!(
+            has_layer(&cache, &fixture.main, "Import"),
+            "Main only observed Base's directory, whose listing did not change"
+        );
+        assert!(
+            !has_layer(&cache, &fixture.derived, "Interface"),
+            "Derived's interface recorded Base's overlay"
+        );
     }
 
     #[test]

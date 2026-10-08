@@ -70,7 +70,8 @@ fn missing_recovered_and_qualified_types_are_not_intrinsic_facts() {
     );
     assert_eq!(h.size("Bad"), None);
     assert_eq!(h.size("Fake"), None);
-    assert_eq!(h.size("A"), None);
+    // Task 4 now owns this parser-validated static array, independently of Bad.
+    assert_eq!(h.size("A"), Some(3));
 }
 
 #[test]

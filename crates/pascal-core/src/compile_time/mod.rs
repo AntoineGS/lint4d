@@ -2,6 +2,7 @@
 //!
 //! Declaration ingestion and lexical queries share a request-wide budget.
 //! Intrinsic layout remains separate from parsing and name binding.
+mod arrays;
 mod bindings;
 mod budget;
 mod declarations;

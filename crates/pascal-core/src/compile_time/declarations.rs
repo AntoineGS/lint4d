@@ -1,5 +1,5 @@
 //! Resumable lexical framing; complete declarations alone go to tree-sitter.
-use super::bindings::{Declaration, TypeExpr};
+use super::bindings::{Declaration, EnumMember, IndexExpr, TypeExpr};
 use super::*;
 use crate::conditional::Truth;
 use crate::{LoadedSource, SourceId};
@@ -57,6 +57,7 @@ pub struct CompileTimeState {
     pub(super) scopes: Vec<Scope>,
     stack: Vec<ScopeId>,
     pub(super) declarations: Vec<Declaration>,
+    definition_count: usize,
     spans: Vec<Span>,
     pub(super) sequence: Sequence,
     logical: usize,
@@ -145,6 +146,7 @@ impl CompileTimeState {
             }],
             stack: vec![ScopeId(0)],
             declarations: Vec::new(),
+            definition_count: 0,
             spans: Vec::new(),
             sequence: Sequence(0),
             logical: 0,
@@ -662,8 +664,12 @@ impl CompileTimeState {
                 self.unknown = true;
                 continue;
             }
+            let mut definition_count = self
+                .definition_count
+                .checked_add(1)
+                .ok_or(IncompleteReason::MalformedSource)?;
             limit(
-                self.declarations.len() + 1,
+                definition_count,
                 budget.limits().max_definitions,
                 "max_definitions",
             )?;
@@ -693,11 +699,22 @@ impl CompileTimeState {
             budget.charge(
                 1,
                 name_text.len() + ty_text.len() + initializer_len,
-                size_of::<Declaration>() + name_text.len() + ty_text.len() + initializer_len,
+                size_of::<Declaration>() + name_text.len() + initializer_len,
             )?;
             let mut ty = if valid {
-                type_expr(ty_node, bytes, ty_text)
+                type_expr(
+                    self,
+                    prefix,
+                    ty_node,
+                    bytes,
+                    ty_text,
+                    node.kind() == "declArg",
+                    0,
+                    &mut definition_count,
+                    budget,
+                )?
             } else {
+                budget.charge(1, ty_text.len(), ty_text.len())?;
                 TypeExpr::Unsupported(ty_text.into())
             };
             if strong {
@@ -728,10 +745,14 @@ impl CompileTimeState {
                 site,
                 ty,
                 is_type,
+                // As in the existing conditional scanner, typed constants are
+                // lexical blockers, not proven values without coercion evidence.
+                is_constant: valid && node.kind() == "declConst" && ty_node.is_none(),
                 settings: self.context.layout.defaults.clone(),
                 provenance,
                 initializer: initializer.map(str::to_owned),
             });
+            self.definition_count = definition_count;
         }
         Ok(())
     }
@@ -906,6 +927,7 @@ impl CompileTimeState {
         self.stack.hash(&mut h);
         self.spans.hash(&mut h);
         self.sequence.hash(&mut h);
+        self.definition_count.hash(&mut h);
         self.logical.hash(&mut h);
         self.pending_start.hash(&mut h);
         self.pending.hash(&mut h);
@@ -927,6 +949,7 @@ impl CompileTimeState {
             d.site.hash(&mut h);
             d.ty.hash(&mut h);
             d.is_type.hash(&mut h);
+            d.is_constant.hash(&mut h);
             d.provenance.hash(&mut h);
             d.settings.hash(&mut h);
             d.initializer.hash(&mut h);
@@ -967,13 +990,7 @@ impl CompileTimeState {
             visit(size_of::<Declaration>())?;
             visit(d.name.len())?;
             visit(d.key.anchor.source.as_str().len())?;
-            let text = match &d.ty {
-                TypeExpr::Named(s)
-                | TypeExpr::StrongAlias(s)
-                | TypeExpr::Pointer(s)
-                | TypeExpr::Unsupported(s) => s,
-            };
-            visit(text.len())?;
+            visit_type_payload(&d.ty, visit)?;
             if let Some(text) = &d.initializer {
                 visit(text.len())?;
             }
@@ -1012,20 +1029,222 @@ fn find_node<'a>(
     }
 }
 
-fn type_expr(node: Option<Node<'_>>, bytes: &[u8], raw: &str) -> TypeExpr {
+#[allow(clippy::too_many_arguments)]
+fn type_expr(
+    state: &CompileTimeState,
+    prefix: usize,
+    node: Option<Node<'_>>,
+    bytes: &[u8],
+    raw: &str,
+    argument: bool,
+    depth: usize,
+    definition_count: &mut usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<TypeExpr, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
     let Some(node) = node else {
-        return TypeExpr::Unsupported(raw.into());
+        return Ok(TypeExpr::Unsupported(retain(raw, budget)?));
     };
     let mut n = node;
     while matches!(n.kind(), "type" | "typeref") && n.named_child_count() == 1 {
+        budget.charge(1, 0, 0)?;
         n = n.named_child(0).unwrap();
     }
     if n.kind() == "identifier" {
-        let name = n.utf8_text(bytes).unwrap_or("").to_ascii_lowercase();
-        TypeExpr::Named(name)
+        let mut name = retain(n.utf8_text(bytes).unwrap_or(""), budget)?;
+        name.make_ascii_lowercase();
+        Ok(TypeExpr::Named(name))
     } else if n.kind() == "typerefPtr" {
-        TypeExpr::Pointer(raw.into())
+        Ok(TypeExpr::Pointer(retain(raw, budget)?))
+    } else if n.kind() == "declArray" {
+        let mut dimensions = Vec::new();
+        let mut element = None;
+        let mut bracket = false;
+        let mut packed = false;
+        let mut cursor = n.walk();
+        for child in n.children(&mut cursor) {
+            budget.charge(1, 0, 0)?;
+            match child.kind() {
+                "[" => bracket = true,
+                "type" => element = Some(child),
+                "kPacked" => packed = true,
+                "kArray" | "kOf" | "]" | "," => {}
+                _ if child.is_named() => {
+                    limit(
+                        dimensions.len() + 1,
+                        budget.limits().max_array_dimensions,
+                        "max_array_dimensions",
+                    )?;
+                    budget.charge(1, 0, size_of::<IndexExpr>())?;
+                    dimensions.push(index_expr(child, bytes, budget)?);
+                }
+                _ => {}
+            }
+        }
+        if bracket && dimensions.is_empty() {
+            return Ok(TypeExpr::Unsupported(retain(raw, budget)?));
+        }
+        budget.charge(1, 0, size_of::<TypeExpr>())?;
+        let text = element.and_then(|e| e.utf8_text(bytes).ok()).unwrap_or("");
+        let element = Box::new(type_expr(
+            state,
+            prefix,
+            element,
+            bytes,
+            text,
+            false,
+            depth + 1,
+            definition_count,
+            budget,
+        )?);
+        Ok(TypeExpr::Array {
+            open: argument && !bracket,
+            dimensions,
+            element,
+            packed,
+        })
+    } else if n.kind() == "declSubRange" {
+        Ok(TypeExpr::Range(index_expr(n, bytes, budget)?))
+    } else if n.kind() == "declEnum" {
+        let mut members = Vec::new();
+        let mut cursor = n.walk();
+        for member in n.named_children(&mut cursor) {
+            budget.charge(1, 0, 0)?;
+            if member.kind() != "declEnumValue" {
+                continue;
+            }
+            *definition_count = definition_count
+                .checked_add(1)
+                .ok_or(IncompleteReason::MalformedSource)?;
+            limit(
+                *definition_count,
+                budget.limits().max_definitions,
+                "max_definitions",
+            )?;
+            budget.charge(1, 0, size_of::<EnumMember>())?;
+            let name_node = member
+                .child_by_field_name("name")
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let name = name_node
+                .utf8_text(bytes)
+                .map_err(|_| IncompleteReason::MalformedSource)?;
+            let logical = name_node
+                .start_byte()
+                .checked_sub(prefix)
+                .and_then(|n| state.pending_start.checked_add(n))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let key = DefinitionKey {
+                anchor: state.anchor_at(logical, name.len(), budget)?,
+                scope: state.site().scope,
+            };
+            let value = member
+                .child_by_field_name("value")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .map(|s| {
+                    budget.charge(
+                        1,
+                        s.len()
+                            .checked_mul(3)
+                            .ok_or(IncompleteReason::MalformedSource)?,
+                        0,
+                    )?;
+                    retain(initializer_expression(s), budget)
+                })
+                .transpose()?;
+            members.push(EnumMember {
+                name: retain(name, budget)?,
+                value,
+                key,
+            });
+        }
+        Ok(TypeExpr::Enum(members))
     } else {
-        TypeExpr::Unsupported(raw.into())
+        Ok(TypeExpr::Unsupported(retain(raw, budget)?))
+    }
+}
+
+fn retain(text: &str, budget: &mut CompileTimeBudget<'_>) -> Result<String, IncompleteReason> {
+    budget.charge(1, text.len(), text.len())?;
+    Ok(text.to_owned())
+}
+
+pub(super) fn initializer_expression(text: &str) -> &str {
+    text.trim().strip_prefix('=').unwrap_or(text).trim()
+}
+
+fn index_expr(
+    node: Node<'_>,
+    bytes: &[u8],
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<IndexExpr, IncompleteReason> {
+    budget.charge(1, 0, 0)?;
+    if matches!(node.kind(), "range" | "declSubRange") {
+        let lower = node
+            .named_child(0)
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .unwrap_or("");
+        let upper = node
+            .named_child(1)
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .unwrap_or("");
+        Ok(IndexExpr::Bounds {
+            lower: retain(lower, budget)?,
+            upper: retain(upper, budget)?,
+        })
+    } else {
+        Ok(IndexExpr::Domain(retain(
+            node.utf8_text(bytes).unwrap_or(""),
+            budget,
+        )?))
+    }
+}
+
+fn visit_index_payload(
+    index: &IndexExpr,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    match index {
+        IndexExpr::Domain(s) => visit(s.len()),
+        IndexExpr::Bounds { lower, upper } => {
+            visit(lower.len())?;
+            visit(upper.len())
+        }
+    }
+}
+
+fn visit_type_payload(
+    ty: &TypeExpr,
+    visit: &mut dyn FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    match ty {
+        TypeExpr::Named(s)
+        | TypeExpr::StrongAlias(s)
+        | TypeExpr::Pointer(s)
+        | TypeExpr::Unsupported(s) => visit(s.len()),
+        TypeExpr::Range(index) => visit_index_payload(index, visit),
+        TypeExpr::Array {
+            dimensions,
+            element,
+            ..
+        } => {
+            for index in dimensions {
+                visit(size_of::<IndexExpr>())?;
+                visit_index_payload(index, visit)?;
+            }
+            visit(size_of::<TypeExpr>())?;
+            visit_type_payload(element, visit)
+        }
+        TypeExpr::Enum(members) => {
+            for member in members {
+                visit(size_of::<EnumMember>())?;
+                visit(member.name.len())?;
+                visit(member.key.anchor.source.as_str().len())?;
+                if let Some(s) = &member.value {
+                    visit(s.len())?;
+                }
+            }
+            Ok(())
+        }
     }
 }

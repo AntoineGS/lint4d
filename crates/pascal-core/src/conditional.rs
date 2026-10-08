@@ -18,7 +18,7 @@ use std::cell::Cell;
 
 const MAX_DIRECTIVES: usize = 16_384;
 const MAX_CONDITIONAL_DEPTH: usize = 256;
-const MAX_EXPRESSION_TOKENS: usize = 256;
+pub(crate) const MAX_EXPRESSION_TOKENS: usize = 256;
 const MAX_EXPRESSION_BYTES: usize = 4_096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 32_768;
 const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
@@ -2381,6 +2381,15 @@ fn evaluate_typed_expression(
     environment: &ConditionalEnvironment,
     complete: &mut bool,
 ) -> Value {
+    evaluate_typed_expression_with_lookup(expression, environment, complete, None)
+}
+
+fn evaluate_typed_expression_with_lookup<'a>(
+    expression: &str,
+    environment: &'a ConditionalEnvironment,
+    complete: &mut bool,
+    lookup: Option<&'a mut dyn FnMut(&str) -> Option<ConstantValue>>,
+) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
         return Value::Unknown;
@@ -2394,6 +2403,7 @@ fn evaluate_typed_expression(
         tokens,
         index: 0,
         environment,
+        lookup,
         malformed: false,
         depth: 0,
         work: 0,
@@ -2410,6 +2420,86 @@ fn evaluate_typed_expression(
         *complete = false;
     }
     result
+}
+
+/// Reuse the conditional expression language with declaration-site lookup.
+/// The legacy entry point above keeps its original environment semantics.
+pub(crate) fn evaluate_bound_expression(
+    expression: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut dyn FnMut(
+        &str,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    )
+        -> Result<Option<ConstantValue>, crate::compile_time::IncompleteReason>,
+) -> Result<Option<ConstantValue>, crate::compile_time::IncompleteReason> {
+    use crate::compile_time::IncompleteReason;
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Ok(None);
+    }
+    // Each byte can produce a token; reserve token capacity, token clones and
+    // string intermediates before tokenization. Existing parser work/depth caps
+    // remain in force. Lookup payloads are admitted by the callback.
+    let before = budget.snapshot().retained_bytes;
+    let scratch = expression
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(4 * std::mem::size_of::<ExprToken>() + 8))
+        .ok_or(IncompleteReason::MalformedSource)?;
+    let work = expression
+        .len()
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(IncompleteReason::MalformedSource)?;
+    // String concatenation/comparison can revisit a growing value at each
+    // bounded parser operation, so linear byte accounting is insufficient.
+    let byte_work = expression
+        .len()
+        .checked_mul(MAX_EXPRESSION_TOKENS)
+        .ok_or(IncompleteReason::MalformedSource)?;
+    budget.charge(work, byte_work, scratch)?;
+    let environment = ConditionalEnvironment::default();
+    let mut failure = None;
+    let result = {
+        let mut bounded_lookup = |name: &str| match lookup(name, budget) {
+            Ok(value) => value,
+            Err(reason) => {
+                failure = Some(reason);
+                None
+            }
+        };
+        let mut complete = true;
+        let value = evaluate_typed_expression_with_lookup(
+            expression,
+            &environment,
+            &mut complete,
+            Some(&mut bounded_lookup),
+        );
+        if complete { value } else { Value::Unknown }
+    };
+    // Charge the surviving string before copying it out of parser scratch.
+    let output_bytes = match &result {
+        Value::String(s) => s.len(),
+        _ => 0,
+    };
+    let output_charge = budget.charge(1, output_bytes, output_bytes);
+    let output = if failure.is_none() && output_charge.is_ok() {
+        result.to_constant()
+    } else {
+        None
+    };
+    budget.release(
+        budget
+            .snapshot()
+            .retained_bytes
+            .saturating_sub(before)
+            .saturating_sub(if output.is_some() { output_bytes } else { 0 }),
+    );
+    if let Some(reason) = failure {
+        return Err(reason);
+    }
+    output_charge?;
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2596,6 +2686,7 @@ struct ExpressionParser<'a> {
     tokens: Vec<ExprToken>,
     index: usize,
     environment: &'a ConditionalEnvironment,
+    lookup: Option<&'a mut dyn FnMut(&str) -> Option<ConstantValue>>,
     malformed: bool,
     depth: usize,
     work: usize,
@@ -2681,7 +2772,22 @@ impl ExpressionParser<'_> {
             };
             self.take();
             let right = self.parse_unary();
-            value = value.arithmetic(right, operator);
+            // Bound evaluation must not turn discarded shift bits into a
+            // cardinality. Leave legacy conditional shift semantics unchanged.
+            value = if self.lookup.is_some() && matches!(operator, BinaryArithmetic::ShiftLeft) {
+                match (value, right) {
+                    (Value::Number(left), Value::Number(right)) => u32::try_from(right)
+                        .ok()
+                        .filter(|shift| *shift < 64)
+                        .and_then(|shift| i128::from(left).checked_shl(shift))
+                        .and_then(|n| i64::try_from(n).ok())
+                        .map(Value::Number)
+                        .unwrap_or(Value::Error),
+                    (left, right) => left.arithmetic(right, operator),
+                }
+            } else {
+                value.arithmetic(right, operator)
+            };
         }
         value
     }
@@ -2875,6 +2981,11 @@ impl ExpressionParser<'_> {
                         _ => Value::Error,
                     }
                 } else {
+                    if let Some(lookup) = &mut self.lookup {
+                        return lookup(&identifier)
+                            .map(Value::from_constant)
+                            .unwrap_or(Value::Unknown);
+                    }
                     let key = canonical_symbol(&identifier);
                     key.and_then(|key| {
                         self.environment

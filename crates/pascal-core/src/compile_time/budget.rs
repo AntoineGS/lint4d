@@ -49,6 +49,11 @@ pub struct CompileTimeBudget<'a> {
 }
 
 impl<'a> CompileTimeBudget<'a> {
+    /// Limits used by stream consumers for dimension-specific admission.
+    pub fn limits(&self) -> CompileTimeLimits {
+        self.limits
+    }
+
     pub fn new(limits: CompileTimeLimits, cancel: &'a dyn CancellationToken) -> Self {
         Self {
             limits,

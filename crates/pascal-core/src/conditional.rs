@@ -7,6 +7,7 @@
 
 use crate::resolver::{CancellationToken, NoCancellation};
 use pascal_project::canonical_option_name;
+use pascal_project::{LayoutContext, LayoutPlatform};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -235,6 +236,8 @@ pub struct ConditionalEnvironment {
     source_constants: BTreeSet<String>,
     source_declarations: BTreeMap<String, Truth>,
     compiler_version: Option<CompilerVersion>,
+    layout: LayoutContext,
+    layout_explicit: bool,
     absent_define: Truth,
     rtl_constants_known: bool,
     bytes: usize,
@@ -250,6 +253,8 @@ impl Default for ConditionalEnvironment {
             source_constants: BTreeSet::new(),
             source_declarations: BTreeMap::new(),
             compiler_version: None,
+            layout: LayoutContext::default(),
+            layout_explicit: false,
             absent_define: Truth::Unknown,
             rtl_constants_known: false,
             bytes: 0,
@@ -293,6 +298,18 @@ impl ConditionalEnvironment {
         let mut environment = Self::new();
         environment.absent_define = context.absent_define;
         environment.rtl_constants_known = context.rtl_constants_known;
+        // Other targets retain an owned spelling even though they have no
+        // verified ABI. Admit that payload before cloning it into the evaluator.
+        let layout_bytes = layout_entry_size(&context.layout, context.layout_explicit);
+        if layout_bytes > MAX_ENVIRONMENT_BYTES
+            || !budget.charge(usize::from(layout_bytes > 0))
+            || !budget.charge_bytes(layout_bytes)
+        {
+            return None;
+        }
+        environment.layout = context.layout.clone();
+        environment.layout_explicit = context.layout_explicit;
+        environment.bytes = layout_bytes;
         if let Some(version) = context.compiler_version {
             if !budget.charge(1) || !budget.charge_bytes(size_of::<CompilerVersion>()) {
                 return None;
@@ -362,11 +379,16 @@ impl ConditionalEnvironment {
         Some(environment)
     }
 
+    /// Data-only projection of conditional facts and source-entry layout.
+    ///
+    /// This is not a typed-state snapshot: declaration identities, scopes,
+    /// occurrence continuation and pending lexical state are not represented by
+    /// `ConditionalContext` and cannot be restored from this projection.
     pub fn to_context(&self) -> ConditionalContext {
         ConditionalContext {
             compiler_version: self.compiler_version,
-            layout: Default::default(),
-            layout_explicit: false,
+            layout: self.layout.clone(),
+            layout_explicit: self.layout_explicit,
             defines: self
                 .values
                 .iter()
@@ -578,6 +600,7 @@ impl ConditionalEnvironment {
             || self.compiler_version.is_some()
             || self.absent_define != Truth::Unknown
             || self.rtl_constants_known
+            || layout_entry_size(&self.layout, self.layout_explicit) > 0
     }
 
     /// Return a stable identity for the currently established facts.
@@ -623,6 +646,9 @@ impl ConditionalEnvironment {
         self.rtl_constants_known.hash(&mut hasher);
         8_u8.hash(&mut hasher);
         self.source_declarations.hash(&mut hasher);
+        9_u8.hash(&mut hasher);
+        self.layout.hash(&mut hasher);
+        self.layout_explicit.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -633,6 +659,9 @@ impl ConditionalEnvironment {
             .saturating_add(self.constants.len())
             .saturating_add(self.source_declarations.len())
             .saturating_add(usize::from(self.compiler_version.is_some()))
+            .saturating_add(usize::from(
+                layout_entry_size(&self.layout, self.layout_explicit) > 0,
+            ))
     }
     fn contains_key(&self, key: &str) -> bool {
         self.values.contains_key(key)
@@ -741,6 +770,7 @@ impl ConditionalEnvironment {
         } else {
             0
         };
+        bytes = bytes.saturating_add(layout_entry_size(&self.layout, self.layout_explicit));
         for key in self.values.keys() {
             bytes = bytes.saturating_add(self.value_entry_size(key));
         }
@@ -758,6 +788,19 @@ impl ConditionalEnvironment {
         }
         self.bytes = bytes;
     }
+}
+
+fn layout_entry_size(layout: &LayoutContext, explicit: bool) -> usize {
+    if !explicit && *layout == LayoutContext::default() {
+        return 0;
+    }
+    let payload = match &layout.platform {
+        Some(LayoutPlatform::Other(name)) => name.len(),
+        _ => 0,
+    };
+    size_of::<LayoutContext>()
+        .saturating_add(size_of::<bool>())
+        .saturating_add(payload)
 }
 
 #[derive(Debug)]
@@ -1941,6 +1984,22 @@ fn merge_environment(
         .filter(|(left, right)| left == right)
         .map(|_| size_of::<CompilerVersion>())
         .unwrap_or(0);
+    // Equality can scan an unsupported target's owned spelling. Charge the
+    // complete layout comparison before inspecting those bytes.
+    if !budget.charge_bytes(
+        layout_entry_size(&current.layout, current.layout_explicit).saturating_add(
+            layout_entry_size(&incoming.layout, incoming.layout_explicit),
+        ),
+    ) {
+        return false;
+    }
+    let common_layout = current.layout == incoming.layout;
+    let common_explicit = current.layout_explicit && incoming.layout_explicit;
+    merged_bytes = merged_bytes.saturating_add(if common_layout {
+        layout_entry_size(&current.layout, common_explicit)
+    } else {
+        layout_entry_size(&LayoutContext::default(), common_explicit)
+    });
     for key in &keys {
         let Some(bytes) = merged_bytes.checked_add(current.value_entry_size(key)) else {
             budget.exhausted = true;
@@ -2052,6 +2111,10 @@ fn merge_environment(
     } else {
         None
     };
+    if !common_layout {
+        current.layout = LayoutContext::default();
+    }
+    current.layout_explicit = common_explicit;
     current.absent_define = current.absent_define.merge(incoming.absent_define);
     current.rtl_constants_known &= incoming.rtl_constants_known;
     current

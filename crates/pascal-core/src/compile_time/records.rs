@@ -1,6 +1,7 @@
 //! Delphi record field storage (not class instance layouts).
-//! See ABI fixture references `record_fields`, `record_variants`, `layout_options`.
-use super::bindings::{IndexExpr, TypeExpr, same_name, storage_type};
+//! See ABI fixture references `record_fields`, `record_variants`, `layout_options`,
+//! and `variant_eligibility`.
+use super::bindings::{IndexExpr, TypeExpr, intrinsic, lookup, same_name, storage_type};
 use super::declarations::{index_expr, limit, type_expr, visit_index_payload, visit_type_payload};
 use super::*;
 use crate::conditional::Truth;
@@ -319,6 +320,147 @@ impl Admission<'_, '_, '_> {
     }
 }
 
+/// Delphi variant alternatives cannot contain managed data, including through
+/// aliases or aggregates. This is eligibility, not a size/stride calculation.
+/// Evidence: Structured Types, Variant Parts (controller's task-5-evidence.md).
+fn variant_field_eligible<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    settings: &LayoutSettings,
+    visited: &mut Vec<&'a DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
+    match ty {
+        // Never inspect pointees for managed-content rejection. In particular,
+        // legal pointer-forward references do not become by-value cycles here.
+        TypeExpr::Pointer(_) => Ok(true),
+        TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+            let Some(binding) = lookup(state, site, name, budget)? else {
+                return Ok(match intrinsic(name) {
+                    Some(BuiltinType::String) => settings.long_strings == ConditionalFact::False,
+                    Some(
+                        BuiltinType::AnsiString
+                        | BuiltinType::UnicodeString
+                        | BuiltinType::WideString
+                        | BuiltinType::DynamicArrayReference,
+                    )
+                    | None => false,
+                    Some(_) => true,
+                });
+            };
+            let Some(decl) = binding.type_declaration() else {
+                return Ok(false);
+            };
+            for key in visited.iter() {
+                budget.charge(
+                    1,
+                    key.anchor
+                        .source
+                        .as_str()
+                        .len()
+                        .min(decl.key.anchor.source.as_str().len()),
+                    0,
+                )?;
+                if *key == &decl.key {
+                    return Ok(false);
+                }
+            }
+            budget.charge(1, 0, size_of::<&DefinitionKey>())?;
+            visited.push(&decl.key);
+            let result = variant_field_eligible(
+                state,
+                &decl.site,
+                &decl.ty,
+                &decl.settings,
+                visited,
+                depth + 1,
+                budget,
+            );
+            visited.pop();
+            budget.release(size_of::<&DefinitionKey>());
+            result
+        }
+        TypeExpr::Array {
+            dimensions,
+            element,
+            open,
+            packed,
+        } => {
+            if *open || *packed || dimensions.is_empty() {
+                return Ok(false);
+            }
+            if !super::arrays::element_valid(state, site, ty, visited, depth + 1, budget)? {
+                return Ok(false);
+            }
+            variant_field_eligible(state, site, element, settings, visited, depth + 1, budget)
+        }
+        TypeExpr::Record(record) => {
+            if !record.valid {
+                return Ok(false);
+            }
+            managed_free_parts(
+                state,
+                &record.site,
+                &record.parts,
+                visited,
+                depth + 1,
+                budget,
+            )
+        }
+        TypeExpr::Range(_) | TypeExpr::Enum(_) => {
+            super::arrays::element_valid(state, site, ty, visited, depth + 1, budget)
+        }
+        // Interfaces/Variant and unimplemented class/reference forms cannot
+        // acquire eligibility from a guessed width or opaque nominal syntax.
+        TypeExpr::OpaqueNominal(_) | TypeExpr::Unsupported(_) => Ok(false),
+    }
+}
+
+fn managed_free_parts<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    parts: &[Part],
+    visited: &mut Vec<&'a DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    for part in parts {
+        budget.charge(1, 0, 0)?;
+        match part {
+            Part::Field { ty, settings, .. } => {
+                if !variant_field_eligible(state, site, ty, settings, visited, depth + 1, budget)? {
+                    return Ok(false);
+                }
+            }
+            Part::Variant {
+                ty, alternatives, ..
+            } => {
+                if !super::arrays::validate_variant_labels(
+                    state,
+                    site,
+                    ty,
+                    alternatives.iter().flat_map(|a| a.labels.iter()),
+                    depth + 1,
+                    budget,
+                )? {
+                    return Ok(false);
+                }
+                for alt in alternatives {
+                    if !managed_free_parts(state, site, &alt.parts, visited, depth + 1, budget)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Nominal element validity is distinct from storage/stride proof. Reuse the
 /// array graph's shape validation so invalid labels cannot hide behind a dynamic
 /// reference, including nested anonymous records and definition-site aliases.
@@ -329,10 +471,12 @@ pub(super) fn record_element_valid<'a>(
     depth: usize,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<bool, IncompleteReason> {
+    #[allow(clippy::too_many_arguments)]
     fn parts<'a>(
         state: &'a CompileTimeState,
         site: &BindingSite,
         items: &[Part],
+        in_variant: bool,
         visited: &mut Vec<&'a DefinitionKey>,
         depth: usize,
         budget: &mut CompileTimeBudget<'_>,
@@ -341,7 +485,20 @@ pub(super) fn record_element_valid<'a>(
         for part in items {
             budget.charge(1, 0, 0)?;
             match part {
-                Part::Field { ty, .. } => {
+                Part::Field { ty, settings, .. } => {
+                    if in_variant
+                        && !variant_field_eligible(
+                            state,
+                            site,
+                            ty,
+                            settings,
+                            visited,
+                            depth + 1,
+                            budget,
+                        )?
+                    {
+                        return Ok(false);
+                    }
                     if !super::arrays::element_valid(state, site, ty, visited, depth + 1, budget)? {
                         return Ok(false);
                     }
@@ -360,7 +517,7 @@ pub(super) fn record_element_valid<'a>(
                         return Ok(false);
                     }
                     for alt in alternatives {
-                        if !parts(state, site, &alt.parts, visited, depth + 1, budget)? {
+                        if !parts(state, site, &alt.parts, true, visited, depth + 1, budget)? {
                             return Ok(false);
                         }
                     }
@@ -372,7 +529,15 @@ pub(super) fn record_element_valid<'a>(
     if !record.valid {
         return Ok(false);
     }
-    parts(state, &record.site, &record.parts, visited, depth, budget)
+    parts(
+        state,
+        &record.site,
+        &record.parts,
+        false,
+        visited,
+        depth,
+        budget,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -408,7 +573,16 @@ pub(super) fn record_layout<'a>(
     {
         return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
     }
-    layout_parts(state, site, &record.parts, cap, visited, depth + 1, budget)
+    layout_parts(
+        state,
+        site,
+        &record.parts,
+        cap,
+        false,
+        visited,
+        depth + 1,
+        budget,
+    )
 }
 
 fn uniform_alignment(
@@ -450,6 +624,7 @@ fn layout_parts<'a>(
     site: &BindingSite,
     parts: &[Part],
     cap: u32,
+    in_variant: bool,
     visited: &mut Vec<&'a DefinitionKey>,
     depth: usize,
     budget: &mut CompileTimeBudget<'_>,
@@ -466,6 +641,19 @@ fn layout_parts<'a>(
                 settings,
                 ..
             } => {
+                if in_variant
+                    && !variant_field_eligible(
+                        state,
+                        site,
+                        ty,
+                        settings,
+                        visited,
+                        depth + 1,
+                        budget,
+                    )?
+                {
+                    return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
+                }
                 let fact = storage_type(state, site, ty, settings, visited, depth + 1, budget)?;
                 let Fact::Known(storage) = fact else {
                     return Ok(fact);
@@ -516,8 +704,16 @@ fn layout_parts<'a>(
                     alignment: 1,
                 };
                 for alt in alternatives {
-                    let fact =
-                        layout_parts(state, site, &alt.parts, cap, visited, depth + 1, budget)?;
+                    let fact = layout_parts(
+                        state,
+                        site,
+                        &alt.parts,
+                        cap,
+                        true,
+                        visited,
+                        depth + 1,
+                        budget,
+                    )?;
                     let Fact::Known(storage) = fact else {
                         return Ok(fact);
                     };
@@ -815,10 +1011,9 @@ impl CompileTimeState {
                 && self.context.compiler_version == Some(CompilerVersion::new(37, 0))
             {
                 if let Some(Some(saved)) = saved {
-                    // LONGSTRINGS is absent from the documented eligible options list.
-                    let h = self.settings.long_strings;
+                    // Whole-option restoration includes LONGSTRINGS/H, as well
+                    // as ALIGN, MINENUMSIZE, OLDTYPELAYOUT and REALCOMPATIBILITY.
                     self.settings = saved;
-                    self.settings.long_strings = h;
                 } else {
                     self.poison_settings_stack(budget)?;
                     self.settings = LayoutSettings::default();

@@ -123,7 +123,7 @@ fn uncertainty_affects_only_dependent_layouts() {
 }
 
 #[test]
-fn supported_save_restore_does_not_restore_ineligible_h() {
+fn supported_save_restore_restores_eligible_h() {
     let mut h = Harness::stream("unit T; interface ", context(LayoutPlatform::Win32));
     h.with_layout("A1");
     h.with_layout("PUSHOPT");
@@ -138,7 +138,7 @@ fn supported_save_restore_does_not_restore_ineligible_h() {
     h.finish();
     assert_eq!(h.size("R"), Some(8));
     assert_eq!(h.size("P"), Some(5));
-    assert_eq!(h.size("S"), Some(256));
+    assert_eq!(h.size("S"), Some(4));
     assert_eq!(h.size("U"), None);
     assert_eq!(h.size("B"), Some(1));
 }
@@ -726,4 +726,146 @@ fn fix_i1_invalid_labels_cannot_be_nominal_dynamic_array_elements() {
     );
     assert_eq!(h.size("A"), None);
     assert_eq!(h.size("NA"), None);
+}
+
+#[test]
+fn supplement_i4_whole_pop_restores_h_a_z_and_captured_definitions() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let pointer = if platform == LayoutPlatform::Win32 {
+            4
+        } else {
+            8
+        };
+        let mut h = Harness::stream("unit T; interface ", context(platform));
+        h.with_layout("H-");
+        h.with_layout("A8");
+        h.with_layout("Z1");
+        h.with_layout("PUSHOPT");
+        h.with_layout("H+");
+        h.with_layout("A1");
+        h.with_layout("Z4");
+        h.feed("type Early=String; EarlyRecord=record B:Byte; S:String; end; E=(e0,e1); ");
+        h.with_layout("POPOPT");
+        h.feed("type Late=String; LateRecord=record B:Byte; S:String; end; F=(f0,f1); Alias=Early; implementation end.");
+        h.finish();
+        assert_eq!(h.size("Early"), Some(pointer));
+        assert_eq!(h.size("EarlyRecord"), Some(1 + pointer));
+        assert_eq!(h.size("Alias"), Some(pointer));
+        assert_eq!(h.size("Late"), Some(256));
+        assert_eq!(h.size("LateRecord"), Some(257));
+        assert_eq!(h.size("E"), Some(4));
+        assert_eq!(h.size("F"), Some(1));
+    }
+}
+
+#[test]
+fn supplement_i4_nested_and_unknown_h_restore_without_defaults() {
+    let mut c = context(LayoutPlatform::Win32);
+    c.layout.defaults.long_strings = ConditionalFact::Unknown;
+    let mut h = Harness::stream("unit T; interface ", c);
+    h.with_layout("PUSHOPT");
+    h.with_layout("H-");
+    h.with_layout("PUSHOPT");
+    h.with_layout("H+");
+    h.feed("type Long=String; ");
+    h.with_layout("POPOPT");
+    h.feed("type Short=String; ");
+    h.with_layout("POPOPT");
+    h.feed("type Unproven=String; B=Byte; implementation end.");
+    h.finish();
+    assert_eq!(h.size("Long"), Some(4));
+    assert_eq!(h.size("Short"), Some(256));
+    assert_eq!(h.size("Unproven"), None);
+    assert_eq!(h.size("B"), Some(1));
+}
+
+#[test]
+fn supplement_i5_managed_variants_are_not_valid_storage_or_elements() {
+    for body in [
+        "S:UnicodeString;",
+        "S:AnsiString;",
+        "S:WideString;",
+        "S:String;",
+        "A:array of Byte;",
+        "S:Variant;",
+    ] {
+        let h = records(
+            &format!("R=packed record case Byte of 0:({body}); end; A=array of R;"),
+            LayoutPlatform::Win32,
+        );
+        assert_eq!(h.size("R"), None, "{body}");
+        assert_eq!(h.size("A"), None, "{body}");
+    }
+    let h = records(
+        "Long=UnicodeString; Dyn=array of Byte; M=record S:Long; end; MS=array[1..2] of M; V=packed record case Byte of 0:(S:Long); end; W=packed record case Byte of 0:(D:Dyn); end; X=packed record case Byte of 0:(M1:M); end; Y=packed record case Byte of 0:(A:MS); end; D=array of Y; I=interface end; Z=packed record case Byte of 0:(F:I); end;",
+        LayoutPlatform::Win32,
+    );
+    for name in ["V", "W", "X", "Y", "D", "Z"] {
+        assert_eq!(h.size(name), None, "{name}");
+    }
+}
+
+#[test]
+fn supplement_i5_pointers_and_normal_managed_fields_remain_valid() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let pointer = if platform == LayoutPlatform::Win32 {
+            4
+        } else {
+            8
+        };
+        let h = records(
+            "Dyn=array of Byte; M=record S:UnicodeString; D:Dyn; end; PM=^M; R=packed record case Byte of 0:(S:^UnicodeString; D:^Dyn; M1:PM; V:^Variant); end; Plain=record S:UnicodeString; D:Dyn; end; A=array of Plain;",
+            platform,
+        );
+        assert_eq!(h.size("R"), Some(4 * pointer));
+        assert_eq!(h.size("Plain"), Some(2 * pointer));
+        assert_eq!(h.size("A"), Some(pointer));
+    }
+}
+
+#[test]
+fn supplement_i5_aliases_aggregates_use_captured_h_not_current_h() {
+    let mut h = Harness::stream("unit T; interface ", context(LayoutPlatform::Win32));
+    h.with_layout("A8");
+    h.with_layout("H-");
+    h.feed("type Short=String; ShortRecord=record S:String; end; ");
+    h.with_layout("H+");
+    h.feed("type Long=String; LongRecord=record S:String; end; ");
+    h.with_layout("H-");
+    h.feed("type Good=packed record case Byte of 0:(S:Short; R:ShortRecord); end; Bad=packed record case Byte of 0:(S:Long); end; BadRecord=packed record case Byte of 0:(R:LongRecord); end; BadArray=packed record case Byte of 0:(A:array[0..1] of LongRecord); end; A=array of BadArray; implementation end.");
+    h.finish();
+    assert_eq!(h.size("Good"), Some(512));
+    for name in ["Bad", "BadRecord", "BadArray", "A"] {
+        assert_eq!(h.size(name), None, "{name}");
+    }
+}
+
+#[test]
+fn supplement_i5_unknown_eligibility_cycles_and_query_scratch_are_bounded() {
+    let mut c = context(LayoutPlatform::Win32);
+    c.layout.defaults.long_strings = ConditionalFact::Unknown;
+    let text = "unit T; interface type S=String; R=packed record case Byte of 0:(Text:S); end; A=array of R; P=packed record case Byte of 0:(Text:^String); end; Cycle=Cycle; C=packed record case Byte of 0:(X:Cycle); end; implementation end.";
+    let h = Harness::plain(text, c);
+    for name in ["R", "A", "C"] {
+        assert_eq!(h.size(name), None, "{name}");
+    }
+    assert_eq!(h.size("P"), Some(4));
+    let site = h
+        .state
+        .site_at(&h.root.id, OccurrenceId(0), text.len())
+        .unwrap();
+    for work in [30, 80, 200, 1000] {
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: work,
+                ..CompileTimeLimits::default()
+            },
+            &NoCancellation,
+        );
+        assert!(!matches!(
+            h.state.layout_name(site.clone(), "R", &mut budget),
+            Fact::Known(_)
+        ));
+        assert_eq!(budget.snapshot().retained_bytes, 0, "work={work}");
+    }
 }

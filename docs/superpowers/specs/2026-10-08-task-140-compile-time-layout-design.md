@@ -1,7 +1,7 @@
 # TASK-140: compile-time type layout and library-unit navigation
 
 - Date: 2026-10-08
-- Status: architecture agreed in chat; written spec awaiting user review
+- Status: written spec approved by the user on 2026-10-08
 - Task: TASK-140
 
 ## 1. Intent and constraints
@@ -378,6 +378,6 @@ general MSBuild/configuration cleanup. The full agreed operand categories remain
 in scope; an unsupported instance is an explicit unknown result, not a reason to
 silently reduce delivery to the built-in-only proposal.
 
-Next gate: the user reviews this written spec. After approval, create the
-implementation plan and obtain its review and execution-method selection. No
+Written spec approved by the user on 2026-10-08. Next gate: review the
+implementation plan and select its execution method. No
 product-code implementation or delegation is authorized by this document alone.

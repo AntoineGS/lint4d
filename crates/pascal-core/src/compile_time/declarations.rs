@@ -96,13 +96,6 @@ pub(super) fn limit(
 }
 
 impl CompileTimeState {
-    pub(super) fn type_admission_sequence(&self) -> Result<Sequence, IncompleteReason> {
-        self.sequence
-            .0
-            .checked_add(u64::from(self.section == Section::Types))
-            .map(Sequence)
-            .ok_or(IncompleteReason::MalformedSource)
-    }
     pub(super) fn finished_for_directive(&self) -> bool {
         self.finished
     }
@@ -718,6 +711,15 @@ impl CompileTimeState {
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
         let group_site = self.site();
+        // Freeze recursive descriptors before any grouped value name is admitted.
+        // Named types include their own imminent definition for cycle detection.
+        let type_sequence = Sequence(
+            group_site
+                .sequence
+                .0
+                .checked_add(u64::from(is_type))
+                .ok_or(IncompleteReason::MalformedSource)?,
+        );
         let mut cursor = node.walk();
         for name in node.children_by_field_name("name", &mut cursor) {
             if !name.is_named() {
@@ -774,6 +776,7 @@ impl CompileTimeState {
             let mut ty = if valid {
                 type_expr(
                     self,
+                    type_sequence,
                     prefix,
                     ty_node,
                     bytes,
@@ -1125,6 +1128,7 @@ fn find_node<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn type_expr(
     state: &CompileTimeState,
+    type_sequence: Sequence,
     prefix: usize,
     node: Option<Node<'_>>,
     bytes: &[u8],
@@ -1205,6 +1209,7 @@ pub(super) fn type_expr(
         let text = element.and_then(|e| e.utf8_text(bytes).ok()).unwrap_or("");
         let element = Box::new(type_expr(
             state,
+            type_sequence,
             prefix,
             element,
             bytes,
@@ -1227,6 +1232,7 @@ pub(super) fn type_expr(
     } else if n.kind() == "declClass" && super::records::is_record(n, budget)? {
         super::records::parse_record(
             state,
+            type_sequence,
             prefix,
             n,
             bytes,

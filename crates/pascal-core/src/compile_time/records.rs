@@ -128,6 +128,7 @@ pub(super) fn is_record(
 
 struct Admission<'a, 'b, 'c> {
     state: &'a CompileTimeState,
+    type_sequence: Sequence,
     prefix: usize,
     bytes: &'b [u8],
     definitions: &'c mut usize,
@@ -140,6 +141,7 @@ struct Admission<'a, 'b, 'c> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn parse_record(
     state: &CompileTimeState,
+    type_sequence: Sequence,
     prefix: usize,
     node: Node<'_>,
     bytes: &[u8],
@@ -151,6 +153,7 @@ pub(super) fn parse_record(
 ) -> Result<Record, IncompleteReason> {
     let mut a = Admission {
         state,
+        type_sequence,
         prefix,
         bytes,
         definitions,
@@ -177,7 +180,9 @@ pub(super) fn parse_record(
     // Include an enclosing type for recursive-by-value cycle detection, never
     // later declarations. Value/parameter names cannot shadow their own fields'
     // declared types during this admission.
-    site.sequence = state.type_admission_sequence()?;
+    // This sequence was captured before the entire group, not read from mutable
+    // state after preceding group names were admitted. Physical scope stays intact.
+    site.sequence = type_sequence;
     budget.release(size_of::<SourceAnchor>() + anchor.source.as_str().len());
     let end = logical
         .checked_add(node.end_byte() - node.start_byte())
@@ -241,6 +246,7 @@ impl Admission<'_, '_, '_> {
         let raw = n.and_then(|n| n.utf8_text(self.bytes).ok()).unwrap_or("");
         type_expr(
             self.state,
+            self.type_sequence,
             self.prefix,
             n,
             self.bytes,

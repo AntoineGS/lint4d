@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 use pascal_core::compile_time::*;
 use pascal_core::conditional::Truth;
+use pascal_core::{
+    CancellationToken, IncludeResolveRequest, Resolution, ResolutionOutcome, ResolverError,
+    UnitResolveRequest,
+};
 use pascal_core::{LoadedSource, NoCancellation, SourceId, SourceRevision};
 use pascal_project::{
     CompilerVersion, ConditionalContext, ConditionalFact, LayoutContext, LayoutPlatform,
@@ -18,6 +22,128 @@ pub fn context(platform: LayoutPlatform) -> ConditionalContext {
                 ..LayoutSettings::default()
             },
         })
+}
+
+pub struct NoResources;
+impl CompileTimeResolver for NoResources {
+    fn include(
+        &mut self,
+        _: IncludeResolveRequest<'_>,
+        _: &mut CompileTimeBudget<'_>,
+        _: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+        Ok(ResolutionOutcome {
+            result: Resolution::Unavailable {
+                reason: "no resource capability".into(),
+            },
+            observations: vec![],
+            warnings: vec![],
+        })
+    }
+    fn unit(
+        &mut self,
+        _: UnitResolveRequest<'_>,
+        _: &mut CompileTimeBudget<'_>,
+        _: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+        Ok(ResolutionOutcome {
+            result: Resolution::Unavailable {
+                reason: "no resource capability".into(),
+            },
+            observations: vec![],
+            warnings: vec![],
+        })
+    }
+}
+
+pub struct Fixture {
+    pub root: LoadedSource,
+    pub context: ConditionalContext,
+    pub limits: CompileTimeLimits,
+    includes: std::collections::BTreeMap<String, LoadedSource>,
+    denied: std::collections::BTreeSet<String>,
+    reads: Vec<String>,
+}
+impl Fixture {
+    pub fn new(text: &str, context: ConditionalContext) -> Self {
+        Self {
+            root: loaded("T.pas", text),
+            context,
+            limits: CompileTimeLimits::default(),
+            includes: Default::default(),
+            denied: Default::default(),
+            reads: vec![],
+        }
+    }
+    pub fn include(&mut self, name: &str, text: &str) {
+        self.includes.insert(name.into(), loaded(name, text));
+    }
+    pub fn deny_include(&mut self, name: &str) {
+        self.denied.insert(name.into());
+    }
+    pub fn read_names(&self) -> Vec<String> {
+        self.reads.clone()
+    }
+    pub fn analyze(&mut self) -> Result<CompileTimeAnalysis, ResolverError> {
+        let root = self.root.clone();
+        let context = self.context.clone();
+        let limits = self.limits;
+        analyze_source(&root, &context, self, limits, &NoCancellation)
+    }
+}
+impl CompileTimeResolver for Fixture {
+    fn include(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        _: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+        budget
+            .charge(
+                1,
+                request.requested_name.len(),
+                request.requested_name.len(),
+            )
+            .map_err(|_| ResolverError::InvalidRequest("fixture budget".into()))?;
+        self.reads.push(request.requested_name.into());
+        let result = if self.denied.contains(request.requested_name) {
+            Resolution::Unavailable {
+                reason: "denied fixture include".into(),
+            }
+        } else {
+            self.includes
+                .get(request.requested_name)
+                .cloned()
+                .map(Resolution::Found)
+                .unwrap_or_else(|| Resolution::Unavailable {
+                    reason: "missing fixture include".into(),
+                })
+        };
+        Ok(ResolutionOutcome {
+            result,
+            observations: vec![],
+            warnings: vec![],
+        })
+    }
+    fn unit(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+        NoResources.unit(request, budget, cancel)
+    }
+}
+
+pub fn activity(analysis: &CompileTimeAnalysis, body: &str) -> Truth {
+    let matches = analysis
+        .root
+        .directives
+        .iter()
+        .filter(|d| d.body == body)
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "directive {body}");
+    matches[0].activity
 }
 
 pub fn loaded(path: &str, text: &str) -> LoadedSource {

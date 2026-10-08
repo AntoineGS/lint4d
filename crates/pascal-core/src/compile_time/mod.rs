@@ -10,9 +10,11 @@ mod model;
 mod operands;
 mod records;
 mod scalars;
+mod session;
 
 pub use budget::{CompileTimeBudget, CompileTimeLimits};
 pub use declarations::CompileTimeState;
 pub use model::*;
 pub use operands::{SizeOfOperand, parse_sizeof_operand};
 pub use scalars::{BuiltinType, builtin_layout};
+pub use session::*;

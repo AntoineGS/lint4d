@@ -38,9 +38,18 @@ pub enum UnknownReason {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IncompleteReason {
     Cancelled,
-    Limit { name: &'static str, maximum: usize },
-    RequiredSource { source: SourceId, reason: String },
+    Limit {
+        name: &'static str,
+        maximum: usize,
+    },
+    RequiredSource {
+        source: SourceId,
+        reason: String,
+    },
     MalformedSource,
+    /// Phase-A conservative barrier; complete reachable-path snapshots are
+    /// implemented by the next session checkpoint, not approximated by splicing.
+    BranchStateNotAnalyzed,
 }
 
 /// Inherent storage alignment, not a declaration's packed-field alignment.

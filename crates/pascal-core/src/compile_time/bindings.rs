@@ -34,6 +34,7 @@ pub(crate) enum IndexExpr {
 pub(crate) struct EnumMember {
     pub name: String,
     pub value: Option<String>,
+    pub value_logical: Option<usize>,
     pub key: DefinitionKey,
 }
 
@@ -53,6 +54,9 @@ pub(crate) struct Declaration {
     pub provenance: Vec<SourceAnchor>,
     /// Unevaluated initializer for the later bounded constant-expression owner.
     pub initializer: Option<String>,
+    /// Logical start of the original defaultValue node, never a parser-wrapper
+    /// offset. Its physical segments live in the state's occurrence span map.
+    pub initializer_logical: Option<usize>,
 }
 
 /// One source-ordered lexical result for both type and constant consumers.

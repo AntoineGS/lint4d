@@ -234,7 +234,7 @@ fn unsupported_const_initializer_before_rtl_constant_invalidates_rtl_completenes
         ..ConditionalContext::default()
     };
     let source = concat!(
-        "const Foo = SizeOf(Integer); RTLVersion113 = True;",
+        "const Foo = UnsupportedFunction(Integer); RTLVersion113 = True;",
         "{$IF Declared(RTLVersion113)}{$DEFINE DECLARED}{$IFEND}",
         "{$IF RTLVersion113}{$DEFINE VALUE}{$IFEND}",
     );

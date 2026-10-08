@@ -46,6 +46,8 @@ pub struct CompileTimeBudget<'a> {
     limits: CompileTimeLimits,
     cancel: &'a dyn CancellationToken,
     counters: BudgetSnapshot,
+    layout_query_depth: usize,
+    last_failed_charge: Option<(&'static str, usize, usize)>,
 }
 
 impl<'a> CompileTimeBudget<'a> {
@@ -59,6 +61,8 @@ impl<'a> CompileTimeBudget<'a> {
             limits,
             cancel,
             counters: BudgetSnapshot::default(),
+            layout_query_depth: 0,
+            last_failed_charge: None,
         }
     }
 
@@ -71,14 +75,15 @@ impl<'a> CompileTimeBudget<'a> {
         if self.cancel.is_cancelled() {
             return Err(IncompleteReason::Cancelled);
         }
-        let work = admit(self.counters.work, work, self.limits.max_work, "max_work")?;
-        let byte_work = admit(
+        let work =
+            self.admit_counter(self.counters.work, work, self.limits.max_work, "max_work")?;
+        let byte_work = self.admit_counter(
             self.counters.byte_work,
             byte_work,
             self.limits.max_byte_work,
             "max_byte_work",
         )?;
-        let retained_bytes = admit(
+        let retained_bytes = self.admit_counter(
             self.counters.retained_bytes,
             retained,
             self.limits.max_retained_bytes,
@@ -100,6 +105,46 @@ impl<'a> CompileTimeBudget<'a> {
 
     pub fn snapshot(&self) -> BudgetSnapshot {
         self.counters
+    }
+
+    fn admit_counter(
+        &mut self,
+        current: usize,
+        added: usize,
+        maximum: usize,
+        name: &'static str,
+    ) -> Result<usize, IncompleteReason> {
+        let result = admit(current, added, maximum, name);
+        if result.is_err() {
+            self.last_failed_charge = Some((name, current.saturating_add(added), maximum));
+        }
+        result
+    }
+
+    pub(super) fn failure_observed(&self, name: &'static str, maximum: usize) -> Option<usize> {
+        self.last_failed_charge
+            .filter(|(failed, _, limit)| *failed == name && *limit == maximum)
+            .map(|(_, observed, _)| observed)
+    }
+
+    /// SizeOf inside an ordinal expression may recursively ask for that same
+    /// array's layout. This guard spans parser/layout calls, not just one local
+    /// storage traversal, and never resets request work/byte counters.
+    pub(super) fn with_layout_query<T>(
+        &mut self,
+        query: impl FnOnce(&mut Self) -> Result<T, IncompleteReason>,
+    ) -> Result<T, IncompleteReason> {
+        self.charge(1, 0, 0)?;
+        if self.layout_query_depth >= self.limits.max_type_depth {
+            return Err(IncompleteReason::Limit {
+                name: "max_type_depth",
+                maximum: self.limits.max_type_depth,
+            });
+        }
+        self.layout_query_depth += 1;
+        let result = query(self);
+        self.layout_query_depth -= 1;
+        result
     }
 }
 

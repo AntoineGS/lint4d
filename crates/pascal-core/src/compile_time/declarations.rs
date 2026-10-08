@@ -195,7 +195,7 @@ impl CompileTimeState {
         })
     }
 
-    fn site(&self) -> BindingSite {
+    pub(super) fn site(&self) -> BindingSite {
         BindingSite {
             scope: *self.stack.last().expect("root scope"),
             sequence: self.sequence,
@@ -762,9 +762,11 @@ impl CompileTimeState {
             } else {
                 self.pending.as_str()
             };
-            let initializer = node
-                .child_by_field_name("defaultValue")
-                .and_then(|n| n.utf8_text(bytes).ok());
+            let initializer_node = node.child_by_field_name("defaultValue");
+            let initializer = initializer_node.and_then(|n| n.utf8_text(bytes).ok());
+            let initializer_logical = initializer_node
+                .map(|n| self.node_logical_position(n.start_byte(), prefix))
+                .transpose()?;
             let initializer_len = initializer.map_or(0, str::len);
             budget.charge(
                 1,
@@ -832,6 +834,7 @@ impl CompileTimeState {
                 settings: self.settings_at_logical(logical_name, budget)?.clone(),
                 provenance,
                 initializer: initializer.map(str::to_owned),
+                initializer_logical,
             });
             self.definition_count = definition_count;
             self.field_count = field_count;
@@ -1044,6 +1047,7 @@ impl CompileTimeState {
             d.provenance.hash(&mut h);
             d.settings.hash(&mut h);
             d.initializer.hash(&mut h);
+            d.initializer_logical.hash(&mut h);
         }
         h.finish()
     }
@@ -1277,8 +1281,23 @@ pub(super) fn type_expr(
                 anchor: state.anchor_at(logical, name.len(), budget)?,
                 scope: state.site().scope,
             };
-            let value = member
-                .child_by_field_name("value")
+            let value_node = member.child_by_field_name("value");
+            let value_logical = value_node
+                .map(|n| {
+                    let raw = n
+                        .utf8_text(bytes)
+                        .map_err(|_| IncompleteReason::MalformedSource)?;
+                    let expression = initializer_expression(raw);
+                    let offset = (expression.as_ptr() as usize)
+                        .checked_sub(raw.as_ptr() as usize)
+                        .ok_or(IncompleteReason::MalformedSource)?;
+                    state
+                        .node_logical_position(n.start_byte(), prefix)?
+                        .checked_add(offset)
+                        .ok_or(IncompleteReason::MalformedSource)
+                })
+                .transpose()?;
+            let value = value_node
                 .and_then(|n| n.utf8_text(bytes).ok())
                 .map(|s| {
                     budget.charge(
@@ -1294,6 +1313,7 @@ pub(super) fn type_expr(
             members.push(EnumMember {
                 name: retain(name, budget)?,
                 value,
+                value_logical,
                 key,
             });
         }

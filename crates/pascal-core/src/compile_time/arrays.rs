@@ -4,9 +4,7 @@ use super::bindings::{
 };
 use super::declarations::{initializer_expression, limit};
 use super::*;
-use crate::conditional::{
-    BoundValue, ConstantValue, MAX_EXPRESSION_TOKENS, evaluate_bound_expression,
-};
+use crate::conditional::{BoundValue, ConstantValue, MAX_EXPRESSION_TOKENS};
 use pascal_project::{LayoutPlatform, LayoutSettings};
 use std::mem::size_of;
 
@@ -753,12 +751,99 @@ fn constant_expression(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
-    evaluate_bound_expression(text, budget, &mut |name, budget| {
-        constant_name(state, site, name, depth + 1, budget)
+    constant_expression_at(state, site, text, None, depth, budget)
+}
+
+fn constant_expression_at(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    text: &str,
+    logical: Option<usize>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    crate::conditional::evaluate_layout_expression(
+        text,
+        &crate::conditional::ConditionalEnvironment::default(),
+        budget,
+        &mut |query, budget| match query {
+            crate::conditional::ExpressionQuery::Name(name) => {
+                constant_name(state, site, name, depth + 1, budget)
+            }
+            crate::conditional::ExpressionQuery::LexicalName(name) => {
+                lexical_constant_name(state, site, name, depth + 1, budget)
+            }
+            crate::conditional::ExpressionQuery::SizeOf { argument, range } => {
+                sizeof_expression_at(state, site, argument, range, logical, budget)
+            }
+            crate::conditional::ExpressionQuery::Declared(_) => Ok(None),
+        },
+        false,
+        false,
+    )
+}
+
+pub(super) fn lexical_constant_name(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    if lookup(state, site, name, budget)?.is_some() {
+        return Ok(Some(
+            constant_name(state, site, name, depth + 1, budget)?.unwrap_or(BoundValue::Unproven),
+        ));
+    }
+    // CompilerVersion is an explicit immutable context fact, but source lexical
+    // bindings must win. Keep its existing Version category, not an integer cast.
+    budget.charge(1, name.len(), 0)?;
+    Ok(if name.eq_ignore_ascii_case("CompilerVersion") {
+        state
+            .context
+            .compiler_version
+            .map(|version| BoundValue::Constant(ConstantValue::Version(version)))
+    } else {
+        None
     })
 }
 
-fn constant_name(
+fn sizeof_expression_at(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    argument: &str,
+    range: std::ops::Range<usize>,
+    logical: Option<usize>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    if let Some(logical) = logical {
+        let start = logical
+            .checked_add(range.start)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let end = logical
+            .checked_add(range.end)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        // Map actual declaration fragments, including gaps around directives.
+        // Never invent one editable contiguous range or parser-wrapper offset.
+        let before = budget.snapshot().retained_bytes;
+        let mapped = state.provenance(start, end, budget);
+        let result = (|| {
+            let mapped = mapped?;
+            budget.charge(mapped.len(), 0, 0)?;
+            if mapped.iter().map(|a| a.range.len()).sum::<usize>() != argument.len() {
+                return Err(IncompleteReason::MalformedSource);
+            }
+            Ok(())
+        })();
+        budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        result?;
+    }
+    super::session::sizeof_value(state, site, argument, budget)
+}
+
+pub(super) fn constant_name(
     state: &CompileTimeState,
     site: &BindingSite,
     name: &str,
@@ -793,10 +878,22 @@ fn constant_name(
                                 .ok_or(IncompleteReason::MalformedSource)?,
                             0,
                         )?;
-                        constant_expression(
+                        let expression = initializer_expression(s);
+                        let offset = (expression.as_ptr() as usize)
+                            .checked_sub(s.as_ptr() as usize)
+                            .ok_or(IncompleteReason::MalformedSource)?;
+                        let logical = decl
+                            .initializer_logical
+                            .map(|n| {
+                                n.checked_add(offset)
+                                    .ok_or(IncompleteReason::MalformedSource)
+                            })
+                            .transpose()?;
+                        constant_expression_at(
                             state,
                             &prior,
-                            initializer_expression(s),
+                            expression,
+                            logical,
                             depth + 1,
                             budget,
                         )
@@ -834,6 +931,9 @@ fn constant_name(
             }
         }
     }
+    if qualifier_blocked(state, site, name, budget)? {
+        return Ok(None);
+    }
     // Immutable explicit context facts are admitted only after lexical blockers.
     let mut found = None;
     for (key, value) in &state.context.constants {
@@ -866,6 +966,19 @@ fn constant_name(
     Ok(Some(BoundValue::Constant(value.clone())))
 }
 
+pub(super) fn qualifier_blocked(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    name: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    budget.charge(1, name.len(), 0)?;
+    match name.split_once('.') {
+        Some((head, _)) => Ok(lookup(state, site, head, budget)?.is_some()),
+        None => Ok(false),
+    }
+}
+
 fn enum_values(
     state: &CompileTimeState,
     site: &BindingSite,
@@ -883,19 +996,59 @@ fn enum_values(
     let result = (|| {
         for member in &members[..take] {
             let n = if let Some(text) = &member.value {
-                let value = evaluate_bound_expression(text, budget, &mut |name, budget| {
-                    for (previous, value) in members.iter().zip(&values) {
-                        budget.charge(1, previous.name.len().min(name.len()), 0)?;
-                        if same_name(&previous.name, name) {
-                            return Ok(Some(BoundValue::Constant(ConstantValue::Integer(*value))));
+                let prior = BindingSite {
+                    scope: site.scope,
+                    sequence: Sequence(
+                        site.sequence
+                            .0
+                            .checked_sub(1)
+                            .ok_or(IncompleteReason::MalformedSource)?,
+                    ),
+                };
+                let value = crate::conditional::evaluate_layout_expression(
+                    text,
+                    &crate::conditional::ConditionalEnvironment::default(),
+                    budget,
+                    &mut |query, budget| {
+                        let (name, lexical_only) = match query {
+                            crate::conditional::ExpressionQuery::Name(name) => (name, false),
+                            crate::conditional::ExpressionQuery::LexicalName(name) => (name, true),
+                            crate::conditional::ExpressionQuery::SizeOf { argument, range } => {
+                                return sizeof_expression_at(
+                                    state,
+                                    &prior,
+                                    argument,
+                                    range,
+                                    member.value_logical,
+                                    budget,
+                                );
+                            }
+                            crate::conditional::ExpressionQuery::Declared(_) => return Ok(None),
+                        };
+                        budget.charge(1, name.len(), 0)?;
+                        let qualifier = name.split_once('.').map(|(head, _)| head);
+                        for (previous, value) in members.iter().zip(&values) {
+                            budget.charge(1, previous.name.len().min(name.len()), 0)?;
+                            if same_name(&previous.name, name) {
+                                return Ok(Some(BoundValue::Constant(ConstantValue::Integer(
+                                    *value,
+                                ))));
+                            }
+                            if let Some(head) = qualifier {
+                                budget.charge(1, previous.name.len().min(head.len()), 0)?;
+                                if same_name(&previous.name, head) {
+                                    return Ok(None);
+                                }
+                            }
                         }
-                    }
-                    let prior = BindingSite {
-                        scope: site.scope,
-                        sequence: Sequence(site.sequence.0 - 1),
-                    };
-                    constant_name(state, &prior, name, depth + 1, budget)
-                })?;
+                        if lexical_only {
+                            return lexical_constant_name(state, &prior, name, depth + 1, budget);
+                        }
+                        constant_name(state, &prior, name, depth + 1, budget)
+                    },
+                    false,
+                    false,
+                )?;
                 match value {
                     Some(BoundValue::Constant(ConstantValue::Integer(n))) => n,
                     Some(BoundValue::EnumOrdinal(_, identity)) => {

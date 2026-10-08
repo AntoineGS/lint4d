@@ -405,6 +405,16 @@ impl ConditionalEnvironment {
         }
     }
 
+    pub(crate) fn recovery_payload_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.bytes())
+            .saturating_add(
+                self.len()
+                    .saturating_add(self.source_constants.len())
+                    .saturating_mul(size_of::<String>() + 4 * size_of::<usize>()),
+            )
+    }
+
     fn insert_value(&mut self, key: String, value: Truth) {
         self.replace_fact_bytes(&key, self.value_entry_size(&key));
         self.values.insert(key, value);
@@ -967,7 +977,15 @@ fn analyze_inner(
             ConditionalEnvironment::new()
         }
     };
-    analyze_lexed(source, lexed, &mut environment, cancel, None, complete)
+    analyze_lexed(
+        source,
+        lexed,
+        &mut environment,
+        cancel,
+        None,
+        complete,
+        None,
+    )
 }
 
 pub fn analyze_with_include_callback(
@@ -990,6 +1008,7 @@ pub fn analyze_with_include_callback(
         Some(cancel),
         Some(include),
         initial_complete,
+        None,
     )
 }
 
@@ -1008,6 +1027,52 @@ pub fn analyze_with_include_callback_context(
     analyze_with_include_callback(source, environment, cancel, include)
 }
 
+/// Internal source-backed extension of the same directive interpreter. The
+/// session owns admission, lexical declarations, and unavailable-fact reasons.
+pub(crate) trait SourceOrder {
+    fn admit_directive(&mut self, body_bytes: usize) -> bool;
+    fn admit_environment(&mut self, environment: &ConditionalEnvironment) -> bool;
+    fn feed(&mut self, range: Range<usize>, activity: Truth);
+    fn condition(
+        &mut self,
+        body: &str,
+        start: usize,
+        environment: &ConditionalEnvironment,
+        complete: &mut bool,
+    ) -> Truth;
+    fn directive(&mut self, directive: &ConditionalDirective);
+}
+
+pub(crate) fn analyze_with_source_order(
+    source: &str,
+    context: &ConditionalContext,
+    cancel: &dyn CancellationToken,
+    order: &mut dyn SourceOrder,
+) -> ConditionalAnalysis {
+    let mut budget = AnalysisBudget {
+        cancel: Some(cancel),
+        work: 0,
+        byte_work: 0,
+        exhausted: false,
+    };
+    let mut environment =
+        initial_environment(context, &mut budget).unwrap_or_else(|| ConditionalEnvironment {
+            rejected_context: true,
+            ..Default::default()
+        });
+    let complete = !environment.rejected_context;
+    let lexed = lex_directives_inner(source, Some(cancel), Some(order));
+    analyze_lexed(
+        source,
+        lexed,
+        &mut environment,
+        Some(cancel),
+        None,
+        complete,
+        Some(order),
+    )
+}
+
 fn analyze_lexed(
     source: &str,
     lexed: LexResult,
@@ -1015,6 +1080,7 @@ fn analyze_lexed(
     cancel: Option<&dyn CancellationToken>,
     mut include: Option<IncludeCallback<'_>>,
     initial_complete: bool,
+    mut order: Option<&mut dyn SourceOrder>,
 ) -> ConditionalAnalysis {
     let mut budget = AnalysisBudget {
         cancel,
@@ -1041,7 +1107,9 @@ fn analyze_lexed(
             complete = false;
             break;
         }
-        if !observe_source_constants(
+        if let Some(order) = order.as_deref_mut() {
+            order.feed(cursor..raw.start, active);
+        } else if !observe_source_constants(
             source,
             cursor..raw.start,
             active,
@@ -1069,6 +1137,9 @@ fn analyze_lexed(
             activity: active,
             condition: None,
         });
+        if let Some(order) = order.as_deref_mut() {
+            order.directive(directives.last().expect("directive recorded"));
+        }
 
         match kind {
             DirectiveKind::ConditionalStart => {
@@ -1076,9 +1147,23 @@ fn analyze_lexed(
                     complete = false;
                     active = Truth::Unknown;
                 } else {
-                    let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    let condition = if active == Truth::False && order.is_some() {
+                        Truth::Unknown
+                    } else if let Some(order) = order.as_deref_mut() {
+                        order.condition(&raw.body, raw.start, environment, &mut complete)
+                    } else {
+                        evaluate_condition(&raw.body, environment, &mut complete)
+                    };
                     if let Some(directive) = directives.last_mut() {
                         directive.condition = Some(condition);
+                    }
+                    if order
+                        .as_deref_mut()
+                        .is_some_and(|order| !order.admit_environment(environment))
+                    {
+                        complete = false;
+                        cursor = raw.end;
+                        break;
                     }
                     let Some(before_environment) = clone_environment(environment, &mut budget)
                     else {
@@ -1115,7 +1200,24 @@ fn analyze_lexed(
                     complete = false;
                 }
                 if frame.current_active != Truth::False
+                    && order
+                        .as_deref_mut()
+                        .is_some_and(|order| !order.admit_environment(environment))
+                {
+                    complete = false;
+                    cursor = raw.end;
+                    break;
+                }
+                if frame.current_active != Truth::False
                     && !merge_environment(&mut frame.merged_environment, environment, &mut budget)
+                {
+                    complete = false;
+                    cursor = raw.end;
+                    break;
+                }
+                if order
+                    .as_deref_mut()
+                    .is_some_and(|order| !order.admit_environment(&frame.before_environment))
                 {
                     complete = false;
                     cursor = raw.end;
@@ -1135,7 +1237,15 @@ fn analyze_lexed(
                     frame.current_active = frame.parent_active.and(frame.remaining);
                     frame.remaining = Truth::False;
                 } else {
-                    let condition = evaluate_condition(&raw.body, environment, &mut complete);
+                    let condition = if frame.parent_active.and(frame.remaining) == Truth::False
+                        && order.is_some()
+                    {
+                        Truth::Unknown
+                    } else if let Some(order) = order.as_deref_mut() {
+                        order.condition(&raw.body, raw.start, environment, &mut complete)
+                    } else {
+                        evaluate_condition(&raw.body, environment, &mut complete)
+                    };
                     if let Some(directive) = directives.last_mut() {
                         directive.condition = Some(condition);
                     }
@@ -1151,6 +1261,14 @@ fn analyze_lexed(
                     cursor = raw.end;
                     continue;
                 };
+                if order.as_deref_mut().is_some_and(|order| {
+                    !order.admit_environment(environment)
+                        || !order.admit_environment(&frame.before_environment)
+                }) {
+                    complete = false;
+                    cursor = raw.end;
+                    break;
+                }
                 let Some(merged_environment) =
                     merge_conditional_environment(&mut frame, environment, &mut budget)
                 else {
@@ -1220,7 +1338,9 @@ fn analyze_lexed(
         cursor = raw.end;
     }
 
-    if cursor < source.len()
+    if let Some(order) = order.as_deref_mut() {
+        order.feed(cursor..source.len(), active);
+    } else if cursor < source.len()
         && !observe_source_constants(
             source,
             cursor..source.len(),
@@ -1557,7 +1677,7 @@ fn apply_option_directive(
     apply_option_fact(environment, &canonical_name, value, activity, budget)
 }
 
-fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
+pub(crate) fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
     if !body.contains(',') {
         return None;
     }
@@ -1569,7 +1689,7 @@ fn switch_list_members(body: &str) -> Option<impl Iterator<Item = &str>> {
     valid.then_some(members)
 }
 
-fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
+pub(crate) fn switch_list_candidates(body: &str) -> Option<impl Iterator<Item = &str>> {
     if !body.contains(',') {
         return None;
     }
@@ -2172,6 +2292,14 @@ fn project_source(source: &str, inactive: &[Range<usize>], directives: &[Range<u
 }
 
 fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexResult {
+    lex_directives_inner(source, cancel, None)
+}
+
+fn lex_directives_inner(
+    source: &str,
+    cancel: Option<&dyn CancellationToken>,
+    mut order: Option<&mut dyn SourceOrder>,
+) -> LexResult {
     let bytes = source.as_bytes();
     let mut result = LexResult {
         directives: Vec::new(),
@@ -2204,6 +2332,13 @@ fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexRe
                     result.complete = false;
                     break;
                 }
+                if order
+                    .as_deref_mut()
+                    .is_some_and(|order| !order.admit_directive(close - index - 2))
+                {
+                    result.complete = false;
+                    break;
+                }
                 result.directives.push(RawDirective {
                     start: index,
                     end: close + 1,
@@ -2225,6 +2360,13 @@ fn lex_directives(source: &str, cancel: Option<&dyn CancellationToken>) -> LexRe
                         break;
                     };
                     if result.directives.len() >= MAX_DIRECTIVES {
+                        result.complete = false;
+                        break;
+                    }
+                    if order
+                        .as_deref_mut()
+                        .is_some_and(|order| !order.admit_directive(close - index - 3))
+                    {
                         result.complete = false;
                         break;
                     }
@@ -2431,6 +2573,72 @@ fn evaluate_condition(
     }
 }
 
+pub(crate) fn condition_expression(body: &str) -> Option<&str> {
+    match directive_keyword(body)?.to_ascii_lowercase().as_str() {
+        "if" | "elseif" | "elif" => Some(directive_arguments(body)),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_option_condition(body: &str) -> bool {
+    directive_keyword(body).is_some_and(|key| key.eq_ignore_ascii_case("ifopt"))
+}
+
+pub(crate) fn evaluate_source_condition(
+    body: &str,
+    environment: &ConditionalEnvironment,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut dyn FnMut(
+        ExpressionQuery<'_>,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    )
+        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+) -> Result<Truth, crate::compile_time::IncompleteReason> {
+    if let Some(expression) = condition_expression(body) {
+        Ok(
+            match evaluate_layout_expression(expression, environment, budget, lookup, false, true)?
+            {
+                Some(BoundValue::Constant(ConstantValue::Boolean(value))) => {
+                    if value {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    }
+                }
+                _ => Truth::Unknown,
+            },
+        )
+    } else {
+        budget.charge(1, body.len(), 0)?;
+        let mut complete = true;
+        let value = evaluate_condition(body, environment, &mut complete);
+        if complete {
+            Ok(value)
+        } else {
+            Err(crate::compile_time::IncompleteReason::MalformedSource)
+        }
+    }
+}
+
+pub(crate) fn bound_define(
+    environment: &ConditionalEnvironment,
+    name: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    budget.charge(1, name.len(), name.len())?;
+    let key = canonical_symbol(name);
+    let value = key
+        .as_ref()
+        .and_then(|key| environment.values.get(key))
+        .and_then(|value| match value {
+            Truth::True => Some(BoundValue::Constant(ConstantValue::Boolean(true))),
+            Truth::False => Some(BoundValue::Constant(ConstantValue::Boolean(false))),
+            Truth::Unknown => None,
+        });
+    budget.release(name.len());
+    Ok(value)
+}
+
 fn evaluate_expression(
     expression: &str,
     environment: &ConditionalEnvironment,
@@ -2451,29 +2659,52 @@ fn evaluate_typed_expression_with_lookup<'a>(
     expression: &str,
     environment: &'a ConditionalEnvironment,
     complete: &mut bool,
-    lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
+    mut lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
 ) -> Value {
-    parse_bound_expression(expression, environment, complete, lookup, false)
+    if lookup.is_none() {
+        return parse_bound_expression(expression, environment, complete, None, false);
+    }
+    let mut adapter = |query: ExpressionQuery<'_>| match query {
+        ExpressionQuery::Name(name) => lookup.as_mut().and_then(|lookup| lookup(name)),
+        _ => None,
+    };
+    parse_bound_expression(expression, environment, complete, Some(&mut adapter), false)
+}
+
+/// Argument ranges are relative to the original expression, not a normalized
+/// synthetic wrapper. A source-backed caller maps them with its captured site.
+pub(crate) enum ExpressionQuery<'a> {
+    Name(&'a str),
+    /// Check only source lexical bindings before intrinsic metadata/literals.
+    /// An absent binding is different from a visible unproven variable value.
+    LexicalName(&'a str),
+    Declared(&'a str),
+    SizeOf {
+        argument: &'a str,
+        range: Range<usize>,
+    },
 }
 
 fn parse_bound_expression<'a>(
-    expression: &str,
+    expression: &'a str,
     environment: &'a ConditionalEnvironment,
     complete: &mut bool,
-    lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
+    lookup: Option<&'a mut dyn FnMut(ExpressionQuery<'_>) -> Option<BoundValue>>,
     static_only: bool,
 ) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
         return Value::Unknown;
     }
-    let tokens = tokenize_expression(expression);
+    let (tokens, spans) = tokenize_expression_spanned(expression);
     if tokens.len() > MAX_EXPRESSION_TOKENS {
         *complete = false;
         return Value::Unknown;
     }
     let mut parser = ExpressionParser {
         tokens,
+        spans,
+        expression,
         index: 0,
         environment,
         lookup,
@@ -2494,20 +2725,6 @@ fn parse_bound_expression<'a>(
         *complete = false;
     }
     result
-}
-
-/// Reuse the conditional expression language with declaration-site lookup.
-/// The legacy entry point above keeps its original environment semantics.
-pub(crate) fn evaluate_bound_expression(
-    expression: &str,
-    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
-    lookup: &mut dyn FnMut(
-        &str,
-        &mut crate::compile_time::CompileTimeBudget<'_>,
-    )
-        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
-) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
-    bound_expression_mode(expression, budget, lookup, false)
 }
 
 /// Type-only interpretation of the existing expression grammar. Number(0),
@@ -2535,9 +2752,40 @@ fn bound_expression_mode(
         -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
     static_only: bool,
 ) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
-    use crate::compile_time::IncompleteReason;
     if expression.len() > MAX_EXPRESSION_BYTES {
         return Ok(None);
+    }
+    evaluate_layout_expression(
+        expression,
+        &ConditionalEnvironment::default(),
+        budget,
+        &mut |query, budget| match query {
+            ExpressionQuery::Name(name) => lookup(name, budget),
+            _ => Ok(None),
+        },
+        static_only,
+        false,
+    )
+}
+
+pub(crate) fn evaluate_layout_expression(
+    expression: &str,
+    environment: &ConditionalEnvironment,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    lookup: &mut dyn FnMut(
+        ExpressionQuery<'_>,
+        &mut crate::compile_time::CompileTimeBudget<'_>,
+    )
+        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+    static_only: bool,
+    strict: bool,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    use crate::compile_time::IncompleteReason;
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(IncompleteReason::Limit {
+            name: "max_expression_bytes",
+            maximum: MAX_EXPRESSION_BYTES,
+        });
     }
     // Each byte can produce a token; reserve token capacity, token clones and
     // string intermediates before tokenization. Existing parser work/depth caps
@@ -2560,10 +2808,9 @@ fn bound_expression_mode(
         .checked_mul(MAX_EXPRESSION_TOKENS)
         .ok_or(IncompleteReason::MalformedSource)?;
     budget.charge(work, byte_work, scratch)?;
-    let environment = ConditionalEnvironment::default();
     let mut failure = None;
     let result = {
-        let mut bounded_lookup = |name: &str| match lookup(name, budget) {
+        let mut bounded_lookup = |query: ExpressionQuery<'_>| match lookup(query, budget) {
             Ok(value) => value,
             Err(reason) => {
                 failure = Some(reason);
@@ -2573,11 +2820,14 @@ fn bound_expression_mode(
         let mut complete = true;
         let value = parse_bound_expression(
             expression,
-            &environment,
+            environment,
             &mut complete,
             Some(&mut bounded_lookup),
             static_only,
         );
+        if !complete && strict && failure.is_none() {
+            failure = Some(IncompleteReason::MalformedSource);
+        }
         if complete { value } else { Value::Unknown }
     };
     // Charge surviving string/nominal-identity payload before copying it out
@@ -2640,14 +2890,20 @@ enum ExprToken {
 }
 
 fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
+    tokenize_expression_spanned(expression).0
+}
+
+fn tokenize_expression_spanned(expression: &str) -> (Vec<ExprToken>, Vec<Range<usize>>) {
     let bytes = expression.as_bytes();
     let mut tokens = Vec::new();
+    let mut spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index].is_ascii_whitespace() {
             index += 1;
             continue;
         }
+        let token_start = index;
         match bytes[index] {
             b'(' => {
                 tokens.push(ExprToken::LParen);
@@ -2734,6 +2990,7 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
                     tokens.push(ExprToken::String(value));
                 } else {
                     tokens.push(ExprToken::Invalid);
+                    spans.push(token_start..index);
                     break;
                 }
             }
@@ -2790,9 +3047,11 @@ fn tokenize_expression(expression: &str) -> Vec<ExprToken> {
                 index += 1;
             }
         }
+        spans.push(token_start..index);
     }
     tokens.push(ExprToken::End);
-    tokens
+    spans.push(expression.len()..expression.len());
+    (tokens, spans)
 }
 
 /// Reserve tokenizer scratch before the shared lexical count; no index grammar
@@ -2816,9 +3075,11 @@ pub(crate) fn expression_token_count(
 
 struct ExpressionParser<'a> {
     tokens: Vec<ExprToken>,
+    spans: Vec<Range<usize>>,
+    expression: &'a str,
     index: usize,
     environment: &'a ConditionalEnvironment,
-    lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
+    lookup: Option<&'a mut dyn FnMut(ExpressionQuery<'_>) -> Option<BoundValue>>,
     malformed: bool,
     depth: usize,
     work: usize,
@@ -3030,6 +3291,76 @@ impl ExpressionParser<'_> {
         left
     }
 
+    fn parse_sizeof(&mut self) -> Value {
+        let start = self.spans[self.index].end;
+        let bytes = self.expression.as_bytes();
+        let mut pos = start;
+        let mut depth = 1usize;
+        let mut brackets = 0usize;
+        let mut quoted = false;
+        let mut comma = false;
+        let mut end = None;
+        while pos < bytes.len() {
+            let ch = bytes[pos];
+            if ch == b'\'' {
+                if quoted && bytes.get(pos + 1) == Some(&b'\'') {
+                    pos += 2;
+                    continue;
+                }
+                quoted = !quoted;
+            } else if !quoted {
+                match ch {
+                    b'(' => {
+                        depth += 1;
+                        if depth > MAX_CONDITIONAL_DEPTH {
+                            self.malformed = true;
+                            return Value::Error;
+                        }
+                    }
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(pos);
+                            break;
+                        }
+                    }
+                    b'[' => brackets += 1,
+                    b']' if brackets > 0 => brackets -= 1,
+                    b']' => {
+                        self.malformed = true;
+                    }
+                    b',' if depth == 1 && brackets == 0 => comma = true,
+                    _ => {}
+                }
+            }
+            pos += 1;
+        }
+        let Some(end) = end else {
+            self.malformed = true;
+            return Value::Error;
+        };
+        while !matches!(self.peek(), ExprToken::End) && self.spans[self.index].end <= end + 1 {
+            self.take();
+        }
+        let argument = &self.expression[start..end];
+        if comma || quoted || brackets != 0 || argument.trim().is_empty() {
+            self.malformed = true;
+            return Value::Error;
+        }
+        if let Some(lookup) = &mut self.lookup {
+            lookup(ExpressionQuery::SizeOf {
+                argument,
+                range: start..end,
+            })
+            .map(Value::from_bound_value)
+            .unwrap_or(Value::Unknown)
+        } else {
+            // Preserve the context-only evaluator's fail-closed semantics when
+            // no lexical/type capability exists. Source sessions supply it.
+            Value::Error
+        }
+    }
+
     fn parse_value(&mut self) -> Value {
         if self.static_only {
             return match self.take() {
@@ -3042,7 +3373,11 @@ impl ExpressionParser<'_> {
                 }
                 ExprToken::Identifier(name) => {
                     // A lexical binding can block a familiar literal spelling.
-                    if let Some(value) = self.lookup.as_mut().and_then(|lookup| lookup(&name)) {
+                    if let Some(value) = self
+                        .lookup
+                        .as_mut()
+                        .and_then(|lookup| lookup(ExpressionQuery::Name(&name)))
+                    {
                         Value::from_bound_value(value)
                     } else if name.eq_ignore_ascii_case("true")
                         || name.eq_ignore_ascii_case("false")
@@ -3082,6 +3417,9 @@ impl ExpressionParser<'_> {
                 let symbol = self.parse_function_identifier();
                 symbol
                     .map(|symbol| {
+                        if let Some(lookup) = &mut self.lookup {
+                            return lookup(ExpressionQuery::Declared(&symbol)).map(Value::from_bound_value).unwrap_or(Value::Unknown);
+                        }
                         Value::Truth(
                             if self.environment.constant(&symbol).is_some() {
                                 Truth::True
@@ -3108,19 +3446,49 @@ impl ExpressionParser<'_> {
             ExprToken::Identifier(identifier)
                 if identifier.eq_ignore_ascii_case("compilerVersion") =>
             {
+                if let Some(value) = self
+                    .lookup
+                    .as_mut()
+                    .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
+                {
+                    return Value::from_bound_value(value);
+                }
                 self.environment
                     .compiler_version
                     .map(Value::Version)
                     .unwrap_or(Value::Unknown)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("true") => {
+                if let Some(value) = self
+                    .lookup
+                    .as_mut()
+                    .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
+                {
+                    return Value::from_bound_value(value);
+                }
                 Value::Truth(Truth::True)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("false") => {
+                if let Some(value) = self
+                    .lookup
+                    .as_mut()
+                    .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
+                {
+                    return Value::from_bound_value(value);
+                }
                 Value::Truth(Truth::False)
             }
             ExprToken::Identifier(identifier) => {
                 if matches!(self.peek(), ExprToken::LParen) {
+                    let blocked = self
+                        .lookup
+                        .as_mut()
+                        .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
+                        .is_some();
+                    if identifier.eq_ignore_ascii_case("sizeof") {
+                        let value = self.parse_sizeof();
+                        return if blocked { Value::Unknown } else { value };
+                    }
                     self.take();
                     let mut argument = None;
                     let mut arity = 0usize;
@@ -3145,6 +3513,9 @@ impl ExpressionParser<'_> {
                     if arity != 1 {
                         self.malformed = true;
                         return Value::Error;
+                    }
+                    if blocked {
+                        return Value::Unknown;
                     }
                     match identifier.to_ascii_lowercase().as_str() {
                         "length" => match argument {
@@ -3173,14 +3544,11 @@ impl ExpressionParser<'_> {
                             }
                             _ => Value::Error,
                         },
-                        // No type/width information is carried by the
-                        // bounded context, so SizeOf is never a proven fact.
-                        "sizeof" => Value::Error,
                         _ => Value::Error,
                     }
                 } else {
                     if let Some(lookup) = &mut self.lookup {
-                        return lookup(&identifier)
+                        return lookup(ExpressionQuery::Name(&identifier))
                             .map(Value::from_bound_value)
                             .unwrap_or(Value::Unknown);
                     }
@@ -3272,6 +3640,7 @@ enum Value {
 /// Grouping preserves it; unsupported arithmetic cannot silently turn it into
 /// an integer. The legacy conditional environment never constructs this variant.
 pub(crate) enum BoundValue {
+    Unproven,
     Constant(ConstantValue),
     EnumOrdinal(i64, crate::compile_time::DefinitionKey),
     StaticCharacter(crate::compile_time::BuiltinType),
@@ -3303,6 +3672,7 @@ fn static_binary(left: Value, right: Value, logical: bool, comparison: bool) -> 
 impl Value {
     fn from_bound_value(value: BoundValue) -> Self {
         match value {
+            BoundValue::Unproven => Self::Unknown,
             BoundValue::Constant(value) => Self::from_constant(value),
             BoundValue::EnumOrdinal(value, identity) => Self::EnumOrdinal(value, identity),
             BoundValue::StaticCharacter(ty) => Self::StaticCharacter(ty),

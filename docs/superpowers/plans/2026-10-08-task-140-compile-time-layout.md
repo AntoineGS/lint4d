@@ -10,9 +10,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-08-task-140-compile-time-layout-design.md` (user-approved).
 
+**Execution:** User approved subagent-driven execution and requested an isolated
+worktree on 2026-10-08; branch `task-140-compile-time-layout`.
+
 ## Global Constraints
 
-- "Work stays in the current checkout." Do not create a worktree unless the user changes this preference.
+- Work runs in `.worktrees/task-140-compile-time-layout`, as explicitly requested by the user on 2026-10-08; leave the original checkout untouched.
 - "Preserve TASK-139's project-name fix and tests." They are in existing commit `8e47b4f`; do not modify them merely to make this task pass.
 - "Do not change the real ChainDriveAPI sources, Delphi installation sources, editor configuration, or installation mappings."
 - "Header-only navigation is a safety-preserving fallback, not a replacement for working conditional evaluation."
@@ -26,7 +29,7 @@
 - "Ordinary tests must run without a proprietary compiler or the user's installed source tree." Record references/compiler results for numeric ABI expectations.
 - No new runtime dependencies, full navigation-index extraction, arbitrary Delphi execution, DCU layout inference, or unbounded provider scans.
 - The additional limits introduced below supplement, rather than bypass, existing source/include/recovery budgets.
-- Product implementation begins only after this plan is reviewed and the user chooses an execution method. No delegation is authorized by writing this plan.
+- User approved this plan and selected subagent-driven execution in a worktree on 2026-10-08. Writing the plan alone did not authorize execution; that later user approval does.
 
 ## Review Focus
 
@@ -1590,5 +1593,5 @@ no independent reviewer or subagent ran. These checks validate the plan, not
 new product behavior: execution tests and the real 13-import probe remain pending.
 
 The tasks share declaration identities, continuation state, and request budgets.
-Execute them in the listed dependency order. User approval of this plan and the
-execution choice is the next gate; this document does not start implementation.
+Execute them in the listed dependency order. The user approved the plan and
+selected subagent-driven execution in a worktree on 2026-10-08.

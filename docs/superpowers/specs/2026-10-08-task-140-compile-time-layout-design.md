@@ -17,7 +17,8 @@ user-defined aliases, records, arrays, and variables. The agreed design includes
 scope and imported-type resolution, record packing/alignment/variant sections,
 and field, indexed, and dereferenced variable operands.
 
-Work stays in the current checkout. Preserve TASK-139's project-name
+Work runs in an isolated worktree, as requested by the user on 2026-10-08.
+Preserve TASK-139's project-name
 fix and tests. Do not change the real ChainDriveAPI sources, Delphi installation
 sources, editor configuration, or installation mappings. Obsolete project
 references remain separate work. This spec changes no product code and does not
@@ -378,6 +379,6 @@ general MSBuild/configuration cleanup. The full agreed operand categories remain
 in scope; an unsupported instance is an explicit unknown result, not a reason to
 silently reduce delivery to the built-in-only proposal.
 
-Written spec approved by the user on 2026-10-08. Next gate: review the
-implementation plan and select its execution method. No
-product-code implementation or delegation is authorized by this document alone.
+Written spec and implementation plan approved by the user on 2026-10-08.
+Execution method: subagent-driven development in an isolated worktree. Task-scoped
+implementation/review and final verification follow the approved plan.

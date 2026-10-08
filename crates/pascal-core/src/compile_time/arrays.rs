@@ -1,24 +1,52 @@
 //! Checked ordinal domains and array storage. A domain is not an enum's ABI width.
-use super::bindings::{EnumMember, IndexExpr, TypeExpr, intrinsic, lookup, storage_type};
+use super::bindings::{
+    Binding, EnumMember, IndexExpr, TypeExpr, intrinsic, lookup, same_name, storage_type,
+};
 use super::declarations::{initializer_expression, limit};
 use super::*;
-use crate::conditional::{ConstantValue, MAX_EXPRESSION_TOKENS, evaluate_bound_expression};
-use pascal_project::LayoutSettings;
+use crate::conditional::{
+    BoundValue, ConstantValue, MAX_EXPRESSION_TOKENS, evaluate_bound_expression,
+};
+use pascal_project::{LayoutPlatform, LayoutSettings};
 use std::mem::size_of;
 
 type Domain = (i64, i64);
 
-enum OrdinalKind<'a> {
+enum OrdinalKind {
     Integer,
     Boolean,
-    Enum(&'a DefinitionKey),
+    Character(BuiltinType),
+    Enum(DefinitionKey),
 }
-impl OrdinalKind<'_> {
-    fn compatible(&self, other: &Self) -> bool {
-        match (self, other) {
+impl OrdinalKind {
+    fn compatible(
+        &self,
+        other: &Self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        budget.charge(1, 0, 0)?;
+        Ok(match (self, other) {
             (Self::Integer, Self::Integer) | (Self::Boolean, Self::Boolean) => true,
-            (Self::Enum(a), Self::Enum(b)) => std::ptr::eq(*a, *b),
+            (Self::Character(a), Self::Character(b)) => a == b,
+            (Self::Enum(a), Self::Enum(b)) => {
+                budget.charge(
+                    1,
+                    a.anchor
+                        .source
+                        .as_str()
+                        .len()
+                        .min(b.anchor.source.as_str().len()),
+                    0,
+                )?;
+                a == b
+            }
             _ => false,
+        })
+    }
+    fn release(&self, budget: &mut CompileTimeBudget<'_>) {
+        if let Self::Enum(key) = self {
+            budget.release(size_of::<DefinitionKey>());
+            budget.release(key.anchor.source.as_str().len());
         }
     }
 }
@@ -41,12 +69,47 @@ pub(super) fn array_layout<'a>(
     if dimensions.is_empty() {
         // The descriptor retains its element independently; SizeOf never queries
         // the heap elements to establish the variable's reference storage.
+        if !element_valid(state, site, element, visited, depth + 1, budget)? {
+            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+        }
         return Ok(builtin_layout(
             BuiltinType::DynamicArrayReference,
             &state.context,
             settings,
         ));
     }
+    let count = match array_count(state, site, dimensions, depth, budget)? {
+        Fact::Known(count) => count,
+        Fact::Unknown(reason) => return Ok(Fact::Unknown(reason)),
+        Fact::Incomplete(reason) => return Ok(Fact::Incomplete(reason)),
+    };
+    match storage_type(state, site, element, settings, visited, depth + 1, budget)? {
+        Fact::Known(element) => {
+            budget.charge(1, 0, 0)?;
+            Ok(element.size.checked_mul(count).map_or(
+                Fact::Unknown(UnknownReason::Overflow),
+                |size| {
+                    Fact::Known(StorageLayout {
+                        size,
+                        alignment: element.alignment,
+                    })
+                },
+            ))
+        }
+        Fact::Unknown(r) => Ok(Fact::Unknown(r)),
+        Fact::Incomplete(r) => Ok(Fact::Incomplete(r)),
+    }
+}
+
+/// Cardinality proof is shared by storage and element-type validity. Neither
+/// may accept overflowing bounds/products merely because stride is not needed.
+fn array_count(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    dimensions: &[IndexExpr],
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Fact<u64>, IncompleteReason> {
     limit(
         dimensions.len(),
         budget.limits().max_array_dimensions,
@@ -70,22 +133,120 @@ pub(super) fn array_layout<'a>(
         };
         count = product;
     }
-    match storage_type(state, site, element, settings, visited, depth + 1, budget)? {
-        Fact::Known(element) => {
-            budget.charge(1, 0, 0)?;
-            Ok(element.size.checked_mul(count).map_or(
-                Fact::Unknown(UnknownReason::Overflow),
-                |size| {
-                    Fact::Known(StorageLayout {
-                        size,
-                        alignment: element.alignment,
-                    })
-                },
-            ))
+    Ok(Fact::Known(count))
+}
+
+/// Establish a valid element binding/shape, not its size or record stride.
+fn element_valid<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    visited: &mut Vec<&'a DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
+    match ty {
+        TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+            let Some(binding) = lookup(state, site, name, budget)? else {
+                return Ok(intrinsic(name).is_some());
+            };
+            let Some(decl) = binding.type_declaration() else {
+                return Ok(false);
+            };
+            for key in visited.iter() {
+                budget.charge(
+                    1,
+                    key.anchor
+                        .source
+                        .as_str()
+                        .len()
+                        .min(decl.key.anchor.source.as_str().len()),
+                    0,
+                )?;
+                if *key == &decl.key {
+                    return Ok(false);
+                }
+            }
+            budget.charge(1, 0, size_of::<&DefinitionKey>())?;
+            visited.push(&decl.key);
+            let result = element_valid(state, &decl.site, &decl.ty, visited, depth + 1, budget);
+            visited.pop();
+            budget.release(size_of::<&DefinitionKey>());
+            result
         }
-        Fact::Unknown(r) => Ok(Fact::Unknown(r)),
-        Fact::Incomplete(r) => Ok(Fact::Incomplete(r)),
+        TypeExpr::OpaqueNominal(_) | TypeExpr::Pointer(_) => Ok(true),
+        TypeExpr::Array {
+            dimensions,
+            element,
+            open,
+            ..
+        } => {
+            if *open {
+                return Ok(false);
+            }
+            if !dimensions.is_empty()
+                && !matches!(
+                    array_count(state, site, dimensions, depth, budget)?,
+                    Fact::Known(_)
+                )
+            {
+                return Ok(false);
+            }
+            element_valid(state, site, element, visited, depth + 1, budget)
+        }
+        TypeExpr::Range(_) | TypeExpr::Enum(_) => {
+            Ok(type_domain(state, site, ty, depth + 1, budget)?
+                .is_some_and(|(lower, upper)| upper >= lower))
+        }
+        TypeExpr::Unsupported(_) => Ok(false),
     }
+}
+
+/// Char is AnsiChar before Delphi 2009, and a UTF-16 WideChar afterwards.
+/// Reuse verified target/compiler profiles. A supplementary scalar occupies two
+/// code units, not one Char. Legacy non-ASCII bytes need code-page evidence.
+fn character_ordinal(
+    state: &CompileTimeState,
+    text: &str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<(i64, OrdinalKind)>, IncompleteReason> {
+    budget.charge(1, text.len(), 0)?;
+    if !matches!(
+        state.context.layout.platform,
+        Some(LayoutPlatform::Win32 | LayoutPlatform::Win64)
+    ) {
+        return Ok(None);
+    }
+    let Some(storage) = builtin_layout(
+        BuiltinType::Char,
+        &state.context,
+        &state.context.layout.defaults,
+    )
+    .known() else {
+        return Ok(None);
+    };
+    Ok(match storage.size {
+        1 => match text.as_bytes() {
+            [value] if value.is_ascii() => Some((
+                i64::from(*value),
+                OrdinalKind::Character(BuiltinType::AnsiChar),
+            )),
+            _ => None,
+        },
+        2 => {
+            let mut units = text.encode_utf16();
+            match (units.next(), units.next()) {
+                (Some(value), None) => Some((
+                    i64::from(value),
+                    OrdinalKind::Character(BuiltinType::WideChar),
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
 }
 
 pub(super) fn ordinal_layout(
@@ -105,7 +266,14 @@ pub(super) fn ordinal_layout(
     let enum_based = match ty {
         TypeExpr::Enum(_) => true,
         TypeExpr::Range(IndexExpr::Bounds { lower, .. }) => {
-            enum_owner(state, site, lower, depth + 1, budget)?.is_some()
+            let value = ordinal_expression(state, site, lower, depth + 1, budget)?;
+            let enum_based = value
+                .as_ref()
+                .is_some_and(|(_, kind)| matches!(kind, OrdinalKind::Enum(_)));
+            if let Some((_, kind)) = value {
+                kind.release(budget);
+            }
+            enum_based
         }
         _ => false,
     };
@@ -148,18 +316,29 @@ fn index_domain(
     match index {
         IndexExpr::Bounds { lower, upper } => {
             let lower = ordinal_expression(state, site, lower, depth + 1, budget)?;
-            let upper = ordinal_expression(state, site, upper, depth + 1, budget)?;
-            Ok(lower
-                .zip(upper)
-                .and_then(|((lower, lower_kind), (upper, upper_kind))| {
-                    lower_kind.compatible(&upper_kind).then_some((lower, upper))
-                }))
+            let result = (|| {
+                let upper = ordinal_expression(state, site, upper, depth + 1, budget)?;
+                let result = match (&lower, &upper) {
+                    (Some((lower, lower_kind)), Some((upper, upper_kind))) => lower_kind
+                        .compatible(upper_kind, budget)
+                        .map(|valid| valid.then_some((*lower, *upper))),
+                    _ => Ok(None),
+                };
+                if let Some((_, kind)) = upper {
+                    kind.release(budget);
+                }
+                result
+            })();
+            if let Some((_, kind)) = lower {
+                kind.release(budget);
+            }
+            result
         }
         IndexExpr::Domain(name) => {
-            if let Some(decl) = lookup(state, site, name, budget)? {
-                if !decl.is_type {
+            if let Some(binding) = lookup(state, site, name, budget)? {
+                let Some(decl) = binding.type_declaration() else {
                     return Ok(None);
-                }
+                };
                 return type_domain(state, &decl.site, &decl.ty, depth + 1, budget);
             }
             budget.charge(1, name.len(), name.len())?;
@@ -229,10 +408,10 @@ fn index_domain_name(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<Domain>, IncompleteReason> {
     // Resolve aliases at their definition sites, independently of storage width.
-    if let Some(decl) = lookup(state, site, name, budget)? {
-        if !decl.is_type {
+    if let Some(binding) = lookup(state, site, name, budget)? {
+        let Some(decl) = binding.type_declaration() else {
             return Ok(None);
-        }
+        };
         type_domain(state, &decl.site, &decl.ty, depth + 1, budget)
     } else {
         budget.charge(1, name.len(), size_of::<IndexExpr>() + name.len())?;
@@ -243,24 +422,24 @@ fn index_domain_name(
     }
 }
 
-fn ordinal_expression<'a>(
-    state: &'a CompileTimeState,
+fn ordinal_expression(
+    state: &CompileTimeState,
     site: &BindingSite,
     text: &str,
     depth: usize,
     budget: &mut CompileTimeBudget<'_>,
-) -> Result<Option<(i64, OrdinalKind<'a>)>, IncompleteReason> {
+) -> Result<Option<(i64, OrdinalKind)>, IncompleteReason> {
     let value = constant_expression(state, site, text, depth, budget)?;
     Ok(match value {
-        Some(ConstantValue::Integer(n)) => Some((
-            n,
-            enum_owner(state, site, text, depth + 1, budget)?
-                .map_or(OrdinalKind::Integer, OrdinalKind::Enum),
-        )),
-        Some(ConstantValue::Boolean(b)) => Some((i64::from(b), OrdinalKind::Boolean)),
-        Some(ConstantValue::String(s)) => {
+        Some(BoundValue::Constant(ConstantValue::Integer(n))) => Some((n, OrdinalKind::Integer)),
+        Some(BoundValue::EnumOrdinal(n, identity)) => Some((n, OrdinalKind::Enum(identity))),
+        Some(BoundValue::Constant(ConstantValue::Boolean(b))) => {
+            Some((i64::from(b), OrdinalKind::Boolean))
+        }
+        Some(BoundValue::Constant(ConstantValue::String(s))) => {
+            let result = character_ordinal(state, &s, budget);
             budget.release(s.len());
-            None
+            result?
         }
         _ => None,
     })
@@ -272,74 +451,11 @@ fn constant_expression(
     text: &str,
     depth: usize,
     budget: &mut CompileTimeBudget<'_>,
-) -> Result<Option<ConstantValue>, IncompleteReason> {
+) -> Result<Option<BoundValue>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
     evaluate_bound_expression(text, budget, &mut |name, budget| {
-        // The existing evaluator carries integer values, not enum arithmetic
-        // rules. Bare enum constants are supported with nominal identity;
-        // arithmetic on them must remain unknown rather than erase that type.
-        if !text.trim().eq_ignore_ascii_case(name)
-            && enum_owner(state, site, name, depth + 1, budget)?.is_some()
-        {
-            return Ok(None);
-        }
         constant_name(state, site, name, depth + 1, budget)
     })
-}
-
-fn enum_owner<'a>(
-    state: &'a CompileTimeState,
-    site: &BindingSite,
-    name: &str,
-    depth: usize,
-    budget: &mut CompileTimeBudget<'_>,
-) -> Result<Option<&'a DefinitionKey>, IncompleteReason> {
-    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
-    budget.charge(1, name.len(), 0)?;
-    let name = name.trim();
-    let mut scope = Some(site.scope);
-    while let Some(id) = scope {
-        for decl in state.declarations.iter().rev() {
-            budget.charge(1, 0, 0)?;
-            if decl.site.scope != id || decl.site.sequence.0 > site.sequence.0 {
-                continue;
-            }
-            budget.charge(1, name.len().min(decl.name.len()), 0)?;
-            if decl.name.eq_ignore_ascii_case(name) {
-                if !decl.is_constant {
-                    return Ok(None);
-                }
-                let prior = BindingSite {
-                    scope: decl.site.scope,
-                    sequence: Sequence(decl.site.sequence.0 - 1),
-                };
-                return decl
-                    .initializer
-                    .as_deref()
-                    .map(|s| {
-                        budget.charge(
-                            1,
-                            s.len()
-                                .checked_mul(3)
-                                .ok_or(IncompleteReason::MalformedSource)?,
-                            0,
-                        )?;
-                        enum_owner(state, &prior, initializer_expression(s), depth + 1, budget)
-                    })
-                    .unwrap_or(Ok(None));
-            }
-            if let (true, TypeExpr::Enum(members)) = (decl.is_type, &decl.ty) {
-                for member in members {
-                    budget.charge(1, name.len().min(member.name.len()), 0)?;
-                    if member.name.eq_ignore_ascii_case(name) {
-                        return Ok(Some(&decl.key));
-                    }
-                }
-            }
-        }
-        scope = state.scopes[id.0 as usize].parent;
-    }
-    Ok(None)
 }
 
 fn constant_name(
@@ -348,23 +464,23 @@ fn constant_name(
     name: &str,
     depth: usize,
     budget: &mut CompileTimeBudget<'_>,
-) -> Result<Option<ConstantValue>, IncompleteReason> {
+) -> Result<Option<BoundValue>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
-    let mut scope = Some(site.scope);
-    while let Some(id) = scope {
-        for decl in state.declarations.iter().rev() {
-            budget.charge(1, 0, 0)?;
-            if decl.site.scope != id || decl.site.sequence.0 > site.sequence.0 {
-                continue;
-            }
-            budget.charge(1, name.len().min(decl.name.len()), 0)?;
-            if decl.name.eq_ignore_ascii_case(name) {
+    if let Some(binding) = lookup(state, site, name, budget)? {
+        match binding {
+            Binding::Declaration(decl) => {
                 if !decl.is_constant {
                     return Ok(None);
                 }
                 let prior = BindingSite {
                     scope: decl.site.scope,
-                    sequence: Sequence(decl.site.sequence.0 - 1),
+                    sequence: Sequence(
+                        decl.site
+                            .sequence
+                            .0
+                            .checked_sub(1)
+                            .ok_or(IncompleteReason::MalformedSource)?,
+                    ),
                 };
                 return decl
                     .initializer
@@ -387,30 +503,42 @@ fn constant_name(
                     })
                     .unwrap_or(Ok(None));
             }
-            if let (true, TypeExpr::Enum(members)) = (decl.is_type, &decl.ty) {
-                for (index, member) in members.iter().enumerate() {
-                    budget.charge(1, name.len().min(member.name.len()), 0)?;
-                    if member.name.eq_ignore_ascii_case(name) {
-                        return Ok(enum_values(
-                            state,
-                            &decl.site,
-                            members,
-                            index + 1,
-                            depth + 1,
-                            budget,
-                        )?
-                        .map(|(_, last)| ConstantValue::Integer(last)));
-                    }
+            Binding::EnumMember { owner, index } => {
+                let TypeExpr::Enum(members) = &owner.ty else {
+                    return Err(IncompleteReason::MalformedSource);
+                };
+                // Preserve a member's nominal kind only after its complete
+                // owning declaration establishes a valid domain, not its prefix.
+                if enum_values(
+                    state,
+                    &owner.site,
+                    members,
+                    members.len(),
+                    depth + 1,
+                    budget,
+                )?
+                .is_none()
+                {
+                    return Ok(None);
                 }
+                let Some((_, value)) =
+                    enum_values(state, &owner.site, members, index + 1, depth + 1, budget)?
+                else {
+                    return Ok(None);
+                };
+                let bytes = size_of::<DefinitionKey>()
+                    .checked_add(owner.key.anchor.source.as_str().len())
+                    .ok_or(IncompleteReason::MalformedSource)?;
+                budget.charge(1, owner.key.anchor.source.as_str().len(), bytes)?;
+                return Ok(Some(BoundValue::EnumOrdinal(value, owner.key.clone())));
             }
         }
-        scope = state.scopes[id.0 as usize].parent;
     }
     // Immutable explicit context facts are admitted only after lexical blockers.
     let mut found = None;
     for (key, value) in &state.context.constants {
         budget.charge(1, key.len().min(name.len()), 0)?;
-        if key.eq_ignore_ascii_case(name) {
+        if same_name(key, name) {
             if let Some(previous) = found {
                 let bytes = match value {
                     ConstantValue::String(s) => s.len(),
@@ -435,7 +563,7 @@ fn constant_name(
         .checked_mul(MAX_EXPRESSION_TOKENS)
         .ok_or(IncompleteReason::MalformedSource)?;
     budget.charge(1, byte_work, bytes)?;
-    Ok(Some(value.clone()))
+    Ok(Some(BoundValue::Constant(value.clone())))
 }
 
 fn enum_values(
@@ -458,8 +586,8 @@ fn enum_values(
                 let value = evaluate_bound_expression(text, budget, &mut |name, budget| {
                     for (previous, value) in members.iter().zip(&values) {
                         budget.charge(1, previous.name.len().min(name.len()), 0)?;
-                        if previous.name.eq_ignore_ascii_case(name) {
-                            return Ok(Some(ConstantValue::Integer(*value)));
+                        if same_name(&previous.name, name) {
+                            return Ok(Some(BoundValue::Constant(ConstantValue::Integer(*value))));
                         }
                     }
                     let prior = BindingSite {
@@ -469,8 +597,12 @@ fn enum_values(
                     constant_name(state, &prior, name, depth + 1, budget)
                 })?;
                 match value {
-                    Some(ConstantValue::Integer(n)) => n,
-                    Some(ConstantValue::String(s)) => {
+                    Some(BoundValue::Constant(ConstantValue::Integer(n))) => n,
+                    Some(BoundValue::EnumOrdinal(_, identity)) => {
+                        OrdinalKind::Enum(identity).release(budget);
+                        return Ok(false);
+                    }
+                    Some(BoundValue::Constant(ConstantValue::String(s))) => {
                         budget.release(s.len());
                         return Ok(false);
                     }

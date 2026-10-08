@@ -17,6 +17,8 @@ pub(crate) enum TypeExpr {
     },
     Range(IndexExpr),
     Enum(Vec<EnumMember>),
+    /// Parser-validated nominal record/class/interface binding, not a layout.
+    OpaqueNominal(String),
     /// Complete parser-validated syntax retained for later composite owners.
     Unsupported(String),
 }
@@ -48,11 +50,30 @@ pub(crate) struct Declaration {
     pub initializer: Option<String>,
 }
 
+/// One source-ordered lexical result for both type and constant consumers.
+/// A visible member is a binding/blocker, never permission for intrinsic fallback.
+pub(super) enum Binding<'a> {
+    Declaration(&'a Declaration),
+    EnumMember {
+        owner: &'a Declaration,
+        index: usize,
+    },
+}
+
+impl<'a> Binding<'a> {
+    pub(super) fn type_declaration(self) -> Option<&'a Declaration> {
+        match self {
+            Self::Declaration(decl) if decl.is_type => Some(decl),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) fn intrinsic(name: &str) -> Option<BuiltinType> {
     use BuiltinType::*;
     // Only the compiler's unqualified intrinsic namespace is admitted here.
     // Qualified names require provider/binding evidence, not suffix matching.
-    Some(match name {
+    Some(match name.strip_prefix('&').unwrap_or(name) {
         "byte" => Byte,
         "shortint" => ShortInt,
         "ansichar" => AnsiChar,
@@ -88,6 +109,14 @@ pub(crate) fn intrinsic(name: &str) -> Option<BuiltinType> {
     })
 }
 
+/// Delphi's identifier escape changes spelling, not the symbol's identity.
+/// Callers charge comparison byte work before using this allocation-free helper.
+pub(super) fn same_name(left: &str, right: &str) -> bool {
+    left.strip_prefix('&')
+        .unwrap_or(left)
+        .eq_ignore_ascii_case(right.strip_prefix('&').unwrap_or(right))
+}
+
 pub(super) fn layout_name(
     state: &CompileTimeState,
     site: BindingSite,
@@ -113,10 +142,10 @@ pub(super) fn layout_name(
     let mut identity_bytes = 0;
     let result = (|| {
         let decl = lookup(state, &site, &name, budget)?;
-        let identity = if let Some(decl) = decl {
-            if !decl.is_type {
+        let identity = if let Some(binding) = decl {
+            let Some(decl) = binding.type_declaration() else {
                 return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
-            }
+            };
             let bytes = size_of::<TypeIdentity>() + decl.key.anchor.source.as_str().len();
             budget.charge(1, decl.key.anchor.source.as_str().len(), bytes)?;
             identity_bytes = bytes;
@@ -150,15 +179,23 @@ pub(super) fn lookup<'a>(
     site: &BindingSite,
     name: &str,
     budget: &mut CompileTimeBudget<'_>,
-) -> Result<Option<&'a Declaration>, IncompleteReason> {
+) -> Result<Option<Binding<'a>>, IncompleteReason> {
     let mut scope = Some(site.scope);
     while let Some(id) = scope {
         for decl in state.declarations.iter().rev() {
             budget.charge(1, 0, 0)?;
             if decl.site.scope == id && decl.site.sequence.0 <= site.sequence.0 {
                 budget.charge(0, decl.name.len().min(name.len()), 0)?;
-                if decl.name.eq_ignore_ascii_case(name) {
-                    return Ok(Some(decl));
+                if same_name(&decl.name, name) {
+                    return Ok(Some(Binding::Declaration(decl)));
+                }
+                if let (true, TypeExpr::Enum(members)) = (decl.is_type, &decl.ty) {
+                    for (index, member) in members.iter().enumerate() {
+                        budget.charge(1, member.name.len().min(name.len()), 0)?;
+                        if same_name(&member.name, name) {
+                            return Ok(Some(Binding::EnumMember { owner: decl, index }));
+                        }
+                    }
                 }
             }
         }
@@ -177,16 +214,16 @@ pub(super) fn storage_name<'a>(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Fact<StorageLayout>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
-    let Some(decl) = lookup(state, site, name, budget)? else {
+    let Some(binding) = lookup(state, site, name, budget)? else {
         return Ok(
             intrinsic(name).map_or(Fact::Unknown(UnknownReason::UnresolvedName), |ty| {
                 builtin_layout(ty, &state.context, settings)
             }),
         );
     };
-    if !decl.is_type {
+    let Some(decl) = binding.type_declaration() else {
         return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
-    }
+    };
     for key in visited.iter() {
         budget.charge(
             1,
@@ -249,7 +286,9 @@ pub(super) fn storage_type<'a>(
         TypeExpr::Range(_) | TypeExpr::Enum(_) => {
             super::arrays::ordinal_layout(state, site, ty, settings, depth, budget)
         }
-        TypeExpr::Unsupported(_) => Ok(Fact::Unknown(UnknownReason::UnsupportedLayout)),
+        TypeExpr::OpaqueNominal(_) | TypeExpr::Unsupported(_) => {
+            Ok(Fact::Unknown(UnknownReason::UnsupportedLayout))
+        }
     }
 }
 

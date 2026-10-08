@@ -384,3 +384,185 @@ fn enum_members_share_the_declaration_definition_limit() {
         })
     );
 }
+
+#[test]
+fn fix_i1_dynamic_elements_require_a_type_binding_not_a_stride() {
+    for (platform, width) in [(LayoutPlatform::Win32, 4), (LayoutPlatform::Win64, 8)] {
+        let h = Harness::plain(
+            "unit T; interface type R=record X:Byte; end; Alias=R; Valid=array of Alias; MissingElement=array of Missing; implementation procedure P; var Byte:Integer; type Invalid=array of Byte; LocalValid=Valid; begin {inside} end; end.",
+            context(platform),
+        );
+        assert_eq!(h.size("MissingElement"), None);
+        assert_eq!(h.size_at("{inside}", "Invalid"), None);
+        assert_eq!(h.size("Valid"), Some(width));
+        assert_eq!(h.size_at("{inside}", "LocalValid"), Some(width));
+        assert_eq!(h.size("R"), None);
+    }
+}
+
+#[test]
+fn fix_i2_enum_members_block_type_and_intrinsic_fallback() {
+    let h = Harness::plain(
+        "unit T; interface type E=(Byte,Other); A=array[Byte] of Word; B=array[0..1] of Byte; C=array of Byte; Valid=array[E] of Word; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    for name in ["Byte", "A", "B", "C"] {
+        assert_eq!(h.size(name), None, "{name}");
+    }
+    assert_eq!(h.size("Valid"), Some(4));
+}
+
+#[test]
+fn fix_i2_nearest_enum_member_shadow_keeps_earlier_element_binding() {
+    let h = Harness::plain(
+        "unit T; interface type Old=array[0..1] of Byte; implementation procedure P; type E=(Byte,Other); A=array[Byte] of Word; B=array[0..1] of Byte; C=Old; begin {inside} end; end.",
+        context(LayoutPlatform::Win32),
+    );
+    assert_eq!(h.size_at("{inside}", "A"), None);
+    assert_eq!(h.size_at("{inside}", "B"), None);
+    assert_eq!(h.size_at("{inside}", "C"), Some(2));
+    assert_eq!(h.size("Byte"), Some(1));
+}
+
+#[test]
+fn fix_i3_grouping_preserves_nominal_enum_bound_kind() {
+    let h = Harness::plain(
+        "unit T; interface type E=(Red,Blue); F=(Low,High); const Lower=(Red); Upper=((Blue)); type A=array[(Lower)..((Upper))] of Byte; Good=array[(Red)..(Blue)] of Word; Bad=array[(Red)..(High)] of Byte; Mixed=array[(Red)..1] of Byte; Arithmetic=array[(Red)+1..(Blue)] of Byte; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size("A"), Some(2));
+    assert_eq!(h.size("Good"), Some(4));
+    for name in ["Bad", "Mixed", "Arithmetic"] {
+        assert_eq!(h.size(name), None, "{name}");
+    }
+}
+
+#[test]
+fn fix_i3_character_subranges_and_earlier_character_constants() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let h = Harness::plain(
+            "unit T; interface const Lower='A'; Upper='Z'; type C='A'..'Z'; A=array[C] of Byte; B=array[(Lower)..((Upper))] of Word; Unicode=array['Ā'..'Ă'] of Byte; Mixed=array['A'..90] of Byte; Multi=array['AA'..'ZZ'] of Byte; Reversed=array['Z'..'A'] of Byte; Surrogate=array['😀'..'😁'] of Byte; implementation end.",
+            context(platform),
+        );
+        assert_eq!(h.size("A"), Some(26));
+        assert_eq!(h.size("B"), Some(52));
+        assert_eq!(h.size("Unicode"), Some(3));
+        for name in ["Mixed", "Multi", "Reversed", "Surrogate"] {
+            assert_eq!(h.size(name), None, "{name}");
+        }
+    }
+}
+
+#[test]
+fn fix_i3_character_profiles_and_code_unit_limits_are_explicit() {
+    let source = "unit T; interface type A=array['A'..'Z'] of Byte; B=array['Ā'..'Ă'] of Byte; Edge=array['￿'..'￿'] of Byte; implementation end.";
+    let mut legacy = context(LayoutPlatform::Win32);
+    legacy.compiler_version = Some(pascal_project::CompilerVersion::new(18, 5));
+    let old = Harness::plain(source, legacy);
+    assert_eq!(old.size("A"), Some(26));
+    assert_eq!(old.size("B"), None);
+    assert_eq!(old.size("Edge"), None);
+    let modern = Harness::plain(source, context(LayoutPlatform::Win64));
+    assert_eq!(modern.size("B"), Some(3));
+    assert_eq!(modern.size("Edge"), Some(1));
+    let mut missing_target = context(LayoutPlatform::Win64);
+    missing_target.layout.platform = None;
+    let unverified = Harness::plain(source, missing_target);
+    assert_eq!(unverified.size("A"), None);
+    let mut missing_version = context(LayoutPlatform::Win64);
+    missing_version.compiler_version = None;
+    assert_eq!(Harness::plain(source, missing_version).size("A"), None);
+}
+
+#[test]
+fn fix_i3_nominal_group_scratch_is_bounded_and_refunded_on_failure() {
+    let h = Harness::plain(
+        "unit T; interface type E=(Red,Blue); A=array[((Red))..((Blue))] of Byte; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    let source_len = "unit T; interface type E=(Red,Blue); A=array[((Red))..((Blue))] of Byte; implementation end.".len();
+    let site = h
+        .state
+        .site_at(&h.root.id, OccurrenceId(0), source_len)
+        .unwrap();
+    for work in [8, 30, 80, 120, 200] {
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: work,
+                ..CompileTimeLimits::default()
+            },
+            &NoCancellation,
+        );
+        let result = h.state.layout_name(site.clone(), "A", &mut budget);
+        if matches!(result, Fact::Incomplete(_)) {
+            assert_eq!(budget.snapshot().retained_bytes, 0, "work={work}");
+        } else {
+            assert_eq!(result.known().unwrap().storage.size, 2);
+        }
+    }
+    assert_eq!(h.size("A"), Some(2));
+}
+
+#[test]
+fn fix_i3_grouped_enum_constants_keep_their_definition_time_domain() {
+    let h = Harness::plain(
+        "unit T; interface type E=(Red,Blue); const Lower=((Red)); Upper=(Blue); implementation procedure P; type Local=(Red,Blue,Extra); A=array[(Lower)..((Upper))] of Byte; Mixed=array[(Red)..(Upper)] of Byte; begin {inside} end; end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size_at("{inside}", "A"), Some(2));
+    assert_eq!(h.size_at("{inside}", "Mixed"), None);
+}
+
+#[test]
+fn fix_i2_member_blockers_are_source_ordered_in_the_same_scope() {
+    let h = Harness::plain(
+        "unit T; interface type Before=array[0..1] of Byte; {before_enum} E=(Byte,Other); After=array[0..1] of Byte; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size_at("{before_enum}", "Byte"), Some(1));
+    assert_eq!(h.size("Byte"), None);
+    assert_eq!(h.size("Before"), Some(2));
+    assert_eq!(h.size("After"), None);
+}
+
+#[test]
+fn fix_i3_grouped_members_do_not_prove_an_invalid_enum_domain() {
+    let h = Harness::plain(
+        "unit T; interface type E=(First=3,Last=2); A=array[(First)..(First)] of Byte; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size("A"), None);
+}
+
+#[test]
+fn fix_i1_preserves_valid_nominal_reference_element_bindings() {
+    let h = Harness::plain(
+        "unit T; interface type C=class end; I=interface end; A=array of C; B=array of I; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size("A"), Some(8));
+    assert_eq!(h.size("B"), Some(8));
+    assert_eq!(h.size("C"), None);
+    assert_eq!(h.size("I"), None);
+}
+
+#[test]
+fn fix_i2_escaped_names_keep_the_same_lexical_binding() {
+    let h = Harness::plain(
+        "unit T; interface type &R=record X:Word; end; Valid=array of R; E=(&Byte=2,Other=Byte+1); Invalid=array of Byte; Index=array[Byte] of Word; Values=array[(&Byte)..(Other)] of Word; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size("Valid"), Some(8));
+    assert_eq!(h.size("Invalid"), None);
+    assert_eq!(h.size("Index"), None);
+    assert_eq!(h.size("Values"), Some(4));
+}
+
+#[test]
+fn fix_i1_invalid_element_cardinality_is_not_a_valid_type_shape() {
+    let h = Harness::plain(
+        "unit T; interface type Huge=array[0..9223372036854775807] of Byte; A=array of Huge; implementation end.",
+        context(LayoutPlatform::Win64),
+    );
+    assert_eq!(h.size("A"), None);
+}

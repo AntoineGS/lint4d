@@ -1106,6 +1106,8 @@ fn type_expr(
         })
     } else if n.kind() == "declSubRange" {
         Ok(TypeExpr::Range(index_expr(n, bytes, budget)?))
+    } else if matches!(n.kind(), "declClass" | "declIntf") {
+        Ok(TypeExpr::OpaqueNominal(retain(raw, budget)?))
     } else if n.kind() == "declEnum" {
         let mut members = Vec::new();
         let mut cursor = n.walk();
@@ -1221,6 +1223,7 @@ fn visit_type_payload(
         TypeExpr::Named(s)
         | TypeExpr::StrongAlias(s)
         | TypeExpr::Pointer(s)
+        | TypeExpr::OpaqueNominal(s)
         | TypeExpr::Unsupported(s) => visit(s.len()),
         TypeExpr::Range(index) => visit_index_payload(index, visit),
         TypeExpr::Array {

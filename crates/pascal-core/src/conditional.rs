@@ -2388,7 +2388,7 @@ fn evaluate_typed_expression_with_lookup<'a>(
     expression: &str,
     environment: &'a ConditionalEnvironment,
     complete: &mut bool,
-    lookup: Option<&'a mut dyn FnMut(&str) -> Option<ConstantValue>>,
+    lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
 ) -> Value {
     if expression.len() > MAX_EXPRESSION_BYTES {
         *complete = false;
@@ -2431,8 +2431,8 @@ pub(crate) fn evaluate_bound_expression(
         &str,
         &mut crate::compile_time::CompileTimeBudget<'_>,
     )
-        -> Result<Option<ConstantValue>, crate::compile_time::IncompleteReason>,
-) -> Result<Option<ConstantValue>, crate::compile_time::IncompleteReason> {
+        -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
     use crate::compile_time::IncompleteReason;
     if expression.len() > MAX_EXPRESSION_BYTES {
         return Ok(None);
@@ -2477,14 +2477,20 @@ pub(crate) fn evaluate_bound_expression(
         );
         if complete { value } else { Value::Unknown }
     };
-    // Charge the surviving string before copying it out of parser scratch.
+    // Charge surviving string/nominal-identity payload before copying it out
+    // of parser scratch.
     let output_bytes = match &result {
         Value::String(s) => s.len(),
+        Value::EnumOrdinal(_, identity) => {
+            std::mem::size_of::<crate::compile_time::DefinitionKey>()
+                .checked_add(identity.anchor.source.as_str().len())
+                .ok_or(IncompleteReason::MalformedSource)?
+        }
         _ => 0,
     };
     let output_charge = budget.charge(1, output_bytes, output_bytes);
     let output = if failure.is_none() && output_charge.is_ok() {
-        result.to_constant()
+        result.to_bound_value()
     } else {
         None
     };
@@ -2686,7 +2692,7 @@ struct ExpressionParser<'a> {
     tokens: Vec<ExprToken>,
     index: usize,
     environment: &'a ConditionalEnvironment,
-    lookup: Option<&'a mut dyn FnMut(&str) -> Option<ConstantValue>>,
+    lookup: Option<&'a mut dyn FnMut(&str) -> Option<BoundValue>>,
     malformed: bool,
     depth: usize,
     work: usize,
@@ -2983,7 +2989,7 @@ impl ExpressionParser<'_> {
                 } else {
                     if let Some(lookup) = &mut self.lookup {
                         return lookup(&identifier)
-                            .map(Value::from_constant)
+                            .map(Value::from_bound_value)
                             .unwrap_or(Value::Unknown);
                     }
                     let key = canonical_symbol(&identifier);
@@ -3064,11 +3070,36 @@ enum Value {
     Number(i64),
     String(String),
     Version(CompilerVersion),
+    EnumOrdinal(i64, crate::compile_time::DefinitionKey),
     Unknown,
     Error,
 }
 
+/// Bound-only nominal metadata travels through the same parser as constants.
+/// Grouping preserves it; unsupported arithmetic cannot silently turn it into
+/// an integer. The legacy conditional environment never constructs this variant.
+pub(crate) enum BoundValue {
+    Constant(ConstantValue),
+    EnumOrdinal(i64, crate::compile_time::DefinitionKey),
+}
+
 impl Value {
+    fn from_bound_value(value: BoundValue) -> Self {
+        match value {
+            BoundValue::Constant(value) => Self::from_constant(value),
+            BoundValue::EnumOrdinal(value, identity) => Self::EnumOrdinal(value, identity),
+        }
+    }
+
+    fn to_bound_value(&self) -> Option<BoundValue> {
+        match self {
+            Self::EnumOrdinal(value, identity) => {
+                Some(BoundValue::EnumOrdinal(*value, identity.clone()))
+            }
+            _ => self.to_constant().map(BoundValue::Constant),
+        }
+    }
+
     fn from_constant(value: ConstantValue) -> Self {
         match value {
             ConstantValue::Boolean(value) => {
@@ -3084,7 +3115,9 @@ impl Value {
         match self {
             Self::Truth(Truth::True) => Some(ConstantValue::Boolean(true)),
             Self::Truth(Truth::False) => Some(ConstantValue::Boolean(false)),
-            Self::Truth(Truth::Unknown) | Self::Unknown | Self::Error => None,
+            Self::Truth(Truth::Unknown) | Self::Unknown | Self::Error | Self::EnumOrdinal(..) => {
+                None
+            }
             Self::Number(value) => Some(ConstantValue::Integer(*value)),
             Self::String(value) => Some(ConstantValue::String(value.clone())),
             Self::Version(value) => Some(ConstantValue::Version(*value)),
@@ -3094,9 +3127,12 @@ impl Value {
     fn as_truth(&self) -> Truth {
         match self {
             Self::Truth(value) => *value,
-            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::Unknown | Self::Error => {
-                Truth::Unknown
-            }
+            Self::Number(_)
+            | Self::String(_)
+            | Self::Version(_)
+            | Self::EnumOrdinal(..)
+            | Self::Unknown
+            | Self::Error => Truth::Unknown,
         }
     }
 
@@ -3104,7 +3140,7 @@ impl Value {
         match self {
             Self::Truth(value) => Some(*value),
             Self::Unknown => Some(Truth::Unknown),
-            Self::Number(_) | Self::String(_) | Self::Version(_) => None,
+            Self::Number(_) | Self::String(_) | Self::Version(_) | Self::EnumOrdinal(..) => None,
             Self::Error => None,
         }
     }
@@ -3254,7 +3290,7 @@ impl Value {
         match self {
             Self::Truth(value) => Self::Truth(value.not()),
             Self::Number(value) => Self::Number(!value),
-            Self::String(_) | Self::Version(_) => Self::Error,
+            Self::String(_) | Self::Version(_) | Self::EnumOrdinal(..) => Self::Error,
             Self::Unknown => Self::Unknown,
             Self::Error => Self::Error,
         }

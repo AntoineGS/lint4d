@@ -1,3 +1,4 @@
+pub mod compile_time;
 pub mod conditional;
 pub mod config_discovery;
 pub mod directive_fragment_rewrite;

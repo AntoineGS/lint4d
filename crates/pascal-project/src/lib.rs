@@ -1327,6 +1327,86 @@ pub struct ProjectContext {
 }
 
 impl ProjectContext {
+    /// Equality without the observations that import resolution appends to a
+    /// worker's copy of a context as it reads project files
+    /// (`metadata_files`, `metadata_observations`, `warnings`). Workers that
+    /// resolved different imports under one project then still agree, while
+    /// every field that shapes parsing or resolution must match.
+    pub fn same_analysis_inputs(&self, other: &Self) -> bool {
+        // Destructured so that a new field must be classified here.
+        let Self {
+            discovery_complete,
+            binding_metadata_complete,
+            path_issues,
+            project_file,
+            installation_evidence,
+            installation_selection,
+            main_source,
+            search_paths,
+            search_path_entries,
+            browsing_path_entries,
+            debug_dcu_path_entries,
+            main_source_entry,
+            explicit_unit_entries,
+            include_paths,
+            include_path_entries,
+            explicit_units,
+            unit_namespaces,
+            unit_aliases,
+            defines,
+            conditional_context,
+            conditional_closure,
+            library_conditional_context,
+            project_source_roots,
+            config,
+            platform,
+            config_selection,
+            platform_selection,
+            overrides,
+            read_policy,
+            packages,
+            metadata_files: _,
+            installation_config_files,
+            system_pas_searches,
+            metadata_observations: _,
+            warnings: _,
+            override_error,
+        } = self;
+        *discovery_complete == other.discovery_complete
+            && *binding_metadata_complete == other.binding_metadata_complete
+            && *path_issues == other.path_issues
+            && *project_file == other.project_file
+            && *installation_evidence == other.installation_evidence
+            && *installation_selection == other.installation_selection
+            && *main_source == other.main_source
+            && *search_paths == other.search_paths
+            && *search_path_entries == other.search_path_entries
+            && *browsing_path_entries == other.browsing_path_entries
+            && *debug_dcu_path_entries == other.debug_dcu_path_entries
+            && *main_source_entry == other.main_source_entry
+            && *explicit_unit_entries == other.explicit_unit_entries
+            && *include_paths == other.include_paths
+            && *include_path_entries == other.include_path_entries
+            && *explicit_units == other.explicit_units
+            && *unit_namespaces == other.unit_namespaces
+            && *unit_aliases == other.unit_aliases
+            && *defines == other.defines
+            && *conditional_context == other.conditional_context
+            && *conditional_closure == other.conditional_closure
+            && *library_conditional_context == other.library_conditional_context
+            && *project_source_roots == other.project_source_roots
+            && *config == other.config
+            && *platform == other.platform
+            && *config_selection == other.config_selection
+            && *platform_selection == other.platform_selection
+            && *overrides == other.overrides
+            && *read_policy == other.read_policy
+            && *packages == other.packages
+            && *installation_config_files == other.installation_config_files
+            && *system_pas_searches == other.system_pas_searches
+            && *override_error == other.override_error
+    }
+
     pub fn can_resolve_units(&self) -> bool {
         self.discovery_complete || self.binding_metadata_complete
     }
@@ -9816,6 +9896,36 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn same_analysis_inputs_ignores_only_recorded_observations() {
+        let base = ProjectContext {
+            project_file: Some("A.dproj".into()),
+            defines: vec!["DEBUG".to_string()],
+            ..ProjectContext::default()
+        };
+        let observed = ProjectContext {
+            metadata_files: vec!["Unit.pas".into()],
+            metadata_observations: vec![MetadataObservation::Stat {
+                path: "Unit.pas".into(),
+            }],
+            warnings: vec!["warning".to_string()],
+            ..base.clone()
+        };
+        assert!(base.same_analysis_inputs(&observed));
+        assert!(observed.same_analysis_inputs(&base));
+
+        let other_defines = ProjectContext {
+            defines: vec!["RELEASE".to_string()],
+            ..observed.clone()
+        };
+        let other_includes = ProjectContext {
+            include_paths: vec!["inc".into()],
+            ..observed
+        };
+        assert!(!base.same_analysis_inputs(&other_defines));
+        assert!(!base.same_analysis_inputs(&other_includes));
+    }
 
     #[test]
     fn xml_property_text_resolves_entities_without_losing_spaces() {

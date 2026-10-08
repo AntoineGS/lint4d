@@ -656,6 +656,82 @@ mod cache_tests {
         );
     }
 
+    /// `ctx` after a worker's import resolution recorded what it read.
+    fn with_recorded_observations(ctx: &ProjectContext) -> ProjectContext {
+        let read = PathBuf::from("Auth.Types.pas");
+        ProjectContext {
+            metadata_files: vec![read.clone()],
+            metadata_observations: vec![pascal_project::MetadataObservation::Stat { path: read }],
+            warnings: vec!["unit Auth.Types was read for its DCCReference".to_string()],
+            ..ctx.clone()
+        }
+    }
+
+    #[test]
+    fn entries_are_shared_by_contexts_that_differ_only_in_recorded_observations() {
+        let cache = ProjectCache::new(usize::MAX);
+        let warmer = context("A.dproj");
+        let requester = with_recorded_observations(&warmer);
+        fill_unit(&cache, "Base.pas", &warmer, 7, vec![]);
+        cache.put_interface_imports(
+            &uri("Base.pas"),
+            &warmer,
+            7,
+            interface_value(&[], true),
+            None,
+        );
+
+        assert!(matches!(
+            cache.unit(
+                &uri("Base.pas"),
+                &requester,
+                7,
+                &HashMap::new(),
+                &no_cancel()
+            ),
+            Lookup::Hit(_)
+        ));
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &requester, 7, &HashMap::new())
+                .is_some()
+        );
+        assert!(
+            cache
+                .peek_interface_imports(&uri("Base.pas"), &requester, 7, &HashMap::new())
+                .is_some()
+        );
+        // The entry stored first stays a hit for its own context too.
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &warmer, 7, &HashMap::new())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn entries_are_not_shared_by_contexts_that_differ_in_analysis_inputs() {
+        let cache = ProjectCache::new(usize::MAX);
+        let ctx = context("A.dproj");
+        fill_unit(&cache, "Base.pas", &ctx, 7, vec![]);
+        // Include paths are not part of the fingerprint, so only the
+        // context comparison tells these apart.
+        let other = ProjectContext {
+            include_paths: vec![PathBuf::from("inc")],
+            ..with_recorded_observations(&ctx)
+        };
+
+        assert!(
+            cache
+                .peek_unit(&uri("Base.pas"), &other, 7, &HashMap::new())
+                .is_none()
+        );
+        assert!(matches!(
+            cache.unit(&uri("Base.pas"), &other, 7, &HashMap::new(), &no_cancel()),
+            Lookup::Compute(_)
+        ));
+    }
+
     #[test]
     fn peek_unit_misses_when_a_probe_fails() {
         let temp = tempfile::tempdir().unwrap();
@@ -2595,7 +2671,7 @@ impl ProjectCache {
                 context: entry_context,
                 input_hash,
                 ..
-            })) if entry_context.as_ref() == context && same_file(unit) => *input_hash,
+            })) if entry_context.same_analysis_inputs(context) && same_file(unit) => *input_hash,
             _ => return None,
         };
         let unit = self.peek_unit(uri, context, content_hash, overlays)?;
@@ -2663,7 +2739,7 @@ impl ProjectCache {
                 context: old_context,
                 input_hash,
                 ..
-            })) if old_context.as_ref() == context
+            })) if old_context.same_analysis_inputs(context)
                 && *input_hash == content_hash
                 && old.bindings == value.bindings
                 && old.complete == value.complete
@@ -2702,7 +2778,8 @@ impl ProjectCache {
             let state = lock(&self.inner);
             match state.slots.get(&key) {
                 Some(Slot::Ready(entry))
-                    if entry.context.as_ref() == context && entry.input_hash == input_hash =>
+                    if entry.context.same_analysis_inputs(context)
+                        && entry.input_hash == input_hash =>
                 {
                     extract(&entry.value)?
                 }
@@ -2918,7 +2995,8 @@ impl ProjectCache {
                     };
                 }
                 Some(Slot::Ready(entry))
-                    if entry.context.as_ref() == context && entry.input_hash == input_hash =>
+                    if entry.context.same_analysis_inputs(context)
+                        && entry.input_hash == input_hash =>
                 {
                     let Some(value) = extract(&entry.value) else {
                         break;
@@ -2934,7 +3012,7 @@ impl ProjectCache {
                     state = lock(&self.inner);
                     let same_entry = match state.slots.get(&key) {
                         Some(Slot::Ready(entry))
-                            if entry.context.as_ref() == context
+                            if entry.context.same_analysis_inputs(context)
                                 && entry.input_hash == input_hash =>
                         {
                             extract(&entry.value)
@@ -2969,7 +3047,7 @@ impl ProjectCache {
                 Some(Slot::Ready(entry)) if entry.input_hash != input_hash => {
                     "input changed".to_string()
                 }
-                Some(Slot::Ready(entry)) if entry.context.as_ref() != context => {
+                Some(Slot::Ready(entry)) if !entry.context.same_analysis_inputs(context) => {
                     format!(
                         "context differs in {}",
                         context_differences(&entry.context, context)
@@ -3324,7 +3402,7 @@ fn intern_context(
     context: &ProjectContext,
 ) -> Arc<ProjectContext> {
     if let Some(shared) = state.contexts.get(&fingerprint)
-        && shared.as_ref() == context
+        && shared.same_analysis_inputs(context)
     {
         return shared.clone();
     }

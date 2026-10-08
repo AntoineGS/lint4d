@@ -4777,6 +4777,15 @@
                 {
                   "type": "SYMBOL",
                   "name": "declSubRange"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_anonymousRecord"
+                  },
+                  "named": true,
+                  "value": "declClass"
                 }
               ]
             }
@@ -4832,6 +4841,15 @@
                 {
                   "type": "SYMBOL",
                   "name": "declSubRange"
+                },
+                {
+                  "type": "ALIAS",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "_anonymousRecord"
+                  },
+                  "named": true,
+                  "value": "declClass"
                 }
               ]
             },
@@ -4887,6 +4905,15 @@
                       {
                         "type": "SYMBOL",
                         "name": "declSubRange"
+                      },
+                      {
+                        "type": "ALIAS",
+                        "content": {
+                          "type": "SYMBOL",
+                          "name": "_anonymousRecord"
+                        },
+                        "named": true,
+                        "value": "declClass"
                       }
                     ]
                   }
@@ -4905,6 +4932,35 @@
           ]
         }
       ]
+    },
+    "_anonymousRecord": {
+      "type": "PREC",
+      "value": -1,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "kPacked"
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          },
+          {
+            "type": "SYMBOL",
+            "name": "kRecord"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "_declClass"
+          }
+        ]
+      }
     },
     "declSubRange": {
       "type": "PREC",

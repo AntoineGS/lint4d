@@ -486,3 +486,244 @@ fn packing_caps_do_not_rewrite_scalar_inherent_alignment() {
         );
     }
 }
+
+#[test]
+fn fix_i1_invalid_variant_labels_block_the_entire_union() {
+    for labels in [
+        "256",
+        "Missing",
+        "True",
+        "1.5",
+        "'xx'",
+        "0:(C:Int64);0",
+        "0..4:(C:Int64);4..8",
+        "4..0",
+    ] {
+        let h = records(
+            &format!("R=packed record case Byte of {labels}:(B:Byte); end;"),
+            LayoutPlatform::Win32,
+        );
+        assert_eq!(h.size("R"), None, "{labels}");
+    }
+    let h = records(
+        "E=(First,Last); F=(Other,Final); R=packed record case E of Other:(X:Byte); end;",
+        LayoutPlatform::Win32,
+    );
+    assert_eq!(h.size("R"), None);
+}
+
+#[test]
+fn fix_i1_valid_labels_use_earlier_bindings_and_nominal_domains() {
+    let mut c = context(LayoutPlatform::Win32);
+    c.layout.defaults.record_alignment = Some(8);
+    let h = Harness::plain(
+        "unit T; interface const L=2; type E=(First,Last); Alias=E; R=packed record case Alias of First:(X:Word);Last:(Y:Int64); end; B=packed record case Byte of 0,1:(X:Word);L..4:(Y:Int64); end; C=packed record case Char of 'a'..'c':(X:Word);'z':(Y:Byte); end; T=packed record case Boolean of False:(X:Word);True:(Y:Int64); end; implementation end.",
+        c,
+    );
+    assert_eq!(h.size("R"), Some(8));
+    assert_eq!(h.size("B"), Some(8));
+    assert_eq!(h.size("C"), Some(2));
+    assert_eq!(h.size("T"), Some(8));
+}
+
+#[test]
+fn fix_i2_anonymous_ordinary_packed_nested_records_and_stride() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let h = records(
+            "R=record Inner:record B:Byte; I:LongWord; end; end; P=packed record B:Byte; Inner:packed record C:Byte; I:LongWord; end; end; N=record B:Byte; Inner:record I:LongWord; C:Byte; end; end; A=array[0..1] of N;",
+            platform,
+        );
+        assert_eq!(h.size("R"), Some(8));
+        assert_eq!(h.size("P"), Some(6));
+        assert_eq!(h.size("N"), Some(12));
+        assert_eq!(h.size("A"), Some(24));
+    }
+}
+
+#[test]
+fn fix_i3_nonclass_or_uncertain_variable_sections_never_shrink_records() {
+    for section in [
+        "var X:Int64;",
+        "threadvar X:Int64;",
+        "class threadvar X:Int64;",
+        "class var {$IFDEF X} X:Int64; {$ENDIF}",
+        "class var X:{$IFDEF X}Int64{$ELSE}Byte{$ENDIF};",
+        "class var X:;",
+        "class var",
+    ] {
+        assert_eq!(
+            records(
+                &format!("R=record B:Byte; {section} end;"),
+                LayoutPlatform::Win32
+            )
+            .size("R"),
+            None,
+            "{section}"
+        );
+    }
+    assert_eq!(
+        records(
+            "R=record B:Byte; class var X,Y:Int64; end;",
+            LayoutPlatform::Win32
+        )
+        .size("R"),
+        Some(1)
+    );
+}
+
+#[test]
+fn fix_i1_overlap_ranges_identity_and_budget_scratch_are_checked() {
+    for labels in [
+        "-1",
+        "0,0",
+        "0..2:(A:Word);2",
+        "0:(A:Word);0..2",
+        "0..256",
+        "'a'",
+    ] {
+        assert_eq!(
+            records(
+                &format!("R=packed record case Byte of {labels}:(B:Byte); end;"),
+                LayoutPlatform::Win32
+            )
+            .size("R"),
+            None,
+            "{labels}"
+        );
+    }
+    let h = records(
+        "E=(First,Last); F=(Other,Final); R=packed record case E of First:(A:Word);Final:(B:Int64); end; Huge=packed record case Int64 of 0..9223372036854775807:(C:Word); end;",
+        LayoutPlatform::Win32,
+    );
+    assert_eq!(h.size("R"), None);
+    assert_eq!(h.size("Huge"), Some(2));
+    let source = "unit T; interface type E=(First,Last); F=(Other,Final); R=packed record case E of First:(A:Word);Final:(B:Int64); end; Huge=packed record case Int64 of 0..9223372036854775807:(C:Word); end; implementation end.";
+    let site = h
+        .state
+        .site_at(&h.root.id, OccurrenceId(0), source.len())
+        .unwrap();
+    for work in [40, 100, 500, 2000] {
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: work,
+                ..CompileTimeLimits::default()
+            },
+            &NoCancellation,
+        );
+        assert!(!matches!(
+            h.state.layout_name(site.clone(), "R", &mut budget),
+            Fact::Known(_)
+        ));
+        assert_eq!(budget.snapshot().retained_bytes, 0, "work={work}");
+    }
+}
+
+#[test]
+fn fix_i1_labels_and_aliases_bind_at_definition_not_later_shadows() {
+    let mut c = context(LayoutPlatform::Win32);
+    c.layout.defaults.record_alignment = Some(8);
+    let h = Harness::plain(
+        "unit T; interface const LabelValue=2; type R=packed record case Byte of LabelValue:(X:Word); end; implementation const LabelValue=256; end.",
+        c,
+    );
+    assert_eq!(h.size("R"), Some(2));
+    assert_eq!(
+        records(
+            "R=packed record case Byte of Later:(B:Byte); end;",
+            LayoutPlatform::Win32
+        )
+        .size("R"),
+        None
+    );
+    assert_eq!(
+        records(
+            "R=packed record case Byte of 0:(A:Word; case Boolean of 2:(B:Byte));1:(C:Int64); end;",
+            LayoutPlatform::Win32
+        )
+        .size("R"),
+        None
+    );
+}
+
+#[test]
+fn fix_i2_fragmented_anonymous_records_capture_inner_settings_and_sites() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let mut c = context(platform.clone());
+        c.layout.defaults.record_alignment = Some(8);
+        let mut h = Harness::stream(
+            "unit T; interface type T=Word; R=record Inner:packed rec",
+            c,
+        );
+        h.feed("ord B:T; Text:String; ");
+        h.with_layout("H-");
+        h.feed("Second:String; en");
+        h.feed("d; end; Alias=R; T=Int64; A=array[1..2] of R; implementation end.");
+        h.finish();
+        let pointer = if platform == LayoutPlatform::Win32 {
+            4
+        } else {
+            8
+        };
+        assert_eq!(h.size("R"), Some(2 + pointer + 256));
+        assert_eq!(h.size("Alias"), h.size("R"));
+        assert_eq!(h.size("A"), Some((2 + pointer + 256) * 2));
+    }
+}
+
+#[test]
+fn fix_i2_anonymous_graph_admission_and_recovery_remain_bounded() {
+    let text = "unit T; interface type R=record Inner:record B:Byte; I:LongWord; end; C:Byte; end; implementation end.";
+    let root = support::loaded("T.pas", text);
+    let mut c = context(LayoutPlatform::Win32);
+    c.layout.defaults.record_alignment = Some(8);
+    for fields in [2, 4] {
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_fields: fields,
+                ..CompileTimeLimits::default()
+            },
+            &NoCancellation,
+        );
+        let mut state = CompileTimeState::new(&c, &root, &mut budget).unwrap();
+        let result = state.feed(
+            SourceFragment {
+                source: &root.id,
+                occurrence: OccurrenceId(0),
+                physical_start: 0,
+                text,
+            },
+            Truth::True,
+            &mut budget,
+        );
+        if fields == 2 {
+            assert!(matches!(
+                result,
+                Err(IncompleteReason::Limit {
+                    name: "max_fields",
+                    ..
+                })
+            ));
+        } else {
+            result.unwrap();
+            state.finish_root(&mut budget).unwrap();
+            let mut payload = 0;
+            state
+                .visit_recovery_payload(&mut |n| {
+                    payload += n;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(budget.snapshot().retained_bytes >= payload);
+        }
+    }
+}
+
+#[test]
+fn fix_i1_invalid_labels_cannot_be_nominal_dynamic_array_elements() {
+    let h = records(
+        "R=packed record case Byte of 256:(B:Byte); end; A=array of R; N=record Inner:packed record case Boolean of 2:(C:Byte); end; end; NA=array of N;",
+        LayoutPlatform::Win32,
+    );
+    assert_eq!(h.size("A"), None);
+    assert_eq!(h.size("NA"), None);
+}

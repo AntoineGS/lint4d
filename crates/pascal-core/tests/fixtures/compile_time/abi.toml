@@ -89,6 +89,12 @@ array_fixture = [
 ]
 
 record_fixture = [
+  { compiler="37.0", platform="Win32", switches="A8 OLDTYPELAYOUT OFF", declaration="R=record Inner:record B:Byte; I:LongWord; end; end", name="R", expected_size=8, expected_alignment=4, reference="record_fields" },
+  { compiler="37.0", platform="Win64", switches="A8 OLDTYPELAYOUT OFF", declaration="R=record Inner:record B:Byte; I:LongWord; end; end", name="R", expected_size=8, expected_alignment=4, reference="record_fields" },
+  { compiler="37.0", platform="Win32", switches="A8 OLDTYPELAYOUT OFF", declaration="R=packed record B:Byte; Inner:packed record C:Byte; I:LongWord; end; end", name="R", expected_size=6, expected_alignment=1, reference="record_fields" },
+  { compiler="37.0", platform="Win64", switches="A8 OLDTYPELAYOUT OFF", declaration="R=packed record B:Byte; Inner:packed record C:Byte; I:LongWord; end; end", name="R", expected_size=6, expected_alignment=1, reference="record_fields" },
+  { compiler="37.0", platform="Win32", switches="A8 OLDTYPELAYOUT OFF", declaration="R=record B:Byte; Inner:record I:LongWord; C:Byte; end; end; A=array[0..1] of R", name="A", expected_size=24, expected_alignment=4, reference="record_stride" },
+  { compiler="37.0", platform="Win64", switches="A8 OLDTYPELAYOUT OFF", declaration="R=record B:Byte; Inner:record I:LongWord; C:Byte; end; end; A=array[0..1] of R", name="A", expected_size=24, expected_alignment=4, reference="record_stride" },
   { compiler="37.0", platform="Win32", switches="A8 OLDTYPELAYOUT OFF", declaration="R=record B:Byte; I:LongWord; end", name="R", expected_size=8, expected_alignment=4, reference="record_fields" },
   { compiler="37.0", platform="Win64", switches="A8 OLDTYPELAYOUT OFF", declaration="R=record B:Byte; I:LongWord; end", name="R", expected_size=8, expected_alignment=4, reference="record_fields" },
   { compiler="37.0", platform="Win32", switches="A8 OLDTYPELAYOUT OFF", declaration="R=packed record B:Byte; I:LongWord; end", name="R", expected_size=5, expected_alignment=1, reference="record_fields" },

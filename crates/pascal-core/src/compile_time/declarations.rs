@@ -789,7 +789,7 @@ impl CompileTimeState {
         Ok(())
     }
 
-    fn anchor_at(
+    pub(super) fn anchor_at(
         &self,
         logical: usize,
         len: usize,
@@ -836,7 +836,7 @@ impl CompileTimeState {
         Ok(low)
     }
 
-    fn provenance(
+    pub(super) fn provenance(
         &self,
         start: usize,
         end: usize,
@@ -1233,7 +1233,7 @@ pub(super) fn initializer_expression(text: &str) -> &str {
     text.trim().strip_prefix('=').unwrap_or(text).trim()
 }
 
-fn index_expr(
+pub(super) fn index_expr(
     node: Node<'_>,
     bytes: &[u8],
     budget: &mut CompileTimeBudget<'_>,
@@ -1260,7 +1260,7 @@ fn index_expr(
     }
 }
 
-fn visit_index_payload(
+pub(super) fn visit_index_payload(
     index: &IndexExpr,
     visit: &mut dyn FnMut(usize) -> Result<(), String>,
 ) -> Result<(), String> {

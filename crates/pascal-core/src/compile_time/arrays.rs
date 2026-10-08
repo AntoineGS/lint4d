@@ -137,7 +137,7 @@ fn array_count(
 }
 
 /// Establish a valid element binding/shape, not its size or record stride.
-fn element_valid<'a>(
+pub(super) fn element_valid<'a>(
     state: &'a CompileTimeState,
     site: &BindingSite,
     ty: &TypeExpr,
@@ -177,7 +177,9 @@ fn element_valid<'a>(
             result
         }
         TypeExpr::OpaqueNominal(_) | TypeExpr::Pointer(_) => Ok(true),
-        TypeExpr::Record(record) => Ok(record.is_valid()),
+        TypeExpr::Record(record) => {
+            super::records::record_element_valid(state, record, visited, depth + 1, budget)
+        }
         TypeExpr::Array {
             dimensions,
             element,
@@ -444,6 +446,154 @@ fn ordinal_expression(
         }
         _ => None,
     })
+}
+
+/// Shared typed ordinal admission for record labels. Resolve nominal enum
+/// identity through definition-site aliases; never compare enum values alone.
+fn selector_kind(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    ty: &TypeExpr,
+    owner: Option<&DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<OrdinalKind>, IncompleteReason> {
+    limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(1, 0, 0)?;
+    match ty {
+        TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+            if let Some(binding) = lookup(state, site, name, budget)? {
+                let Some(decl) = binding.type_declaration() else {
+                    return Ok(None);
+                };
+                return selector_kind(
+                    state,
+                    &decl.site,
+                    &decl.ty,
+                    Some(&decl.key),
+                    depth + 1,
+                    budget,
+                );
+            }
+            Ok(match intrinsic(name) {
+                Some(BuiltinType::Boolean) => Some(OrdinalKind::Boolean),
+                Some(BuiltinType::AnsiChar) => Some(OrdinalKind::Character(BuiltinType::AnsiChar)),
+                Some(BuiltinType::WideChar) => Some(OrdinalKind::Character(BuiltinType::WideChar)),
+                Some(BuiltinType::Char) => builtin_layout(
+                    BuiltinType::Char,
+                    &state.context,
+                    &state.context.layout.defaults,
+                )
+                .known()
+                .and_then(|s| match s.size {
+                    1 => Some(OrdinalKind::Character(BuiltinType::AnsiChar)),
+                    2 => Some(OrdinalKind::Character(BuiltinType::WideChar)),
+                    _ => None,
+                }),
+                // The separate domain admission determines which integer intrinsics
+                // are actually supported; this does not invent their bounds.
+                Some(_) => Some(OrdinalKind::Integer),
+                None => None,
+            })
+        }
+        TypeExpr::Enum(_) => {
+            let Some(key) = owner else {
+                return Ok(None);
+            };
+            budget.charge(
+                1,
+                key.anchor.source.as_str().len(),
+                size_of::<DefinitionKey>() + key.anchor.source.as_str().len(),
+            )?;
+            Ok(Some(OrdinalKind::Enum(key.clone())))
+        }
+        TypeExpr::Range(IndexExpr::Bounds { lower, .. }) => {
+            Ok(ordinal_expression(state, site, lower, depth + 1, budget)?.map(|(_, kind)| kind))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn label_interval(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    label: &IndexExpr,
+    expected: &OrdinalKind,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<Domain>, IncompleteReason> {
+    let (lower, upper) = match label {
+        IndexExpr::Domain(text) => (text.as_str(), None),
+        IndexExpr::Bounds { lower, upper } => (lower.as_str(), Some(upper.as_str())),
+    };
+    let Some((lower, kind)) = ordinal_expression(state, site, lower, depth + 1, budget)? else {
+        return Ok(None);
+    };
+    let result = (|| {
+        if !expected.compatible(&kind, budget)? {
+            return Ok(None);
+        }
+        let Some(text) = upper else {
+            return Ok(Some((lower, lower)));
+        };
+        let Some((upper, upper_kind)) = ordinal_expression(state, site, text, depth + 1, budget)?
+        else {
+            return Ok(None);
+        };
+        let result = expected
+            .compatible(&upper_kind, budget)
+            .map(|valid| (valid && lower <= upper).then_some((lower, upper)));
+        upper_kind.release(budget);
+        result
+    })();
+    kind.release(budget);
+    result
+}
+
+pub(super) fn validate_variant_labels<'a>(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    selector: &TypeExpr,
+    labels: impl Iterator<Item = &'a IndexExpr>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let Some((minimum, maximum)) = type_domain(state, site, selector, depth + 1, budget)? else {
+        return Ok(false);
+    };
+    if minimum > maximum {
+        return Ok(false);
+    }
+    let Some(kind) = selector_kind(state, site, selector, None, depth + 1, budget)? else {
+        return Ok(false);
+    };
+    let mut intervals: Vec<Domain> = Vec::new();
+    let result = (|| {
+        for label in labels {
+            budget.charge(1, 0, 0)?;
+            let Some((lower, upper)) =
+                label_interval(state, site, label, &kind, depth + 1, budget)?
+            else {
+                return Ok(false);
+            };
+            if lower < minimum || upper > maximum {
+                return Ok(false);
+            }
+            for (a, b) in &intervals {
+                budget.charge(1, 0, 0)?;
+                if lower <= *b && *a <= upper {
+                    return Ok(false);
+                }
+            }
+            // Retain intervals, never enumerate values of a possibly huge range.
+            budget.charge(1, 0, size_of::<Domain>())?;
+            intervals.push((lower, upper));
+        }
+        Ok(!intervals.is_empty())
+    })();
+    kind.release(budget);
+    budget.release(intervals.len() * size_of::<Domain>());
+    result
 }
 
 fn constant_expression(

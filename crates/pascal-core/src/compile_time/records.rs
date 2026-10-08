@@ -1,7 +1,7 @@
 //! Delphi record field storage (not class instance layouts).
 //! See ABI fixture references `record_fields`, `record_variants`, `layout_options`.
-use super::bindings::{TypeExpr, same_name, storage_type};
-use super::declarations::{limit, type_expr, visit_type_payload};
+use super::bindings::{IndexExpr, TypeExpr, same_name, storage_type};
+use super::declarations::{index_expr, limit, type_expr, visit_index_payload, visit_type_payload};
 use super::*;
 use crate::conditional::Truth;
 use pascal_project::{CompilerVersion, ConditionalFact, LayoutPlatform, LayoutSettings};
@@ -13,12 +13,9 @@ pub(super) struct Record {
     packed: bool,
     valid: bool,
     settings: LayoutSettings,
+    site: BindingSite,
+    provenance: Vec<SourceAnchor>,
     parts: Vec<Part>,
-}
-impl Record {
-    pub(super) fn is_valid(&self) -> bool {
-        self.valid
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -39,7 +36,7 @@ enum Part {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Alternative {
-    labels: String,
+    labels: Vec<IndexExpr>,
     parts: Vec<Part>,
 }
 
@@ -105,12 +102,33 @@ pub(super) fn parse_record(
     }
     let result = a.parts(node, depth + 1, budget);
     budget.release(a.names.len() * size_of::<&str>());
+    let parts = result?;
     let logical = state.node_logical_position(node.start_byte(), prefix)?;
     let settings = state.settings_at_logical(logical, budget)?.clone();
-    result.map(|parts| Record {
+    let anchor = state.anchor_at(logical, 1, budget)?;
+    let mut site = state
+        .site_at(&anchor.source, anchor.occurrence, anchor.range.start)
+        .ok_or(IncompleteReason::MalformedSource)?;
+    // The enclosing declaration is admitted immediately after this parse. Include
+    // it for recursive-by-value cycle detection, never later declarations.
+    site.sequence = Sequence(
+        state
+            .sequence
+            .0
+            .checked_add(1)
+            .ok_or(IncompleteReason::MalformedSource)?,
+    );
+    budget.release(size_of::<SourceAnchor>() + anchor.source.as_str().len());
+    let end = logical
+        .checked_add(node.end_byte() - node.start_byte())
+        .ok_or(IncompleteReason::MalformedSource)?;
+    let provenance = state.provenance(logical, end, budget)?;
+    Ok(Record {
         packed,
         valid: a.valid,
         settings,
+        site,
+        provenance,
         parts,
     })
 }
@@ -240,24 +258,31 @@ impl Admission<'_, '_, '_> {
                             budget.limits().max_variant_alternatives,
                             "max_variant_alternatives",
                         )?;
-                        let mut labels = None;
+                        let mut labels = Vec::new();
                         let mut lc = clause.walk();
                         for n in clause.named_children(&mut lc) {
                             budget.charge(1, 0, 0)?;
                             if n.kind() == "caseLabel" {
-                                labels = Some(
-                                    n.utf8_text(self.bytes)
-                                        .map_err(|_| IncompleteReason::MalformedSource)?,
-                                );
+                                let mut cursor = n.walk();
+                                for label in n.named_children(&mut cursor) {
+                                    budget.charge(1, 0, size_of::<IndexExpr>())?;
+                                    if label.kind() == "comment" {
+                                        budget.release(size_of::<IndexExpr>());
+                                        continue;
+                                    }
+                                    if label.kind().starts_with("pp") {
+                                        self.valid = false;
+                                    }
+                                    labels.push(index_expr(label, self.bytes, budget)?);
+                                }
                             }
                         }
-                        let labels = labels.unwrap_or("");
                         if labels.is_empty() {
                             self.valid = false;
                         }
-                        budget.charge(1, labels.len(), size_of::<Alternative>() + labels.len())?;
+                        budget.charge(1, 0, size_of::<Alternative>())?;
                         alternatives.push(Alternative {
-                            labels: labels.to_owned(),
+                            labels,
                             parts: self.parts(clause, depth + 1, budget)?,
                         });
                     }
@@ -280,7 +305,12 @@ impl Admission<'_, '_, '_> {
                     budget.release(bytes);
                 }
                 // Only parser-identified non-instance declarations may be ignored.
-                "declProc" | "declProp" | "declVars" | "comment" | "caseLabel" => {}
+                "declVars" => {
+                    if !proven_static_section(child, budget)? {
+                        self.valid = false;
+                    }
+                }
+                "declProc" | "declProp" | "comment" | "caseLabel" => {}
                 kind if kind.starts_with('k') => {}
                 _ => self.valid = false,
             }
@@ -289,10 +319,66 @@ impl Admission<'_, '_, '_> {
     }
 }
 
+/// Nominal element validity is distinct from storage/stride proof. Reuse the
+/// array graph's shape validation so invalid labels cannot hide behind a dynamic
+/// reference, including nested anonymous records and definition-site aliases.
+pub(super) fn record_element_valid<'a>(
+    state: &'a CompileTimeState,
+    record: &Record,
+    visited: &mut Vec<&'a DefinitionKey>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    fn parts<'a>(
+        state: &'a CompileTimeState,
+        site: &BindingSite,
+        items: &[Part],
+        visited: &mut Vec<&'a DefinitionKey>,
+        depth: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, IncompleteReason> {
+        limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+        for part in items {
+            budget.charge(1, 0, 0)?;
+            match part {
+                Part::Field { ty, .. } => {
+                    if !super::arrays::element_valid(state, site, ty, visited, depth + 1, budget)? {
+                        return Ok(false);
+                    }
+                }
+                Part::Variant {
+                    ty, alternatives, ..
+                } => {
+                    if !super::arrays::validate_variant_labels(
+                        state,
+                        site,
+                        ty,
+                        alternatives.iter().flat_map(|a| a.labels.iter()),
+                        depth + 1,
+                        budget,
+                    )? {
+                        return Ok(false);
+                    }
+                    for alt in alternatives {
+                        if !parts(state, site, &alt.parts, visited, depth + 1, budget)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+    if !record.valid {
+        return Ok(false);
+    }
+    parts(state, &record.site, &record.parts, visited, depth, budget)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_layout<'a>(
     state: &'a CompileTimeState,
-    site: &BindingSite,
+    _site: &BindingSite,
     record: &Record,
     _settings: &LayoutSettings,
     visited: &mut Vec<&'a DefinitionKey>,
@@ -300,6 +386,7 @@ pub(super) fn record_layout<'a>(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Fact<StorageLayout>, IncompleteReason> {
     let settings = &record.settings;
+    let site = &record.site;
     if !record.valid || record.parts.is_empty() {
         return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
     }
@@ -400,7 +487,14 @@ fn layout_parts<'a>(
                 alternatives,
                 settings,
             } => {
-                if super::arrays::type_domain(state, site, ty, depth + 1, budget)?.is_none() {
+                if !super::arrays::validate_variant_labels(
+                    state,
+                    site,
+                    ty,
+                    alternatives.iter().flat_map(|a| a.labels.iter()),
+                    depth + 1,
+                    budget,
+                )? {
                     return Ok(Fact::Unknown(UnknownReason::UnsupportedLayout));
                 }
                 if name.is_some() {
@@ -474,7 +568,10 @@ pub(super) fn visit_payload(
                     visit_type_payload(ty, visit)?;
                     for alt in alternatives {
                         visit(size_of::<Alternative>())?;
-                        visit(alt.labels.len())?;
+                        for label in &alt.labels {
+                            visit(size_of::<IndexExpr>())?;
+                            visit_index_payload(label, visit)?;
+                        }
                         visit_parts(&alt.parts, visit)?;
                     }
                 }
@@ -482,7 +579,85 @@ pub(super) fn visit_payload(
         }
         Ok(())
     }
+    for anchor in &record.provenance {
+        visit(size_of::<SourceAnchor>())?;
+        visit(anchor.source.as_str().len())?;
+    }
     visit_parts(&record.parts, visit)
+}
+
+fn proven_static_section(
+    node: Node<'_>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let mut class = false;
+    let mut var = false;
+    let mut declarations = 0;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        budget.charge(1, 0, 0)?;
+        if child.has_error() || child.is_missing() {
+            return Ok(false);
+        }
+        match child.kind() {
+            "kClass" => class = true,
+            "kVar" => var = true,
+            "declVar" => {
+                if child.child_by_field_name("type").is_none()
+                    || !unconditional_shape(child, budget)?
+                {
+                    return Ok(false);
+                }
+                let mut c = child.walk();
+                let mut names = 0;
+                for name in child.children_by_field_name("name", &mut c) {
+                    budget.charge(1, 0, 0)?;
+                    if !name.is_named() {
+                        continue;
+                    }
+                    if name.kind() != "identifier" || name.is_missing() || name.has_error() {
+                        return Ok(false);
+                    }
+                    names += 1;
+                }
+                if names == 0 {
+                    return Ok(false);
+                }
+                declarations += 1;
+            }
+            "comment" => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(class && var && declarations > 0)
+}
+
+/// A class marker does not prove a conditional/recovered variable declaration.
+/// Traverse without a second parser or an allocation proportional to nesting.
+fn unconditional_shape(
+    node: Node<'_>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<bool, IncompleteReason> {
+    let mut cursor = node.walk();
+    loop {
+        budget.charge(1, 0, 0)?;
+        let node = cursor.node();
+        if node.is_missing() || node.has_error() || node.kind().starts_with("pp") {
+            return Ok(false);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            budget.charge(1, 0, 0)?;
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 impl CompileTimeState {

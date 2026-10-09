@@ -2958,7 +2958,8 @@ impl<S: SourceStore> UnitResolver<S> {
                 paths: entries
                     .iter()
                     .map(|entry| (entry.path.clone(), entry.clone()))
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
                 legacy_route: request.legacy_route.cloned(),
             };
             if let Some(result) =
@@ -2971,7 +2972,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .explicit_units
             .get(&lookup.to_ascii_lowercase())
         {
-            let paths = paths
+            let paths: Vec<_> = paths
                 .iter()
                 .filter_map(|path| {
                     self.context
@@ -2981,7 +2982,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 })
                 .collect();
             let group = CandidateGroup {
-                paths,
+                paths: paths.into(),
                 legacy_route: request.legacy_route.cloned(),
             };
             if let Some(result) =
@@ -3077,12 +3078,7 @@ impl<S: SourceStore> UnitResolver<S> {
         provided_entry: Option<&ProjectPathEntry>,
         requested: &str,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
-        let bytes = directory.as_os_str().len().saturating_mul(8)
-            + unit_name.len().saturating_mul(8)
-            + namespaces
-                .iter()
-                .map(|n| 8 * (n.len() + std::mem::size_of::<String>()))
-                .sum::<usize>();
+        let bytes = directory.as_os_str().len().saturating_mul(8); // canonical directory/entry scratch remains a later boundary
         self.admit_lookup_storage(1, bytes, bytes, cancel)?;
         let directory = canonical_path(directory);
         let Some(entry) = provided_entry
@@ -3106,8 +3102,8 @@ impl<S: SourceStore> UnitResolver<S> {
                 candidates: Vec::new(),
             }));
         }
-        let tiers = filename_tiers(unit_name, namespaces);
-        for names in tiers {
+        let tiers = self.filename_tiers_scratch(unit_name, namespaces, cancel)?;
+        for names in tiers.iter() {
             let paths = self.paths_for_names(&directory, &entry, &names, &listing, cancel)?;
             let group = CandidateGroup {
                 paths,
@@ -3168,7 +3164,12 @@ impl<S: SourceStore> UnitResolver<S> {
                             candidates: Vec::new(),
                         }));
                     }
-                    for names in filename_tiers(parts.last().copied().unwrap_or_default(), &[]) {
+                    let nested_tiers = self.filename_tiers_scratch(
+                        parts.last().copied().unwrap_or_default(),
+                        &[],
+                        cancel,
+                    )?;
+                    for names in nested_tiers.iter() {
                         let group = CandidateGroup {
                             paths: self.paths_for_names(
                                 &nested,
@@ -3288,7 +3289,55 @@ impl<S: SourceStore> UnitResolver<S> {
         self.admit_lookup_storage(1, copies, copies, cancel)?;
         let mut valid = Vec::new();
         let mut candidates = Vec::new();
-        for (path, entry) in dedup_paths(group.paths.clone()) {
+        let mut order_bound = group
+            .paths
+            .len()
+            .checked_mul(std::mem::size_of::<usize>() * 2)
+            .ok_or_else(|| ResolverError::InvalidRequest("candidate ordering overflow".into()))?;
+        for (path, _) in group.paths.iter() {
+            order_bound = order_bound
+                .checked_add(
+                    path.as_os_str()
+                        .len()
+                        .checked_mul(8)
+                        .and_then(|n| n.checked_add(32))
+                        .ok_or_else(|| {
+                            ResolverError::InvalidRequest("candidate ordering key overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("candidate ordering bound overflow".into())
+                })?;
+        }
+        let build_order = || {
+            let mut order = (0..group.paths.len())
+                .filter(|index| {
+                    !group.paths[..*index]
+                        .iter()
+                        .any(|(previous, _)| path_equivalent(previous, &group.paths[*index].0))
+                })
+                .collect::<Vec<_>>();
+            order.sort_by_key(|index| path_key(&group.paths[*index].0));
+            order
+        };
+        let order = if let Some(mut budget) = self.store_budget(cancel) {
+            let work = group
+                .paths
+                .len()
+                .checked_mul(group.paths.len())
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("candidate ordering work overflow".into())
+                })?;
+            LookupScratch::Admitted(
+                budget
+                    .admit_owned(work, order_bound, order_bound, build_order)
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+            )
+        } else {
+            LookupScratch::Legacy(build_order())
+        };
+        for index in order.iter() {
+            let (path, entry) = &group.paths[*index];
             self.check_cancel(cancel)?;
             match self.load_candidate(
                 &path,
@@ -3410,7 +3459,10 @@ impl<S: SourceStore> UnitResolver<S> {
         names: &[String],
         listing: &DirectoryListing,
         cancel: &dyn CancellationToken,
-    ) -> Result<Vec<(PathBuf, ProjectPathEntry)>, ResolverError> {
+    ) -> Result<LookupScratch<Vec<(PathBuf, ProjectPathEntry)>>, ResolverError> {
+        if self.compile_time_store.is_some() {
+            return self.paths_for_names_owned(directory, entry, names, listing, cancel);
+        }
         let copy_bound = listing
             .files
             .iter()
@@ -3483,7 +3535,195 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
         paths.sort_by_key(|left| path_key(&left.0));
-        Ok(paths)
+        Ok(LookupScratch::Legacy(paths))
+    }
+
+    fn filename_tiers_scratch(
+        &self,
+        unit_name: &str,
+        namespaces: &[String],
+        cancel: &dyn CancellationToken,
+    ) -> Result<LookupScratch<Vec<Vec<String>>>, ResolverError> {
+        let Some(mut budget) = self.store_budget(cancel) else {
+            return Ok(filename_tiers(unit_name, namespaces).into());
+        };
+        let overflow =
+            || ResolverError::InvalidRequest("filename tier construction overflow".into());
+        let count = namespaces.len().checked_add(1).ok_or_else(overflow)?;
+        let mut bytes = count
+            .checked_mul(4 * std::mem::size_of::<Vec<String>>() + 2 * std::mem::size_of::<String>())
+            .ok_or_else(overflow)?;
+        let exact = unit_name
+            .len()
+            .checked_add(4)
+            .and_then(|n| n.checked_mul(4))
+            .map(|n| n.max(32))
+            .ok_or_else(overflow)?;
+        bytes = bytes.checked_add(exact).ok_or_else(overflow)?;
+        for namespace in namespaces {
+            bytes = bytes
+                .checked_add(
+                    namespace
+                        .len()
+                        .checked_add(unit_name.len())
+                        .and_then(|n| n.checked_add(5))
+                        .and_then(|n| n.checked_mul(2))
+                        .map(|n| n.max(32))
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+        }
+        let tiers = budget
+            .admit_owned(count, bytes, bytes, || {
+                filename_tiers(unit_name, namespaces)
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        Ok(LookupScratch::Admitted(tiers))
+    }
+
+    fn paths_for_names_owned(
+        &mut self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        names: &[String],
+        listing: &DirectoryListing,
+        cancel: &dyn CancellationToken,
+    ) -> Result<LookupScratch<Vec<(PathBuf, ProjectPathEntry)>>, ResolverError> {
+        let mut budget = self.store_budget(cancel).expect("admitted path lookup");
+        let overflow =
+            || ResolverError::InvalidRequest("candidate path construction overflow".into());
+        let root = budget
+            .admit_owned(
+                1,
+                directory.as_os_str().len(),
+                directory.as_os_str().len(),
+                || directory.to_path_buf(),
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let overlays = self
+            .store
+            .overlay_candidates_admitted(std::slice::from_ref(&*root), names, &mut budget, cancel)
+            .map_err(root_store_error)?;
+        if !overlays.is_admitted_by(&budget) {
+            return Err(ResolverError::InvalidRequest(
+                "foreign-root overlay candidates".into(),
+            ));
+        }
+        let count = listing
+            .files
+            .len()
+            .checked_add(overlays.len())
+            .ok_or_else(overflow)?;
+        let mut entry_bound = 0;
+        for source in std::iter::once(entry)
+            .chain(self.context.main_source_entry.iter())
+            .chain(self.context.explicit_unit_entries.values().flatten())
+        {
+            let mut bytes = 0usize;
+            source
+                .visit_recovery_payload(&mut |n| {
+                    bytes = bytes
+                        .checked_add(n)
+                        .ok_or_else(|| "candidate authorization bound overflow".to_string())?;
+                    Ok(())
+                })
+                .map_err(ResolverError::InvalidRequest)?;
+            entry_bound = entry_bound.max(bytes);
+        }
+        let backing = count
+            .checked_mul(std::mem::size_of::<(PathBuf, ProjectPathEntry)>())
+            .ok_or_else(overflow)?;
+        let mut payload = backing;
+        let mut key_bytes = 0usize;
+        for path in listing.files.iter().chain(overlays.iter()) {
+            let path_bytes = path.as_os_str().len();
+            let copies = path_bytes
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(entry_bound.checked_mul(2)?))
+                .and_then(|n| n.checked_add(32))
+                .ok_or_else(overflow)?;
+            payload = payload.checked_add(copies).ok_or_else(overflow)?;
+            key_bytes = key_bytes
+                .checked_add(
+                    path_bytes
+                        .checked_mul(8)
+                        .and_then(|n| n.checked_add(32))
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+        }
+        // Comparisons, lossy name and sorting keys have a separate temporary
+        // construction owner; they never travel with the returned path Vec.
+        let work = count
+            .checked_mul(
+                count
+                    .checked_add(self.context.explicit_unit_entries.len())
+                    .and_then(|n| n.checked_add(names.len()))
+                    .and_then(|n| n.checked_add(2))
+                    .ok_or_else(overflow)?,
+            )
+            .ok_or_else(overflow)?;
+        let _sorting = budget
+            .admit_owned(
+                work,
+                key_bytes.checked_mul(count.max(1)).ok_or_else(overflow)?,
+                key_bytes.checked_add(backing).ok_or_else(overflow)?,
+                || (),
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let paths = budget.admit_fallible(
+            count,
+            payload,
+            payload,
+            crate::compile_time::resolver_error,
+            || {
+                let mut paths: Vec<(PathBuf, ProjectPathEntry)> = Vec::with_capacity(count);
+                for path in &listing.files {
+                    if cancel.is_cancelled() {
+                        return Err(ResolverError::Cancelled);
+                    }
+                    if path.file_name().is_some_and(|name| {
+                        names
+                            .iter()
+                            .any(|wanted| name.to_string_lossy().eq_ignore_ascii_case(wanted))
+                    }) && !paths
+                        .iter()
+                        .any(|(previous, _)| path_equivalent(previous, path))
+                    {
+                        paths.push((
+                            path.clone(),
+                            self.candidate_entry_for_path(path, entry, None),
+                        ));
+                    }
+                }
+                for path in overlays.iter() {
+                    if cancel.is_cancelled() {
+                        return Err(ResolverError::Cancelled);
+                    }
+                    if path
+                        .parent()
+                        .is_none_or(|parent| !path_equivalent(parent, directory))
+                    {
+                        continue;
+                    }
+                    if !paths
+                        .iter()
+                        .any(|(previous, _)| path_equivalent(previous, path))
+                    {
+                        paths.push((
+                            path.clone(),
+                            self.candidate_entry_for_path(path, entry, None),
+                        ));
+                    }
+                }
+                paths.sort_by_key(|left| path_key(&left.0));
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                Ok(paths)
+            },
+        )?;
+        Ok(LookupScratch::Admitted(paths))
     }
 
     fn list_directory(
@@ -4460,7 +4700,7 @@ impl<S: SourceStore> UnitResolver<S> {
         Ok(paths_by_tier
             .into_iter()
             .map(|paths| CandidateGroup {
-                paths,
+                paths: paths.into(),
                 legacy_route: None,
             })
             .collect())
@@ -5373,8 +5613,29 @@ fn conditional_context_reserve(context: &ProjectContext) -> Result<usize, Resolv
 }
 
 struct CandidateGroup {
-    paths: Vec<(PathBuf, ProjectPathEntry)>,
+    paths: LookupScratch<Vec<(PathBuf, ProjectPathEntry)>>,
     legacy_route: Option<LegacyRoute>,
+}
+
+/// Private temporary storage only. Deref borrows cannot detach its payload from
+/// the admission; escaping result fields require a separate consuming owner.
+enum LookupScratch<T> {
+    Legacy(T),
+    Admitted(AdmittedOwned<T>),
+}
+impl<T> From<T> for LookupScratch<T> {
+    fn from(value: T) -> Self {
+        Self::Legacy(value)
+    }
+}
+impl<T> std::ops::Deref for LookupScratch<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Self::Legacy(value) => value,
+            Self::Admitted(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5883,20 +6144,6 @@ fn package_stem(name: &str) -> String {
             }
         })
         .to_ascii_lowercase()
-}
-
-fn dedup_paths(paths: Vec<(PathBuf, ProjectPathEntry)>) -> Vec<(PathBuf, ProjectPathEntry)> {
-    let mut result: Vec<(PathBuf, ProjectPathEntry)> = Vec::new();
-    for (path, entry) in paths {
-        if !result
-            .iter()
-            .any(|(existing, _)| path_equivalent(existing, &path))
-        {
-            result.push((path, entry));
-        }
-    }
-    result.sort_by_key(|left| path_key(&left.0));
-    result
 }
 
 fn push_warning(report: &mut ResolutionReport, warning: String, maximum: usize) {
@@ -6595,6 +6842,396 @@ mod tests {
         );
     }
 
+    #[test]
+    fn candidate_scratch_paths_drop_refunds_only_temporary_paths_not_directory_report_source() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let source = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let before = budget.snapshot();
+        let paths = call
+            .paths_for_names(
+                dir.path(),
+                &entry,
+                &["Other.pas".into()],
+                &listing,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(budget.snapshot().retained_bytes > before.retained_bytes);
+        let spent = budget.snapshot();
+        drop(paths);
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            before.retained_bytes,
+            "temporary candidate paths must not remain billed to StoreCache"
+        );
+        assert_eq!(budget.snapshot().work, spent.work);
+        assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+        assert!(matches!(source.result(), Resolution::Found(_)));
+        assert!(!source.reports().observations().is_empty());
+        assert!(!listing.files.is_empty());
+    }
+
+    #[test]
+    fn candidate_scratch_group_borrows_original_paths_and_keeps_source_after_drop() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let paths = call
+            .paths_for_names(
+                dir.path(),
+                &entry,
+                &["Other.pas".into()],
+                &listing,
+                &NoCancellation,
+            )
+            .unwrap();
+        let original = paths.as_ptr();
+        let group = CandidateGroup {
+            paths,
+            legacy_route: None,
+        };
+        let result = call
+            .resolve_candidate_group(&group, "Other", "Other", &NoCancellation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            group.paths.as_ptr(),
+            original,
+            "candidate iteration keeps the original owning group; source loading canonicalizes its own path independently"
+        );
+        let spent = budget.snapshot();
+        drop(group);
+        assert!(budget.snapshot().retained_bytes < spent.retained_bytes);
+        assert_eq!(budget.snapshot().work, spent.work);
+        assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+        assert!(
+            matches!(&result,Resolution::Found(unit) if unit.declared_name=="Other" && unit.source.compile_time_backing.is_some() && !unit.source.analysis_bytes().is_empty())
+        );
+        assert!(!listing.files.is_empty());
+        assert!(!call.report.observations.is_empty());
+    }
+
+    #[test]
+    fn candidate_scratch_missing_overlay_dedup_and_case_variants_keep_real_capacity_owner() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        fs::write(dir.path().join("OTHER.pas"), "unit Other;").unwrap();
+        let overlay = dir.path().join("Other.pas");
+        resolver
+            .store
+            .inner
+            .insert_overlay(&overlay, 1, Arc::<[u8]>::from(&b"unit Other;"[..]));
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let paths;
+        {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let listing = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            let before = budget.snapshot();
+            let missing = call
+                .paths_for_names(
+                    dir.path(),
+                    &entry,
+                    &["Never.pas".into()],
+                    &listing,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(missing.is_empty());
+            assert!(
+                missing.capacity() >= listing.files.len(),
+                "empty result still owns allocated receiving capacity until drop"
+            );
+            drop(missing);
+            assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+            paths = call
+                .paths_for_names(
+                    dir.path(),
+                    &entry,
+                    &["Other.pas".into()],
+                    &listing,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert_eq!(
+                paths.iter().filter(|(p, _)| p == &overlay).count(),
+                1,
+                "disk+overlay identity is deduplicated without cloning the overlay buffer"
+            );
+            #[cfg(not(windows))]
+            if !path_identity::is_case_insensitive(dir.path()) {
+                assert_eq!(
+                    paths.len(),
+                    2,
+                    "case-sensitive filesystem keeps distinct case variants"
+                );
+            }
+            assert!(paths.iter().all(|(_, e)| e.provenance == entry.provenance));
+        }
+        drop(resolver);
+        drop(budget);
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > baseline);
+        assert!(!paths.is_empty());
+        drop(paths);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, live.work);
+        assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn candidate_scratch_name_tiers_preserve_order_and_refund_independently() {
+        use crate::compile_time::CompileTimeLimits;
+        let (_dir, _, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let call = resolver.store_call(&mut budget).unwrap();
+        let namespaces = vec![" First. ".to_string(), "Second".to_string()];
+        let before = budget.snapshot();
+        let tiers = call
+            .filename_tiers_scratch("Other", &namespaces, &NoCancellation)
+            .unwrap();
+        assert_eq!(
+            &*tiers,
+            &vec![
+                vec!["Other.pas".to_string()],
+                vec!["First.Other.pas".to_string()],
+                vec!["Second.Other.pas".to_string()]
+            ]
+        );
+        let spent = budget.snapshot();
+        drop(tiers);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert_eq!(budget.snapshot().work, spent.work);
+        assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+        let tiers = call
+            .filename_tiers_scratch("First.Other", &namespaces, &NoCancellation)
+            .unwrap();
+        assert_eq!(
+            &*tiers,
+            &vec![vec!["First.Other.pas".to_string(), "Other.pas".to_string()]]
+        );
+        drop(tiers);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+    }
+
+    #[test]
+    fn candidate_scratch_actual_alias_namespace_and_ambiguous_callbacks_keep_behavior() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        resolver
+            .context
+            .unit_aliases
+            .insert("Alias".into(), "Other".into());
+        resolver.context.unit_namespaces = vec!["Space".into()];
+        fs::write(
+            dir.path().join("Space.Named.pas"),
+            "unit Space.Named; interface type T=Byte; implementation end.",
+        )
+        .unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        for name in ["Alias", "Named"] {
+            let out = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: name,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(
+                matches!(out.result(), Resolution::Found(_)),
+                "actual alias/namespace lookup {name}"
+            );
+            assert!(!out.reports().observations().is_empty());
+            let before = budget.snapshot();
+            drop(out);
+            assert_eq!(budget.snapshot().work, before.work);
+            assert_eq!(budget.snapshot().byte_work, before.byte_work);
+        }
+        if !path_identity::is_case_insensitive(dir.path()) {
+            fs::write(
+                dir.path().join("OTHER.pas"),
+                "unit Other; interface implementation end.",
+            )
+            .unwrap();
+            let out = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: "Alias",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(
+                matches!(out.result(),Resolution::Ambiguous { candidates } if candidates.len()==2)
+            );
+            assert!(
+                out.reports()
+                    .warnings()
+                    .iter()
+                    .any(|w| w.contains("ambiguous unit"))
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_scratch_precopy_refusal_partial_cancel_error_and_unwind_refund_temporary_storage()
+    {
+        use crate::compile_time::CompileTimeLimits;
+        for failure in [
+            DirectoryFailure::Error,
+            DirectoryFailure::Cancel,
+            DirectoryFailure::Panic,
+            DirectoryFailure::Foreign,
+        ] {
+            let (dir, _, mut resolver) = directory_probe_resolver();
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let listing = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            call.store.overlay_failure = failure;
+            let before = budget.snapshot();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                call.paths_for_names(
+                    dir.path(),
+                    &entry,
+                    &["Other.pas".into()],
+                    &listing,
+                    &NoCancellation,
+                )
+            }));
+            if matches!(failure, DirectoryFailure::Panic) {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+            assert!(budget.snapshot().work >= before.work);
+            assert!(budget.snapshot().byte_work >= before.byte_work);
+            assert!(!listing.files.is_empty());
+        }
+        struct Poll {
+            count: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.count.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut cancellations = 0;
+        let mut complete = false;
+        for stop in 0..100 {
+            let (dir, _, mut resolver) = directory_probe_resolver();
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let listing = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            let before = budget.snapshot();
+            let poll = Poll {
+                count: 0.into(),
+                stop,
+            };
+            match call.paths_for_names(dir.path(), &entry, &["Other.pas".into()], &listing, &poll) {
+                Err(ResolverError::Cancelled) => {
+                    cancellations += 1;
+                }
+                Ok(paths) => {
+                    assert_eq!(paths.len(), 1);
+                    drop(paths);
+                    complete = true;
+                }
+                Err(other) => panic!("unexpected candidate error {other:?}"),
+            }
+            assert_eq!(
+                budget.snapshot().retained_bytes,
+                before.retained_bytes,
+                "partial copies refund at poll {stop}"
+            );
+            assert!(budget.snapshot().work >= before.work);
+            assert!(budget.snapshot().byte_work >= before.byte_work);
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        assert!(cancellations > 5);
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let listing;
+        {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            listing = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+        }
+        let before = budget.snapshot();
+        budget
+            .constrain_retained(before.retained_bytes + 1024)
+            .unwrap();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let original = listing.files.as_ptr();
+        assert!(matches!(
+            call.paths_for_names(
+                dir.path(),
+                &entry,
+                &["Other.pas".into()],
+                &listing,
+                &NoCancellation
+            ),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(listing.files.as_ptr(), original);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert!(
+            call.store.overlay_calls.get() > 0,
+            "refusal still precedes candidate copying/receiving allocation after the admitted overlay read"
+        );
+    }
+
     fn physical_directory_backing_invoice(listing: &DirectoryListing, directory: &Path) -> usize {
         let count = listing.files.len() + listing.directories.len();
         std::mem::size_of::<AdmittedOwned<DirectoryListing>>()
@@ -6616,6 +7253,8 @@ mod tests {
         failure: DirectoryFailure,
         calls: usize,
         files: usize,
+        overlay_failure: DirectoryFailure,
+        overlay_calls: std::cell::Cell<usize>,
     }
     impl SourceStore for DirectoryProbeStore {
         fn list_directory_admitted(
@@ -6653,7 +7292,23 @@ mod tests {
             b: &mut CompileTimeBudget<'_>,
             c: &dyn CancellationToken,
         ) -> Result<AdmittedOwned<Vec<PathBuf>>, SourceStoreError> {
-            self.inner.overlay_candidates_admitted(r, n, b, c)
+            self.overlay_calls.set(self.overlay_calls.get() + 1);
+            let paths = self.inner.overlay_candidates_admitted(r, n, b, c)?;
+            match self.overlay_failure {
+                DirectoryFailure::None => Ok(paths),
+                DirectoryFailure::Error => Err(SourceStoreError::AdmissionUnavailable),
+                DirectoryFailure::Cancel => Err(SourceStoreError::Cancelled),
+                DirectoryFailure::Panic => panic!("actual overlay scratch unwind after build"),
+                DirectoryFailure::Foreign => {
+                    drop(paths);
+                    let mut other = CompileTimeBudget::new(
+                        crate::compile_time::CompileTimeLimits::default(),
+                        &NoCancellation,
+                    );
+                    self.inner
+                        .overlay_candidates_admitted(r, n, &mut other, &NoCancellation)
+                }
+            }
         }
         fn load_admitted(
             &mut self,
@@ -6695,6 +7350,8 @@ mod tests {
                 failure: DirectoryFailure::None,
                 calls: 0,
                 files: 0,
+                overlay_failure: DirectoryFailure::None,
+                overlay_calls: 0.into(),
             },
             Default::default(),
         );

@@ -706,6 +706,37 @@ fn successful_and_failed_include_warnings_are_transported() {
 }
 
 #[test]
+fn byte_work_occurrences_have_fixed_shared_usage_bounds() {
+    let comment = format!("{{{}}}", "x".repeat(2048));
+    for count in [1, 3] {
+        let source = format!(
+            "unit T; interface {} implementation end.",
+            "{$I body.inc}".repeat(count)
+        );
+        let mut fixture = Fixture::new(&source, context(LayoutPlatform::Win32));
+        fixture.include("body.inc", &comment);
+        let output = fixture.analyze().unwrap();
+        assert!(output.root.complete);
+        assert_eq!(output.occurrences.len(), count + 1);
+        assert_eq!(output.includes.len(), count);
+        assert_eq!(fixture.read_names(), vec!["body.inc"; count]);
+        // R16's successful default-budget audit measured 15,726 / 40,906.
+        // Fixed bounds catch significant extra work or accidentally free child
+        // processing; they never determine the configured refusal budget.
+        let bounds = match count {
+            1 => 14 * 1024..=16 * 1024,
+            3 => 36 * 1024..=44 * 1024,
+            _ => unreachable!(),
+        };
+        let usage = output.budget.budget_snapshot();
+        assert!(
+            bounds.contains(&usage.byte_work),
+            "occurrences={count}: {usage:?}"
+        );
+    }
+}
+
+#[test]
 fn nested_occurrences_share_definition_and_byte_work_limits() {
     let mut f = Fixture::new(
         "unit T; interface {$I types.inc}{$I types.inc} implementation end.",
@@ -729,21 +760,60 @@ fn nested_occurrences_share_definition_and_byte_work_limits() {
         context(LayoutPlatform::Win32),
     );
     one.include("body.inc", &comment);
-    one.limits.max_byte_work = 12000;
-    assert!(one.analyze().unwrap().root.complete);
+    // R16: 12,000 was an estimate before honest continuation recopy invoices.
+    // Audit: one=15,726, three=40,906 under default limits, publication=0.
+    // This fixed test-only budget keeps one complete and repeated work bounded;
+    // it is not computed from current usage and changes no production default.
+    const OCCURRENCE_BYTE_WORK_LIMIT: usize = 16 * 1024;
+    one.limits.max_byte_work = OCCURRENCE_BYTE_WORK_LIMIT;
+    let single = one.analyze().unwrap();
+    assert!(single.root.complete);
+    assert!((14 * 1024..=16 * 1024).contains(&single.budget.budget_snapshot().byte_work));
+    assert_eq!(one.read_names(), vec!["body.inc"]);
     let mut many = Fixture::new(
         "unit T; interface {$I body.inc}{$I body.inc}{$I body.inc} implementation end.",
         context(LayoutPlatform::Win32),
     );
     many.include("body.inc", &comment);
-    many.limits.max_byte_work = 12000;
+    many.limits.max_byte_work = OCCURRENCE_BYTE_WORK_LIMIT;
+    let result = many.analyze();
     assert!(matches!(
-        many.analyze(),
+        &result,
         Err(pascal_core::ResolverError::LimitExceeded {
             limit: "max_byte_work",
             ..
         })
     ));
+    let Err(pascal_core::ResolverError::LimitExceeded {
+        observed, maximum, ..
+    }) = result
+    else {
+        unreachable!()
+    };
+    assert_eq!(maximum, OCCURRENCE_BYTE_WORK_LIMIT);
+    assert!(
+        (16 * 1024 + 1..=20 * 1024).contains(&observed),
+        "bounded overshoot: {observed}"
+    );
+    // Both children share the root counter. Exhaustion during the second child
+    // must not authorize the third lookup, even though its source is available.
+    assert_eq!(many.read_names(), vec!["body.inc", "body.inc"]);
+    let first_two = many
+        .root
+        .decoded_text
+        .as_deref()
+        .unwrap()
+        .match_indices("{$I body.inc}")
+        .take(2)
+        .map(|(start, text)| start..start + text.len())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        many.requests
+            .iter()
+            .map(|(_, range, _)| range.clone())
+            .collect::<Vec<_>>(),
+        first_two
+    );
 }
 
 #[test]

@@ -4923,38 +4923,7 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<LoadedSource, SourceStoreError> {
         self.check_cancel(cancel)
             .map_err(|_| SourceStoreError::Cancelled)?;
-        // Canonical path and local entry scratch only. Persistent candidate /
-        // revision observation payload and slots now have report receipts.
-        let mut provenance = 0usize;
-        entry
-            .visit_recovery_payload(&mut |n| {
-                provenance = provenance.saturating_add(n);
-                Ok(())
-            })
-            .expect("infallible local entry bound");
-        let metadata = path
-            .as_os_str()
-            .len()
-            .saturating_mul(4)
-            .saturating_add(provenance.saturating_sub(entry.path.as_os_str().len()));
-        self.admit_lookup_storage(1, metadata, metadata, cancel)
-            .map_err(|error| match error {
-                ResolverError::LimitExceeded {
-                    limit,
-                    observed,
-                    maximum,
-                } => SourceStoreError::RootLimit {
-                    limit,
-                    observed,
-                    maximum,
-                },
-                _ => SourceStoreError::Cancelled,
-            })?;
-        let path = canonical_path(path);
-        let entry = ProjectPathEntry {
-            path: path.clone(),
-            provenance: entry.provenance.clone(),
-        };
+        let (path, entry) = self.source_request_scratch(path, entry, cancel)?;
         let stamp = if self.context.read_policy.allows_location(&entry) {
             path_stamp_result(&path).ok().flatten()
         } else {
@@ -5033,25 +5002,66 @@ impl<S: SourceStore> UnitResolver<S> {
         } else {
             self.loaded.insert(loaded.id.clone(), loaded.clone());
         }
-        let mut observation_bytes = loaded.id.as_str().len() + loaded.path.as_os_str().len();
+        let mut sizing_budget = self.store_budget(cancel);
+        if let Some(budget) = sizing_budget.as_mut() {
+            budget
+                .charge(2, 0, 0)
+                .map_err(|r| store_admission_error(r, budget))?;
+        }
+        let mut observation_bytes = loaded
+            .id
+            .as_str()
+            .len()
+            .checked_add(loaded.path.as_os_str().len())
+            .ok_or(SourceStoreError::AdmissionUnavailable)?;
         if let SourceRevision::Disk {
             read_policy,
             path_entry,
             ..
         } = &loaded.revision
         {
+            let mut failure = None;
+            let mut sizing_visits = 0usize;
             read_policy
-                .visit_owned_clone_payload(&mut |n| {
-                    observation_bytes += n;
+                .visit_owned_clone_payload_with_preflight(&mut |work, bytes| {
+                    if let Some(bytes) = bytes {
+                        // Each visit reads only O(1) lengths. Poll at bounded
+                        // eight-visit intervals, in addition to every admitted
+                        // group preflight, rather than one poll per scalar size.
+                        if sizing_visits % 8 == 0 && cancel.is_cancelled() {
+                            failure = Some(SourceStoreError::Cancelled);
+                            return Err("revision sizing cancelled".into());
+                        }
+                        sizing_visits = (sizing_visits + 1) % 8;
+                        observation_bytes = observation_bytes
+                            .checked_add(bytes)
+                            .ok_or_else(|| "revision sizing overflow".to_string())?;
+                    } else if let Some(budget) = sizing_budget.as_mut() {
+                        if let Err(reason) = budget.charge(work, 0, 0) {
+                            failure = Some(store_admission_error(reason, budget));
+                            return Err("revision sizing refused".into());
+                        }
+                    }
                     Ok(())
                 })
-                .expect("infallible revision bound");
-            path_entry
-                .visit_recovery_payload(&mut |n| {
-                    observation_bytes += n;
-                    Ok(())
+                .map_err(|_| failure.unwrap_or(SourceStoreError::AdmissionUnavailable))?;
+            if let Some(budget) = sizing_budget.as_mut() {
+                budget
+                    .charge(2, 0, 0)
+                    .map_err(|r| store_admission_error(r, budget))?;
+            }
+            if cancel.is_cancelled() {
+                return Err(SourceStoreError::Cancelled);
+            }
+            observation_bytes = observation_bytes
+                .checked_add(path_entry.path.as_os_str().len())
+                .and_then(|n| {
+                    n.checked_add(match &path_entry.provenance {
+                        ProjectPathProvenance::Mapped { root } => root.as_os_str().len(),
+                        _ => 0,
+                    })
                 })
-                .expect("infallible path entry bound");
+                .ok_or(SourceStoreError::AdmissionUnavailable)?;
         }
         self.record_observation_build(observation_bytes, cancel, || {
             ResolutionObservation::Payload {
@@ -5062,6 +5072,29 @@ impl<S: SourceStore> UnitResolver<S> {
         })
         .map_err(resolver_report_store_error)?;
         Ok(loaded)
+    }
+
+    fn source_request_scratch(
+        &self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(LookupScratch<PathBuf>, LookupScratch<ProjectPathEntry>), SourceStoreError> {
+        if let Some(mut budget) = self.store_budget(cancel) {
+            let path = source_request_path(path, &mut budget, cancel)?;
+            let local = source_request_entry(&path, entry, &mut budget, cancel)?;
+            Ok((
+                LookupScratch::Admitted(path),
+                LookupScratch::Admitted(local),
+            ))
+        } else {
+            let path = canonical_path(path);
+            let local = ProjectPathEntry {
+                path: path.clone(),
+                provenance: entry.provenance.clone(),
+            };
+            Ok((LookupScratch::Legacy(path), LookupScratch::Legacy(local)))
+        }
     }
 
     fn record_candidate(
@@ -7916,6 +7949,82 @@ fn push_observation(
     observations.push(observation);
 }
 
+fn source_request_path(
+    path: &Path,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<AdmittedOwned<PathBuf>, SourceStoreError> {
+    // Production callers already canonicalize their query/group paths. Relative
+    // cwd/query construction belongs to those caller boundaries, not this local
+    // request. Keep the plain legacy constructor compatible below.
+    let bytes = path.as_os_str().len();
+    let work = bytes
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    budget.admit_fallible(work, bytes, bytes, store_admission_error, || {
+        if cancel.is_cancelled() {
+            return Err(SourceStoreError::Cancelled);
+        }
+        // Prefix/root validation can traverse a platform-specific prefix; do
+        // it only after the byte-bound construction work has been admitted.
+        if !path.is_absolute() && !path.has_root() {
+            return Err(SourceStoreError::AdmissionUnavailable);
+        }
+        let mut normalized = PathBuf::with_capacity(bytes);
+        for component in path.components() {
+            if cancel.is_cancelled() {
+                return Err(SourceStoreError::Cancelled);
+            }
+            match component {
+                Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                Component::Normal(value) => normalized.push(value),
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(SourceStoreError::Cancelled);
+        }
+        Ok(normalized)
+    })
+}
+
+fn source_request_entry(
+    path: &Path,
+    entry: &ProjectPathEntry,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<AdmittedOwned<ProjectPathEntry>, SourceStoreError> {
+    // Enum payload shape is fixed: at most one mapped-root PathBuf. These are
+    // O(1) byte bounds, not a hidden provenance traversal before admission.
+    let provenance = match &entry.provenance {
+        ProjectPathProvenance::Mapped { root } => root.as_os_str().len(),
+        _ => 0,
+    };
+    let bytes = path
+        .as_os_str()
+        .len()
+        .checked_add(provenance)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    budget.admit_fallible(1, bytes, bytes, store_admission_error, || {
+        if cancel.is_cancelled() {
+            return Err(SourceStoreError::Cancelled);
+        }
+        let local = ProjectPathEntry {
+            path: path.to_path_buf(),
+            provenance: entry.provenance.clone(),
+        };
+        if cancel.is_cancelled() {
+            return Err(SourceStoreError::Cancelled);
+        }
+        Ok(local)
+    })
+}
+
 fn canonical_path(path: &Path) -> PathBuf {
     // A rooted Windows path without a drive (`\workspace`) keeps its form, so
     // it still matches the project paths it was compared with.
@@ -10312,6 +10421,431 @@ mod tests {
             assert_eq!(observer.budget_snapshot().work, spent.work);
             assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
         }
+    }
+
+    #[test]
+    fn source_load_scratch_missing_request_refunds_before_live_cache_and_reports_drop() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("missing.pas");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let before = budget.snapshot();
+        let error = call
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap_err();
+        assert!(matches!(error, SourceStoreError::NotFound { .. }));
+        drop(error);
+        assert!(!call.report.observations.is_empty());
+        // Actual report buffers and original receipts die together. Keep the
+        // actual cache root alive to detect request scratch misbilled to it.
+        call.report = ResolutionReport {
+            observations: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+        };
+        call.report_owners = ReportOwners::default();
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            before.retained_bytes,
+            "dead canonical/local-entry request scratch must not remain on live source cache"
+        );
+        assert!(budget.snapshot().work > before.work);
+        assert!(budget.snapshot().byte_work > before.byte_work);
+    }
+
+    #[test]
+    fn source_load_scratch_actual_leaf_cancel_unwind_error_and_foreign_owner_preserve_prior_source()
+    {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stopped = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stopped && self.panic {
+                    panic!("actual source request/read/report unwind")
+                }
+                stopped
+            }
+        }
+        for panic in [false, true] {
+            let mut completed = false;
+            let mut refused = 0;
+            for stop in 0..700 {
+                let (dir, root, mut resolver) = physical_report_resolver();
+                let query = dir.path().join("absent/../Other.pas");
+                let entry = resolver
+                    .context
+                    .path_entry_for(&dir.path().join("Other.pas"))
+                    .unwrap();
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                let prior = resolver
+                    .include_capability(
+                        IncludeResolveRequest {
+                            including_path: &root,
+                            byte_range: 0..0,
+                            requested_name: "value.inc",
+                            legacy_route: None,
+                        },
+                        &mut budget,
+                        &NoCancellation,
+                    )
+                    .unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut call = resolver.store_call(&mut budget).unwrap();
+                    call.load_candidate_with_limit(
+                        &query,
+                        &entry,
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &Poll {
+                            calls: 0.into(),
+                            stop,
+                            panic,
+                        },
+                    )
+                }));
+                match result {
+                    Err(_) => {
+                        assert!(panic);
+                        refused += 1;
+                    }
+                    Ok(Err(SourceStoreError::Cancelled)) => {
+                        assert!(!panic);
+                        refused += 1;
+                    }
+                    Ok(Ok(source)) => {
+                        assert!(source.path.ends_with("Other.pas"));
+                        assert!(source.compile_time_backing.is_some());
+                        drop(source);
+                        completed = true;
+                    }
+                    Ok(Err(error)) => panic!("unexpected source error at {stop}: {error:?}"),
+                }
+                let spent = budget.snapshot();
+                drop(resolver);
+                drop(budget);
+                assert!(
+                    matches!(prior.result(),Resolution::Found(source) if source.bytes.as_ref()==b"{physical include}")
+                );
+                assert!(!prior.reports().observations().is_empty());
+                drop(prior);
+                assert_eq!(
+                    observer.budget_snapshot().retained_bytes,
+                    baseline,
+                    "scratch/cache/report/source drop at {stop}, panic={panic}"
+                );
+                assert_eq!(observer.budget_snapshot().work, spent.work);
+                assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+                if completed {
+                    break;
+                }
+            }
+            assert!(completed);
+            assert!(refused > 20);
+        }
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let bad = dir.path().join("Bad.pas");
+        fs::create_dir(&bad).unwrap();
+        let entry = resolver.context.path_entry_for(&bad).unwrap();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        assert!(matches!(
+            call.load_candidate_with_limit(
+                &bad,
+                &entry,
+                None,
+                SourceKind::Unit,
+                4096,
+                &NoCancellation
+            ),
+            Err(SourceStoreError::Unauthorized { .. })
+        ));
+        let good = dir.path().join("Other.pas");
+        assert!(matches!(
+            call.load_candidate_with_limit(
+                &good,
+                &entry,
+                None,
+                SourceKind::Unit,
+                1,
+                &NoCancellation
+            ),
+            Err(SourceStoreError::TooLarge { .. })
+        ));
+        let (path, local) = call
+            .source_request_scratch(&good, &entry, &NoCancellation)
+            .unwrap();
+        let LookupScratch::Admitted(path) = path else {
+            panic!("actual original path owner")
+        };
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let before = foreign.snapshot();
+        assert!(path.map_value(&mut foreign, |path| path).is_err());
+        assert_eq!(foreign.snapshot(), before);
+        assert_eq!(local.path, good);
+        assert!(matches!(prior.result(), Resolution::Found(_)));
+        assert!(!call.report.observations.is_empty());
+    }
+
+    #[test]
+    fn source_load_scratch_original_path_and_mapped_entry_drop_independently() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let query = dir.path().join("absent/../value.inc");
+        let mapped = ProjectPathEntry {
+            path: query.clone(),
+            provenance: ProjectPathProvenance::Mapped {
+                root: dir.path().into(),
+            },
+        };
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let before = budget.snapshot();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let (path, entry) = call
+            .source_request_scratch(&query, &mapped, &NoCancellation)
+            .unwrap();
+        let LookupScratch::Admitted(path) = path else {
+            panic!("actual typed path constructor")
+        };
+        let LookupScratch::Admitted(entry) = entry else {
+            panic!("actual typed local entry constructor")
+        };
+        assert_eq!(&*path, &canonical_path(&query));
+        assert_eq!(entry.path, *path);
+        assert_eq!(entry.provenance, mapped.provenance);
+        assert_eq!(path.capacity(), query.as_os_str().len());
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            before.retained_bytes
+                + path.capacity()
+                + std::mem::size_of::<AdmittedOwned<PathBuf>>()
+                + entry.path.capacity()
+                + dir.path().as_os_str().len()
+                + std::mem::size_of::<AdmittedOwned<ProjectPathEntry>>()
+        );
+        let entry_pointer = entry.path.as_os_str().as_encoded_bytes().as_ptr();
+        drop(path);
+        assert_eq!(
+            entry.path.as_os_str().as_encoded_bytes().as_ptr(),
+            entry_pointer
+        );
+        drop(entry);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        let loaded = call
+            .load_candidate_with_limit(
+                &query,
+                &mapped,
+                None,
+                SourceKind::Include,
+                4096,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(&loaded.revision,SourceRevision::Disk {path_entry,..} if path_entry.provenance==mapped.provenance)
+        );
+        assert!(call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Candidate {path,entry:Some(e),..} if path==&dir.path().join("value.inc") && e.provenance==mapped.provenance)));
+        assert!(
+            matches!(prior.result(),Resolution::Found(source) if source.path==dir.path().join("value.inc"))
+        );
+    }
+
+    #[test]
+    fn source_load_scratch_success_case_legacy_route_cache_report_and_backing_are_independent() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let file = dir.path().join("MiXeD.inc");
+        fs::write(&file, "{case source payload}").unwrap();
+        let query = dir.path().join("absent/../MiXeD.inc");
+        let entry = ProjectPathEntry::legacy(query.clone());
+        let route = LegacyRoute {
+            source_path: root,
+            sibling_directory: dir.path().into(),
+        };
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let loaded = {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let loaded = call
+                .load_candidate_with_limit(
+                    &query,
+                    &entry,
+                    Some(&route),
+                    SourceKind::Include,
+                    4096,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert_eq!(loaded.path, file);
+            assert_eq!(loaded.bytes.as_ref(), b"{case source payload}");
+            let SourceRevision::Disk { path_entry, .. } = &loaded.revision else {
+                panic!("physical source revision")
+            };
+            assert_eq!(path_entry.path, file);
+            assert_eq!(path_entry.provenance, ProjectPathProvenance::LegacyNative);
+            assert!(call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {path,source_id,..} if path==&file && source_id==&loaded.id)));
+            let root = call.compile_time_store.as_ref().unwrap();
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                cache.loaded.get(&loaded.id).unwrap().bytes.as_ptr(),
+                loaded.bytes.as_ptr()
+            );
+            drop(cache);
+            loaded
+        };
+        let pointer = loaded.bytes.as_ptr();
+        let backing = loaded.compile_time_backing.as_ref().unwrap().clone();
+        let report = resolver.finish_admitted(&mut budget).unwrap();
+        drop(budget);
+        assert_eq!(loaded.bytes.as_ptr(), pointer);
+        assert!(
+            report
+                .report()
+                .observations
+                .iter()
+                .any(|o| matches!(o,ResolutionObservation::Payload {path,..} if path==&file))
+        );
+        drop(report);
+        drop(loaded);
+        assert_eq!(backing.bytes.as_ptr(), pointer);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        let spent = observer.budget_snapshot();
+        drop(backing);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[test]
+    fn source_load_scratch_precopy_work_retained_refusal_and_policy_preflight_do_not_walk() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Probe(std::cell::Cell<usize>);
+        impl CancellationToken for Probe {
+            fn is_cancelled(&self) -> bool {
+                self.0.set(self.0.get() + 1);
+                false
+            }
+        }
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let query = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&query).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let probe = Probe(0.into());
+        let call = resolver.store_call(&mut budget).unwrap();
+        assert!(matches!(
+            call.source_request_scratch(&query, &entry, &probe),
+            Err(SourceStoreError::RootLimit { .. })
+        ));
+        assert_eq!(
+            probe.0.get(),
+            1,
+            "admission cancellation poll occurs, but no constructor body poll/copy"
+        );
+        assert_eq!(budget.snapshot(), before);
+        drop(call);
+        probe.0.set(0);
+        let limits = CompileTimeLimits {
+            max_work: 0,
+            ..Default::default()
+        };
+        let mut empty = CompileTimeBudget::new(limits, &NoCancellation);
+        assert!(matches!(
+            source_request_path(&query, &mut empty, &probe),
+            Err(SourceStoreError::RootLimit { .. })
+        ));
+        assert_eq!(probe.0.get(), 0);
+        assert_eq!(empty.snapshot().work, 0);
+        let policy = &resolver.context.read_policy;
+        let mut payload_visits = 0;
+        let error = policy.visit_owned_clone_payload_with_preflight(&mut |work, bytes| {
+            if bytes.is_none() {
+                assert!(work > 0);
+                return Err("preflight refusal".into());
+            }
+            payload_visits += 1;
+            Ok(())
+        });
+        assert!(error.is_err());
+        assert_eq!(payload_visits, 0);
+        let mut plain = Vec::new();
+        policy
+            .visit_owned_clone_payload(&mut |bytes| {
+                plain.push(bytes);
+                Ok(())
+            })
+            .unwrap();
+        let mut bounded = Vec::new();
+        policy
+            .visit_owned_clone_payload_with_preflight(&mut |_, bytes| {
+                if let Some(bytes) = bytes {
+                    bounded.push(bytes);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            plain, bounded,
+            "read-only preflight bridge preserves exact old clone payload/provenance visitor"
+        );
+        assert!(matches!(prior.result(), Resolution::Found(_)));
     }
 
     #[test]

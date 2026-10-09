@@ -289,17 +289,24 @@ pub(crate) fn analyze_source_in_session(
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
-    let mut providers = ProviderSession::new(budget)?;
-    let analysis = analyze_source_with_providers(
-        root,
-        context,
-        resolver,
-        budget,
-        cancel,
-        &mut providers,
-        false,
-        OccurrenceId(0),
-    )?;
+    let metadata = crate::resolver::loaded_source_metadata_retained(root);
+    budget
+        .charge(1, metadata, metadata.saturating_mul(2))
+        .map_err(|r| resolver_error(r, budget))?;
+    let analysis = budget.admit_compilation(metadata.saturating_mul(2), |budget| {
+        let mut providers = ProviderSession::new(budget)?;
+        analyze_source_with_providers_inner(
+            root,
+            context,
+            resolver,
+            budget,
+            cancel,
+            &mut providers,
+            false,
+            OccurrenceId(0),
+            true,
+        )
+    })?;
     publish_analysis(&analysis, budget)
 }
 
@@ -459,7 +466,7 @@ fn analyze_source_with_providers(
     interface_only: bool,
     root_occurrence: OccurrenceId,
 ) -> Result<AdmittedOwned<SessionOutput>, ResolverError> {
-    budget.admit_compilation(|budget| {
+    budget.admit_compilation(0, |budget| {
         analyze_source_with_providers_inner(
             root,
             context,
@@ -469,6 +476,7 @@ fn analyze_source_with_providers(
             providers,
             interface_only,
             root_occurrence,
+            false,
         )
     })
 }
@@ -483,13 +491,16 @@ fn analyze_source_with_providers_inner(
     providers: &mut ProviderSession,
     interface_only: bool,
     root_occurrence: OccurrenceId,
+    metadata_admitted: bool,
 ) -> Result<SessionOutput, ResolverError> {
     let limits = budget.limits();
     let bytes = root.analysis_bytes();
     let metadata = crate::resolver::loaded_source_metadata_retained(root);
-    budget
-        .charge(1, metadata, metadata.saturating_mul(2))
-        .map_err(|r| resolver_error(r, budget))?;
+    if !metadata_admitted {
+        budget
+            .charge(1, metadata, metadata.saturating_mul(2))
+            .map_err(|r| resolver_error(r, budget))?;
+    }
     // Reserve root projection, lexer/output scratch and source identity copies
     // before the existing lexer's allocations. Its original directive/depth/
     // environment limits remain enforced by the shared interpreter.
@@ -1138,15 +1149,17 @@ impl ProviderEngine<'_, '_> {
                 .map_err(|r| resolver_error(r, self.budget))?;
                 self.providers.queries += 1;
                 let pending = &state.interfaces[index].pending;
-                let outcome = self.resolver.unit_capability(
-                    UnitResolveRequest {
-                        requested_name: &pending.identity.name,
-                        importer_path: &pending.importer_path,
-                        legacy_route: None,
-                    },
-                    self.budget,
-                    self.cancel,
-                )?;
+                let outcome = self.budget.external(|budget| {
+                    self.resolver.unit_capability(
+                        UnitResolveRequest {
+                            requested_name: &pending.identity.name,
+                            importer_path: &pending.importer_path,
+                            legacy_route: None,
+                        },
+                        budget,
+                        self.cancel,
+                    )
+                })?;
                 append_observations(self.observations, &outcome.observations, self.budget)?;
                 append_warnings(self.warnings, &outcome.warnings, self.budget)?;
                 state.interfaces[index].attempted = true;
@@ -1653,16 +1666,18 @@ impl RootSession<'_, '_> {
                 warnings: vec![],
             }
         } else if let Some(name) = name.as_deref() {
-            self.resolver.include(
-                IncludeResolveRequest {
-                    including_path,
-                    byte_range: anchor.range.clone(),
-                    requested_name: name,
-                    legacy_route: None,
-                },
-                &mut self.budget,
-                self.cancel,
-            )?
+            self.budget.external(|budget| {
+                self.resolver.include(
+                    IncludeResolveRequest {
+                        including_path,
+                        byte_range: anchor.range.clone(),
+                        requested_name: name,
+                        legacy_route: None,
+                    },
+                    budget,
+                    self.cancel,
+                )
+            })?
         } else {
             ResolutionOutcome {
                 result: Resolution::Unavailable {
@@ -2592,6 +2607,160 @@ fn argument_anchor(
 mod tests {
     use super::*;
     use crate::{NoCancellation, SourceId, SourceRevision};
+
+    #[test]
+    fn actual_declaration_mutation_survives_unwind_with_immediate_owner_credits() {
+        let text = "unit T; interface ";
+        let root = LoadedSource {
+            id: SourceId::new("T.pas"),
+            path: "T.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            compile_time_backing: None,
+        };
+        let context = ConditionalContext::default();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut graph = budget
+            .admit_compilation(0, |budget| {
+                let mut state = CompileTimeState::new(&context, &root, budget)
+                    .map_err(|r| resolver_error(r, budget))?;
+                state
+                    .feed(
+                        SourceFragment {
+                            source: &root.id,
+                            occurrence: OccurrenceId(0),
+                            physical_start: 0,
+                            text,
+                        },
+                        Truth::True,
+                        budget,
+                    )
+                    .map_err(|r| resolver_error(r, budget))?;
+                Ok(state)
+            })
+            .unwrap();
+        let before = observer.budget_snapshot();
+        let extra = "type Persisted = record X: Byte; end; type Pending = record Y:";
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph
+                .with_budget_mut(&mut budget, |state, budget| {
+                    state
+                        .feed(
+                            SourceFragment {
+                                source: &root.id,
+                                occurrence: OccurrenceId(0),
+                                physical_start: text.len(),
+                                text: extra,
+                            },
+                            Truth::True,
+                            budget,
+                        )
+                        .unwrap();
+                    panic!("after actual declaration and pending-parser mutation");
+                })
+                .unwrap();
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case("Persisted"))
+        );
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > before.retained_bytes);
+        assert!(live.work > before.work);
+        assert!(live.byte_work > before.byte_work);
+        // Work after the externally caught unwind must not be attributed to the
+        // old graph. A fresh real parser owner is independent of it.
+        let another = budget
+            .admit_compilation(0, |budget| {
+                CompileTimeState::new(&context, &root, budget)
+                    .map_err(|r| resolver_error(r, budget))
+            })
+            .unwrap();
+        drop(another);
+        assert_eq!(
+            observer.budget_snapshot().retained_bytes,
+            live.retained_bytes
+        );
+        drop(graph);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert!(dead.work >= live.work);
+        assert!(dead.byte_work >= live.byte_work);
+    }
+
+    #[test]
+    fn root_metadata_invoice_refunds_when_coordinator_control_admission_refuses() {
+        let text = "unit T; interface implementation end.";
+        let root = LoadedSource {
+            id: SourceId::new("T.pas"),
+            path: "T.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            compile_time_backing: None,
+        };
+        struct NoResources;
+        impl CompileTimeResolver for NoResources {
+            fn unit(
+                &mut self,
+                _: UnitResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                panic!("control refusal must precede callback");
+            }
+            fn include(
+                &mut self,
+                _: IncludeResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                panic!("control refusal must precede callback");
+            }
+        }
+        let metadata = crate::resolver::loaded_source_metadata_retained(&root);
+        // The original metadata fits exactly. No compilation control can fit.
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_retained_bytes: 2 * metadata,
+                ..Default::default()
+            },
+            &NoCancellation,
+        );
+        let result = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoResources,
+            &mut budget,
+            &NoCancellation,
+        );
+        assert!(matches!(
+            result,
+            Err(ResolverError::LimitExceeded {
+                limit: "max_retained_bytes",
+                ..
+            })
+        ));
+        assert_eq!(budget.snapshot().retained_bytes, 0);
+        assert!(budget.snapshot().work > 0);
+        assert_eq!(budget.snapshot().byte_work, metadata);
+    }
 
     #[test]
     fn typed_environment_snapshot_retains_partial_graph_maps_options_and_provenance() {

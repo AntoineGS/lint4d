@@ -221,13 +221,18 @@ impl CompileTimeResolver for Fixture {
         budget: &mut CompileTimeBudget<'_>,
         _: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
-        budget
-            .charge(
-                1,
-                request.requested_name.len(),
-                request.requested_name.len(),
-            )
-            .map_err(|_| ResolverError::InvalidRequest("fixture budget".into()))?;
+        let log_bytes = 2 * request.requested_name.len()
+            + request.including_path.as_os_str().len()
+            + std::mem::size_of::<String>()
+            + std::mem::size_of::<(std::path::PathBuf, std::ops::Range<usize>, String)>()
+            + std::mem::size_of::<AdmittedOwned<()>>();
+        let log = budget
+            .admit_owned(1, request.requested_name.len(), log_bytes, || ())
+            .map_err(|_| ResolverError::InvalidRequest("fixture include log admission".into()))?;
+        self.callback_logs.reserve_exact(1);
+        self.callback_logs.push(log);
+        self.reads.reserve_exact(1);
+        self.requests.reserve_exact(1);
         self.reads.push(request.requested_name.into());
         self.requests.push((
             request.including_path.into(),

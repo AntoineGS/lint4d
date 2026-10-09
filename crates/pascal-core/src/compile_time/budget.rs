@@ -55,7 +55,7 @@ pub struct CompileTimeBudget<'a> {
     definitions: usize,
     fields: usize,
     variants: usize,
-    manual_scope: Option<usize>,
+    construction: Option<Arc<Mutex<Retention>>>,
 }
 
 impl<'a> CompileTimeBudget<'a> {
@@ -81,7 +81,7 @@ impl<'a> CompileTimeBudget<'a> {
             definitions: 0,
             fields: 0,
             variants: 0,
-            manual_scope: None,
+            construction: None,
         }
     }
 
@@ -104,23 +104,30 @@ impl<'a> CompileTimeBudget<'a> {
             *current = next;
             Ok(())
         })?;
-        if let Some(scope) = &mut self.manual_scope {
-            *scope += retained;
+        if let Some(owner) = &self.construction {
+            let mut owner = owner.lock().unwrap_or_else(|e| e.into_inner());
+            owner.ledger.lock().reserved += retained;
+            owner.retained += retained;
         }
         Ok(())
     }
 
     /// Release live storage only. Neither operation count nor byte work refunds.
-    /// Releasing more than legacy storage clamps to zero rather than wrapping.
-    /// Receipt-owned storage and the live ledger cannot be refunded this way.
+    /// Within construction, retire only that selected owner's explicit storage
+    /// invoices, never its credit-cell control. Otherwise release only legacy
+    /// storage. Independent receipts and the root ledger control cannot be
+    /// refunded through this operation.
     pub fn release(&mut self, retained: usize) {
-        let retained = if let Some(scope) = &mut self.manual_scope {
-            let released = retained.min(*scope);
-            *scope -= released;
-            released
-        } else {
-            retained
-        };
+        if let Some(owner) = &self.construction {
+            let mut owner = owner.lock().unwrap_or_else(|e| e.into_inner());
+            let released = retained.min(owner.retained - owner.floor);
+            let mut state = owner.ledger.lock();
+            state.reserved -= released;
+            state.usage.retained_bytes -= released;
+            drop(state);
+            owner.retained -= released;
+            return;
+        }
         match &mut self.counters {
             Counters::Inline(current) => {
                 current.retained_bytes = current.retained_bytes.saturating_sub(retained);
@@ -143,8 +150,9 @@ impl<'a> CompileTimeBudget<'a> {
     /// Scratch marks exclude independently owned/cache/shared reservations.
     /// These are admission invoices, not differences of whole callback usage.
     pub(crate) fn manual_retained(&self) -> usize {
-        if let Some(scope) = self.manual_scope {
-            return scope;
+        if let Some(owner) = &self.construction {
+            let owner = owner.lock().unwrap_or_else(|e| e.into_inner());
+            return owner.retained - owner.floor;
         }
         match &self.counters {
             Counters::Inline(current) => current.retained_bytes,
@@ -155,37 +163,56 @@ impl<'a> CompileTimeBudget<'a> {
         }
     }
 
-    /// Compilation owns every ordinary retained admission issued in this scope.
-    /// Nested receipt-backed cache/graph/output owners are invoiced separately.
-    /// The invoice transfers only on success; on error all scoped locals have
-    /// already died before their invoice is released. No callback delta is used.
+    /// Establish construction ownership before calling a fallible builder.
+    /// Each successful ordinary admission is attached immediately; the selected
+    /// binding is restored on all exits. Named subowners and external callbacks
+    /// use their own bindings, not an interval of whole-ledger usage.
     pub(crate) fn admit_compilation<T>(
         &mut self,
+        preadmitted: usize,
         build: impl FnOnce(&mut Self) -> Result<T, crate::ResolverError>,
     ) -> Result<AdmittedOwned<T>, crate::ResolverError> {
-        let mut reservation = self
+        let mut initial = InitialInvoice {
+            budget: self,
+            bytes: preadmitted,
+        };
+        let reservation = initial
             .mint_retention(1, 0, size_of::<AdmittedOwned<T>>())
-            .map_err(|reason| super::resolver_error(reason, self))?;
-        let parent = self.manual_scope.replace(0);
-        let result = build(self);
-        let invoice = self.manual_scope.take().unwrap_or(0);
-        self.manual_scope = parent;
-        match result {
-            Ok(value) => {
-                reservation.absorb_manual(invoice);
-                Ok(AdmittedOwned { value, reservation })
-            }
-            Err(error) => {
-                self.release_invoice(invoice);
-                Err(error)
-            }
+            .map_err(|reason| super::resolver_error(reason, &initial))?;
+        let increments = initial
+            .construction_credit()
+            .map_err(|r| super::resolver_error(r, &initial))?;
+        if preadmitted != 0 {
+            // A named root metadata admission precedes ledger/coordinator
+            // controls. Move that exact invoice out of the inline legacy pool.
+            let mut owner = increments.lock().unwrap_or_else(|e| e.into_inner());
+            owner.ledger.lock().reserved += preadmitted;
+            owner.retained += preadmitted;
         }
+        initial.bytes = 0;
+        let value = {
+            let mut binding = ConstructionBinding::new(&mut initial, Some(increments.clone()));
+            build(&mut binding)?
+        };
+        Ok(AdmittedOwned {
+            value,
+            reservation,
+            increments: Some(increments),
+        })
     }
 
-    fn release_invoice(&mut self, invoice: usize) {
-        let parent = self.manual_scope.take();
-        self.release(invoice);
-        self.manual_scope = parent;
+    fn construction_credit(&mut self) -> Result<Arc<Mutex<Retention>>, IncompleteReason> {
+        let control = size_of::<Mutex<Retention>>() + arc_overhead::<Mutex<Retention>>()?;
+        let mut reservation = self.mint_retention(0, 0, control)?;
+        reservation.floor = control;
+        Ok(Arc::new(Mutex::new(reservation)))
+    }
+
+    /// External caches/returns must mint their own receipts, never inherit a
+    /// compiler construction binding. Restore that binding on unwind too.
+    pub(crate) fn external<R>(&mut self, call: impl FnOnce(&mut Self) -> R) -> R {
+        let mut binding = ConstructionBinding::new(self, None);
+        call(&mut binding)
     }
 
     /// Admit an owned carrier and its backing payload before calling `build`.
@@ -207,7 +234,11 @@ impl<'a> CompileTimeBudget<'a> {
             .ok_or(IncompleteReason::MalformedSource)?;
         let reservation = self.mint_retention(work, byte_work, retained)?;
         let value = build();
-        Ok(AdmittedOwned { value, reservation })
+        Ok(AdmittedOwned {
+            value,
+            reservation,
+            increments: None,
+        })
     }
 
     /// Store construction may fail after admission. The constructor's locals
@@ -227,7 +258,11 @@ impl<'a> CompileTimeBudget<'a> {
             .and_then(|n| self.mint_retention(work, byte_work, n))
             .map_err(|r| refusal(r, self))?;
         let value = build()?;
-        Ok(AdmittedOwned { value, reservation })
+        Ok(AdmittedOwned {
+            value,
+            reservation,
+            increments: None,
+        })
     }
 
     fn mint_retention(
@@ -242,16 +277,15 @@ impl<'a> CompileTimeBudget<'a> {
                 .ok_or(IncompleteReason::MalformedSource)?,
             Counters::Shared(_) => 0,
         };
-        self.charge(
+        let mut binding = ConstructionBinding::new(self, None);
+        binding.charge(
             work,
             byte_work,
             retained
                 .checked_add(control_bytes)
                 .ok_or(IncompleteReason::MalformedSource)?,
         )?;
-        if let Some(scope) = &mut self.manual_scope {
-            *scope -= retained + control_bytes;
-        }
+        drop(binding);
         if let Counters::Inline(usage) = &self.counters {
             // The ledger/control allocation occurs only AFTER its full credit
             // is admitted. Its storage lasts while the root or any receipt does.
@@ -270,6 +304,7 @@ impl<'a> CompileTimeBudget<'a> {
         Ok(Retention {
             ledger: ledger.clone(),
             retained,
+            floor: 0,
         })
     }
 
@@ -388,6 +423,7 @@ impl Ledger {
 struct Retention {
     ledger: Arc<Ledger>,
     retained: usize,
+    floor: usize,
 }
 
 impl Drop for Retention {
@@ -400,10 +436,55 @@ impl Drop for Retention {
     }
 }
 
-impl Retention {
-    fn absorb_manual(&mut self, invoice: usize) {
-        self.ledger.lock().reserved += invoice;
-        self.retained += invoice;
+struct ConstructionBinding<'b, 'a> {
+    budget: &'b mut CompileTimeBudget<'a>,
+    previous: Option<Arc<Mutex<Retention>>>,
+}
+
+/// Allocation-free owner of the historic first metadata boundary until the
+/// exact admission transfers to the construction cell. Controls can refuse
+/// between these steps; such refusal must not orphan the initial invoice.
+struct InitialInvoice<'b, 'a> {
+    budget: &'b mut CompileTimeBudget<'a>,
+    bytes: usize,
+}
+impl<'a> Deref for InitialInvoice<'_, 'a> {
+    type Target = CompileTimeBudget<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.budget
+    }
+}
+impl std::ops::DerefMut for InitialInvoice<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.budget
+    }
+}
+impl Drop for InitialInvoice<'_, '_> {
+    fn drop(&mut self) {
+        let bytes = self.bytes;
+        self.budget.external(|budget| budget.release(bytes));
+    }
+}
+impl<'b, 'a> ConstructionBinding<'b, 'a> {
+    fn new(budget: &'b mut CompileTimeBudget<'a>, selected: Option<Arc<Mutex<Retention>>>) -> Self {
+        let previous = std::mem::replace(&mut budget.construction, selected);
+        Self { budget, previous }
+    }
+}
+impl<'a> Deref for ConstructionBinding<'_, 'a> {
+    type Target = CompileTimeBudget<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.budget
+    }
+}
+impl std::ops::DerefMut for ConstructionBinding<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.budget
+    }
+}
+impl Drop for ConstructionBinding<'_, '_> {
+    fn drop(&mut self) {
+        self.budget.construction = self.previous.take();
     }
 }
 
@@ -414,6 +495,7 @@ pub struct AdmittedOwned<T> {
     // Field order guarantees value destruction before the reservation refunds.
     value: T,
     reservation: Retention,
+    increments: Option<Arc<Mutex<Retention>>>,
 }
 
 impl<T> Deref for AdmittedOwned<T> {
@@ -467,12 +549,11 @@ impl<T> AdmittedOwned<T> {
         if !budget.owns(&self.reservation) {
             return Err(IncompleteReason::MalformedSource);
         }
-        let parent = budget.manual_scope.replace(0);
-        let result = update(&mut self.value, budget);
-        let invoice = budget.manual_scope.take().unwrap_or(0);
-        budget.manual_scope = parent;
-        self.reservation.absorb_manual(invoice);
-        Ok(result)
+        if self.increments.is_none() {
+            self.increments = Some(budget.construction_credit()?);
+        }
+        let mut binding = ConstructionBinding::new(budget, self.increments.clone());
+        Ok(update(&mut self.value, &mut binding))
     }
     /// Validate a returned capability without accepting unadmitted or other-root
     /// data as proof. This checks the opaque minting identity, not payload size.
@@ -538,7 +619,7 @@ impl<T> AdmittedShared<T> {
             definitions: 0,
             fields: 0,
             variants: 0,
-            manual_scope: None,
+            construction: None,
         }
     }
     /// Internal shared carrier envelope: its Arc/control credit follows the

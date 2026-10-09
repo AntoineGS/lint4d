@@ -307,7 +307,7 @@ pub(crate) fn analyze_source_in_session(
             true,
         )
     })?;
-    publish_analysis(&analysis, budget)
+    publish_analysis(analysis, budget)
 }
 
 struct ProviderSession {
@@ -335,7 +335,7 @@ impl ProviderSession {
 }
 
 fn publish_analysis(
-    analysis: &SessionOutput,
+    mut analysis: AdmittedOwned<SessionOutput>,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
     let facts = analysis
@@ -394,13 +394,7 @@ fn publish_analysis(
             payload += a.source.as_str().len();
         }
     }
-    for o in analysis.observations.iter() {
-        payload += observation_payload(o)?;
-    }
-    for w in analysis.warnings.iter() {
-        payload += size_of::<String>() + w.len();
-    }
-    budget
+    let mut output = budget
         .admit_owned(1, payload, payload, || CompileTimeOutput {
             root: analysis.root.clone(),
             occurrences: analysis.occurrences.clone(),
@@ -408,12 +402,35 @@ fn publish_analysis(
             facts,
             header: analysis.header.clone(),
             reasons: analysis.reasons.clone(),
-            observations: analysis.observations.to_vec(),
-            warnings: analysis.warnings.to_vec(),
+            observations: Vec::new(),
+            warnings: Vec::new(),
             directive_fragments: analysis.directive_fragments.clone(),
             budget: view,
         })
-        .map_err(|r| resolver_error(r, budget))
+        .map_err(|r| resolver_error(r, budget))?;
+    // The side buffers already have independent construction/return owners.
+    // Replace their internal slots with admitted empty carriers, then move the
+    // actual vectors and their exact minted credits into the published fields.
+    let empty_observations = budget
+        .admit_owned(0, 0, 0, Vec::new)
+        .map_err(|r| resolver_error(r, budget))?;
+    let empty_warnings = budget
+        .admit_owned(0, 0, 0, Vec::new)
+        .map_err(|r| resolver_error(r, budget))?;
+    let observations =
+        std::mem::replace(&mut analysis.value_mut().observations, empty_observations);
+    let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
+    output
+        .move_field(observations, budget, |output, observations| {
+            output.observations = observations
+        })
+        .map_err(|r| resolver_error(r, budget))?;
+    output
+        .move_field(warnings, budget, |output, warnings| {
+            output.warnings = warnings
+        })
+        .map_err(|r| resolver_error(r, budget))?;
+    Ok(output)
 }
 
 fn conditional_output_payload(a: &ConditionalAnalysis) -> Result<usize, ResolverError> {
@@ -2628,6 +2645,171 @@ fn argument_anchor(
 mod tests {
     use super::*;
     use crate::{NoCancellation, SourceId, SourceRevision};
+
+    #[test]
+    fn actual_final_sidebuffer_publication_moves_backing_and_receipts() {
+        struct NoCallbacks;
+        impl CompileTimeResolver for NoCallbacks {
+            fn include(
+                &mut self,
+                _: IncludeResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                panic!("no include in this root");
+            }
+            fn unit(
+                &mut self,
+                _: UnitResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                panic!("no uses in this root");
+            }
+        }
+        let text = "unit T; interface type R=record X:Byte; end; implementation end.";
+        let root = LoadedSource {
+            id: SourceId::new("T.pas"),
+            path: "T.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            compile_time_backing: None,
+        };
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let view = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = view.budget_snapshot().retained_bytes;
+        let mut providers = ProviderSession::new(&mut budget).unwrap();
+        let mut analysis = analyze_source_with_providers(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoCallbacks,
+            &mut budget,
+            &NoCancellation,
+            &mut providers,
+            false,
+            OccurrenceId(0),
+        )
+        .unwrap();
+        let observation = ResolutionObservation::Directory {
+            path: "observed".into(),
+            entry: pascal_project::ProjectPathEntry {
+                path: "observed".into(),
+                provenance: pascal_project::ProjectPathProvenance::Configured,
+            },
+            stamp: None,
+            complete: true,
+        };
+        append_observations(
+            &mut analysis.value_mut().observations,
+            &[observation.clone()],
+            &mut budget,
+        )
+        .unwrap();
+        append_warnings(
+            &mut analysis.value_mut().warnings,
+            &["warning".repeat(128)],
+            &mut budget,
+        )
+        .unwrap();
+        let observations_ptr = analysis.observations.as_ptr();
+        let warnings_ptr = analysis.warnings.as_ptr();
+        let warning_text_ptr = analysis.warnings[0].as_ptr();
+        struct CancelAt(std::cell::Cell<usize>, usize);
+        impl CancellationToken for CancelAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= self.1
+            }
+        }
+        // Actual final publication refusal before graph promotion, during
+        // destination controls and before taking either independent side field.
+        // The consumed failed analysis must refund only its dead owners.
+        for allowed in 0..8 {
+            let before = view.budget_snapshot();
+            let mut failed = analyze_source_with_providers(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoCallbacks,
+                &mut budget,
+                &NoCancellation,
+                &mut providers,
+                false,
+                OccurrenceId(0),
+            )
+            .unwrap();
+            append_warnings(
+                &mut failed.value_mut().warnings,
+                &["cancelled-warning".repeat(128)],
+                &mut budget,
+            )
+            .unwrap();
+            let cancel = CancelAt(std::cell::Cell::new(0), allowed);
+            let mut cancelled_budget = view.store_budget(CompileTimeLimits::default(), &cancel);
+            assert!(matches!(
+                publish_analysis(failed, &mut cancelled_budget),
+                Err(ResolverError::Cancelled)
+            ));
+            let after = view.budget_snapshot();
+            assert_eq!(
+                after.retained_bytes, before.retained_bytes,
+                "publication cancel boundary {allowed}"
+            );
+            assert!(after.work >= before.work);
+            assert!(after.byte_work >= before.byte_work);
+        }
+        let output = publish_analysis(analysis, &mut budget).unwrap();
+        assert_eq!(
+            output.observations.as_ptr(),
+            observations_ptr,
+            "move the actual observation buffer"
+        );
+        assert_eq!(
+            output.warnings.as_ptr(),
+            warnings_ptr,
+            "move the actual warning buffer"
+        );
+        assert_eq!(
+            output.warnings[0].as_ptr(),
+            warning_text_ptr,
+            "move owned warning text, not clone"
+        );
+        assert_eq!(output.observations, [observation]);
+        let snapshot = output
+            .facts
+            .try_clone(&mut budget)
+            .unwrap()
+            .into_arc(&mut budget)
+            .unwrap();
+        drop(providers);
+        drop(budget);
+        assert_eq!(output.warnings[0], "warning".repeat(128));
+        let live = view.budget_snapshot();
+        drop(output);
+        assert!(
+            view.budget_snapshot().retained_bytes > baseline,
+            "shared final facts remain live"
+        );
+        assert!(
+            snapshot
+                .declarations
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case("R"))
+        );
+        drop(snapshot);
+        let dead = view.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
 
     #[test]
     fn actual_interface_replacement_copies_once_and_preserves_old_snapshot_last_owner() {

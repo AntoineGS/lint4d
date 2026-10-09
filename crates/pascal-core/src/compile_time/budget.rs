@@ -506,6 +506,50 @@ impl<T> Deref for AdmittedOwned<T> {
 }
 
 impl<T> AdmittedOwned<T> {
+    /// Consume a named, independently admitted field into an already admitted
+    /// destination. Move its minted credits BEFORE the payload mutation; this
+    /// neither measures a callback interval nor extracts uncredited storage.
+    pub(crate) fn move_field<U>(
+        &mut self,
+        mut field: AdmittedOwned<U>,
+        budget: &CompileTimeBudget<'_>,
+        install: impl FnOnce(&mut T, U),
+    ) -> Result<(), IncompleteReason> {
+        let carrier = size_of::<AdmittedOwned<U>>();
+        if !self.is_admitted_by(budget)
+            || !field.is_admitted_by(budget)
+            || field.reservation.retained < carrier
+        {
+            return Err(IncompleteReason::MalformedSource);
+        }
+        if let Some(cell) = field.increments.take() {
+            let cell = match Arc::try_unwrap(cell) {
+                Ok(cell) => cell,
+                Err(cell) => {
+                    // A still-selected construction binding cannot transfer its
+                    // field. Restore it so payload still dies before credits.
+                    field.increments = Some(cell);
+                    return Err(IncompleteReason::MalformedSource);
+                }
+            };
+            let mut credit = cell.into_inner().unwrap_or_else(|e| e.into_inner());
+            field.reservation.retained += credit.retained - credit.floor;
+            // The unique construction cell's Arc/Mutex allocation has died.
+            // Only its explicit control invoice retires here; field capacity
+            // and text reservations move intact, irrespective of current len.
+            credit.retained = credit.floor;
+        }
+        self.reservation.retained += field.reservation.retained;
+        field.reservation.retained = 0;
+        let AdmittedOwned { value, .. } = field;
+        install(&mut self.value, value);
+        // This field's original inline carrier is gone; the destination's
+        // receiving inline fields were admitted by its own constructor. Retire
+        // only this named, originally minted control invoice, not payload len.
+        self.retire_storage(carrier)?;
+        Ok(())
+    }
+
     pub(crate) fn retire_storage(&mut self, bytes: usize) -> Result<(), IncompleteReason> {
         if bytes > self.reservation.retained {
             return Err(IncompleteReason::MalformedSource);

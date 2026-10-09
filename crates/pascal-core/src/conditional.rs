@@ -1755,10 +1755,11 @@ pub(crate) fn restore_source_options(
     ] {
         budget.charge(1, key.len(), key.len() + size_of::<Truth>() + 64)?;
         let value = saved.map_or(Truth::Unknown, |saved| {
-            if matches!(key, "T" | "Y" | "RUNTIME_CHECKS") {
-                // These modeled legacy facts have no verified Florence OPT
-                // eligibility in the recorded evidence. Only a value unchanged
-                // by either possible restore behavior can remain proven.
+            if key == "RUNTIME_CHECKS" {
+                // This legacy carrier has no verified Florence OPT mapping.
+                // Only a value unchanged by either possible restore behavior
+                // can remain proven. Documented TYPEDADDRESS/T and REFERENCEINFO/Y
+                // are eligible and restore the saved fact, including unknown.
                 saved.option(key).merge(environment.option(key))
             } else {
                 saved.option(key)

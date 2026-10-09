@@ -98,7 +98,7 @@ fn phase_b_caller_branch_budget_is_shared_with_sequential_forks() {
 
 #[test]
 fn phase_b_whole_restore_covers_documented_scalar_options_without_restoring_defines() {
-    for option in ["R", "O", "Q", "C", "B", "I", "X", "D", "H"] {
+    for option in ["R", "O", "Q", "C", "B", "I", "X", "D", "H", "T", "Y"] {
         let source = format!(
             "unit T; interface {{$UNDEF FLAG}}{{${option}+}}{{$PUSHOPT}}{{${option}-}}{{$DEFINE FLAG}}{{$POPOPT}}{{$IFOPT {option}+}}{{$DEFINE RESTORED}}{{$ENDIF}}{{$IF Defined(FLAG)}}{{$DEFINE DEFINE_KEPT}}{{$ENDIF}} implementation end."
         );
@@ -109,6 +109,82 @@ fn phase_b_whole_restore_covers_documented_scalar_options_without_restoring_defi
         assert_eq!(activity(&a, "DEFINE RESTORED"), Truth::True, "{option}");
         assert_eq!(activity(&a, "DEFINE DEFINE_KEPT"), Truth::True, "{option}");
     }
+}
+
+#[test]
+fn option_evidence_t_y_whole_restore_keeps_saved_facts_and_source_constants() {
+    let source = "unit T; interface {$T-}{$Y+}{$PUSHOPT}{$TYPEDADDRESS ON}{$REFERENCEINFO OFF} \
+        const Width=SizeOf(Word); {$DEFINE DURING_SAVE}{$POPOPT} \
+        {$IFOPT T-}{$DEFINE T_RESTORED}{$ENDIF}{$IFOPT Y+}{$DEFINE Y_RESTORED}{$ENDIF} \
+        {$IF (Width=2) and Defined(DURING_SAVE)}{$DEFINE SOURCE_FACTS_KEPT}{$ENDIF} implementation end.";
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let a = Fixture::new(source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        for body in [
+            "DEFINE T_RESTORED",
+            "DEFINE Y_RESTORED",
+            "DEFINE SOURCE_FACTS_KEPT",
+        ] {
+            assert_eq!(activity(&a, body), Truth::True, "{body}");
+        }
+    }
+}
+
+#[test]
+fn option_evidence_t_y_nested_saves_preserve_unknown_outer_facts() {
+    let source = "unit T; interface {$PUSHOPT}{$T+}{$Y-}{$PUSHOPT}{$T-}{$Y+}{$POPOPT} \
+        {$IFOPT T+}{$DEFINE INNER_T}{$ENDIF}{$IFOPT Y-}{$DEFINE INNER_Y}{$ENDIF}{$POPOPT} \
+        {$IFOPT T+}{$DEFINE UNKNOWN_T}{$ENDIF}{$IFOPT Y-}{$DEFINE UNKNOWN_Y}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE INNER_T"), Truth::True);
+    assert_eq!(activity(&a, "DEFINE INNER_Y"), Truth::True);
+    assert_eq!(activity(&a, "DEFINE UNKNOWN_T"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE UNKNOWN_Y"), Truth::Unknown);
+}
+
+#[test]
+fn option_evidence_t_y_restore_remains_correlated_with_each_branch() {
+    let source = "unit T; interface {$IF Mystery}{$DEFINE LEFT}{$T-}{$Y+}{$ELSE}{$UNDEF LEFT}{$T+}{$Y-}{$ENDIF} \
+        {$PUSHOPT}{$T+}{$Y+}{$POPOPT} {$IF Defined(LEFT)} \
+        {$IFOPT T-}{$DEFINE LEFT_T}{$ELSE}{$DEFINE WRONG_LEFT_T}{$ENDIF} \
+        {$IFOPT Y+}{$DEFINE LEFT_Y}{$ELSE}{$DEFINE WRONG_LEFT_Y}{$ENDIF} {$ELSE} \
+        {$IFOPT T+}{$DEFINE RIGHT_T}{$ELSE}{$DEFINE WRONG_RIGHT_T}{$ENDIF} \
+        {$IFOPT Y-}{$DEFINE RIGHT_Y}{$ELSE}{$DEFINE WRONG_RIGHT_Y}{$ENDIF} {$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    for body in [
+        "DEFINE LEFT_T",
+        "DEFINE LEFT_Y",
+        "DEFINE RIGHT_T",
+        "DEFINE RIGHT_Y",
+    ] {
+        assert_eq!(activity(&a, body), Truth::Unknown, "{body}");
+    }
+    for body in [
+        "DEFINE WRONG_LEFT_T",
+        "DEFINE WRONG_LEFT_Y",
+        "DEFINE WRONG_RIGHT_T",
+        "DEFINE WRONG_RIGHT_Y",
+    ] {
+        assert_eq!(activity(&a, body), Truth::False, "{body}");
+    }
+    assert_eq!(a.facts.reachable_states().count(), 2);
+}
+
+#[test]
+fn option_evidence_runtime_checks_changed_restore_stays_unverified() {
+    let source = "unit T; interface {$RUNTIME_CHECKS ON}{$PUSHOPT}{$RUNTIME_CHECKS OFF}{$POPOPT} \
+        {$IFOPT RUNTIME_CHECKS+}{$DEFINE UNVERIFIED}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE UNVERIFIED"), Truth::Unknown);
 }
 
 #[test]

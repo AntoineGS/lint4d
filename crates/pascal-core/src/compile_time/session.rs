@@ -1245,25 +1245,46 @@ impl ProviderEngine<'_, '_> {
                     Fact::Incomplete(reason) => return Err(resolver_error(reason, self.budget)),
                 }
             } else if let Some(graph) = &state.interfaces[index].graph {
-                // Copy only through the existing admitted snapshot API; no
-                // interior mutability or name-only memo is introduced.
-                let scratch = self.budget.manual_retained();
-                let mut copy = graph
-                    .snapshot(self.budget)
-                    .map_err(|r| resolver_error(r, self.budget))?;
-                let captured = copy.site();
-                self.prepare_name(&mut copy, &captured, suffix, pointers, depth + 1)?;
-                let graph = copy
-                    .admitted_snapshot(self.budget)
-                    .and_then(|v| v.into_arc(self.budget))
-                    .map_err(|r| resolver_error(r, self.budget))?;
-                drop(copy);
-                self.budget
-                    .release(self.budget.manual_retained().saturating_sub(scratch));
-                state.interfaces[index].graph = Some(graph);
+                state.interfaces[index].graph =
+                    Some(self.replace_interface_graph(graph, suffix, pointers, depth + 1)?);
             }
         }
         Ok(())
+    }
+
+    fn replace_interface_graph(
+        &mut self,
+        graph: &AdmittedInterfaceGraph,
+        suffix: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<AdmittedInterfaceGraph, ResolverError> {
+        // An independent mutable copy is required; attach its construction
+        // credits before traversing/copying, not after preparation completes.
+        let mut copy = self.budget.admit_compilation(0, |budget| {
+            graph
+                .snapshot(budget)
+                .map_err(|r| resolver_error(r, budget))
+        })?;
+        copy.with_budget_mut(self.budget, |copy, budget| {
+            let captured = copy.site();
+            let mut engine = ProviderEngine {
+                resolver: self.resolver,
+                providers: self.providers,
+                cancel: self.cancel,
+                budget,
+                observations: self.observations,
+                warnings: self.warnings,
+            };
+            engine.prepare_name(copy, &captured, suffix, pointers, depth)
+        })
+        .map_err(|r| resolver_error(r, self.budget))??;
+        // Move the now-prepared graph AND its existing credits into shared
+        // backing. Only destination Arc/handle controls are new admissions.
+        // No discarded projections/scanner/whole-analysis receipt comes along.
+        copy.into_shared(self.budget)
+            .and_then(|v| v.into_arc(self.budget))
+            .map_err(|r| resolver_error(r, self.budget))
     }
 
     fn prepare_expression(
@@ -2607,6 +2628,168 @@ fn argument_anchor(
 mod tests {
     use super::*;
     use crate::{NoCancellation, SourceId, SourceRevision};
+
+    #[test]
+    fn actual_interface_replacement_copies_once_and_preserves_old_snapshot_last_owner() {
+        struct NoCallbacks;
+        impl CompileTimeResolver for NoCallbacks {
+            fn include(
+                &mut self,
+                _: IncludeResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                panic!("this interface has no external include");
+            }
+            fn unit(
+                &mut self,
+                _: UnitResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                panic!("this interface has no external unit");
+            }
+        }
+        let text = "unit P; interface type R=record X:Byte; end; implementation end.";
+        let root = LoadedSource {
+            id: SourceId::new("P.pas"),
+            path: "P.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            compile_time_backing: None,
+        };
+        let context = ConditionalContext::default();
+        let mut resolver = NoCallbacks;
+        let analysis = analyze_source(
+            &root,
+            &context,
+            &mut resolver,
+            CompileTimeLimits::default(),
+            &NoCancellation,
+        )
+        .unwrap();
+        let view = analysis.budget.clone();
+        let mut budget = view.store_budget(CompileTimeLimits::default(), &NoCancellation);
+        let old = analysis
+            .facts
+            .try_clone(&mut budget)
+            .unwrap()
+            .into_arc(&mut budget)
+            .unwrap();
+        let old_snapshot = old.clone();
+        let mut payload = 0;
+        old.visit_snapshot_payload(&mut |n| {
+            payload += n;
+            Ok(())
+        })
+        .unwrap();
+        drop(analysis);
+        let mut providers = ProviderSession::new(&mut budget).unwrap();
+        let mut observations = budget.admit_owned(0, 0, 0, Vec::new).unwrap();
+        let mut warnings = budget.admit_owned(0, 0, 0, Vec::new).unwrap();
+        let before = view.budget_snapshot();
+        let mut engine = ProviderEngine {
+            resolver: &mut resolver,
+            providers: &mut providers,
+            cancel: &NoCancellation,
+            budget: &mut budget,
+            observations: &mut observations,
+            warnings: &mut warnings,
+        };
+        let replacement = engine.replace_interface_graph(&old, "R", false, 1).unwrap();
+        let after = view.budget_snapshot();
+        // This is the actual replacement boundary, not a primitive stand-in:
+        // one mutable independent graph copy is required; sharing it performs
+        // no second payload traversal/copy or payload-byte-work admission.
+        assert_eq!(after.byte_work - before.byte_work, payload);
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert_eq!(old.fingerprint(), replacement.fingerprint());
+        assert!(
+            replacement
+                .declarations
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case("R"))
+        );
+        struct CancelAt {
+            calls: std::cell::Cell<usize>,
+            allowed: usize,
+        }
+        impl CancellationToken for CancelAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.calls.get();
+                self.calls.set(n + 1);
+                n >= self.allowed
+            }
+        }
+        let mut visits = 0;
+        old.visit_snapshot_payload(&mut |_| {
+            visits += 1;
+            Ok(())
+        })
+        .unwrap();
+        // Refusal before construction, during snapshot traversal, after the
+        // mutable copy, and after shared promotion must destroy only the new
+        // owner. Existing old and newly published snapshots remain independent.
+        for allowed in [0, 1, 2, visits / 2 + 2, visits + 2, visits + 3] {
+            let cancel = CancelAt {
+                calls: std::cell::Cell::new(0),
+                allowed,
+            };
+            let mut cancelled_budget = view.store_budget(CompileTimeLimits::default(), &cancel);
+            let before_error = view.budget_snapshot();
+            let mut engine = ProviderEngine {
+                resolver: &mut resolver,
+                providers: &mut providers,
+                cancel: &cancel,
+                budget: &mut cancelled_budget,
+                observations: &mut observations,
+                warnings: &mut warnings,
+            };
+            assert!(
+                matches!(
+                    engine.replace_interface_graph(&old, "R", false, 1),
+                    Err(ResolverError::Cancelled)
+                ),
+                "cancel boundary {allowed}"
+            );
+            let after_error = view.budget_snapshot();
+            assert_eq!(
+                after_error.retained_bytes, before_error.retained_bytes,
+                "temporary replacement owner must die at cancel boundary {allowed}"
+            );
+            assert!(after_error.work >= before_error.work);
+            assert!(after_error.byte_work >= before_error.byte_work);
+        }
+        drop(old);
+        assert_eq!(
+            view.budget_snapshot().retained_bytes,
+            after.retained_bytes,
+            "another continuation still holds the old graph snapshot"
+        );
+        drop(old_snapshot);
+        assert!(view.budget_snapshot().retained_bytes < after.retained_bytes);
+        drop(providers);
+        drop(observations);
+        drop(warnings);
+        drop(budget);
+        // The replacement has no borrowed-budget/token lifetime dependency.
+        assert!(
+            replacement
+                .declarations
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case("R"))
+        );
+        let live = view.budget_snapshot();
+        drop(replacement);
+        let dead = view.budget_snapshot();
+        assert!(dead.retained_bytes < live.retained_bytes);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
 
     #[test]
     fn actual_declaration_mutation_survives_unwind_with_immediate_owner_credits() {

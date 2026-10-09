@@ -506,6 +506,52 @@ impl<T> Deref for AdmittedOwned<T> {
 }
 
 impl<T> AdmittedOwned<T> {
+    /// Consume one actual owner into a different inline carrier. Owned backing
+    /// and already minted increments move equal-sum, without a payload visitor
+    /// or clone. The receiving carrier is admitted before transformation; any
+    /// allocation in the private transform must already have its named invoice.
+    pub(crate) fn map_value<U>(
+        mut self,
+        budget: &mut CompileTimeBudget<'_>,
+        transform: impl FnOnce(T) -> U,
+    ) -> Result<AdmittedOwned<U>, IncompleteReason> {
+        if !self.is_admitted_by(budget) {
+            return Err(IncompleteReason::MalformedSource);
+        }
+        self.seal_increments()?;
+        let mut reservation = budget.mint_retention(0, 0, size_of::<AdmittedOwned<U>>())?;
+        reservation.retained += self.reservation.retained;
+        self.reservation.retained = 0;
+        let Self { value, .. } = self;
+        let value = transform(value);
+        let mut result = AdmittedOwned {
+            value,
+            reservation,
+            increments: None,
+        };
+        // The original inline carrier died during the consuming transform.
+        // This is its originally minted control invoice, never payload length.
+        result.retire_storage(size_of::<Self>())?;
+        Ok(result)
+    }
+
+    fn seal_increments(&mut self) -> Result<(), IncompleteReason> {
+        if let Some(cell) = self.increments.take() {
+            let cell = match Arc::try_unwrap(cell) {
+                Ok(cell) => cell,
+                Err(cell) => {
+                    self.increments = Some(cell);
+                    return Err(IncompleteReason::MalformedSource);
+                }
+            };
+            let mut credit = cell.into_inner().unwrap_or_else(|e| e.into_inner());
+            self.reservation.retained += credit.retained - credit.floor;
+            // The unique, unbound Arc/Mutex allocation is gone. Payload and
+            // capacity credits remain; only that named control invoice retires.
+            credit.retained = credit.floor;
+        }
+        Ok(())
+    }
     /// Consume a named, independently admitted field into an already admitted
     /// destination. Move its minted credits BEFORE the payload mutation; this
     /// neither measures a callback interval nor extracts uncredited storage.
@@ -522,23 +568,7 @@ impl<T> AdmittedOwned<T> {
         {
             return Err(IncompleteReason::MalformedSource);
         }
-        if let Some(cell) = field.increments.take() {
-            let cell = match Arc::try_unwrap(cell) {
-                Ok(cell) => cell,
-                Err(cell) => {
-                    // A still-selected construction binding cannot transfer its
-                    // field. Restore it so payload still dies before credits.
-                    field.increments = Some(cell);
-                    return Err(IncompleteReason::MalformedSource);
-                }
-            };
-            let mut credit = cell.into_inner().unwrap_or_else(|e| e.into_inner());
-            field.reservation.retained += credit.retained - credit.floor;
-            // The unique construction cell's Arc/Mutex allocation has died.
-            // Only its explicit control invoice retires here; field capacity
-            // and text reservations move intact, irrespective of current len.
-            credit.retained = credit.floor;
-        }
+        field.seal_increments()?;
         self.reservation.retained += field.reservation.retained;
         field.reservation.retained = 0;
         let AdmittedOwned { value, .. } = field;
@@ -614,6 +644,9 @@ impl<T> AdmittedOwned<T> {
         if !budget.owns(&self.reservation) {
             return Err(IncompleteReason::MalformedSource);
         }
+        // Mutation is complete. Move its already-minted increments into this
+        // backing reservation, retiring only the dead unique binding control.
+        self.seal_increments()?;
         let control = arc_overhead::<Self>()?;
         let retained = size_of::<AdmittedShared<T>>()
             .checked_add(control)

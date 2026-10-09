@@ -258,12 +258,21 @@ struct SessionOutput {
     root: ConditionalAnalysis,
     occurrences: Vec<OccurrenceAnalysis>,
     includes: Vec<IncludeOccurrence>,
-    facts: CompileTimeState,
+    facts: Option<AdmittedOwned<CompileTimeState>>,
     header: Fact<VerifiedUnitHeader>,
     reasons: Vec<IncompleteReason>,
     observations: AdmittedOwned<Vec<ResolutionObservation>>,
     warnings: AdmittedOwned<Vec<String>>,
     directive_fragments: AdmittedOwned<Vec<DirectiveFragments>>,
+}
+
+impl SessionOutput {
+    fn facts(&self) -> &AdmittedOwned<CompileTimeState> {
+        self.facts.as_ref().expect("unpublished facts owner")
+    }
+    fn facts_mut(&mut self) -> &mut AdmittedOwned<CompileTimeState> {
+        self.facts.as_mut().expect("unpublished facts owner")
+    }
 }
 
 /// Analyze one root with the shared conditional interpreter and lexical binder.
@@ -339,8 +348,11 @@ fn publish_analysis(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
     let facts = analysis
+        .value_mut()
         .facts
-        .admitted_snapshot(budget)
+        .take()
+        .expect("unpublished facts owner")
+        .into_shared(budget)
         .map_err(|r| resolver_error(r, budget))?;
     let view = budget
         .admit_owned(0, 0, 0, || ())
@@ -507,7 +519,7 @@ fn analyze_source_with_providers_inner(
     root: &LoadedSource,
     context: &ConditionalContext,
     resolver: &mut dyn CompileTimeResolver,
-    mut budget: &mut CompileTimeBudget<'_>,
+    budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
     providers: &mut ProviderSession,
     interface_only: bool,
@@ -542,59 +554,71 @@ fn analyze_source_with_providers_inner(
         .map_err(|r| resolver_error(r, &budget))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| ResolverError::InvalidRequest("root coordinate text is not UTF-8".into()))?;
-    let entries = context
-        .defines
-        .len()
-        .checked_add(context.options.len())
-        .and_then(|n| n.checked_add(context.constants.len()))
-        .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
-    let metadata = entries
-        .checked_mul(size_of::<(String, ConstantValue)>() + 4 * size_of::<usize>())
-        .and_then(|n| n.checked_add(size_of::<ConditionalEnvironment>()))
-        .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
-    budget
-        .charge(entries + 1, 0, metadata)
-        .map_err(|r| resolver_error(r, &budget))?;
-    // The conditional environment is separately retained from the immutable
-    // declaration context. Admit its context payload before construction.
-    let mut failure = None;
-    context
-        .visit_recovery_payload(&mut |n| {
-            budget.charge(1, n, n).map_err(|reason| {
-                failure = Some(reason);
-                "conditional context admission".into()
-            })
-        })
-        .map_err(|_| {
-            resolver_error(
-                failure.unwrap_or(IncompleteReason::MalformedSource),
-                &budget,
-            )
-        })?;
-    let mut state = CompileTimeState::new(context, root, &mut budget)
-        .map_err(|r| resolver_error(r, &budget))?;
-    state.interface_only = interface_only;
+    let mut state = CompileTimeState::admitted_new(context, root, budget)?;
+    state.value_mut().interface_only = interface_only;
     super::declarations::limit(1, limits.max_branch_states.min(64), "max_branch_states")
         .map_err(|r| resolver_error(r, &budget))?;
+    // Graph payload and its final conditional environment belong to this path
+    // from construction; frame/current Vec slots remain coordinator storage.
+    let first = budget.admit_compilation(0, |budget| {
+        let entries = context
+            .defines
+            .len()
+            .checked_add(context.options.len())
+            .and_then(|n| n.checked_add(context.constants.len()))
+            .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
+        // The path carrier already admits the current inline environment.
+        // Reserve its eventual conditional Box here, before context allocation;
+        // collapse can then move these maps without a new copy/invoice.
+        let metadata = entries
+            .checked_mul(size_of::<(String, ConstantValue)>() + 4 * size_of::<usize>())
+            .and_then(|n| n.checked_add(size_of::<ConditionalEnvironment>()))
+            .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
+        budget
+            .charge(entries + 1, 0, metadata)
+            .map_err(|r| resolver_error(r, &budget))?;
+        // The conditional environment is separately retained from the immutable
+        // declaration context. Admit its context payload before construction.
+        let mut failure = None;
+        context
+            .visit_recovery_payload(&mut |n| {
+                budget.charge(1, n, n).map_err(|reason| {
+                    failure = Some(reason);
+                    "conditional context admission".into()
+                })
+            })
+            .map_err(|_| {
+                resolver_error(
+                    failure.unwrap_or(IncompleteReason::MalformedSource),
+                    &budget,
+                )
+            })?;
+        budget
+            .charge(1, 0, size_of::<Sequence>())
+            .map_err(|r| resolver_error(r, &budget))?;
+        let mut environment = ConditionalEnvironment::from_context(context);
+        environment.typed_state = Some(Box::new(
+            state
+                .snapshot(budget)
+                .map_err(|r| resolver_error(r, &budget))?,
+        ));
+        let scalar = environment
+            .snapshot_scalar(budget)
+            .map_err(|r| resolver_error(r, &budget))?;
+        environment
+            .typed_state
+            .as_deref_mut()
+            .expect("typed root")
+            .scalar_history
+            .push((Sequence(0), scalar));
+        Ok(ReachablePath {
+            environment,
+            boxed_state_invoice: size_of::<CompileTimeState>(),
+        })
+    })?;
     budget
-        .charge(1, 0, size_of::<ReachablePath>() + size_of::<Sequence>())
-        .map_err(|r| resolver_error(r, &budget))?;
-    let mut environment = ConditionalEnvironment::from_context(context);
-    environment.typed_state = Some(Box::new(
-        state
-            .snapshot(&mut budget)
-            .map_err(|r| resolver_error(r, &budget))?,
-    ));
-    let scalar = environment
-        .snapshot_scalar(&mut budget)
-        .map_err(|r| resolver_error(r, &budget))?;
-    environment
-        .typed_state
-        .as_deref_mut()
-        .expect("typed root")
-        .scalar_history
-        .push((Sequence(0), scalar));
-    let first = ReachablePath { environment };
+        .charge(1, 0, size_of::<AdmittedOwned<ReachablePath>>())
+        .map_err(|r| resolver_error(r, budget))?;
     budget
         .charge(
             1,
@@ -652,7 +676,7 @@ fn analyze_source_with_providers_inner(
         let paths = session.reachable_count();
         session
             .budget
-            .charge(paths, 0, paths * size_of::<ReachablePath>())
+            .charge(paths, 0, paths * size_of::<AdmittedOwned<ReachablePath>>())
             .map_err(|r| resolver_error(r, &session.budget))?;
         for mut frame in std::mem::take(&mut session.frames) {
             session.current.append(&mut frame.pending);
@@ -662,7 +686,7 @@ fn analyze_source_with_providers_inner(
     if session.reasons.is_empty() {
         let mut failure = None;
         for path in &mut session.current {
-            if let Err(reason) = path.state_mut().finish_root(&mut session.budget) {
+            if let Err(reason) = path.finish_owned(&mut session.budget) {
                 failure = Some(reason);
                 break;
             } else if path.state().unknown {
@@ -676,17 +700,31 @@ fn analyze_source_with_providers_inner(
     }
     if !session.current.is_empty() {
         let count = session.current.len();
-        session
-            .budget
-            .charge(
-                count,
-                0,
-                count * (size_of::<CompileTimeState>() + size_of::<ConditionalEnvironment>()),
-            )
-            .map_err(|r| resolver_error(r, &session.budget))?;
         let mut paths = std::mem::take(&mut session.current).into_iter();
-        session.state = paths.next().expect("nonempty").into_state();
-        session.state.alternatives = paths.map(|path| path.into_state()).collect();
+        let mut state = paths
+            .next()
+            .expect("nonempty")
+            .into_state_owner(session.budget)
+            .map_err(|r| resolver_error(r, session.budget))?;
+        let slots = (count - 1)
+            .checked_mul(size_of::<CompileTimeState>())
+            .ok_or_else(|| ResolverError::InvalidRequest("alternative slots overflow".into()))?;
+        state
+            .grow(session.budget, count, 0, slots, |state| {
+                state.alternatives.reserve_exact(count - 1);
+            })
+            .map_err(|r| resolver_error(r, session.budget))?;
+        for path in paths {
+            let alternative = path
+                .into_state_owner(session.budget)
+                .map_err(|r| resolver_error(r, session.budget))?;
+            state
+                .move_field(alternative, session.budget, |state, alternative| {
+                    state.alternatives.push(alternative)
+                })
+                .map_err(|r| resolver_error(r, session.budget))?;
+        }
+        session.state = state;
     }
     if let Some(reason) = session.fatal.take() {
         return Err(resolver_error(reason, &session.budget));
@@ -706,19 +744,24 @@ fn analyze_source_with_providers_inner(
         };
         let count = session.state.alternatives.len() + 1;
         session
-            .budget
-            .charge(
-                count,
-                dynamic.saturating_mul(count),
-                (size_of::<IncompleteReason>() + dynamic).saturating_mul(count),
-            )
-            .map_err(|r| resolver_error(r, &session.budget))?;
-        // Every retained graph remains incomplete; never publish the primary
-        // healthy path merely because it happened to be the first alternative.
-        session.state.failure = Some(reason.clone());
-        for alternative in &mut session.state.alternatives {
-            alternative.failure = Some(reason.clone());
-        }
+            .state
+            .with_budget_mut(session.budget, |state, budget| {
+                budget
+                    .charge(
+                        count,
+                        dynamic.saturating_mul(count),
+                        dynamic.saturating_mul(count),
+                    )
+                    .map_err(|r| resolver_error(r, budget))?;
+                // Every retained graph remains incomplete; never publish the primary
+                // healthy path merely because it happened to be the first alternative.
+                state.failure = Some(reason.clone());
+                for alternative in &mut state.alternatives {
+                    alternative.failure = Some(reason.clone());
+                }
+                Ok(())
+            })
+            .map_err(|r| resolver_error(r, session.budget))??;
     }
     if let Some(reason) = session.fatal.take() {
         return Err(resolver_error(reason, &session.budget));
@@ -802,7 +845,7 @@ fn analyze_source_with_providers_inner(
             session.occurrences
         },
         includes: session.includes,
-        facts: session.state,
+        facts: Some(session.state),
         header: Fact::Unknown(UnknownReason::HeaderNotAnalyzed),
         reasons: session.reasons,
         observations: session.observations,
@@ -948,12 +991,12 @@ struct RootSession<'a, 'b> {
     directive_fragments: AdmittedOwned<Vec<DirectiveFragments>>,
     directive_fragment_slots: usize,
     current_directive: usize,
-    state: CompileTimeState,
+    state: AdmittedOwned<CompileTimeState>,
     budget: &'a mut CompileTimeBudget<'b>,
     reasons: Vec<IncompleteReason>,
     includes: Vec<IncludeOccurrence>,
     fatal: Option<IncompleteReason>,
-    current: Vec<ReachablePath>,
+    current: Vec<AdmittedOwned<ReachablePath>>,
     frames: Vec<ReachableFrame>,
     last_condition: Truth,
     providers: &'a mut ProviderSession,
@@ -962,12 +1005,15 @@ struct RootSession<'a, 'b> {
 
 struct ReachablePath {
     environment: ConditionalEnvironment,
+    // snapshot/new admitted the receiving Box<State>'s exact inline storage.
+    // Collapse destroys that Box; only this named construction invoice retires.
+    boxed_state_invoice: usize,
 }
 
 #[derive(Default)]
 struct ReachableFrame {
-    pending: Vec<ReachablePath>,
-    joined: Vec<ReachablePath>,
+    pending: Vec<AdmittedOwned<ReachablePath>>,
+    joined: Vec<AdmittedOwned<ReachablePath>>,
     has_else: bool,
 }
 
@@ -1023,28 +1069,19 @@ impl ProviderEngine<'_, '_> {
         match query {
             ExpressionQuery::Defined(..) => Ok(()),
             ExpressionQuery::SizeOf { argument, .. } => {
-                let before = self.budget.manual_retained();
-                match parse_sizeof_operand(argument, self.budget) {
+                let operand = self
+                    .budget
+                    .admit_compilation(0, |budget| Ok(parse_sizeof_operand(argument, budget)))?;
+                match &*operand {
                     Fact::Known(operand) => {
-                        let leading = operand
-                            .leading_name(self.budget)
-                            .map_err(|r| resolver_error(r, self.budget));
-                        let scratch = self.budget.manual_retained().saturating_sub(before);
-                        let result = match &leading {
-                            Ok((name, pointers)) => {
-                                self.prepare_name(state, site, name, *pointers, depth + 1)
-                            }
-                            Err(_) => Ok(()),
-                        };
-                        drop(operand);
-                        let error = leading.err();
-                        self.budget.release(scratch);
-                        if let Some(error) = error {
-                            return Err(error);
-                        }
-                        result
+                        let leading = self.budget.admit_compilation(0, |budget| {
+                            operand
+                                .leading_name(budget)
+                                .map_err(|r| resolver_error(r, budget))
+                        })?;
+                        self.prepare_name(state, site, &leading.0, leading.1, depth + 1)
                     }
-                    Fact::Incomplete(r) => Err(resolver_error(r, self.budget)),
+                    Fact::Incomplete(r) => Err(resolver_error(r.clone(), self.budget)),
                     Fact::Unknown(_) => Ok(()),
                 }
             }
@@ -1119,14 +1156,11 @@ impl ProviderEngine<'_, '_> {
             push_owner(&mut self.providers.declarations, key, self.budget)?;
             // Retain the original captured sites while mutating only the live
             // graph's lazy capabilities. Copying a snapshot is not syntax work.
-            let snapshot_before = self.budget.manual_retained();
-            let copy = state
-                .snapshot(self.budget)
-                .map_err(|r| resolver_error(r, self.budget));
-            let snapshot_bytes = self
-                .budget
-                .manual_retained()
-                .saturating_sub(snapshot_before);
+            let copy = self.budget.admit_compilation(0, |budget| {
+                state
+                    .snapshot(budget)
+                    .map_err(|r| resolver_error(r, budget))
+            });
             let result = copy.and_then(|copy| {
                 let binding = super::bindings::lookup(&copy, site, name, self.budget)
                     .map_err(|r| resolver_error(r, self.budget))?;
@@ -1153,7 +1187,6 @@ impl ProviderEngine<'_, '_> {
                 }
                 self.prepare_type(state, &decl.type_site, &decl.ty, pointers, depth + 1)
             });
-            self.budget.release(snapshot_bytes);
             self.providers.declarations.value_mut().pop();
             return result;
         }
@@ -1320,19 +1353,20 @@ impl ProviderEngine<'_, '_> {
         text: &str,
         depth: usize,
     ) -> Result<(), ResolverError> {
-        let before = self.budget.manual_retained();
-        let environment = if let Some((_, environment)) = state
-            .scalar_history
-            .iter()
-            .rev()
-            .find(|(seq, _)| seq.0 <= site.sequence.0)
-        {
-            environment.snapshot_scalar(self.budget)
-        } else {
-            ConditionalEnvironment::context_snapshot(&state.context, self.budget)
-        }
-        .map_err(|r| resolver_error(r, self.budget))?;
-        let environment_bytes = self.budget.manual_retained().saturating_sub(before);
+        let environment = self.budget.admit_compilation(0, |budget| {
+            let environment = if let Some((_, environment)) = state
+                .scalar_history
+                .iter()
+                .rev()
+                .find(|(seq, _)| seq.0 <= site.sequence.0)
+            {
+                environment.snapshot_scalar(budget)
+            } else {
+                ConditionalEnvironment::context_snapshot(&state.context, budget)
+            }
+            .map_err(|r| resolver_error(r, budget))?;
+            Ok(environment)
+        })?;
         let resolver = &mut *self.resolver;
         let providers = &mut *self.providers;
         let observations = &mut *self.observations;
@@ -1368,7 +1402,7 @@ impl ProviderEngine<'_, '_> {
             false,
             false,
         );
-        self.budget.release(environment_bytes);
+        drop(environment);
         if let Some(error) = error {
             return Err(error);
         }
@@ -1548,8 +1582,10 @@ impl ProviderEngine<'_, '_> {
                 return Err(resolver_error(reason.clone(), self.budget));
             }
             let result = analysis
-                .with_budget_mut(self.budget, |analysis, budget| {
-                    let site = analysis.facts.site();
+                .value_mut()
+                .facts_mut()
+                .with_budget_mut(self.budget, |facts, budget| {
+                    let site = facts.site();
                     let mut engine = ProviderEngine {
                         resolver: self.resolver,
                         providers: self.providers,
@@ -1558,7 +1594,7 @@ impl ProviderEngine<'_, '_> {
                         observations: self.observations,
                         warnings: self.warnings,
                     };
-                    engine.prepare_name(&mut analysis.facts, &site, name, pointers, depth + 1)
+                    engine.prepare_name(facts, &site, name, pointers, depth + 1)
                 })
                 .map_err(|r| resolver_error(r, self.budget))?;
             result?;
@@ -1568,32 +1604,31 @@ impl ProviderEngine<'_, '_> {
         let mut analysis = result?;
         append_observations(self.observations, &analysis.observations, self.budget)?;
         append_warnings(self.warnings, &analysis.warnings, self.budget)?;
-        if !analysis.facts.interface_complete {
+        if !analysis.facts().interface_complete {
             return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
         }
-        self.budget
-            .charge(
-                analysis.occurrences.len(),
-                0,
-                analysis.occurrences.len() * size_of::<LoadedSource>(),
-            )
-            .map_err(|r| resolver_error(r, self.budget))?;
-        analysis
-            .with_budget_mut(self.budget, |analysis, budget| {
-                let metadata = analysis
-                    .occurrences
+        let output = analysis.value_mut();
+        let occurrences = &output.occurrences;
+        output
+            .facts
+            .as_mut()
+            .expect("provider facts owner")
+            .with_budget_mut(self.budget, |facts, budget| {
+                let metadata = occurrences
                     .iter()
                     .map(|o| crate::resolver::loaded_source_metadata_retained(&o.source))
                     .sum::<usize>();
                 budget
-                    .charge(1, metadata, metadata + size_of::<AdmittedSourceBacking>())
+                    .charge(
+                        1,
+                        metadata,
+                        metadata
+                            + size_of::<AdmittedSourceBacking>()
+                            + occurrences.len() * size_of::<LoadedSource>(),
+                    )
                     .map_err(|r| resolver_error(r, budget))?;
-                analysis.facts.provider_sources = analysis
-                    .occurrences
-                    .iter()
-                    .map(|o| o.source.clone())
-                    .collect();
-                analysis.facts.provider_backings.push(
+                facts.provider_sources = occurrences.iter().map(|o| o.source.clone()).collect();
+                facts.provider_backings.push(
                     provider
                         .backing
                         .as_ref()
@@ -1604,8 +1639,11 @@ impl ProviderEngine<'_, '_> {
             })
             .map_err(|r| resolver_error(r, self.budget))??;
         let graph = analysis
+            .value_mut()
             .facts
-            .admitted_snapshot(self.budget)
+            .take()
+            .expect("provider facts owner")
+            .into_shared(self.budget)
             .and_then(|v| v.into_arc(self.budget))
             .map_err(|r| resolver_error(r, self.budget))?;
         drop(analysis);
@@ -1616,53 +1654,61 @@ impl ProviderEngine<'_, '_> {
 impl RootSession<'_, '_> {
     fn resolve_pending_imports(&mut self, activity: Truth) -> Result<(), ResolverError> {
         for index in 0..self.current.len() {
-            let imports = std::mem::take(&mut self.current[index].state_mut().pending_imports);
+            let imports =
+                std::mem::take(&mut self.current[index].value_mut().state_mut().pending_imports);
             for identity in imports {
-                self.budget
-                    .charge(self.physical_paths.len(), 0, 0)
-                    .map_err(|r| resolver_error(r, self.budget))?;
-                let path = &self
-                    .physical_paths
-                    .iter()
-                    .find(|(id, _)| *id == identity.opener.occurrence)
-                    .ok_or_else(|| {
-                        ResolverError::InvalidRequest("missing import opener occurrence".into())
-                    })?
-                    .1;
-                self.budget
-                    .charge(
-                        1,
-                        identity.name.len() + path.as_os_str().len(),
-                        size_of::<super::bindings::InterfaceFacts>()
-                            + size_of::<String>()
-                            + identity.name.len()
-                            + path.as_os_str().len(),
-                    )
-                    .map_err(|r| resolver_error(r, self.budget))?;
-                let qualifiers = vec![identity.name.clone()];
-                let site = identity.site.clone();
-                let pending = super::bindings::PendingProvider {
-                    identity,
-                    importer_path: path.clone(),
-                    authorized: activity == Truth::True,
-                };
-                self.current[index].state_mut().interfaces.reserve_exact(1);
                 self.current[index]
-                    .state_mut()
-                    .interfaces
-                    .push(super::bindings::InterfaceFacts {
-                        qualifiers,
-                        site,
-                        graph: None,
-                        pending,
-                        attempted: activity != Truth::True,
-                        provided: None,
-                        failure: if activity != Truth::True {
-                            Some(UnknownReason::UnknownActivity)
-                        } else {
-                            None
-                        },
-                    });
+                    .with_budget_mut(self.budget, |path_state, budget| {
+                        budget
+                            .charge(self.physical_paths.len(), 0, 0)
+                            .map_err(|r| resolver_error(r, budget))?;
+                        let path = &self
+                            .physical_paths
+                            .iter()
+                            .find(|(id, _)| *id == identity.opener.occurrence)
+                            .ok_or_else(|| {
+                                ResolverError::InvalidRequest(
+                                    "missing import opener occurrence".into(),
+                                )
+                            })?
+                            .1;
+                        budget
+                            .charge(
+                                1,
+                                identity.name.len() + path.as_os_str().len(),
+                                size_of::<super::bindings::InterfaceFacts>()
+                                    + size_of::<String>()
+                                    + identity.name.len()
+                                    + path.as_os_str().len(),
+                            )
+                            .map_err(|r| resolver_error(r, budget))?;
+                        let qualifiers = vec![identity.name.clone()];
+                        let site = identity.site.clone();
+                        let pending = super::bindings::PendingProvider {
+                            identity,
+                            importer_path: path.clone(),
+                            authorized: activity == Truth::True,
+                        };
+                        path_state.state_mut().interfaces.reserve_exact(1);
+                        path_state
+                            .state_mut()
+                            .interfaces
+                            .push(super::bindings::InterfaceFacts {
+                                qualifiers,
+                                site,
+                                graph: None,
+                                pending,
+                                attempted: activity != Truth::True,
+                                provided: None,
+                                failure: if activity != Truth::True {
+                                    Some(UnknownReason::UnknownActivity)
+                                } else {
+                                    None
+                                },
+                            });
+                        Ok(())
+                    })
+                    .map_err(|r| resolver_error(r, self.budget))??;
             }
         }
         Ok(())
@@ -1928,7 +1974,7 @@ impl RootSession<'_, '_> {
     fn split(
         &mut self,
         directive: &ConditionalDirective,
-    ) -> Result<Vec<ReachablePath>, IncompleteReason> {
+    ) -> Result<Vec<AdmittedOwned<ReachablePath>>, IncompleteReason> {
         let mut remaining = Vec::new();
         let total = self.reachable_count();
         let mut selected = Vec::new();
@@ -1936,23 +1982,26 @@ impl RootSession<'_, '_> {
         self.budget.charge(
             self.current.len(),
             0,
-            self.current.len() * (size_of::<Truth>() + 2 * size_of::<ReachablePath>()),
+            self.current.len()
+                * (size_of::<Truth>() + 2 * size_of::<AdmittedOwned<ReachablePath>>()),
         )?;
         let mut decisions = Vec::new();
         let mut paths = std::mem::take(&mut self.current);
         for path in &mut paths {
-            let condition = evaluate_path_condition(
-                &self.directive_fragments[self.current_directive].body_fragments,
-                path,
-                directive,
-                &mut self.budget,
-                self.resolver,
-                self.providers,
-                self.cancel,
-                &mut self.observations,
-                &mut self.warnings,
-                &mut self.resource_error,
-            )?;
+            let condition = path.with_budget_mut(self.budget, |path, budget| {
+                evaluate_path_condition(
+                    &self.directive_fragments[self.current_directive].body_fragments,
+                    path,
+                    directive,
+                    budget,
+                    self.resolver,
+                    self.providers,
+                    self.cancel,
+                    &mut self.observations,
+                    &mut self.warnings,
+                    &mut self.resource_error,
+                )
+            })??;
             aggregate = Some(aggregate.map_or(condition, |prior: Truth| prior.merge(condition)));
             decisions.push(condition);
         }
@@ -1966,7 +2015,17 @@ impl RootSession<'_, '_> {
         let mut clones = Vec::new();
         for (path, decision) in self.current.iter().zip(&decisions) {
             clones.push(if *decision == Truth::Unknown {
-                Some(path.snapshot(&mut self.budget)?)
+                Some(
+                    match self.budget.admit_compilation(0, |budget| {
+                        path.snapshot(budget).map_err(|r| resolver_error(r, budget))
+                    }) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            self.resource_error = Some(error);
+                            return Err(IncompleteReason::MalformedSource);
+                        }
+                    },
+                )
             } else {
                 None
             });
@@ -2052,7 +2111,7 @@ impl RootSession<'_, '_> {
         if let Err(reason) = self.budget.charge(
             self.reasons.len() + 1,
             dynamic,
-            2 * (size_of::<IncompleteReason>() + dynamic),
+            size_of::<IncompleteReason>() + dynamic,
         ) {
             self.fatal = Some(reason);
             return;
@@ -2061,7 +2120,11 @@ impl RootSession<'_, '_> {
             self.reasons.push(reason.clone());
         }
         if self.state.failure.is_none() {
-            self.state.failure = Some(reason);
+            if let Err(reason) = self.state.grow(self.budget, 1, dynamic, dynamic, |state| {
+                state.failure = Some(reason.clone());
+            }) {
+                self.fatal = Some(reason);
+            }
         }
     }
 }
@@ -2074,7 +2137,9 @@ impl ReachablePath {
         budget.charge(self.state().option_stack.len(), 0, 0)?;
         for saved in &mut self.state_mut().option_stack {
             if let Some(saved) = saved.take() {
-                budget.release(saved.recovery_payload_bytes());
+                let invoice = saved.recovery_payload_bytes();
+                drop(saved);
+                budget.release(invoice);
             }
         }
         Ok(())
@@ -2095,15 +2160,48 @@ impl ReachablePath {
     }
     fn snapshot(&self, budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
         // The environment owns the complete typed continuation, not a context projection.
+        // snapshot_typed admits the Box<State> and scalar inline footprint before
+        // cloning; the latter reserves this path's eventual conditional Box.
         let before = budget.manual_retained();
-        budget.charge(1, 0, size_of::<Self>())?;
         match self.environment.snapshot_typed(budget) {
-            Ok(environment) => Ok(Self { environment }),
+            Ok(environment) => Ok(Self {
+                environment,
+                boxed_state_invoice: size_of::<CompileTimeState>(),
+            }),
             Err(reason) => {
                 budget.release(budget.manual_retained().saturating_sub(before));
                 Err(reason)
             }
         }
+    }
+}
+
+impl AdmittedOwned<ReachablePath> {
+    fn feed_owned(
+        &mut self,
+        fragment: SourceFragment<'_>,
+        activity: Truth,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        self.with_budget_mut(budget, |path, budget| {
+            path.state_mut().feed(fragment, activity, budget)
+        })?
+    }
+    fn finish_owned(&mut self, budget: &mut CompileTimeBudget<'_>) -> Result<(), IncompleteReason> {
+        self.with_budget_mut(budget, |path, budget| path.state_mut().finish_root(budget))?
+    }
+    fn into_state_owner(
+        self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedOwned<CompileTimeState>, IncompleteReason> {
+        let boxed_state_invoice = self.boxed_state_invoice;
+        // Scalar construction/snapshot already reserved its future conditional
+        // Box's inline storage. The path carrier owns the current inline scalar
+        // environment, so no second context copy or payload traversal occurs.
+        let mut state = self.map_value(budget, ReachablePath::into_state)?;
+        // into_state destroyed the original, separately admitted Box<State>.
+        state.retire_storage(boxed_state_invoice)?;
+        Ok(state)
     }
 }
 
@@ -2203,7 +2301,7 @@ impl SourceOrder for RootSession<'_, '_> {
         for (anchor, text) in next.deferred.iter() {
             if self.reasons.is_empty() {
                 for path in &mut self.current {
-                    if let Err(reason) = path.state_mut().feed(
+                    if let Err(reason) = path.feed_owned(
                         SourceFragment {
                             source: &anchor.source,
                             occurrence: anchor.occurrence,
@@ -2399,7 +2497,7 @@ impl SourceOrder for RootSession<'_, '_> {
         }
         let mut failure = None;
         for path in &mut self.current {
-            if let Err(reason) = path.state_mut().feed(
+            if let Err(reason) = path.feed_owned(
                 SourceFragment {
                     source: &self.root.id,
                     occurrence: self.occurrence,
@@ -2479,7 +2577,10 @@ impl SourceOrder for RootSession<'_, '_> {
         } else {
             let mut failure = None;
             for path in &mut self.current {
-                if let Err(reason) = apply_path_directive(path, directive, &mut self.budget) {
+                let result = path.with_budget_mut(self.budget, |path, budget| {
+                    apply_path_directive(path, directive, budget)
+                });
+                if let Err(reason) = result.and_then(|r| r) {
                     failure = Some(reason);
                     break;
                 }
@@ -2530,7 +2631,16 @@ fn apply_path_directive_inner(
             budget.limits().max_scope_depth,
             "max_scope_depth",
         )?;
-        budget.charge(1, 0, size_of::<Option<ConditionalEnvironment>>())?;
+        if path.state().option_stack.len() == path.state().option_stack.capacity() {
+            let slots = (path.state().option_stack.len() + 1)
+                .checked_mul(size_of::<Option<ConditionalEnvironment>>())
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let old_slots = path.state().option_stack_slots;
+            budget.charge(1, old_slots, slots)?;
+            path.state_mut().option_stack.reserve_exact(1);
+            path.state_mut().option_stack_slots = slots;
+            budget.release(old_slots);
+        }
         let saved = if supported {
             Some(path.environment.snapshot_scalar(budget)?)
         } else {
@@ -2543,11 +2653,7 @@ fn apply_path_directive_inner(
         || key.eq_ignore_ascii_case("PUSH")
     {
         let saved = if key.eq_ignore_ascii_case("POPOPT") {
-            let popped = path.state_mut().option_stack.pop();
-            if popped.is_some() {
-                budget.release(size_of::<Option<ConditionalEnvironment>>());
-            }
-            popped.flatten()
+            path.state_mut().option_stack.pop().flatten()
         } else {
             None
         };
@@ -2560,11 +2666,16 @@ fn apply_path_directive_inner(
             },
             budget,
         );
-        if let Some(saved) = &saved {
-            budget.release(saved.recovery_payload_bytes());
+        let saved_missing = saved.is_none();
+        let saved_invoice = saved
+            .as_ref()
+            .map(ConditionalEnvironment::recovery_payload_bytes);
+        drop(saved);
+        if let Some(invoice) = saved_invoice {
+            budget.release(invoice);
         }
         restored?;
-        if !supported || saved.is_none() {
+        if !supported || saved_missing {
             path.poison_options(budget)?;
         }
     }
@@ -2713,6 +2824,221 @@ mod tests {
     use super::*;
     use crate::{NoCancellation, SourceId, SourceRevision};
 
+    struct NoGraphCallbacks;
+    impl CompileTimeResolver for NoGraphCallbacks {
+        fn include(
+            &mut self,
+            _: IncludeResolveRequest<'_>,
+            _: &mut CompileTimeBudget<'_>,
+            _: &dyn CancellationToken,
+        ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+            panic!("graph fixture has no include");
+        }
+        fn unit(
+            &mut self,
+            _: UnitResolveRequest<'_>,
+            _: &mut CompileTimeBudget<'_>,
+            _: &dyn CancellationToken,
+        ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+            panic!("graph fixture has no unit");
+        }
+    }
+    fn graph_source(text: &str) -> LoadedSource {
+        LoadedSource {
+            id: SourceId::new("graph.pas"),
+            path: "graph.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+            compile_time_backing: None,
+        }
+    }
+
+    #[test]
+    fn actual_branch_facts_collapse_and_promotion_move_every_captured_backing() {
+        let root = graph_source(
+            "unit T; interface {$IF MISSING}{$DEFINE A}{$ELSE}{$UNDEF A}{$ENDIF}{$DEFINE COMMON} type R=record X:Byte; end; implementation end.",
+        );
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut providers = ProviderSession::new(&mut budget).unwrap();
+        let analysis = analyze_source_with_providers(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+            &mut providers,
+            false,
+            OccurrenceId(0),
+        )
+        .unwrap();
+        assert_eq!(analysis.facts().reachable_states().count(), 2);
+        let alternatives = analysis.facts().alternatives.as_ptr();
+        let captures = analysis
+            .facts()
+            .reachable_states()
+            .map(|state| {
+                (
+                    state.scopes.as_ptr(),
+                    state.declarations.as_ptr(),
+                    state.scalar_history.as_ptr(),
+                    state.conditional_environment().unwrap() as *const ConditionalEnvironment,
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = publish_analysis(analysis, &mut budget).unwrap();
+        assert_eq!(output.facts.alternatives.as_ptr(), alternatives);
+        for (state, (scopes, declarations, history, environment)) in
+            output.facts.reachable_states().zip(captures)
+        {
+            assert_eq!(state.scopes.as_ptr(), scopes);
+            assert_eq!(state.declarations.as_ptr(), declarations);
+            assert_eq!(state.scalar_history.as_ptr(), history);
+            assert_eq!(
+                state.conditional_environment().unwrap() as *const _,
+                environment
+            );
+        }
+        let snapshot = output.facts.try_clone(&mut budget).unwrap();
+        drop(providers);
+        drop(budget);
+        drop(output);
+        let contexts = snapshot
+            .reachable_states()
+            .map(|state| {
+                assert!(
+                    state
+                        .declarations
+                        .iter()
+                        .any(|d| d.name.eq_ignore_ascii_case("R"))
+                );
+                assert!(state.scalar_history.len() >= 3);
+                state.conditional_environment().unwrap().to_context()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            contexts
+                .iter()
+                .any(|c| c.defines.get("a").or_else(|| c.defines.get("A")) == Some(&Truth::True))
+        );
+        assert!(
+            contexts
+                .iter()
+                .any(|c| c.defines.get("a").or_else(|| c.defines.get("A")) == Some(&Truth::False))
+        );
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > baseline);
+        drop(snapshot);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn actual_facts_owner_does_not_retain_root_output_or_dead_compilation_scratch() {
+        let measure = |padding| {
+            let root = graph_source(&format!(
+                "unit T; interface {{{}}} type R=record X:Byte; end; implementation end.",
+                "x".repeat(padding)
+            ));
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = observer.budget_snapshot().retained_bytes;
+            let output = analyze_source_in_session(
+                &root,
+                &ConditionalContext::default(),
+                &mut NoGraphCallbacks,
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+            let graph = output.facts.try_clone(&mut budget).unwrap();
+            drop(output);
+            let graph_only = observer.budget_snapshot().retained_bytes - baseline;
+            drop(graph);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            graph_only
+        };
+        assert_eq!(
+            measure(0),
+            measure(4096),
+            "the same actual graph must not inherit root text/projection/parser/coordinator invoices"
+        );
+    }
+
+    #[test]
+    fn actual_partial_branch_cancellation_drops_new_graph_owners_not_live_sibling() {
+        struct CancelAt(std::cell::Cell<usize>, usize);
+        impl CancellationToken for CancelAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= self.1
+            }
+        }
+        let root = graph_source(
+            "unit T; interface {$IF MISSING}{$DEFINE A}{$ELSE}{$UNDEF A}{$ENDIF} type R=record X:Byte; end; {$IF OTHER}{$DEFINE B}{$ELSE}{$UNDEF B}{$ENDIF} implementation end.",
+        );
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let sibling = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let sibling_ptr = sibling.facts.declarations.as_ptr();
+        for allowed in [0, 1, 20, 100, 300, 600, 900] {
+            let before = observer.budget_snapshot();
+            let cancel = CancelAt(std::cell::Cell::new(0), allowed);
+            let mut cancelled = observer.store_budget(CompileTimeLimits::default(), &cancel);
+            assert!(
+                matches!(
+                    analyze_source_in_session(
+                        &root,
+                        &ConditionalContext::default(),
+                        &mut NoGraphCallbacks,
+                        &mut cancelled,
+                        &cancel
+                    ),
+                    Err(ResolverError::Cancelled)
+                ),
+                "boundary {allowed}"
+            );
+            let after = observer.budget_snapshot();
+            assert_eq!(
+                after.retained_bytes, before.retained_bytes,
+                "partial graph owner cleanup at boundary {allowed}"
+            );
+            assert!(after.work >= before.work);
+            assert!(after.byte_work >= before.byte_work);
+            assert_eq!(sibling.facts.declarations.as_ptr(), sibling_ptr);
+        }
+        drop(sibling);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
     #[test]
     fn actual_final_sidebuffer_publication_moves_backing_and_receipts() {
         struct NoCallbacks;
@@ -2793,6 +3119,9 @@ mod tests {
         let fragment_ptr = analysis.directive_fragments[0].fragments.as_ptr();
         let body_fragment_ptr = analysis.directive_fragments[0].body_fragments.as_ptr();
         let directive_body_ptr = analysis.directive_fragments[0].directive.body.as_ptr();
+        let scopes_ptr = analysis.facts().scopes.as_ptr();
+        let declarations_ptr = analysis.facts().declarations.as_ptr();
+        let scalar_history_ptr = analysis.facts().scalar_history.as_ptr();
         struct CancelAt(std::cell::Cell<usize>, usize);
         impl CancellationToken for CancelAt {
             fn is_cancelled(&self) -> bool {
@@ -2837,17 +3166,6 @@ mod tests {
             assert!(after.work >= before.work);
             assert!(after.byte_work >= before.byte_work);
         }
-        let mut facts_copy = 0;
-        analysis
-            .facts
-            .visit_snapshot_payload(&mut |n| {
-                facts_copy += n;
-                Ok(())
-            })
-            .unwrap();
-        // admitted_snapshot's carrier constructor separately admits the inline
-        // state/control floor; its byte-work invoice is owned backing only.
-        facts_copy -= size_of::<CompileTimeState>();
         let remaining_output_copy = conditional_output_payload(&analysis.root).unwrap()
             + analysis
                 .occurrences
@@ -2862,9 +3180,12 @@ mod tests {
         let output = publish_analysis(analysis, &mut budget).unwrap();
         assert_eq!(
             budget.snapshot().byte_work - before_publication.byte_work,
-            facts_copy + remaining_output_copy,
-            "publication copies the still-plain facts/root, not emitted physical metadata or sidebuffers"
+            remaining_output_copy,
+            "facts promotion moves existing backing and credits without a graph copy invoice"
         );
+        assert_eq!(output.facts.scopes.as_ptr(), scopes_ptr);
+        assert_eq!(output.facts.declarations.as_ptr(), declarations_ptr);
+        assert_eq!(output.facts.scalar_history.as_ptr(), scalar_history_ptr);
         assert_eq!(output.directive_fragments.as_ptr(), physical_ptr);
         assert_eq!(
             output.directive_fragments[0].fragments.as_ptr(),
@@ -3279,7 +3600,10 @@ mod tests {
             .unwrap();
         let mut environment = ConditionalEnvironment::from_context(&context);
         environment.typed_state = Some(Box::new(state));
-        let mut path = ReachablePath { environment };
+        let mut path = ReachablePath {
+            environment,
+            boxed_state_invoice: size_of::<CompileTimeState>(),
+        };
         for body in ["B+", "PUSHOPT", "B-"] {
             apply_path_directive(
                 &mut path,

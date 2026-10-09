@@ -71,6 +71,8 @@ pub struct CompileTimeState {
     pending_start: usize,
     pending: String,
     word: String,
+    pending_backing: usize,
+    word_backing: usize,
     lex: Lex,
     section: Section,
     composite_depth: usize,
@@ -85,6 +87,7 @@ pub struct CompileTimeState {
     /// Independent reachable continuations; never a synthesized graph.
     pub(super) alternatives: Vec<CompileTimeState>,
     pub(super) option_stack: Vec<Option<crate::conditional::ConditionalEnvironment>>,
+    pub(super) option_stack_slots: usize,
     pub(super) conditional: Option<Box<crate::conditional::ConditionalEnvironment>>,
     pub(super) scalar_history: Vec<(Sequence, crate::conditional::ConditionalEnvironment)>,
     pub(super) pending_imports: Vec<super::bindings::ImportIdentity>,
@@ -131,7 +134,7 @@ impl CompileTimeState {
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Self, IncompleteReason> {
         let before = budget.manual_retained();
-        let result = Self::new_inner(context, root, budget);
+        let result = Self::new_inner(context, root, budget, size_of::<Self>());
         if result.is_err() {
             // Admission above the previous owner's live payload is not an
             // allocation until the whole context has been admitted.
@@ -140,17 +143,29 @@ impl CompileTimeState {
         result
     }
 
+    pub(crate) fn admitted_new(
+        context: &ConditionalContext,
+        root: &LoadedSource,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedOwned<Self>, crate::ResolverError> {
+        budget.admit_compilation(0, |budget| {
+            // The independently minted carrier already includes inline Self.
+            Self::new_inner(context, root, budget, 0).map_err(|r| super::resolver_error(r, budget))
+        })
+    }
+
     fn new_inner(
         context: &ConditionalContext,
         root: &LoadedSource,
         budget: &mut CompileTimeBudget<'_>,
+        inline_invoice: usize,
     ) -> Result<Self, IncompleteReason> {
         limit(1, budget.limits().max_scope_depth, "max_scope_depth")?;
         // Account the complete context before cloning, including its strings.
         budget.charge(
             1,
             root.id.as_str().len(),
-            size_of::<Self>() + size_of::<Scope>() + size_of::<ScopeId>(),
+            inline_invoice + size_of::<Scope>() + size_of::<ScopeId>(),
         )?;
         let entries = context
             .defines
@@ -194,6 +209,8 @@ impl CompileTimeState {
             pending_start: 0,
             pending: String::new(),
             word: String::new(),
+            pending_backing: 0,
+            word_backing: 0,
             lex: Lex::Normal,
             section: Section::None,
             composite_depth: 0,
@@ -207,6 +224,7 @@ impl CompileTimeState {
             unknown: false,
             alternatives: Vec::new(),
             option_stack: Vec::new(),
+            option_stack_slots: 0,
             conditional: None,
             scalar_history: Vec::new(),
             pending_imports: Vec::new(),
@@ -284,8 +302,7 @@ impl CompileTimeState {
                 budget.limits().max_pending_bytes,
                 "max_pending_bytes",
             )?;
-            budget.charge(0, 0, ch.len_utf8())?;
-            self.pending.push(ch);
+            push_continuation_char(&mut self.pending, &mut self.pending_backing, ch, budget)?;
             self.logical = self
                 .logical
                 .checked_add(ch.len_utf8())
@@ -335,8 +352,9 @@ impl CompileTimeState {
     }
 
     fn clear_pending(&mut self, budget: &mut CompileTimeBudget<'_>) {
-        budget.release(self.pending.len());
-        self.pending = String::new();
+        let pending = std::mem::take(&mut self.pending);
+        drop(pending);
+        budget.release(std::mem::replace(&mut self.pending_backing, 0));
         self.pending_start = self.logical;
         self.rhs = false;
         self.pending_class = false;
@@ -417,8 +435,7 @@ impl CompileTimeState {
                 budget.limits().max_pending_bytes,
                 "max_pending_bytes",
             )?;
-            budget.charge(0, 0, ch.len_utf8())?;
-            self.word.push(ch);
+            push_continuation_char(&mut self.word, &mut self.word_backing, ch, budget)?;
             return Ok(());
         }
         self.flush_word(budget)?;
@@ -482,7 +499,8 @@ impl CompileTimeState {
         let mut word = std::mem::take(&mut self.word);
         word.make_ascii_lowercase();
         let result = self.process_word(&word, budget);
-        budget.release(word.len());
+        drop(word);
+        budget.release(std::mem::replace(&mut self.word_backing, 0));
         result
     }
 
@@ -576,7 +594,7 @@ impl CompileTimeState {
                 let start = self.pending.len().saturating_sub(word.len() + 1);
                 if start > 0 {
                     self.pending.drain(..start);
-                    budget.release(start);
+                    // Draining the prefix does not free the String backing.
                     self.pending_start += start;
                 }
             }
@@ -622,14 +640,16 @@ impl CompileTimeState {
         if self.section == Section::None && self.unit_name.is_none() && self.sequence.0 == 0 {
             let suffix = " interface implementation end.";
             let len = self.pending.len() + suffix.len();
-            budget.charge(1, len, len)?;
-            let mut source = String::with_capacity(len);
-            source.push_str(&self.pending);
-            source.push_str(suffix);
+            let source = budget.admit_owned(1, len, len, || {
+                let mut source = String::with_capacity(len);
+                source.push_str(&self.pending);
+                source.push_str(suffix);
+                source
+            })?;
             let result = crate::parser::PARSER.with(|cell| {
                 let tree = cell
                     .borrow_mut()
-                    .parse(&source, None)
+                    .parse(source.as_bytes(), None)
                     .ok_or(IncompleteReason::MalformedSource)?;
                 if tree.root_node().has_error() {
                     return Ok(());
@@ -648,7 +668,7 @@ impl CompileTimeState {
                 }
                 Ok(())
             });
-            budget.release(len);
+            drop(source);
             result?;
         }
         let (prefix, suffix, kind) = match self.section {
@@ -682,15 +702,17 @@ impl CompileTimeState {
             budget.limits().max_pending_bytes,
             "max_pending_bytes",
         )?;
-        budget.charge(1, len, len)?;
-        let mut source = String::with_capacity(len);
-        source.push_str(prefix);
-        source.push_str(&self.pending);
-        source.push_str(suffix);
+        let source = budget.admit_owned(1, len, len, || {
+            let mut source = String::with_capacity(len);
+            source.push_str(prefix);
+            source.push_str(&self.pending);
+            source.push_str(suffix);
+            source
+        })?;
         let result = crate::parser::PARSER.with(|cell| {
             let tree = cell
                 .borrow_mut()
-                .parse(&source, None)
+                .parse(source.as_bytes(), None)
                 .ok_or(IncompleteReason::MalformedSource)?;
             let valid = !tree.root_node().has_error();
             let Some(decl) = find_node(tree.root_node(), kind, budget)? else {
@@ -731,7 +753,7 @@ impl CompileTimeState {
             }
             Ok(())
         });
-        budget.release(len);
+        drop(source);
         result
     }
 
@@ -1401,25 +1423,21 @@ impl CompileTimeState {
             budget.release(budget.manual_retained().saturating_sub(before));
             return Err(reason.unwrap_or(IncompleteReason::MalformedSource));
         }
-        Ok(self.clone())
+        let mut copy = self.clone();
+        copy.install_copied_backing_invoices();
+        Ok(copy)
     }
 
-    pub(crate) fn admitted_snapshot(
-        &self,
-        budget: &mut CompileTimeBudget<'_>,
-    ) -> Result<AdmittedShared<Self>, IncompleteReason> {
-        let mut payload = 0usize;
-        self.visit_snapshot_payload(&mut |n| {
-            payload = payload.checked_add(n).ok_or("graph snapshot overflow")?;
-            Ok(())
-        })
-        .map_err(|_| IncompleteReason::MalformedSource)?;
-        let payload = payload
-            .checked_sub(size_of::<Self>())
-            .ok_or(IncompleteReason::MalformedSource)?;
-        budget
-            .admit_owned(1, payload, payload, || self.clone())?
-            .into_shared(budget)
+    fn install_copied_backing_invoices(&mut self) {
+        // Snapshot visitors admitted the copied String/Vec backing before
+        // cloning. Clone receives len-sized backing, not the source capacity.
+        self.pending_backing = self.pending.len();
+        self.word_backing = self.word.len();
+        self.option_stack_slots = self.option_stack.len()
+            * size_of::<Option<crate::conditional::ConditionalEnvironment>>();
+        for alternative in &mut self.alternatives {
+            alternative.install_copied_backing_invoices();
+        }
     }
 
     /// Every retained path, including the primary continuation.
@@ -1450,6 +1468,37 @@ impl CompileTimeState {
                     .sum::<usize>(),
             )
     }
+}
+
+/// Continuation text remains in the actual state across physical feeds/forks.
+/// Admit a full replacement peak under that state owner before copying, and
+/// retire only the previously minted backing invoice after its String dies.
+fn push_continuation_char(
+    text: &mut String,
+    backing_invoice: &mut usize,
+    ch: char,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    let needed = text
+        .len()
+        .checked_add(ch.len_utf8())
+        .ok_or(IncompleteReason::MalformedSource)?;
+    if needed > text.capacity() {
+        let capacity = text
+            .capacity()
+            .max(8)
+            .saturating_mul(2)
+            .min(budget.limits().max_pending_bytes)
+            .max(needed);
+        budget.charge(1, text.len(), capacity)?;
+        let mut replacement = String::with_capacity(capacity);
+        replacement.push_str(text);
+        let previous = std::mem::replace(text, replacement);
+        drop(previous);
+        budget.release(std::mem::replace(backing_invoice, capacity));
+    }
+    text.push(ch);
+    Ok(())
 }
 
 fn find_node<'a>(

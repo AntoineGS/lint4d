@@ -778,8 +778,8 @@ pub struct AdmittedCapabilityOutcome<T> {
     reports: AdmittedCapabilityReports,
 }
 
-/// Borrow-only callback result. Migrated reason payloads cannot be detached
-/// from their original construction receipt by splitting the outcome.
+/// Borrow-only callback result. Migrated reason/candidate payloads cannot be
+/// detached from their original construction receipts by splitting the outcome.
 #[derive(Debug)]
 pub struct AdmittedCapabilityResult<T> {
     storage: CapabilityResultStorage<T>,
@@ -788,6 +788,7 @@ pub struct AdmittedCapabilityResult<T> {
 enum CapabilityResultStorage<T> {
     Unmigrated(Resolution<T>),
     Reason(AdmittedOwned<Resolution<T>>),
+    Candidates(AdmittedOwned<Resolution<T>>),
 }
 impl<T> From<Resolution<T>> for AdmittedCapabilityResult<T> {
     fn from(value: Resolution<T>) -> Self {
@@ -800,18 +801,26 @@ impl<T> AdmittedCapabilityResult<T> {
     pub fn result(&self) -> &Resolution<T> {
         match &self.storage {
             CapabilityResultStorage::Unmigrated(value) => value,
-            CapabilityResultStorage::Reason(value) => value,
+            CapabilityResultStorage::Reason(value) | CapabilityResultStorage::Candidates(value) => {
+                value
+            }
         }
     }
     pub(crate) fn owns_reason(&self) -> bool {
         matches!(self.storage, CapabilityResultStorage::Reason(_))
+            || matches!(&self.storage,CapabilityResultStorage::Candidates(value) if matches!(&**value,Resolution::Incomplete {..}))
+    }
+    pub(crate) fn owns_candidates(&self) -> bool {
+        matches!(self.storage, CapabilityResultStorage::Candidates(_))
     }
     pub(crate) fn into_unmigrated(self) -> Result<Resolution<T>, ResolverError> {
         match self.storage {
             CapabilityResultStorage::Unmigrated(value) => Ok(value),
-            CapabilityResultStorage::Reason(_) => Err(ResolverError::InvalidRequest(
-                "owned reason requires consuming field transfer".into(),
-            )),
+            CapabilityResultStorage::Reason(_) | CapabilityResultStorage::Candidates(_) => {
+                Err(ResolverError::InvalidRequest(
+                    "owned result fields require consuming field transfer".into(),
+                ))
+            }
         }
     }
     pub(crate) fn move_reason_into<U>(
@@ -820,12 +829,27 @@ impl<T> AdmittedCapabilityResult<T> {
         budget: &CompileTimeBudget<'_>,
         install: impl FnOnce(&mut U, Resolution<T>),
     ) -> Result<(), ResolverError> {
-        match self.storage {
-            CapabilityResultStorage::Reason(value) => destination
-                .move_field(value, budget, install)
-                .map_err(|r| crate::compile_time::resolver_error(r, budget)),
-            CapabilityResultStorage::Unmigrated(_) => Err(ResolverError::InvalidRequest(
+        if !self.owns_reason() {
+            return Err(ResolverError::InvalidRequest(
                 "result has no original reason receipt".into(),
+            ));
+        }
+        self.move_fields_into(destination, budget, install)
+    }
+    pub(crate) fn move_fields_into<U>(
+        self,
+        destination: &mut AdmittedOwned<U>,
+        budget: &CompileTimeBudget<'_>,
+        install: impl FnOnce(&mut U, Resolution<T>),
+    ) -> Result<(), ResolverError> {
+        match self.storage {
+            CapabilityResultStorage::Reason(value) | CapabilityResultStorage::Candidates(value) => {
+                destination
+                    .move_field(value, budget, install)
+                    .map_err(|r| crate::compile_time::resolver_error(r, budget))
+            }
+            CapabilityResultStorage::Unmigrated(_) => Err(ResolverError::InvalidRequest(
+                "result has no original owned field receipt".into(),
             )),
         }
     }
@@ -835,6 +859,38 @@ impl<T> AdmittedCapabilityResult<T> {
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Self, ResolverError> {
         Self::reason_with_candidates(reason, incomplete, Vec::new(), budget)
+    }
+    fn candidates(
+        candidates: AdmittedOwned<Vec<ResolutionCandidate>>,
+        reason: Option<AdmittedOwned<String>>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, ResolverError> {
+        let incomplete = reason.is_some();
+        let mut value = candidates
+            .map_value(budget, |candidates| {
+                if incomplete {
+                    Resolution::Incomplete {
+                        reason: String::new(),
+                        candidates,
+                    }
+                } else {
+                    Resolution::Ambiguous { candidates }
+                }
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        if let Some(reason) = reason {
+            value
+                .move_field(reason, budget, |result, reason| {
+                    let Resolution::Incomplete { reason: field, .. } = result else {
+                        unreachable!()
+                    };
+                    *field = reason;
+                })
+                .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        }
+        Ok(Self {
+            storage: CapabilityResultStorage::Candidates(value),
+        })
     }
     fn reason_with_candidates(
         reason: AdmittedOwned<String>,
@@ -1272,6 +1328,8 @@ pub struct UnitResolver<S> {
     callback_reports: Option<CallbackReports>,
     callback_include_reason: Option<AdmittedOwned<String>>,
     callback_unit_reason: Option<AdmittedOwned<String>>,
+    callback_unit_candidates: Option<AdmittedOwned<Vec<ResolutionCandidate>>>,
+    owning_unit_candidates: bool,
     owning_unit_reason: bool,
     owning_include_callback: bool,
     owning_unit_callback: bool,
@@ -1293,6 +1351,8 @@ struct CallbackReportCall<'a, S: SourceStore> {
     previous: Option<CallbackReports>,
     previous_reason: Option<AdmittedOwned<String>>,
     previous_unit_reason: Option<AdmittedOwned<String>>,
+    previous_candidates: Option<AdmittedOwned<Vec<ResolutionCandidate>>>,
+    previous_candidates_mode: bool,
     previous_unit_reason_mode: bool,
     previous_include: bool,
     previous_unit: bool,
@@ -1315,6 +1375,8 @@ impl<S: SourceStore> Drop for CallbackReportCall<'_, S> {
         self.resolver.callback_reports = self.previous.take();
         self.resolver.callback_include_reason = self.previous_reason.take();
         self.resolver.callback_unit_reason = self.previous_unit_reason.take();
+        self.resolver.callback_unit_candidates = self.previous_candidates.take();
+        self.resolver.owning_unit_candidates = self.previous_candidates_mode;
         self.resolver.owning_unit_reason = self.previous_unit_reason_mode;
         self.resolver.owning_include_callback = self.previous_include;
         self.resolver.owning_unit_callback = self.previous_unit;
@@ -1350,6 +1412,38 @@ impl<S: SourceStore> CallbackReportCall<'_, S> {
             drop(result);
             return Ok(AdmittedCapabilityOutcome {
                 result: AdmittedCapabilityResult::reason(reason, incomplete, budget)?,
+                reports,
+            });
+        }
+        if self.resolver.owning_unit_candidates
+            && matches!(
+                &result,
+                Resolution::Ambiguous { .. } | Resolution::Incomplete { .. }
+            )
+        {
+            match &result {
+                Resolution::Ambiguous { candidates } if candidates.is_empty() => {}
+                Resolution::Incomplete { reason, candidates }
+                    if reason.is_empty() && candidates.is_empty() => {}
+                _ => {
+                    return Err(ResolverError::InvalidRequest(
+                        "unit candidate constructor/handoff mismatch".into(),
+                    ));
+                }
+            }
+            let candidates = match self.resolver.callback_unit_candidates.take() {
+                Some(candidates) => candidates,
+                None => candidate_vector(0, budget)?,
+            };
+            let reason = self.resolver.callback_unit_reason.take();
+            if matches!(&result, Resolution::Incomplete { .. }) != reason.is_some() {
+                return Err(ResolverError::InvalidRequest(
+                    "unit candidate reason handoff mismatch".into(),
+                ));
+            }
+            drop(result);
+            return Ok(AdmittedCapabilityOutcome {
+                result: AdmittedCapabilityResult::candidates(candidates, reason, budget)?,
                 reports,
             });
         }
@@ -1513,6 +1607,8 @@ impl<S: SourceStore> UnitResolver<S> {
         let previous = self.callback_reports.replace(CallbackReports::Requested);
         let previous_reason = self.callback_include_reason.take();
         let previous_unit_reason = self.callback_unit_reason.take();
+        let previous_candidates = self.callback_unit_candidates.take();
+        let previous_candidates_mode = std::mem::replace(&mut self.owning_unit_candidates, false);
         let previous_unit_reason_mode = std::mem::replace(&mut self.owning_unit_reason, false);
         let previous_include = std::mem::replace(&mut self.owning_include_callback, false);
         let previous_unit = std::mem::replace(&mut self.owning_unit_callback, false);
@@ -1523,6 +1619,8 @@ impl<S: SourceStore> UnitResolver<S> {
             previous,
             previous_reason,
             previous_unit_reason,
+            previous_candidates,
+            previous_candidates_mode,
             previous_unit_reason_mode,
             previous_include,
             previous_unit,
@@ -2133,6 +2231,8 @@ impl<S: SourceStore> UnitResolver<S> {
             callback_reports: None,
             callback_include_reason: None,
             callback_unit_reason: None,
+            callback_unit_candidates: None,
+            owning_unit_candidates: false,
             owning_unit_reason: false,
             owning_include_callback: false,
             owning_unit_callback: false,
@@ -3510,6 +3610,24 @@ impl<S: SourceStore> UnitResolver<S> {
                     CaseInsensitiveLookup::Found(nested) => Some(nested),
                     CaseInsensitiveLookup::Missing => None,
                     CaseInsensitiveLookup::Ambiguous(paths) => {
+                        if self.owning_unit_candidates {
+                            let mut budget = self
+                                .store_budget(cancel)
+                                .expect("owning unit candidate root");
+                            budget
+                                .charge(paths.len(), 0, 0)
+                                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                            let mut candidates = candidate_vector(paths.len(), &mut budget)?;
+                            for path in paths.iter() {
+                                if cancel.is_cancelled() {
+                                    return Err(ResolverError::Cancelled);
+                                }
+                                let candidate =
+                                    unit_candidate_entry(path, None, &mut budget, cancel)?;
+                                push_unit_candidate(&mut candidates, candidate, &budget)?;
+                            }
+                            return self.candidate_result(candidates, None);
+                        }
                         // The plain legacy/result contract is still backed by
                         // its unmigrated result invoice. Borrow the new match
                         // owner and admit this independent receiving copy;
@@ -3686,6 +3804,9 @@ impl<S: SourceStore> UnitResolver<S> {
         lookup: &str,
         cancel: &dyn CancellationToken,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        if self.owning_unit_candidates {
+            return self.resolve_candidate_group_owned(group, requested, lookup, cancel);
+        }
         self.check_cancel(cancel)?;
         if self.owning_unit_callback {
             let mut budget = self.store_budget(cancel).expect("owning unit root");
@@ -3977,6 +4098,288 @@ impl<S: SourceStore> UnitResolver<S> {
                     format_args!("ambiguous unit {requested}: multiple valid candidates"),
                 )?;
                 Ok(Some(Resolution::Ambiguous { candidates }))
+            }
+        }
+    }
+
+    fn candidate_result(
+        &mut self,
+        candidates: AdmittedOwned<Vec<ResolutionCandidate>>,
+        reason: Option<String>,
+    ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        if self.callback_unit_candidates.is_some() {
+            return Err(ResolverError::InvalidRequest(
+                "duplicate unit candidate construction".into(),
+            ));
+        }
+        self.callback_unit_candidates = Some(candidates);
+        Ok(Some(match reason {
+            Some(reason) => Resolution::Incomplete {
+                reason,
+                candidates: Vec::new(),
+            },
+            None => Resolution::Ambiguous {
+                candidates: Vec::new(),
+            },
+        }))
+    }
+
+    fn resolve_candidate_group_owned(
+        &mut self,
+        group: &CandidateGroup,
+        requested: &str,
+        lookup: &str,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        self.check_cancel(cancel)?;
+        let overflow =
+            || ResolverError::InvalidRequest("owned candidate construction bound overflow".into());
+        let count = group.paths.len();
+        let mut budget = self
+            .store_budget(cancel)
+            .expect("owning unit candidates root");
+        budget
+            .charge(count, 0, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        // This old conservative invoice also covers source/entry/group scratch.
+        // Do not carve candidate payload lengths out of that mixed bound.
+        let mut copies = 0usize;
+        let mut order_bound = count
+            .checked_mul(2 * std::mem::size_of::<usize>())
+            .ok_or_else(overflow)?;
+        for (path, entry) in group.paths.iter() {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            let copy = path
+                .as_os_str()
+                .len()
+                .checked_add(entry.path.as_os_str().len())
+                .and_then(|n| n.checked_add(std::mem::size_of::<ResolutionCandidate>()))
+                .and_then(|n| n.checked_mul(8))
+                .ok_or_else(overflow)?;
+            copies = copies.checked_add(copy).ok_or_else(overflow)?;
+            order_bound = order_bound
+                .checked_add(
+                    path.as_os_str()
+                        .len()
+                        .checked_mul(8)
+                        .and_then(|n| n.checked_add(32))
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+        }
+        self.admit_lookup_storage(1, copies, copies, cancel)?;
+        type Valid = (LoadedSource, Option<AdmittedOwned<String>>);
+        let mut valid = budget
+            .admit_owned(
+                1,
+                0,
+                count
+                    .checked_mul(std::mem::size_of::<Valid>())
+                    .ok_or_else(overflow)?,
+                || Vec::<Valid>::with_capacity(count),
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let mut rejected = candidate_vector(count, &mut budget)?;
+        // Index dedup, sort-key allocations and backing have their own temporary
+        // invoice; stable source-path ordering is already established here.
+        let order = budget.admit_fallible(
+            count.checked_mul(count).ok_or_else(overflow)?,
+            order_bound,
+            order_bound,
+            crate::compile_time::resolver_error,
+            || {
+                let mut order = Vec::with_capacity(count);
+                for index in 0..count {
+                    if cancel.is_cancelled() {
+                        return Err(ResolverError::Cancelled);
+                    }
+                    if !group.paths[..index]
+                        .iter()
+                        .any(|(previous, _)| path_equivalent(previous, &group.paths[index].0))
+                    {
+                        order.push(index);
+                    }
+                }
+                order.sort_by_key(|index| path_key(&group.paths[*index].0));
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                Ok(order)
+            },
+        )?;
+        for index in order.iter() {
+            let (path, entry) = &group.paths[*index];
+            self.check_cancel(cancel)?;
+            match self.load_candidate(
+                path,
+                entry,
+                group.legacy_route.as_ref(),
+                SourceKind::Unit,
+                cancel,
+            ) {
+                Ok(source) => {
+                    let name =
+                        owned_header_name(source.analysis_bytes().as_ref(), &mut budget, cancel)?;
+                    if declared_name_matches_owned(
+                        name.as_ref().map(|n| n.as_str()),
+                        requested,
+                        lookup,
+                        &self.context,
+                        &mut budget,
+                        cancel,
+                    )? {
+                        valid.value_mut().push((source, name));
+                    } else {
+                        let candidate =
+                            unit_candidate_entry(&source.path, name, &mut budget, cancel)?;
+                        push_unit_candidate(&mut rejected, candidate, &budget)?;
+                    }
+                }
+                Err(SourceStoreError::NotFound { path: missing }) => {
+                    self.record_candidate(&missing, Some(entry), false, cancel)?
+                }
+                Err(SourceStoreError::Cancelled) => return Err(ResolverError::Cancelled),
+                Err(error @ SourceStoreError::RootLimit { .. }) => {
+                    return Err(root_store_error(error));
+                }
+                Err(SourceStoreError::Unauthorized { path, reason }) => {
+                    self.warning_args(
+                        cancel,
+                        128 + 4 * path.as_os_str().len() + reason.len(),
+                        format_args!(
+                            "unit candidate {} is unauthorized: {reason}",
+                            path.display()
+                        ),
+                    )?;
+                    self.diagnostic_args(
+                        cancel,
+                        64 + 4 * path.as_os_str().len(),
+                        format_args!("unit candidate {} is unauthorized", path.display()),
+                    )?;
+                    let reason = self.unit_reason_build(
+                        32,
+                        cancel,
+                        format_args!("unit candidate is unauthorized"),
+                    )?;
+                    return self.candidate_result(rejected, Some(reason));
+                }
+                Err(SourceStoreError::Incomplete { path, reason }) => {
+                    self.diagnostic_args(
+                        cancel,
+                        128 + 4 * path.as_os_str().len() + reason.len(),
+                        format_args!("unit candidate {} is incomplete: {reason}", path.display()),
+                    )?;
+                    let reason =
+                        self.unit_reason_build(reason.len(), cancel, format_args!("{reason}"))?;
+                    return self.candidate_result(rejected, Some(reason));
+                }
+                Err(error) => {
+                    self.diagnostic_args(
+                        cancel,
+                        source_error_report_bound(&error),
+                        format_args!("unit candidate could not be loaded: {error:?}"),
+                    )?;
+                    let reason = self.unit_reason_build(
+                        source_error_report_bound(&error),
+                        cancel,
+                        format_args!("unit candidate could not be loaded: {error:?}"),
+                    )?;
+                    return self.candidate_result(rejected, Some(reason));
+                }
+            }
+        }
+        match valid.len() {
+            0 => Ok(None),
+            1 => {
+                let (source, name) = valid.value_mut().pop().expect("one valid owned candidate");
+                let requested = budget
+                    .admit_owned(1, requested.len(), requested.len(), || {
+                        requested.to_string()
+                    })
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                let declared = match name {
+                    Some(name) => name,
+                    None => budget
+                        .admit_owned(1, lookup.len(), lookup.len(), || lookup.to_string())
+                        .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+                };
+                if self.callback_unit_names.is_some() {
+                    return Err(ResolverError::InvalidRequest(
+                        "duplicate selected unit names".into(),
+                    ));
+                }
+                self.callback_unit_names = Some(OwnedUnitNames {
+                    requested,
+                    declared,
+                });
+                Ok(Some(Resolution::Found(ResolvedUnit {
+                    requested_name: String::new(),
+                    declared_name: String::new(),
+                    source,
+                })))
+            }
+            _ => {
+                // Loaded source spellings can differ from requested paths.
+                // Preserve the legacy canonical-source ordering, admitting its
+                // key/sort scratch separately from all escaped vector fields.
+                budget
+                    .charge(valid.len(), 0, 0)
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                let mut keys = 0usize;
+                for (source, _) in valid.iter() {
+                    if cancel.is_cancelled() {
+                        return Err(ResolverError::Cancelled);
+                    }
+                    keys = keys
+                        .checked_add(
+                            source
+                                .path
+                                .as_os_str()
+                                .len()
+                                .checked_mul(8)
+                                .and_then(|n| n.checked_add(32))
+                                .ok_or_else(overflow)?,
+                        )
+                        .ok_or_else(overflow)?;
+                }
+                let _sort = budget
+                    .admit_owned(
+                        valid.len().checked_mul(valid.len()).ok_or_else(overflow)?,
+                        keys.checked_mul(valid.len()).ok_or_else(overflow)?,
+                        keys.checked_add(
+                            valid
+                                .len()
+                                .checked_mul(std::mem::size_of::<Valid>())
+                                .ok_or_else(overflow)?,
+                        )
+                        .ok_or_else(overflow)?,
+                        || (),
+                    )
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                valid
+                    .value_mut()
+                    .sort_by_key(|(source, _)| path_key(&source.path));
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                let mut candidates = candidate_vector(valid.len(), &mut budget)?;
+                // Keep the actual valid tuple allocation charged while draining;
+                // don't extract its live Vec and retire its capacity first.
+                for (source, name) in valid.value_mut().drain(..) {
+                    if cancel.is_cancelled() {
+                        return Err(ResolverError::Cancelled);
+                    }
+                    let candidate = unit_candidate_entry(&source.path, name, &mut budget, cancel)?;
+                    push_unit_candidate(&mut candidates, candidate, &budget)?;
+                }
+                self.warning_args(
+                    cancel,
+                    64 + requested.len(),
+                    format_args!("ambiguous unit {requested}: multiple valid candidates"),
+                )?;
+                self.candidate_result(candidates, None)
             }
         }
     }
@@ -6233,6 +6636,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         let mut call = self.callback_report_call();
         call.owning_unit_callback = true;
         call.owning_unit_reason = true;
+        call.owning_unit_candidates = true;
         let outcome = crate::compile_time::CompileTimeResolver::unit_capability(
             &mut *call, request, budget, cancel,
         )?;
@@ -6915,6 +7319,72 @@ fn has_ancestor_kind(mut node: tree_sitter::Node<'_>, kind: &str) -> bool {
     false
 }
 
+fn declared_name_matches_owned(
+    actual: Option<&str>,
+    requested: &str,
+    lookup: &str,
+    context: &ProjectContext,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<bool, ResolverError> {
+    let Some(actual) = actual else {
+        return Ok(false);
+    };
+    let overflow = || ResolverError::InvalidRequest("candidate name matching work overflow".into());
+    budget
+        .charge(
+            context
+                .unit_namespaces
+                .len()
+                .checked_add(2)
+                .ok_or_else(overflow)?,
+            actual
+                .len()
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(requested.len()))
+                .and_then(|n| n.checked_add(lookup.len()))
+                .ok_or_else(overflow)?,
+            0,
+        )
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    if cancel.is_cancelled() {
+        return Err(ResolverError::Cancelled);
+    }
+    if actual.eq_ignore_ascii_case(requested) || actual.eq_ignore_ascii_case(lookup) {
+        return Ok(true);
+    }
+    if lookup.contains('.') {
+        return Ok(false);
+    }
+    for namespace in &context.unit_namespaces {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        budget
+            .charge(
+                1,
+                namespace
+                    .len()
+                    .checked_add(lookup.len())
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(overflow)?,
+                0,
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        if actual
+            .get(..namespace.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(namespace))
+            && actual
+                .get(namespace.len()..)
+                .and_then(|tail| tail.strip_prefix('.'))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(lookup))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn declared_name_matches(
     actual: Option<&str>,
     requested: &str,
@@ -7093,6 +7563,83 @@ fn admitted_header_name(bytes: &[u8]) -> Option<&str> {
         }
     }
     (!start).then_some(name)
+}
+
+fn candidate_vector(
+    count: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<AdmittedOwned<Vec<ResolutionCandidate>>, ResolverError> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<ResolutionCandidate>())
+        .ok_or_else(|| {
+            ResolverError::InvalidRequest("unit candidate vector capacity overflow".into())
+        })?;
+    budget
+        .admit_owned(1, 0, bytes, || Vec::with_capacity(count))
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))
+}
+
+fn unit_candidate_entry(
+    path: &Path,
+    name: Option<AdmittedOwned<String>>,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<AdmittedOwned<ResolutionCandidate>, ResolverError> {
+    if name
+        .as_ref()
+        .is_some_and(|name| !name.is_admitted_by(budget))
+    {
+        return Err(ResolverError::InvalidRequest(
+            "foreign-root candidate declared name".into(),
+        ));
+    }
+    let path = budget.admit_fallible(
+        1,
+        path.as_os_str().len(),
+        path.as_os_str().len(),
+        crate::compile_time::resolver_error,
+        || {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            let path = path.to_path_buf();
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            Ok(path)
+        },
+    )?;
+    let mut candidate = path
+        .map_value(budget, |path| ResolutionCandidate {
+            path,
+            declared_name: None,
+        })
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    if let Some(name) = name {
+        candidate
+            .move_field(name, budget, |candidate, name| {
+                candidate.declared_name = Some(name)
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    }
+    Ok(candidate)
+}
+
+fn push_unit_candidate(
+    vector: &mut AdmittedOwned<Vec<ResolutionCandidate>>,
+    candidate: AdmittedOwned<ResolutionCandidate>,
+    budget: &CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    if vector.len() == vector.capacity() {
+        return Err(ResolverError::InvalidRequest(
+            "candidate push exceeds admitted receiving capacity".into(),
+        ));
+    }
+    vector
+        .move_field(candidate, budget, |vector, candidate| {
+            vector.push(candidate)
+        })
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))
 }
 
 fn build_unit_reason(
@@ -8955,6 +9502,547 @@ mod tests {
             assert_eq!(observer.budget_snapshot().work, spent.work);
             assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
         }
+    }
+
+    #[test]
+    fn unit_candidate_owner_original_partial_fields_drop_independently_before_merge() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let a = dir.path().join("A.pas");
+        let z = dir.path().join("Z.pas");
+        fs::write(&a, "unit Wrong;").unwrap();
+        fs::create_dir(&z).unwrap();
+        let entries = [&a, &z]
+            .into_iter()
+            .map(|p| resolver.context.path_entry_for(p).unwrap())
+            .collect();
+        resolver
+            .context
+            .explicit_unit_entries
+            .insert("broken".into(), entries);
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let mut call = resolver.callback_report_call();
+        call.owning_unit_callback = true;
+        call.owning_unit_reason = true;
+        call.owning_unit_candidates = true;
+        let out = CompileTimeResolver::unit_capability(
+            &mut *call,
+            UnitResolveRequest {
+                importer_path: &root,
+                requested_name: "Broken",
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        assert!(
+            matches!(out.result,Resolution::Incomplete {reason,candidates} if reason.is_empty() && candidates.is_empty())
+        );
+        let candidates = call.callback_unit_candidates.take().unwrap();
+        let reason = call.callback_unit_reason.take().unwrap();
+        let Some(CallbackReports::Built(reports)) = call.callback_reports.take() else {
+            panic!("actual independently owned report construction")
+        };
+        let reason_pointer = reason.as_ptr();
+        let payload = candidates.capacity() * std::mem::size_of::<ResolutionCandidate>()
+            + candidates
+                .iter()
+                .map(|c| c.path.capacity() + c.declared_name.as_ref().map_or(0, String::capacity))
+                .sum::<usize>();
+        drop(call);
+        drop(resolver);
+        drop(budget);
+        let before = observer.budget_snapshot();
+        drop(candidates);
+        assert_eq!(
+            before.retained_bytes - observer.budget_snapshot().retained_bytes,
+            payload + std::mem::size_of::<AdmittedOwned<Vec<ResolutionCandidate>>>()
+        );
+        assert_eq!(reason.as_ptr(), reason_pointer);
+        assert_eq!(&*reason, "unit candidate is unauthorized");
+        assert!(!reports.observations().is_empty());
+        drop(reports);
+        assert_eq!(
+            observer.budget_snapshot().retained_bytes,
+            baseline + reason.capacity() + std::mem::size_of::<AdmittedOwned<String>>()
+        );
+        drop(reason);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, before.work);
+        assert_eq!(observer.budget_snapshot().byte_work, before.byte_work);
+    }
+
+    #[test]
+    fn unit_candidate_owner_actual_constructor_refusal_peak_foreign_root_and_unwind() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let Resolution::Found(provider) = prior.result() else {
+            panic!("actual prior physical provider")
+        };
+        let path = &provider.unit.source.path;
+        let mut vector = candidate_vector(1, &mut budget).unwrap();
+        let name = owned_header_name(
+            provider.unit.source.analysis_bytes().as_ref(),
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let name_pointer = name.as_ref().unwrap().as_ptr();
+        let candidate = unit_candidate_entry(path, name, &mut budget, &NoCancellation).unwrap();
+        assert_eq!(
+            candidate.declared_name.as_ref().unwrap().as_ptr(),
+            name_pointer
+        );
+        let path_pointer = candidate.path.as_os_str().as_encoded_bytes().as_ptr();
+        push_unit_candidate(&mut vector, candidate, &budget).unwrap();
+        assert_eq!(
+            vector[0].path.as_os_str().as_encoded_bytes().as_ptr(),
+            path_pointer
+        );
+        let name = owned_header_name(
+            provider.unit.source.analysis_bytes().as_ref(),
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        struct Probe(std::cell::Cell<usize>);
+        impl CancellationToken for Probe {
+            fn is_cancelled(&self) -> bool {
+                self.0.set(self.0.get() + 1);
+                false
+            }
+        }
+        let probe = Probe(0.into());
+        assert!(matches!(
+            unit_candidate_entry(path, name, &mut budget, &probe),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            probe.0.get(),
+            0,
+            "path-copy body must not run after preconstruction refusal"
+        );
+        let before = budget.snapshot();
+        assert!(matches!(
+            candidate_vector(2, &mut budget),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            budget.snapshot(),
+            before,
+            "receiving capacity refusal keeps old-plus-new peak unallocated"
+        );
+        assert_eq!(
+            vector[0].path.as_os_str().as_encoded_bytes().as_ptr(),
+            path_pointer
+        );
+        let mut other = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let before_other = other.snapshot();
+        assert!(
+            vector
+                .map_value(&mut other, |candidates| {
+                    Resolution::<LoadedSource>::Ambiguous { candidates }
+                })
+                .is_err()
+        );
+        assert_eq!(other.snapshot(), before_other);
+        let mut fresh = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = fresh
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut fresh)
+            .unwrap();
+        let baseline = fresh.snapshot().retained_bytes;
+        struct PanicAfterCopy(std::cell::Cell<usize>);
+        impl CancellationToken for PanicAfterCopy {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                if n == 1 {
+                    panic!("actual candidate path copied before callback unwind")
+                }
+                false
+            }
+        }
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = unit_candidate_entry(path, None, &mut fresh, &PanicAfterCopy(0.into()));
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert!(fresh.snapshot().work > 0);
+        assert!(fresh.snapshot().byte_work >= path.as_os_str().len());
+        assert!(!provider.unit.source.bytes.is_empty());
+        assert_eq!(provider.unit.declared_name, "Other");
+        assert!(!prior.reports().observations().is_empty());
+    }
+
+    #[test]
+    fn unit_candidate_owner_actual_partial_callback_cancel_every_poll_and_foreign_result() {
+        use crate::compile_time::{AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver};
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut completed = false;
+        let mut cancelled = 0;
+        for stop in 0..700 {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            let a = dir.path().join("A.pas");
+            let z = dir.path().join("Z.pas");
+            fs::write(&a, "unit Wrong;").unwrap();
+            fs::create_dir(&z).unwrap();
+            let entries = [&z, &a]
+                .into_iter()
+                .map(|p| resolver.context.path_entry_for(p).unwrap())
+                .collect();
+            resolver
+                .context
+                .explicit_unit_entries
+                .insert("broken".into(), entries);
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let prior = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: "Other",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match resolver.unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Broken",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &Poll {
+                    calls: 0.into(),
+                    stop,
+                },
+            ) {
+                Err(ResolverError::Cancelled) => cancelled += 1,
+                Ok(out) => {
+                    assert!(
+                        matches!(out.result(),Resolution::Incomplete {reason,candidates} if reason=="unit candidate is unauthorized" && candidates.len()==1 && candidates[0].declared_name.as_deref()==Some("Wrong"))
+                    );
+                    let (result, reports) = out.into_parts();
+                    assert!(result.owns_candidates());
+                    let mut other =
+                        CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                    let mut receiver = other
+                        .admit_owned(0, 0, 0, || None::<Resolution<AdmittedProviderSource>>)
+                        .unwrap();
+                    let before = other.snapshot();
+                    assert!(
+                        result
+                            .move_fields_into(&mut receiver, &other, |to, value| *to = Some(value))
+                            .is_err()
+                    );
+                    assert_eq!(other.snapshot(), before);
+                    assert!(receiver.is_none());
+                    assert!(!reports.observations().is_empty());
+                    drop(reports);
+                    completed = true;
+                }
+                Err(error) => panic!("unexpected callback result at {stop}: {error:?}"),
+            }
+            assert!(resolver.callback_unit_candidates.is_none());
+            assert!(resolver.callback_unit_reason.is_none());
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(matches!(prior.result(),Resolution::Found(p) if p.unit.declared_name=="Other"));
+            assert!(!prior.reports().observations().is_empty());
+            drop(prior);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline,
+                "no candidate/name/reason/control leak at poll {stop}"
+            );
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            if completed {
+                break;
+            }
+        }
+        assert!(completed);
+        assert!(cancelled > 20);
+    }
+
+    #[test]
+    fn unit_candidate_owner_partial_original_pointers_capacity_and_reason_move_without_copy() {
+        use crate::compile_time::{AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let a = dir.path().join("A.pas");
+        let b = dir.path().join("B.pas");
+        let z = dir.path().join("Z.pas");
+        fs::write(&a, "unit Wrong;").unwrap();
+        fs::write(&b, "not a unit header").unwrap();
+        fs::create_dir(&z).unwrap();
+        let entries = [&z, &b, &a]
+            .into_iter()
+            .map(|p| resolver.context.path_entry_for(p).unwrap())
+            .collect();
+        resolver
+            .context
+            .explicit_unit_entries
+            .insert("broken".into(), entries);
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let mut call = resolver.callback_report_call();
+        call.owning_unit_callback = true;
+        call.owning_unit_reason = true;
+        call.owning_unit_candidates = true;
+        let out = CompileTimeResolver::unit_capability(
+            &mut *call,
+            UnitResolveRequest {
+                importer_path: &root,
+                requested_name: "Broken",
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let vector = call.callback_unit_candidates.as_ref().unwrap();
+        assert_eq!(vector.len(), 2);
+        assert_eq!(vector.capacity(), 3);
+        assert_eq!(vector[0].declared_name.as_deref(), Some("Wrong"));
+        assert!(vector[1].declared_name.is_none());
+        let vec_pointer = vector.as_ptr();
+        let path_pointer = vector[0].path.as_os_str().as_encoded_bytes().as_ptr();
+        let name_pointer = vector[0].declared_name.as_ref().unwrap().as_ptr();
+        let payload = vector.capacity() * std::mem::size_of::<ResolutionCandidate>()
+            + vector
+                .iter()
+                .map(|c| c.path.capacity() + c.declared_name.as_ref().map_or(0, String::capacity))
+                .sum::<usize>();
+        let reason = call.callback_unit_reason.as_ref().unwrap();
+        let reason_pointer = reason.as_ptr();
+        let reason_capacity = reason.capacity();
+        let before = budget.snapshot();
+        let out = call.finish(out.result, &mut budget).unwrap();
+        assert_eq!(
+            budget.snapshot().byte_work,
+            before.byte_work,
+            "callback candidate and original reason transfer cannot clone payloads"
+        );
+        let (result, reports) = out.into_parts();
+        assert!(result.owns_candidates());
+        assert!(result.owns_reason());
+        let mut receiver = budget
+            .admit_owned(0, 0, 0, || None::<Resolution<AdmittedProviderSource>>)
+            .unwrap();
+        let before = budget.snapshot();
+        result
+            .move_fields_into(&mut receiver, &budget, |to, value| *to = Some(value))
+            .unwrap();
+        assert_eq!(budget.snapshot().byte_work, before.byte_work);
+        drop(reports);
+        drop(resolver);
+        drop(budget);
+        assert_eq!(
+            observer.budget_snapshot().retained_bytes,
+            baseline
+                + payload
+                + reason_capacity
+                + std::mem::size_of::<AdmittedOwned<Option<Resolution<AdmittedProviderSource>>>>()
+        );
+        let Some(Resolution::Incomplete { reason, candidates }) = &*receiver else {
+            panic!("real incomplete receiving fields")
+        };
+        assert_eq!(reason.as_ptr(), reason_pointer);
+        assert_eq!(candidates.as_ptr(), vec_pointer);
+        assert_eq!(
+            candidates[0].path.as_os_str().as_encoded_bytes().as_ptr(),
+            path_pointer
+        );
+        assert_eq!(
+            candidates[0].declared_name.as_ref().unwrap().as_ptr(),
+            name_pointer
+        );
+        let spent = observer.budget_snapshot();
+        drop(receiver);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[test]
+    fn unit_candidate_owner_case_ambiguity_and_empty_vectors_are_original_owned_storage() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for case in [true, false] {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            fs::create_dir(dir.path().join("SPACE")).unwrap();
+            fs::create_dir(dir.path().join("Space")).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let out = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: if case { "space.Other" } else { "" },
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let (result, reports) = out.into_parts();
+            assert!(result.owns_candidates());
+            let candidates = match result.result() {
+                Resolution::Ambiguous { candidates } if case => candidates,
+                Resolution::Incomplete { candidates, .. } if !case => candidates,
+                _ => panic!("actual nested case/empty result"),
+            };
+            assert_eq!(candidates.len(), if case { 2 } else { 0 });
+            assert!(candidates.iter().all(|c| c.declared_name.is_none()));
+            let vector_pointer = candidates.as_ptr();
+            let payload = candidates.capacity() * std::mem::size_of::<ResolutionCandidate>()
+                + candidates.iter().map(|c| c.path.capacity()).sum::<usize>()
+                + match result.result() {
+                    Resolution::Incomplete { reason, .. } => reason.capacity(),
+                    _ => 0,
+                };
+            drop(reports);
+            drop(resolver);
+            drop(budget);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline
+                    + payload
+                    + std::mem::size_of::<
+                        AdmittedOwned<Resolution<crate::compile_time::AdmittedProviderSource>>,
+                    >()
+            );
+            assert!(
+                matches!(result.result(),Resolution::Ambiguous {candidates}|Resolution::Incomplete {candidates,..} if candidates.as_ptr()==vector_pointer)
+            );
+            assert!(result.into_unmigrated().is_err());
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        }
+    }
+
+    #[test]
+    fn unit_candidate_owner_physical_ambiguity_survives_cache_report_and_budget_exit() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let a = dir.path().join("A.pas");
+        let z = dir.path().join("Z.pas");
+        fs::write(&a, "unit Other; interface end.").unwrap();
+        fs::write(&z, "unit Other; interface end.").unwrap();
+        let entries = [&z, &a]
+            .into_iter()
+            .map(|p| resolver.context.path_entry_for(p).unwrap())
+            .collect();
+        resolver
+            .context
+            .explicit_unit_entries
+            .insert("other".into(), entries);
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let out = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (result, reports) = out.into_parts();
+        let Resolution::Ambiguous { candidates } = result.result() else {
+            panic!("real multiple valid physical candidates")
+        };
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].path.ends_with("A.pas"));
+        assert!(candidates[1].path.ends_with("Z.pas"));
+        let backing = candidates.as_ptr();
+        let path = candidates[0].path.as_os_str().as_encoded_bytes().as_ptr();
+        let name = candidates[0].declared_name.as_ref().unwrap().as_ptr();
+        let payload = candidates.capacity() * std::mem::size_of::<ResolutionCandidate>()
+            + candidates
+                .iter()
+                .map(|c| c.path.capacity() + c.declared_name.as_ref().map_or(0, String::capacity))
+                .sum::<usize>();
+        drop(reports);
+        drop(resolver);
+        drop(budget);
+        assert_eq!(
+            observer.budget_snapshot().retained_bytes,
+            baseline
+                + payload
+                + std::mem::size_of::<
+                    AdmittedOwned<Resolution<crate::compile_time::AdmittedProviderSource>>,
+                >(),
+            "escaped candidates must retain exact original vector/path/name credits"
+        );
+        let Resolution::Ambiguous { candidates } = result.result() else {
+            unreachable!()
+        };
+        assert_eq!(candidates.as_ptr(), backing);
+        assert_eq!(
+            candidates[0].path.as_os_str().as_encoded_bytes().as_ptr(),
+            path
+        );
+        assert_eq!(candidates[0].declared_name.as_ref().unwrap().as_ptr(), name);
+        let spent = observer.budget_snapshot();
+        drop(result);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
     }
 
     #[test]

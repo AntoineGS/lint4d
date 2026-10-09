@@ -1424,6 +1424,18 @@ impl ProviderEngine<'_, '_> {
                 let (result, reports) = outcome.into_parts();
                 reports.consume_into(self.observations, self.warnings, self.budget)?;
                 state.interfaces[index].attempted = true;
+                if result.owns_candidates() {
+                    let failure = if matches!(result.result(), Resolution::Ambiguous { .. }) {
+                        UnknownReason::AmbiguousBinding
+                    } else {
+                        UnknownReason::UnresolvedName
+                    };
+                    // Classify through a borrow; discard actual owned candidates
+                    // and independent reason only after their reports transfer.
+                    drop(result);
+                    state.interfaces[index].failure = Some(failure);
+                    continue;
+                }
                 let result = if result.owns_reason() {
                     // Failed provider reason is discarded, not detached into a
                     // plain field. Its actual storage dies before its credit.
@@ -3061,6 +3073,176 @@ fn argument_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_candidate_owner_provider_engine_classifies_owned_ambiguity_and_partial_failure() {
+        struct Recording {
+            inner: crate::UnitResolver<crate::FilesystemSourceStore>,
+            seen: bool,
+            warnings: Vec<String>,
+            observations: Vec<ResolutionObservation>,
+        }
+        impl CompileTimeResolver for Recording {
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                let out = self.inner.unit_report_capability(r, b, c)?;
+                match out.result() {
+                    Resolution::Ambiguous { candidates } => assert_eq!(candidates.len(), 2),
+                    Resolution::Incomplete { reason, candidates } => {
+                        assert_eq!(reason, "unit candidate is unauthorized");
+                        assert_eq!(candidates.len(), 1);
+                        assert_eq!(candidates[0].declared_name.as_deref(), Some("Wrong"));
+                    }
+                    _ => panic!("real escaped candidate callback reached"),
+                }
+                assert!(out.reports().observations().len() < 32);
+                assert!(out.reports().warnings().len() < 8);
+                self.observations = out.reports().observations().to_vec();
+                self.warnings = out.reports().warnings().to_vec();
+                self.seen = true;
+                Ok(out)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                self.inner.unit(r, b, c)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+        }
+        for partial in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root_path = dir.path().join("Main.pas");
+            let a = dir.path().join("A.pas");
+            let z = dir.path().join("Z.pas");
+            std::fs::write(&root_path,"unit Main; interface uses Alias; {$IF SizeOf(Alias.T)=8}{$DEFINE HIT}{$ENDIF} implementation end.").unwrap();
+            std::fs::write(
+                &a,
+                if partial {
+                    "unit Wrong; interface end."
+                } else {
+                    "unit Space . Other; interface type T=Int64; implementation end."
+                },
+            )
+            .unwrap();
+            if partial {
+                std::fs::create_dir(&z).unwrap();
+            } else {
+                std::fs::write(
+                    &z,
+                    "unit Space.Other; interface type T=Int64; implementation end.",
+                )
+                .unwrap();
+            }
+            let mut project = pascal_project::ProjectContext::discover(
+                &root_path,
+                &[dir.path().into()],
+                &Default::default(),
+            )
+            .unwrap();
+            project
+                .unit_aliases
+                .insert("Alias".into(), "Space.Other".into());
+            project.unit_namespaces = vec!["Space".into()];
+            let entries = [&z, &a]
+                .into_iter()
+                .map(|p| project.path_entry_for(p).unwrap())
+                .collect();
+            project
+                .explicit_unit_entries
+                .insert("space.other".into(), entries);
+            let context = ConditionalContext::default()
+                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                .with_layout(pascal_project::LayoutContext {
+                    platform: Some(pascal_project::LayoutPlatform::Win32),
+                    defaults: Default::default(),
+                });
+            let mut inner = crate::UnitResolver::new(
+                project,
+                vec![dir.path().into()],
+                crate::FilesystemSourceStore::new(),
+                Default::default(),
+            );
+            let root = inner
+                .load_source(
+                    &root_path,
+                    None,
+                    crate::SourceKind::Unit,
+                    &crate::NoCancellation,
+                )
+                .unwrap();
+            let mut recording = Recording {
+                inner,
+                seen: false,
+                warnings: Vec::new(),
+                observations: Vec::new(),
+            };
+            let mut budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let output = analyze_source_in_session(
+                &root,
+                &context,
+                &mut recording,
+                &mut budget,
+                &crate::NoCancellation,
+            )
+            .unwrap();
+            assert!(recording.seen);
+            assert_eq!(output.facts.interfaces[0].pending.identity.name, "Alias");
+            assert_eq!(
+                output.facts.interfaces[0].failure,
+                Some(if partial {
+                    UnknownReason::UnresolvedName
+                } else {
+                    UnknownReason::AmbiguousBinding
+                })
+            );
+            assert!(output.facts.interfaces[0].provided.is_none());
+            assert!(
+                !output
+                    .root
+                    .directives
+                    .iter()
+                    .any(|d| d.body == "DEFINE HIT" && d.activity == Truth::True)
+            );
+            for warning in &recording.warnings {
+                assert!(output.warnings.contains(warning));
+            }
+            for observation in &recording.observations {
+                assert!(output.observations.contains(observation));
+            }
+            assert!(!recording.warnings.is_empty());
+            drop(recording);
+            drop(root);
+            drop(budget);
+            let spent = observer.budget_snapshot();
+            assert!(spent.retained_bytes > baseline);
+            drop(output);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+        }
+    }
 
     #[test]
     fn unit_reason_owner_provider_engine_discards_failure_but_preserves_exact_reports() {

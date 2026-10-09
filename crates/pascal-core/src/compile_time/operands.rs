@@ -184,7 +184,38 @@ enum Carrier<'a> {
 }
 
 impl CompileTimeState {
+    /// Scalar projection across every reachable graph. Equal storage sizes do
+    /// not imply a single declaration identity (or even equal alignments).
+    pub fn sizeof_operand(
+        &self,
+        site: BindingSite,
+        operand: &SizeOfOperand,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Fact<u64> {
+        self.fact_all_paths(site, budget, &mut |state, site, budget| {
+            let before = budget.snapshot().retained_bytes;
+            let fact = match state.layout_operand_single(site, operand, budget) {
+                Fact::Known(layout) => Fact::Known(layout.storage.size),
+                Fact::Unknown(reason) => Fact::Unknown(reason),
+                Fact::Incomplete(reason) => Fact::Incomplete(reason),
+            };
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            fact
+        })
+    }
+
     pub fn layout_operand(
+        &self,
+        site: BindingSite,
+        operand: &SizeOfOperand,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Fact<KnownLayout> {
+        self.layout_all_paths(site, budget, &mut |state, site, budget| {
+            state.layout_operand_single(site, operand, budget)
+        })
+    }
+
+    pub(super) fn layout_operand_single(
         &self,
         site: BindingSite,
         operand: &SizeOfOperand,

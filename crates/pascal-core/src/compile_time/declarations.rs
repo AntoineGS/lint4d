@@ -51,7 +51,7 @@ struct Span {
 
 /// Opaque declaration state. Source, occurrence, logical sequence and scope are
 /// deliberately independent. No final body reparse repairs earlier queries.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompileTimeState {
     pub(super) context: ConditionalContext,
     pub(super) scopes: Vec<Scope>,
@@ -81,6 +81,11 @@ pub struct CompileTimeState {
     root_ended: bool,
     pub(super) failure: Option<IncompleteReason>,
     pub(super) unknown: bool,
+    /// Independent reachable continuations; never a synthesized graph.
+    pub(super) alternatives: Vec<CompileTimeState>,
+    pub(super) option_stack: Vec<Option<crate::conditional::ConditionalEnvironment>>,
+    pub(super) conditional: Option<Box<crate::conditional::ConditionalEnvironment>>,
+    pub(super) scalar_history: Vec<(Sequence, crate::conditional::ConditionalEnvironment)>,
 }
 
 pub(super) fn limit(
@@ -192,6 +197,10 @@ impl CompileTimeState {
             root_ended: false,
             failure: None,
             unknown: false,
+            alternatives: Vec::new(),
+            option_stack: Vec::new(),
+            conditional: None,
+            scalar_history: Vec::new(),
         })
     }
 
@@ -1003,7 +1012,66 @@ impl CompileTimeState {
         name: &str,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Fact<KnownLayout> {
-        super::bindings::layout_name(self, site, name, budget)
+        self.layout_all_paths(site, budget, &mut |state, site, budget| {
+            super::bindings::layout_name(state, site, name, budget)
+        })
+    }
+
+    pub(super) fn layout_all_paths(
+        &self,
+        site: BindingSite,
+        budget: &mut CompileTimeBudget<'_>,
+        query: &mut dyn FnMut(&Self, BindingSite, &mut CompileTimeBudget<'_>) -> Fact<KnownLayout>,
+    ) -> Fact<KnownLayout> {
+        self.fact_all_paths(site, budget, query)
+    }
+
+    pub(super) fn fact_all_paths<T: PartialEq>(
+        &self,
+        site: BindingSite,
+        budget: &mut CompileTimeBudget<'_>,
+        query: &mut dyn FnMut(&Self, BindingSite, &mut CompileTimeBudget<'_>) -> Fact<T>,
+    ) -> Fact<T> {
+        if self.alternatives.is_empty() {
+            return query(self, site, budget);
+        }
+        let before = budget.snapshot().retained_bytes;
+        let mut result = query(self, site.clone(), budget);
+        if let Err(reason) = budget.charge(self.spans.len(), 0, 0) {
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            return Fact::Incomplete(reason);
+        }
+        let anchor = self
+            .spans
+            .iter()
+            .rev()
+            .find(|span| span.site == site)
+            .map(|span| &span.anchor);
+        for alternative in &self.alternatives {
+            let scratch = budget.snapshot().retained_bytes;
+            if let Err(reason) = budget.charge(alternative.spans.len() + 1, 0, 0) {
+                result = Fact::Incomplete(reason);
+                break;
+            }
+            let alternative_site = anchor.and_then(|anchor| {
+                alternative.site_at(&anchor.source, anchor.occurrence, anchor.range.end)
+            });
+            let candidate = match alternative_site {
+                Some(site) => query(alternative, site, budget),
+                None => Fact::Unknown(UnknownReason::AmbiguousBinding),
+            };
+            result = match (&result, &candidate) {
+                (_, Fact::Incomplete(reason)) => Fact::Incomplete(reason.clone()),
+                (Fact::Incomplete(_), _) => result,
+                (Fact::Known(a), Fact::Known(b)) if a == b => result,
+                _ => Fact::Unknown(UnknownReason::AmbiguousBinding),
+            };
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(scratch));
+        }
+        if !matches!(result, Fact::Known(_)) {
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        }
+        result
     }
 
     pub fn fingerprint(&self) -> u64 {
@@ -1035,6 +1103,21 @@ impl CompileTimeState {
         self.rhs.hash(&mut h);
         self.pending_class.hash(&mut h);
         self.failure.hash(&mut h);
+        self.option_stack.len().hash(&mut h);
+        for saved in &self.option_stack {
+            saved.as_ref().map(|saved| saved.fingerprint()).hash(&mut h);
+        }
+        self.conditional
+            .as_ref()
+            .map(|environment| environment.fingerprint())
+            .hash(&mut h);
+        for (sequence, environment) in &self.scalar_history {
+            sequence.hash(&mut h);
+            environment.fingerprint().hash(&mut h);
+        }
+        for alternative in &self.alternatives {
+            alternative.fingerprint().hash(&mut h);
+        }
         for d in &self.declarations {
             d.name.hash(&mut h);
             d.key.hash(&mut h);
@@ -1082,6 +1165,22 @@ impl CompileTimeState {
         visit(self.settings_history.len() * size_of::<super::records::LayoutChange>())?;
         visit(self.pending.len())?;
         visit(self.word.len())?;
+        visit(
+            self.option_stack.len()
+                * size_of::<Option<crate::conditional::ConditionalEnvironment>>(),
+        )?;
+        for saved in self.option_stack.iter().flatten() {
+            visit(saved.recovery_payload_bytes())?;
+        }
+        if let Some(environment) = &self.conditional {
+            visit(environment.recovery_payload_bytes())?;
+        }
+        for (_, environment) in &self.scalar_history {
+            visit(size_of::<Sequence>() + environment.recovery_payload_bytes())?;
+        }
+        for alternative in &self.alternatives {
+            alternative.visit_recovery_payload(visit)?;
+        }
         for s in &self.spans {
             visit(size_of::<Span>())?;
             visit(s.anchor.source.as_str().len())?;
@@ -1100,6 +1199,55 @@ impl CompileTimeState {
             }
         }
         Ok(())
+    }
+
+    /// Pre-admit a complete independent continuation before copying any payload.
+    pub(crate) fn snapshot(
+        &self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, IncompleteReason> {
+        let before = budget.snapshot().retained_bytes;
+        let mut reason = None;
+        let admitted = self.visit_recovery_payload(&mut |bytes| {
+            budget.charge(1, bytes, bytes).map_err(|failure| {
+                reason = Some(failure);
+                "snapshot admission".into()
+            })
+        });
+        if admitted.is_err() {
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            return Err(reason.unwrap_or(IncompleteReason::MalformedSource));
+        }
+        Ok(self.clone())
+    }
+
+    /// Every retained path, including the primary continuation.
+    pub fn reachable_states(&self) -> impl Iterator<Item = &Self> {
+        std::iter::once(self).chain(self.alternatives.iter())
+    }
+
+    pub fn conditional_environment(&self) -> Option<&crate::conditional::ConditionalEnvironment> {
+        self.conditional.as_deref()
+    }
+
+    pub(crate) fn retained_entries(&self) -> usize {
+        self.scopes
+            .len()
+            .saturating_add(self.stack.len())
+            .saturating_add(self.spans.len())
+            .saturating_add(self.declarations.len())
+            .saturating_add(self.field_count)
+            .saturating_add(self.variant_count)
+            .saturating_add(self.scalar_history.len())
+            .saturating_add(self.option_stack.len())
+            .saturating_add(self.settings_stack.len())
+            .saturating_add(self.settings_history.len())
+            .saturating_add(
+                self.alternatives
+                    .iter()
+                    .map(Self::retained_entries)
+                    .sum::<usize>(),
+            )
     }
 }
 

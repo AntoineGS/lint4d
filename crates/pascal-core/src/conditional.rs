@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::cell::Cell;
 
 const MAX_DIRECTIVES: usize = 16_384;
-const MAX_CONDITIONAL_DEPTH: usize = 256;
+pub(crate) const MAX_CONDITIONAL_DEPTH: usize = 256;
 pub(crate) const MAX_EXPRESSION_TOKENS: usize = 256;
 const MAX_EXPRESSION_BYTES: usize = 4_096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 32_768;
@@ -230,6 +230,7 @@ struct LexResult {
 
 #[derive(Debug, Clone)]
 pub struct ConditionalEnvironment {
+    pub(crate) typed_state: Option<Box<crate::compile_time::CompileTimeState>>,
     values: HashMap<String, Truth>,
     options: HashMap<String, Truth>,
     constants: BTreeMap<String, ConstantValue>,
@@ -247,6 +248,7 @@ pub struct ConditionalEnvironment {
 impl Default for ConditionalEnvironment {
     fn default() -> Self {
         Self {
+            typed_state: None,
             values: HashMap::new(),
             options: HashMap::new(),
             constants: BTreeMap::new(),
@@ -264,6 +266,69 @@ impl Default for ConditionalEnvironment {
 }
 
 impl ConditionalEnvironment {
+    pub(crate) fn snapshot_scalar(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, crate::compile_time::IncompleteReason> {
+        self.admit_scalar_snapshot(budget)?;
+        Ok(self.clone_scalar())
+    }
+
+    fn admit_scalar_snapshot(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        let bytes = size_of::<Self>()
+            + self.bytes
+            + (self.scalar_len() + self.source_constants.len())
+                * (size_of::<String>() + 4 * size_of::<usize>());
+        budget.charge(
+            self.scalar_len() + self.source_constants.len() + 1,
+            bytes,
+            bytes,
+        )
+    }
+
+    fn clone_scalar(&self) -> Self {
+        Self {
+            typed_state: None,
+            values: self.values.clone(),
+            options: self.options.clone(),
+            constants: self.constants.clone(),
+            source_constants: self.source_constants.clone(),
+            source_declarations: self.source_declarations.clone(),
+            compiler_version: self.compiler_version,
+            layout: self.layout.clone(),
+            layout_explicit: self.layout_explicit,
+            absent_define: self.absent_define,
+            rtl_constants_known: self.rtl_constants_known,
+            bytes: self.bytes,
+            rejected_context: self.rejected_context,
+        }
+    }
+
+    pub(crate) fn snapshot_typed(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, crate::compile_time::IncompleteReason> {
+        // Admit both complete owners before any copied payload is constructed.
+        let before = budget.snapshot().retained_bytes;
+        let result = (|| {
+            self.admit_scalar_snapshot(budget)?;
+            let state = self
+                .typed_state
+                .as_deref()
+                .map(|state| state.snapshot(budget))
+                .transpose()?;
+            let mut snapshot = self.clone_scalar();
+            snapshot.typed_state = state.map(Box::new);
+            Ok(snapshot)
+        })();
+        if result.is_err() {
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        }
+        result
+    }
     fn new() -> Self {
         Self::default()
     }
@@ -406,10 +471,18 @@ impl ConditionalEnvironment {
     }
 
     pub(crate) fn recovery_payload_bytes(&self) -> usize {
-        size_of::<Self>()
-            .saturating_add(self.bytes())
+        let mut typed_bytes = 0usize;
+        if let Some(state) = &self.typed_state {
+            let _ = state.visit_recovery_payload(&mut |bytes| {
+                typed_bytes = typed_bytes.saturating_add(bytes);
+                Ok(())
+            });
+        }
+        typed_bytes
+            .saturating_add(size_of::<Self>())
+            .saturating_add(self.bytes)
             .saturating_add(
-                self.len()
+                self.scalar_len()
                     .saturating_add(self.source_constants.len())
                     .saturating_mul(size_of::<String>() + 4 * size_of::<usize>()),
             )
@@ -603,7 +676,8 @@ impl ConditionalEnvironment {
 
     /// Whether this environment carries any inherited DEFINE/UNDEF facts.
     pub fn has_facts(&self) -> bool {
-        !self.values.is_empty()
+        self.typed_state.is_some()
+            || !self.values.is_empty()
             || !self.options.is_empty()
             || !self.constants.is_empty()
             || !self.source_declarations.is_empty()
@@ -659,10 +733,22 @@ impl ConditionalEnvironment {
         9_u8.hash(&mut hasher);
         self.layout.hash(&mut hasher);
         self.layout_explicit.hash(&mut hasher);
+        self.typed_state
+            .as_ref()
+            .map(|state| state.fingerprint())
+            .hash(&mut hasher);
         hasher.finish()
     }
 
     fn len(&self) -> usize {
+        self.scalar_len().saturating_add(
+            self.typed_state
+                .as_deref()
+                .map_or(0, |state| state.retained_entries()),
+        )
+    }
+
+    fn scalar_len(&self) -> usize {
         self.values
             .len()
             .saturating_add(self.options.len())
@@ -691,10 +777,18 @@ impl ConditionalEnvironment {
         self.values.keys()
     }
     fn bytes(&self) -> usize {
-        self.bytes
+        let mut bytes = self.bytes;
+        if let Some(state) = &self.typed_state {
+            let _ = state.visit_recovery_payload(&mut |payload| {
+                bytes = bytes.saturating_add(payload);
+                Ok(())
+            });
+        }
+        bytes
     }
 
     fn clear(&mut self) {
+        self.typed_state = None;
         self.values.clear();
         self.options.clear();
         self.clear_constants();
@@ -1030,6 +1124,7 @@ pub fn analyze_with_include_callback_context(
 /// Internal source-backed extension of the same directive interpreter. The
 /// session owns admission, lexical declarations, and unavailable-fact reasons.
 pub(crate) trait SourceOrder {
+    fn activity(&self) -> Truth;
     fn admit_directive(&mut self, body_bytes: usize) -> bool;
     fn admit_environment(&mut self, environment: &ConditionalEnvironment) -> bool;
     fn feed(&mut self, range: Range<usize>, activity: Truth);
@@ -1108,7 +1203,9 @@ fn analyze_lexed(
             break;
         }
         if let Some(order) = order.as_deref_mut() {
+            active = order.activity();
             order.feed(cursor..raw.start, active);
+            active = order.activity();
         } else if !observe_source_constants(
             source,
             cursor..raw.start,
@@ -1139,6 +1236,20 @@ fn analyze_lexed(
         });
         if let Some(order) = order.as_deref_mut() {
             order.directive(directives.last().expect("directive recorded"));
+            // The source-backed owner keeps independent correlated environments.
+            // Do not also run the legacy single-environment fork/merge below:
+            // its scalar projection cannot select typed paths after a join.
+            if matches!(
+                kind,
+                DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+            ) && !is_else_directive(&raw.body)
+            {
+                let condition = order.condition(&raw.body, raw.start, environment, &mut complete);
+                directives.last_mut().expect("directive recorded").condition = Some(condition);
+            }
+            active = order.activity();
+            cursor = raw.end;
+            continue;
         }
 
         match kind {
@@ -1147,9 +1258,7 @@ fn analyze_lexed(
                     complete = false;
                     active = Truth::Unknown;
                 } else {
-                    let condition = if active == Truth::False && order.is_some() {
-                        Truth::Unknown
-                    } else if let Some(order) = order.as_deref_mut() {
+                    let condition = if let Some(order) = order.as_deref_mut() {
                         order.condition(&raw.body, raw.start, environment, &mut complete)
                     } else {
                         evaluate_condition(&raw.body, environment, &mut complete)
@@ -1237,11 +1346,7 @@ fn analyze_lexed(
                     frame.current_active = frame.parent_active.and(frame.remaining);
                     frame.remaining = Truth::False;
                 } else {
-                    let condition = if frame.parent_active.and(frame.remaining) == Truth::False
-                        && order.is_some()
-                    {
-                        Truth::Unknown
-                    } else if let Some(order) = order.as_deref_mut() {
+                    let condition = if let Some(order) = order.as_deref_mut() {
                         order.condition(&raw.body, raw.start, environment, &mut complete)
                     } else {
                         evaluate_condition(&raw.body, environment, &mut complete)
@@ -1339,6 +1444,7 @@ fn analyze_lexed(
     }
 
     if let Some(order) = order.as_deref_mut() {
+        active = order.activity();
         order.feed(cursor..source.len(), active);
     } else if cursor < source.len()
         && !observe_source_constants(
@@ -1577,9 +1683,90 @@ fn supported_option_name(name: &str) -> Option<String> {
     let name = canonical_option_name(name)?;
     matches!(
         name.as_str(),
-        "R" | "O" | "Q" | "C" | "B" | "I" | "X" | "T" | "D" | "Y" | "RUNTIME_CHECKS"
+        "R" | "O" | "Q" | "C" | "B" | "I" | "X" | "T" | "D" | "Y" | "H" | "RUNTIME_CHECKS"
     )
     .then_some(name)
+}
+
+/// Apply one reachable arm's scalar directive using the existing decoder.
+pub(crate) fn apply_source_directive(
+    environment: &mut ConditionalEnvironment,
+    directive: &ConditionalDirective,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<(), crate::compile_time::IncompleteReason> {
+    // Admit decoding/key growth before the existing mutator allocates.
+    budget.charge(
+        1,
+        directive.body.len(),
+        directive.body.len().saturating_mul(4) + 128,
+    )?;
+    let mut legacy = AnalysisBudget {
+        cancel: None,
+        work: 0,
+        byte_work: 0,
+        exhausted: false,
+    };
+    let ok = match directive.kind {
+        DirectiveKind::Define | DirectiveKind::Undef => directive_symbol(&directive.body)
+            .is_some_and(|symbol| {
+                apply_fact(
+                    environment,
+                    &symbol,
+                    if directive.kind == DirectiveKind::Define {
+                        Truth::True
+                    } else {
+                        Truth::False
+                    },
+                    Truth::True,
+                    &mut legacy,
+                )
+            }),
+        _ if is_option_directive(&directive.body) => {
+            apply_option_directive(environment, &directive.body, Truth::True, &mut legacy)
+        }
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::compile_time::IncompleteReason::MalformedSource)
+    }
+}
+
+pub(crate) fn restore_source_options(
+    environment: &mut ConditionalEnvironment,
+    saved: Option<&ConditionalEnvironment>,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<(), crate::compile_time::IncompleteReason> {
+    // Restore option facts only: PUSHOPT never restores DEFINEs or constants.
+    for key in [
+        "R",
+        "O",
+        "Q",
+        "C",
+        "B",
+        "I",
+        "X",
+        "T",
+        "D",
+        "Y",
+        "H",
+        "RUNTIME_CHECKS",
+    ] {
+        budget.charge(1, key.len(), key.len() + size_of::<Truth>() + 64)?;
+        let value = saved.map_or(Truth::Unknown, |saved| {
+            if matches!(key, "T" | "Y" | "RUNTIME_CHECKS") {
+                // These modeled legacy facts have no verified Florence OPT
+                // eligibility in the recorded evidence. Only a value unchanged
+                // by either possible restore behavior can remain proven.
+                saved.option(key).merge(environment.option(key))
+            } else {
+                saved.option(key)
+            }
+        });
+        environment.insert_option_value(key.to_owned(), value);
+    }
+    Ok(())
 }
 
 fn apply_option_directive(
@@ -2578,10 +2765,6 @@ pub(crate) fn condition_expression(body: &str) -> Option<&str> {
         "if" | "elseif" | "elif" => Some(directive_arguments(body)),
         _ => None,
     }
-}
-
-pub(crate) fn is_option_condition(body: &str) -> bool {
-    directive_keyword(body).is_some_and(|key| key.eq_ignore_ascii_case("ifopt"))
 }
 
 pub(crate) fn evaluate_source_condition(

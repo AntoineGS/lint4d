@@ -1,5 +1,5 @@
-//! Source-backed root session. Textual includes, providers, verified headers,
-//! and complete alternative snapshots are separate follow-on owners.
+//! Source-backed root session with independent reachable typed continuations.
+//! Textual includes, providers and verified headers have separate owners.
 use super::*;
 use crate::conditional::{
     self, BoundValue, ConditionalAnalysis, ConditionalDirective, ConditionalEnvironment,
@@ -131,6 +131,27 @@ pub fn analyze_source(
         })?;
     let state = CompileTimeState::new(context, root, &mut budget)
         .map_err(|r| resolver_error(r, &budget))?;
+    super::declarations::limit(1, limits.max_branch_states.min(64), "max_branch_states")
+        .map_err(|r| resolver_error(r, &budget))?;
+    budget
+        .charge(1, 0, size_of::<ReachablePath>() + size_of::<Sequence>())
+        .map_err(|r| resolver_error(r, &budget))?;
+    let mut environment = ConditionalEnvironment::from_context(context);
+    environment.typed_state = Some(Box::new(
+        state
+            .snapshot(&mut budget)
+            .map_err(|r| resolver_error(r, &budget))?,
+    ));
+    let scalar = environment
+        .snapshot_scalar(&mut budget)
+        .map_err(|r| resolver_error(r, &budget))?;
+    environment
+        .typed_state
+        .as_deref_mut()
+        .expect("typed root")
+        .scalar_history
+        .push((Sequence(0), scalar));
+    let first = ReachablePath { environment };
     let mut session = RootSession {
         root,
         text,
@@ -139,18 +160,54 @@ pub fn analyze_source(
         reasons: Vec::new(),
         includes: Vec::new(),
         fatal: None,
-        option_restore_unanalyzed: false,
+        current: vec![first],
+        frames: Vec::new(),
+        last_condition: Truth::Unknown,
     };
     let mut analysis = conditional::analyze_with_source_order(text, context, cancel, &mut session);
     if let Some(reason) = session.fatal.take() {
         return Err(resolver_error(reason, &session.budget));
     }
-    if session.state.failure.is_none() {
-        if let Err(reason) = session.state.finish_root(&mut session.budget) {
-            session.record(reason);
-        } else if session.state.unknown {
-            session.record(IncompleteReason::MalformedSource);
+    if !session.frames.is_empty() {
+        session.record(IncompleteReason::MalformedSource);
+        let paths = session.reachable_count();
+        session
+            .budget
+            .charge(paths, 0, paths * size_of::<ReachablePath>())
+            .map_err(|r| resolver_error(r, &session.budget))?;
+        for mut frame in std::mem::take(&mut session.frames) {
+            session.current.append(&mut frame.pending);
+            session.current.append(&mut frame.joined);
         }
+    }
+    if session.reasons.is_empty() {
+        let mut failure = None;
+        for path in &mut session.current {
+            if let Err(reason) = path.state_mut().finish_root(&mut session.budget) {
+                failure = Some(reason);
+                break;
+            } else if path.state().unknown {
+                failure = Some(IncompleteReason::MalformedSource);
+                break;
+            }
+        }
+        if let Some(reason) = failure {
+            session.record(reason);
+        }
+    }
+    if !session.current.is_empty() {
+        let count = session.current.len();
+        session
+            .budget
+            .charge(
+                count,
+                0,
+                count * (size_of::<CompileTimeState>() + size_of::<ConditionalEnvironment>()),
+            )
+            .map_err(|r| resolver_error(r, &session.budget))?;
+        let mut paths = std::mem::take(&mut session.current).into_iter();
+        session.state = paths.next().expect("nonempty").into_state();
+        session.state.alternatives = paths.map(|path| path.into_state()).collect();
     }
     if let Some(reason) = session.fatal.take() {
         return Err(resolver_error(reason, &session.budget));
@@ -160,6 +217,29 @@ pub fn analyze_source(
     }
     if !analysis.complete && session.reasons.is_empty() {
         session.record(IncompleteReason::MalformedSource);
+    }
+    if let Some(reason) = session.reasons.first() {
+        let dynamic = match reason {
+            IncompleteReason::RequiredSource { source, reason } => {
+                source.as_str().len() + reason.len()
+            }
+            _ => 0,
+        };
+        let count = session.state.alternatives.len() + 1;
+        session
+            .budget
+            .charge(
+                count,
+                dynamic.saturating_mul(count),
+                (size_of::<IncompleteReason>() + dynamic).saturating_mul(count),
+            )
+            .map_err(|r| resolver_error(r, &session.budget))?;
+        // Every retained graph remains incomplete; never publish the primary
+        // healthy path merely because it happened to be the first alternative.
+        session.state.failure = Some(reason.clone());
+        for alternative in &mut session.state.alternatives {
+            alternative.failure = Some(reason.clone());
+        }
     }
     if let Some(reason) = session.fatal.take() {
         return Err(resolver_error(reason, &session.budget));
@@ -235,13 +315,134 @@ struct RootSession<'a> {
     reasons: Vec<IncompleteReason>,
     includes: Vec<IncludeOccurrence>,
     fatal: Option<IncompleteReason>,
-    /// The layout stack is implemented, but restoring all conditional option
-    /// facts requires the phase-B complete environment snapshot. Do not reuse
-    /// post-push scalar options as though they were a restored snapshot.
-    option_restore_unanalyzed: bool,
+    current: Vec<ReachablePath>,
+    frames: Vec<ReachableFrame>,
+    last_condition: Truth,
+}
+
+struct ReachablePath {
+    environment: ConditionalEnvironment,
+}
+
+#[derive(Default)]
+struct ReachableFrame {
+    pending: Vec<ReachablePath>,
+    joined: Vec<ReachablePath>,
+    has_else: bool,
 }
 
 impl RootSession<'_> {
+    fn reachable_count(&self) -> usize {
+        self.current.len()
+            + self
+                .frames
+                .iter()
+                .map(|f| f.pending.len() + f.joined.len())
+                .sum::<usize>()
+    }
+
+    fn split(
+        &mut self,
+        directive: &ConditionalDirective,
+    ) -> Result<Vec<ReachablePath>, IncompleteReason> {
+        let mut remaining = Vec::new();
+        let total = self.reachable_count();
+        let mut selected = Vec::new();
+        let mut aggregate = None;
+        self.budget.charge(
+            self.current.len(),
+            0,
+            self.current.len() * (size_of::<Truth>() + 2 * size_of::<ReachablePath>()),
+        )?;
+        let mut decisions = Vec::new();
+        for path in &self.current {
+            let condition =
+                evaluate_path_condition(self.root, self.text, &path, directive, &mut self.budget)?;
+            aggregate = Some(aggregate.map_or(condition, |prior: Truth| prior.merge(condition)));
+            decisions.push(condition);
+        }
+        let forks = decisions.iter().filter(|d| **d == Truth::Unknown).count();
+        super::declarations::limit(
+            total + forks,
+            self.budget.limits().max_branch_states.min(64),
+            "max_branch_states",
+        )?;
+        let mut clones = Vec::new();
+        for (path, decision) in self.current.iter().zip(&decisions) {
+            clones.push(if *decision == Truth::Unknown {
+                Some(path.snapshot(&mut self.budget)?)
+            } else {
+                None
+            });
+        }
+        for ((path, condition), clone) in std::mem::take(&mut self.current)
+            .into_iter()
+            .zip(decisions)
+            .zip(clones)
+        {
+            match condition {
+                Truth::True => selected.push(path),
+                Truth::False => remaining.push(path),
+                Truth::Unknown => {
+                    selected.push(path);
+                    remaining.push(clone.expect("admitted fork"));
+                }
+            }
+        }
+        self.current = selected;
+        self.last_condition = aggregate.unwrap_or(Truth::Unknown);
+        Ok(remaining)
+    }
+
+    fn transition(&mut self, directive: &ConditionalDirective) -> Result<(), IncompleteReason> {
+        match directive.kind {
+            DirectiveKind::ConditionalStart => {
+                super::declarations::limit(
+                    self.frames.len() + 1,
+                    conditional::MAX_CONDITIONAL_DEPTH,
+                    "max_conditional_depth",
+                )?;
+                self.budget.charge(1, 0, size_of::<ReachableFrame>())?;
+                let pending = self.split(directive)?;
+                self.frames.push(ReachableFrame {
+                    pending,
+                    ..Default::default()
+                });
+            }
+            DirectiveKind::ConditionalMiddle => {
+                let Some(mut frame) = self.frames.pop() else {
+                    return Err(IncompleteReason::MalformedSource);
+                };
+                if frame.has_else {
+                    self.frames.push(frame);
+                    return Err(IncompleteReason::MalformedSource);
+                }
+                frame.joined.append(&mut self.current);
+                self.current = std::mem::take(&mut frame.pending);
+                let is_else = layout_body_key(&directive.body).eq_ignore_ascii_case("ELSE");
+                if is_else {
+                    frame.has_else = true;
+                }
+                // Keep completed arms visible while admitting additional forks.
+                self.frames.push(frame);
+                if !is_else {
+                    let pending = self.split(directive)?;
+                    self.frames.last_mut().expect("frame").pending = pending;
+                }
+            }
+            DirectiveKind::ConditionalEnd => {
+                let Some(mut frame) = self.frames.pop() else {
+                    return Err(IncompleteReason::MalformedSource);
+                };
+                frame.joined.append(&mut self.current);
+                frame.joined.append(&mut frame.pending);
+                self.current = frame.joined;
+            }
+            _ => unreachable!("conditional transition only"),
+        }
+        Ok(())
+    }
+
     fn record(&mut self, reason: IncompleteReason) {
         if self.fatal.is_some() {
             return;
@@ -269,7 +470,135 @@ impl RootSession<'_> {
     }
 }
 
+impl ReachablePath {
+    fn poison_options(
+        &mut self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        budget.charge(self.state().option_stack.len(), 0, 0)?;
+        for saved in &mut self.state_mut().option_stack {
+            if let Some(saved) = saved.take() {
+                budget.release(saved.recovery_payload_bytes());
+            }
+        }
+        Ok(())
+    }
+    fn state(&self) -> &CompileTimeState {
+        self.environment.typed_state.as_deref().expect("typed path")
+    }
+    fn state_mut(&mut self) -> &mut CompileTimeState {
+        self.environment
+            .typed_state
+            .as_deref_mut()
+            .expect("typed path")
+    }
+    fn into_state(mut self) -> CompileTimeState {
+        let mut state = *self.environment.typed_state.take().expect("typed path");
+        state.conditional = Some(Box::new(self.environment));
+        state
+    }
+    fn snapshot(&self, budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
+        // The environment owns the complete typed continuation, not a context projection.
+        let before = budget.snapshot().retained_bytes;
+        budget.charge(1, 0, size_of::<Self>())?;
+        match self.environment.snapshot_typed(budget) {
+            Ok(environment) => Ok(Self { environment }),
+            Err(reason) => {
+                budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+                Err(reason)
+            }
+        }
+    }
+}
+
+fn evaluate_path_condition(
+    root: &LoadedSource,
+    text: &str,
+    path: &ReachablePath,
+    directive: &ConditionalDirective,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Truth, IncompleteReason> {
+    let state = path.state();
+    let site = state.site();
+    let environment = &path.environment;
+    conditional::evaluate_source_condition(
+        &directive.body,
+        environment,
+        budget,
+        &mut |query, budget| match query {
+            ExpressionQuery::LexicalName(name) => {
+                super::arrays::lexical_constant_name(state, &site, name, 0, budget)
+            }
+            ExpressionQuery::Name(name) => {
+                if super::bindings::lookup(state, &site, name, budget)?.is_some() {
+                    return super::arrays::constant_name(state, &site, name, 0, budget);
+                }
+                if super::arrays::qualifier_blocked(state, &site, name, budget)? {
+                    return Ok(None);
+                }
+                let value = super::arrays::constant_name(state, &site, name, 0, budget)?;
+                if value.is_some() {
+                    Ok(value)
+                } else {
+                    conditional::bound_define(environment, name, budget)
+                }
+            }
+            ExpressionQuery::Declared(name) => {
+                let mut known = super::bindings::lookup(state, &site, name, budget)?.is_some();
+                if !known && super::arrays::qualifier_blocked(state, &site, name, budget)? {
+                    return Ok(None);
+                }
+                if !known {
+                    for key in state.context.constants.keys() {
+                        budget.charge(1, key.len().min(name.len()), 0)?;
+                        if super::bindings::same_name(key, name) {
+                            known = true;
+                            break;
+                        }
+                    }
+                }
+                budget.charge(1, name.len(), 0)?;
+                Ok(if known {
+                    Some(BoundValue::Constant(ConstantValue::Boolean(true)))
+                } else if state.context.rtl_constants_known
+                    && ConditionalContext::is_rtl_version_constant(name)
+                {
+                    Some(BoundValue::Constant(ConstantValue::Boolean(false)))
+                } else {
+                    None
+                })
+            }
+            ExpressionQuery::SizeOf { argument, range } => {
+                let before = budget.snapshot().retained_bytes;
+                let anchor =
+                    argument_anchor(root, text, &directive.body, directive.start, range, budget)?;
+                if text.get(anchor.range.clone()) != Some(argument) {
+                    return Err(IncompleteReason::MalformedSource);
+                }
+                drop(anchor);
+                budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+                sizeof_value(state, &site, argument, budget)
+            }
+        },
+    )
+}
+
 impl SourceOrder for RootSession<'_> {
+    fn activity(&self) -> Truth {
+        if !self.reasons.is_empty() || self.fatal.is_some() {
+            Truth::Unknown
+        } else if self.current.is_empty() {
+            Truth::False
+        } else if self
+            .frames
+            .iter()
+            .all(|frame| frame.pending.is_empty() && frame.joined.is_empty())
+        {
+            Truth::True
+        } else {
+            Truth::Unknown
+        }
+    }
     fn admit_directive(&mut self, body_bytes: usize) -> bool {
         if self.fatal.is_some() {
             return false;
@@ -309,127 +638,58 @@ impl SourceOrder for RootSession<'_> {
         if self.fatal.is_some() || self.state.failure.is_some() || activity == Truth::False {
             return;
         }
-        if activity == Truth::Unknown {
-            self.record(IncompleteReason::BranchStateNotAnalyzed);
-            return;
+        let mut failure = None;
+        for path in &mut self.current {
+            if let Err(reason) = path.state_mut().feed(
+                SourceFragment {
+                    source: &self.root.id,
+                    occurrence: OccurrenceId(0),
+                    physical_start: range.start,
+                    text: &self.text[range.clone()],
+                },
+                Truth::True,
+                &mut self.budget,
+            ) {
+                failure = Some(reason);
+                break;
+            }
         }
-        if let Err(reason) = self.state.feed(
-            SourceFragment {
-                source: &self.root.id,
-                occurrence: OccurrenceId(0),
-                physical_start: range.start,
-                text: &self.text[range],
-            },
-            Truth::True,
-            &mut self.budget,
-        ) {
+        if let Some(reason) = failure {
             self.record(reason);
         }
     }
 
     fn condition(
         &mut self,
-        body: &str,
-        start: usize,
-        environment: &ConditionalEnvironment,
-        complete: &mut bool,
+        _body: &str,
+        _start: usize,
+        _environment: &ConditionalEnvironment,
+        _complete: &mut bool,
     ) -> Truth {
-        if self.state.failure.is_some() || self.fatal.is_some() {
-            return Truth::Unknown;
-        }
-        let site = self.state.site();
-        let state = &self.state;
-        let result = conditional::evaluate_source_condition(
-            body,
-            environment,
-            &mut self.budget,
-            &mut |query, budget| match query {
-                ExpressionQuery::LexicalName(name) => {
-                    super::arrays::lexical_constant_name(state, &site, name, 0, budget)
-                }
-                ExpressionQuery::Name(name) => {
-                    if super::bindings::lookup(state, &site, name, budget)?.is_some() {
-                        return super::arrays::constant_name(state, &site, name, 0, budget);
-                    }
-                    if super::arrays::qualifier_blocked(state, &site, name, budget)? {
-                        return Ok(None);
-                    }
-                    let value = super::arrays::constant_name(state, &site, name, 0, budget)?;
-                    if value.is_some() {
-                        Ok(value)
-                    } else {
-                        conditional::bound_define(environment, name, budget)
-                    }
-                }
-                ExpressionQuery::Declared(name) => {
-                    let mut known = super::bindings::lookup(state, &site, name, budget)?.is_some();
-                    if !known && super::arrays::qualifier_blocked(state, &site, name, budget)? {
-                        return Ok(None);
-                    }
-                    if !known {
-                        for key in state.context.constants.keys() {
-                            budget.charge(1, key.len().min(name.len()), 0)?;
-                            if super::bindings::same_name(key, name) {
-                                known = true;
-                                break;
-                            }
-                        }
-                    }
-                    budget.charge(1, name.len(), 0)?;
-                    Ok(if known {
-                        Some(BoundValue::Constant(ConstantValue::Boolean(true)))
-                    } else if state.context.rtl_constants_known
-                        && ConditionalContext::is_rtl_version_constant(name)
-                    {
-                        Some(BoundValue::Constant(ConstantValue::Boolean(false)))
-                    } else {
-                        None
-                    })
-                }
-                ExpressionQuery::SizeOf { argument, range } => {
-                    // The original body slice includes its original whitespace.
-                    // These coordinates are physical root bytes, not wrapper bytes.
-                    let before = budget.snapshot().retained_bytes;
-                    let anchor = argument_anchor(self.root, self.text, body, start, range, budget)?;
-                    if self.text.get(anchor.range.clone()) != Some(argument) {
-                        return Err(IncompleteReason::MalformedSource);
-                    }
-                    drop(anchor);
-                    budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
-                    sizeof_value(state, &site, argument, budget)
-                }
-            },
-        );
-        let result = result.map(|value| {
-            if self.option_restore_unanalyzed && conditional::is_option_condition(body) {
-                Truth::Unknown
-            } else {
-                value
-            }
-        });
-        match result {
-            Ok(Truth::Unknown) => {
-                self.record(IncompleteReason::BranchStateNotAnalyzed);
-                Truth::Unknown
-            }
-            Ok(value) => value,
-            Err(reason) => {
-                *complete = false;
-                self.record(reason);
-                Truth::Unknown
-            }
+        if self.fatal.is_some() || !self.reasons.is_empty() {
+            Truth::Unknown
+        } else {
+            self.last_condition
         }
     }
 
     fn directive(&mut self, directive: &ConditionalDirective) {
-        if self.fatal.is_some() || directive.activity == Truth::False {
+        if self.fatal.is_some() || !self.reasons.is_empty() {
             return;
         }
-        if ["POPOPT", "POP"]
-            .iter()
-            .any(|key| layout_body_key(&directive.body).eq_ignore_ascii_case(key))
-        {
-            self.option_restore_unanalyzed = true;
+        if matches!(
+            directive.kind,
+            DirectiveKind::ConditionalStart
+                | DirectiveKind::ConditionalMiddle
+                | DirectiveKind::ConditionalEnd
+        ) {
+            if let Err(reason) = self.transition(directive) {
+                self.record(reason);
+            }
+            return;
+        }
+        if self.current.is_empty() {
+            return;
         }
         if directive.kind == DirectiveKind::Include {
             const REASON: &str = "textual include analysis unavailable until Task8";
@@ -457,61 +717,152 @@ impl SourceOrder for RootSession<'_> {
                 source: self.root.id.clone(),
                 reason: REASON.into(),
             });
-        } else if self.state.failure.is_none() {
-            if let Some(members) = conditional::switch_list_members(&directive.body) {
-                for member in members {
-                    if is_layout_body(member) {
-                        if let Err(reason) = self.state.apply_layout_directive(
-                            member,
-                            directive.activity,
-                            &mut self.budget,
-                        ) {
-                            self.record(reason);
-                            break;
-                        }
-                    }
+        } else {
+            let mut failure = None;
+            for path in &mut self.current {
+                if let Err(reason) = apply_path_directive(path, directive, &mut self.budget) {
+                    failure = Some(reason);
+                    break;
                 }
-            } else if let Some(members) = conditional::switch_list_candidates(&directive.body) {
-                // Use the existing decoder's invalid-list candidate rules. An
-                // invalid list cannot leave a dependent layout switch precise.
-                for member in members {
-                    if is_layout_body(member) {
-                        if let Err(reason) = self.state.apply_layout_directive(
-                            member,
-                            Truth::Unknown,
-                            &mut self.budget,
-                        ) {
-                            self.record(reason);
-                            break;
-                        }
-                    }
-                }
-            } else if is_layout_body(&directive.body) {
-                if directive.body.contains(',') {
-                    // Numeric/mixed lists have no verified list grammar here;
-                    // invalidate each named family, never keep a stale H/Z fact.
-                    for member in directive.body.split(',') {
-                        if is_layout_body(member) {
-                            if let Err(reason) = self.state.apply_layout_directive(
-                                member,
-                                Truth::Unknown,
-                                &mut self.budget,
-                            ) {
-                                self.record(reason);
-                                break;
-                            }
-                        }
-                    }
-                } else if let Err(reason) = self.state.apply_layout_directive(
-                    &directive.body,
-                    directive.activity,
-                    &mut self.budget,
-                ) {
-                    self.record(reason);
-                }
+            }
+            if let Some(reason) = failure {
+                self.record(reason);
             }
         }
     }
+}
+
+fn apply_path_directive(
+    path: &mut ReachablePath,
+    directive: &ConditionalDirective,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    // Bound shared-decoder scratch and scan/copy work before parsing switch
+    // lists or invoking the legacy scalar mutator's independent safety limits.
+    let bytes = directive.body.len();
+    let scratch = bytes.saturating_mul(2 * size_of::<&str>());
+    budget.charge(
+        bytes.saturating_mul(8).saturating_add(1),
+        bytes.saturating_mul(32),
+        scratch,
+    )?;
+    let result = apply_path_directive_inner(path, directive, budget);
+    budget.release(scratch);
+    result
+}
+
+fn apply_path_directive_inner(
+    path: &mut ReachablePath,
+    directive: &ConditionalDirective,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    let key = layout_body_key(&directive.body);
+    let value = directive.body.trim().get(key.len()..).unwrap_or("!").trim();
+    let supported = value.is_empty()
+        && path.state().context.compiler_version
+            == Some(pascal_project::CompilerVersion::new(37, 0))
+        && matches!(
+            path.state().context.layout.platform,
+            Some(pascal_project::LayoutPlatform::Win32 | pascal_project::LayoutPlatform::Win64)
+        );
+    if key.eq_ignore_ascii_case("PUSHOPT") {
+        super::declarations::limit(
+            path.state().option_stack.len() + 1,
+            budget.limits().max_scope_depth,
+            "max_scope_depth",
+        )?;
+        budget.charge(1, 0, size_of::<Option<ConditionalEnvironment>>())?;
+        let saved = if supported {
+            Some(path.environment.snapshot_scalar(budget)?)
+        } else {
+            path.poison_options(budget)?;
+            None
+        };
+        path.state_mut().option_stack.push(saved);
+    } else if key.eq_ignore_ascii_case("POPOPT")
+        || key.eq_ignore_ascii_case("POP")
+        || key.eq_ignore_ascii_case("PUSH")
+    {
+        let saved = if key.eq_ignore_ascii_case("POPOPT") {
+            let popped = path.state_mut().option_stack.pop();
+            if popped.is_some() {
+                budget.release(size_of::<Option<ConditionalEnvironment>>());
+            }
+            popped.flatten()
+        } else {
+            None
+        };
+        let restored = conditional::restore_source_options(
+            &mut path.environment,
+            if supported && key.eq_ignore_ascii_case("POPOPT") {
+                saved.as_ref()
+            } else {
+                None
+            },
+            budget,
+        );
+        if let Some(saved) = &saved {
+            budget.release(saved.recovery_payload_bytes());
+        }
+        restored?;
+        if !supported || saved.is_none() {
+            path.poison_options(budget)?;
+        }
+    }
+    conditional::apply_source_directive(&mut path.environment, directive, budget)?;
+    if matches!(directive.kind, DirectiveKind::Define | DirectiveKind::Undef)
+        || conditional::is_option_directive(&directive.body)
+    {
+        let scalar = path.environment.snapshot_scalar(budget)?;
+        budget.charge(
+            1,
+            0,
+            size_of::<Sequence>() + size_of::<ConditionalEnvironment>(),
+        )?;
+        let state = path.state_mut();
+        state.sequence = Sequence(
+            state
+                .sequence
+                .0
+                .checked_add(1)
+                .ok_or(IncompleteReason::MalformedSource)?,
+        );
+        state.scalar_history.push((state.sequence, scalar));
+    }
+    {
+        if let Some(members) = conditional::switch_list_members(&directive.body) {
+            for member in members {
+                if is_layout_body(member) {
+                    path.state_mut()
+                        .apply_layout_directive(member, Truth::True, budget)?;
+                }
+            }
+        } else if let Some(members) = conditional::switch_list_candidates(&directive.body) {
+            // Use the existing decoder's invalid-list candidate rules. An
+            // invalid list cannot leave a dependent layout switch precise.
+            for member in members {
+                if is_layout_body(member) {
+                    path.state_mut()
+                        .apply_layout_directive(member, Truth::Unknown, budget)?;
+                }
+            }
+        } else if is_layout_body(&directive.body) {
+            if directive.body.contains(',') {
+                // Numeric/mixed lists have no verified list grammar here;
+                // invalidate each named family, never keep a stale H/Z fact.
+                for member in directive.body.split(',') {
+                    if is_layout_body(member) {
+                        path.state_mut()
+                            .apply_layout_directive(member, Truth::Unknown, budget)?;
+                    }
+                }
+            } else {
+                path.state_mut()
+                    .apply_layout_directive(&directive.body, Truth::True, budget)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_layout_body(body: &str) -> bool {
@@ -600,6 +951,138 @@ fn argument_anchor(
 mod tests {
     use super::*;
     use crate::{NoCancellation, SourceId, SourceRevision};
+
+    #[test]
+    fn typed_environment_snapshot_retains_partial_graph_maps_options_and_provenance() {
+        let text = "unit T; interface type R=packed record X:";
+        let root = LoadedSource {
+            id: SourceId::new("/fixture/snapshot.pas"),
+            path: "/fixture/snapshot.pas".into(),
+            bytes: text.as_bytes().into(),
+            decoded_text: Some(text.into()),
+            revision: SourceRevision::Overlay {
+                version: 1,
+                content_hash: 1,
+            },
+        };
+        let context = ConditionalContext::default()
+            .with_layout(pascal_project::LayoutContext {
+                platform: Some(pascal_project::LayoutPlatform::Win32),
+                ..Default::default()
+            })
+            .with_compiler_version(pascal_project::CompilerVersion::new(37, 0));
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut state = CompileTimeState::new(&context, &root, &mut budget).unwrap();
+        state
+            .feed(
+                SourceFragment {
+                    source: &root.id,
+                    occurrence: OccurrenceId(3),
+                    physical_start: 0,
+                    text,
+                },
+                Truth::True,
+                &mut budget,
+            )
+            .unwrap();
+        let mut environment = ConditionalEnvironment::from_context(&context);
+        environment.typed_state = Some(Box::new(state));
+        let mut path = ReachablePath { environment };
+        for body in ["B+", "PUSHOPT", "B-"] {
+            apply_path_directive(
+                &mut path,
+                &ConditionalDirective {
+                    kind: DirectiveKind::Other,
+                    body: body.into(),
+                    start: text.len(),
+                    end: text.len(),
+                    activity: Truth::True,
+                    condition: None,
+                },
+                &mut budget,
+            )
+            .unwrap();
+        }
+        let identity = path.environment.fingerprint();
+        let bytes = path.environment.recovery_payload_bytes();
+        let before = budget.snapshot();
+        let mut other = path.snapshot(&mut budget).unwrap();
+        assert_eq!(identity, other.environment.fingerprint());
+        assert_eq!(bytes, other.environment.recovery_payload_bytes());
+        assert!(budget.snapshot().work > before.work);
+        assert!(budget.snapshot().byte_work > before.byte_work);
+        assert!(budget.snapshot().retained_bytes >= before.retained_bytes + bytes);
+        assert_eq!(other.environment.to_context().layout, context.layout);
+        assert!(other.environment.to_context().layout_explicit);
+        let projected = ConditionalEnvironment::from_context(&other.environment.to_context());
+        assert!(projected.typed_state.is_none());
+        assert_ne!(identity, projected.fingerprint());
+        for (path, suffix) in [(&mut path, "Byte; end;"), (&mut other, "Int64; end;")] {
+            path.state_mut()
+                .feed(
+                    SourceFragment {
+                        source: &root.id,
+                        occurrence: OccurrenceId(3),
+                        physical_start: text.len(),
+                        text: suffix,
+                    },
+                    Truth::True,
+                    &mut budget,
+                )
+                .unwrap();
+        }
+        assert_ne!(
+            path.environment.fingerprint(),
+            other.environment.fingerprint()
+        );
+        for (path, size) in [(&path, 1), (&other, 8)] {
+            let state = path.state();
+            let layout = state
+                .layout_name(state.site(), "R", &mut budget)
+                .known()
+                .unwrap();
+            assert_eq!(layout.storage.size, size);
+            let TypeIdentity::Declared(key) = layout.identity else {
+                panic!("declared graph lost");
+            };
+            assert_eq!(key.anchor.occurrence, OccurrenceId(3));
+            assert_eq!(key.anchor.source, root.id);
+        }
+        let mut denied = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_retained_bytes: 0,
+                ..Default::default()
+            },
+            &NoCancellation,
+        );
+        let identity = path.environment.fingerprint();
+        assert!(matches!(
+            path.snapshot(&mut denied),
+            Err(IncompleteReason::Limit {
+                name: "max_retained_bytes",
+                ..
+            })
+        ));
+        assert_eq!(denied.snapshot().retained_bytes, 0);
+        assert_eq!(path.environment.fingerprint(), identity);
+        struct CancelDuringSnapshot(std::cell::Cell<usize>);
+        impl CancellationToken for CancelDuringSnapshot {
+            fn is_cancelled(&self) -> bool {
+                let calls = self.0.get() + 1;
+                self.0.set(calls);
+                calls >= 3
+            }
+        }
+        let cancel = CancelDuringSnapshot(std::cell::Cell::new(0));
+        let mut cancelled = CompileTimeBudget::new(CompileTimeLimits::default(), &cancel);
+        assert!(matches!(
+            path.snapshot(&mut cancelled),
+            Err(IncompleteReason::Cancelled)
+        ));
+        assert_eq!(cancelled.snapshot().retained_bytes, 0);
+        assert!(cancelled.snapshot().work > 0);
+        assert_eq!(path.environment.fingerprint(), identity);
+    }
 
     #[test]
     fn sizeof_argument_ranges_map_to_original_brace_and_paren_occurrences() {
@@ -751,8 +1234,11 @@ mod tests {
     }
 }
 
-/// One layout bridge used by IF and declaration-captured constant expressions.
-/// No numeric literal typing, callable evaluation or memory reads are introduced.
+/// Per-path bridge used by IF and declaration-captured constant expressions.
+/// The session compares complete expression results across paths; the public
+/// sizeof_operand projects returned graphs across alternatives. Captured bounds
+/// must stay in their owning path, even when the primary returned graph also
+/// carries alternatives. No literal typing, callable evaluation or memory reads.
 pub(super) fn sizeof_value(
     state: &CompileTimeState,
     site: &BindingSite,
@@ -762,13 +1248,15 @@ pub(super) fn sizeof_value(
     budget.with_layout_query(|budget| {
         let before = budget.snapshot().retained_bytes;
         let result = match parse_sizeof_operand(argument, budget) {
-            Fact::Known(operand) => match state.layout_operand(site.clone(), &operand, budget) {
-                Fact::Known(layout) => Ok(i64::try_from(layout.storage.size)
-                    .ok()
-                    .map(|n| BoundValue::Constant(ConstantValue::Integer(n)))),
-                Fact::Unknown(_) => Ok(None),
-                Fact::Incomplete(reason) => Err(reason),
-            },
+            Fact::Known(operand) => {
+                match state.layout_operand_single(site.clone(), &operand, budget) {
+                    Fact::Known(layout) => Ok(i64::try_from(layout.storage.size)
+                        .ok()
+                        .map(|n| BoundValue::Constant(ConstantValue::Integer(n)))),
+                    Fact::Unknown(_) => Ok(None),
+                    Fact::Incomplete(reason) => Err(reason),
+                }
+            }
             Fact::Unknown(_) => Ok(None),
             Fact::Incomplete(reason) => Err(reason),
         };

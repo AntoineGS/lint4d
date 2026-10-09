@@ -763,9 +763,17 @@ fn constant_expression_at(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    budget.charge(state.scalar_history.len(), 0, 0)?;
+    let fallback = crate::conditional::ConditionalEnvironment::default();
+    let environment = state
+        .scalar_history
+        .iter()
+        .rev()
+        .find(|(sequence, _)| sequence.0 <= site.sequence.0)
+        .map_or(&fallback, |(_, environment)| environment);
     crate::conditional::evaluate_layout_expression(
         text,
-        &crate::conditional::ConditionalEnvironment::default(),
+        environment,
         budget,
         &mut |query, budget| match query {
             crate::conditional::ExpressionQuery::Name(name) => {

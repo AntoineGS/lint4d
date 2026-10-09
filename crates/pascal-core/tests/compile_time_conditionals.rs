@@ -13,6 +13,277 @@ use pascal_project::{
 };
 use support::compile_time::{Fixture, activity, context};
 
+#[test]
+fn phase_b_reachable_branches_keep_correlated_declarations_and_switches() {
+    let source = "unit T; interface {$IF Mystery}{$DEFINE SMALL}type R=Byte;{$ELSE}{$UNDEF SMALL}type R=Int64;{$ENDIF} \
+        {$IF Defined(SMALL)}{$IF SizeOf(R)=1}{$DEFINE SMALL_OK}{$ELSE}{$DEFINE WRONG_SMALL}{$ENDIF}{$ELSE}\
+        {$IF SizeOf(R)=8}{$DEFINE LARGE_OK}{$ELSE}{$DEFINE WRONG_LARGE}{$ENDIF}{$ENDIF} \
+        {$IF SizeOf(R)=1}{$DEFINE MAYBE}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE SMALL_OK"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE LARGE_OK"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE WRONG_SMALL"), Truth::False);
+    assert_eq!(activity(&a, "DEFINE WRONG_LARGE"), Truth::False);
+    assert_eq!(activity(&a, "DEFINE MAYBE"), Truth::Unknown);
+}
+
+#[test]
+fn phase_b_equal_size_partial_records_and_initializers_prove_all_paths() {
+    let source = "unit T; interface type R=packed record X:{$IF Mystery}Byte{$ELSE}ShortInt{$ENDIF}; end; \
+        const N=SizeOf({$IF Mystery}R{$ELSE}Byte{$ENDIF}); type A=array[1..N] of Word; \
+        {$IF (N=1) and (SizeOf(A)=2)}{$DEFINE ALL_OK}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE ALL_OK"), Truth::True);
+}
+
+#[test]
+fn phase_b_missing_else_retains_the_unchanged_reachable_state() {
+    let source = "unit T; interface {$IF Mystery}type R=Byte;{$ENDIF} \
+        {$IF SizeOf(R)=1}{$DEFINE MAYBE}{$ENDIF} type Later=Word; \
+        {$IF SizeOf(Later)=2}{$DEFINE LATER_OK}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE MAYBE"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE LATER_OK"), Truth::True);
+}
+
+#[test]
+fn phase_b_sequential_splits_are_capped_not_only_nested_depth() {
+    for (splits, complete) in [(6, true), (7, false)] {
+        let mut source = String::from("unit T; interface ");
+        for i in 0..splits {
+            source.push_str(&format!(
+                "{{$IF Mystery{i}}}{{$DEFINE X{i}}}{{$ELSE}}{{$UNDEF X{i}}}{{$ENDIF}}"
+            ));
+        }
+        source.push_str("implementation end.");
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert_eq!(a.root.complete, complete, "{:?}", a.reasons);
+        if !complete {
+            assert!(a.reasons.iter().any(|r| matches!(
+                r,
+                IncompleteReason::Limit {
+                    name: "max_branch_states",
+                    maximum: 64
+                }
+            )));
+        }
+    }
+}
+
+#[test]
+fn phase_b_caller_branch_budget_is_shared_with_sequential_forks() {
+    let mut f = Fixture::new(
+        "unit T; interface {$IF Mystery}type R=Byte;{$ELSE}type R=Word;{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.limits.max_branch_states = 1;
+    let a = f.analyze().unwrap();
+    assert!(!a.root.complete);
+    assert!(a.reasons.contains(&IncompleteReason::Limit {
+        name: "max_branch_states",
+        maximum: 1
+    }));
+}
+
+#[test]
+fn phase_b_whole_restore_covers_documented_scalar_options_without_restoring_defines() {
+    for option in ["R", "O", "Q", "C", "B", "I", "X", "D", "H"] {
+        let source = format!(
+            "unit T; interface {{$UNDEF FLAG}}{{${option}+}}{{$PUSHOPT}}{{${option}-}}{{$DEFINE FLAG}}{{$POPOPT}}{{$IFOPT {option}+}}{{$DEFINE RESTORED}}{{$ENDIF}}{{$IF Defined(FLAG)}}{{$DEFINE DEFINE_KEPT}}{{$ENDIF}} implementation end."
+        );
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert!(a.root.complete, "{option}: {:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE RESTORED"), Truth::True, "{option}");
+        assert_eq!(activity(&a, "DEFINE DEFINE_KEPT"), Truth::True, "{option}");
+    }
+}
+
+#[test]
+fn phase_b_reachable_failures_pending_and_depth_do_not_publish_precise_facts() {
+    let mut f = Fixture::new(
+        "unit T; interface {$IF Mystery}type R=packed record X:Byte;{$ELSE}type R=Byte;{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.limits.max_pending_bytes = 8;
+    let a = f.analyze().unwrap();
+    assert!(!a.root.complete);
+    assert!(a.reasons.iter().any(|r| matches!(
+        r,
+        IncompleteReason::Limit {
+            name: "max_pending_bytes",
+            ..
+        }
+    )));
+    assert_eq!(a.root.directives[0].activity, Truth::Unknown);
+    let mut source = String::from("unit T; interface ");
+    for _ in 0..257 {
+        source.push_str("{$IF false}");
+    }
+    for _ in 0..257 {
+        source.push_str("{$ENDIF}");
+    }
+    source.push_str("implementation end.");
+    let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(!a.root.complete);
+    assert!(a.reasons.iter().any(|r| matches!(
+        r,
+        IncompleteReason::Limit {
+            name: "max_conditional_depth",
+            maximum: 256
+        }
+    )));
+}
+
+#[test]
+fn phase_b_equal_scalar_sizes_do_not_invent_one_layout_identity() {
+    let source = "unit T; interface {$IF Mystery}type R=Byte;{$ELSE}type R=ShortInt;{$ENDIF} \
+        {$IF SizeOf(R)=1}{$DEFINE SIZE_OK}{$ENDIF} implementation end.";
+    let mut f = Fixture::new(source, context(LayoutPlatform::Win32));
+    let a = f.analyze().unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE SIZE_OK"), Truth::True);
+    assert_eq!(a.facts.reachable_states().count(), 2);
+    let site = a
+        .facts
+        .site_at(&f.root.id, OccurrenceId(0), source.len())
+        .unwrap();
+    let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+    assert!(matches!(
+        a.facts.layout_name(site.clone(), "R", &mut budget),
+        Fact::Unknown(_)
+    ));
+    let operand = parse_sizeof_operand("R", &mut budget).known().unwrap();
+    assert_eq!(
+        a.facts.sizeof_operand(site, &operand, &mut budget),
+        Fact::Known(1)
+    );
+}
+
+#[test]
+fn phase_b_returned_graphs_evaluate_captured_bounds_in_their_own_path() {
+    let source = "unit T; interface {$IF Mystery}type R=Byte;{$ELSE}type R=Word;{$ENDIF} \
+        type A=array[0..SizeOf(R)-SizeOf(R)] of Word; {$IF SizeOf(A)=2}{$DEFINE ARRAY_OK}{$ENDIF} implementation end.";
+    let mut f = Fixture::new(source, context(LayoutPlatform::Win32));
+    let a = f.analyze().unwrap();
+    assert_eq!(activity(&a, "DEFINE ARRAY_OK"), Truth::True);
+    let site = a
+        .facts
+        .site_at(&f.root.id, OccurrenceId(0), source.len())
+        .unwrap();
+    let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+    let operand = parse_sizeof_operand("A", &mut budget).known().unwrap();
+    assert_eq!(
+        a.facts.sizeof_operand(site, &operand, &mut budget),
+        Fact::Known(2)
+    );
+}
+
+#[test]
+fn phase_b_failed_fork_never_returns_a_healthy_selected_graph() {
+    let mut source = String::from("unit T; interface type R=Byte;");
+    for i in 0..7 {
+        source.push_str(&format!("{{$IF Mystery{i}}}{{$DEFINE X{i}}}{{$ENDIF}}"));
+    }
+    source.push_str("implementation end.");
+    let mut f = Fixture::new(&source, context(LayoutPlatform::Win32));
+    let a = f.analyze().unwrap();
+    assert!(!a.root.complete);
+    let site = a
+        .facts
+        .site_at(
+            &f.root.id,
+            OccurrenceId(0),
+            source.find("{$IF Mystery0}").unwrap(),
+        )
+        .unwrap();
+    let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+    assert!(matches!(
+        a.facts.layout_name(site, "R", &mut budget),
+        Fact::Incomplete(_)
+    ));
+}
+
+#[test]
+fn phase_b_scope_and_later_shadow_queries_use_each_paths_physical_site() {
+    let source = "unit T; interface type R=Word; implementation procedure P(p:Byte); \
+        {$IF Mystery}type R=Byte; const N=SizeOf(p);{$ELSE}type R=ShortInt; const N=SizeOf(R); Extra=9;{$ENDIF} \
+        begin {$IF (N=1) and (SizeOf(R)=1)}{$DEFINE LOCAL_OK}{$ENDIF} end; \
+        {$IF SizeOf(R)=2}{$DEFINE OUTER_OK}{$ENDIF} end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE LOCAL_OK"), Truth::True);
+    assert_eq!(activity(&a, "DEFINE OUTER_OK"), Truth::True);
+}
+
+#[test]
+fn phase_b_elseifs_pending_tokens_and_nested_option_stacks_keep_independent_paths() {
+    let source = "unit T; interface {$B+}{$H-}{$PUSHOPT} {$IF Mystery}{$B-}{$H+}{$ELSEIF false}type Bad=record Nope: ;{$ELSE}{$B-}{$H+}{$ENDIF} \
+        {$PUSHOPT}{$B+}{$H-}{$POPOPT}{$IFOPT B-}{$DEFINE INNER_OK}{$ENDIF}{$POPOPT} \
+        type A=By{$IF Mystery}te{$ELSE}te{$ENDIF}; const N=SizeOf(A); \
+        {$IFOPT B+}{$DEFINE OUTER_OK}{$ENDIF}{$IFOPT H-}{$DEFINE H_OK}{$ENDIF}{$IF N=1}{$DEFINE TOKEN_OK}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    for body in [
+        "DEFINE INNER_OK",
+        "DEFINE OUTER_OK",
+        "DEFINE H_OK",
+        "DEFINE TOKEN_OK",
+    ] {
+        assert_eq!(activity(&a, body), Truth::True, "{body}");
+    }
+}
+
+#[test]
+fn phase_b_unknown_saved_option_is_not_defaulted_and_subset_restore_poisoned() {
+    let source = "unit T; interface {$PUSHOPT}{$B+}{$POPOPT}{$IFOPT B+}{$DEFINE SAVED_UNKNOWN}{$ENDIF} \
+        {$B+}{$PUSHOPT B}{$B-}{$POPOPT}{$IFOPT B+}{$DEFINE SUBSET_UNKNOWN}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE SAVED_UNKNOWN"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE SUBSET_UNKNOWN"), Truth::Unknown);
+}
+
+#[test]
+fn phase_b_initializers_capture_each_paths_scalar_environment_without_retroactive_define_changes() {
+    let source = "unit T; interface {$IF Mystery}{$DEFINE FLAG}{$ELSE}{$UNDEF FLAG}{$ENDIF} \
+        const N=Ord(Defined(FLAG)); {$DEFINE FLAG} \
+        {$IF N=0}{$DEFINE ZERO}{$ELSE}{$DEFINE ONE}{$ENDIF} \
+        {$IF Defined(FLAG)}{$DEFINE FLAG_OK}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE ZERO"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE ONE"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE FLAG_OK"), Truth::True);
+    assert_eq!(
+        a.facts.reachable_states().count(),
+        2,
+        "unknown initializers must not cause extra spurious forks"
+    );
+}
+
 fn assert_transport(context: &ConditionalContext) {
     let mut environment = ConditionalEnvironment::from_context(context);
     assert_eq!(environment.to_context().layout, context.layout);
@@ -201,10 +472,10 @@ fn sizeof_respects_captured_aliases_switches_and_source_order_bounds() {
     let a = Fixture::new(source, context(LayoutPlatform::Win32))
         .analyze()
         .unwrap();
-    // A valid unresolved query does not require a branch-state fork: its body
-    // is inactive in no proven path, so phase A conservatively halts typed facts.
+    // The unresolved early query forks without rebinding the earlier decision.
     assert_eq!(activity(&a, "DEFINE ORDER_OK"), Truth::True);
     assert_eq!(activity(&a, "DEFINE TOO_EARLY"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE LATER_OK"), Truth::True);
 }
 
 #[test]
@@ -235,14 +506,14 @@ fn known_inactive_malformed_declarations_do_not_poison_reachable_state() {
 }
 
 #[test]
-fn unknown_branches_are_explicitly_incomplete_without_splicing_phase_a() {
+fn unknown_branches_remain_complete_without_splicing() {
     let source = "unit T; interface {$IF Mystery}type R=Byte;{$ELSE}type R=Int64;{$ENDIF} \
         {$IF SizeOf(R)=1}{$DEFINE WRONG}{$ENDIF} implementation end.";
     let a = Fixture::new(source, context(LayoutPlatform::Win32))
         .analyze()
         .unwrap();
-    assert!(!a.root.complete);
-    assert!(!a.reasons.is_empty());
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert!(a.reasons.is_empty());
     assert_eq!(activity(&a, "DEFINE WRONG"), Truth::Unknown);
 }
 
@@ -335,8 +606,8 @@ fn unsupported_sizeof_value_preserves_existing_conservative_boolean_semantics() 
     let a = Fixture::new(source, context(LayoutPlatform::Win32))
         .analyze()
         .unwrap();
-    assert!(!a.root.complete);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.root.complete);
+    assert!(a.reasons.is_empty());
     assert_eq!(activity(&a, "DEFINE PROVEN"), Truth::Unknown);
 }
 
@@ -422,7 +693,7 @@ fn completed_constant_captures_the_site_before_a_later_type_is_declared() {
         .unwrap();
     assert_eq!(activity(&a, "DEFINE AFTER_OK"), Truth::True);
     assert_eq!(activity(&a, "DEFINE RETROACTIVE"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
 
 #[test]
@@ -435,7 +706,7 @@ fn sizeof_is_static_and_does_not_admit_runtime_values_or_calls() {
         .unwrap();
     assert_eq!(activity(&a, "DEFINE STATIC_OK"), Truth::True);
     assert_eq!(activity(&a, "DEFINE RUNTIME"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
 
 #[test]
@@ -491,17 +762,17 @@ fn lexical_compiler_version_constant_and_parameter_block_metadata_fallback() {
     assert_eq!(activity(&a, "DEFINE LEXICAL_VERSION"), Truth::True);
     assert_eq!(activity(&a, "DEFINE PARAM_TYPE"), Truth::True);
     assert_eq!(activity(&a, "DEFINE PARAM_VALUE"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
 
 #[test]
-fn scalar_option_restore_without_complete_snapshots_is_conservative_until_phase_b() {
+fn scalar_option_restore_restores_complete_option_snapshot() {
     let source = "unit T; interface {$B+}{$PUSHOPT}{$B-}{$POPOPT}{$IFOPT B+}{$DEFINE RESTORED}{$ENDIF} implementation end.";
     let a = Fixture::new(source, context(LayoutPlatform::Win32))
         .analyze()
         .unwrap();
-    assert_eq!(activity(&a, "DEFINE RESTORED"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert_eq!(activity(&a, "DEFINE RESTORED"), Truth::True);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
 
 #[test]
@@ -532,7 +803,7 @@ fn scoped_qualifier_variable_blocks_explicit_constant_value_fallback() {
     );
     let a = Fixture::new("unit T; interface implementation procedure P; var System:Integer; begin {$IF System.RTLVersion113}{$DEFINE WRONG}{$ENDIF} end; end.", ctx).analyze().unwrap();
     assert_eq!(activity(&a, "DEFINE WRONG"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
 
 #[test]
@@ -543,7 +814,7 @@ fn earlier_enum_member_blocks_qualified_context_fallback_in_its_initializer() {
     );
     let a = Fixture::new("unit T; interface {$Z1} type E=(System=0,e1=System.K); {$IF SizeOf(E)=1}{$DEFINE WRONG_ENUM}{$ENDIF} implementation end.", ctx).analyze().unwrap();
     assert_eq!(activity(&a, "DEFINE WRONG_ENUM"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }
 
 #[test]
@@ -557,5 +828,5 @@ fn source_routines_block_later_intrinsic_calls_without_rebinding_earlier_constan
         .unwrap();
     assert_eq!(activity(&a, "DEFINE EARLY_OK"), Truth::True);
     assert_eq!(activity(&a, "DEFINE RUNTIME_CALLS"), Truth::Unknown);
-    assert_eq!(a.reasons, vec![IncompleteReason::BranchStateNotAnalyzed]);
+    assert!(a.reasons.is_empty(), "{:?}", a.reasons);
 }

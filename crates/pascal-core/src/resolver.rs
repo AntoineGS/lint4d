@@ -5,6 +5,7 @@
 //! bytes.  No result is considered precise unless the candidate was loaded and
 //! its declaration matched the requested name.
 
+use crate::compile_time::{AdmittedOwned, CompileTimeBudget};
 use pascal_project::{
     MetadataObservation, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
     ProjectReadObservation, ProjectReadStamp, ReadPolicy, content_hash_bytes, path_identity,
@@ -438,6 +439,354 @@ pub struct ResolutionReport {
     pub incomplete_reasons: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct ReportReceipt {
+    recorded_work: usize,
+    recorded_byte_work: usize,
+}
+
+type ReportCredit = AdmittedOwned<ReportReceipt>;
+
+/// Receipt slots mirror public vector entries, including unbudgeted legacy
+/// entries (None). Storage dies before its paired receipts on every path.
+#[derive(Debug, Default)]
+struct ReportFieldOwners {
+    payloads: Vec<Option<ReportCredit>>,
+    capacity: Option<ReportCredit>,
+    receipt_capacity: Option<ReportCredit>,
+}
+
+enum ReportAction {
+    Discard,
+    Replace(usize),
+    Append,
+}
+
+struct BoundedReportString {
+    string: String,
+    bound: usize,
+}
+struct ReportPaths<'a>(&'a [PathBuf]);
+impl fmt::Display for ReportPaths<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, path) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", path.display())?;
+        }
+        Ok(())
+    }
+}
+impl fmt::Write for BoundedReportString {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if s.len() > self.bound.saturating_sub(self.string.len()) {
+            return Err(fmt::Error);
+        }
+        self.string.push_str(s);
+        Ok(())
+    }
+}
+
+fn observation_action(
+    values: &[ResolutionObservation],
+    incoming: &mut ResolutionObservation,
+) -> ReportAction {
+    for (index, existing) in values.iter().enumerate() {
+        match (&*incoming, existing) {
+            (
+                ResolutionObservation::Candidate { path, present, .. },
+                ResolutionObservation::Candidate { path: old, .. },
+            ) if path == old => {
+                return if *present {
+                    ReportAction::Replace(index)
+                } else {
+                    ReportAction::Discard
+                };
+            }
+            (ResolutionObservation::Metadata(new), ResolutionObservation::Metadata(old))
+                if new.path() == old.path() =>
+            {
+                return if matches!(old, MetadataObservation::Stat { .. })
+                    && matches!(new, MetadataObservation::Payload { .. })
+                {
+                    ReportAction::Replace(index)
+                } else {
+                    ReportAction::Discard
+                };
+            }
+            (ResolutionObservation::ProjectRead(new), ResolutionObservation::ProjectRead(old))
+                if new.path == old.path =>
+            {
+                return ReportAction::Discard;
+            }
+            _ if incoming == existing => return ReportAction::Discard,
+            _ => {}
+        }
+    }
+    ReportAction::Append
+}
+
+fn report_path_payload(path: &Path, entry: Option<&ProjectPathEntry>) -> usize {
+    let mut bytes = path.as_os_str().len();
+    if let Some(entry) = entry {
+        entry
+            .visit_recovery_payload(&mut |n| {
+                bytes = bytes.saturating_add(n);
+                Ok(())
+            })
+            .expect("infallible report metadata bound");
+    }
+    bytes
+}
+
+fn source_error_report_bound(error: &SourceStoreError) -> usize {
+    let payload = match error {
+        SourceStoreError::NotFound { path }
+        | SourceStoreError::NotRegularFile { path }
+        | SourceStoreError::TooLarge { path, .. } => path.as_os_str().len(),
+        SourceStoreError::Unauthorized { path, reason }
+        | SourceStoreError::Incomplete { path, reason } => {
+            path.as_os_str().len().saturating_add(reason.len())
+        }
+        SourceStoreError::Io { path, message } => {
+            path.as_os_str().len().saturating_add(message.len())
+        }
+        SourceStoreError::RootLimit { limit, .. } => limit.len(),
+        _ => 0,
+    };
+    256usize.saturating_add(payload.saturating_mul(8))
+}
+
+fn resolver_error_report_bound(error: &ResolverError) -> usize {
+    match error {
+        ResolverError::SourceStore(error) => source_error_report_bound(error).saturating_add(32),
+        ResolverError::InvalidRequest(reason) => reason.len().saturating_add(64),
+        ResolverError::LimitExceeded { limit, .. } => limit.len().saturating_add(128),
+        ResolverError::Cancelled => 64,
+    }
+}
+
+fn resolver_report_store_error(error: ResolverError) -> SourceStoreError {
+    match error {
+        ResolverError::LimitExceeded {
+            limit,
+            observed,
+            maximum,
+        } => SourceStoreError::RootLimit {
+            limit,
+            observed,
+            maximum,
+        },
+        ResolverError::Cancelled => SourceStoreError::Cancelled,
+        error => SourceStoreError::Incomplete {
+            path: PathBuf::new(),
+            reason: error.to_string(),
+        },
+    }
+}
+
+impl ReportFieldOwners {
+    fn credits(&self) -> impl Iterator<Item = &ReportCredit> {
+        self.payloads
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(self.capacity.iter())
+            .chain(self.receipt_capacity.iter())
+    }
+
+    fn record<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        budget: &mut CompileTimeBudget<'_>,
+        payload: usize,
+        build: impl FnOnce() -> Result<T, ResolverError>,
+        action: impl FnOnce(&[T], &mut T) -> ReportAction,
+    ) -> Result<(), ResolverError> {
+        let count = values
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| ResolverError::InvalidRequest("report capacity overflow".into()))?;
+        let reserve = |budget: &mut CompileTimeBudget<'_>, bytes| {
+            budget
+                .admit_owned(0, 0, bytes, ReportReceipt::default)
+                .map_err(|r| crate::compile_time::resolver_error(r, budget))
+        };
+        // Reserve *all* prospective construction/receiving peaks before build.
+        // No allocation for either vector, copied payload or formatting occurs
+        // between these admissions. A refusal drops only unused invoices.
+        let vector = if count > values.capacity() {
+            let bytes = count
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| ResolverError::InvalidRequest("report vector overflow".into()))?;
+            Some(reserve(budget, bytes)?)
+        } else {
+            None
+        };
+        let slots = if count > self.payloads.capacity() {
+            let bytes = count
+                .checked_mul(std::mem::size_of::<Option<ReportCredit>>())
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("report receipt vector overflow".into())
+                })?;
+            Some(reserve(budget, bytes)?)
+        } else {
+            None
+        };
+        let credit = budget
+            .admit_owned(1, payload, payload, ReportReceipt::default)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let mut value = build()?;
+        let action = action(values, &mut value);
+        if matches!(action, ReportAction::Discard) {
+            return Ok(());
+        }
+        if let Some(new_credit) = slots.filter(|_| {
+            matches!(action, ReportAction::Append) || self.payloads.capacity() < values.len()
+        }) {
+            let mut new = Vec::with_capacity(count);
+            new.append(&mut self.payloads);
+            let old = std::mem::replace(&mut self.payloads, new);
+            drop(old); // actual old receipt-slot backing dies first
+            self.receipt_capacity = Some(new_credit);
+        }
+        self.payloads.resize_with(values.len(), || None);
+        match action {
+            ReportAction::Replace(index) => {
+                values[index] = value; // destroy actual old payload first
+                self.payloads[index] = Some(credit);
+            }
+            ReportAction::Append => {
+                if let Some(new_credit) = vector {
+                    let mut new = Vec::with_capacity(count);
+                    new.append(values);
+                    let old = std::mem::replace(values, new);
+                    drop(old); // old-plus-new peak; retire only dead backing
+                    self.capacity = Some(new_credit);
+                }
+                values.push(value);
+                self.payloads.push(Some(credit));
+            }
+            ReportAction::Discard => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn into_raw_floor(self) {
+        let Self {
+            payloads,
+            capacity,
+            receipt_capacity,
+        } = self;
+        for credit in payloads.into_iter().flatten() {
+            credit.into_raw_report_floor();
+        }
+        if let Some(credit) = capacity {
+            credit.into_raw_report_floor();
+        }
+        // Receipt slots were consumed and their Vec destroyed by into_iter;
+        // they are not caller report storage and must refund, not become floor.
+        drop(receipt_capacity);
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReportOwners {
+    observations: ReportFieldOwners,
+    warnings: ReportFieldOwners,
+    diagnostics: ReportFieldOwners,
+}
+impl ReportOwners {
+    fn credits(&self) -> impl Iterator<Item = &ReportCredit> {
+        self.observations
+            .credits()
+            .chain(self.warnings.credits())
+            .chain(self.diagnostics.credits())
+    }
+    fn record_work(&mut self, budget: &CompileTimeBudget<'_>) {
+        let snapshot = budget.snapshot();
+        for field in [
+            &mut self.observations,
+            &mut self.warnings,
+            &mut self.diagnostics,
+        ] {
+            for credit in field
+                .payloads
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .chain(field.capacity.iter_mut())
+                .chain(field.receipt_capacity.iter_mut())
+            {
+                if credit.is_admitted_by(budget) {
+                    credit.value_mut().recorded_work = snapshot.work;
+                    credit.value_mut().recorded_byte_work = snapshot.byte_work;
+                }
+            }
+        }
+    }
+    fn into_raw_floor(self) {
+        self.observations.into_raw_floor();
+        self.warnings.into_raw_floor();
+        self.diagnostics.into_raw_floor();
+    }
+}
+
+/// Typed report handoff: immutable borrowed access cannot detach plain fields
+/// from their independently minted, possibly multi-root report receipts.
+#[derive(Debug)]
+pub struct AdmittedResolutionReport {
+    report: ResolutionReport,
+    owners: ReportOwners,
+}
+impl AdmittedResolutionReport {
+    pub fn report(&self) -> &ResolutionReport {
+        &self.report
+    }
+}
+
+#[derive(Debug)]
+pub struct AdmittedReportObservations {
+    observations: Vec<ResolutionObservation>,
+    _owners: ReportFieldOwners,
+}
+impl AdmittedReportObservations {
+    pub fn observations(&self) -> &[ResolutionObservation] {
+        &self.observations
+    }
+}
+impl AdmittedOwned<AdmittedResolutionReport> {
+    /// Move the actual observation buffer/receipts; destroy the other report
+    /// fields before refunding their named owners. Destination control precedes
+    /// the transfer, and the envelope's own minting identity is checked.
+    pub fn into_report_observations(
+        self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedOwned<AdmittedReportObservations>, ResolverError> {
+        self.map_value(budget, |report| {
+            let ResolutionReport {
+                observations,
+                warnings,
+                incomplete_reasons,
+                ..
+            } = report.report;
+            drop(warnings);
+            drop(incomplete_reasons);
+            let ReportOwners {
+                observations: owners,
+                warnings,
+                diagnostics,
+            } = report.owners;
+            drop(warnings);
+            drop(diagnostics);
+            AdmittedReportObservations {
+                observations,
+                _owners: owners,
+            }
+        })
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitResolveRequest<'a> {
     pub requested_name: &'a str,
@@ -537,6 +886,8 @@ pub struct UnitResolver<S> {
     store: S,
     limits: ResolverLimits,
     report: ResolutionReport,
+    // Declared after report: actual buffers die before paired credits refund.
+    report_owners: ReportOwners,
     loaded: HashMap<SourceId, LoadedSource>,
     directories: HashMap<DirectoryCacheKey, DirectoryListing>,
     package_catalogues: HashMap<PathBuf, Arc<Catalogue>>,
@@ -599,6 +950,9 @@ impl<S: SourceStore> std::ops::DerefMut for StoreCall<'_, S> {
 }
 impl<S: SourceStore> Drop for StoreCall<'_, S> {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.resolver.report.complete = false;
+        }
         self.resolver.compile_time_store = self.previous.take();
     }
 }
@@ -643,6 +997,7 @@ impl<S: SourceStore> UnitResolver<S> {
             .filter(|r| !r.view.is_admitted_by(budget))
             .map(|r| r.view.budget_snapshot().retained_bytes)
             .sum::<usize>();
+        let other = other.saturating_add(self.orphan_report_usage(Some(budget)).retained_bytes);
         let remaining = self
             .limits
             .max_compile_time_retained_bytes
@@ -701,6 +1056,43 @@ impl<S: SourceStore> UnitResolver<S> {
                 .byte_work
                 .saturating_add(live.byte_work.saturating_sub(cache.recorded_byte_work));
         }
+        let reports = self.orphan_report_usage(None);
+        usage.retained_bytes = usage.retained_bytes.saturating_add(reports.retained_bytes);
+        usage.work = usage.work.saturating_add(reports.work);
+        usage.byte_work = usage.byte_work.saturating_add(reports.byte_work);
+        usage
+    }
+
+    // Report-owned views keep earlier roots observable independently of cache
+    // ownership. Count each existing ledger once, never a copied live total.
+    fn orphan_report_usage(
+        &self,
+        exclude: Option<&CompileTimeBudget<'_>>,
+    ) -> crate::compile_time::BudgetSnapshot {
+        let mut usage = crate::compile_time::BudgetSnapshot::default();
+        for (index, credit) in self.report_owners.credits().enumerate() {
+            if exclude.is_some_and(|b| credit.is_admitted_by(b))
+                || self
+                    .compile_time_caches
+                    .iter()
+                    .any(|r| credit.shares_shared_root(&r.view))
+                || self
+                    .report_owners
+                    .credits()
+                    .take(index)
+                    .any(|previous| credit.shares_root(previous))
+            {
+                continue;
+            }
+            let live = credit.budget_snapshot();
+            usage.retained_bytes = usage.retained_bytes.saturating_add(live.retained_bytes);
+            usage.work = usage
+                .work
+                .saturating_add(live.work.saturating_sub(credit.recorded_work));
+            usage.byte_work = usage
+                .byte_work
+                .saturating_add(live.byte_work.saturating_sub(credit.recorded_byte_work));
+        }
         usage
     }
 
@@ -755,7 +1147,11 @@ impl<S: SourceStore> UnitResolver<S> {
                 Ok(())
             }
             Err(error) => {
-                self.mark_incomplete(error.to_string());
+                let _ = self.diagnostic_args(
+                    cancel,
+                    resolver_error_report_bound(&error),
+                    format_args!("{error}"),
+                );
                 Err(error)
             }
         }
@@ -847,9 +1243,31 @@ impl<S: SourceStore> UnitResolver<S> {
         self.compile_time_route = previous;
         self.compile_time_root_path = previous_path;
         self.release_compile_time(root_path_bytes);
+        if let Err(error) = &result {
+            self.report.complete = false;
+            // No active StoreCall remains here. Use the actual compilation
+            // ledger explicitly, including failures before any store callback.
+            // If cancelled/exhausted, retain the scalar diagnostic state and
+            // prior evidence rather than allocate an unadmitted error string.
+            if !budget.has_owned_ledger() {
+                // The historical first metadata refusal precedes any typed
+                // ledger/capability construction. Its caller-facing legacy
+                // failure diagnostic keeps the existing plain-report contract;
+                // no typed report credit exists to mint, transfer or refund.
+                self.mark_incomplete(error.to_string());
+            } else {
+                let _ = self.report_message_in_budget(
+                    true,
+                    resolver_error_report_bound(error),
+                    format_args!("{error}"),
+                    &mut budget,
+                );
+            }
+        }
         // Record already-performed work even when cancellation/error ends the
         // session. Failed-session storage has been dropped, never published.
         let usage = budget.snapshot();
+        self.report_owners.record_work(&budget);
         self.compile_time_accounting.work += usage.work;
         self.compile_time_accounting.byte_work += usage.byte_work;
         if let Some(root) = self
@@ -862,9 +1280,6 @@ impl<S: SourceStore> UnitResolver<S> {
             cache.value_mut().recorded_byte_work = usage.byte_work;
         } else if result.is_ok() {
             self.compile_time_accounting.retained_bytes += usage.retained_bytes;
-        }
-        if let Err(error) = &result {
-            self.mark_incomplete(error.to_string());
         }
         drop(decoded);
         self.release_compile_time(decode_reserve);
@@ -1119,6 +1534,7 @@ impl<S: SourceStore> UnitResolver<S> {
             store,
             limits,
             report,
+            report_owners: ReportOwners::default(),
             loaded: HashMap::new(),
             directories: HashMap::new(),
             package_catalogues: HashMap::new(),
@@ -1185,7 +1601,15 @@ impl<S: SourceStore> UnitResolver<S> {
         let before_observations = self.report.observations.len();
         let before_warnings = self.report.warnings.len();
         let result = self.resolve_unit_result(request, cancel);
-        self.outcome(result, before_observations, before_warnings)
+        self.outcome(result, before_observations, before_warnings, cancel)
+            .unwrap_or_else(|error| ResolutionOutcome {
+                result: Resolution::Incomplete {
+                    reason: error.to_string(),
+                    candidates: vec![],
+                },
+                observations: vec![],
+                warnings: vec![],
+            })
     }
 
     /// Result-preserving variant for callers that must distinguish
@@ -1197,8 +1621,16 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<ResolutionOutcome<ResolvedUnit>, ResolverError> {
         let before_observations = self.report.observations.len();
         let before_warnings = self.report.warnings.len();
-        let result = self.resolve_unit_result(request, cancel)?;
-        Ok(self.outcome(Ok(result), before_observations, before_warnings))
+        let result = self.resolve_unit_result(request, cancel).map_err(|error| {
+            self.report.complete = false;
+            let _ = self.diagnostic_args(
+                cancel,
+                resolver_error_report_bound(&error),
+                format_args!("{error}"),
+            );
+            error
+        })?;
+        self.outcome(Ok(result), before_observations, before_warnings, cancel)
     }
 
     /// Load one caller-selected source through the same authorization and
@@ -1569,7 +2001,15 @@ impl<S: SourceStore> UnitResolver<S> {
         let before_observations = self.report.observations.len();
         let before_warnings = self.report.warnings.len();
         let result = self.resolve_include_result(request, cancel);
-        self.outcome(result, before_observations, before_warnings)
+        self.outcome(result, before_observations, before_warnings, cancel)
+            .unwrap_or_else(|error| ResolutionOutcome {
+                result: Resolution::Incomplete {
+                    reason: error.to_string(),
+                    candidates: vec![],
+                },
+                observations: vec![],
+                warnings: vec![],
+            })
     }
 
     /// Result-preserving variant for callers that must distinguish
@@ -1581,8 +2021,18 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<ResolutionOutcome<ResolvedSource>, ResolverError> {
         let before_observations = self.report.observations.len();
         let before_warnings = self.report.warnings.len();
-        let result = self.resolve_include_result(request, cancel)?;
-        Ok(self.outcome(Ok(result), before_observations, before_warnings))
+        let result = self
+            .resolve_include_result(request, cancel)
+            .map_err(|error| {
+                self.report.complete = false;
+                let _ = self.diagnostic_args(
+                    cancel,
+                    resolver_error_report_bound(&error),
+                    format_args!("{error}"),
+                );
+                error
+            })?;
+        self.outcome(Ok(result), before_observations, before_warnings, cancel)
     }
 
     pub fn resolve_project(
@@ -1871,7 +2321,40 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     pub fn finish(self) -> ResolutionReport {
+        self.report_owners.into_raw_floor();
         self.report
+    }
+
+    /// Consume the persistent report without cloning. The admitted envelope
+    /// owns all original per-field/per-root receipts; other resolver storage
+    /// drops independently. A refusal destroys report storage normally.
+    pub fn finish_admitted(
+        self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedOwned<AdmittedResolutionReport>, ResolverError> {
+        let other = self
+            .compile_time_caches
+            .iter()
+            .filter(|root| !root.view.is_admitted_by(budget))
+            .map(|root| root.view.budget_snapshot().retained_bytes)
+            .fold(
+                self.compile_time_accounting.retained_bytes,
+                usize::saturating_add,
+            )
+            .saturating_add(self.orphan_report_usage(Some(budget)).retained_bytes);
+        budget
+            .constrain_retained(
+                self.limits
+                    .max_compile_time_retained_bytes
+                    .saturating_sub(other),
+            )
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        budget
+            .admit_owned(0, 0, 0, || AdmittedResolutionReport {
+                report: self.report,
+                owners: self.report_owners,
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))
     }
 
     /// Adjust the request-wide include budget before another include lookup.
@@ -1905,28 +2388,37 @@ impl<S: SourceStore> UnitResolver<S> {
         result: Result<Resolution<T>, ResolverError>,
         before_observations: usize,
         before_warnings: usize,
-    ) -> ResolutionOutcome<T> {
+        cancel: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<T>, ResolverError> {
         let result = match result {
             Ok(result) => {
                 if matches!(&result, Resolution::Incomplete { .. }) {
-                    self.mark_incomplete("resolution outcome was incomplete".to_string());
+                    self.diagnostic_args(
+                        cancel,
+                        37,
+                        format_args!("resolution outcome was incomplete"),
+                    )?;
                 }
                 result
             }
             Err(error) => {
+                self.diagnostic_args(
+                    cancel,
+                    resolver_error_report_bound(&error),
+                    format_args!("{error}"),
+                )?;
                 let reason = error.to_string();
-                self.mark_incomplete(reason.clone());
                 Resolution::Incomplete {
                     reason,
                     candidates: Vec::new(),
                 }
             }
         };
-        ResolutionOutcome {
+        Ok(ResolutionOutcome {
             result,
             observations: self.report.observations[before_observations..].to_vec(),
             warnings: self.report.warnings[before_warnings..].to_vec(),
-        }
+        })
     }
 
     fn resolve_unit_result(
@@ -1962,7 +2454,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let route = request.legacy_route.cloned();
         let result = self.resolve_unit_inner(request, skip_browsing, cancel)?;
         if matches!(&result, Resolution::Incomplete { .. }) {
-            self.mark_incomplete("unit resolution was incomplete".to_string());
+            self.diagnostic_args(cancel, 30, format_args!("unit resolution was incomplete"))?;
         }
         if let Resolution::Found(unit) = &result {
             if self.compile_time_store.is_none() {
@@ -1982,14 +2474,21 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         let result = self.resolve_include_inner(request, cancel)?;
         if matches!(&result, Resolution::Incomplete { .. }) {
-            self.mark_incomplete("include resolution was incomplete".to_string());
+            self.diagnostic_args(
+                cancel,
+                33,
+                format_args!("include resolution was incomplete"),
+            )?;
         }
         Ok(result)
     }
 
     fn check_cancel(&mut self, cancel: &dyn CancellationToken) -> Result<(), ResolverError> {
         if cancel.is_cancelled() {
-            self.mark_incomplete("request cancelled".to_string());
+            // Cancellation prevents new allocation; preserve scalar incomplete
+            // state and all already admitted evidence without formatting first.
+            self.report.complete = false;
+            let _ = self.diagnostic_args(cancel, 17, format_args!("request cancelled"));
             Err(ResolverError::Cancelled)
         } else {
             Ok(())
@@ -2042,7 +2541,7 @@ impl<S: SourceStore> UnitResolver<S> {
             ));
         }
         if !self.context.can_resolve_units() {
-            self.mark_incomplete("project metadata is incomplete".to_string());
+            self.diagnostic_args(cancel, 30, format_args!("project metadata is incomplete"))?;
             return Ok(Resolution::Incomplete {
                 reason: "project metadata is incomplete".to_string(),
                 candidates: Vec::new(),
@@ -2444,17 +2943,22 @@ impl<S: SourceStore> UnitResolver<S> {
                     }
                 }
                 Err(SourceStoreError::NotFound { path: missing }) => {
-                    self.record_candidate(&missing, Some(entry.clone()), false);
+                    self.record_candidate(&missing, Some(&entry), false, cancel)?;
                 }
                 Err(SourceStoreError::Unauthorized { path, reason }) => {
-                    self.warn(format!(
-                        "unit candidate {} is unauthorized: {reason}",
-                        path.display()
-                    ));
-                    self.mark_incomplete(format!(
-                        "unit candidate {} is unauthorized",
-                        path.display()
-                    ));
+                    self.warning_args(
+                        cancel,
+                        128 + 4 * path.as_os_str().len() + reason.len(),
+                        format_args!(
+                            "unit candidate {} is unauthorized: {reason}",
+                            path.display()
+                        ),
+                    )?;
+                    self.diagnostic_args(
+                        cancel,
+                        64 + 4 * path.as_os_str().len(),
+                        format_args!("unit candidate {} is unauthorized", path.display()),
+                    )?;
                     return Ok(Some(Resolution::Incomplete {
                         reason: "unit candidate is unauthorized".to_string(),
                         candidates,
@@ -2465,15 +2969,20 @@ impl<S: SourceStore> UnitResolver<S> {
                     return Err(root_store_error(error));
                 }
                 Err(SourceStoreError::Incomplete { path, reason }) => {
-                    self.mark_incomplete(format!(
-                        "unit candidate {} is incomplete: {reason}",
-                        path.display()
-                    ));
+                    self.diagnostic_args(
+                        cancel,
+                        128 + 4 * path.as_os_str().len() + reason.len(),
+                        format_args!("unit candidate {} is incomplete: {reason}", path.display()),
+                    )?;
                     return Ok(Some(Resolution::Incomplete { reason, candidates }));
                 }
                 Err(error) => {
+                    self.diagnostic_args(
+                        cancel,
+                        source_error_report_bound(&error),
+                        format_args!("unit candidate could not be loaded: {error:?}"),
+                    )?;
                     let reason = format!("unit candidate could not be loaded: {error:?}");
-                    self.mark_incomplete(reason.clone());
                     return Ok(Some(Resolution::Incomplete { reason, candidates }));
                 }
             }
@@ -2493,9 +3002,11 @@ impl<S: SourceStore> UnitResolver<S> {
             _ => {
                 valid.sort_by_key(|left| path_key(&left.0.path));
                 let candidates = valid.into_iter().map(|(_, candidate)| candidate).collect();
-                self.warn(format!(
-                    "ambiguous unit {requested}: multiple valid candidates"
-                ));
+                self.warning_args(
+                    cancel,
+                    64 + requested.len(),
+                    format_args!("ambiguous unit {requested}: multiple valid candidates"),
+                )?;
                 Ok(Some(Resolution::Ambiguous { candidates }))
             }
         }
@@ -2716,17 +3227,23 @@ impl<S: SourceStore> UnitResolver<S> {
             complete,
             ..listing
         };
-        self.record_observation(ResolutionObservation::Directory {
-            path: key.clone(),
-            entry: entry.clone(),
-            stamp: listing.stamp.clone(),
-            complete,
-        });
+        self.record_observation_build(report_path_payload(&key, Some(entry)), cancel, || {
+            ResolutionObservation::Directory {
+                path: key.clone(),
+                entry: entry.clone(),
+                stamp: listing.stamp.clone(),
+                complete,
+            }
+        })?;
         if !complete {
-            self.mark_incomplete(format!(
-                "directory scan limit or traversal failure under {}",
-                key.display()
-            ));
+            self.diagnostic_args(
+                cancel,
+                64 + 4 * key.as_os_str().len(),
+                format_args!(
+                    "directory scan limit or traversal failure under {}",
+                    key.display()
+                ),
+            )?;
         }
         if self.compile_time_store.is_none() {
             self.directories.insert(cache_key, listing.clone());
@@ -2763,15 +3280,20 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<LoadedSource, SourceStoreError> {
         self.check_cancel(cancel)
             .map_err(|_| SourceStoreError::Cancelled)?;
-        let mut metadata =
-            6 * path.as_os_str().len() + std::mem::size_of::<ResolutionObservation>();
-        self.context
-            .read_policy
-            .visit_owned_clone_payload(&mut |n| {
-                metadata += n;
+        // Canonical path and local entry scratch only. Persistent candidate /
+        // revision observation payload and slots now have report receipts.
+        let mut provenance = 0usize;
+        entry
+            .visit_recovery_payload(&mut |n| {
+                provenance = provenance.saturating_add(n);
                 Ok(())
             })
-            .expect("infallible source metadata sizing");
+            .expect("infallible local entry bound");
+        let metadata = path
+            .as_os_str()
+            .len()
+            .saturating_mul(4)
+            .saturating_add(provenance.saturating_sub(entry.path.as_os_str().len()));
         self.admit_lookup_storage(1, metadata, metadata, cancel)
             .map_err(|error| match error {
                 ResolverError::LimitExceeded {
@@ -2795,7 +3317,8 @@ impl<S: SourceStore> UnitResolver<S> {
         } else {
             None
         };
-        self.record_candidate(&path, Some(entry.clone()), stamp.is_some());
+        self.record_candidate(&path, Some(&entry), stamp.is_some(), cancel)
+            .map_err(resolver_report_store_error)?;
         let request = SourceRequest {
             path: &path,
             entry: &entry,
@@ -2824,7 +3347,8 @@ impl<S: SourceStore> UnitResolver<S> {
                 })?;
         }
         if stamp.is_none() {
-            self.record_candidate(&path, Some(entry.clone()), true);
+            self.record_candidate(&path, Some(&entry), true, cancel)
+                .map_err(resolver_report_store_error)?;
         }
         if let Some(mut budget) = self.store_budget(cancel) {
             let cached = loaded.admitted_copy(&mut budget)?;
@@ -2866,25 +3390,56 @@ impl<S: SourceStore> UnitResolver<S> {
         } else {
             self.loaded.insert(loaded.id.clone(), loaded.clone());
         }
-        self.record_observation(ResolutionObservation::Payload {
-            source_id: loaded.id.clone(),
-            path: loaded.path.clone(),
-            revision: loaded.revision.clone(),
-        });
+        let mut observation_bytes = loaded.id.as_str().len() + loaded.path.as_os_str().len();
+        if let SourceRevision::Disk {
+            read_policy,
+            path_entry,
+            ..
+        } = &loaded.revision
+        {
+            read_policy
+                .visit_owned_clone_payload(&mut |n| {
+                    observation_bytes += n;
+                    Ok(())
+                })
+                .expect("infallible revision bound");
+            path_entry
+                .visit_recovery_payload(&mut |n| {
+                    observation_bytes += n;
+                    Ok(())
+                })
+                .expect("infallible path entry bound");
+        }
+        self.record_observation_build(observation_bytes, cancel, || {
+            ResolutionObservation::Payload {
+                source_id: loaded.id.clone(),
+                path: loaded.path.clone(),
+                revision: loaded.revision.clone(),
+            }
+        })
+        .map_err(resolver_report_store_error)?;
         Ok(loaded)
     }
 
-    fn record_candidate(&mut self, path: &Path, entry: Option<ProjectPathEntry>, present: bool) {
+    fn record_candidate(
+        &mut self,
+        path: &Path,
+        entry: Option<&ProjectPathEntry>,
+        present: bool,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
         let stamp = entry
             .as_ref()
             .filter(|entry| self.context.read_policy.allows_location(entry))
             .and_then(|_| path_stamp_result(path).ok().flatten());
-        self.record_observation(ResolutionObservation::Candidate {
-            path: path.to_path_buf(),
-            entry,
-            stamp,
-            present,
-        });
+        self.record_observation_build(report_path_payload(path, entry), cancel, || {
+            ResolutionObservation::Candidate {
+                path: path.to_path_buf(),
+                entry: entry.cloned(),
+                stamp,
+                present,
+            }
+        })
     }
 
     fn resolve_include_inner(
@@ -2924,7 +3479,7 @@ impl<S: SourceStore> UnitResolver<S> {
         let mut saw_incomplete = false;
         for entry in entries {
             self.check_cancel(cancel)?;
-            self.record_include_search_directory(&entry);
+            self.record_include_search_directory(&entry, cancel)?;
             let resolved = match self
                 .context
                 .overrides
@@ -2932,10 +3487,14 @@ impl<S: SourceStore> UnitResolver<S> {
             {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    self.warn(format!(
-                        "include {} could not be mapped: {error}",
-                        request.requested_name
-                    ));
+                    self.warning_args(
+                        cancel,
+                        64 + request.requested_name.len() + error.len(),
+                        format_args!(
+                            "include {} could not be mapped: {error}",
+                            request.requested_name
+                        ),
+                    )?;
                     saw_incomplete = true;
                     continue;
                 }
@@ -2994,9 +3553,13 @@ impl<S: SourceStore> UnitResolver<S> {
                                 }
                                 Err(error) => {
                                     saw_incomplete = true;
-                                    self.warn(format!(
-                                        "include candidate could not be loaded: {error:?}"
-                                    ));
+                                    self.warning_args(
+                                        cancel,
+                                        source_error_report_bound(&error),
+                                        format_args!(
+                                            "include candidate could not be loaded: {error:?}"
+                                        ),
+                                    )?;
                                     break;
                                 }
                             }
@@ -3004,15 +3567,21 @@ impl<S: SourceStore> UnitResolver<S> {
                         CaseInsensitiveLookup::Missing => {}
                         CaseInsensitiveLookup::Ambiguous(paths) => {
                             saw_incomplete = true;
-                            self.warn(format!(
-                                "include {} has ambiguous case-insensitive path components: {}",
-                                request.requested_name,
-                                paths
+                            let bound = 128
+                                + request.requested_name.len()
+                                + paths
                                     .iter()
-                                    .map(|path| path.display().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ));
+                                    .map(|p| 4 * p.as_os_str().len() + 2)
+                                    .sum::<usize>();
+                            self.warning_args(
+                                cancel,
+                                bound,
+                                format_args!(
+                                    "include {} has ambiguous case-insensitive path components: {}",
+                                    request.requested_name,
+                                    ReportPaths(&paths)
+                                ),
+                            )?;
                             break;
                         }
                         CaseInsensitiveLookup::Incomplete => {
@@ -3027,7 +3596,11 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
                 Err(error) => {
                     saw_incomplete = true;
-                    self.warn(format!("include candidate could not be loaded: {error:?}"));
+                    self.warning_args(
+                        cancel,
+                        source_error_report_bound(&error),
+                        format_args!("include candidate could not be loaded: {error:?}"),
+                    )?;
                     break;
                 }
             }
@@ -3042,10 +3615,14 @@ impl<S: SourceStore> UnitResolver<S> {
                 candidates.pop().expect("one include candidate"),
             )),
             0 if saw_incomplete => {
-                self.mark_incomplete(format!(
-                    "include {} could not be resolved completely",
-                    request.requested_name
-                ));
+                self.diagnostic_args(
+                    cancel,
+                    64 + request.requested_name.len(),
+                    format_args!(
+                        "include {} could not be resolved completely",
+                        request.requested_name
+                    ),
+                )?;
                 Ok(Resolution::Incomplete {
                     reason: format!("include {} lookup was incomplete", request.requested_name),
                     candidates: Vec::new(),
@@ -3066,16 +3643,24 @@ impl<S: SourceStore> UnitResolver<S> {
         }
     }
 
-    fn record_include_search_directory(&mut self, entry: &ProjectPathEntry) {
-        self.record_observation(ResolutionObservation::Directory {
-            // Keep the configured spelling instead of canonicalizing through a
-            // symlink.  Revalidation must detect changes to the search-path
-            // link itself as well as changes to its target.
-            path: entry.path.clone(),
-            entry: entry.clone(),
-            stamp: path_stamp_result(&entry.path).ok().flatten(),
-            complete: true,
-        });
+    fn record_include_search_directory(
+        &mut self,
+        entry: &ProjectPathEntry,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        self.record_observation_build(
+            report_path_payload(&entry.path, Some(entry)),
+            cancel,
+            || ResolutionObservation::Directory {
+                // Keep the configured spelling instead of canonicalizing through a
+                // symlink.  Revalidation must detect changes to the search-path
+                // link itself as well as changes to its target.
+                path: entry.path.clone(),
+                entry: entry.clone(),
+                stamp: path_stamp_result(&entry.path).ok().flatten(),
+                complete: true,
+            },
+        )
     }
 
     fn load_include_candidate(
@@ -3274,10 +3859,14 @@ impl<S: SourceStore> UnitResolver<S> {
                 .collect::<Vec<_>>();
             matches.sort_by_key(|left| path_key(left));
             if !listing.complete {
-                self.mark_incomplete(format!(
-                    "case-insensitive lookup under {} was incomplete",
-                    current.display()
-                ));
+                self.diagnostic_args(
+                    cancel,
+                    64 + 4 * current.as_os_str().len(),
+                    format_args!(
+                        "case-insensitive lookup under {} was incomplete",
+                        current.display()
+                    ),
+                )?;
                 return Ok(CaseInsensitiveLookup::Incomplete);
             }
             if let Some(exact) = matches
@@ -3423,10 +4012,12 @@ impl<S: SourceStore> UnitResolver<S> {
             return Ok(catalogue);
         }
         if self.package_catalogue_count >= self.limits.max_package_catalogues {
-            self.mark_incomplete(format!(
-                "package/source catalogue limit ({}) reached",
-                self.limits.max_package_catalogues
-            ));
+            let maximum = self.limits.max_package_catalogues;
+            self.diagnostic_args(
+                cancel,
+                64,
+                format_args!("package/source catalogue limit ({}) reached", maximum),
+            )?;
             return Ok(Arc::new(Catalogue {
                 entries: HashMap::new(),
                 complete: false,
@@ -3465,10 +4056,14 @@ impl<S: SourceStore> UnitResolver<S> {
             }
             let Some(entry) = self.context.path_entry_for(&directory) else {
                 complete = false;
-                self.mark_incomplete(format!(
-                    "catalogue directory {} is outside the requester read policy",
-                    directory.display()
-                ));
+                self.diagnostic_args(
+                    cancel,
+                    128 + 4 * directory.as_os_str().len(),
+                    format_args!(
+                        "catalogue directory {} is outside the requester read policy",
+                        directory.display()
+                    ),
+                )?;
                 break;
             };
             let listing = self.list_directory(&directory, &entry, None, cancel, true)?;
@@ -3646,7 +4241,7 @@ impl<S: SourceStore> UnitResolver<S> {
                     candidates: Vec::new(),
                 });
             };
-            self.record_candidate(&descriptor, Some(entry.clone()), true);
+            self.record_candidate(&descriptor, Some(&entry), true, cancel)?;
             let package_read = read_package_metadata_with_observations(
                 &descriptor,
                 &self.context.selected_project_options(),
@@ -3860,10 +4455,133 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn record_observation(&mut self, observation: ResolutionObservation) {
+        assert!(
+            self.compile_time_store.is_none(),
+            "typed report construction must precede copying"
+        );
         push_observation(&mut self.report.observations, observation);
     }
 
+    fn record_observation_build(
+        &mut self,
+        payload: usize,
+        cancel: &dyn CancellationToken,
+        build: impl FnOnce() -> ResolutionObservation,
+    ) -> Result<(), ResolverError> {
+        if let Some(mut budget) = self.store_budget(cancel) {
+            self.report_owners.observations.record(
+                &mut self.report.observations,
+                &mut budget,
+                payload,
+                || Ok(build()),
+                observation_action,
+            )
+        } else {
+            self.record_observation(build());
+            Ok(())
+        }
+    }
+
+    fn report_message(
+        &mut self,
+        diagnostic: bool,
+        bound: usize,
+        args: fmt::Arguments<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        if diagnostic {
+            self.report.complete = false;
+        }
+        if !diagnostic && self.limits.max_resolution_warnings == 0 {
+            return Ok(());
+        }
+        let Some(mut budget) = self.store_budget(cancel) else {
+            let message = fmt::format(args);
+            if diagnostic {
+                self.mark_incomplete(message);
+            } else {
+                self.warn(message);
+            }
+            return Ok(());
+        };
+        self.report_message_in_budget(diagnostic, bound, args, &mut budget)
+    }
+
+    fn report_message_in_budget(
+        &mut self,
+        diagnostic: bool,
+        bound: usize,
+        args: fmt::Arguments<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        if diagnostic {
+            self.report.complete = false;
+        }
+        const WARNING_LIMIT: &str = "resolution warning limit reached";
+        let bound = bound.max(WARNING_LIMIT.len());
+        let (values, owners) = if diagnostic {
+            (
+                &mut self.report.incomplete_reasons,
+                &mut self.report_owners.diagnostics,
+            )
+        } else {
+            (&mut self.report.warnings, &mut self.report_owners.warnings)
+        };
+        let maximum = self.limits.max_resolution_warnings;
+        owners.record(
+            values,
+            budget,
+            bound,
+            || {
+                let mut writer = BoundedReportString {
+                    string: String::with_capacity(bound),
+                    bound,
+                };
+                fmt::write(&mut writer, args).map_err(|_| {
+                    ResolverError::InvalidRequest("report formatting bound exceeded".into())
+                })?;
+                Ok(writer.string)
+            },
+            |values, message| {
+                if values.contains(message) {
+                    return ReportAction::Discard;
+                }
+                if !diagnostic && values.len() >= maximum {
+                    if values.last().is_some_and(|s| s == WARNING_LIMIT) {
+                        return ReportAction::Discard;
+                    }
+                    message.clear();
+                    message.push_str(WARNING_LIMIT); // admitted same backing
+                    ReportAction::Replace(values.len() - 1)
+                } else {
+                    ReportAction::Append
+                }
+            },
+        )
+    }
+
+    fn diagnostic_args(
+        &mut self,
+        cancel: &dyn CancellationToken,
+        bound: usize,
+        args: fmt::Arguments<'_>,
+    ) -> Result<(), ResolverError> {
+        self.report_message(true, bound, args, cancel)
+    }
+    fn warning_args(
+        &mut self,
+        cancel: &dyn CancellationToken,
+        bound: usize,
+        args: fmt::Arguments<'_>,
+    ) -> Result<(), ResolverError> {
+        self.report_message(false, bound, args, cancel)
+    }
+
     fn warn(&mut self, warning: String) {
+        assert!(
+            self.compile_time_store.is_none(),
+            "typed warning must be admitted before formatting"
+        );
         push_warning(
             &mut self.report,
             warning,
@@ -3872,6 +4590,10 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn mark_incomplete(&mut self, reason: String) {
+        assert!(
+            self.compile_time_store.is_none(),
+            "typed diagnostic must be admitted before formatting"
+        );
         self.report.complete = false;
         if !self
             .report
@@ -5326,9 +6048,658 @@ mod tests {
         );
     }
 
+    fn physical_report_resolver() -> (
+        tempfile::TempDir,
+        PathBuf,
+        UnitResolver<FilesystemSourceStore>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Main.pas");
+        fs::write(&root, "unit Main; interface implementation end.").unwrap();
+        fs::write(dir.path().join("value.inc"), "{physical include}").unwrap();
+        fs::write(
+            dir.path().join("Other.pas"),
+            "unit Other; interface implementation end.",
+        )
+        .unwrap();
+        let context =
+            ProjectContext::discover(&root, &[dir.path().into()], &Default::default()).unwrap();
+        let resolver = UnitResolver::new(
+            context,
+            vec![dir.path().into()],
+            FilesystemSourceStore::new(),
+            Default::default(),
+        );
+        (dir, root, resolver)
+    }
+
+    #[test]
+    fn persistent_report_typed_finish_moves_and_refunds_without_source_refund() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let outcome = CompileTimeResolver::include(
+            &mut resolver,
+            IncludeResolveRequest {
+                including_path: &root,
+                byte_range: 0..0,
+                requested_name: "value.inc",
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        assert!(matches!(outcome.result, Resolution::Found(_)));
+        let vector = resolver.report.observations.as_ptr();
+        let path = match resolver.report.observations.last().unwrap() {
+            ResolutionObservation::Payload { path, .. } => {
+                path.as_os_str().as_encoded_bytes().as_ptr()
+            }
+            _ => panic!("physical payload observation"),
+        };
+        let byte_work = budget.snapshot().byte_work;
+        let report = resolver.finish_admitted(&mut budget).unwrap();
+        assert_eq!(report.report().observations.as_ptr(), vector);
+        let projected = report.into_report_observations(&mut budget).unwrap();
+        assert_eq!(projected.observations().as_ptr(), vector);
+        assert!(
+            matches!(projected.observations().last(), Some(ResolutionObservation::Payload { path: p, .. }) if p.as_os_str().as_encoded_bytes().as_ptr() == path)
+        );
+        assert_eq!(
+            budget.snapshot().byte_work,
+            byte_work,
+            "finish/extraction moves, not copies"
+        );
+        drop(budget);
+        let live = observer.budget_snapshot();
+        drop(projected);
+        let source_only = observer.budget_snapshot();
+        assert!(source_only.retained_bytes < live.retained_bytes);
+        assert!(
+            source_only.retained_bytes > baseline,
+            "returned source owns independent backing"
+        );
+        assert_eq!(source_only.work, live.work);
+        assert_eq!(source_only.byte_work, live.byte_work);
+        drop(outcome);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
+    #[test]
+    fn persistent_report_raw_finish_floor_survives_field_moves_and_unrelated_release() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let outcome = CompileTimeResolver::include(
+            &mut resolver,
+            IncludeResolveRequest {
+                including_path: &root,
+                byte_range: 0..0,
+                requested_name: "value.inc",
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let vector = resolver.report.observations.as_ptr();
+        let report = resolver.finish();
+        let observations = report.observations;
+        assert_eq!(observations.as_ptr(), vector);
+        drop(outcome);
+        let floor = budget.snapshot();
+        assert!(floor.retained_bytes > baseline);
+        budget.charge(1, 13, 128).unwrap();
+        let temporary = budget.admit_owned(1, 7, 256, || vec![0u8; 256]).unwrap();
+        drop(temporary);
+        budget.release(usize::MAX);
+        assert_eq!(budget.snapshot().retained_bytes, floor.retained_bytes);
+        assert!(budget.snapshot().work > floor.work);
+        drop(observations);
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            floor.retained_bytes,
+            "raw handoff makes no last-drop promise"
+        );
+    }
+
+    #[test]
+    fn persistent_report_multiple_roots_remain_counted_without_cache_handles() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut a = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut b = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let oa = a
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut a)
+            .unwrap();
+        let ob = b
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut b)
+            .unwrap();
+        let ba = oa.budget_snapshot().retained_bytes;
+        let bb = ob.budget_snapshot().retained_bytes;
+        drop(
+            CompileTimeResolver::include(
+                &mut resolver,
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut a,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        drop(
+            CompileTimeResolver::unit_capability(
+                &mut resolver,
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut b,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        resolver.compile_time_caches.clear(); // test destruction only; no production eviction
+        assert!(oa.budget_snapshot().retained_bytes > ba);
+        assert!(ob.budget_snapshot().retained_bytes > bb);
+        let usage = resolver.compile_time_usage();
+        assert_eq!(
+            usage.retained_bytes,
+            resolver.compile_time_accounting.retained_bytes
+                + oa.budget_snapshot().retained_bytes
+                + ob.budget_snapshot().retained_bytes
+        );
+        assert_eq!(
+            usage.work,
+            resolver.compile_time_accounting.work
+                + oa.budget_snapshot().work
+                + ob.budget_snapshot().work
+        );
+        let report = resolver.finish_admitted(&mut b).unwrap();
+        assert!(report.report().observations.iter().any(|o| matches!(o, ResolutionObservation::Payload { path, .. } if path.ends_with("Other.pas"))));
+        drop(a);
+        drop(b);
+        drop(report);
+        assert_eq!(oa.budget_snapshot().retained_bytes, ba);
+        assert_eq!(ob.budget_snapshot().retained_bytes, bb);
+    }
+
     #[derive(Default)]
     struct MemoryStore {
         sources: HashMap<PathBuf, Vec<u8>>,
+    }
+
+    #[test]
+    fn persistent_report_refuses_before_format_clone_or_receiving_allocation() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        drop(
+            CompileTimeResolver::include(
+                &mut resolver,
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let observations = resolver.report.observations.as_ptr();
+        let observation_capacity = resolver.report.observations.capacity();
+        let warnings = resolver.report.warnings.as_ptr();
+        let warning_capacity = resolver.report.warnings.capacity();
+        let calls = std::cell::Cell::new(0);
+        struct Formatting<'a>(&'a std::cell::Cell<usize>);
+        impl fmt::Display for Formatting<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.set(self.0.get() + 1);
+                f.write_str("formatted payload")
+            }
+        }
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        assert!(matches!(
+            call.warning_args(&NoCancellation, 128, format_args!("{}", Formatting(&calls))),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            call.record_observation_build(128, &NoCancellation, || {
+                calls.set(calls.get() + 1);
+                ResolutionObservation::Candidate {
+                    path: root.clone(),
+                    entry: None,
+                    stamp: None,
+                    present: false,
+                }
+            }),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            calls.get(),
+            0,
+            "constructors/formatters run only after all peak admissions"
+        );
+        assert_eq!(call.report.observations.as_ptr(), observations);
+        assert_eq!(call.report.observations.capacity(), observation_capacity);
+        assert_eq!(call.report.warnings.as_ptr(), warnings);
+        assert_eq!(call.report.warnings.capacity(), warning_capacity);
+        drop(call);
+        assert_eq!(
+            budget.snapshot(),
+            before,
+            "failed preallocation is transactional"
+        );
+    }
+
+    #[test]
+    fn persistent_report_replacement_and_capacity_peak_retire_only_dead_storage() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        resolver.limits.max_resolution_warnings = 1;
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        drop(
+            CompileTimeResolver::include(
+                &mut resolver,
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        call.warning_args(&NoCancellation, 4096, format_args!("first"))
+            .unwrap();
+        let pointer = call.report.warnings.as_ptr();
+        let before = budget.snapshot();
+        call.warning_args(&NoCancellation, 64, format_args!("second"))
+            .unwrap();
+        assert_eq!(call.report.warnings, ["resolution warning limit reached"]);
+        assert_eq!(
+            call.report.warnings.as_ptr(),
+            pointer,
+            "replacement retains receiving backing"
+        );
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            4096 - 64
+        );
+        let spent = budget.snapshot();
+        call.warning_args(&NoCancellation, 64, format_args!("third"))
+            .unwrap();
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            spent.retained_bytes,
+            "discarded new payload/unused peaks refund exactly"
+        );
+        assert!(budget.snapshot().work > spent.work);
+        call.diagnostic_args(&NoCancellation, 64, format_args!("first diagnostic"))
+            .unwrap();
+        let before_growth = budget.snapshot();
+        let pointer = call.report.incomplete_reasons.as_ptr();
+        let peak = 3 * std::mem::size_of::<ReportCredit>()
+            + 2 * std::mem::size_of::<String>()
+            + 2 * std::mem::size_of::<Option<ReportCredit>>()
+            + 64;
+        budget
+            .constrain_retained(before_growth.retained_bytes + peak - 1)
+            .unwrap();
+        assert!(matches!(
+            call.report_message_in_budget(true, 64, format_args!("second diagnostic"), &mut budget),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(call.report.incomplete_reasons.as_ptr(), pointer);
+        assert_eq!(call.report.incomplete_reasons.capacity(), 1);
+        assert_eq!(
+            budget.snapshot(),
+            before_growth,
+            "old-plus-new backing peak must be admitted before format or replacement"
+        );
+        drop(call);
+        resolver.compile_time_caches.clear(); // test destruction frees envelope headroom
+        let report = resolver.finish_admitted(&mut budget).unwrap();
+        drop(report);
+        // Historical bytes stay charged even for a discarded warning.
+        assert!(budget.snapshot().byte_work >= spent.byte_work);
+    }
+
+    #[test]
+    fn persistent_report_builder_unwind_refunds_unused_peak_not_previous_report() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        drop(
+            CompileTimeResolver::include(
+                &mut resolver,
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        let pointer = resolver.report.observations.as_ptr();
+        let before = budget.snapshot();
+        struct PanicFormat;
+        impl fmt::Display for PanicFormat {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("report constructor unwind")
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolver.store_call(&mut budget).unwrap().warning_args(
+                &NoCancellation,
+                128,
+                format_args!("{PanicFormat}"),
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(resolver.report.observations.as_ptr(), pointer);
+        assert!(resolver.report.warnings.is_empty());
+        assert_eq!(resolver.report.warnings.capacity(), 0);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert_eq!(budget.snapshot().work, before.work + 1);
+        assert_eq!(budget.snapshot().byte_work, before.byte_work + 128);
+        assert!(resolver.compile_time_store.is_none());
+        assert!(!resolver.report.complete);
+    }
+
+    #[test]
+    fn persistent_report_legacy_finish_keeps_plain_field_move_contract() {
+        let (_dir, _root, resolver) = physical_report_resolver();
+        assert_eq!(resolver.report_owners.credits().count(), 0);
+        let expected = resolver.report();
+        let report = resolver.finish();
+        assert_eq!(report, expected);
+        let ResolutionReport {
+            observations,
+            warnings,
+            complete,
+            incomplete_reasons,
+        } = report;
+        assert!(complete);
+        drop((observations, warnings, incomplete_reasons));
+    }
+
+    #[test]
+    fn persistent_report_raw_finish_preserves_both_original_root_floors() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut a = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut b = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let oa = a
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut a)
+            .unwrap();
+        let ob = b
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut b)
+            .unwrap();
+        let ba = oa.budget_snapshot().retained_bytes;
+        let bb = ob.budget_snapshot().retained_bytes;
+        drop(
+            CompileTimeResolver::include(
+                &mut resolver,
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut a,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        drop(
+            CompileTimeResolver::unit_capability(
+                &mut resolver,
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut b,
+                &NoCancellation,
+            )
+            .unwrap(),
+        );
+        let pointer = resolver.report.observations.as_ptr();
+        let report = resolver.finish();
+        assert_eq!(report.observations.as_ptr(), pointer);
+        let sa = a.snapshot();
+        let sb = b.snapshot();
+        assert!(sa.retained_bytes > ba);
+        assert!(sb.retained_bytes > bb);
+        a.release(usize::MAX);
+        b.release(usize::MAX);
+        assert_eq!(a.snapshot(), sa);
+        assert_eq!(b.snapshot(), sb);
+        let ResolutionReport {
+            observations,
+            warnings,
+            incomplete_reasons,
+            ..
+        } = report;
+        drop((observations, warnings, incomplete_reasons));
+        assert_eq!(a.snapshot(), sa);
+        assert_eq!(b.snapshot(), sb);
+        drop(a);
+        drop(b);
+        assert_eq!(oa.budget_snapshot(), sa);
+        assert_eq!(ob.budget_snapshot(), sb);
+        // Dropping the last request views ends both ledger/floor lifetimes;
+        // there is no global holder, forgotten Arc or permanent allocation.
+    }
+
+    #[test]
+    fn persistent_report_physical_include_unit_error_cancel_and_unwind() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Error,
+            Cancel,
+            Panic,
+        }
+        struct HookStore {
+            inner: FilesystemSourceStore,
+            failure: Failure,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl SourceStore for HookStore {
+            fn list_directory_admitted(
+                &mut self,
+                r: DirectoryRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedOwned<DirectoryListing>, SourceStoreError> {
+                self.inner.list_directory_admitted(r, b, c)
+            }
+            fn overlay_candidates_admitted(
+                &self,
+                r: &[PathBuf],
+                n: &[String],
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedOwned<Vec<PathBuf>>, SourceStoreError> {
+                self.inner.overlay_candidates_admitted(r, n, b, c)
+            }
+            fn load_admitted(
+                &mut self,
+                r: SourceRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<LoadedSource, SourceStoreError> {
+                if r.path
+                    .file_name()
+                    .is_some_and(|n| n == "break.inc" || n == "Break.pas")
+                {
+                    match self.failure {
+                        Failure::Error => {
+                            return Err(SourceStoreError::Io {
+                                path: r.path.into(),
+                                message: "injected after candidate observation".into(),
+                            });
+                        }
+                        Failure::Cancel => {
+                            self.cancelled.store(true, Ordering::Relaxed);
+                            return Err(SourceStoreError::Cancelled);
+                        }
+                        Failure::Panic => panic!("actual store callback unwind"),
+                    }
+                }
+                self.inner.load_admitted(r, b, c)
+            }
+            fn list_directory(
+                &mut self,
+                r: DirectoryRequest<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<DirectoryListing, SourceStoreError> {
+                self.inner.list_directory(r, c)
+            }
+            fn overlay_candidates(&self, r: &[PathBuf], n: &[String]) -> Vec<PathBuf> {
+                self.inner.overlay_candidates(r, n)
+            }
+            fn load(
+                &mut self,
+                r: SourceRequest<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<LoadedSource, SourceStoreError> {
+                self.inner.load(r, c)
+            }
+        }
+        for unit in [false, true] {
+            for failure in [Failure::Error, Failure::Cancel, Failure::Panic] {
+                let (dir, root, original) = physical_report_resolver();
+                fs::write(dir.path().join("break.inc"), "{not returned}").unwrap();
+                fs::write(dir.path().join("Break.pas"), "unit Break;").unwrap();
+                let flag = Arc::new(AtomicBool::new(false));
+                let mut resolver = UnitResolver::new(
+                    original.context,
+                    vec![dir.path().into()],
+                    HookStore {
+                        inner: FilesystemSourceStore::new(),
+                        failure,
+                        cancelled: flag.clone(),
+                    },
+                    Default::default(),
+                );
+                let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &*flag);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                drop(
+                    CompileTimeResolver::include(
+                        &mut resolver,
+                        IncludeResolveRequest {
+                            including_path: &root,
+                            byte_range: 0..0,
+                            requested_name: "value.inc",
+                            legacy_route: None,
+                        },
+                        &mut budget,
+                        &*flag,
+                    )
+                    .unwrap(),
+                );
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if unit {
+                        CompileTimeResolver::unit_capability(
+                            &mut resolver,
+                            UnitResolveRequest {
+                                importer_path: &root,
+                                requested_name: "Break",
+                                legacy_route: None,
+                            },
+                            &mut budget,
+                            &*flag,
+                        )
+                        .map(drop)
+                    } else {
+                        CompileTimeResolver::include(
+                            &mut resolver,
+                            IncludeResolveRequest {
+                                including_path: &root,
+                                byte_range: 0..0,
+                                requested_name: "break.inc",
+                                legacy_route: None,
+                            },
+                            &mut budget,
+                            &*flag,
+                        )
+                        .map(drop)
+                    }
+                }));
+                match failure {
+                    Failure::Error => assert!(result.unwrap().is_ok()),
+                    Failure::Cancel => assert_eq!(result.unwrap(), Err(ResolverError::Cancelled)),
+                    Failure::Panic => assert!(result.is_err()),
+                }
+                assert!(
+                    resolver.compile_time_store.is_none(),
+                    "unwind restores callback route"
+                );
+                assert!(!resolver.report.complete);
+                assert!(resolver.report.observations.iter().any(|o| matches!(o, ResolutionObservation::Payload { path, .. } if path.ends_with("value.inc"))));
+                if matches!(failure, Failure::Error) {
+                    assert!(
+                        !resolver.report.warnings.is_empty()
+                            || !resolver.report.incomplete_reasons.is_empty()
+                    );
+                }
+                flag.store(false, Ordering::Relaxed);
+                resolver.compile_time_caches.clear(); // only test actual cache destruction
+                let report = resolver.finish_admitted(&mut budget).unwrap();
+                let live = observer.budget_snapshot();
+                assert!(live.retained_bytes > baseline);
+                drop(budget);
+                drop(report);
+                let dead = observer.budget_snapshot();
+                assert_eq!(dead.retained_bytes, baseline);
+                assert_eq!(dead.work, live.work);
+                assert_eq!(dead.byte_work, live.byte_work);
+            }
+        }
     }
 
     impl SourceStore for MemoryStore {

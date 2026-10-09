@@ -63,6 +63,9 @@ impl<'a> CompileTimeBudget<'a> {
     pub fn limits(&self) -> CompileTimeLimits {
         self.limits
     }
+    pub(crate) fn has_owned_ledger(&self) -> bool {
+        matches!(self.counters, Counters::Shared(_))
+    }
     pub(crate) fn cancel_token(&self) -> &'a dyn CancellationToken {
         self.cancel
     }
@@ -134,7 +137,10 @@ impl<'a> CompileTimeBudget<'a> {
             }
             Counters::Shared(ledger) => {
                 let mut state = ledger.lock();
-                let manual = state.usage.retained_bytes - state.reserved - ledger.control_bytes;
+                let manual = state.usage.retained_bytes
+                    - state.reserved
+                    - ledger.control_bytes
+                    - state.raw_report_floor;
                 state.usage.retained_bytes -= retained.min(manual);
             }
         }
@@ -158,7 +164,10 @@ impl<'a> CompileTimeBudget<'a> {
             Counters::Inline(current) => current.retained_bytes,
             Counters::Shared(ledger) => {
                 let state = ledger.lock();
-                state.usage.retained_bytes - state.reserved - ledger.control_bytes
+                state.usage.retained_bytes
+                    - state.reserved
+                    - ledger.control_bytes
+                    - state.raw_report_floor
             }
         }
     }
@@ -293,6 +302,7 @@ impl<'a> CompileTimeBudget<'a> {
                 state: Mutex::new(LedgerState {
                     usage: *usage,
                     reserved: 0,
+                    raw_report_floor: 0,
                 }),
                 control_bytes,
             }));
@@ -405,6 +415,8 @@ struct Ledger {
 struct LedgerState {
     usage: BudgetSnapshot,
     reserved: usize,
+    // R17 raw report handoff only; unrelated legacy scratch cannot release it.
+    raw_report_floor: usize,
 }
 
 impl Ledger {
@@ -506,6 +518,36 @@ impl<T> Deref for AdmittedOwned<T> {
 }
 
 impl<T> AdmittedOwned<T> {
+    pub(crate) fn budget_snapshot(&self) -> BudgetSnapshot {
+        self.reservation.ledger.lock().usage
+    }
+
+    pub(crate) fn shares_root<U>(&self, other: &AdmittedOwned<U>) -> bool {
+        Arc::ptr_eq(&self.reservation.ledger, &other.reservation.ledger)
+    }
+
+    pub(crate) fn shares_shared_root<U>(&self, other: &AdmittedShared<U>) -> bool {
+        Arc::ptr_eq(&self.reservation.ledger, &other.handle.ledger)
+    }
+
+    /// Explicit R17 raw finish only. Move actual minted backing credits into a
+    /// protected floor in their own ledger, retiring the dead inline carrier.
+    pub(crate) fn into_raw_report_floor(mut self) {
+        self.seal_increments().expect("unbound report receipt");
+        let Self {
+            value,
+            mut reservation,
+            ..
+        } = self;
+        drop(value);
+        let control = size_of::<Self>();
+        let mut state = reservation.ledger.lock();
+        state.reserved -= reservation.retained;
+        state.usage.retained_bytes -= control;
+        state.raw_report_floor += reservation.retained - control;
+        reservation.retained = 0;
+    }
+
     /// Consume one actual owner into a different inline carrier. Owned backing
     /// and already minted increments move equal-sum, without a payload visitor
     /// or clone. The receiving carrier is admitted before transformation; any

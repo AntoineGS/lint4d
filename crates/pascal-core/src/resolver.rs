@@ -4159,6 +4159,15 @@ mod tests {
             + std::mem::size_of::<ResolvedUnit>()
     }
 
+    fn root_context_output_reservation(
+        resolver: &UnitResolver<MemoryStore>,
+        root: &ResolvedUnit,
+    ) -> usize {
+        std::mem::size_of::<(SourceId, pascal_project::ConditionalContext)>()
+            + root.source.id.as_str().len()
+            + conditional_context_reserve(&resolver.context).unwrap()
+    }
+
     #[test]
     fn fix2_queued_sites_aggregate_capacity_is_admitted_before_growth() {
         let root = admission_root("unit T; interface implementation end.");
@@ -4206,11 +4215,18 @@ mod tests {
             admission_root("unit T; interface {$IF false}uses A,B,C;{$ENDIF} implementation end.");
         let initial = root_output_reservation(&root);
         let mut r = admission_resolver(Default::default());
+        let context_output = root_context_output_reservation(&r, &root);
         let p = r.resolve_project_inner(root, &[], &NoCancellation).unwrap();
         assert!(p.complete);
+        assert_eq!(p.conditional_contexts.len(), 1);
+        assert_eq!(
+            p.conditional_contexts[&p.root.source.id],
+            r.context.conditional_context_for(&p.root.source.path)
+        );
         assert_eq!(p.imports.len(), 3);
         assert!(p.report.observations.is_empty());
         let output = initial
+            + context_output
             + p.imports
                 .iter()
                 .map(|i| {
@@ -4275,12 +4291,21 @@ mod tests {
         let mut r = admission_resolver(Default::default());
         r.stop_project_walk_when_incomplete(true);
         r.mark_incomplete("prior lookup failure".into());
+        let context_output = root_context_output_reservation(&r, &root);
         let p = r
             .resolve_project_inner(root, &sites, &NoCancellation)
             .unwrap();
         assert!(!p.complete);
         assert!(p.imports.is_empty());
-        assert_eq!(r.compile_time_usage().retained_bytes, initial);
+        assert_eq!(p.conditional_contexts.len(), 1);
+        assert_eq!(
+            p.conditional_contexts[&p.root.source.id],
+            r.context.conditional_context_for(&p.root.source.path)
+        );
+        assert_eq!(
+            r.compile_time_usage().retained_bytes,
+            initial + context_output
+        );
         assert!(r.compile_time_usage().work > 0);
         assert_eq!(p.report.incomplete_reasons, vec!["prior lookup failure"]);
     }

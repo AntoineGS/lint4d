@@ -53,6 +53,179 @@ fn allocations_at_least<T>(minimum: usize, call: impl FnOnce() -> T) -> (T, usiz
 mod support;
 
 #[test]
+fn task9_b_receipt_control_refuses_before_first_ledger_or_payload_allocation() {
+    use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits, IncompleteReason};
+    let mut budget = CompileTimeBudget::new(
+        CompileTimeLimits {
+            max_retained_bytes: 0,
+            ..Default::default()
+        },
+        &NoCancellation,
+    );
+    let (result, allocations) = allocations_at_least(1, || {
+        budget.admit_owned(1, 10_000, 10_000, || vec![0u8; 10_000])
+    });
+    assert!(matches!(
+        result,
+        Err(IncompleteReason::Limit {
+            name: "max_retained_bytes",
+            ..
+        })
+    ));
+    assert_eq!(
+        allocations, 0,
+        "even receipt/control allocation must follow admission"
+    );
+    assert_eq!(budget.snapshot().retained_bytes, 0);
+}
+
+#[test]
+fn task9_b_shared_arc_alignment_control_refuses_before_backing_allocation() {
+    use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits, IncompleteReason};
+    #[derive(Debug)]
+    #[repr(align(4096))]
+    struct Aligned;
+    let mut budget = CompileTimeBudget::new(
+        CompileTimeLimits {
+            max_retained_bytes: 6000,
+            ..Default::default()
+        },
+        &NoCancellation,
+    );
+    let value = budget.admit_owned(1, 0, 0, || Aligned).unwrap();
+    let (result, allocations) = allocations_at_least(8192, || value.into_shared(&mut budget));
+    assert!(matches!(
+        result,
+        Err(IncompleteReason::Limit {
+            name: "max_retained_bytes",
+            ..
+        })
+    ));
+    assert_eq!(
+        allocations, 0,
+        "Arc control padding must be admitted before allocation"
+    );
+    assert!(budget.snapshot().retained_bytes < 256);
+}
+
+#[test]
+fn task9_b_overlay_directory_refuses_before_unrelated_path_copy() {
+    use pascal_core::UnitResolveRequest;
+    use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Root.pas");
+    std::fs::write(&root, "unit Root; interface implementation end.").unwrap();
+    let ctx =
+        ProjectContext::discover(&root, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let mut store = FilesystemSourceStore::new();
+    store.insert_overlay(dir.path().join("X".repeat(100_000)), 1, &b"ignored"[..]);
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        store,
+        ResolverLimits::default(),
+    );
+    let mut budget = CompileTimeBudget::new(
+        CompileTimeLimits {
+            max_retained_bytes: 8_000,
+            ..Default::default()
+        },
+        &NoCancellation,
+    );
+    let (result, allocations) = allocations_at_least(100_000, || {
+        CompileTimeResolver::unit(
+            &mut resolver,
+            UnitResolveRequest {
+                requested_name: "Missing",
+                importer_path: &root,
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+    });
+    assert_eq!(
+        allocations, 0,
+        "directory overlay names must be admitted before path clones"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ResolverError::LimitExceeded {
+                limit: "max_retained_bytes",
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn task9_b_provider_payload_refuses_before_physical_read_or_decode() {
+    use pascal_core::UnitResolveRequest;
+    use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Root.pas");
+    std::fs::write(&root, "unit Root; interface implementation end.").unwrap();
+    std::fs::write(
+        dir.path().join("Provider.pas"),
+        format!(
+            "unit Provider; interface {{ {} }} implementation end.",
+            "X".repeat(100_000)
+        ),
+    )
+    .unwrap();
+    let ctx =
+        ProjectContext::discover(&root, &[dir.path().into()], &ProjectOptions::default()).unwrap();
+    let mut resolver = UnitResolver::new(
+        ctx,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let mut budget = CompileTimeBudget::new(
+        CompileTimeLimits {
+            max_retained_bytes: 8_000,
+            ..Default::default()
+        },
+        &NoCancellation,
+    );
+    let (result, allocations) = allocations_at_least(100_000, || {
+        CompileTimeResolver::unit(
+            &mut resolver,
+            UnitResolveRequest {
+                requested_name: "Provider",
+                importer_path: &root,
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+    });
+    assert_eq!(
+        allocations, 0,
+        "payload read/decode must follow shared root admission"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ResolverError::LimitExceeded {
+                limit: "max_retained_bytes",
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(
+        !resolver
+            .report()
+            .observations
+            .iter()
+            .any(|o| matches!(o, ResolutionObservation::Payload { .. }))
+    );
+}
+
+#[test]
 fn fix2_i3a_zero_retained_long_unknown_keyword_does_not_allocate_classifier_scratch() {
     let text = format!(
         "unit T; interface {{$ {} }} implementation end.",

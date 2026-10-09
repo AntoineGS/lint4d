@@ -12,7 +12,7 @@ mod records;
 mod scalars;
 mod session;
 
-pub use budget::{CompileTimeBudget, CompileTimeLimits};
+pub use budget::{AdmittedOwned, AdmittedShared, CompileTimeBudget, CompileTimeLimits};
 pub use declarations::CompileTimeState;
 pub use model::*;
 pub use operands::{SizeOfOperand, parse_sizeof_operand};

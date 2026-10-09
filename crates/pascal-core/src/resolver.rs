@@ -5129,6 +5129,78 @@ mod tests {
             flag: Arc<AtomicBool>,
         }
         impl SourceStore for CancelInclude {
+            fn list_directory_admitted(
+                &mut self,
+                request: DirectoryRequest<'_>,
+                budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+                cancel: &dyn CancellationToken,
+            ) -> Result<crate::compile_time::AdmittedOwned<DirectoryListing>, SourceStoreError>
+            {
+                // This fixture's entire directory is known before construction.
+                // Admit the copied paths and receiving vector, not a legacy
+                // listing obtained first and measured after allocation.
+                let count = self
+                    .inner
+                    .sources
+                    .keys()
+                    .filter(|path| path.parent() == Some(request.directory))
+                    .count();
+                let paths = self
+                    .inner
+                    .sources
+                    .keys()
+                    .filter(|path| path.parent() == Some(request.directory))
+                    .map(|path| path.as_os_str().len())
+                    .sum::<usize>();
+                let payload = paths + count * std::mem::size_of::<PathBuf>();
+                budget.admit_fallible(1, paths, payload, store_admission_error, || {
+                    if cancel.is_cancelled() {
+                        return Err(SourceStoreError::Cancelled);
+                    }
+                    let mut files = Vec::with_capacity(count);
+                    files.extend(
+                        self.inner
+                            .sources
+                            .keys()
+                            .filter(|path| path.parent() == Some(request.directory))
+                            .cloned(),
+                    );
+                    Ok(DirectoryListing {
+                        files,
+                        directories: Vec::new(),
+                        stamp: None,
+                        complete: true,
+                    })
+                })
+            }
+            fn overlay_candidates_admitted(
+                &self,
+                _roots: &[PathBuf],
+                _names: &[String],
+                budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+                _cancel: &dyn CancellationToken,
+            ) -> Result<crate::compile_time::AdmittedOwned<Vec<PathBuf>>, SourceStoreError>
+            {
+                // MemoryStore has no overlay candidates.
+                budget
+                    .admit_owned(1, 0, 0, Vec::new)
+                    .map_err(|reason| store_admission_error(reason, budget))
+            }
+            fn load_admitted(
+                &mut self,
+                request: SourceRequest<'_>,
+                budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+                cancel: &dyn CancellationToken,
+            ) -> Result<LoadedSource, SourceStoreError> {
+                let bytes = self.inner.sources.get(request.path).map_or(0, Vec::len);
+                let metadata = 2 * request.path.as_os_str().len() + "source:".len();
+                // Legacy MemoryStore copies its Vec into an Arc. Both buffers
+                // coexist during that bounded conversion; include the peak and
+                // formatting capacity before forwarding to its constructor.
+                LoadedSource::admit_construction(budget, bytes, 2 * (bytes + metadata), || {
+                    self.load(request, cancel)
+                })
+            }
             fn list_directory(
                 &mut self,
                 request: DirectoryRequest<'_>,

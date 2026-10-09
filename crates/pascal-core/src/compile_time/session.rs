@@ -249,9 +249,39 @@ pub struct CompileTimeOutput {
     pub directive_fragments: Vec<DirectiveFragments>,
     /// Admitted session storage and cumulative work (not allocator telemetry).
     pub budget: Arc<AdmittedShared<()>>,
+    // Root backing remains independently transferable even after publication.
+    // Declared after root so payload dies before its credit on ordinary Drop.
+    root_credit: Option<AdmittedOwned<()>>,
+    root_limits: CompileTimeLimits,
 }
 
 pub type CompileTimeAnalysis = AdmittedOwned<CompileTimeOutput>;
+
+impl AdmittedOwned<CompileTimeOutput> {
+    // Resolver integration remains gated on the callback/cache ownership split.
+    #[allow(dead_code)]
+    pub(crate) fn into_root_projection(
+        mut self,
+        cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedOwned<ConditionalAnalysis>, ResolverError> {
+        let view = self.budget.clone();
+        let mut budget = view.store_budget(self.root_limits, cancel);
+        let credit = self
+            .value_mut()
+            .root_credit
+            .take()
+            .expect("independent root receipt");
+        let root = credit
+            .map_value(&mut budget, |()| {
+                std::mem::replace(&mut self.value_mut().root, conditional::empty_output())
+            })
+            .map_err(|r| resolver_error(r, &budget))?;
+        // All other output/facts/occurrence owners die normally, not by an
+        // aggregate retained snapshot subtraction. Root backing never clones.
+        drop(self);
+        Ok(root)
+    }
+}
 
 #[derive(Debug)]
 struct SessionOutput {
@@ -372,6 +402,7 @@ fn publish_analysis(
         .and_then(|v| v.into_shared(budget))
         .and_then(|v| v.into_arc(budget))
         .map_err(|r| resolver_error(r, budget))?;
+    let root_limits = budget.limits();
     let mut output = budget
         .admit_owned(1, 0, 0, || CompileTimeOutput {
             root: conditional::empty_output(),
@@ -384,6 +415,8 @@ fn publish_analysis(
             warnings: Vec::new(),
             directive_fragments: Vec::new(),
             budget: view,
+            root_credit: None,
+            root_limits,
         })
         .map_err(|r| resolver_error(r, budget))?;
     macro_rules! transfer {
@@ -397,7 +430,14 @@ fn publish_analysis(
                 .map_err(|r| resolver_error(r, budget))?;
         }};
     }
-    transfer!(root, conditional::empty_output);
+    let empty_root = budget
+        .admit_owned(0, 0, 0, conditional::empty_output)
+        .map_err(|r| resolver_error(r, budget))?;
+    let root = std::mem::replace(&mut analysis.root, empty_root);
+    let credit = root
+        .map_value(budget, |root| output.value_mut().root = root)
+        .map_err(|r| resolver_error(r, budget))?;
+    output.value_mut().root_credit = Some(credit);
     transfer!(occurrences, Vec::new);
     transfer!(includes, Vec::new);
     transfer!(header, || Fact::Unknown(UnknownReason::HeaderNotAnalyzed));
@@ -2900,6 +2940,93 @@ mod tests {
             },
             compile_time_backing: None,
         }
+    }
+
+    #[test]
+    fn actual_root_projection_moves_credit_and_backing_without_other_output_storage() {
+        let root =
+            graph_source("unit T; interface {$H+} type R=record X:Byte; end; implementation end.");
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let output = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let text = output.root.projected_source.as_ptr();
+        let directives = output.root.directives.as_ptr();
+        let body = output.root.directives[0].body.as_ptr();
+        let sibling = output.facts.try_clone(&mut budget).unwrap();
+        let before = observer.budget_snapshot();
+        let projection = output.into_root_projection(&NoCancellation).unwrap();
+        assert_eq!(projection.projected_source.as_ptr(), text);
+        assert_eq!(projection.directives.as_ptr(), directives);
+        assert_eq!(projection.directives[0].body.as_ptr(), body);
+        let after = observer.budget_snapshot();
+        assert_eq!(after.byte_work, before.byte_work);
+        assert!(
+            after.retained_bytes < before.retained_bytes,
+            "dead occurrences/output controls drop, live sibling facts remain"
+        );
+        drop(budget);
+        assert!(projection.complete);
+        assert_eq!(projection.directives[0].body, "H+");
+        drop(projection);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        assert!(sibling.declarations.iter().any(|d| d.name == "r"));
+        drop(sibling);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().byte_work, before.byte_work);
+    }
+
+    #[test]
+    fn actual_root_projection_cancel_drops_only_consumed_output_not_live_sibling() {
+        struct Cancel;
+        impl CancellationToken for Cancel {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        let root = graph_source("unit T; interface {$H+} implementation end.");
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let sibling = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let before = observer.budget_snapshot();
+        let output = analyze_source_in_session(
+            &root,
+            &ConditionalContext::default(),
+            &mut NoGraphCallbacks,
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        assert!(matches!(
+            output.into_root_projection(&Cancel),
+            Err(ResolverError::Cancelled)
+        ));
+        let after = observer.budget_snapshot();
+        assert_eq!(after.retained_bytes, before.retained_bytes);
+        assert!(after.byte_work > before.byte_work);
+        assert_eq!(sibling.root.directives[0].body, "H+");
     }
 
     #[test]

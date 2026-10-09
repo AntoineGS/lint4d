@@ -1,51 +1,66 @@
-# Agent Instructions
+# lint4d
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+## Editable dependencies
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [sync-concepts](https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+The grammar and CFG crates live in this workspace (merged with `git subtree`,
+see `docs/decisions/0001-monorepo.md`); fix bugs in them directly instead of
+working around them, in the same commit as the code that needs the fix:
 
-## Quick Reference
+- `crates/tree-sitter-pascal` — grammar (`grammar.js`), generated parser
+  (`src/parser.c`, `src/grammar.json`, `src/node-types.json`), external scanner
+  (`src/scanner.c`) and queries. After editing `grammar.js`, run
+  `tree-sitter generate` and `tree-sitter test` in that directory with
+  tree-sitter CLI 0.24 (ABI 14; `npm install` there provides it as
+  `npx tree-sitter`), and commit the regenerated `src/` files with the
+  grammar change
+- `crates/cfg-core` — language-agnostic CFG and interprocedural analysis
+- `crates/cfg-pascal` — Pascal CFG builder; lint4d uses cfg-core only through
+  its `cfg_pascal::cfg_core` re-export
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
-```
+All three are path dependencies, so there are no revs to bump and no
+`.cargo/config.toml` overrides. The old `github.com/AntoineGS/{tree-sitter-pascal,cfg-core,cfg-pascal}`
+repositories are no longer used by the build; do not add git dependencies on them.
 
-## Non-Interactive Shell Commands
+## Work tracking — Beads (required)
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+Tracked work lives in Beads (`bd`, issue prefix `l4d`); run `bd prime` for
+the command reference. The database lives on the shared Dolt server at
+`~/.beads/shared-server/`, not in the repo, so issue updates never create
+commits. Issue history syncs to `refs/dolt/data` on `origin`: writes
+auto-push (`dolt.auto-push`), and `bd dolt pull` fetches changes made
+elsewhere.
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+- **History:** Backlog.md is historical. Its last state is commit `55026f9`
+  (`git show 55026f9:backlog/...`). `TASK-N` in older commits and records is
+  issue `l4d-N` (`TASK-1.1` is `l4d-1.1`), and each imported issue keeps its
+  Backlog ID as its external reference; `DRAFT-1` is `l4d-0jh`. Do not run
+  `backlog` or recreate `backlog/`.
+- **Find work:** `bd ready`, `bd list` (filter by `--status`, `--label`),
+  `bd search`, `bd show`. Respect dependencies. Milestones M1..M7 are the
+  epics `l4d-m1`..`l4d-m7`; their children (`bd children l4d-m1`) give the
+  intended order. Shared context for `arch-review` issues is in
+  `docs/architecture-review-context.md`.
+- **Start:** `bd update <id> --claim` (sets `in_progress`) and record the plan
+  with `--design` before writing code.
+- **Complete:** only after the acceptance criteria are verified (tests, fmt,
+  clippy). Check each one (`[x]`) with `bd update <id> --acceptance`, then
+  `bd close <id> --reason` with the final summary (what changed, commits, how
+  it was verified).
+- **Defer or put off:** `bd update <id> --status deferred --append-notes`
+  with the reason, what was done so far, and what would unblock it. A
+  deferred issue must never be left `in_progress`.
+- **Partial work or new findings:** record progress with `--append-notes`;
+  create new issues (`bd create`) for follow-ups or bugs discovered, linked
+  with `--deps discovered-from:<id>` or `bd dep add`. Fix stale `file:line`
+  citations you notice.
+- Name the issue in the commit message of code done for it. Do not commit
+  merely to synchronize tracking.
+- Do not keep separate TODO files. `TODOS.md` is the user's own list: do
+  not edit it.
 
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
+## Bug fixes
 
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
-```
-
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+TDD required: failing test first, minimal fix, refactor. No fix without a regression test.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:46cd31e7 -->
 ## Beads Issue Tracker

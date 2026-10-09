@@ -75,3 +75,4 @@ sync:
     remote: "git+ssh://git@github.com/AntoineGS/lint4d.git"
 dolt:
     shared-server: true
+    auto-push: true

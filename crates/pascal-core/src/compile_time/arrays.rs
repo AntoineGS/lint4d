@@ -20,7 +20,7 @@ pub(super) fn operand_indices<'a>(
     indices: impl Iterator<Item = &'a str>,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<bool, IncompleteReason> {
-    let before = budget.snapshot().retained_bytes;
+    let before = budget.manual_retained();
     let result = (|| {
         if !dimensions.is_empty()
             && !matches!(
@@ -158,7 +158,7 @@ pub(super) fn operand_indices<'a>(
         }
         Ok(count == dimensions.len().max(1))
     })();
-    budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+    budget.release(budget.manual_retained().saturating_sub(before));
     result
 }
 
@@ -779,13 +779,13 @@ fn captured_expression_at(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
-    let before = budget.snapshot().retained_bytes;
+    let before = budget.manual_retained();
     let fallback = if state.scalar_history.is_empty() {
         crate::conditional::ConditionalEnvironment::context_snapshot(&state.context, budget)?
     } else {
         crate::conditional::ConditionalEnvironment::default()
     };
-    let fallback_bytes = budget.snapshot().retained_bytes.saturating_sub(before);
+    let fallback_bytes = budget.manual_retained().saturating_sub(before);
     let result = (|| {
         let initial = expression_query_site(state, site, logical, text, 0, budget)?;
         let environment = scalar_environment_at(state, &initial, &fallback, budget)?;
@@ -986,7 +986,7 @@ fn sizeof_expression_at(
             .ok_or(IncompleteReason::MalformedSource)?;
         // Map actual declaration fragments, including gaps around directives.
         // Never invent one editable contiguous range or parser-wrapper offset.
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let mapped = state.provenance(start, end, budget);
         let result = (|| {
             let mapped = mapped?;
@@ -1006,7 +1006,7 @@ fn sizeof_expression_at(
             )?;
             Ok(())
         })();
-        budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        budget.release(budget.manual_retained().saturating_sub(before));
         result?;
     }
     super::session::sizeof_value(state, &captured, argument, budget)

@@ -291,6 +291,35 @@ impl PartialEq for ReadPolicy {
 impl Eq for ReadPolicy {}
 
 impl ReadPolicy {
+    /// Owned storage copied by `Clone`. The authorization-file table and the
+    /// compiled matcher are shared Arc backing, not copied parser/cache payload.
+    /// Recovery traversal remains separate and still refuses opaque matcher data.
+    pub fn visit_owned_clone_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        visit(
+            (self.configured_roots.len() + self.mapped_roots.len())
+                * std::mem::size_of::<AuthorizedReadRoot>(),
+        )?;
+        for root in self.configured_roots.iter().chain(&self.mapped_roots) {
+            visit(root.path.as_os_str().len())?;
+            visit(root.pattern_exclusion_bases.len() * std::mem::size_of::<PathBuf>())?;
+            for base in &root.pattern_exclusion_bases {
+                visit(base.as_os_str().len())?;
+            }
+        }
+        visit(self.exclusions.len() * std::mem::size_of::<String>())?;
+        for pattern in &self.exclusions {
+            visit(pattern.len())?;
+        }
+        visit(self.exclusion_bases.len() * std::mem::size_of::<PathBuf>())?;
+        for base in &self.exclusion_bases {
+            visit(base.as_os_str().len())?;
+        }
+        Ok(())
+    }
+
     pub fn visit_recovery_payload(
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,

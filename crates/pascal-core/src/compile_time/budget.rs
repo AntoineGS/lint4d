@@ -55,12 +55,20 @@ pub struct CompileTimeBudget<'a> {
     definitions: usize,
     fields: usize,
     variants: usize,
+    manual_scope: Option<usize>,
 }
 
 impl<'a> CompileTimeBudget<'a> {
     /// Limits used by stream consumers for dimension-specific admission.
     pub fn limits(&self) -> CompileTimeLimits {
         self.limits
+    }
+    pub(crate) fn cancel_token(&self) -> &'a dyn CancellationToken {
+        self.cancel
+    }
+    pub(crate) fn constrain_retained(&mut self, maximum: usize) -> Result<(), IncompleteReason> {
+        self.limits.max_retained_bytes = self.limits.max_retained_bytes.min(maximum);
+        self.charge(0, 0, 0)
     }
 
     pub fn new(limits: CompileTimeLimits, cancel: &'a dyn CancellationToken) -> Self {
@@ -73,6 +81,7 @@ impl<'a> CompileTimeBudget<'a> {
             definitions: 0,
             fields: 0,
             variants: 0,
+            manual_scope: None,
         }
     }
 
@@ -94,13 +103,24 @@ impl<'a> CompileTimeBudget<'a> {
             )?;
             *current = next;
             Ok(())
-        })
+        })?;
+        if let Some(scope) = &mut self.manual_scope {
+            *scope += retained;
+        }
+        Ok(())
     }
 
     /// Release live storage only. Neither operation count nor byte work refunds.
     /// Releasing more than legacy storage clamps to zero rather than wrapping.
     /// Receipt-owned storage and the live ledger cannot be refunded this way.
     pub fn release(&mut self, retained: usize) {
+        let retained = if let Some(scope) = &mut self.manual_scope {
+            let released = retained.min(*scope);
+            *scope -= released;
+            released
+        } else {
+            retained
+        };
         match &mut self.counters {
             Counters::Inline(current) => {
                 current.retained_bytes = current.retained_bytes.saturating_sub(retained);
@@ -118,6 +138,54 @@ impl<'a> CompileTimeBudget<'a> {
             Counters::Inline(current) => *current,
             Counters::Shared(ledger) => ledger.lock().usage,
         }
+    }
+
+    /// Scratch marks exclude independently owned/cache/shared reservations.
+    /// These are admission invoices, not differences of whole callback usage.
+    pub(crate) fn manual_retained(&self) -> usize {
+        if let Some(scope) = self.manual_scope {
+            return scope;
+        }
+        match &self.counters {
+            Counters::Inline(current) => current.retained_bytes,
+            Counters::Shared(ledger) => {
+                let state = ledger.lock();
+                state.usage.retained_bytes - state.reserved - ledger.control_bytes
+            }
+        }
+    }
+
+    /// Compilation owns every ordinary retained admission issued in this scope.
+    /// Nested receipt-backed cache/graph/output owners are invoiced separately.
+    /// The invoice transfers only on success; on error all scoped locals have
+    /// already died before their invoice is released. No callback delta is used.
+    pub(crate) fn admit_compilation<T>(
+        &mut self,
+        build: impl FnOnce(&mut Self) -> Result<T, crate::ResolverError>,
+    ) -> Result<AdmittedOwned<T>, crate::ResolverError> {
+        let mut reservation = self
+            .mint_retention(1, 0, size_of::<AdmittedOwned<T>>())
+            .map_err(|reason| super::resolver_error(reason, self))?;
+        let parent = self.manual_scope.replace(0);
+        let result = build(self);
+        let invoice = self.manual_scope.take().unwrap_or(0);
+        self.manual_scope = parent;
+        match result {
+            Ok(value) => {
+                reservation.absorb_manual(invoice);
+                Ok(AdmittedOwned { value, reservation })
+            }
+            Err(error) => {
+                self.release_invoice(invoice);
+                Err(error)
+            }
+        }
+    }
+
+    fn release_invoice(&mut self, invoice: usize) {
+        let parent = self.manual_scope.take();
+        self.release(invoice);
+        self.manual_scope = parent;
     }
 
     /// Admit an owned carrier and its backing payload before calling `build`.
@@ -142,6 +210,26 @@ impl<'a> CompileTimeBudget<'a> {
         Ok(AdmittedOwned { value, reservation })
     }
 
+    /// Store construction may fail after admission. The constructor's locals
+    /// die before the reservation; performed work is never rolled back.
+    pub(crate) fn admit_fallible<T, E>(
+        &mut self,
+        work: usize,
+        byte_work: usize,
+        payload: usize,
+        refusal: impl FnOnce(IncompleteReason, &Self) -> E,
+        build: impl FnOnce() -> Result<T, E>,
+    ) -> Result<AdmittedOwned<T>, E> {
+        let retained = payload
+            .checked_add(size_of::<AdmittedOwned<T>>())
+            .ok_or(IncompleteReason::MalformedSource);
+        let reservation = retained
+            .and_then(|n| self.mint_retention(work, byte_work, n))
+            .map_err(|r| refusal(r, self))?;
+        let value = build()?;
+        Ok(AdmittedOwned { value, reservation })
+    }
+
     fn mint_retention(
         &mut self,
         work: usize,
@@ -161,6 +249,9 @@ impl<'a> CompileTimeBudget<'a> {
                 .checked_add(control_bytes)
                 .ok_or(IncompleteReason::MalformedSource)?,
         )?;
+        if let Some(scope) = &mut self.manual_scope {
+            *scope -= retained + control_bytes;
+        }
         if let Counters::Inline(usage) = &self.counters {
             // The ledger/control allocation occurs only AFTER its full credit
             // is admitted. Its storage lasts while the root or any receipt does.
@@ -309,6 +400,13 @@ impl Drop for Retention {
     }
 }
 
+impl Retention {
+    fn absorb_manual(&mut self, invoice: usize) {
+        self.ledger.lock().reserved += invoice;
+        self.retained += invoice;
+    }
+}
+
 /// An admitted, move-only payload. Fields are private so no operation can move
 /// its value out and refund the credits while leaving that payload live.
 #[derive(Debug)]
@@ -326,6 +424,56 @@ impl<T> Deref for AdmittedOwned<T> {
 }
 
 impl<T> AdmittedOwned<T> {
+    pub(crate) fn retire_storage(&mut self, bytes: usize) -> Result<(), IncompleteReason> {
+        if bytes > self.reservation.retained {
+            return Err(IncompleteReason::MalformedSource);
+        }
+        let mut state = self.reservation.ledger.lock();
+        state.reserved -= bytes;
+        state.usage.retained_bytes -= bytes;
+        self.reservation.retained -= bytes;
+        Ok(())
+    }
+    /// Attach a known construction increment BEFORE mutation, including on
+    /// unwind with a surviving owner. No callback interval/delta is inferred.
+    pub(crate) fn grow<R>(
+        &mut self,
+        budget: &mut CompileTimeBudget<'_>,
+        work: usize,
+        bytes: usize,
+        retained: usize,
+        update: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, IncompleteReason> {
+        if !budget.owns(&self.reservation) {
+            return Err(IncompleteReason::MalformedSource);
+        }
+        let mut credit = budget.mint_retention(work, bytes, retained)?;
+        self.reservation.retained += credit.retained;
+        credit.retained = 0;
+        Ok(update(&mut self.value))
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    /// Mutate an actual owner through the same root; new ordinary admissions
+    /// follow that owner even if a fallible mutation leaves partial state.
+    pub(crate) fn with_budget_mut<R>(
+        &mut self,
+        budget: &mut CompileTimeBudget<'_>,
+        update: impl FnOnce(&mut T, &mut CompileTimeBudget<'_>) -> R,
+    ) -> Result<R, IncompleteReason> {
+        if !budget.owns(&self.reservation) {
+            return Err(IncompleteReason::MalformedSource);
+        }
+        let parent = budget.manual_scope.replace(0);
+        let result = update(&mut self.value, budget);
+        let invoice = budget.manual_scope.take().unwrap_or(0);
+        budget.manual_scope = parent;
+        self.reservation.absorb_manual(invoice);
+        Ok(result)
+    }
     /// Validate a returned capability without accepting unadmitted or other-root
     /// data as proof. This checks the opaque minting identity, not payload size.
     pub fn is_admitted_by(&self, budget: &CompileTimeBudget<'_>) -> bool {
@@ -373,6 +521,40 @@ impl<T> Deref for AdmittedShared<T> {
 }
 
 impl<T> AdmittedShared<T> {
+    /// Borrow the SAME root ledger for an existing resolver/store call chain.
+    /// This is not a new root or copied retained counter. Only store work and
+    /// storage use this bridge; declaration counters remain on the root budget.
+    pub(crate) fn store_budget<'a>(
+        &self,
+        limits: CompileTimeLimits,
+        cancel: &'a dyn CancellationToken,
+    ) -> CompileTimeBudget<'a> {
+        CompileTimeBudget {
+            limits,
+            cancel,
+            counters: Counters::Shared(self.handle.ledger.clone()),
+            layout_query_depth: 0,
+            last_failed_charge: None,
+            definitions: 0,
+            fields: 0,
+            variants: 0,
+            manual_scope: None,
+        }
+    }
+    /// Internal shared carrier envelope: its Arc/control credit follows the
+    /// wrapped shared handle, and is admitted before allocating the envelope.
+    pub(crate) fn into_arc(
+        mut self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Arc<Self>, IncompleteReason> {
+        if !budget.owns(&self.handle) {
+            return Err(IncompleteReason::MalformedSource);
+        }
+        let mut control = budget.mint_retention(1, 0, arc_overhead::<Self>()?)?;
+        self.handle.retained += control.retained;
+        control.retained = 0;
+        Ok(Arc::new(self))
+    }
     pub fn is_admitted_by(&self, budget: &CompileTimeBudget<'_>) -> bool {
         budget.owns(&self.handle)
     }

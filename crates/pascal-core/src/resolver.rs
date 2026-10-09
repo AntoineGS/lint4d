@@ -109,6 +109,32 @@ pub struct SourceRequest<'a> {
 }
 
 pub trait SourceStore {
+    /// Compile-time capability: defaults never invoke unbounded legacy methods.
+    fn list_directory_admitted(
+        &mut self,
+        _request: DirectoryRequest<'_>,
+        _budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<crate::compile_time::AdmittedOwned<DirectoryListing>, SourceStoreError> {
+        Err(SourceStoreError::AdmissionUnavailable)
+    }
+    fn overlay_candidates_admitted(
+        &self,
+        _roots: &[PathBuf],
+        _names: &[String],
+        _budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<crate::compile_time::AdmittedOwned<Vec<PathBuf>>, SourceStoreError> {
+        Err(SourceStoreError::AdmissionUnavailable)
+    }
+    fn load_admitted(
+        &mut self,
+        _request: SourceRequest<'_>,
+        _budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        Err(SourceStoreError::AdmissionUnavailable)
+    }
     fn list_directory(
         &mut self,
         request: DirectoryRequest<'_>,
@@ -139,7 +165,7 @@ pub struct DirectoryListing {
     pub complete: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LoadedSource {
     pub id: SourceId,
     pub path: PathBuf,
@@ -148,9 +174,67 @@ pub struct LoadedSource {
     /// their coordinate model while retaining raw bytes for revision hashes.
     pub decoded_text: Option<Arc<str>>,
     pub revision: SourceRevision,
+    /// Opaque root-minted backing/metadata owner. Legacy sources have none.
+    /// Declared last so physical fields die before their final receipt.
+    pub compile_time_backing: Option<crate::compile_time::AdmittedSourceBacking>,
 }
 
+impl PartialEq for LoadedSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.path == other.path
+            && self.bytes == other.bytes
+            && self.decoded_text == other.decoded_text
+            && self.revision == other.revision
+    }
+}
+impl Eq for LoadedSource {}
+
 impl LoadedSource {
+    /// Store implementers must supply a proven payload bound and construct/read
+    /// only in `build`, which runs after root admission. This is the source-only
+    /// capability constructor; it is not a wrapper for an unbounded legacy read.
+    pub fn admit_construction(
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+        byte_work: usize,
+        retained_payload: usize,
+        build: impl FnOnce() -> Result<Self, SourceStoreError>,
+    ) -> Result<Self, SourceStoreError> {
+        let owner =
+            budget.admit_fallible(1, byte_work, retained_payload, store_admission_error, build)?;
+        let backing = owner
+            .into_shared(budget)
+            .and_then(|v| v.into_arc(budget))
+            .map_err(|r| store_admission_error(r, budget))?;
+        let metadata = loaded_source_metadata_retained(&backing);
+        let _scratch = budget
+            .admit_owned(1, metadata, metadata, || ())
+            .map_err(|r| store_admission_error(r, budget))?;
+        let mut source = (**backing).clone();
+        source.compile_time_backing = Some(backing);
+        source.admitted_copy(budget)
+    }
+    pub(crate) fn admitted_copy(
+        &self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, SourceStoreError> {
+        if !self
+            .compile_time_backing
+            .as_ref()
+            .is_some_and(|b| b.is_admitted_by(budget))
+        {
+            return Err(SourceStoreError::AdmissionUnavailable);
+        }
+        let metadata = loaded_source_metadata_retained(self);
+        let owner = budget
+            .admit_owned(1, metadata, metadata.saturating_mul(2), || self.clone())
+            .and_then(|v| v.into_shared(budget))
+            .and_then(|v| v.into_arc(budget))
+            .map_err(|r| store_admission_error(r, budget))?;
+        let mut source = (**owner).clone();
+        source.compile_time_backing = Some(owner);
+        Ok(source)
+    }
     /// Return the UTF-8 bytes used by parser, resolver metadata, and CFG.
     ///
     /// `bytes` remains the exact payload read from disk or supplied by an
@@ -195,13 +279,70 @@ pub enum SourceRevision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceStoreError {
+    AdmissionUnavailable,
+    RootLimit {
+        limit: &'static str,
+        observed: usize,
+        maximum: usize,
+    },
     Cancelled,
-    NotFound { path: PathBuf },
-    Unauthorized { path: PathBuf, reason: String },
-    NotRegularFile { path: PathBuf },
-    TooLarge { path: PathBuf, maximum: usize },
-    Io { path: PathBuf, message: String },
-    Incomplete { path: PathBuf, reason: String },
+    NotFound {
+        path: PathBuf,
+    },
+    Unauthorized {
+        path: PathBuf,
+        reason: String,
+    },
+    NotRegularFile {
+        path: PathBuf,
+    },
+    TooLarge {
+        path: PathBuf,
+        maximum: usize,
+    },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
+    Incomplete {
+        path: PathBuf,
+        reason: String,
+    },
+}
+
+pub(crate) fn store_admission_error(
+    reason: crate::compile_time::IncompleteReason,
+    budget: &crate::compile_time::CompileTimeBudget<'_>,
+) -> SourceStoreError {
+    match crate::compile_time::resolver_error(reason, budget) {
+        ResolverError::Cancelled => SourceStoreError::Cancelled,
+        ResolverError::LimitExceeded {
+            limit,
+            observed,
+            maximum,
+        } => SourceStoreError::RootLimit {
+            limit,
+            observed,
+            maximum,
+        },
+        _ => SourceStoreError::AdmissionUnavailable,
+    }
+}
+
+fn root_store_error(error: SourceStoreError) -> ResolverError {
+    match error {
+        SourceStoreError::RootLimit {
+            limit,
+            observed,
+            maximum,
+        } => ResolverError::LimitExceeded {
+            limit,
+            observed,
+            maximum,
+        },
+        SourceStoreError::Cancelled => ResolverError::Cancelled,
+        error => ResolverError::SourceStore(error),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,15 +558,150 @@ pub struct UnitResolver<S> {
     compile_time_route: Option<LegacyRoute>,
     compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
+    compile_time_store: Option<StoreRoot>,
+    compile_time_caches: Vec<StoreRoot>,
+}
+
+#[derive(Default)]
+struct StoreCache {
+    loaded: HashMap<SourceId, LoadedSource>,
+    directories: HashMap<DirectoryCacheKey, crate::compile_time::AdmittedOwned<DirectoryListing>>,
+    loaded_capacity_credit: usize,
+    directory_capacity_credit: usize,
+    recorded_work: usize,
+    recorded_byte_work: usize,
+}
+
+#[derive(Clone)]
+struct StoreRoot {
+    view: Arc<
+        crate::compile_time::AdmittedShared<
+            std::sync::Mutex<crate::compile_time::AdmittedOwned<StoreCache>>,
+        >,
+    >,
+    limits: crate::compile_time::CompileTimeLimits,
+}
+
+struct StoreCall<'a, S: SourceStore> {
+    resolver: &'a mut UnitResolver<S>,
+    previous: Option<StoreRoot>,
+}
+impl<S: SourceStore> std::ops::Deref for StoreCall<'_, S> {
+    type Target = UnitResolver<S>;
+    fn deref(&self) -> &Self::Target {
+        self.resolver
+    }
+}
+impl<S: SourceStore> std::ops::DerefMut for StoreCall<'_, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.resolver
+    }
+}
+impl<S: SourceStore> Drop for StoreCall<'_, S> {
+    fn drop(&mut self) {
+        self.resolver.compile_time_store = self.previous.take();
+    }
 }
 
 impl<S: SourceStore> UnitResolver<S> {
+    fn store_call<'b>(
+        &'b mut self,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<StoreCall<'b, S>, ResolverError> {
+        let mut root = if let Some(root) = self
+            .compile_time_caches
+            .iter()
+            .find(|r| r.view.is_admitted_by(budget))
+        {
+            root.clone()
+        } else {
+            let owner = budget
+                .admit_owned(0, 0, std::mem::size_of::<StoreRoot>(), StoreCache::default)
+                .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+            let view = budget
+                .admit_owned(0, 0, 0, || std::sync::Mutex::new(owner))
+                .and_then(|v| v.into_shared(budget))
+                .and_then(|v| v.into_arc(budget))
+                .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+            let root = StoreRoot {
+                view,
+                limits: budget.limits(),
+            };
+            let old = self.compile_time_caches.capacity();
+            if self.compile_time_caches.len() == old {
+                let new = (old + 1) * std::mem::size_of::<StoreRoot>();
+                self.charge_compile_time(0, 0, new, budget.cancel_token())?;
+                self.compile_time_caches.reserve_exact(1);
+                self.release_compile_time(old * std::mem::size_of::<StoreRoot>());
+            }
+            self.compile_time_caches.push(root.clone());
+            root
+        };
+        let other = self
+            .compile_time_caches
+            .iter()
+            .filter(|r| !r.view.is_admitted_by(budget))
+            .map(|r| r.view.budget_snapshot().retained_bytes)
+            .sum::<usize>();
+        let remaining = self
+            .limits
+            .max_compile_time_retained_bytes
+            .saturating_sub(self.compile_time_accounting.retained_bytes)
+            .saturating_sub(other);
+        budget
+            .constrain_retained(remaining)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        root.limits = budget.limits();
+        let previous = self.compile_time_store.replace(root);
+        Ok(StoreCall {
+            resolver: self,
+            previous,
+        })
+    }
+
+    fn store_budget<'a>(
+        &self,
+        cancel: &'a dyn CancellationToken,
+    ) -> Option<crate::compile_time::CompileTimeBudget<'a>> {
+        self.compile_time_store
+            .as_ref()
+            .map(|root| root.view.store_budget(root.limits, cancel))
+    }
+
+    fn admit_lookup_storage(
+        &mut self,
+        work: usize,
+        bytes: usize,
+        retained: usize,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        if let Some(root) = self.compile_time_store.clone() {
+            let mut budget = root.view.store_budget(root.limits, cancel);
+            let mut owner = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            owner
+                .grow(&mut budget, work, bytes, retained, |_| ())
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        }
+        Ok(())
+    }
     /// Cumulative admitted work and live scratch/published-output reservations.
     /// Temporary projections refund storage, never work or byte work. The
     /// resolver cannot observe callers dropping outputs, so their reservations
     /// conservatively last for this resolver's request-local lifetime.
     pub fn compile_time_usage(&self) -> crate::compile_time::BudgetSnapshot {
-        self.compile_time_accounting
+        let mut usage = self.compile_time_accounting;
+        for root in &self.compile_time_caches {
+            let live = root.view.budget_snapshot();
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            usage.retained_bytes = usage.retained_bytes.saturating_add(live.retained_bytes);
+            usage.work = usage
+                .work
+                .saturating_add(live.work.saturating_sub(cache.recorded_work));
+            usage.byte_work = usage
+                .byte_work
+                .saturating_add(live.byte_work.saturating_sub(cache.recorded_byte_work));
+        }
+        usage
     }
 
     fn charge_compile_time(
@@ -448,7 +724,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 Ok(observed)
             }
         };
-        let c = self.compile_time_accounting;
+        let c = self.compile_time_usage();
         let result: Result<_, ResolverError> = (|| {
             Ok(crate::compile_time::BudgetSnapshot {
                 work: admit(
@@ -472,8 +748,10 @@ impl<S: SourceStore> UnitResolver<S> {
             })
         })();
         match result {
-            Ok(counters) => {
-                self.compile_time_accounting = counters;
+            Ok(_) => {
+                self.compile_time_accounting.work += work;
+                self.compile_time_accounting.byte_work += bytes;
+                self.compile_time_accounting.retained_bytes += retained;
                 Ok(())
             }
             Err(error) => {
@@ -539,21 +817,22 @@ impl<S: SourceStore> UnitResolver<S> {
             std::mem::replace(&mut self.compile_time_root_path, Some(root.path.clone()));
         let previous = std::mem::replace(&mut self.compile_time_route, route);
         let defaults = crate::compile_time::CompileTimeLimits::default();
+        let aggregate = self.compile_time_usage();
         let limits = crate::compile_time::CompileTimeLimits {
             max_work: defaults.max_work.min(
                 self.limits
                     .max_compile_time_work
-                    .saturating_sub(self.compile_time_accounting.work),
+                    .saturating_sub(aggregate.work),
             ),
             max_byte_work: defaults.max_byte_work.min(
                 self.limits
                     .max_compile_time_byte_work
-                    .saturating_sub(self.compile_time_accounting.byte_work),
+                    .saturating_sub(aggregate.byte_work),
             ),
             max_retained_bytes: defaults.max_retained_bytes.min(
                 self.limits
                     .max_compile_time_retained_bytes
-                    .saturating_sub(self.compile_time_accounting.retained_bytes),
+                    .saturating_sub(aggregate.retained_bytes),
             ),
             ..defaults
         };
@@ -573,9 +852,18 @@ impl<S: SourceStore> UnitResolver<S> {
         let usage = budget.snapshot();
         self.compile_time_accounting.work += usage.work;
         self.compile_time_accounting.byte_work += usage.byte_work;
-        if result.is_ok() {
+        if let Some(root) = self
+            .compile_time_caches
+            .iter()
+            .find(|r| r.view.is_admitted_by(&budget))
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            cache.value_mut().recorded_work = usage.work;
+            cache.value_mut().recorded_byte_work = usage.byte_work;
+        } else if result.is_ok() {
             self.compile_time_accounting.retained_bytes += usage.retained_bytes;
-        } else if let Err(error) = &result {
+        }
+        if let Err(error) = &result {
             self.mark_incomplete(error.to_string());
         }
         drop(decoded);
@@ -664,7 +952,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 })
             });
             if unsupported {
-                analysis.root.complete = false;
+                analysis.value_mut().root.complete = false;
                 self.mark_incomplete(format!(
                     "source {} contains an unsupported active directive",
                     source.path.display()
@@ -753,13 +1041,14 @@ impl<S: SourceStore> UnitResolver<S> {
             let bytes = conditional_analysis_retained(&analysis.root);
             // Transfer the existing immutable projection; no root clone or cache
             // insertion. Drop the graphs/occurrences and refund their reservation.
-            if bytes > analysis.budget.retained_bytes {
-                self.charge_compile_time(1, 0, bytes - analysis.budget.retained_bytes, cancel)?;
+            let typed_usage = analysis.budget.budget_snapshot().retained_bytes;
+            if bytes > typed_usage {
+                self.charge_compile_time(1, 0, bytes - typed_usage, cancel)?;
             } else {
-                self.release_compile_time(analysis.budget.retained_bytes - bytes);
+                self.release_compile_time(typed_usage - bytes);
             }
             Ok(SourceOrderProjection {
-                root: analysis.root,
+                root: analysis.root.clone(),
                 retained: bytes,
                 includes,
             })
@@ -851,6 +1140,8 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_route: None,
             compile_time_root_path: None,
             compile_time_accounting: Default::default(),
+            compile_time_store: None,
+            compile_time_caches: Vec::new(),
         }
     }
 
@@ -1653,12 +1944,19 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
         self.check_cancel(cancel)?;
+        let key_bytes = request.importer_path.as_os_str().len()
+            + request.requested_name.len()
+            + std::mem::size_of::<UnitCacheKey>();
+        self.admit_lookup_storage(1, key_bytes, key_bytes, cancel)?;
         let key = UnitCacheKey::new(
             request.importer_path,
             request.requested_name,
             request.legacy_route,
         );
-        if !skip_browsing && let Some(unit) = self.unit_cache.get(&key).cloned() {
+        if self.compile_time_store.is_none()
+            && !skip_browsing
+            && let Some(unit) = self.unit_cache.get(&key).cloned()
+        {
             return Ok(Resolution::Found(unit));
         }
         let route = request.legacy_route.cloned();
@@ -1667,7 +1965,9 @@ impl<S: SourceStore> UnitResolver<S> {
             self.mark_incomplete("unit resolution was incomplete".to_string());
         }
         if let Resolution::Found(unit) = &result {
-            self.unit_cache.insert(key, unit.clone());
+            if self.compile_time_store.is_none() {
+                self.unit_cache.insert(key, unit.clone());
+            }
             if let Some(route) = self.legacy_route_for_source(&unit.source, route.as_ref()) {
                 self.legacy_routes.insert(unit.source.id.clone(), route);
             }
@@ -1703,6 +2003,38 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
         self.check_cancel(cancel)?;
+        let names = self
+            .context
+            .unit_namespaces
+            .iter()
+            .map(|n| n.len() + std::mem::size_of::<String>())
+            .sum::<usize>();
+        let paths = self
+            .context
+            .search_path_entries
+            .iter()
+            .chain(&self.context.browsing_path_entries)
+            .map(|e| e.path.as_os_str().len() + std::mem::size_of::<ProjectPathEntry>())
+            .sum::<usize>();
+        let explicit = self
+            .context
+            .explicit_unit_entries
+            .values()
+            .flatten()
+            .map(|e| {
+                2 * e.path.as_os_str().len() + std::mem::size_of::<(PathBuf, ProjectPathEntry)>()
+            })
+            .sum::<usize>();
+        let reserve = paths
+            .saturating_mul(2)
+            .saturating_add(explicit.saturating_mul(2))
+            .saturating_add(names.saturating_mul(
+                self.context.search_path_entries.len()
+                    + self.context.browsing_path_entries.len()
+                    + 2,
+            ))
+            .saturating_add(request.requested_name.len().saturating_mul(8));
+        self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         let requested = request.requested_name.trim();
         if requested.is_empty() {
             return Err(ResolverError::InvalidRequest(
@@ -1855,6 +2187,13 @@ impl<S: SourceStore> UnitResolver<S> {
         provided_entry: Option<&ProjectPathEntry>,
         requested: &str,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        let bytes = directory.as_os_str().len().saturating_mul(8)
+            + unit_name.len().saturating_mul(8)
+            + namespaces
+                .iter()
+                .map(|n| 8 * (n.len() + std::mem::size_of::<String>()))
+                .sum::<usize>();
+        self.admit_lookup_storage(1, bytes, bytes, cancel)?;
         let directory = canonical_path(directory);
         let Some(entry) = provided_entry
             .cloned()
@@ -1879,7 +2218,7 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         let tiers = filename_tiers(unit_name, namespaces);
         for names in tiers {
-            let paths = self.paths_for_names(&directory, &entry, &names, &listing);
+            let paths = self.paths_for_names(&directory, &entry, &names, &listing, cancel)?;
             let group = CandidateGroup {
                 paths,
                 legacy_route: legacy_route.cloned(),
@@ -1946,7 +2285,8 @@ impl<S: SourceStore> UnitResolver<S> {
                                 &nested_entry,
                                 &names,
                                 &nested_listing,
-                            ),
+                                cancel,
+                            )?,
                             legacy_route: legacy_route.cloned(),
                         };
                         if let Some(result) =
@@ -2046,6 +2386,16 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
         self.check_cancel(cancel)?;
+        let copies = group
+            .paths
+            .iter()
+            .map(|(p, e)| {
+                8 * (p.as_os_str().len()
+                    + e.path.as_os_str().len()
+                    + std::mem::size_of::<ResolutionCandidate>())
+            })
+            .sum::<usize>();
+        self.admit_lookup_storage(1, copies, copies, cancel)?;
         let mut valid = Vec::new();
         let mut candidates = Vec::new();
         for (path, entry) in dedup_paths(group.paths.clone()) {
@@ -2058,9 +2408,25 @@ impl<S: SourceStore> UnitResolver<S> {
                 cancel,
             ) {
                 Ok(source) => {
-                    let declared_name = match self.store.declared_unit_name(&source) {
-                        Some(declared_name) => declared_name,
-                        None => self.source_metadata(&source).declared_name.clone(),
+                    let declared_name = if self.compile_time_store.is_some() {
+                        let bytes = source.analysis_bytes();
+                        self.admit_lookup_storage(bytes.len(), bytes.len(), 0, cancel)?;
+                        if let Some(name) = admitted_header_name(&bytes) {
+                            self.admit_lookup_storage(
+                                1,
+                                name.len(),
+                                2 * name.len() + std::mem::size_of::<String>(),
+                                cancel,
+                            )?;
+                            Some(canonical_unit_name(name))
+                        } else {
+                            None
+                        }
+                    } else {
+                        match self.store.declared_unit_name(&source) {
+                            Some(declared_name) => declared_name,
+                            None => self.source_metadata(&source).declared_name.clone(),
+                        }
                     };
                     let candidate = ResolutionCandidate {
                         path: source.path.clone(),
@@ -2095,6 +2461,9 @@ impl<S: SourceStore> UnitResolver<S> {
                     }));
                 }
                 Err(SourceStoreError::Cancelled) => return Err(ResolverError::Cancelled),
+                Err(error @ SourceStoreError::RootLimit { .. }) => {
+                    return Err(root_store_error(error));
+                }
                 Err(SourceStoreError::Incomplete { path, reason }) => {
                     self.mark_incomplete(format!(
                         "unit candidate {} is incomplete: {reason}",
@@ -2133,12 +2502,21 @@ impl<S: SourceStore> UnitResolver<S> {
     }
 
     fn paths_for_names(
-        &self,
+        &mut self,
         directory: &Path,
         entry: &ProjectPathEntry,
         names: &[String],
         listing: &DirectoryListing,
-    ) -> Vec<(PathBuf, ProjectPathEntry)> {
+        cancel: &dyn CancellationToken,
+    ) -> Result<Vec<(PathBuf, ProjectPathEntry)>, ResolverError> {
+        let copy_bound = listing
+            .files
+            .iter()
+            .map(|p| {
+                6 * p.as_os_str().len() + 4 * std::mem::size_of::<(PathBuf, ProjectPathEntry)>()
+            })
+            .sum::<usize>();
+        self.admit_lookup_storage(1, copy_bound, copy_bound, cancel)?;
         let mut paths = listing
             .files
             .iter()
@@ -2156,9 +2534,35 @@ impl<S: SourceStore> UnitResolver<S> {
                 )
             })
             .collect::<Vec<_>>();
-        let overlays = self
-            .store
-            .overlay_candidates(&[directory.to_path_buf()], names);
+        let admitted = if let Some(mut budget) = self.store_budget(cancel) {
+            Some(
+                self.store
+                    .overlay_candidates_admitted(
+                        &[directory.to_path_buf()],
+                        names,
+                        &mut budget,
+                        cancel,
+                    )
+                    .map_err(root_store_error)?,
+            )
+        } else {
+            None
+        };
+        if let Some(ref admitted) = admitted {
+            let bytes = admitted
+                .iter()
+                .map(|p| {
+                    6 * p.as_os_str().len() + 4 * std::mem::size_of::<(PathBuf, ProjectPathEntry)>()
+                })
+                .sum();
+            self.admit_lookup_storage(1, bytes, bytes, cancel)?;
+        }
+        let overlays = if let Some(ref admitted) = admitted {
+            admitted.to_vec()
+        } else {
+            self.store
+                .overlay_candidates(&[directory.to_path_buf()], names)
+        };
         for path in overlays {
             if path
                 .parent()
@@ -2177,7 +2581,7 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
         paths.sort_by_key(|left| path_key(&left.0));
-        paths
+        Ok(paths)
     }
 
     fn list_directory(
@@ -2189,6 +2593,16 @@ impl<S: SourceStore> UnitResolver<S> {
         missing_is_incomplete: bool,
     ) -> Result<DirectoryListing, ResolverError> {
         self.check_cancel(cancel)?;
+        let mut key_bytes =
+            4 * directory.as_os_str().len() + std::mem::size_of::<DirectoryCacheKey>();
+        self.context
+            .read_policy
+            .visit_owned_clone_payload(&mut |n| {
+                key_bytes += n;
+                Ok(())
+            })
+            .expect("infallible metadata sizing");
+        self.admit_lookup_storage(1, key_bytes, key_bytes, cancel)?;
         let key = canonical_path(directory);
         let cache_key = DirectoryCacheKey {
             path: path_identity::path_lookup_key(&key),
@@ -2196,17 +2610,80 @@ impl<S: SourceStore> UnitResolver<S> {
             read_policy: self.context.read_policy.clone(),
             missing_is_incomplete,
         };
-        if let Some(listing) = self.directories.get(&cache_key).cloned() {
+        if self.compile_time_store.is_none()
+            && let Some(listing) = self.directories.get(&cache_key).cloned()
+        {
             return Ok(listing);
         }
-        let listing = match self.store.list_directory(
-            DirectoryRequest {
-                directory: &key,
-                entry,
-                read_policy: &self.context.read_policy,
-            },
-            cancel,
-        ) {
+        let request = DirectoryRequest {
+            directory: &key,
+            entry,
+            read_policy: &self.context.read_policy,
+        };
+        let result = if let Some(mut budget) = self.store_budget(cancel) {
+            match self
+                .store
+                .list_directory_admitted(request, &mut budget, cancel)
+            {
+                Ok(mut owner) => {
+                    let bytes = owner
+                        .files
+                        .iter()
+                        .chain(&owner.directories)
+                        .map(|p| p.as_os_str().len() + std::mem::size_of::<PathBuf>())
+                        .sum::<usize>();
+                    let listing = owner
+                        .grow(
+                            &mut budget,
+                            1,
+                            bytes.saturating_mul(2),
+                            bytes.saturating_mul(2)
+                                + std::mem::size_of::<
+                                    crate::compile_time::AdmittedOwned<DirectoryListing>,
+                                >(),
+                            |v| v.clone(),
+                        )
+                        .map_err(|r| root_store_error(store_admission_error(r, &budget)))?;
+                    let root = self
+                        .compile_time_store
+                        .as_ref()
+                        .expect("admitted store call")
+                        .clone();
+                    let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    let old = cache.directory_capacity_credit;
+                    let growth = cache.directories.len() == cache.directories.capacity();
+                    let new = if growth {
+                        ((cache.directories.len() + 1).next_power_of_two() * 2).max(4)
+                            * (std::mem::size_of::<(
+                                DirectoryCacheKey,
+                                crate::compile_time::AdmittedOwned<DirectoryListing>,
+                            )>() + 1)
+                            + 16
+                    } else {
+                        0
+                    };
+                    cache
+                        .grow(&mut budget, 1, key_bytes, key_bytes + new, |c| {
+                            if growth {
+                                c.directories.reserve(1);
+                                c.directory_capacity_credit = new;
+                            }
+                            c.directories.insert(cache_key.clone(), owner);
+                        })
+                        .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                    if growth {
+                        cache
+                            .retire_storage(old)
+                            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                    }
+                    Ok(listing)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.store.list_directory(request, cancel)
+        };
+        let listing = match result {
             Ok(listing) => listing,
             Err(SourceStoreError::NotFound { path: _ }) => DirectoryListing {
                 files: Vec::new(),
@@ -2215,7 +2692,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 complete: !missing_is_incomplete,
             },
             Err(SourceStoreError::Cancelled) => return Err(ResolverError::Cancelled),
-            Err(error) => return Err(ResolverError::SourceStore(error)),
+            Err(error) => return Err(root_store_error(error)),
         };
         self.scanned_entries = self.scanned_entries.saturating_add(
             listing
@@ -2251,7 +2728,9 @@ impl<S: SourceStore> UnitResolver<S> {
                 key.display()
             ));
         }
-        self.directories.insert(cache_key, listing.clone());
+        if self.compile_time_store.is_none() {
+            self.directories.insert(cache_key, listing.clone());
+        }
         Ok(listing)
     }
 
@@ -2284,6 +2763,28 @@ impl<S: SourceStore> UnitResolver<S> {
     ) -> Result<LoadedSource, SourceStoreError> {
         self.check_cancel(cancel)
             .map_err(|_| SourceStoreError::Cancelled)?;
+        let mut metadata =
+            6 * path.as_os_str().len() + std::mem::size_of::<ResolutionObservation>();
+        self.context
+            .read_policy
+            .visit_owned_clone_payload(&mut |n| {
+                metadata += n;
+                Ok(())
+            })
+            .expect("infallible source metadata sizing");
+        self.admit_lookup_storage(1, metadata, metadata, cancel)
+            .map_err(|error| match error {
+                ResolverError::LimitExceeded {
+                    limit,
+                    observed,
+                    maximum,
+                } => SourceStoreError::RootLimit {
+                    limit,
+                    observed,
+                    maximum,
+                },
+                _ => SourceStoreError::Cancelled,
+            })?;
         let path = canonical_path(path);
         let entry = ProjectPathEntry {
             path: path.clone(),
@@ -2295,21 +2796,76 @@ impl<S: SourceStore> UnitResolver<S> {
             None
         };
         self.record_candidate(&path, Some(entry.clone()), stamp.is_some());
-        let loaded = self.store.load(
-            SourceRequest {
-                path: &path,
-                entry: &entry,
-                read_policy: &self.context.read_policy,
-                legacy_route,
-                kind,
-                max_bytes,
-            },
-            cancel,
-        )?;
+        let request = SourceRequest {
+            path: &path,
+            entry: &entry,
+            read_policy: &self.context.read_policy,
+            legacy_route,
+            kind,
+            max_bytes,
+        };
+        let mut loaded = if let Some(mut budget) = self.store_budget(cancel) {
+            self.store.load_admitted(request, &mut budget, cancel)?
+        } else {
+            self.store.load(request, cancel)?
+        };
+        if kind == SourceKind::Unit
+            && loaded.decoded_text.is_none()
+            && std::str::from_utf8(&loaded.bytes).is_err()
+            && let Some(mut budget) = self.store_budget(cancel)
+        {
+            let payload =
+                loaded.bytes.len().saturating_mul(3) + loaded_source_metadata_retained(&loaded);
+            loaded =
+                LoadedSource::admit_construction(&mut budget, loaded.bytes.len(), payload, || {
+                    let mut decoded = loaded.clone();
+                    decoded.decoded_text = Some(source_text(&loaded).into());
+                    Ok(decoded)
+                })?;
+        }
         if stamp.is_none() {
             self.record_candidate(&path, Some(entry.clone()), true);
         }
-        self.loaded.insert(loaded.id.clone(), loaded.clone());
+        if let Some(mut budget) = self.store_budget(cancel) {
+            let cached = loaded.admitted_copy(&mut budget)?;
+            let root = self
+                .compile_time_store
+                .as_ref()
+                .expect("store call")
+                .clone();
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let old = cache.loaded_capacity_credit;
+            let growth = cache.loaded.len() == cache.loaded.capacity();
+            let new = if growth {
+                ((cache.loaded.len() + 1).next_power_of_two() * 2).max(4)
+                    * (std::mem::size_of::<(SourceId, LoadedSource)>() + 1)
+                    + 16
+            } else {
+                0
+            };
+            cache
+                .grow(
+                    &mut budget,
+                    1,
+                    loaded.id.as_str().len(),
+                    new + loaded.id.as_str().len(),
+                    |c| {
+                        if growth {
+                            c.loaded.reserve(1);
+                            c.loaded_capacity_credit = new;
+                        }
+                        c.loaded.insert(loaded.id.clone(), cached);
+                    },
+                )
+                .map_err(|r| store_admission_error(r, &budget))?;
+            if growth {
+                cache
+                    .retire_storage(old)
+                    .map_err(|r| store_admission_error(r, &budget))?;
+            }
+        } else {
+            self.loaded.insert(loaded.id.clone(), loaded.clone());
+        }
         self.record_observation(ResolutionObservation::Payload {
             source_id: loaded.id.clone(),
             path: loaded.path.clone(),
@@ -2337,6 +2893,17 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         self.check_cancel(cancel)?;
+        let paths = self
+            .context
+            .include_paths
+            .iter()
+            .chain(&self.context.search_paths)
+            .map(|p| p.as_os_str().len() + std::mem::size_of::<ProjectPathEntry>())
+            .sum::<usize>();
+        let reserve = paths.saturating_mul(4)
+            + request.including_path.as_os_str().len().saturating_mul(8)
+            + request.requested_name.len().saturating_mul(8);
+        self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         if request.requested_name.trim().is_empty() {
             return Ok(Resolution::Incomplete {
                 reason: "include directive has no file name".to_string(),
@@ -2422,6 +2989,9 @@ impl<S: SourceStore> UnitResolver<S> {
                                 Err(SourceStoreError::Cancelled) => {
                                     return Err(ResolverError::Cancelled);
                                 }
+                                Err(error @ SourceStoreError::RootLimit { .. }) => {
+                                    return Err(root_store_error(error));
+                                }
                                 Err(error) => {
                                     saw_incomplete = true;
                                     self.warn(format!(
@@ -2452,6 +3022,9 @@ impl<S: SourceStore> UnitResolver<S> {
                     }
                 }
                 Err(SourceStoreError::Cancelled) => return Err(ResolverError::Cancelled),
+                Err(error @ SourceStoreError::RootLimit { .. }) => {
+                    return Err(root_store_error(error));
+                }
                 Err(error) => {
                     saw_incomplete = true;
                     self.warn(format!("include candidate could not be loaded: {error:?}"));
@@ -2513,14 +3086,31 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<LoadedSource, SourceStoreError> {
         let source_id = source_id_for_path(path);
-        let existing = self
-            .loaded
-            .values()
-            .find(|source| {
-                path_equivalent(&source.path, path)
-                    && self.can_reuse_loaded_source(path, entry, legacy_route)
-            })
-            .cloned();
+        let existing = if let Some(mut budget) = self.store_budget(cancel) {
+            let root = self
+                .compile_time_store
+                .as_ref()
+                .expect("store call")
+                .clone();
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .loaded
+                .values()
+                .find(|source| {
+                    path_equivalent(&source.path, path)
+                        && self.can_reuse_loaded_source(path, entry, legacy_route)
+                })
+                .map(|source| source.admitted_copy(&mut budget))
+                .transpose()?
+        } else {
+            self.loaded
+                .values()
+                .find(|source| {
+                    path_equivalent(&source.path, path)
+                        && self.can_reuse_loaded_source(path, entry, legacy_route)
+                })
+                .cloned()
+        };
         let known_id = existing
             .as_ref()
             .map_or_else(|| source_id.clone(), |source| source.id.clone());
@@ -2711,6 +3301,24 @@ impl<S: SourceStore> UnitResolver<S> {
         unit_name: &str,
         cancel: &dyn CancellationToken,
     ) -> Result<Vec<CandidateGroup>, ResolverError> {
+        let initial = self
+            .workspace_roots
+            .iter()
+            .map(|p| p.as_os_str().len() + std::mem::size_of::<PathBuf>())
+            .sum::<usize>()
+            + self
+                .context
+                .unit_namespaces
+                .iter()
+                .map(|n| n.len() + std::mem::size_of::<String>())
+                .sum::<usize>()
+            + unit_name.len();
+        self.admit_lookup_storage(
+            1,
+            initial.saturating_mul(8),
+            initial.saturating_mul(8),
+            cancel,
+        )?;
         let tiers = filename_tiers(unit_name, &self.context.unit_namespaces);
         let mut paths_by_tier: Vec<Vec<(PathBuf, ProjectPathEntry)>> =
             vec![Vec::new(); tiers.len()];
@@ -2731,6 +3339,14 @@ impl<S: SourceStore> UnitResolver<S> {
             for (index, names) in tiers.iter().enumerate() {
                 for name in names {
                     if let Some(found) = catalogue.entries.get(&name.to_ascii_lowercase()) {
+                        let bytes = found
+                            .iter()
+                            .map(|p| {
+                                4 * p.as_os_str().len()
+                                    + 4 * std::mem::size_of::<(PathBuf, ProjectPathEntry)>()
+                            })
+                            .sum();
+                        self.admit_lookup_storage(1, bytes, bytes, cancel)?;
                         paths_by_tier[index].extend(found.iter().filter_map(|path| {
                             self.context
                                 .path_entry_for(path)
@@ -2740,9 +3356,34 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
             }
             for (index, names) in tiers.iter().enumerate() {
-                let overlays = self
-                    .store
-                    .overlay_candidates(std::slice::from_ref(&root), names);
+                let owned = if let Some(mut budget) = self.store_budget(cancel) {
+                    Some(
+                        self.store
+                            .overlay_candidates_admitted(
+                                std::slice::from_ref(&root),
+                                names,
+                                &mut budget,
+                                cancel,
+                            )
+                            .map_err(root_store_error)?,
+                    )
+                } else {
+                    None
+                };
+                let overlays = if let Some(ref owned) = owned {
+                    let bytes = owned
+                        .iter()
+                        .map(|p| {
+                            4 * p.as_os_str().len()
+                                + 4 * std::mem::size_of::<(PathBuf, ProjectPathEntry)>()
+                        })
+                        .sum();
+                    self.admit_lookup_storage(1, bytes, bytes, cancel)?;
+                    owned.to_vec()
+                } else {
+                    self.store
+                        .overlay_candidates(std::slice::from_ref(&root), names)
+                };
                 for path in overlays {
                     let Some(entry) = self.context.path_entry_for(&path) else {
                         continue;
@@ -2770,11 +3411,15 @@ impl<S: SourceStore> UnitResolver<S> {
         root: &Path,
         cancel: &dyn CancellationToken,
     ) -> Result<Arc<Catalogue>, ResolverError> {
+        let initial = 4 * root.as_os_str().len() + 4 * std::mem::size_of::<Catalogue>();
+        self.admit_lookup_storage(1, initial, initial, cancel)?;
         let root = canonical_path(root);
         // Every spelling of a directory on a case-insensitive volume is one
         // catalogue; distinct directories never share one.
         let root_key = path_identity::path_lookup_key(&root);
-        if let Some(catalogue) = self.package_catalogues.get(&root_key).cloned() {
+        if self.compile_time_store.is_none()
+            && let Some(catalogue) = self.package_catalogues.get(&root_key).cloned()
+        {
             return Ok(catalogue);
         }
         if self.package_catalogue_count >= self.limits.max_package_catalogues {
@@ -2788,7 +3433,8 @@ impl<S: SourceStore> UnitResolver<S> {
             }));
         }
         self.package_catalogue_count += 1;
-        if let Some(session_cache) = &self.session_cache
+        if self.compile_time_store.is_none()
+            && let Some(session_cache) = &self.session_cache
             && let Some(cached) = session_cache.get(&root_key)
         {
             for observation in cached.observations.iter().cloned() {
@@ -2826,6 +3472,18 @@ impl<S: SourceStore> UnitResolver<S> {
                 break;
             };
             let listing = self.list_directory(&directory, &entry, None, cancel, true)?;
+            let copies = listing
+                .files
+                .iter()
+                .chain(&listing.directories)
+                .map(|p| {
+                    8 * (p.as_os_str().len()
+                        + std::mem::size_of::<PathBuf>()
+                        + std::mem::size_of::<String>()
+                        + 4 * std::mem::size_of::<usize>())
+                })
+                .sum::<usize>();
+            self.admit_lookup_storage(1, copies, copies, cancel)?;
             complete &= listing.complete;
             catalogue_entries = catalogue_entries.saturating_add(
                 listing
@@ -2894,6 +3552,17 @@ impl<S: SourceStore> UnitResolver<S> {
         legacy_route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
+        if self.compile_time_store.is_some() {
+            // The XML/package metadata reader is not a SourceStore payload
+            // capability. Never invoke its legacy transitive reader under a
+            // typed root and pretend later catalogue charges admitted that IO.
+            let reason = "package metadata has no admitted compile-time reader";
+            self.admit_lookup_storage(1, reason.len(), reason.len(), cancel)?;
+            return Ok(Resolution::Incomplete {
+                reason: reason.into(),
+                candidates: vec![],
+            });
+        }
         if self.package_lookups >= self.limits.max_package_lookups {
             self.mark_incomplete(format!(
                 "package lookup limit ({}) reached",
@@ -3149,21 +3818,38 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         for include in result.includes {
             if let ResolutionTarget::Found(id) = &include.target
-                && let Some(source) = self.loaded.get(id)
                 && !include_sources.iter().any(|existing| existing.id == *id)
             {
-                let bytes = loaded_source_retained(&source);
+                let typed = self
+                    .compile_time_caches
+                    .iter()
+                    .rev()
+                    .find_map(|root| {
+                        let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.loaded.get(id).map(|source| {
+                            let mut budget = root.view.store_budget(root.limits, cancel);
+                            source.admitted_copy(&mut budget).map_err(root_store_error)
+                        })
+                    })
+                    .transpose()?;
+                let source = if let Some(source) = typed {
+                    source
+                } else if let Some(source) = self.loaded.get(id) {
+                    source.clone()
+                } else {
+                    continue;
+                };
+                let bytes = if source.compile_time_backing.is_some() {
+                    0
+                } else {
+                    loaded_source_retained(&source)
+                };
                 self.charge_compile_time(
                     include_sources.len() + 1,
                     0,
                     bytes + std::mem::size_of::<LoadedSource>(),
                     cancel,
                 )?;
-                let source = self
-                    .loaded
-                    .get(id)
-                    .expect("admitted loaded include")
-                    .clone();
                 include_sources.reserve_exact(1);
                 include_sources.push(source);
             }
@@ -3207,6 +3893,34 @@ impl<S: SourceStore> UnitResolver<S> {
 }
 
 impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S> {
+    fn unit_capability(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<crate::compile_time::AdmittedProviderSource>, ResolverError> {
+        let outcome =
+            crate::compile_time::CompileTimeResolver::unit(self, request, budget, cancel)?;
+        let result = match outcome.result {
+            Resolution::Found(provider) => {
+                let backing = crate::compile_time::ProviderSource::admit_cached_backing(
+                    &provider.unit.source,
+                    budget,
+                )?;
+                Resolution::Found(provider.admit_copy(&backing, budget)?)
+            }
+            Resolution::Unavailable { reason } => Resolution::Unavailable { reason },
+            Resolution::Ambiguous { candidates } => Resolution::Ambiguous { candidates },
+            Resolution::Incomplete { reason, candidates } => {
+                Resolution::Incomplete { reason, candidates }
+            }
+        };
+        Ok(ResolutionOutcome {
+            result,
+            observations: outcome.observations,
+            warnings: outcome.warnings,
+        })
+    }
     fn max_include_depth(&self) -> usize {
         self.limits.max_include_depth
     }
@@ -3261,35 +3975,44 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
             });
         // The store's bounded payload read supplements the shared typed budget.
         // Do not reset any resolver counters or construct a child resolver.
-        let source_limit = self.limits.max_source_bytes;
-        let remaining = budget
-            .limits()
-            .max_retained_bytes
-            .saturating_sub(budget.snapshot().retained_bytes)
-            / 4;
-        let remaining_bytes = budget
-            .limits()
-            .max_byte_work
-            .saturating_sub(budget.snapshot().byte_work)
-            / 4;
-        self.limits.max_source_bytes = source_limit.min(remaining).min(remaining_bytes);
-        let outcome = self.try_resolve_include(
+        let outcome = self.store_call(budget)?.try_resolve_include(
             IncludeResolveRequest {
                 legacy_route: route.as_ref(),
                 ..request
             },
             cancel,
         );
-        self.limits.max_source_bytes = source_limit;
         let mut outcome = outcome?;
         if let Resolution::Found(source) = &mut outcome.result {
             if source.decoded_text.is_none() && std::str::from_utf8(&source.bytes).is_err() {
-                budget
-                    .charge(1, source.bytes.len(), source.bytes.len().saturating_mul(3))
+                let payload = source
+                    .bytes
+                    .len()
+                    .checked_mul(3)
+                    .and_then(|n| n.checked_add(2 * loaded_source_metadata_retained(source)))
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("include decode admission overflow".into())
+                    })?;
+                let owner = budget
+                    .admit_owned(1, source.bytes.len(), payload, || {
+                        let mut decoded = source.clone();
+                        decoded.decoded_text = Some(source_text(source).into());
+                        decoded
+                    })
+                    .and_then(|v| v.into_shared(budget))
+                    .and_then(|v| v.into_arc(budget))
                     .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
-                source.decoded_text = Some(source_text(source).into());
-                if let Some(loaded) = self.loaded.get_mut(&source.id) {
-                    loaded.decoded_text = source.decoded_text.clone();
+                *source = (**owner).clone();
+                source.compile_time_backing = Some(owner);
+                if let Some(root) = self
+                    .compile_time_caches
+                    .iter()
+                    .find(|r| r.view.is_admitted_by(budget))
+                {
+                    let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(loaded) = cache.value_mut().loaded.get_mut(&source.id) {
+                        *loaded = source.admitted_copy(budget).map_err(root_store_error)?;
+                    }
                 }
             }
             if let Some(route) = route {
@@ -3332,26 +4055,13 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
                     .filter(|r| path_equivalent(&r.source_path, request.importer_path))
                     .cloned()
             });
-        let source_limit = self.limits.max_source_bytes;
-        let remaining = budget
-            .limits()
-            .max_retained_bytes
-            .saturating_sub(budget.snapshot().retained_bytes)
-            / 4;
-        let remaining_bytes = budget
-            .limits()
-            .max_byte_work
-            .saturating_sub(budget.snapshot().byte_work)
-            / 4;
-        self.limits.max_source_bytes = source_limit.min(remaining).min(remaining_bytes);
-        let outcome = self.try_resolve_unit(
+        let outcome = self.store_call(budget)?.try_resolve_unit(
             UnitResolveRequest {
                 legacy_route: route.as_ref(),
                 ..request.clone()
             },
             cancel,
         );
-        self.limits.max_source_bytes = source_limit;
         let outcome = outcome?;
         let result = match outcome.result {
             Resolution::Found(mut unit) => {
@@ -3359,39 +4069,40 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
                 let names = request.requested_name.len()
                     + aliased_name_ref(&self.context, request.requested_name).len()
                     + unit.declared_name.len();
-                budget
-                    .charge(
-                        1,
-                        reserve + names,
-                        reserve
-                            + 4 * names
-                            + 8 * std::mem::size_of::<String>()
-                            + loaded_source_metadata_retained(&unit.source),
-                    )
-                    .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
-                let context = self.context.conditional_context_for(&unit.source.path);
-                let authorized_qualifiers = qualifiers_for_found(
-                    request.requested_name,
-                    aliased_name_ref(&self.context, request.requested_name),
-                    &unit.declared_name,
-                );
+                let payload = reserve
+                    + 4 * names
+                    + 8 * std::mem::size_of::<String>()
+                    + loaded_source_metadata_retained(&unit.source);
                 if unit.source.decoded_text.is_none()
                     && std::str::from_utf8(&unit.source.bytes).is_err()
                 {
-                    budget
-                        .charge(
-                            1,
-                            unit.source.bytes.len(),
-                            unit.source.bytes.len().saturating_mul(3),
-                        )
-                        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
-                    unit.source.decoded_text = Some(source_text(&unit.source).into());
+                    unit.source = LoadedSource::admit_construction(
+                        budget,
+                        unit.source.bytes.len(),
+                        unit.source.bytes.len().saturating_mul(3)
+                            + loaded_source_metadata_retained(&unit.source),
+                        || {
+                            let mut decoded = unit.source.clone();
+                            decoded.decoded_text = Some(source_text(&unit.source).into());
+                            Ok(decoded)
+                        },
+                    )
+                    .map_err(root_store_error)?;
                 }
-                Resolution::Found(crate::compile_time::ProviderSource {
-                    unit,
-                    context,
-                    authorized_qualifiers,
-                })
+                Resolution::Found(crate::compile_time::ProviderSource::admit_metadata_build(
+                    budget,
+                    reserve + names,
+                    payload,
+                    || {
+                        let context = self.context.conditional_context_for(&unit.source.path);
+                        let qualifiers = qualifiers_for_found(
+                            request.requested_name,
+                            aliased_name_ref(&self.context, request.requested_name),
+                            &unit.declared_name,
+                        );
+                        crate::compile_time::ProviderSource::new(unit, context, qualifiers)
+                    },
+                )?)
             }
             Resolution::Unavailable { reason } => Resolution::Unavailable { reason },
             Resolution::Ambiguous { candidates } => Resolution::Ambiguous { candidates },
@@ -3617,7 +4328,7 @@ pub(crate) fn loaded_source_metadata_retained(source: &LoadedSource) -> usize {
             Ok(())
         };
         read_policy
-            .visit_recovery_payload(&mut count)
+            .visit_owned_clone_payload(&mut count)
             .expect("infallible size visitor");
         path_entry
             .visit_recovery_payload(&mut count)
@@ -3890,6 +4601,53 @@ fn canonical_unit_name(name: &str) -> String {
         .to_string()
 }
 
+/// Borrow-only unit-header metadata for the admitted lookup. In particular it
+/// does not invoke the legacy whole-file tree-sitter parser before root admission.
+/// Directives before the header cannot prove an unconditional unit identity.
+fn admitted_header_name(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes)
+        .ok()?
+        .trim_start_matches('\u{feff}');
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(comment) = rest.strip_prefix("//") {
+            rest = comment.split_once('\n')?.1;
+        } else if let Some(comment) = rest.strip_prefix('{') {
+            if comment.starts_with('$') {
+                return None;
+            }
+            rest = comment.split_once('}')?.1;
+        } else if let Some(comment) = rest.strip_prefix("(*") {
+            if comment.starts_with('$') {
+                return None;
+            }
+            rest = comment.split_once("*)")?.1;
+        } else {
+            break;
+        }
+    }
+    let head = rest.get(..4)?;
+    if !head.eq_ignore_ascii_case("unit") || !rest.get(4..)?.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name = rest.get(4..)?.split_once(';')?.0.trim();
+    let mut start = true;
+    for c in name.chars().filter(|c| !c.is_whitespace()) {
+        if c == '.' {
+            if start {
+                return None;
+            }
+            start = true;
+        } else if c == '_' || c.is_alphabetic() || (!start && c.is_ascii_digit()) {
+            start = false;
+        } else {
+            return None;
+        }
+    }
+    (!start).then_some(name)
+}
+
 fn package_stem(name: &str) -> String {
     let name = name.replace('\\', "/");
     let name = name.rsplit('/').next().unwrap_or(&name);
@@ -4130,6 +4888,7 @@ mod tests {
                 path: PathBuf::from("/workspace/T.pas"),
                 bytes: Arc::from(text.as_bytes()),
                 decoded_text: None,
+                compile_time_backing: None,
                 revision: SourceRevision::Overlay {
                     version: 1,
                     content_hash: 0,
@@ -4539,6 +5298,7 @@ mod tests {
                 path: request.path.to_path_buf(),
                 bytes: Arc::<[u8]>::from(bytes),
                 decoded_text: None,
+                compile_time_backing: None,
                 revision: SourceRevision::Overlay {
                     version: 1,
                     content_hash: 0,
@@ -4560,6 +5320,7 @@ mod tests {
             path: PathBuf::from("/workspace/A.pas"),
             bytes: Arc::<[u8]>::from(text.as_bytes()),
             decoded_text: None,
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 0,

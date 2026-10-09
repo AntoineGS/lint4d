@@ -16,6 +16,7 @@ fn source(id: &str, path: &str, bytes: &[u8]) -> LoadedSource {
         path: PathBuf::from(path),
         bytes: Arc::from(bytes.to_vec()),
         decoded_text: None,
+        compile_time_backing: None,
         revision: SourceRevision::Overlay {
             version: 1,
             content_hash: 1,

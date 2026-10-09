@@ -71,6 +71,8 @@ pub struct Fixture {
     units: std::collections::BTreeMap<String, ProviderSource>,
     denied_units: std::collections::BTreeSet<String>,
     ambiguous_units: std::collections::BTreeSet<String>,
+    cached_unit: Option<AdmittedSourceBacking>,
+    callback_logs: Vec<AdmittedOwned<()>>,
 }
 impl Fixture {
     pub fn new(text: &str, context: ConditionalContext) -> Self {
@@ -89,6 +91,8 @@ impl Fixture {
             units: Default::default(),
             denied_units: Default::default(),
             ambiguous_units: Default::default(),
+            cached_unit: None,
+            callback_logs: Vec::new(),
         }
     }
     pub fn include(&mut self, name: &str, text: &str) {
@@ -97,15 +101,15 @@ impl Fixture {
     pub fn unit(&mut self, name: &str, text: &str, context: ConditionalContext) {
         self.units.insert(
             name.into(),
-            ProviderSource {
-                unit: pascal_core::ResolvedUnit {
+            ProviderSource::new(
+                pascal_core::ResolvedUnit {
                     requested_name: name.into(),
                     declared_name: name.into(),
                     source: loaded(&format!("{name}.pas"), text),
                 },
                 context,
-                authorized_qualifiers: vec![name.into()],
-            },
+                vec![name.into()],
+            ),
         );
     }
     pub fn unit_qualifiers(&mut self, name: &str, qualifiers: &[&str]) {
@@ -136,6 +140,9 @@ impl Fixture {
     pub fn read_names(&self) -> Vec<String> {
         self.reads.clone()
     }
+    pub fn cached_unit_usage(&self) -> Option<BudgetSnapshot> {
+        self.cached_unit.as_ref().map(|s| s.budget_snapshot())
+    }
     pub fn analyze(&mut self) -> Result<CompileTimeAnalysis, ResolverError> {
         self.analyze_with_cancel(&NoCancellation)
     }
@@ -150,6 +157,61 @@ impl Fixture {
     }
 }
 impl CompileTimeResolver for Fixture {
+    fn unit_capability(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<AdmittedProviderSource>, ResolverError> {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        let log_bytes = request.importer_path.as_os_str().len()
+            + request.requested_name.len() * 2
+            + std::mem::size_of::<(std::path::PathBuf, String)>()
+            + std::mem::size_of::<String>()
+            + std::mem::size_of::<AdmittedOwned<()>>();
+        let log = budget
+            .admit_owned(1, log_bytes, log_bytes, || ())
+            .map_err(|_| ResolverError::InvalidRequest("fixture callback log admission".into()))?;
+        self.callback_logs.reserve_exact(1);
+        self.callback_logs.push(log);
+        self.unit_requests.reserve_exact(1);
+        self.unit_requests
+            .push((request.importer_path.into(), request.requested_name.into()));
+        let result = if self.denied_units.contains(request.requested_name) {
+            Resolution::Unavailable {
+                reason: "denied fixture unit".into(),
+            }
+        } else if self.ambiguous_units.contains(request.requested_name) {
+            Resolution::Ambiguous { candidates: vec![] }
+        } else if let Some(provider) = self.units.get(request.requested_name) {
+            let reusable = self.cached_unit.as_ref().is_some_and(|s| {
+                s.is_admitted_by(budget)
+                    && s.id == provider.unit.source.id
+                    && s.revision == provider.unit.source.revision
+            });
+            if !reusable {
+                self.cached_unit = Some(ProviderSource::admit_cached_backing(
+                    &provider.unit.source,
+                    budget,
+                )?);
+            }
+            let capability = provider.admit_copy(self.cached_unit.as_ref().unwrap(), budget)?;
+            self.reads.reserve_exact(1);
+            self.reads.push(request.requested_name.into());
+            Resolution::Found(capability)
+        } else {
+            Resolution::Unavailable {
+                reason: "missing fixture unit".into(),
+            }
+        };
+        Ok(ResolutionOutcome {
+            result,
+            observations: vec![],
+            warnings: vec![],
+        })
+    }
     fn max_include_depth(&self) -> usize {
         self.max_include_depth
     }
@@ -279,6 +341,7 @@ pub fn loaded(path: &str, text: &str) -> LoadedSource {
         path: format!("/fixture/{path}").into(),
         bytes: text.as_bytes().into(),
         decoded_text: Some(text.into()),
+        compile_time_backing: None,
         revision: SourceRevision::Overlay {
             version: 1,
             content_hash: pascal_project::content_hash_bytes(text.as_bytes()),

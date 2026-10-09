@@ -273,7 +273,7 @@ impl ConditionalEnvironment {
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
     ) -> Result<Self, crate::compile_time::IncompleteReason> {
         use crate::compile_time::IncompleteReason;
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let result = (|| {
             let entries = context
                 .defines
@@ -304,7 +304,7 @@ impl ConditionalEnvironment {
             Self::try_from_context(context).ok_or(IncompleteReason::MalformedSource)
         })();
         if result.is_err() {
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
         }
         result
     }
@@ -355,7 +355,7 @@ impl ConditionalEnvironment {
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
     ) -> Result<Self, crate::compile_time::IncompleteReason> {
         // Admit both complete owners before any copied payload is constructed.
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let result = (|| {
             self.admit_scalar_snapshot(budget)?;
             let state = self
@@ -368,7 +368,7 @@ impl ConditionalEnvironment {
             Ok(snapshot)
         })();
         if result.is_err() {
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
         }
         result
     }

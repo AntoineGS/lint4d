@@ -834,6 +834,7 @@ mod cache_tests {
                     path: PathBuf::from("/ws/Provider.pas"),
                     bytes: raw.clone(),
                     decoded_text: Some(decoded.clone()),
+                    compile_time_backing: None,
                     revision: pascal_core::SourceRevision::Overlay {
                         version: 1,
                         content_hash: 2,

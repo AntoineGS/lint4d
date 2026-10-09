@@ -2464,6 +2464,7 @@ fn mid_load_cancellation_is_returned_as_a_typed_error() {
         path: PathBuf::from("/workspace/Main.pas"),
         bytes: Arc::from(&b""[..]),
         decoded_text: None,
+        compile_time_backing: None,
         revision: SourceRevision::Overlay {
             version: 1,
             content_hash: 0,
@@ -2756,6 +2757,50 @@ impl MemoryStore {
 }
 
 impl SourceStore for MemoryStore {
+    fn list_directory_admitted(
+        &mut self,
+        request: DirectoryRequest<'_>,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<pascal_core::compile_time::AdmittedOwned<DirectoryListing>, SourceStoreError> {
+        // Known, pre-existing fixture keys give a before-copy upper bound.
+        let payload = self
+            .sources
+            .keys()
+            .map(|p| p.len() + 2 * std::mem::size_of::<PathBuf>())
+            .sum::<usize>()
+            + 3 * request.directory.as_os_str().len();
+        budget
+            .admit_owned(1, payload, payload, || {
+                self.list_directory(request, cancel).unwrap()
+            })
+            .map_err(|_| SourceStoreError::AdmissionUnavailable)
+    }
+    fn overlay_candidates_admitted(
+        &self,
+        _roots: &[PathBuf],
+        _names: &[String],
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<pascal_core::compile_time::AdmittedOwned<Vec<PathBuf>>, SourceStoreError> {
+        budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|_| SourceStoreError::AdmissionUnavailable)
+    }
+    fn load_admitted(
+        &mut self,
+        request: SourceRequest<'_>,
+        budget: &mut pascal_core::compile_time::CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        let payload = self.sources.values().map(Vec::len).sum::<usize>()
+            + self.sources.keys().map(|p| p.len()).sum::<usize>()
+            + 4 * request.path.as_os_str().len()
+            + std::mem::size_of::<LoadedSource>();
+        LoadedSource::admit_construction(budget, payload, 2 * payload, || {
+            self.load(request, cancel)
+        })
+    }
     fn list_directory(
         &mut self,
         request: DirectoryRequest<'_>,
@@ -2799,6 +2844,7 @@ impl SourceStore for MemoryStore {
             path: request.path.to_path_buf(),
             bytes: Arc::<[u8]>::from(bytes),
             decoded_text: None,
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 0,

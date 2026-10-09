@@ -67,10 +67,10 @@ pub(crate) struct Declaration {
 pub(super) struct InterfaceFacts {
     pub qualifiers: Vec<String>,
     pub site: BindingSite,
-    pub graph: Option<std::sync::Arc<CompileTimeState>>,
+    pub graph: Option<super::session::AdmittedInterfaceGraph>,
     pub pending: PendingProvider,
     pub attempted: bool,
-    pub provided: Option<super::session::ProviderSource>,
+    pub provided: Option<super::session::AdmittedProviderSource>,
     pub failure: Option<UnknownReason>,
 }
 
@@ -135,6 +135,21 @@ impl InterfaceFacts {
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.visit_payload(visit, true)
+    }
+
+    pub(super) fn visit_snapshot_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.visit_payload(visit, false)
+    }
+
+    fn visit_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+        recovery: bool,
+    ) -> Result<(), String> {
         visit(size_of::<Self>() + self.qualifiers.len() * size_of::<String>())?;
         for qualifier in &self.qualifiers {
             visit(qualifier.len())?;
@@ -144,7 +159,7 @@ impl InterfaceFacts {
                 + self.pending.identity.opener.source.as_str().len()
                 + self.pending.importer_path.as_os_str().len(),
         )?;
-        if let Some(provider) = &self.provided {
+        if recovery && let Some(provider) = &self.provided {
             visit(
                 crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
                     + provider.unit.requested_name.len()
@@ -162,7 +177,7 @@ impl InterfaceFacts {
                 visit(size_of::<String>() + q.len())?;
             }
         }
-        if let Some(graph) = &self.graph {
+        if recovery && let Some(graph) = &self.graph {
             graph.visit_recovery_payload(visit)?;
         }
         Ok(())
@@ -227,7 +242,7 @@ pub(super) fn imported_declaration<'a>(
         if result.is_some() {
             return Ok(Fact::Unknown(UnknownReason::AmbiguousBinding));
         }
-        result = Some((graph.as_ref(), decl));
+        result = Some((&***graph, decl));
     }
     Ok(result.map_or(Fact::Unknown(UnknownReason::UnresolvedName), Fact::Known))
 }
@@ -299,7 +314,7 @@ pub(super) fn imported_operand_with_query(
         if result.is_some() {
             return Ok(Some(Fact::Unknown(UnknownReason::AmbiguousBinding)));
         }
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let fact = match parse_sizeof_operand(suffix, budget) {
             Fact::Known(operand) => budget.with_layout_query(|budget| {
                 Ok(graph.layout_operand_in_context(
@@ -320,8 +335,7 @@ pub(super) fn imported_operand_with_query(
         };
         budget.release(
             budget
-                .snapshot()
-                .retained_bytes
+                .manual_retained()
                 .saturating_sub(before)
                 .saturating_sub(keep),
         );
@@ -409,10 +423,10 @@ pub(super) fn attach_dependencies(
         }
         Ok(())
     }
-    let before = budget.snapshot().retained_bytes;
+    let before = budget.manual_retained();
     let result = visit(state, layout, 0, budget);
     if result.is_err() {
-        budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        budget.release(budget.manual_retained().saturating_sub(before));
     }
     result
 }

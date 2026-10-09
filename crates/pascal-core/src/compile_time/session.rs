@@ -10,16 +10,171 @@ use crate::{
     ResolutionOutcome, ResolvedUnit, ResolverError, UnitResolveRequest,
 };
 use pascal_project::ConditionalContext;
+use std::sync::Arc;
 use std::{mem::size_of, ops::Range};
+
+pub type AdmittedProviderSource = Arc<AdmittedShared<ProviderSource>>;
+pub type AdmittedSourceBacking = Arc<AdmittedShared<LoadedSource>>;
+pub type AdmittedInterfaceGraph = Arc<AdmittedShared<CompileTimeState>>;
 
 #[derive(Debug, Clone)]
 pub struct ProviderSource {
     pub unit: ResolvedUnit,
     pub context: ConditionalContext,
     pub authorized_qualifiers: Vec<String>,
+    backing: Option<AdmittedSourceBacking>,
+    metadata_credit: Option<Arc<AdmittedShared<()>>>,
+}
+
+impl ProviderSource {
+    pub fn new(
+        unit: ResolvedUnit,
+        context: ConditionalContext,
+        authorized_qualifiers: Vec<String>,
+    ) -> Self {
+        Self {
+            unit,
+            context,
+            authorized_qualifiers,
+            backing: None,
+            metadata_credit: None,
+        }
+    }
+
+    /// The plain compile-time compatibility return owns its newly constructed
+    /// context/qualifiers separately from shared source backing and cache data.
+    pub(crate) fn admit_metadata_build(
+        budget: &mut CompileTimeBudget<'_>,
+        bytes: usize,
+        payload: usize,
+        build: impl FnOnce() -> Self,
+    ) -> Result<Self, ResolverError> {
+        let credit = budget
+            .admit_owned(1, bytes, payload + size_of::<Self>(), || ())
+            .and_then(|v| v.into_shared(budget))
+            .and_then(|v| v.into_arc(budget))
+            .map_err(|r| resolver_error(r, budget))?;
+        let mut value = build();
+        value.metadata_credit = Some(credit);
+        Ok(value)
+    }
+
+    /// Admit a bounded pre-existing cache/input source before its root-local
+    /// metadata/Arc handle copy. This is not permission to read a legacy store
+    /// unboundedly and then call this method as a substitute for read admission.
+    pub fn admit_cached_backing(
+        source: &LoadedSource,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedSourceBacking, ResolverError> {
+        if let Some(backing) = &source.compile_time_backing {
+            if backing.is_admitted_by(budget) {
+                return Ok(backing.clone());
+            }
+            return Err(ResolverError::InvalidRequest(
+                "source backing belongs to another root".into(),
+            ));
+        }
+        let payload = crate::resolver::loaded_source_metadata_retained(source)
+            .checked_add(source.bytes.len())
+            .and_then(|n| n.checked_add(source.decoded_text.as_ref().map_or(0, |s| s.len())))
+            .ok_or_else(|| {
+                ResolverError::InvalidRequest("source backing admission overflow".into())
+            })?;
+        budget
+            .admit_owned(1, payload, payload, || source.clone())
+            .and_then(|value| value.into_shared(budget))
+            .and_then(|value| value.into_arc(budget))
+            .map_err(|r| resolver_error(r, budget))
+    }
+
+    pub fn admit_copy(
+        &self,
+        backing: &AdmittedSourceBacking,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedProviderSource, ResolverError> {
+        if !backing.is_admitted_by(budget)
+            || backing.id != self.unit.source.id
+            || backing.revision != self.unit.source.revision
+        {
+            return Err(ResolverError::InvalidRequest(
+                "provider source has no same-root backing admission".into(),
+            ));
+        }
+        let payload = provider_owned_payload(self)?;
+        budget
+            .admit_owned(1, payload, payload, || Self {
+                unit: self.unit.clone(),
+                context: self.context.clone(),
+                authorized_qualifiers: self.authorized_qualifiers.clone(),
+                backing: Some(backing.clone()),
+                metadata_credit: None,
+            })
+            .and_then(|value| value.into_shared(budget))
+            .and_then(|value| value.into_arc(budget))
+            .map_err(|r| resolver_error(r, budget))
+    }
+
+    fn valid_backing(&self, budget: &CompileTimeBudget<'_>) -> bool {
+        self.backing.as_ref().is_some_and(|s| {
+            s.is_admitted_by(budget)
+                && s.id == self.unit.source.id
+                && s.revision == self.unit.source.revision
+        })
+    }
+}
+
+fn provider_owned_payload(provider: &ProviderSource) -> Result<usize, ResolverError> {
+    let mut bytes = crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
+        + provider.unit.requested_name.len()
+        + provider.unit.declared_name.len()
+        + provider.authorized_qualifiers.len() * size_of::<String>();
+    provider
+        .context
+        .visit_recovery_payload(&mut |n| {
+            bytes = bytes.checked_add(n).ok_or("provider context overflow")?;
+            Ok(())
+        })
+        .map_err(ResolverError::InvalidRequest)?;
+    bytes = bytes
+        .checked_add(
+            (provider.context.defines.len()
+                + provider.context.options.len()
+                + provider.context.constants.len())
+                * (size_of::<(String, ConstantValue)>() + 4 * size_of::<usize>()),
+        )
+        .ok_or_else(|| {
+            ResolverError::InvalidRequest("provider context metadata overflow".into())
+        })?;
+    for q in &provider.authorized_qualifiers {
+        bytes = bytes
+            .checked_add(q.len())
+            .ok_or_else(|| ResolverError::InvalidRequest("provider qualifier overflow".into()))?;
+    }
+    Ok(bytes)
 }
 
 pub trait CompileTimeResolver {
+    /// Compile-time capability entrypoint. Never delegates to an unbounded legacy
+    /// callback. Adapters without this capability fail closed; legacy lookup
+    /// remains available for non-admitted callers until its store bridge exists.
+    fn unit_capability(
+        &mut self,
+        _request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<ResolutionOutcome<AdmittedProviderSource>, ResolverError> {
+        let reason = "no admitted provider capability";
+        budget
+            .charge(1, reason.len(), reason.len())
+            .map_err(|r| resolver_error(r, budget))?;
+        Ok(ResolutionOutcome {
+            result: Resolution::Unavailable {
+                reason: reason.into(),
+            },
+            observations: vec![],
+            warnings: vec![],
+        })
+    }
     fn max_include_depth(&self) -> usize {
         64
     }
@@ -82,18 +237,33 @@ pub struct VerifiedUnitHeader {
 }
 
 #[derive(Debug)]
-pub struct CompileTimeAnalysis {
+pub struct CompileTimeOutput {
     pub root: ConditionalAnalysis,
     pub occurrences: Vec<OccurrenceAnalysis>,
     pub includes: Vec<IncludeOccurrence>,
-    pub facts: CompileTimeState,
+    pub facts: AdmittedShared<CompileTimeState>,
     pub header: Fact<VerifiedUnitHeader>,
     pub reasons: Vec<IncompleteReason>,
     pub observations: Vec<ResolutionObservation>,
     pub warnings: Vec<String>,
     pub directive_fragments: Vec<DirectiveFragments>,
     /// Admitted session storage and cumulative work (not allocator telemetry).
-    pub budget: BudgetSnapshot,
+    pub budget: Arc<AdmittedShared<()>>,
+}
+
+pub type CompileTimeAnalysis = AdmittedOwned<CompileTimeOutput>;
+
+#[derive(Debug)]
+struct SessionOutput {
+    root: ConditionalAnalysis,
+    occurrences: Vec<OccurrenceAnalysis>,
+    includes: Vec<IncludeOccurrence>,
+    facts: CompileTimeState,
+    header: Fact<VerifiedUnitHeader>,
+    reasons: Vec<IncompleteReason>,
+    observations: AdmittedOwned<Vec<ResolutionObservation>>,
+    warnings: AdmittedOwned<Vec<String>>,
+    directive_fragments: Vec<DirectiveFragments>,
 }
 
 /// Analyze one root with the shared conditional interpreter and lexical binder.
@@ -119,31 +289,140 @@ pub(crate) fn analyze_source_in_session(
     budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
-    analyze_source_with_providers(
+    let mut providers = ProviderSession::new(budget)?;
+    let analysis = analyze_source_with_providers(
         root,
         context,
         resolver,
         budget,
         cancel,
-        &mut ProviderSession {
-            active: Vec::new(),
-            queries: 0,
-            next_occurrence: 1,
-            declarations: Vec::new(),
-        },
+        &mut providers,
         false,
         OccurrenceId(0),
-    )
+    )?;
+    publish_analysis(&analysis, budget)
 }
 
 struct ProviderSession {
-    active: Vec<ProviderKey>,
+    active: AdmittedOwned<Vec<AdmittedOwned<ProviderKey>>>,
     queries: usize,
     next_occurrence: u64,
-    declarations: Vec<DefinitionKey>,
+    declarations: AdmittedOwned<Vec<AdmittedOwned<DefinitionKey>>>,
 }
 
-#[derive(PartialEq, Eq)]
+impl ProviderSession {
+    fn new(budget: &mut CompileTimeBudget<'_>) -> Result<Self, ResolverError> {
+        let active = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
+        let declarations = budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?;
+        Ok(Self {
+            active,
+            declarations,
+            queries: 0,
+            next_occurrence: 1,
+        })
+    }
+}
+
+fn publish_analysis(
+    analysis: &SessionOutput,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<CompileTimeAnalysis, ResolverError> {
+    let facts = analysis
+        .facts
+        .admitted_snapshot(budget)
+        .map_err(|r| resolver_error(r, budget))?;
+    let view = budget
+        .admit_owned(0, 0, 0, || ())
+        .and_then(|v| v.into_shared(budget))
+        .and_then(|v| v.into_arc(budget))
+        .map_err(|r| resolver_error(r, budget))?;
+    let mut payload = conditional_output_payload(&analysis.root)?;
+    for o in &analysis.occurrences {
+        payload = payload
+            .checked_add(
+                size_of::<OccurrenceAnalysis>()
+                    + crate::resolver::loaded_source_metadata_retained(&o.source)
+                    + conditional_output_payload(&o.analysis)?,
+            )
+            .ok_or_else(|| ResolverError::InvalidRequest("occurrence output overflow".into()))?;
+    }
+    for i in &analysis.includes {
+        payload = payload
+            .checked_add(
+                size_of::<IncludeOccurrence>()
+                    + i.directive.source.as_str().len()
+                    + i.fragments.len() * size_of::<SourceAnchor>(),
+            )
+            .ok_or_else(|| ResolverError::InvalidRequest("include output overflow".into()))?;
+        for f in &i.fragments {
+            payload += f.source.as_str().len();
+        }
+        match &i.target {
+            Resolution::Found(s) => payload += crate::resolver::loaded_source_metadata_retained(s),
+            Resolution::Unavailable { reason } => payload += reason.len(),
+            Resolution::Ambiguous { candidates } | Resolution::Incomplete { candidates, .. } => {
+                for c in candidates {
+                    payload += size_of::<crate::ResolutionCandidate>()
+                        + c.path.as_os_str().len()
+                        + c.declared_name.as_ref().map_or(0, String::len);
+                }
+            }
+        }
+    }
+    payload += analysis.reasons.len() * size_of::<IncompleteReason>();
+    for r in &analysis.reasons {
+        if let IncompleteReason::RequiredSource { source, reason } = r {
+            payload += source.as_str().len() + reason.len();
+        }
+    }
+    for d in &analysis.directive_fragments {
+        payload += size_of::<DirectiveFragments>()
+            + d.directive.body.len()
+            + (d.fragments.len() + d.body_fragments.len()) * size_of::<SourceAnchor>();
+        for a in d.fragments.iter().chain(&d.body_fragments) {
+            payload += a.source.as_str().len();
+        }
+    }
+    for o in analysis.observations.iter() {
+        payload += observation_payload(o)?;
+    }
+    for w in analysis.warnings.iter() {
+        payload += size_of::<String>() + w.len();
+    }
+    budget
+        .admit_owned(1, payload, payload, || CompileTimeOutput {
+            root: analysis.root.clone(),
+            occurrences: analysis.occurrences.clone(),
+            includes: analysis.includes.clone(),
+            facts,
+            header: analysis.header.clone(),
+            reasons: analysis.reasons.clone(),
+            observations: analysis.observations.to_vec(),
+            warnings: analysis.warnings.to_vec(),
+            directive_fragments: analysis.directive_fragments.clone(),
+            budget: view,
+        })
+        .map_err(|r| resolver_error(r, budget))
+}
+
+fn conditional_output_payload(a: &ConditionalAnalysis) -> Result<usize, ResolverError> {
+    let mut payload = size_of::<ConditionalAnalysis>()
+        + a.projected_source.len()
+        + (a.inactive_spans.len() + a.unknown_spans.len()) * size_of::<Range<usize>>()
+        + a.directives.len() * size_of::<ConditionalDirective>();
+    for d in &a.directives {
+        payload = payload
+            .checked_add(d.body.len())
+            .ok_or_else(|| ResolverError::InvalidRequest("conditional output overflow".into()))?;
+    }
+    Ok(payload)
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct ProviderKey {
     source: crate::SourceId,
     revision: crate::SourceRevision,
@@ -151,7 +430,51 @@ struct ProviderKey {
     qualifiers: Vec<String>,
 }
 
+fn push_owner<T>(
+    owners: &mut AdmittedOwned<Vec<AdmittedOwned<T>>>,
+    owner: AdmittedOwned<T>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    owners
+        .with_budget_mut(budget, |v, budget| {
+            if v.len() == v.capacity() {
+                budget
+                    .charge(1, 0, size_of::<AdmittedOwned<T>>())
+                    .map_err(|r| resolver_error(r, budget))?;
+                v.reserve_exact(1);
+            }
+            v.push(owner);
+            Ok(())
+        })
+        .map_err(|r| resolver_error(r, budget))?
+}
+
 fn analyze_source_with_providers(
+    root: &LoadedSource,
+    context: &ConditionalContext,
+    resolver: &mut dyn CompileTimeResolver,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+    providers: &mut ProviderSession,
+    interface_only: bool,
+    root_occurrence: OccurrenceId,
+) -> Result<AdmittedOwned<SessionOutput>, ResolverError> {
+    budget.admit_compilation(|budget| {
+        analyze_source_with_providers_inner(
+            root,
+            context,
+            resolver,
+            budget,
+            cancel,
+            providers,
+            interface_only,
+            root_occurrence,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_source_with_providers_inner(
     root: &LoadedSource,
     context: &ConditionalContext,
     resolver: &mut dyn CompileTimeResolver,
@@ -160,7 +483,7 @@ fn analyze_source_with_providers(
     providers: &mut ProviderSession,
     interface_only: bool,
     root_occurrence: OccurrenceId,
-) -> Result<CompileTimeAnalysis, ResolverError> {
+) -> Result<SessionOutput, ResolverError> {
     let limits = budget.limits();
     let bytes = root.analysis_bytes();
     let metadata = crate::resolver::loaded_source_metadata_retained(root);
@@ -256,8 +579,12 @@ fn analyze_source_with_providers(
         occurrence: root_occurrence,
         active_sources: vec![root.id.clone()],
         occurrences: Vec::new(),
-        observations: Vec::new(),
-        warnings: Vec::new(),
+        observations: budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?,
+        warnings: budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?,
         scanner: conditional::DirectiveScanner::default(),
         resource_error: None,
         directive_count: 0,
@@ -432,7 +759,7 @@ fn analyze_source_with_providers(
     if cancel.is_cancelled() {
         return Err(ResolverError::Cancelled);
     }
-    Ok(CompileTimeAnalysis {
+    Ok(SessionOutput {
         root: analysis,
         occurrences: {
             session.occurrences.insert(0, occurrence);
@@ -445,7 +772,6 @@ fn analyze_source_with_providers(
         observations: session.observations,
         warnings: session.warnings,
         directive_fragments: session.directive_fragments,
-        budget: session.budget.snapshot(),
     })
 }
 
@@ -453,12 +779,17 @@ fn admit_observation(
     observation: &ResolutionObservation,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<(), ResolverError> {
-    let mut failure = None;
+    let n = observation_payload(observation)?;
+    budget
+        .charge(1, n, n)
+        .map_err(|r| resolver_error(r, budget))
+}
+
+fn observation_payload(observation: &ResolutionObservation) -> Result<usize, ResolverError> {
+    let mut total = size_of::<ResolutionObservation>();
     let mut visit = |n| {
-        budget.charge(1, n, n).map_err(|r| {
-            failure = Some(r);
-            "observation admission".into()
-        })
+        total = total.checked_add(n).ok_or("observation payload overflow")?;
+        Ok(())
     };
     let result = match observation {
         ResolutionObservation::Directory { path, entry, .. } => {
@@ -473,8 +804,21 @@ fn admit_observation(
                 }
             }),
         ResolutionObservation::Payload {
-            source_id, path, ..
-        } => visit(source_id.as_str().len()).and_then(|_| visit(path.as_os_str().len())),
+            source_id,
+            path,
+            revision,
+        } => visit(source_id.as_str().len())
+            .and_then(|_| visit(path.as_os_str().len()))
+            .and_then(|_| match revision {
+                crate::SourceRevision::Disk {
+                    read_policy,
+                    path_entry,
+                    ..
+                } => read_policy
+                    .visit_owned_clone_payload(&mut visit)
+                    .and_then(|_| path_entry.visit_recovery_payload(&mut visit)),
+                _ => Ok(()),
+            }),
         ResolutionObservation::Metadata(observation) => {
             observation.visit_recovery_payload(&mut visit)
         }
@@ -482,7 +826,53 @@ fn admit_observation(
             observation.visit_recovery_payload(&mut visit)
         }
     };
-    result.map_err(|_| resolver_error(failure.unwrap_or(IncompleteReason::MalformedSource), budget))
+    result.map_err(ResolverError::InvalidRequest)?;
+    Ok(total)
+}
+
+fn append_observations(
+    target: &mut AdmittedOwned<Vec<ResolutionObservation>>,
+    incoming: &[ResolutionObservation],
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    let mut payload = 0usize;
+    for o in incoming {
+        payload = payload
+            .checked_add(observation_payload(o)?)
+            .ok_or_else(|| ResolverError::InvalidRequest("observation vector overflow".into()))?;
+    }
+    target
+        .with_budget_mut(budget, |v, budget| {
+            let growth = (v.len() + incoming.len()).saturating_sub(v.capacity())
+                * size_of::<ResolutionObservation>();
+            budget
+                .charge(incoming.len(), payload, payload + growth)
+                .map_err(|r| resolver_error(r, budget))?;
+            v.reserve_exact(incoming.len());
+            v.extend_from_slice(incoming);
+            Ok(())
+        })
+        .map_err(|r| resolver_error(r, budget))?
+}
+
+fn append_warnings(
+    target: &mut AdmittedOwned<Vec<String>>,
+    incoming: &[String],
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    let payload = incoming.iter().map(String::len).sum::<usize>();
+    target
+        .with_budget_mut(budget, |v, budget| {
+            let growth =
+                (v.len() + incoming.len()).saturating_sub(v.capacity()) * size_of::<String>();
+            budget
+                .charge(incoming.len(), payload, payload + growth)
+                .map_err(|r| resolver_error(r, budget))?;
+            v.reserve_exact(incoming.len());
+            v.extend_from_slice(incoming);
+            Ok(())
+        })
+        .map_err(|r| resolver_error(r, budget))?
 }
 
 pub(crate) fn resolver_error(
@@ -514,8 +904,8 @@ struct RootSession<'a, 'b> {
     occurrence: OccurrenceId,
     active_sources: Vec<crate::SourceId>,
     occurrences: Vec<OccurrenceAnalysis>,
-    observations: Vec<ResolutionObservation>,
-    warnings: Vec<String>,
+    observations: AdmittedOwned<Vec<ResolutionObservation>>,
+    warnings: AdmittedOwned<Vec<String>>,
     scanner: conditional::DirectiveScanner,
     resource_error: Option<ResolverError>,
     directive_count: usize,
@@ -549,8 +939,8 @@ struct ProviderEngine<'a, 'b> {
     providers: &'a mut ProviderSession,
     cancel: &'a dyn CancellationToken,
     budget: &'a mut CompileTimeBudget<'b>,
-    observations: &'a mut Vec<ResolutionObservation>,
-    warnings: &'a mut Vec<String>,
+    observations: &'a mut AdmittedOwned<Vec<ResolutionObservation>>,
+    warnings: &'a mut AdmittedOwned<Vec<String>>,
 }
 
 fn admit_provider_context(
@@ -596,13 +986,13 @@ impl ProviderEngine<'_, '_> {
         match query {
             ExpressionQuery::Defined(..) => Ok(()),
             ExpressionQuery::SizeOf { argument, .. } => {
-                let before = self.budget.snapshot().retained_bytes;
+                let before = self.budget.manual_retained();
                 match parse_sizeof_operand(argument, self.budget) {
                     Fact::Known(operand) => {
                         let leading = operand
                             .leading_name(self.budget)
                             .map_err(|r| resolver_error(r, self.budget));
-                        let scratch = self.budget.snapshot().retained_bytes.saturating_sub(before);
+                        let scratch = self.budget.manual_retained().saturating_sub(before);
                         let result = match &leading {
                             Ok((name, pointers)) => {
                                 self.prepare_name(state, site, name, *pointers, depth + 1)
@@ -676,25 +1066,29 @@ impl ProviderEngine<'_, '_> {
                     0,
                 )
                 .map_err(|r| resolver_error(r, self.budget))?;
-            if self.providers.declarations.contains(&decl.key) {
+            if self
+                .providers
+                .declarations
+                .iter()
+                .any(|key| **key == decl.key)
+            {
                 return Ok(());
             }
             let key_payload = decl.key.anchor.source.as_str().len();
-            self.budget
-                .charge(1, key_payload, key_payload + size_of::<DefinitionKey>())
+            let key = self
+                .budget
+                .admit_owned(1, key_payload, key_payload, || decl.key.clone())
                 .map_err(|r| resolver_error(r, self.budget))?;
-            self.providers.declarations.reserve_exact(1);
-            self.providers.declarations.push(decl.key.clone());
+            push_owner(&mut self.providers.declarations, key, self.budget)?;
             // Retain the original captured sites while mutating only the live
             // graph's lazy capabilities. Copying a snapshot is not syntax work.
-            let snapshot_before = self.budget.snapshot().retained_bytes;
+            let snapshot_before = self.budget.manual_retained();
             let copy = state
                 .snapshot(self.budget)
                 .map_err(|r| resolver_error(r, self.budget));
             let snapshot_bytes = self
                 .budget
-                .snapshot()
-                .retained_bytes
+                .manual_retained()
                 .saturating_sub(snapshot_before);
             let result = copy.and_then(|copy| {
                 let binding = super::bindings::lookup(&copy, site, name, self.budget)
@@ -723,8 +1117,7 @@ impl ProviderEngine<'_, '_> {
                 self.prepare_type(state, &decl.type_site, &decl.ty, pointers, depth + 1)
             });
             self.budget.release(snapshot_bytes);
-            self.providers.declarations.pop();
-            self.budget.release(key_payload);
+            self.providers.declarations.value_mut().pop();
             return result;
         }
         for index in 0..state.interfaces.len() {
@@ -745,7 +1138,7 @@ impl ProviderEngine<'_, '_> {
                 .map_err(|r| resolver_error(r, self.budget))?;
                 self.providers.queries += 1;
                 let pending = &state.interfaces[index].pending;
-                let outcome = self.resolver.unit(
+                let outcome = self.resolver.unit_capability(
                     UnitResolveRequest {
                         requested_name: &pending.identity.name,
                         importer_path: &pending.importer_path,
@@ -754,29 +1147,18 @@ impl ProviderEngine<'_, '_> {
                     self.budget,
                     self.cancel,
                 )?;
-                self.budget
-                    .charge(
-                        outcome.observations.len() + outcome.warnings.len(),
-                        0,
-                        outcome.observations.len() * size_of::<ResolutionObservation>()
-                            + outcome.warnings.len() * size_of::<String>(),
-                    )
-                    .map_err(|r| resolver_error(r, self.budget))?;
-                for o in &outcome.observations {
-                    admit_observation(o, self.budget)?;
-                }
-                for w in &outcome.warnings {
-                    self.budget
-                        .charge(1, w.len(), w.len())
-                        .map_err(|r| resolver_error(r, self.budget))?;
-                }
-                self.observations.reserve_exact(outcome.observations.len());
-                self.warnings.reserve_exact(outcome.warnings.len());
-                self.observations.extend(outcome.observations);
-                self.warnings.extend(outcome.warnings);
+                append_observations(self.observations, &outcome.observations, self.budget)?;
+                append_warnings(self.warnings, &outcome.warnings, self.budget)?;
                 state.interfaces[index].attempted = true;
                 match outcome.result {
                     Resolution::Found(provider) => {
+                        if !provider.is_admitted_by(self.budget)
+                            || !provider.valid_backing(self.budget)
+                        {
+                            return Err(ResolverError::InvalidRequest(
+                                "unadmitted provider capability".into(),
+                            ));
+                        }
                         let n = provider
                             .authorized_qualifiers
                             .iter()
@@ -852,15 +1234,20 @@ impl ProviderEngine<'_, '_> {
             } else if let Some(graph) = &state.interfaces[index].graph {
                 // Copy only through the existing admitted snapshot API; no
                 // interior mutability or name-only memo is introduced.
+                let scratch = self.budget.manual_retained();
                 let mut copy = graph
                     .snapshot(self.budget)
                     .map_err(|r| resolver_error(r, self.budget))?;
                 let captured = copy.site();
                 self.prepare_name(&mut copy, &captured, suffix, pointers, depth + 1)?;
-                self.budget
-                    .charge(1, 0, 2 * size_of::<usize>())
+                let graph = copy
+                    .admitted_snapshot(self.budget)
+                    .and_then(|v| v.into_arc(self.budget))
                     .map_err(|r| resolver_error(r, self.budget))?;
-                state.interfaces[index].graph = Some(std::sync::Arc::new(copy));
+                drop(copy);
+                self.budget
+                    .release(self.budget.manual_retained().saturating_sub(scratch));
+                state.interfaces[index].graph = Some(graph);
             }
         }
         Ok(())
@@ -873,7 +1260,7 @@ impl ProviderEngine<'_, '_> {
         text: &str,
         depth: usize,
     ) -> Result<(), ResolverError> {
-        let before = self.budget.snapshot().retained_bytes;
+        let before = self.budget.manual_retained();
         let environment = if let Some((_, environment)) = state
             .scalar_history
             .iter()
@@ -885,7 +1272,7 @@ impl ProviderEngine<'_, '_> {
             ConditionalEnvironment::context_snapshot(&state.context, self.budget)
         }
         .map_err(|r| resolver_error(r, self.budget))?;
-        let environment_bytes = self.budget.snapshot().retained_bytes.saturating_sub(before);
+        let environment_bytes = self.budget.manual_retained().saturating_sub(before);
         let resolver = &mut *self.resolver;
         let providers = &mut *self.providers;
         let observations = &mut *self.observations;
@@ -1004,15 +1391,15 @@ impl ProviderEngine<'_, '_> {
 
     fn compile_provider_interface(
         &mut self,
-        provider: ProviderSource,
+        provider: AdmittedProviderSource,
         name: &str,
         pointers: bool,
         depth: usize,
-    ) -> Result<Fact<std::sync::Arc<CompileTimeState>>, ResolverError> {
+    ) -> Result<Fact<AdmittedInterfaceGraph>, ResolverError> {
         self.budget
             .charge(self.providers.active.len() + 1, 0, 0)
             .map_err(|r| resolver_error(r, self.budget))?;
-        for key in &self.providers.active {
+        for key in self.providers.active.iter() {
             admit_provider_context(&provider.context, self.budget, false)?;
             admit_provider_context(&key.context, self.budget, false)?;
             let n = crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
@@ -1064,33 +1451,23 @@ impl ProviderEngine<'_, '_> {
             "max_type_depth",
         )
         .map_err(|r| resolver_error(r, self.budget))?;
-        let before = self.budget.snapshot().retained_bytes;
-        let metadata = size_of::<ProviderKey>()
-            + crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
-            + provider.unit.source.id.as_str().len()
-            + provider
-                .authorized_qualifiers
-                .iter()
-                .map(|q| size_of::<String>() + q.len())
-                .sum::<usize>();
-        self.budget
-            .charge(1, metadata, metadata)
-            .map_err(|r| resolver_error(r, self.budget))?;
-        admit_provider_context(&provider.context, self.budget, true)?;
+        let metadata = provider_owned_payload(&provider)?;
         let occurrence = OccurrenceId(self.providers.next_occurrence);
         self.providers.next_occurrence = self
             .providers
             .next_occurrence
             .checked_add(1)
             .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
-        self.providers.active.reserve_exact(1);
-        self.providers.active.push(ProviderKey {
-            source: provider.unit.source.id.clone(),
-            revision: provider.unit.source.revision.clone(),
-            context: provider.context.clone(),
-            qualifiers: provider.authorized_qualifiers.clone(),
-        });
-        let key_bytes = self.budget.snapshot().retained_bytes.saturating_sub(before);
+        let key = self
+            .budget
+            .admit_owned(1, metadata, metadata, || ProviderKey {
+                source: provider.unit.source.id.clone(),
+                revision: provider.unit.source.revision.clone(),
+                context: provider.context.clone(),
+                qualifiers: provider.authorized_qualifiers.clone(),
+            })
+            .map_err(|r| resolver_error(r, self.budget))?;
+        push_owner(&mut self.providers.active, key, self.budget)?;
         let result = analyze_source_with_providers(
             &provider.unit.source,
             &provider.context,
@@ -1110,17 +1487,27 @@ impl ProviderEngine<'_, '_> {
             }) {
                 return Err(resolver_error(reason.clone(), self.budget));
             }
-            let site = analysis.facts.site();
-            self.prepare_name(&mut analysis.facts, &site, name, pointers, depth + 1)?;
+            let result = analysis
+                .with_budget_mut(self.budget, |analysis, budget| {
+                    let site = analysis.facts.site();
+                    let mut engine = ProviderEngine {
+                        resolver: self.resolver,
+                        providers: self.providers,
+                        cancel: self.cancel,
+                        budget,
+                        observations: self.observations,
+                        warnings: self.warnings,
+                    };
+                    engine.prepare_name(&mut analysis.facts, &site, name, pointers, depth + 1)
+                })
+                .map_err(|r| resolver_error(r, self.budget))?;
+            result?;
             Ok(analysis)
         });
-        self.providers.active.pop();
-        // The popped key's payload is dropped; its vector slot remains live.
-        self.budget
-            .release(key_bytes.saturating_sub(size_of::<ProviderKey>()));
+        self.providers.active.value_mut().pop();
         let mut analysis = result?;
-        self.observations.extend(analysis.observations);
-        self.warnings.extend(analysis.warnings);
+        append_observations(self.observations, &analysis.observations, self.budget)?;
+        append_warnings(self.warnings, &analysis.warnings, self.budget)?;
         if !analysis.facts.interface_complete {
             return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
         }
@@ -1131,12 +1518,38 @@ impl ProviderEngine<'_, '_> {
                 analysis.occurrences.len() * size_of::<LoadedSource>(),
             )
             .map_err(|r| resolver_error(r, self.budget))?;
-        analysis.facts.provider_sources =
-            analysis.occurrences.into_iter().map(|o| o.source).collect();
-        self.budget
-            .charge(1, 0, size_of::<CompileTimeState>() + 2 * size_of::<usize>())
+        analysis
+            .with_budget_mut(self.budget, |analysis, budget| {
+                let metadata = analysis
+                    .occurrences
+                    .iter()
+                    .map(|o| crate::resolver::loaded_source_metadata_retained(&o.source))
+                    .sum::<usize>();
+                budget
+                    .charge(1, metadata, metadata + size_of::<AdmittedSourceBacking>())
+                    .map_err(|r| resolver_error(r, budget))?;
+                analysis.facts.provider_sources = analysis
+                    .occurrences
+                    .iter()
+                    .map(|o| o.source.clone())
+                    .collect();
+                analysis.facts.provider_backings.push(
+                    provider
+                        .backing
+                        .as_ref()
+                        .expect("validated provider backing")
+                        .clone(),
+                );
+                Ok(())
+            })
+            .map_err(|r| resolver_error(r, self.budget))??;
+        let graph = analysis
+            .facts
+            .admitted_snapshot(self.budget)
+            .and_then(|v| v.into_arc(self.budget))
             .map_err(|r| resolver_error(r, self.budget))?;
-        Ok(Fact::Known(std::sync::Arc::new(analysis.facts)))
+        drop(analysis);
+        Ok(Fact::Known(graph))
     }
 }
 
@@ -1280,8 +1693,8 @@ impl RootSession<'_, '_> {
                 .charge(1, warning.len(), warning.len())
                 .map_err(|r| resolver_error(r, &self.budget))?;
         }
-        self.observations.extend(observations);
-        self.warnings.extend(warnings);
+        append_observations(&mut self.observations, &observations, self.budget)?;
+        append_warnings(&mut self.warnings, &warnings, self.budget)?;
         match &result {
             Resolution::Found(source) => {
                 self.budget
@@ -1620,12 +2033,12 @@ impl ReachablePath {
     }
     fn snapshot(&self, budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
         // The environment owns the complete typed continuation, not a context projection.
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         budget.charge(1, 0, size_of::<Self>())?;
         match self.environment.snapshot_typed(budget) {
             Ok(environment) => Ok(Self { environment }),
             Err(reason) => {
-                budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+                budget.release(budget.manual_retained().saturating_sub(before));
                 Err(reason)
             }
         }
@@ -1640,8 +2053,8 @@ fn evaluate_path_condition(
     resolver: &mut dyn CompileTimeResolver,
     providers: &mut ProviderSession,
     cancel: &dyn CancellationToken,
-    observations: &mut Vec<ResolutionObservation>,
-    warnings: &mut Vec<String>,
+    observations: &mut AdmittedOwned<Vec<ResolutionObservation>>,
+    warnings: &mut AdmittedOwned<Vec<String>>,
     resource_error: &mut Option<ResolverError>,
 ) -> Result<Truth, IncompleteReason> {
     let mut state = path.environment.typed_state.take().expect("typed path");
@@ -1653,7 +2066,7 @@ fn evaluate_path_condition(
         budget,
         &mut |query, budget| {
             if let ExpressionQuery::SizeOf { argument, range } = &query {
-                let before = budget.snapshot().retained_bytes;
+                let before = budget.manual_retained();
                 let mapped = (|| {
                     let expression = conditional::condition_expression(&directive.body)
                         .ok_or(IncompleteReason::MalformedSource)?;
@@ -1677,7 +2090,7 @@ fn evaluate_path_condition(
                     }
                     Ok(())
                 })();
-                budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+                budget.release(budget.manual_retained().saturating_sub(before));
                 mapped?;
             }
             let mut engine = ProviderEngine {
@@ -2188,6 +2601,7 @@ mod tests {
             path: "/fixture/snapshot.pas".into(),
             bytes: text.as_bytes().into(),
             decoded_text: Some(text.into()),
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 1,
@@ -2324,6 +2738,7 @@ mod tests {
                 path: "/fixture/physical.pas".into(),
                 bytes: text.as_bytes().into(),
                 decoded_text: Some(text.clone().into()),
+                compile_time_backing: None,
                 revision: SourceRevision::Overlay {
                     version: 1,
                     content_hash: 1,
@@ -2378,6 +2793,7 @@ mod tests {
             path: "/fixture/fragments.pas".into(),
             bytes: text.as_bytes().into(),
             decoded_text: Some(text.into()),
+            compile_time_backing: None,
             revision: SourceRevision::Overlay {
                 version: 1,
                 content_hash: 1,
@@ -2475,7 +2891,7 @@ pub(super) fn sizeof_value(
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
     budget.with_layout_query(|budget| {
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let result = match parse_sizeof_operand(argument, budget) {
             Fact::Known(operand) => {
                 match state.layout_operand_single(site.clone(), &operand, budget) {
@@ -2491,7 +2907,7 @@ pub(super) fn sizeof_value(
         };
         // Operand strings/selectors and returned layout identities are scratch;
         // only a scalar integer can survive this bridge.
-        budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        budget.release(budget.manual_retained().saturating_sub(before));
         result
     })
 }

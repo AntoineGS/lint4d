@@ -44,7 +44,7 @@ enum Selector {
 }
 
 pub fn parse_sizeof_operand(text: &str, budget: &mut CompileTimeBudget<'_>) -> Fact<SizeOfOperand> {
-    let before = budget.snapshot().retained_bytes;
+    let before = budget.manual_retained();
     let result = (|| {
         limit(text.len(), 4096, "max_expression_bytes")?;
         // Reserve all span/vector/string payload before constructing syntax.
@@ -152,7 +152,7 @@ pub fn parse_sizeof_operand(text: &str, budget: &mut CompileTimeBudget<'_>) -> F
         }))
     })();
     if !matches!(result, Ok(Fact::Known(_))) {
-        budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        budget.release(budget.manual_retained().saturating_sub(before));
     }
     result.unwrap_or_else(Fact::Incomplete)
 }
@@ -218,13 +218,13 @@ impl CompileTimeState {
         budget: &mut CompileTimeBudget<'_>,
     ) -> Fact<u64> {
         self.fact_all_paths(site, budget, &mut |state, site, budget| {
-            let before = budget.snapshot().retained_bytes;
+            let before = budget.manual_retained();
             let fact = match state.layout_operand_single(site, operand, budget) {
                 Fact::Known(layout) => Fact::Known(layout.storage.size),
                 Fact::Unknown(reason) => Fact::Unknown(reason),
                 Fact::Incomplete(reason) => Fact::Incomplete(reason),
             };
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
             fact
         })
     }
@@ -257,7 +257,7 @@ impl CompileTimeState {
         query_site: &BindingSite,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Fact<KnownLayout> {
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let result = (|| {
             budget.charge(1, 0, 0)?;
             if let Some(reason) = &self.failure {
@@ -408,8 +408,7 @@ impl CompileTimeState {
         };
         budget.release(
             budget
-                .snapshot()
-                .retained_bytes
+                .manual_retained()
                 .saturating_sub(before)
                 .saturating_sub(keep),
         );
@@ -538,7 +537,7 @@ impl<'a> BoundType<'a> {
         mut self,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Fact<Self>, IncompleteReason> {
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let result = (|| {
             let mut visited: Vec<&DefinitionKey> = Vec::new();
             let mut depth = 0usize;
@@ -592,7 +591,7 @@ impl<'a> BoundType<'a> {
                     .ok_or(IncompleteReason::MalformedSource)?;
             }
         })();
-        budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        budget.release(budget.manual_retained().saturating_sub(before));
         result
     }
 }

@@ -92,6 +92,7 @@ pub struct CompileTimeState {
     pub(super) interface_only: bool,
     pub(super) interface_complete: bool,
     pub(super) provider_sources: Vec<LoadedSource>,
+    pub(super) provider_backings: Vec<super::session::AdmittedSourceBacking>,
     in_interface: bool,
 }
 
@@ -129,12 +130,12 @@ impl CompileTimeState {
         root: &LoadedSource,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Self, IncompleteReason> {
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let result = Self::new_inner(context, root, budget);
         if result.is_err() {
             // Admission above the previous owner's live payload is not an
             // allocation until the whole context has been admitted.
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
         }
         result
     }
@@ -213,6 +214,7 @@ impl CompileTimeState {
             interface_only: false,
             interface_complete: false,
             provider_sources: Vec::new(),
+            provider_backings: Vec::new(),
             in_interface: false,
         })
     }
@@ -1140,10 +1142,10 @@ impl CompileTimeState {
         if self.alternatives.is_empty() {
             return query(self, site, budget);
         }
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let mut result = query(self, site.clone(), budget);
         if let Err(reason) = budget.charge(self.spans.len(), 0, 0) {
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
             return Fact::Incomplete(reason);
         }
         let anchor = self
@@ -1153,7 +1155,7 @@ impl CompileTimeState {
             .find(|span| span.site == site)
             .map(|span| &span.anchor);
         for alternative in &self.alternatives {
-            let scratch = budget.snapshot().retained_bytes;
+            let scratch = budget.manual_retained();
             if let Err(reason) = budget.charge(alternative.spans.len() + 1, 0, 0) {
                 result = Fact::Incomplete(reason);
                 break;
@@ -1175,10 +1177,10 @@ impl CompileTimeState {
                 ) => result,
                 _ => Fact::Unknown(UnknownReason::AmbiguousBinding),
             };
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(scratch));
+            budget.release(budget.manual_retained().saturating_sub(scratch));
         }
         if !matches!(result, Fact::Known(_)) {
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
         }
         result
     }
@@ -1280,7 +1282,30 @@ impl CompileTimeState {
         &self,
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.visit_payload(visit, true)
+    }
+
+    pub(crate) fn visit_snapshot_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.visit_payload(visit, false)
+    }
+
+    fn visit_payload(
+        &self,
+        visit: &mut dyn FnMut(usize) -> Result<(), String>,
+        recovery: bool,
+    ) -> Result<(), String> {
         visit(size_of::<Self>())?;
+        visit(self.provider_backings.len() * size_of::<super::session::AdmittedSourceBacking>())?;
+        if recovery {
+            for source in &self.provider_backings {
+                visit(crate::resolver::loaded_source_metadata_retained(source))?;
+                visit(source.bytes.len())?;
+                visit(source.decoded_text.as_ref().map_or(0, |s| s.len()))?;
+            }
+        }
         for source in &self.provider_sources {
             visit(crate::resolver::loaded_source_metadata_retained(source))?;
         }
@@ -1292,7 +1317,11 @@ impl CompileTimeState {
             )?;
         }
         for interface in &self.interfaces {
-            interface.visit_recovery_payload(visit)?;
+            if recovery {
+                interface.visit_recovery_payload(visit)?;
+            } else {
+                interface.visit_snapshot_payload(visit)?;
+            }
         }
         if let Some(name) = &self.unit_name {
             visit(name.len())?;
@@ -1333,7 +1362,7 @@ impl CompileTimeState {
             visit(size_of::<Sequence>() + environment.recovery_payload_bytes())?;
         }
         for alternative in &self.alternatives {
-            alternative.visit_recovery_payload(visit)?;
+            alternative.visit_payload(visit, recovery)?;
         }
         for s in &self.spans {
             visit(size_of::<Span>())?;
@@ -1360,19 +1389,37 @@ impl CompileTimeState {
         &self,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Self, IncompleteReason> {
-        let before = budget.snapshot().retained_bytes;
+        let before = budget.manual_retained();
         let mut reason = None;
-        let admitted = self.visit_recovery_payload(&mut |bytes| {
+        let admitted = self.visit_snapshot_payload(&mut |bytes| {
             budget.charge(1, bytes, bytes).map_err(|failure| {
                 reason = Some(failure);
                 "snapshot admission".into()
             })
         });
         if admitted.is_err() {
-            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+            budget.release(budget.manual_retained().saturating_sub(before));
             return Err(reason.unwrap_or(IncompleteReason::MalformedSource));
         }
         Ok(self.clone())
+    }
+
+    pub(crate) fn admitted_snapshot(
+        &self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedShared<Self>, IncompleteReason> {
+        let mut payload = 0usize;
+        self.visit_snapshot_payload(&mut |n| {
+            payload = payload.checked_add(n).ok_or("graph snapshot overflow")?;
+            Ok(())
+        })
+        .map_err(|_| IncompleteReason::MalformedSource)?;
+        let payload = payload
+            .checked_sub(size_of::<Self>())
+            .ok_or(IncompleteReason::MalformedSource)?;
+        budget
+            .admit_owned(1, payload, payload, || self.clone())?
+            .into_shared(budget)
     }
 
     /// Every retained path, including the primary continuation.

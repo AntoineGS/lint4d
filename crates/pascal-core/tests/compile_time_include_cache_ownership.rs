@@ -12,6 +12,38 @@ fn actual_include_decoded_cache_keeps_credits_until_its_last_owner_drops() {
     // decode-and-cache mutation, rather than the default store's earlier decode.
     struct RawFileStore(FilesystemSourceStore);
     impl pascal_core::SourceStore for RawFileStore {
+        fn list_directory_admitted(
+            &mut self,
+            request: pascal_core::DirectoryRequest<'_>,
+            budget: &mut CompileTimeBudget<'_>,
+            cancel: &dyn pascal_core::CancellationToken,
+        ) -> Result<
+            pascal_core::compile_time::AdmittedOwned<pascal_core::DirectoryListing>,
+            pascal_core::SourceStoreError,
+        > {
+            self.0.list_directory_admitted(request, budget, cancel)
+        }
+        fn overlay_candidates_admitted(
+            &self,
+            roots: &[std::path::PathBuf],
+            names: &[String],
+            budget: &mut CompileTimeBudget<'_>,
+            cancel: &dyn pascal_core::CancellationToken,
+        ) -> Result<
+            pascal_core::compile_time::AdmittedOwned<Vec<std::path::PathBuf>>,
+            pascal_core::SourceStoreError,
+        > {
+            self.0
+                .overlay_candidates_admitted(roots, names, budget, cancel)
+        }
+        fn load_admitted(
+            &mut self,
+            request: pascal_core::SourceRequest<'_>,
+            budget: &mut CompileTimeBudget<'_>,
+            cancel: &dyn pascal_core::CancellationToken,
+        ) -> Result<pascal_core::LoadedSource, pascal_core::SourceStoreError> {
+            self.0.load_raw_admitted(request, budget, cancel)
+        }
         fn list_directory(
             &mut self,
             request: pascal_core::DirectoryRequest<'_>,

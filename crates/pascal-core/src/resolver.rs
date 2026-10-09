@@ -381,6 +381,7 @@ pub struct ResolvedProject {
     pub include_sources: Vec<LoadedSource>,
     pub complete: bool,
     pub report: ResolutionReport,
+    pub conditional_contexts: HashMap<SourceId, pascal_project::ConditionalContext>,
 }
 
 #[path = "resolver_store.rs"]
@@ -414,6 +415,7 @@ pub struct UnitResolver<S> {
     source_metadata: HashMap<SourceId, CachedSourceMetadata>,
     stop_when_incomplete: bool,
     compile_time_route: Option<LegacyRoute>,
+    compile_time_root_path: Option<PathBuf>,
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
 }
 
@@ -531,6 +533,10 @@ impl<S: SourceStore> UnitResolver<S> {
         };
         let root = decoded.as_ref().unwrap_or(root);
         let route = self.effective_root_route(root);
+        let root_path_bytes = root.path.as_os_str().len() + std::mem::size_of::<PathBuf>();
+        self.charge_compile_time(1, root_path_bytes, root_path_bytes, cancel)?;
+        let previous_path =
+            std::mem::replace(&mut self.compile_time_root_path, Some(root.path.clone()));
         let previous = std::mem::replace(&mut self.compile_time_route, route);
         let defaults = crate::compile_time::CompileTimeLimits::default();
         let limits = crate::compile_time::CompileTimeLimits {
@@ -560,6 +566,8 @@ impl<S: SourceStore> UnitResolver<S> {
             cancel,
         );
         self.compile_time_route = previous;
+        self.compile_time_root_path = previous_path;
+        self.release_compile_time(root_path_bytes);
         // Record already-performed work even when cancellation/error ends the
         // session. Failed-session storage has been dropped, never published.
         let usage = budget.snapshot();
@@ -841,6 +849,7 @@ impl<S: SourceStore> UnitResolver<S> {
             source_metadata: HashMap::new(),
             stop_when_incomplete: false,
             compile_time_route: None,
+            compile_time_root_path: None,
             compile_time_accounting: Default::default(),
         }
     }
@@ -1539,6 +1548,27 @@ impl<S: SourceStore> UnitResolver<S> {
                 .push("project resolution was incomplete".to_string());
         }
         Ok(ResolvedProject {
+            conditional_contexts: {
+                let mut contexts = HashMap::new();
+                for unit in std::iter::once(&root).chain(units.iter()) {
+                    self.charge_compile_time(
+                        1,
+                        0,
+                        std::mem::size_of::<(SourceId, pascal_project::ConditionalContext)>()
+                            + unit.source.id.as_str().len(),
+                        cancel,
+                    )?;
+                    // Admit all possible selected-context payload before the
+                    // ProjectContext compatibility projection clones it.
+                    let reserve = conditional_context_reserve(&self.context)?;
+                    self.charge_compile_time(1, reserve, reserve, cancel)?;
+                    contexts.insert(
+                        unit.source.id.clone(),
+                        self.context.conditional_context_for(&unit.source.path),
+                    );
+                }
+                contexts
+            },
             root,
             units,
             imports,
@@ -3209,7 +3239,26 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         let route = request
             .legacy_route
             .cloned()
-            .or_else(|| self.compile_time_route.clone());
+            .or_else(|| {
+                if self
+                    .compile_time_root_path
+                    .as_ref()
+                    .is_some_and(|p| path_equivalent(p, request.including_path))
+                {
+                    return self.compile_time_route.clone();
+                }
+                self.loaded
+                    .values()
+                    .find(|s| path_equivalent(&s.path, request.including_path))
+                    .and_then(|s| self.legacy_routes.get(&s.id))
+                    .cloned()
+            })
+            .or_else(|| {
+                self.compile_time_route
+                    .as_ref()
+                    .filter(|r| path_equivalent(&r.source_path, request.including_path))
+                    .cloned()
+            });
         // The store's bounded payload read supplements the shared typed budget.
         // Do not reset any resolver counters or construct a child resolver.
         let source_limit = self.limits.max_source_bytes;
@@ -3252,22 +3301,144 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
 
     fn unit(
         &mut self,
-        _: UnitResolveRequest<'_>,
+        request: UnitResolveRequest<'_>,
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<crate::compile_time::ProviderSource>, ResolverError> {
         budget
-            .charge(1, 0, 0)
+            .charge(1, request.requested_name.len(), 0)
             .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
         self.check_cancel(cancel)?;
-        Ok(ResolutionOutcome {
-            result: Resolution::Unavailable {
-                reason: "external unit capability unavailable until Task9".into(),
+        let route = request
+            .legacy_route
+            .cloned()
+            .or_else(|| {
+                if self
+                    .compile_time_root_path
+                    .as_ref()
+                    .is_some_and(|p| path_equivalent(p, request.importer_path))
+                {
+                    return self.compile_time_route.clone();
+                }
+                self.loaded
+                    .values()
+                    .find(|s| path_equivalent(&s.path, request.importer_path))
+                    .and_then(|s| self.legacy_routes.get(&s.id))
+                    .cloned()
+            })
+            .or_else(|| {
+                self.compile_time_route
+                    .as_ref()
+                    .filter(|r| path_equivalent(&r.source_path, request.importer_path))
+                    .cloned()
+            });
+        let source_limit = self.limits.max_source_bytes;
+        let remaining = budget
+            .limits()
+            .max_retained_bytes
+            .saturating_sub(budget.snapshot().retained_bytes)
+            / 4;
+        let remaining_bytes = budget
+            .limits()
+            .max_byte_work
+            .saturating_sub(budget.snapshot().byte_work)
+            / 4;
+        self.limits.max_source_bytes = source_limit.min(remaining).min(remaining_bytes);
+        let outcome = self.try_resolve_unit(
+            UnitResolveRequest {
+                legacy_route: route.as_ref(),
+                ..request.clone()
             },
-            observations: vec![],
-            warnings: vec![],
+            cancel,
+        );
+        self.limits.max_source_bytes = source_limit;
+        let outcome = outcome?;
+        let result = match outcome.result {
+            Resolution::Found(mut unit) => {
+                let reserve = conditional_context_reserve(&self.context)?;
+                let names = request.requested_name.len()
+                    + aliased_name_ref(&self.context, request.requested_name).len()
+                    + unit.declared_name.len();
+                budget
+                    .charge(
+                        1,
+                        reserve + names,
+                        reserve
+                            + 4 * names
+                            + 8 * std::mem::size_of::<String>()
+                            + loaded_source_metadata_retained(&unit.source),
+                    )
+                    .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+                let context = self.context.conditional_context_for(&unit.source.path);
+                let authorized_qualifiers = qualifiers_for_found(
+                    request.requested_name,
+                    aliased_name_ref(&self.context, request.requested_name),
+                    &unit.declared_name,
+                );
+                if unit.source.decoded_text.is_none()
+                    && std::str::from_utf8(&unit.source.bytes).is_err()
+                {
+                    budget
+                        .charge(
+                            1,
+                            unit.source.bytes.len(),
+                            unit.source.bytes.len().saturating_mul(3),
+                        )
+                        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+                    unit.source.decoded_text = Some(source_text(&unit.source).into());
+                }
+                Resolution::Found(crate::compile_time::ProviderSource {
+                    unit,
+                    context,
+                    authorized_qualifiers,
+                })
+            }
+            Resolution::Unavailable { reason } => Resolution::Unavailable { reason },
+            Resolution::Ambiguous { candidates } => Resolution::Ambiguous { candidates },
+            Resolution::Incomplete { reason, candidates } => {
+                Resolution::Incomplete { reason, candidates }
+            }
+        };
+        Ok(ResolutionOutcome {
+            result,
+            observations: outcome.observations,
+            warnings: outcome.warnings,
         })
     }
+}
+
+fn conditional_context_reserve(context: &ProjectContext) -> Result<usize, ResolverError> {
+    let mut total = std::mem::size_of::<pascal_project::ConditionalContext>();
+    for candidate in [
+        &context.conditional_context,
+        &context.library_conditional_context,
+    ] {
+        candidate
+            .visit_recovery_payload(&mut |n| {
+                total = total
+                    .checked_add(n)
+                    .ok_or_else(|| "context admission overflow".to_string())?;
+                Ok(())
+            })
+            .map_err(ResolverError::InvalidRequest)?;
+        total = total
+            .checked_add(
+                (candidate.defines.len() + candidate.options.len() + candidate.constants.len())
+                    * (std::mem::size_of::<(String, crate::conditional::ConstantValue)>()
+                        + 4 * std::mem::size_of::<usize>()),
+            )
+            .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
+    }
+    for define in &context.defines {
+        total = total
+            .checked_add(
+                define.len()
+                    + std::mem::size_of::<(String, crate::conditional::Truth)>()
+                    + 4 * std::mem::size_of::<usize>(),
+            )
+            .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
+    }
+    Ok(total)
 }
 
 struct CandidateGroup {

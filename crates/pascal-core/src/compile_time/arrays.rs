@@ -14,6 +14,7 @@ type Domain = (i64, i64);
 pub(super) fn operand_indices<'a>(
     state: &CompileTimeState,
     declaration_site: &BindingSite,
+    query_state: &CompileTimeState,
     query_site: &BindingSite,
     dimensions: &[IndexExpr],
     indices: impl Iterator<Item = &'a str>,
@@ -62,7 +63,7 @@ pub(super) fn operand_indices<'a>(
                 expression,
                 budget,
                 &mut |name, budget| {
-                    let Some(binding) = lookup(state, query_site, name, budget)? else {
+                    let Some(binding) = lookup(query_state, query_site, name, budget)? else {
                         return Ok(None);
                     };
                     match binding {
@@ -78,7 +79,7 @@ pub(super) fn operand_indices<'a>(
                         Binding::Declaration(decl) if !decl.is_type && decl.is_constant => {
                             Ok(Some(
                                 constant_expression(
-                                    state,
+                                    query_state,
                                     &decl.site,
                                     initializer_expression(
                                         decl.initializer.as_deref().unwrap_or(""),
@@ -92,11 +93,13 @@ pub(super) fn operand_indices<'a>(
                         Binding::Declaration(decl) if !decl.is_type => {
                             // Domain admission excludes floats, strings and pointers even
                             // when selector_kind's broad intrinsic category is integer.
-                            if type_domain(state, &decl.type_site, &decl.ty, 0, budget)?.is_none() {
+                            if type_domain(query_state, &decl.type_site, &decl.ty, 0, budget)?
+                                .is_none()
+                            {
                                 return Ok(Some(BoundValue::InvalidType));
                             }
                             let Some(kind) = selector_kind(
-                                state,
+                                query_state,
                                 &decl.type_site,
                                 &decl.ty,
                                 Some(&decl.key),
@@ -132,7 +135,7 @@ pub(super) fn operand_indices<'a>(
                 Some(BoundValue::Constant(ConstantValue::Integer(_))) => Some(OrdinalKind::Integer),
                 Some(BoundValue::Constant(ConstantValue::Boolean(_))) => Some(OrdinalKind::Boolean),
                 Some(BoundValue::Constant(ConstantValue::String(s))) => {
-                    let kind = character_ordinal(state, &s, budget)?.map(|(_, kind)| kind);
+                    let kind = character_ordinal(query_state, &s, budget)?.map(|(_, kind)| kind);
                     budget.release(s.len());
                     kind
                 }

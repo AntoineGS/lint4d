@@ -116,8 +116,48 @@ pub(crate) fn analyze_source_in_session(
     root: &LoadedSource,
     context: &ConditionalContext,
     resolver: &mut dyn CompileTimeResolver,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<CompileTimeAnalysis, ResolverError> {
+    analyze_source_with_providers(
+        root,
+        context,
+        resolver,
+        budget,
+        cancel,
+        &mut ProviderSession {
+            active: Vec::new(),
+            queries: 0,
+            next_occurrence: 1,
+        },
+        false,
+        OccurrenceId(0),
+    )
+}
+
+struct ProviderSession {
+    active: Vec<ProviderKey>,
+    queries: usize,
+    next_occurrence: u64,
+}
+
+#[derive(PartialEq, Eq)]
+struct ProviderKey {
+    source: crate::SourceId,
+    revision: crate::SourceRevision,
+    context: ConditionalContext,
+    qualifiers: Vec<String>,
+}
+
+fn analyze_source_with_providers(
+    root: &LoadedSource,
+    context: &ConditionalContext,
+    resolver: &mut dyn CompileTimeResolver,
     mut budget: &mut CompileTimeBudget<'_>,
     cancel: &dyn CancellationToken,
+    providers: &mut ProviderSession,
+    interface_only: bool,
+    root_occurrence: OccurrenceId,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
     let limits = budget.limits();
     let bytes = root.analysis_bytes();
@@ -174,8 +214,9 @@ pub(crate) fn analyze_source_in_session(
                 &budget,
             )
         })?;
-    let state = CompileTimeState::new(context, root, &mut budget)
+    let mut state = CompileTimeState::new(context, root, &mut budget)
         .map_err(|r| resolver_error(r, &budget))?;
+    state.interface_only = interface_only;
     super::declarations::limit(1, limits.max_branch_states.min(64), "max_branch_states")
         .map_err(|r| resolver_error(r, &budget))?;
     budget
@@ -203,8 +244,7 @@ pub(crate) fn analyze_source_in_session(
         resolver,
         cancel,
         context,
-        occurrence: OccurrenceId(0),
-        next_occurrence: 1,
+        occurrence: root_occurrence,
         active_sources: vec![root.id.clone()],
         occurrences: Vec::new(),
         observations: Vec::new(),
@@ -222,6 +262,7 @@ pub(crate) fn analyze_source_in_session(
         current: vec![first],
         frames: Vec::new(),
         last_condition: Truth::Unknown,
+        providers,
     };
     let mut analysis = conditional::analyze_with_source_order(text, context, cancel, &mut session);
     if let Some(error) = session.resource_error.take() {
@@ -336,7 +377,7 @@ pub(crate) fn analyze_source_in_session(
         .charge(analysis.directives.len() + 1, payload, payload)
         .map_err(|r| resolver_error(r, &session.budget))?;
     let mut occurrence = OccurrenceAnalysis {
-        id: OccurrenceId(0),
+        id: root_occurrence,
         source: root.clone(),
         analysis: analysis.clone(),
     };
@@ -461,7 +502,6 @@ struct RootSession<'a, 'b> {
     cancel: &'a dyn CancellationToken,
     context: &'a ConditionalContext,
     occurrence: OccurrenceId,
-    next_occurrence: u64,
     active_sources: Vec<crate::SourceId>,
     occurrences: Vec<OccurrenceAnalysis>,
     observations: Vec<ResolutionObservation>,
@@ -479,6 +519,7 @@ struct RootSession<'a, 'b> {
     current: Vec<ReachablePath>,
     frames: Vec<ReachableFrame>,
     last_condition: Truth,
+    providers: &'a mut ProviderSession,
 }
 
 struct ReachablePath {
@@ -493,6 +534,187 @@ struct ReachableFrame {
 }
 
 impl RootSession<'_, '_> {
+    fn compile_provider_interface(
+        &mut self,
+        provider: ProviderSource,
+    ) -> Result<Option<std::sync::Arc<CompileTimeState>>, ResolverError> {
+        self.budget
+            .charge(self.providers.active.len() + 1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        if self.providers.active.iter().any(|key| {
+            key.source == provider.unit.source.id
+                && key.revision == provider.unit.source.revision
+                && key.context == provider.context
+                && key.qualifiers == provider.authorized_qualifiers
+        }) {
+            return Ok(None);
+        }
+        super::declarations::limit(
+            self.providers.active.len() + 1,
+            self.budget.limits().max_type_depth,
+            "max_type_depth",
+        )
+        .map_err(|r| resolver_error(r, self.budget))?;
+        let before = self.budget.snapshot().retained_bytes;
+        let metadata = size_of::<ProviderKey>()
+            + provider.unit.source.id.as_str().len()
+            + provider
+                .authorized_qualifiers
+                .iter()
+                .map(|q| size_of::<String>() + q.len())
+                .sum::<usize>();
+        self.budget
+            .charge(1, metadata, metadata)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let mut failure = None;
+        provider
+            .context
+            .visit_recovery_payload(&mut |n| {
+                self.budget.charge(1, n, n).map_err(|r| {
+                    failure = Some(r);
+                    "provider context".into()
+                })
+            })
+            .map_err(|_| {
+                resolver_error(
+                    failure.unwrap_or(IncompleteReason::MalformedSource),
+                    self.budget,
+                )
+            })?;
+        let occurrence = OccurrenceId(self.providers.next_occurrence);
+        self.providers.next_occurrence = self
+            .providers
+            .next_occurrence
+            .checked_add(1)
+            .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
+        self.providers.active.reserve_exact(1);
+        self.providers.active.push(ProviderKey {
+            source: provider.unit.source.id.clone(),
+            revision: provider.unit.source.revision.clone(),
+            context: provider.context.clone(),
+            qualifiers: provider.authorized_qualifiers.clone(),
+        });
+        let key_bytes = self.budget.snapshot().retained_bytes.saturating_sub(before);
+        let result = analyze_source_with_providers(
+            &provider.unit.source,
+            &provider.context,
+            self.resolver,
+            self.budget,
+            self.cancel,
+            self.providers,
+            true,
+            occurrence,
+        );
+        self.providers.active.pop();
+        self.budget.release(key_bytes);
+        let mut analysis = result?;
+        self.observations.extend(analysis.observations);
+        self.warnings.extend(analysis.warnings);
+        if !analysis.facts.interface_complete {
+            return Ok(None);
+        }
+        self.budget
+            .charge(
+                analysis.occurrences.len(),
+                0,
+                analysis.occurrences.len() * size_of::<LoadedSource>(),
+            )
+            .map_err(|r| resolver_error(r, self.budget))?;
+        analysis.facts.provider_sources =
+            analysis.occurrences.into_iter().map(|o| o.source).collect();
+        self.budget
+            .charge(1, 0, size_of::<CompileTimeState>() + 2 * size_of::<usize>())
+            .map_err(|r| resolver_error(r, self.budget))?;
+        Ok(Some(std::sync::Arc::new(analysis.facts)))
+    }
+
+    fn resolve_pending_imports(&mut self, activity: Truth) -> Result<(), ResolverError> {
+        for index in 0..self.current.len() {
+            let imports = std::mem::take(&mut self.current[index].state_mut().pending_imports);
+            for (name, site) in imports {
+                let outcome = if activity == Truth::True {
+                    super::declarations::limit(
+                        self.providers.queries + 1,
+                        self.budget.limits().max_provider_queries,
+                        "max_provider_queries",
+                    )
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                    self.providers.queries += 1;
+                    self.resolver.unit(
+                        UnitResolveRequest {
+                            requested_name: &name,
+                            importer_path: &self.root.path,
+                            legacy_route: None,
+                        },
+                        self.budget,
+                        self.cancel,
+                    )?
+                } else {
+                    ResolutionOutcome {
+                        result: Resolution::Unavailable {
+                            reason: "unproven import activity".into(),
+                        },
+                        observations: vec![],
+                        warnings: vec![],
+                    }
+                };
+                self.budget
+                    .charge(
+                        outcome.observations.len() + outcome.warnings.len(),
+                        0,
+                        outcome.observations.len() * size_of::<ResolutionObservation>()
+                            + outcome.warnings.len() * size_of::<String>(),
+                    )
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                for observation in &outcome.observations {
+                    admit_observation(observation, self.budget)?;
+                }
+                for warning in &outcome.warnings {
+                    self.budget
+                        .charge(1, warning.len(), warning.len())
+                        .map_err(|r| resolver_error(r, self.budget))?;
+                }
+                self.observations.extend(outcome.observations);
+                self.warnings.extend(outcome.warnings);
+                let (qualifiers, graph) = match outcome.result {
+                    Resolution::Found(provider) => {
+                        self.budget
+                            .charge(
+                                provider.authorized_qualifiers.len(),
+                                0,
+                                provider
+                                    .authorized_qualifiers
+                                    .iter()
+                                    .map(|q| size_of::<String>() + q.len())
+                                    .sum(),
+                            )
+                            .map_err(|r| resolver_error(r, self.budget))?;
+                        let qualifiers = provider.authorized_qualifiers.clone();
+                        (qualifiers, self.compile_provider_interface(provider)?)
+                    }
+                    _ => (vec![name.clone()], None),
+                };
+                self.budget
+                    .charge(
+                        1,
+                        name.len(),
+                        size_of::<super::bindings::InterfaceFacts>() + name.len(),
+                    )
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                self.current[index].state_mut().interfaces.reserve_exact(1);
+                self.current[index]
+                    .state_mut()
+                    .interfaces
+                    .push(super::bindings::InterfaceFacts {
+                        qualifiers,
+                        site,
+                        graph,
+                    });
+            }
+        }
+        Ok(())
+    }
+
     fn walk_include(&mut self, directive: &ConditionalDirective) -> Result<(), ResolverError> {
         // A reachable hypothetical path is not an authorization to read bytes.
         let name = crate::resolver::include_name(&directive.body);
@@ -674,8 +896,9 @@ impl RootSession<'_, '_> {
                     })?
                     .to_owned();
                 let child = child.clone();
-                let occurrence = OccurrenceId(self.next_occurrence);
-                self.next_occurrence = self
+                let occurrence = OccurrenceId(self.providers.next_occurrence);
+                self.providers.next_occurrence = self
+                    .providers
                     .next_occurrence
                     .checked_add(1)
                     .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
@@ -964,6 +1187,12 @@ impl SourceOrder for RootSession<'_, '_> {
         source: &str,
         cursor: usize,
     ) -> Result<conditional::SourceOrderStep, ()> {
+        if !self.current.is_empty() && self.current.iter().all(|p| p.state().interface_complete) {
+            return Ok(conditional::SourceOrderStep {
+                text_end: source.len(),
+                directive: None,
+            });
+        }
         let next = match self.scanner.next(
             source,
             cursor,
@@ -1136,6 +1365,9 @@ impl SourceOrder for RootSession<'_, '_> {
         if let Some(reason) = failure {
             self.record(reason);
         }
+        if let Err(error) = self.resolve_pending_imports(activity) {
+            self.resource_error = Some(error);
+        }
     }
 
     fn condition(
@@ -1156,6 +1388,9 @@ impl SourceOrder for RootSession<'_, '_> {
         self.directive_fragments[self.current_directive]
             .directive
             .activity = directive.activity;
+        if !self.current.is_empty() && self.current.iter().all(|p| p.state().interface_complete) {
+            return;
+        }
         if self.fatal.is_some() || !self.reasons.is_empty() {
             return;
         }

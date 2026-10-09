@@ -67,6 +67,9 @@ pub struct Fixture {
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
     reads: Vec<String>,
+    units: std::collections::BTreeMap<String, ProviderSource>,
+    denied_units: std::collections::BTreeSet<String>,
+    ambiguous_units: std::collections::BTreeSet<String>,
 }
 impl Fixture {
     pub fn new(text: &str, context: ConditionalContext) -> Self {
@@ -81,10 +84,46 @@ impl Fixture {
             failures: Default::default(),
             denied: Default::default(),
             reads: vec![],
+            units: Default::default(),
+            denied_units: Default::default(),
+            ambiguous_units: Default::default(),
         }
     }
     pub fn include(&mut self, name: &str, text: &str) {
         self.includes.insert(name.into(), loaded(name, text));
+    }
+    pub fn unit(&mut self, name: &str, text: &str, context: ConditionalContext) {
+        self.units.insert(
+            name.into(),
+            ProviderSource {
+                unit: pascal_core::ResolvedUnit {
+                    requested_name: name.into(),
+                    declared_name: name.into(),
+                    source: loaded(&format!("{name}.pas"), text),
+                },
+                context,
+                authorized_qualifiers: vec![name.into()],
+            },
+        );
+    }
+    pub fn unit_qualifiers(&mut self, name: &str, qualifiers: &[&str]) {
+        self.units
+            .get_mut(name)
+            .expect("fixture unit")
+            .authorized_qualifiers = qualifiers.iter().map(|q| (*q).into()).collect();
+    }
+    pub fn unit_revision(&mut self, name: &str, version: i32) {
+        let source = &mut self.units.get_mut(name).expect("fixture unit").unit.source;
+        source.revision = SourceRevision::Overlay {
+            version,
+            content_hash: pascal_project::content_hash_bytes(&source.bytes),
+        };
+    }
+    pub fn deny_unit(&mut self, name: &str) {
+        self.denied_units.insert(name.into());
+    }
+    pub fn ambiguous_unit(&mut self, name: &str) {
+        self.ambiguous_units.insert(name.into());
     }
     pub fn deny_include(&mut self, name: &str) {
         self.denied.insert(name.into());
@@ -164,7 +203,49 @@ impl CompileTimeResolver for Fixture {
         budget: &mut CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
-        NoResources.unit(request, budget, cancel)
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        budget
+            .charge(1, request.requested_name.len(), 0)
+            .map_err(|_| ResolverError::InvalidRequest("fixture unit budget".into()))?;
+        let result = if self.denied_units.contains(request.requested_name) {
+            Resolution::Unavailable {
+                reason: "denied fixture unit".into(),
+            }
+        } else if self.ambiguous_units.contains(request.requested_name) {
+            Resolution::Ambiguous { candidates: vec![] }
+        } else if let Some(provider) = self.units.get(request.requested_name) {
+            let mut failed = false;
+            provider
+                .context
+                .visit_recovery_payload(&mut |n| {
+                    budget.charge(1, n, n).map_err(|_| {
+                        failed = true;
+                        "fixture context budget".into()
+                    })
+                })
+                .map_err(|_| ResolverError::InvalidRequest("fixture context budget".into()))?;
+            let _ = failed;
+            budget
+                .charge(
+                    1,
+                    provider.unit.source.bytes.len(),
+                    provider.unit.source.bytes.len() * 4,
+                )
+                .map_err(|_| ResolverError::InvalidRequest("fixture provider budget".into()))?;
+            self.reads.push(request.requested_name.into());
+            Resolution::Found(provider.clone())
+        } else {
+            Resolution::Unavailable {
+                reason: "missing fixture unit".into(),
+            }
+        };
+        Ok(ResolutionOutcome {
+            result,
+            observations: vec![],
+            warnings: vec![],
+        })
     }
 }
 

@@ -24,6 +24,7 @@ enum Lex {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Section {
     None,
+    Imports,
     Types,
     Vars,
     Consts,
@@ -86,6 +87,12 @@ pub struct CompileTimeState {
     pub(super) option_stack: Vec<Option<crate::conditional::ConditionalEnvironment>>,
     pub(super) conditional: Option<Box<crate::conditional::ConditionalEnvironment>>,
     pub(super) scalar_history: Vec<(Sequence, crate::conditional::ConditionalEnvironment)>,
+    pub(super) pending_imports: Vec<(String, BindingSite)>,
+    pub(super) interfaces: Vec<super::bindings::InterfaceFacts>,
+    pub(super) interface_only: bool,
+    pub(super) interface_complete: bool,
+    pub(super) provider_sources: Vec<LoadedSource>,
+    in_interface: bool,
 }
 
 pub(super) fn limit(
@@ -201,6 +208,12 @@ impl CompileTimeState {
             option_stack: Vec::new(),
             conditional: None,
             scalar_history: Vec::new(),
+            pending_imports: Vec::new(),
+            interfaces: Vec::new(),
+            interface_only: false,
+            interface_complete: false,
+            provider_sources: Vec::new(),
+            in_interface: false,
         })
     }
 
@@ -217,6 +230,9 @@ impl CompileTimeState {
         activity: Truth,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
+        if self.interface_complete {
+            return Ok(());
+        }
         if self.finished {
             return Err(IncompleteReason::MalformedSource);
         }
@@ -249,6 +265,9 @@ impl CompileTimeState {
             .checked_add(fragment.text.len())
             .ok_or(IncompleteReason::MalformedSource)?;
         for (i, ch) in fragment.text.char_indices() {
+            if self.interface_complete {
+                break;
+            }
             budget.charge(1, ch.len_utf8(), 0)?;
             let offset = fragment.physical_start + i;
             self.map_char(
@@ -518,11 +537,15 @@ impl CompileTimeState {
             "program" | "library" => self.implementation = true,
             "unit" => self.implementation = false,
             "implementation" => {
+                if self.interface_only {
+                    self.interface_complete = true;
+                }
                 self.implementation = true;
                 self.section = Section::None;
                 self.clear_pending(budget);
             }
             "interface" => {
+                self.in_interface = true;
                 self.section = Section::None;
                 self.clear_pending(budget);
             }
@@ -530,7 +553,7 @@ impl CompileTimeState {
                 // Import clauses are not another declarator in the preceding
                 // const/type/var section. Their resource owner consumes them;
                 // only keep source-order/scope framing here.
-                self.section = Section::None;
+                self.section = Section::Imports;
                 self.clear_pending(budget);
             }
             "type" => {
@@ -627,6 +650,11 @@ impl CompileTimeState {
             result?;
         }
         let (prefix, suffix, kind) = match self.section {
+            Section::Imports => (
+                "unit T; interface uses ",
+                " implementation end.",
+                "declUses",
+            ),
             Section::Types => (
                 "unit T; interface type ",
                 " implementation end.",
@@ -667,6 +695,15 @@ impl CompileTimeState {
                 self.unknown = true;
                 return Ok(());
             };
+            if self.section == Section::Imports {
+                if !valid {
+                    self.unknown = true;
+                    return Ok(());
+                }
+                self.admit_imports(decl, source.as_bytes(), budget)?;
+                self.section = Section::None;
+                return Ok(());
+            }
             if !valid && self.section == Section::Routine {
                 self.unknown = true;
                 return Ok(());
@@ -694,6 +731,37 @@ impl CompileTimeState {
         });
         budget.release(len);
         result
+    }
+
+    fn admit_imports(
+        &mut self,
+        node: Node<'_>,
+        source: &[u8],
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), IncompleteReason> {
+        if self.site().scope != ScopeId(0) {
+            self.unknown = true;
+            return Ok(());
+        }
+        budget.charge(1, 0, 0)?;
+        if node.kind() == "moduleName" {
+            let text = node
+                .utf8_text(source)
+                .map_err(|_| IncompleteReason::MalformedSource)?;
+            budget.charge(
+                1,
+                text.len(),
+                text.len() + size_of::<(String, BindingSite)>(),
+            )?;
+            let name = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            self.pending_imports.push((name, self.site()));
+            return Ok(());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.admit_imports(child, source, budget)?;
+        }
+        Ok(())
     }
 
     fn admit_arguments(
@@ -835,7 +903,7 @@ impl CompileTimeState {
                     anchor,
                     scope: site.scope,
                 },
-                site,
+                site: site.clone(),
                 type_site: if is_type {
                     self.site()
                 } else {
@@ -843,6 +911,7 @@ impl CompileTimeState {
                 },
                 ty,
                 is_type,
+                exported: self.in_interface && !self.implementation && site.scope == ScopeId(0),
                 // As in the existing conditional scanner, typed constants are
                 // lexical blockers, not proven values without coercion evidence.
                 is_constant: valid && node.kind() == "declConst" && ty_node.is_none(),
@@ -1105,6 +1174,34 @@ impl CompileTimeState {
         let mut h = DefaultHasher::new();
         self.context.hash(&mut h);
         self.unit_name.hash(&mut h);
+        self.pending_imports.hash(&mut h);
+        for source in &self.provider_sources {
+            source.id.hash(&mut h);
+            source.path.hash(&mut h);
+            match &source.revision {
+                crate::SourceRevision::Overlay {
+                    version,
+                    content_hash,
+                } => {
+                    version.hash(&mut h);
+                    content_hash.hash(&mut h);
+                }
+                crate::SourceRevision::Disk {
+                    stamp,
+                    content_hash,
+                    read_policy,
+                    path_entry,
+                } => {
+                    stamp.hash(&mut h);
+                    content_hash.hash(&mut h);
+                    read_policy.hash(&mut h);
+                    path_entry.hash(&mut h);
+                }
+            }
+        }
+        for interface in &self.interfaces {
+            interface.fingerprint().hash(&mut h);
+        }
         self.scopes.hash(&mut h);
         self.stack.hash(&mut h);
         self.spans.hash(&mut h);
@@ -1124,6 +1221,9 @@ impl CompileTimeState {
         self.composite_depth.hash(&mut h);
         self.parens.hash(&mut h);
         self.implementation.hash(&mut h);
+        self.in_interface.hash(&mut h);
+        self.interface_only.hash(&mut h);
+        self.interface_complete.hash(&mut h);
         self.finished.hash(&mut h);
         self.root_ended.hash(&mut h);
         self.unknown.hash(&mut h);
@@ -1152,6 +1252,7 @@ impl CompileTimeState {
             d.type_site.hash(&mut h);
             d.ty.hash(&mut h);
             d.is_type.hash(&mut h);
+            d.exported.hash(&mut h);
             d.is_constant.hash(&mut h);
             d.is_routine.hash(&mut h);
             d.provenance.hash(&mut h);
@@ -1167,6 +1268,15 @@ impl CompileTimeState {
         visit: &mut dyn FnMut(usize) -> Result<(), String>,
     ) -> Result<(), String> {
         visit(size_of::<Self>())?;
+        for source in &self.provider_sources {
+            visit(crate::resolver::loaded_source_metadata_retained(source))?;
+        }
+        for (name, _) in &self.pending_imports {
+            visit(size_of::<(String, BindingSite)>() + name.len())?;
+        }
+        for interface in &self.interfaces {
+            interface.visit_recovery_payload(visit)?;
+        }
         if let Some(name) = &self.unit_name {
             visit(name.len())?;
         }

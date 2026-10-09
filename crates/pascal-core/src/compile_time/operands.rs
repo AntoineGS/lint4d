@@ -171,6 +171,7 @@ impl AccessParser<'_> {
 }
 
 struct BoundType<'a> {
+    state: &'a CompileTimeState,
     carrier: Carrier<'a>,
     site: &'a BindingSite,
     settings: &'a LayoutSettings,
@@ -221,6 +222,17 @@ impl CompileTimeState {
         operand: &SizeOfOperand,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Fact<KnownLayout> {
+        self.layout_operand_in_context(site.clone(), operand, self, &site, budget)
+    }
+
+    pub(super) fn layout_operand_in_context(
+        &self,
+        site: BindingSite,
+        operand: &SizeOfOperand,
+        query_state: &CompileTimeState,
+        query_site: &BindingSite,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Fact<KnownLayout> {
         let before = budget.snapshot().retained_bytes;
         let result = (|| {
             budget.charge(1, 0, 0)?;
@@ -240,6 +252,16 @@ impl CompileTimeState {
             let binding = if let Some(binding) = bindings::lookup(self, &site, &root, budget)? {
                 binding
             } else {
+                if let Some(fact) = bindings::imported_operand_with_query(
+                    self,
+                    &site,
+                    &operand.text,
+                    query_state,
+                    query_site,
+                    budget,
+                )? {
+                    return Ok(fact);
+                }
                 if operand.selectors.is_empty() {
                     return Ok(bindings::layout_name(self, site, &root, budget));
                 }
@@ -288,25 +310,26 @@ impl CompileTimeState {
                 return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
             }
             let mut bound = BoundType {
+                state: self,
                 carrier: Carrier::Captured(&decl.ty),
                 site: &decl.type_site,
                 settings: &decl.settings,
                 owner: &decl.key,
             };
             for selector in operand.selectors.iter().skip(first_selector) {
-                bound = match bound.resolve(self, budget)? {
+                bound = match bound.resolve(budget)? {
                     Fact::Known(bound) => bound,
                     Fact::Unknown(reason) => return Ok(Fact::Unknown(reason)),
                     Fact::Incomplete(reason) => return Ok(Fact::Incomplete(reason)),
                 };
                 let selected = match selector {
                     Selector::Field(span) => {
-                        bound.record_field(self, &operand.text[span.clone()], budget)?
+                        bound.record_field(&operand.text[span.clone()], budget)?
                     }
-                    Selector::Dereference => bound.pointee(self, &site, budget)?,
+                    Selector::Dereference => bound.pointee(query_state, query_site, budget)?,
                     Selector::Index(indices) => bound.array_element(
-                        self,
-                        &site,
+                        query_state,
+                        query_site,
                         indices.iter().map(|r| &operand.text[r.clone()]),
                         budget,
                     )?,
@@ -319,7 +342,7 @@ impl CompileTimeState {
             }
             let storage = match bound.carrier {
                 Carrier::Captured(ty) => bindings::storage_type(
-                    self,
+                    bound.state,
                     bound.site,
                     ty,
                     bound.settings,
@@ -327,7 +350,9 @@ impl CompileTimeState {
                     0,
                     budget,
                 )?,
-                Carrier::Intrinsic(ty, _) => builtin_layout(ty, &self.context, bound.settings),
+                Carrier::Intrinsic(ty, _) => {
+                    builtin_layout(ty, &bound.state.context, bound.settings)
+                }
             };
             Ok(match storage {
                 Fact::Known(storage) => {
@@ -337,14 +362,16 @@ impl CompileTimeState {
                             Carrier::Intrinsic(_, name) => name.len(),
                         };
                     budget.charge(1, bytes, bytes)?;
-                    Fact::Known(KnownLayout {
+                    let mut layout = KnownLayout {
                         storage,
                         identity: match bound.carrier {
                             Carrier::Captured(_) => TypeIdentity::Declared(bound.owner.clone()),
                             Carrier::Intrinsic(_, name) => TypeIdentity::Intrinsic(name.to_owned()),
                         },
                         dependencies: Vec::new(),
-                    })
+                    };
+                    bindings::attach_dependencies(bound.state, &mut layout, budget)?;
+                    Fact::Known(layout)
                 }
                 Fact::Unknown(reason) => Fact::Unknown(reason),
                 Fact::Incomplete(reason) => Fact::Incomplete(reason),
@@ -352,12 +379,7 @@ impl CompileTimeState {
         })();
         // Only the returned identity survives the query. All traversal scratch is released.
         let keep = match &result {
-            Ok(Fact::Known(v)) => match &v.identity {
-                TypeIdentity::Declared(k) => {
-                    size_of::<TypeIdentity>() + k.anchor.source.as_str().len()
-                }
-                TypeIdentity::Intrinsic(n) => size_of::<TypeIdentity>() + n.len(),
-            },
+            Ok(Fact::Known(v)) => bindings::layout_retained(v),
             _ => 0,
         };
         budget.release(
@@ -374,7 +396,6 @@ impl CompileTimeState {
 impl<'a> BoundType<'a> {
     fn record_field(
         self,
-        state: &'a CompileTimeState,
         name: &str,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Fact<Self>, IncompleteReason> {
@@ -382,7 +403,7 @@ impl<'a> BoundType<'a> {
             return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
         };
         let Some((ty, site, settings)) =
-            super::records::operand_field(state, record, name, budget)?
+            super::records::operand_field(self.state, record, name, budget)?
         else {
             return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
         };
@@ -413,7 +434,7 @@ impl<'a> BoundType<'a> {
         if *open
             || *packed
             || !super::arrays::operand_indices(
-                state, self.site, query_site, dimensions, indices, budget,
+                self.state, self.site, state, query_site, dimensions, indices, budget,
             )?
         {
             return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
@@ -426,10 +447,11 @@ impl<'a> BoundType<'a> {
 
     fn pointee(
         self,
-        state: &'a CompileTimeState,
+        query_state: &CompileTimeState,
         query_site: &BindingSite,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Fact<Self>, IncompleteReason> {
+        let state = self.state;
         let Carrier::Captured(TypeExpr::Pointer(name)) = self.carrier else {
             return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
         };
@@ -441,7 +463,11 @@ impl<'a> BoundType<'a> {
                 state,
                 &BindingSite {
                     scope: self.site.scope,
-                    sequence: query_site.sequence,
+                    sequence: if std::ptr::eq(state, query_state) {
+                        query_site.sequence
+                    } else {
+                        state.sequence
+                    },
                 },
                 name,
                 budget,
@@ -450,6 +476,20 @@ impl<'a> BoundType<'a> {
             binding
         };
         let Some(binding) = binding else {
+            if let Fact::Known((state, decl)) =
+                bindings::imported_declaration(state, self.site, name, budget)?
+            {
+                if !decl.is_type {
+                    return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
+                }
+                return Ok(Fact::Known(Self {
+                    state,
+                    carrier: Carrier::Captured(&decl.ty),
+                    site: &decl.type_site,
+                    settings: &decl.settings,
+                    owner: &decl.key,
+                }));
+            }
             return Ok(match bindings::intrinsic(name) {
                 Some(ty) => Fact::Known(Self {
                     carrier: Carrier::Intrinsic(ty, name),
@@ -462,6 +502,7 @@ impl<'a> BoundType<'a> {
             return Ok(Fact::Unknown(UnknownReason::InvalidOperand));
         };
         Ok(Fact::Known(Self {
+            state,
             carrier: Carrier::Captured(&decl.ty),
             site: &decl.type_site,
             settings: &decl.settings,
@@ -471,7 +512,6 @@ impl<'a> BoundType<'a> {
 
     fn resolve(
         mut self,
-        state: &'a CompileTimeState,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Fact<Self>, IncompleteReason> {
         let before = budget.snapshot().retained_bytes;
@@ -486,11 +526,19 @@ impl<'a> BoundType<'a> {
                 else {
                     return Ok(Fact::Known(self));
                 };
-                let Some(binding) = bindings::lookup(state, self.site, name, budget)? else {
-                    return Ok(Fact::Known(self));
-                };
-                let Some(decl) = binding.type_declaration() else {
-                    return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+                let (state, decl) = if let Some(binding) =
+                    bindings::lookup(self.state, self.site, name, budget)?
+                {
+                    let Some(decl) = binding.type_declaration() else {
+                        return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
+                    };
+                    (self.state, decl)
+                } else {
+                    match bindings::imported_declaration(self.state, self.site, name, budget)? {
+                        Fact::Known((state, decl)) if decl.is_type => (state, decl),
+                        Fact::Known(_) => return Ok(Fact::Unknown(UnknownReason::InvalidOperand)),
+                        _ => return Ok(Fact::Known(self)),
+                    }
                 };
                 for key in &visited {
                     budget.charge(
@@ -509,6 +557,7 @@ impl<'a> BoundType<'a> {
                 budget.charge(1, 0, size_of::<&DefinitionKey>())?;
                 visited.push(&decl.key);
                 self = Self {
+                    state,
                     carrier: Carrier::Captured(&decl.ty),
                     site: &decl.type_site,
                     settings: &decl.settings,

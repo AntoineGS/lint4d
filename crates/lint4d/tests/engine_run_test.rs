@@ -162,6 +162,10 @@ fn prepared_include_diagnostic_falls_back_without_publishing_a_fake_location() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            pascal_project::ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "App".to_string(),
             declared_name: "App".to_string(),
@@ -240,6 +244,10 @@ fn prepared_include_diagnostic_scope_uses_original_coordinates() {
         .position(|window| window == directive)
         .expect("include directive");
     let project = ResolvedProject {
+        conditional_contexts: std::collections::HashMap::from([(
+            root_id.clone(),
+            pascal_project::ConditionalContext::default(),
+        )]),
         root: ResolvedUnit {
             requested_name: "Main".to_string(),
             declared_name: "Main".to_string(),

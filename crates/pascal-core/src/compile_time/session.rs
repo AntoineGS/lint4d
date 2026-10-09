@@ -6,8 +6,9 @@ use crate::conditional::{
     ConstantValue, DirectiveKind, ExpressionQuery, SourceOrder, Truth,
 };
 use crate::{
-    CancellationToken, IncludeResolveRequest, LoadedSource, Resolution, ResolutionObservation,
-    ResolutionOutcome, ResolvedUnit, ResolverError, UnitResolveRequest,
+    AdmittedCapabilityOutcome, AdmittedCapabilityReports, CancellationToken, IncludeResolveRequest,
+    LoadedSource, Resolution, ResolutionObservation, ResolutionOutcome, ResolvedUnit,
+    ResolverError, UnitResolveRequest,
 };
 use pascal_project::ConditionalContext;
 use std::sync::Arc;
@@ -154,6 +155,42 @@ fn provider_owned_payload(provider: &ProviderSource) -> Result<usize, ResolverEr
 }
 
 pub trait CompileTimeResolver {
+    /// Returned reports are an explicit owned capability. Defaults never call
+    /// legacy callbacks; bounded adapters opt in with admitted constructors.
+    fn unit_report_capability(
+        &mut self,
+        _request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError> {
+        let reason = "no admitted provider capability";
+        budget
+            .charge(1, reason.len(), reason.len())
+            .map_err(|r| resolver_error(r, budget))?;
+        Ok(AdmittedCapabilityOutcome::new(
+            Resolution::Unavailable {
+                reason: reason.into(),
+            },
+            AdmittedCapabilityReports::copy(&[], &[], budget)?,
+        ))
+    }
+    fn include_capability(
+        &mut self,
+        _request: IncludeResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+        let reason = "no admitted include capability";
+        budget
+            .charge(1, reason.len(), reason.len())
+            .map_err(|r| resolver_error(r, budget))?;
+        Ok(AdmittedCapabilityOutcome::new(
+            Resolution::Unavailable {
+                reason: reason.into(),
+            },
+            AdmittedCapabilityReports::copy(&[], &[], budget)?,
+        ))
+    }
     /// Compile-time capability entrypoint. Never delegates to an unbounded legacy
     /// callback. Adapters without this capability fail closed; legacy lookup
     /// remains available for non-admitted callers until its store bridge exists.
@@ -942,17 +979,9 @@ fn analyze_source_with_providers_inner(
     })
 }
 
-fn admit_observation(
+pub(crate) fn observation_payload(
     observation: &ResolutionObservation,
-    budget: &mut CompileTimeBudget<'_>,
-) -> Result<(), ResolverError> {
-    let n = observation_payload(observation)?;
-    budget
-        .charge(1, n, n)
-        .map_err(|r| resolver_error(r, budget))
-}
-
-fn observation_payload(observation: &ResolutionObservation) -> Result<usize, ResolverError> {
+) -> Result<usize, ResolverError> {
     let mut total = size_of::<ResolutionObservation>();
     let mut visit = |n| {
         total = total.checked_add(n).ok_or("observation payload overflow")?;
@@ -997,6 +1026,65 @@ fn observation_payload(observation: &ResolutionObservation) -> Result<usize, Res
     Ok(total)
 }
 
+fn move_report_vector<T>(
+    target: &mut AdmittedOwned<Vec<T>>,
+    incoming: AdmittedOwned<Vec<T>>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    if !target.is_admitted_by(budget) || !incoming.is_admitted_by(budget) {
+        return Err(ResolverError::InvalidRequest(
+            "foreign-root child report".into(),
+        ));
+    }
+    budget
+        .charge(incoming.len(), 0, 0)
+        .map_err(|r| resolver_error(r, budget))?;
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    if target.is_empty() && target.capacity() == 0 {
+        return target
+            .move_field(incoming, budget, |values, incoming| *values = incoming)
+            .map_err(|r| resolver_error(r, budget));
+    }
+    let capacity_bytes = |count: usize| {
+        count
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| ResolverError::InvalidRequest("child report backing overflow".into()))
+    };
+    let source_backing = capacity_bytes(incoming.capacity())?;
+    let needed = target
+        .len()
+        .checked_add(incoming.len())
+        .ok_or_else(|| ResolverError::InvalidRequest("child report count overflow".into()))?;
+    if needed > target.capacity() {
+        let old_backing = capacity_bytes(target.capacity())?;
+        let new_backing = capacity_bytes(needed)?;
+        target
+            .grow(budget, 0, 0, new_backing, |values| {
+                let mut receiving = Vec::with_capacity(needed);
+                receiving.append(values);
+                let old = std::mem::replace(values, receiving);
+                drop(old);
+            })
+            .map_err(|r| resolver_error(r, budget))?;
+        target
+            .retire_storage(old_backing)
+            .map_err(|r| resolver_error(r, budget))?;
+    }
+    target
+        .move_field(incoming, budget, |values, mut incoming| {
+            values.append(&mut incoming)
+        })
+        .map_err(|r| resolver_error(r, budget))?;
+    // This source field's named Vec backing died inside the consuming append;
+    // payload credits stay in target. No payload-sized or ledger-delta refund.
+    target
+        .retire_storage(source_backing)
+        .map_err(|r| resolver_error(r, budget))
+}
+
+#[cfg(test)]
 fn append_observations(
     target: &mut AdmittedOwned<Vec<ResolutionObservation>>,
     incoming: &[ResolutionObservation],
@@ -1022,6 +1110,7 @@ fn append_observations(
         .map_err(|r| resolver_error(r, budget))?
 }
 
+#[cfg(test)]
 fn append_warnings(
     target: &mut AdmittedOwned<Vec<String>>,
     incoming: &[String],
@@ -1299,7 +1388,7 @@ impl ProviderEngine<'_, '_> {
                 self.providers.queries += 1;
                 let pending = &state.interfaces[index].pending;
                 let outcome = self.budget.external(|budget| {
-                    self.resolver.unit_capability(
+                    self.resolver.unit_report_capability(
                         UnitResolveRequest {
                             requested_name: &pending.identity.name,
                             importer_path: &pending.importer_path,
@@ -1309,10 +1398,10 @@ impl ProviderEngine<'_, '_> {
                         self.cancel,
                     )
                 })?;
-                append_observations(self.observations, &outcome.observations, self.budget)?;
-                append_warnings(self.warnings, &outcome.warnings, self.budget)?;
+                let (result, reports) = outcome.into_parts();
+                reports.consume_into(self.observations, self.warnings, self.budget)?;
                 state.interfaces[index].attempted = true;
-                match outcome.result {
+                match result {
                     Resolution::Found(provider) => {
                         if !provider.is_admitted_by(self.budget)
                             || !provider.valid_backing(self.budget)
@@ -1692,8 +1781,19 @@ impl ProviderEngine<'_, '_> {
         });
         self.providers.active.value_mut().pop();
         let mut analysis = result?;
-        append_observations(self.observations, &analysis.observations, self.budget)?;
-        append_warnings(self.warnings, &analysis.warnings, self.budget)?;
+        let empty_observations = self
+            .budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let empty_warnings = self
+            .budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let observations =
+            std::mem::replace(&mut analysis.value_mut().observations, empty_observations);
+        let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
+        move_report_vector(self.observations, observations, self.budget)?;
+        move_report_vector(self.warnings, warnings, self.budget)?;
         if !analysis.facts().interface_complete {
             return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
         }
@@ -1831,26 +1931,24 @@ impl RootSession<'_, '_> {
                 size_of::<IncludeOccurrence>() + self.root.id.as_str().len(),
             )
             .map_err(|r| resolver_error(r, &self.budget))?;
-        let outcome = if directive.activity != Truth::True {
-            ResolutionOutcome {
-                result: Resolution::Unavailable {
+        let (mut result, reports) = if directive.activity != Truth::True {
+            (
+                Resolution::Unavailable {
                     reason: "include conditional activity is unknown".into(),
                 },
-                observations: vec![],
-                warnings: vec![],
-            }
+                None,
+            )
         } else if self.active_sources.len() > self.resolver.max_include_depth() {
-            ResolutionOutcome {
-                result: Resolution::Incomplete {
+            (
+                Resolution::Incomplete {
                     reason: "include depth limit reached".into(),
                     candidates: vec![],
                 },
-                observations: vec![],
-                warnings: vec![],
-            }
+                None,
+            )
         } else if let Some(name) = name.as_deref() {
-            self.budget.external(|budget| {
-                self.resolver.include(
+            let outcome = self.budget.external(|budget| {
+                self.resolver.include_capability(
                     IncludeResolveRequest {
                         including_path,
                         byte_range: anchor.range.clone(),
@@ -1860,39 +1958,20 @@ impl RootSession<'_, '_> {
                     budget,
                     self.cancel,
                 )
-            })?
+            })?;
+            let (result, reports) = outcome.into_parts();
+            (result, Some(reports))
         } else {
-            ResolutionOutcome {
-                result: Resolution::Unavailable {
+            (
+                Resolution::Unavailable {
                     reason: "include has no statically known name".into(),
                 },
-                observations: vec![],
-                warnings: vec![],
-            }
-        };
-        let ResolutionOutcome {
-            mut result,
-            observations,
-            warnings,
-        } = outcome;
-        self.budget
-            .charge(
-                observations.len() + warnings.len(),
-                0,
-                observations.len() * size_of::<ResolutionObservation>()
-                    + warnings.len() * size_of::<String>(),
+                None,
             )
-            .map_err(|r| resolver_error(r, &self.budget))?;
-        for observation in &observations {
-            admit_observation(observation, &mut self.budget)?;
+        };
+        if let Some(reports) = reports {
+            reports.consume_into(&mut self.observations, &mut self.warnings, self.budget)?;
         }
-        for warning in &warnings {
-            self.budget
-                .charge(1, warning.len(), warning.len())
-                .map_err(|r| resolver_error(r, &self.budget))?;
-        }
-        append_observations(&mut self.observations, &observations, self.budget)?;
-        append_warnings(&mut self.warnings, &warnings, self.budget)?;
         if let Resolution::Found(child) = &result {
             if self.active_sources.contains(&child.id) {
                 result = Resolution::Incomplete {
@@ -3102,6 +3181,20 @@ mod tests {
             child: LoadedSource,
         }
         impl CompileTimeResolver for Includes {
+            fn include_capability(
+                &mut self,
+                request: IncludeResolveRequest<'_>,
+                budget: &mut CompileTimeBudget<'_>,
+                cancel: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+                // Explicit bounded source-only fixture, with no legacy report
+                // allocation to wrap after the fact.
+                let result = self.include(request, budget, cancel)?.result;
+                Ok(AdmittedCapabilityOutcome::new(
+                    result,
+                    AdmittedCapabilityReports::copy(&[], &[], budget)?,
+                ))
+            }
             fn include(
                 &mut self,
                 request: IncludeResolveRequest<'_>,

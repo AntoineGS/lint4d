@@ -156,7 +156,78 @@ impl Fixture {
         analyze_source(&root, &context, self, limits, cancel)
     }
 }
+impl Fixture {
+    fn include_result(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<Resolution<LoadedSource>, ResolverError> {
+        let log_bytes = 2 * request.requested_name.len()
+            + request.including_path.as_os_str().len()
+            + std::mem::size_of::<String>()
+            + std::mem::size_of::<(std::path::PathBuf, std::ops::Range<usize>, String)>()
+            + std::mem::size_of::<AdmittedOwned<()>>();
+        let log = budget
+            .admit_owned(1, request.requested_name.len(), log_bytes, || ())
+            .map_err(|_| ResolverError::InvalidRequest("fixture include log admission".into()))?;
+        self.callback_logs.reserve_exact(1);
+        self.callback_logs.push(log);
+        self.reads.reserve_exact(1);
+        self.requests.reserve_exact(1);
+        self.reads.push(request.requested_name.into());
+        self.requests.push((
+            request.including_path.into(),
+            request.byte_range.clone(),
+            request.requested_name.into(),
+        ));
+        Ok(
+            if let Some(failure) = self.failures.get(request.requested_name) {
+                failure.clone()
+            } else if self.denied.contains(request.requested_name) {
+                Resolution::Unavailable {
+                    reason: "denied fixture include".into(),
+                }
+            } else {
+                self.includes
+                    .get(request.requested_name)
+                    .cloned()
+                    .map(Resolution::Found)
+                    .unwrap_or_else(|| Resolution::Unavailable {
+                        reason: "missing fixture include".into(),
+                    })
+            },
+        )
+    }
+}
 impl CompileTimeResolver for Fixture {
+    fn unit_report_capability(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<pascal_core::AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError> {
+        // This fixture's admitted provider callback has no reports. Explicit
+        // opt-in forwards its proven bounded result, never a legacy default.
+        let result = self.unit_capability(request, budget, cancel)?.result;
+        Ok(pascal_core::AdmittedCapabilityOutcome::new(
+            result,
+            pascal_core::AdmittedCapabilityReports::copy(&[], &[], budget)?,
+        ))
+    }
+    fn include_capability(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<pascal_core::AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+        let result = self.include_result(request, budget, cancel)?;
+        // Borrow the existing bounded fixture warnings: no pre-admission clone
+        // of the plain callback report and no old manual warning shadow charge.
+        let reports =
+            pascal_core::AdmittedCapabilityReports::copy(&[], &self.include_warnings, budget)?;
+        Ok(pascal_core::AdmittedCapabilityOutcome::new(result, reports))
+    }
     fn unit_capability(
         &mut self,
         request: UnitResolveRequest<'_>,
@@ -221,39 +292,7 @@ impl CompileTimeResolver for Fixture {
         budget: &mut CompileTimeBudget<'_>,
         _: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
-        let log_bytes = 2 * request.requested_name.len()
-            + request.including_path.as_os_str().len()
-            + std::mem::size_of::<String>()
-            + std::mem::size_of::<(std::path::PathBuf, std::ops::Range<usize>, String)>()
-            + std::mem::size_of::<AdmittedOwned<()>>();
-        let log = budget
-            .admit_owned(1, request.requested_name.len(), log_bytes, || ())
-            .map_err(|_| ResolverError::InvalidRequest("fixture include log admission".into()))?;
-        self.callback_logs.reserve_exact(1);
-        self.callback_logs.push(log);
-        self.reads.reserve_exact(1);
-        self.requests.reserve_exact(1);
-        self.reads.push(request.requested_name.into());
-        self.requests.push((
-            request.including_path.into(),
-            request.byte_range.clone(),
-            request.requested_name.into(),
-        ));
-        let result = if let Some(failure) = self.failures.get(request.requested_name) {
-            failure.clone()
-        } else if self.denied.contains(request.requested_name) {
-            Resolution::Unavailable {
-                reason: "denied fixture include".into(),
-            }
-        } else {
-            self.includes
-                .get(request.requested_name)
-                .cloned()
-                .map(Resolution::Found)
-                .unwrap_or_else(|| Resolution::Unavailable {
-                    reason: "missing fixture include".into(),
-                })
-        };
+        let result = self.include_result(request, budget, &pascal_core::NoCancellation)?;
         Ok(ResolutionOutcome {
             result,
             observations: vec![],

@@ -10,6 +10,18 @@ use support::{Fixture, activity, context};
 fn actual_provider_callback_unwind_refunds_dead_compilation_not_live_cache() {
     struct PanickingProvider(Fixture);
     impl CompileTimeResolver for PanickingProvider {
+        fn unit_report_capability(
+            &mut self,
+            request: UnitResolveRequest<'_>,
+            budget: &mut CompileTimeBudget<'_>,
+            cancel: &dyn pascal_core::CancellationToken,
+        ) -> Result<
+            pascal_core::AdmittedCapabilityOutcome<AdmittedProviderSource>,
+            pascal_core::ResolverError,
+        > {
+            let _returned = self.0.unit_report_capability(request, budget, cancel)?;
+            panic!("actual callback unwind after admitted return/cache allocation");
+        }
         fn include(
             &mut self,
             request: pascal_core::IncludeResolveRequest<'_>,

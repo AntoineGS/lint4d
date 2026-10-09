@@ -645,6 +645,9 @@ impl<T> AdmittedOwned<T> {
         if !budget.owns(&self.reservation) {
             return Err(IncompleteReason::MalformedSource);
         }
+        // Prior private construction bindings have ended. Seal their exact
+        // invoices before named backing replacement can retire an old buffer.
+        self.seal_increments()?;
         let mut credit = budget.mint_retention(work, bytes, retained)?;
         self.reservation.retained += credit.retained;
         credit.retained = 0;

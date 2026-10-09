@@ -749,6 +749,240 @@ pub struct AdmittedReportObservations {
     observations: Vec<ResolutionObservation>,
     _owners: ReportFieldOwners,
 }
+
+#[derive(Debug)]
+struct CapabilityReportField<T> {
+    values: Vec<T>,
+    owners: ReportFieldOwners,
+}
+
+#[derive(Debug)]
+struct CapabilityReportDrain<T> {
+    values: std::vec::IntoIter<T>,
+    payloads: std::vec::IntoIter<Option<ReportCredit>>,
+    _capacity: Option<ReportCredit>,
+    _receipt_capacity: Option<ReportCredit>,
+}
+
+/// Independently admitted returned report buffers. Borrowing cannot detach
+/// their payload from its receipts; consuming transfer is same-root only.
+#[derive(Debug)]
+pub struct AdmittedCapabilityReports {
+    observations: AdmittedOwned<CapabilityReportField<ResolutionObservation>>,
+    warnings: AdmittedOwned<CapabilityReportField<String>>,
+}
+
+#[derive(Debug)]
+pub struct AdmittedCapabilityOutcome<T> {
+    result: Resolution<T>,
+    reports: AdmittedCapabilityReports,
+}
+impl<T> AdmittedCapabilityOutcome<T> {
+    pub fn new(result: Resolution<T>, reports: AdmittedCapabilityReports) -> Self {
+        Self { result, reports }
+    }
+    pub fn result(&self) -> &Resolution<T> {
+        &self.result
+    }
+    pub fn reports(&self) -> &AdmittedCapabilityReports {
+        &self.reports
+    }
+    pub fn into_parts(self) -> (Resolution<T>, AdmittedCapabilityReports) {
+        (self.result, self.reports)
+    }
+}
+
+impl AdmittedCapabilityReports {
+    /// Clone each legitimately required returned payload only after its own
+    /// invoice and receiving peaks. Persistent reports retain separate owners.
+    pub fn copy(
+        observations: &[ResolutionObservation],
+        warnings: &[String],
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, ResolverError> {
+        Self::copy_with(observations, warnings, budget, Clone::clone, Clone::clone)
+    }
+
+    fn copy_with(
+        observations: &[ResolutionObservation],
+        warnings: &[String],
+        budget: &mut CompileTimeBudget<'_>,
+        mut observation: impl FnMut(&ResolutionObservation) -> ResolutionObservation,
+        mut warning: impl FnMut(&String) -> String,
+    ) -> Result<Self, ResolverError> {
+        let mut obs = budget
+            .admit_owned(0, 0, 0, || CapabilityReportField {
+                values: Vec::new(),
+                owners: ReportFieldOwners::default(),
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let mut warns = budget
+            .admit_owned(0, 0, 0, || CapabilityReportField {
+                values: Vec::new(),
+                owners: ReportFieldOwners::default(),
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        for input in observations {
+            let payload = crate::compile_time::observation_payload(input)?
+                - std::mem::size_of::<ResolutionObservation>();
+            let field = obs.value_mut();
+            field.owners.record(
+                &mut field.values,
+                budget,
+                payload,
+                || Ok(observation(input)),
+                |_, _| ReportAction::Append,
+            )?;
+        }
+        for input in warnings {
+            let field = warns.value_mut();
+            field.owners.record(
+                &mut field.values,
+                budget,
+                input.len(),
+                || Ok(warning(input)),
+                |_, _| ReportAction::Append,
+            )?;
+        }
+        Ok(Self {
+            observations: obs,
+            warnings: warns,
+        })
+    }
+
+    pub fn observations(&self) -> &[ResolutionObservation] {
+        &self.observations.values
+    }
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings.values
+    }
+
+    pub(crate) fn consume_into(
+        self,
+        observations: &mut AdmittedOwned<Vec<ResolutionObservation>>,
+        warnings: &mut AdmittedOwned<Vec<String>>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        // Validate both fields before any destination mutation. No callback
+        // result/provider/cache receipt is treated as report storage.
+        if !observations.is_admitted_by(budget)
+            || !warnings.is_admitted_by(budget)
+            || !self.observations.is_admitted_by(budget)
+            || !self.warnings.is_admitted_by(budget)
+        {
+            return Err(ResolverError::InvalidRequest(
+                "foreign-root capability report".into(),
+            ));
+        }
+        consume_report_field(self.observations, observations, budget)?;
+        consume_report_field(self.warnings, warnings, budget)
+    }
+}
+
+fn consume_report_field<T: PartialEq>(
+    mut source: AdmittedOwned<CapabilityReportField<T>>,
+    target: &mut AdmittedOwned<Vec<T>>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    let refusal = |r, b: &CompileTimeBudget<'_>| crate::compile_time::resolver_error(r, b);
+    if !source.is_admitted_by(budget)
+        || !target.is_admitted_by(budget)
+        || source.owners.credits().any(|c| !c.is_admitted_by(budget))
+    {
+        return Err(ResolverError::InvalidRequest(
+            "foreign-root report field".into(),
+        ));
+    }
+    let count = source.values.len();
+    let work = count.saturating_mul(target.len().saturating_add(count).saturating_add(1));
+    budget.charge(work, 0, 0).map_err(|r| refusal(r, budget))?;
+    if count == 0 {
+        return Ok(());
+    }
+    let unique = source
+        .values
+        .iter()
+        .enumerate()
+        .filter(|(i, value)| !target.contains(value) && !source.values[..*i].contains(value))
+        .count();
+    if target.is_empty() && target.capacity() == 0 && unique == count {
+        // Fold only named report payload/backing receipts into this actual
+        // source owner, then hand off its whole Vec without reallocating it.
+        while let Some(credit) = source.value_mut().owners.payloads.pop() {
+            let credit = credit.expect("returned report entries are admitted");
+            source
+                .move_field(credit, budget, |_, _| ())
+                .map_err(|r| refusal(r, budget))?;
+        }
+        let slots = std::mem::take(&mut source.value_mut().owners.payloads);
+        let slot_credit = source.value_mut().owners.receipt_capacity.take();
+        drop(slots);
+        drop(slot_credit);
+        if let Some(credit) = source.value_mut().owners.capacity.take() {
+            source
+                .move_field(credit, budget, |_, _| ())
+                .map_err(|r| refusal(r, budget))?;
+        }
+        target
+            .move_field(source, budget, |values, field| *values = field.values)
+            .map_err(|r| refusal(r, budget))?;
+        return Ok(());
+    }
+    let needed = target
+        .len()
+        .checked_add(unique)
+        .ok_or_else(|| ResolverError::InvalidRequest("report receiving count overflow".into()))?;
+    if needed > target.capacity() {
+        let old = target
+            .capacity()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| ResolverError::InvalidRequest("report old backing overflow".into()))?;
+        let new = needed
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| {
+                ResolverError::InvalidRequest("report receiving backing overflow".into())
+            })?;
+        target
+            .grow(budget, 0, 0, new, |values| {
+                let mut receiving = Vec::with_capacity(needed);
+                receiving.append(values);
+                let old = std::mem::replace(values, receiving);
+                drop(old);
+            })
+            .map_err(|r| refusal(r, budget))?;
+        target.retire_storage(old).map_err(|r| refusal(r, budget))?;
+    }
+    let mut drain = source
+        .map_value(budget, |field| CapabilityReportDrain {
+            values: field.values.into_iter(),
+            payloads: field.owners.payloads.into_iter(),
+            _capacity: field.owners.capacity,
+            _receipt_capacity: field.owners.receipt_capacity,
+        })
+        .map_err(|r| refusal(r, budget))?;
+    while let Some(value) = drain.value_mut().values.next() {
+        let credit = drain
+            .value_mut()
+            .payloads
+            .next()
+            .flatten()
+            .expect("named returned report payload");
+        if target.contains(&value) {
+            drop(value);
+            drop(credit);
+            continue;
+        }
+        // The consuming transform moves the actual value together with its
+        // exact named receipt, not an invoice inferred from payload length.
+        let entry = credit
+            .map_value(budget, |_| value)
+            .map_err(|r| refusal(r, budget))?;
+        target
+            .move_field(entry, budget, |values, value| values.push(value))
+            .map_err(|r| refusal(r, budget))?;
+    }
+    Ok(()) // drain destroys actual old buffers before their capacity receipts
+}
 impl AdmittedReportObservations {
     pub fn observations(&self) -> &[ResolutionObservation] {
         &self.observations
@@ -911,6 +1145,45 @@ pub struct UnitResolver<S> {
     compile_time_accounting: crate::compile_time::BudgetSnapshot,
     compile_time_store: Option<StoreRoot>,
     compile_time_caches: Vec<StoreRoot>,
+    callback_reports: Option<CallbackReports>,
+}
+
+enum CallbackReports {
+    Requested,
+    Built(AdmittedCapabilityReports),
+}
+struct CallbackReportCall<'a, S: SourceStore> {
+    resolver: &'a mut UnitResolver<S>,
+    previous: Option<CallbackReports>,
+}
+impl<S: SourceStore> std::ops::Deref for CallbackReportCall<'_, S> {
+    type Target = UnitResolver<S>;
+    fn deref(&self) -> &Self::Target {
+        self.resolver
+    }
+}
+impl<S: SourceStore> std::ops::DerefMut for CallbackReportCall<'_, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.resolver
+    }
+}
+impl<S: SourceStore> Drop for CallbackReportCall<'_, S> {
+    fn drop(&mut self) {
+        self.resolver.callback_reports = self.previous.take();
+    }
+}
+impl<S: SourceStore> CallbackReportCall<'_, S> {
+    fn finish<T>(
+        self,
+        result: Resolution<T>,
+    ) -> Result<AdmittedCapabilityOutcome<T>, ResolverError> {
+        let Some(CallbackReports::Built(reports)) = self.resolver.callback_reports.take() else {
+            return Err(ResolverError::InvalidRequest(
+                "callback report capability was not constructed".into(),
+            ));
+        };
+        Ok(AdmittedCapabilityOutcome::new(result, reports))
+    }
 }
 
 #[derive(Default)]
@@ -958,6 +1231,13 @@ impl<S: SourceStore> Drop for StoreCall<'_, S> {
 }
 
 impl<S: SourceStore> UnitResolver<S> {
+    fn callback_report_call(&mut self) -> CallbackReportCall<'_, S> {
+        let previous = self.callback_reports.replace(CallbackReports::Requested);
+        CallbackReportCall {
+            resolver: self,
+            previous,
+        }
+    }
     fn store_call<'b>(
         &'b mut self,
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
@@ -1558,6 +1838,7 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_accounting: Default::default(),
             compile_time_store: None,
             compile_time_caches: Vec::new(),
+            callback_reports: None,
         }
     }
 
@@ -2414,6 +2695,28 @@ impl<S: SourceStore> UnitResolver<S> {
                 }
             }
         };
+        if self.callback_reports.is_some() {
+            let mut budget = self.store_budget(cancel).ok_or_else(|| {
+                ResolverError::InvalidRequest(
+                    "returned report requires an active admitted store call".into(),
+                )
+            })?;
+            let reports = AdmittedCapabilityReports::copy(
+                &self.report.observations[before_observations..],
+                &self.report.warnings[before_warnings..],
+                &mut budget,
+            )
+            .map_err(|error| {
+                self.report.complete = false;
+                error
+            })?;
+            self.callback_reports = Some(CallbackReports::Built(reports));
+            return Ok(ResolutionOutcome {
+                result,
+                observations: Vec::new(),
+                warnings: Vec::new(),
+            });
+        }
         Ok(ResolutionOutcome {
             result,
             observations: self.report.observations[before_observations..].to_vec(),
@@ -4615,6 +4918,30 @@ impl<S: SourceStore> UnitResolver<S> {
 }
 
 impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S> {
+    fn include_capability(
+        &mut self,
+        request: IncludeResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+        let mut call = self.callback_report_call();
+        let outcome =
+            crate::compile_time::CompileTimeResolver::include(&mut *call, request, budget, cancel)?;
+        call.finish(outcome.result)
+    }
+    fn unit_report_capability(
+        &mut self,
+        request: UnitResolveRequest<'_>,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedCapabilityOutcome<crate::compile_time::AdmittedProviderSource>, ResolverError>
+    {
+        let mut call = self.callback_report_call();
+        let outcome = crate::compile_time::CompileTimeResolver::unit_capability(
+            &mut *call, request, budget, cancel,
+        )?;
+        call.finish(outcome.result)
+    }
     fn unit_capability(
         &mut self,
         request: UnitResolveRequest<'_>,
@@ -6133,6 +6460,510 @@ mod tests {
     }
 
     #[test]
+    fn returned_report_physical_callbacks_own_copies_and_transfer_without_copy_work() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for unit in [false, true] {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let reports = if unit {
+                let outcome = CompileTimeResolver::unit_report_capability(
+                    &mut resolver,
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: "Other",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+                let (result, reports) = outcome.into_parts();
+                assert!(matches!(result, Resolution::Found(_)));
+                drop(result);
+                reports
+            } else {
+                let outcome = CompileTimeResolver::include_capability(
+                    &mut resolver,
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+                let (result, reports) = outcome.into_parts();
+                assert!(matches!(result, Resolution::Found(_)));
+                drop(result);
+                reports
+            };
+            assert!(!reports.observations().is_empty());
+            assert_ne!(
+                reports.observations().as_ptr(),
+                resolver.report.observations.as_ptr(),
+                "legitimate independent callback copy"
+            );
+            let vector = reports.observations().as_ptr();
+            let path = match reports.observations().last().unwrap() {
+                ResolutionObservation::Payload { path, .. } => {
+                    path.as_os_str().as_encoded_bytes().as_ptr()
+                }
+                _ => panic!("physical callback payload"),
+            };
+            let mut observations = budget.admit_owned(0, 0, 0, Vec::new).unwrap();
+            let mut warnings = budget.admit_owned(0, 0, 0, Vec::new).unwrap();
+            let before = budget.snapshot();
+            reports
+                .consume_into(&mut observations, &mut warnings, &mut budget)
+                .unwrap();
+            assert_eq!(observations.as_ptr(), vector);
+            assert!(
+                matches!(observations.last(), Some(ResolutionObservation::Payload { path: p, .. }) if p.as_os_str().as_encoded_bytes().as_ptr() == path)
+            );
+            assert_eq!(budget.snapshot().byte_work, before.byte_work);
+            drop(resolver);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            assert!(live.retained_bytes > baseline);
+            drop(observations);
+            drop(warnings);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn returned_report_actual_root_and_provider_engine_preserve_callback_backing() {
+        use crate::compile_time::{
+            AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver, ProviderSource,
+        };
+        struct Recording {
+            inner: UnitResolver<FilesystemSourceStore>,
+            observation: Option<usize>,
+            path: Option<usize>,
+            warning: Option<usize>,
+        }
+        impl Recording {
+            fn capture(&mut self, reports: &AdmittedCapabilityReports) {
+                if !reports.observations().is_empty() {
+                    self.observation = Some(reports.observations().as_ptr() as usize);
+                    self.path = reports.observations().iter().find_map(|o| match o {
+                        ResolutionObservation::Payload { path, .. }
+                        | ResolutionObservation::Candidate { path, .. } => {
+                            Some(path.as_os_str().as_encoded_bytes().as_ptr() as usize)
+                        }
+                        _ => None,
+                    });
+                }
+                self.warning = reports.warnings().first().map(|s| s.as_ptr() as usize);
+            }
+        }
+        impl CompileTimeResolver for Recording {
+            fn include_capability(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+                let out = self.inner.include_capability(r, b, c)?;
+                self.capture(out.reports());
+                Ok(out)
+            }
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                let out = self.inner.unit_report_capability(r, b, c)?;
+                self.capture(out.reports());
+                Ok(out)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                self.inner.unit(r, b, c)
+            }
+        }
+        for scenario in 0..3 {
+            let unit = scenario != 0;
+            let nested = scenario == 2;
+            let (dir, root_path, mut inner) = physical_report_resolver();
+            let text = if unit {
+                "unit Main; interface uses Other; {$IF SizeOf(Other.T)=8}{$DEFINE HIT}{$ENDIF} implementation end."
+            } else {
+                "unit Main; interface {$I bad.inc} implementation end."
+            };
+            fs::write(&root_path, text).unwrap();
+            fs::write(
+                dir.path().join("Other.pas"),
+                "unit Other; interface type T=Int64; implementation end.",
+            )
+            .unwrap();
+            if nested {
+                fs::write(
+                    dir.path().join("Other.pas"),
+                    "unit Other; interface {$I inside.inc} implementation end.",
+                )
+                .unwrap();
+                fs::write(dir.path().join("inside.inc"), "type T=Int64;").unwrap();
+            }
+            fs::create_dir(dir.path().join("bad.inc")).unwrap();
+            inner.context.conditional_context = pascal_project::ConditionalContext::default()
+                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                .with_layout(pascal_project::LayoutContext {
+                    platform: Some(pascal_project::LayoutPlatform::Win32),
+                    defaults: Default::default(),
+                });
+            inner.context.library_conditional_context = inner.context.conditional_context.clone();
+            let context = inner.context.conditional_context.clone();
+            let root = inner
+                .load_source(&root_path, None, SourceKind::Unit, &NoCancellation)
+                .unwrap();
+            let mut recording = Recording {
+                inner,
+                observation: None,
+                path: None,
+                warning: None,
+            };
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let analysis = crate::compile_time::analyze_source_in_session(
+                &root,
+                &context,
+                &mut recording,
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+            if !nested {
+                assert_eq!(
+                    Some(analysis.observations.as_ptr() as usize),
+                    recording.observation
+                );
+            }
+            assert!(analysis.observations.iter().any(|o| match o {
+                ResolutionObservation::Payload { path, .. }
+                | ResolutionObservation::Candidate { path, .. } =>
+                    Some(path.as_os_str().as_encoded_bytes().as_ptr() as usize) == recording.path,
+                _ => false,
+            }));
+            if unit {
+                assert!(analysis.root.directives.iter().any(
+                    |d| d.body == "DEFINE HIT" && d.activity == crate::conditional::Truth::True
+                ));
+            } else {
+                assert_eq!(
+                    analysis.warnings.first().map(|s| s.as_ptr() as usize),
+                    recording.warning
+                );
+                assert!(!analysis.warnings.is_empty());
+            }
+            drop(root);
+            drop(recording);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            assert!(live.retained_bytes > baseline);
+            drop(analysis);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn returned_report_drop_and_dedup_refund_named_invoices_not_persistent_or_source() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        fn invoice<T>(
+            field: &AdmittedOwned<CapabilityReportField<T>>,
+            body: impl Fn(&T) -> usize,
+        ) -> usize {
+            std::mem::size_of::<AdmittedOwned<CapabilityReportField<T>>>()
+                + field.owners.capacity.as_ref().map_or(0, |_| {
+                    std::mem::size_of::<ReportCredit>()
+                        + field.values.capacity() * std::mem::size_of::<T>()
+                })
+                + field.owners.receipt_capacity.as_ref().map_or(0, |_| {
+                    std::mem::size_of::<ReportCredit>()
+                        + field.owners.payloads.capacity()
+                            * std::mem::size_of::<Option<ReportCredit>>()
+                })
+                + field
+                    .values
+                    .iter()
+                    .map(|v| std::mem::size_of::<ReportCredit>() + body(v))
+                    .sum::<usize>()
+        }
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let outcome = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (source, reports) = outcome.into_parts();
+        let receipt = invoice(&reports.observations, |o| {
+            crate::compile_time::observation_payload(o).unwrap()
+                - std::mem::size_of::<ResolutionObservation>()
+        }) + invoice(&reports.warnings, String::len);
+        let before = budget.snapshot();
+        let persistent = resolver.report.observations.as_ptr();
+        drop(reports);
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            receipt
+        );
+        assert_eq!(before.work, budget.snapshot().work);
+        assert_eq!(before.byte_work, budget.snapshot().byte_work);
+        assert_eq!(resolver.report.observations.as_ptr(), persistent);
+        let Resolution::Found(source) = source else {
+            panic!("physical returned source")
+        };
+        assert!(source.analysis_bytes().starts_with(b"{physical"));
+        let observations = resolver.report.observations.clone(); // caller-owned legacy input to explicit copy constructor
+        let mut target = budget.admit_owned(0, 0, 0, Vec::new).unwrap();
+        let mut warnings = budget.admit_owned(0, 0, 0, Vec::new).unwrap();
+        let first = AdmittedCapabilityReports::copy(
+            &observations,
+            &["physical warning".into()],
+            &mut budget,
+        )
+        .unwrap();
+        first
+            .consume_into(&mut target, &mut warnings, &mut budget)
+            .unwrap();
+        let pointers = (target.as_ptr(), warnings.as_ptr(), warnings[0].as_ptr());
+        let retained = budget.snapshot().retained_bytes;
+        let second = AdmittedCapabilityReports::copy(
+            &observations,
+            &["physical warning".into()],
+            &mut budget,
+        )
+        .unwrap();
+        let spent = budget.snapshot();
+        second
+            .consume_into(&mut target, &mut warnings, &mut budget)
+            .unwrap();
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            retained,
+            "duplicate payload/temporary buffers die; destination capacity stays"
+        );
+        assert_eq!(
+            (target.as_ptr(), warnings.as_ptr(), warnings[0].as_ptr()),
+            pointers
+        );
+        assert_eq!(
+            budget.snapshot().byte_work,
+            spent.byte_work,
+            "dedup transfer adds no copy work"
+        );
+        assert!(budget.snapshot().work >= spent.work);
+        // Mix duplicate and genuinely new reports to exercise receiving growth.
+        let mixed = AdmittedCapabilityReports::copy(
+            &observations,
+            &["physical warning".into(), "new warning".into()],
+            &mut budget,
+        )
+        .unwrap();
+        let new_pointer = mixed.warnings()[1].as_ptr();
+        mixed
+            .consume_into(&mut target, &mut warnings, &mut budget)
+            .unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[1].as_ptr(), new_pointer);
+        assert_eq!(warnings[0].as_ptr(), pointers.2);
+    }
+
+    #[test]
+    fn returned_report_precopy_refusal_partial_cancel_unwind_and_foreign_root() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for kind in 0..3 {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let cancel = AtomicBool::new(false);
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &cancel);
+            let out = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &cancel,
+                )
+                .unwrap();
+            let (_, reports) = out.into_parts();
+            let before = budget.snapshot();
+            let clones = std::cell::Cell::new(0);
+            if kind == 0 {
+                budget.constrain_retained(before.retained_bytes).unwrap();
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                AdmittedCapabilityReports::copy_with(
+                    reports.observations(),
+                    reports.warnings(),
+                    &mut budget,
+                    |o| {
+                        clones.set(clones.get() + 1);
+                        if kind == 2 {
+                            panic!("returned report copy constructor unwind")
+                        }
+                        if kind == 1 {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        o.clone()
+                    },
+                    Clone::clone,
+                )
+            }));
+            match kind {
+                0 => {
+                    assert!(matches!(
+                        result.unwrap(),
+                        Err(ResolverError::LimitExceeded { .. })
+                    ));
+                    assert_eq!(clones.get(), 0);
+                }
+                1 => {
+                    assert!(matches!(result.unwrap(), Err(ResolverError::Cancelled)));
+                    assert_eq!(clones.get(), 1);
+                }
+                _ => {
+                    assert!(result.is_err());
+                    assert_eq!(clones.get(), 1);
+                }
+            }
+            assert_eq!(
+                budget.snapshot().retained_bytes,
+                before.retained_bytes,
+                "partial returned construction cannot refund live persistent/cache/report/source"
+            );
+            assert!(budget.snapshot().work >= before.work);
+            assert!(budget.snapshot().byte_work >= before.byte_work);
+            assert!(!reports.observations().is_empty());
+            assert!(resolver.callback_reports.is_none());
+        }
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut original = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let out = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut original,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (source, reports) = out.into_parts();
+        let mut target = foreign.admit_owned(0, 0, 0, Vec::new).unwrap();
+        let mut warnings = foreign.admit_owned(0, 0, 0, Vec::new).unwrap();
+        let before = foreign.snapshot();
+        assert!(matches!(
+            reports.consume_into(&mut target, &mut warnings, &mut foreign),
+            Err(ResolverError::InvalidRequest(_))
+        ));
+        assert!(target.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(foreign.snapshot(), before);
+        assert!(matches!(source, Resolution::Found(_)));
+        assert!(!resolver.report.observations.is_empty());
+    }
+
+    #[test]
+    fn returned_report_unsupported_capabilities_never_call_legacy_callbacks() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver, ProviderSource};
+        struct Legacy;
+        impl CompileTimeResolver for Legacy {
+            fn include(
+                &mut self,
+                _: IncludeResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                panic!("unbounded legacy include must not run")
+            }
+            fn unit(
+                &mut self,
+                _: UnitResolveRequest<'_>,
+                _: &mut CompileTimeBudget<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                panic!("unbounded legacy unit must not run")
+            }
+        }
+        let mut b = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        assert!(matches!(
+            Legacy
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: Path::new("Main.pas"),
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None
+                    },
+                    &mut b,
+                    &NoCancellation
+                )
+                .unwrap()
+                .result(),
+            Resolution::Unavailable { .. }
+        ));
+        assert!(matches!(
+            Legacy
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: Path::new("Main.pas"),
+                        requested_name: "Other",
+                        legacy_route: None
+                    },
+                    &mut b,
+                    &NoCancellation
+                )
+                .unwrap()
+                .result(),
+            Resolution::Unavailable { .. }
+        ));
+    }
+
+    #[test]
     fn persistent_report_raw_finish_floor_survives_field_moves_and_unrelated_release() {
         use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
         let (_dir, root, mut resolver) = physical_report_resolver();
@@ -6607,97 +7438,130 @@ mod tests {
         }
         for unit in [false, true] {
             for failure in [Failure::Error, Failure::Cancel, Failure::Panic] {
-                let (dir, root, original) = physical_report_resolver();
-                fs::write(dir.path().join("break.inc"), "{not returned}").unwrap();
-                fs::write(dir.path().join("Break.pas"), "unit Break;").unwrap();
-                let flag = Arc::new(AtomicBool::new(false));
-                let mut resolver = UnitResolver::new(
-                    original.context,
-                    vec![dir.path().into()],
-                    HookStore {
-                        inner: FilesystemSourceStore::new(),
-                        failure,
-                        cancelled: flag.clone(),
-                    },
-                    Default::default(),
-                );
-                let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &*flag);
-                let observer = budget
-                    .admit_owned(0, 0, 0, || ())
-                    .unwrap()
-                    .into_shared(&mut budget)
-                    .unwrap();
-                let baseline = budget.snapshot().retained_bytes;
-                drop(
-                    CompileTimeResolver::include(
-                        &mut resolver,
-                        IncludeResolveRequest {
-                            including_path: &root,
-                            byte_range: 0..0,
-                            requested_name: "value.inc",
-                            legacy_route: None,
+                for owned in [false, true] {
+                    let (dir, root, original) = physical_report_resolver();
+                    fs::write(dir.path().join("break.inc"), "{not returned}").unwrap();
+                    fs::write(dir.path().join("Break.pas"), "unit Break;").unwrap();
+                    let flag = Arc::new(AtomicBool::new(false));
+                    let mut resolver = UnitResolver::new(
+                        original.context,
+                        vec![dir.path().into()],
+                        HookStore {
+                            inner: FilesystemSourceStore::new(),
+                            failure,
+                            cancelled: flag.clone(),
                         },
-                        &mut budget,
-                        &*flag,
-                    )
-                    .unwrap(),
-                );
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if unit {
-                        CompileTimeResolver::unit_capability(
-                            &mut resolver,
-                            UnitResolveRequest {
-                                importer_path: &root,
-                                requested_name: "Break",
-                                legacy_route: None,
-                            },
-                            &mut budget,
-                            &*flag,
-                        )
-                        .map(drop)
-                    } else {
+                        Default::default(),
+                    );
+                    let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &*flag);
+                    let observer = budget
+                        .admit_owned(0, 0, 0, || ())
+                        .unwrap()
+                        .into_shared(&mut budget)
+                        .unwrap();
+                    let baseline = budget.snapshot().retained_bytes;
+                    drop(
                         CompileTimeResolver::include(
                             &mut resolver,
                             IncludeResolveRequest {
                                 including_path: &root,
                                 byte_range: 0..0,
-                                requested_name: "break.inc",
+                                requested_name: "value.inc",
                                 legacy_route: None,
                             },
                             &mut budget,
                             &*flag,
                         )
-                        .map(drop)
-                    }
-                }));
-                match failure {
-                    Failure::Error => assert!(result.unwrap().is_ok()),
-                    Failure::Cancel => assert_eq!(result.unwrap(), Err(ResolverError::Cancelled)),
-                    Failure::Panic => assert!(result.is_err()),
-                }
-                assert!(
-                    resolver.compile_time_store.is_none(),
-                    "unwind restores callback route"
-                );
-                assert!(!resolver.report.complete);
-                assert!(resolver.report.observations.iter().any(|o| matches!(o, ResolutionObservation::Payload { path, .. } if path.ends_with("value.inc"))));
-                if matches!(failure, Failure::Error) {
-                    assert!(
-                        !resolver.report.warnings.is_empty()
-                            || !resolver.report.incomplete_reasons.is_empty()
+                        .unwrap(),
                     );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if unit && owned {
+                            CompileTimeResolver::unit_report_capability(
+                                &mut resolver,
+                                UnitResolveRequest {
+                                    importer_path: &root,
+                                    requested_name: "Break",
+                                    legacy_route: None,
+                                },
+                                &mut budget,
+                                &*flag,
+                            )
+                            .map(drop)
+                        } else if owned {
+                            CompileTimeResolver::include_capability(
+                                &mut resolver,
+                                IncludeResolveRequest {
+                                    including_path: &root,
+                                    byte_range: 0..0,
+                                    requested_name: "break.inc",
+                                    legacy_route: None,
+                                },
+                                &mut budget,
+                                &*flag,
+                            )
+                            .map(drop)
+                        } else if unit {
+                            CompileTimeResolver::unit_capability(
+                                &mut resolver,
+                                UnitResolveRequest {
+                                    importer_path: &root,
+                                    requested_name: "Break",
+                                    legacy_route: None,
+                                },
+                                &mut budget,
+                                &*flag,
+                            )
+                            .map(drop)
+                        } else {
+                            CompileTimeResolver::include(
+                                &mut resolver,
+                                IncludeResolveRequest {
+                                    including_path: &root,
+                                    byte_range: 0..0,
+                                    requested_name: "break.inc",
+                                    legacy_route: None,
+                                },
+                                &mut budget,
+                                &*flag,
+                            )
+                            .map(drop)
+                        }
+                    }));
+                    match failure {
+                        Failure::Error => assert!(result.unwrap().is_ok()),
+                        Failure::Cancel => {
+                            assert_eq!(result.unwrap(), Err(ResolverError::Cancelled))
+                        }
+                        Failure::Panic => assert!(result.is_err()),
+                    }
+                    assert!(
+                        resolver.compile_time_store.is_none(),
+                        "unwind restores callback route"
+                    );
+                    assert!(!resolver.report.complete);
+                    assert!(
+                        resolver.callback_reports.is_none(),
+                        "returned callback mode/partial reports restore on all exits"
+                    );
+                    assert!(resolver.report.observations.iter().any(|o| matches!(o, ResolutionObservation::Payload { path, .. } if path.ends_with("value.inc"))));
+                    if matches!(failure, Failure::Error) {
+                        assert!(
+                            !resolver.report.warnings.is_empty()
+                                || !resolver.report.incomplete_reasons.is_empty()
+                        );
+                    }
+                    flag.store(false, Ordering::Relaxed);
+                    resolver.compile_time_caches.clear(); // only test actual cache destruction
+                    let report = resolver.finish_admitted(&mut budget).unwrap();
+                    let live = observer.budget_snapshot();
+                    assert!(live.retained_bytes > baseline);
+                    drop(budget);
+                    drop(report);
+                    let dead = observer.budget_snapshot();
+                    assert_eq!(dead.retained_bytes, baseline);
+                    assert_eq!(dead.work, live.work);
+                    assert_eq!(dead.byte_work, live.byte_work);
                 }
-                flag.store(false, Ordering::Relaxed);
-                resolver.compile_time_caches.clear(); // only test actual cache destruction
-                let report = resolver.finish_admitted(&mut budget).unwrap();
-                let live = observer.budget_snapshot();
-                assert!(live.retained_bytes > baseline);
-                drop(budget);
-                drop(report);
-                let dead = observer.budget_snapshot();
-                assert_eq!(dead.retained_bytes, baseline);
-                assert_eq!(dead.work, live.work);
-                assert_eq!(dead.byte_work, live.byte_work);
             }
         }
     }

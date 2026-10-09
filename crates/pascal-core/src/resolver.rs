@@ -1475,6 +1475,8 @@ struct StoreCache {
     loaded: HashMap<OwnedLoadedKey, LoadedSource>,
     directories: HashMap<OwnedDirectoryKey, AdmittedShared<DirectoryListing>>,
     loaded_capacity: Option<AdmittedOwned<()>>,
+    include_seen: HashSet<OwnedLoadedKey>,
+    include_seen_capacity: Option<AdmittedOwned<()>>,
     directory_capacity: Option<AdmittedOwned<()>>,
     recorded_work: usize,
     recorded_byte_work: usize,
@@ -1671,6 +1673,65 @@ impl StoreCache {
 }
 
 impl AdmittedOwned<StoreCache> {
+    fn insert_seen(
+        &mut self,
+        key: OwnedLoadedKey,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, SourceStoreError> {
+        if !self.is_admitted_by(budget) || !key.0.is_admitted_by(budget) {
+            return Err(SourceStoreError::AdmissionUnavailable);
+        }
+        let overflow = || SourceStoreError::AdmissionUnavailable;
+        budget
+            .charge(
+                2,
+                key.0.as_str().len().checked_mul(2).ok_or_else(overflow)?,
+                0,
+            )
+            .map_err(|r| store_admission_error(r, budget))?;
+        if self.include_seen.contains(&*key.0) {
+            return Ok(false);
+        }
+        let cache = self.value_mut();
+        if cache.include_seen.len() == cache.include_seen.capacity() {
+            let count = cache
+                .include_seen
+                .len()
+                .checked_add(1)
+                .ok_or_else(overflow)?;
+            let buckets = count
+                .checked_next_power_of_two()
+                .and_then(|n| n.checked_mul(2))
+                .map(|n| n.max(4))
+                .ok_or_else(overflow)?;
+            let bytes = buckets
+                .checked_mul(std::mem::size_of::<OwnedLoadedKey>() + 1)
+                .and_then(|n| n.checked_add(16))
+                .ok_or_else(overflow)?;
+            budget
+                .charge(cache.include_seen.len(), 0, 0)
+                .map_err(|r| store_admission_error(r, budget))?;
+            let mut rehash = 0usize;
+            for key in &cache.include_seen {
+                if budget.cancel_token().is_cancelled() {
+                    return Err(SourceStoreError::Cancelled);
+                }
+                rehash = rehash
+                    .checked_add(key.0.as_str().len())
+                    .ok_or_else(overflow)?;
+            }
+            let capacity = budget
+                .admit_owned(count, rehash, bytes, || ())
+                .map_err(|r| store_admission_error(r, budget))?;
+            let mut receiving = HashSet::with_capacity(count);
+            receiving.extend(cache.include_seen.drain());
+            drop(std::mem::replace(&mut cache.include_seen, receiving));
+            cache.include_seen_capacity = Some(capacity);
+        }
+        cache.include_seen.insert(key);
+        Ok(true)
+    }
+
     fn insert_loaded(
         &mut self,
         key: OwnedLoadedKey,
@@ -1973,8 +2034,27 @@ impl<S: SourceStore> UnitResolver<S> {
         // route and dependency observations. Keep same-root repeated includes
         // reusable, but revalidate payloads and negative directory observations
         // on the next root operation without resetting resource counters.
-        self.loaded.retain(|id, _| !self.include_seen.contains(id));
+        self.loaded.retain(|id, _| {
+            !self.include_seen.contains(id)
+                && !self.compile_time_caches.iter().any(|root| {
+                    root.view
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .include_seen
+                        .contains(id)
+                })
+        });
         self.include_seen.clear();
+        // Preserve the existing logical seen reset, not an opaque cache eviction.
+        // Actual keys die; independently owned set backing stays charged/live.
+        for root in &self.compile_time_caches {
+            root.view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .value_mut()
+                .include_seen
+                .clear();
+        }
         self.directories.clear();
         let context = self.context.conditional_context_for(&root.path);
         let decode_reserve =
@@ -5665,36 +5745,26 @@ impl<S: SourceStore> UnitResolver<S> {
         legacy_route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
     ) -> Result<LoadedSource, SourceStoreError> {
+        if let Some(mut budget) = self.store_budget(cancel) {
+            return self.load_include_candidate_owned(
+                path,
+                entry,
+                legacy_route,
+                cancel,
+                &mut budget,
+            );
+        }
         let source_id = source_id_for_path(path);
-        let existing = if let Some(mut budget) = self.store_budget(cancel) {
-            let root = self
-                .compile_time_store
-                .as_ref()
-                .expect("store call")
-                .clone();
-            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .loaded
-                .values()
-                .find(|source| {
-                    path_equivalent(&source.path, path)
-                        && self.can_reuse_loaded_source(path, entry, legacy_route)
-                })
-                .map(|source| source.admitted_copy(&mut budget))
-                .transpose()?
-        } else {
-            self.loaded
-                .values()
-                .find(|source| {
-                    path_equivalent(&source.path, path)
-                        && self.can_reuse_loaded_source(path, entry, legacy_route)
-                })
-                .cloned()
-        };
-        let known_id = existing
-            .as_ref()
-            .map_or_else(|| source_id.clone(), |source| source.id.clone());
-        let is_new = !self.include_seen.contains(&known_id);
+        let existing = self
+            .loaded
+            .values()
+            .find(|source| {
+                path_equivalent(&source.path, path)
+                    && self.can_reuse_loaded_source(path, entry, legacy_route)
+            })
+            .cloned();
+        let known_id = existing.as_ref().map_or(&source_id, |source| &source.id);
+        let is_new = !self.seen_include(known_id, None)?;
         if is_new && self.include_files >= self.limits.max_include_files {
             return Err(SourceStoreError::Incomplete {
                 path: canonical_path(path),
@@ -5762,6 +5832,241 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
         Ok(source)
+    }
+
+    fn seen_include(
+        &self,
+        id: &SourceId,
+        budget: Option<&mut CompileTimeBudget<'_>>,
+    ) -> Result<bool, SourceStoreError> {
+        let cancel = budget.as_ref().map(|b| b.cancel_token());
+        if let Some(budget) = budget {
+            let count = self
+                .compile_time_caches
+                .len()
+                .checked_add(1)
+                .ok_or(SourceStoreError::AdmissionUnavailable)?;
+            let bytes = count
+                .checked_mul(id.as_str().len())
+                .ok_or(SourceStoreError::AdmissionUnavailable)?;
+            budget
+                .charge(count, bytes, 0)
+                .map_err(|r| store_admission_error(r, budget))?;
+        }
+        if self.include_seen.contains(id) {
+            return Ok(true);
+        }
+        for root in &self.compile_time_caches {
+            if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(SourceStoreError::Cancelled);
+            }
+            if root
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .include_seen
+                .contains(id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn load_include_candidate_owned(
+        &mut self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        route: Option<&LegacyRoute>,
+        cancel: &dyn CancellationToken,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<LoadedSource, SourceStoreError> {
+        let query = include_query(path, budget)?;
+        let root = self
+            .compile_time_store
+            .as_ref()
+            .expect("typed include reuse")
+            .clone();
+        let existing = {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            budget
+                .charge(cache.loaded.capacity(), 0, 0)
+                .map_err(|r| store_admission_error(r, budget))?;
+            let mut existing = None;
+            for source in cache.loaded.values() {
+                let canonical = source_request_path(&source.path, budget, cancel)?;
+                let identity = include_identity(&canonical, budget)?;
+                budget
+                    .charge(
+                        1,
+                        identity
+                            .len()
+                            .checked_add(query.identity.len())
+                            .ok_or(SourceStoreError::AdmissionUnavailable)?,
+                        0,
+                    )
+                    .map_err(|r| store_admission_error(r, budget))?;
+                if *identity == *query.identity
+                    && self.can_reuse_include_owned(&query, entry, route, budget)?
+                {
+                    existing = Some(source.admitted_copy(budget)?);
+                    break;
+                }
+            }
+            existing
+        };
+        let known_id = existing.as_ref().map_or(&*query.id, |source| &source.id);
+        let is_new = !self.seen_include(known_id, Some(budget))?;
+        if is_new && self.include_files >= self.limits.max_include_files {
+            return Err(SourceStoreError::Incomplete {
+                path: canonical_path(path),
+                reason: format!(
+                    "include file limit ({}) reached",
+                    self.limits.max_include_files
+                ),
+            });
+        }
+        let remaining = self
+            .limits
+            .max_include_bytes
+            .saturating_sub(self.include_bytes);
+        if is_new && remaining == 0 {
+            return Err(SourceStoreError::Incomplete {
+                path: canonical_path(path),
+                reason: format!(
+                    "include byte limit ({}) reached",
+                    self.limits.max_include_bytes
+                ),
+            });
+        }
+        let source = if let Some(source) = existing {
+            if is_new && source.bytes.len() > remaining {
+                return Err(SourceStoreError::Incomplete {
+                    path: source.path,
+                    reason: format!(
+                        "include byte limit ({}) exceeded",
+                        self.limits.max_include_bytes
+                    ),
+                });
+            }
+            source
+        } else {
+            self.load_candidate_with_limit(
+                path,
+                entry,
+                route,
+                SourceKind::Include,
+                if is_new {
+                    self.limits.max_source_bytes.min(remaining)
+                } else {
+                    self.limits.max_source_bytes
+                },
+                cancel,
+            )?
+        };
+        if is_new {
+            budget
+                .charge(
+                    1,
+                    query
+                        .id
+                        .as_str()
+                        .len()
+                        .checked_add(source.id.as_str().len())
+                        .ok_or(SourceStoreError::AdmissionUnavailable)?,
+                    0,
+                )
+                .map_err(|r| store_admission_error(r, budget))?;
+            let key = if *query.id == source.id {
+                OwnedLoadedKey(query.id)
+            } else {
+                loaded_cache_key(&source.id, budget)?
+            };
+            root.view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert_seen(key, budget)?;
+            self.include_files = self.include_files.saturating_add(1);
+            self.include_bytes = self.include_bytes.saturating_add(source.bytes.len());
+            if self.include_bytes > self.limits.max_include_bytes {
+                return Err(SourceStoreError::Incomplete {
+                    path: source.path,
+                    reason: format!(
+                        "include byte limit ({}) exceeded",
+                        self.limits.max_include_bytes
+                    ),
+                });
+            }
+        }
+        Ok(source)
+    }
+
+    fn can_reuse_include_owned(
+        &self,
+        query: &IncludeQuery,
+        entry: &ProjectPathEntry,
+        route: Option<&LegacyRoute>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<bool, SourceStoreError> {
+        let canonical = source_request_path(&entry.path, budget, budget.cancel_token())?;
+        let identity = include_identity(&canonical, budget)?;
+        budget
+            .charge(
+                1,
+                identity
+                    .len()
+                    .checked_add(query.identity.len())
+                    .ok_or(SourceStoreError::AdmissionUnavailable)?,
+                0,
+            )
+            .map_err(|r| store_admission_error(r, budget))?;
+        if *identity != *query.identity {
+            return Ok(false);
+        }
+        let legacy = if let Some(route) = route {
+            let source = source_request_path(&route.source_path, budget, budget.cancel_token())?;
+            let sibling =
+                source_request_path(&route.sibling_directory, budget, budget.cancel_token())?;
+            let parent_bytes = source
+                .as_os_str()
+                .len()
+                .checked_add(query.canonical.as_os_str().len())
+                .ok_or(SourceStoreError::AdmissionUnavailable)?;
+            budget
+                .charge(
+                    parent_bytes
+                        .checked_add(2)
+                        .ok_or(SourceStoreError::AdmissionUnavailable)?,
+                    parent_bytes,
+                    0,
+                )
+                .map_err(|r| store_admission_error(r, budget))?;
+            if let (Some(source_parent), Some(query_parent)) =
+                (source.parent(), query.canonical.parent())
+            {
+                let sibling = include_identity(&sibling, budget)?;
+                let parent = include_identity(source_parent, budget)?;
+                let query_parent = include_identity(query_parent, budget)?;
+                let bytes = sibling
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(parent.len()))
+                    .and_then(|n| n.checked_add(query_parent.len()))
+                    .ok_or(SourceStoreError::AdmissionUnavailable)?;
+                budget
+                    .charge(2, bytes, 0)
+                    .map_err(|r| store_admission_error(r, budget))?;
+                *parent == *sibling && *query_parent == *sibling
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        Ok((legacy
+            && matches!(entry.provenance, ProjectPathProvenance::LegacyNative)
+            && self.context.read_policy.allows_legacy_route_entry(entry))
+            || self.context.read_policy.allows_entry(entry))
     }
 
     fn can_reuse_loaded_source(
@@ -8123,6 +8428,127 @@ fn source_request_entry(
         }
         Ok(local)
     })
+}
+
+struct IncludeQuery {
+    canonical: AdmittedOwned<PathBuf>,
+    id: AdmittedOwned<SourceId>,
+    identity: AdmittedOwned<String>,
+}
+
+enum IncludeLossy<'a> {
+    Borrowed(&'a str),
+    Admitted(AdmittedOwned<String>),
+}
+impl std::ops::Deref for IncludeLossy<'_> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Borrowed(text) => text,
+            Self::Admitted(text) => text,
+        }
+    }
+}
+fn include_lossy<'a>(
+    path: &'a Path,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<IncludeLossy<'a>, SourceStoreError> {
+    let n = path.as_os_str().len();
+    let work = n
+        .checked_add(1)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    budget
+        .charge(work, n, 0)
+        .map_err(|r| store_admission_error(r, budget))?;
+    let text = path.to_str();
+    if budget.cancel_token().is_cancelled() {
+        return Err(SourceStoreError::Cancelled);
+    }
+    if let Some(text) = text {
+        return Ok(IncludeLossy::Borrowed(text));
+    }
+    // Expansion is at most three UTF-8 bytes per input byte. Allow the
+    // standard String builder's doubling capacity and small-buffer minimum.
+    let bound = n
+        .checked_mul(6)
+        .map(|n| n.max(8))
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    budget
+        .admit_owned(work, n, bound, || path.to_string_lossy().into_owned())
+        .map(IncludeLossy::Admitted)
+        .map_err(|r| store_admission_error(r, budget))
+}
+
+fn include_query(
+    path: &Path,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<IncludeQuery, SourceStoreError> {
+    let cancel = budget.cancel_token();
+    let canonical = source_request_path(path, budget, cancel)?;
+    let lossy = include_lossy(&canonical, budget)?;
+    let bytes = lossy
+        .len()
+        .checked_add(7)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    let id = budget
+        .admit_owned(1, bytes, bytes, || {
+            let mut id = String::with_capacity(bytes);
+            id.push_str("source:");
+            id.push_str(&lossy);
+            SourceId::new(id)
+        })
+        .map_err(|r| store_admission_error(r, budget))?;
+    drop(lossy);
+    let identity = include_identity(&canonical, budget)?;
+    Ok(IncludeQuery {
+        canonical,
+        id,
+        identity,
+    })
+}
+
+/// Already canonical input; independently own lossy scratch and the transformed
+/// key rather than charging a hidden path_key normalization/replace chain.
+fn include_identity(
+    path: &Path,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<AdmittedOwned<String>, SourceStoreError> {
+    let cancel = budget.cancel_token();
+    let bound = path
+        .as_os_str()
+        .len()
+        .checked_mul(3)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    let work = bound
+        .checked_add(1)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    let lossy = include_lossy(path, budget)?;
+    budget.admit_fallible(
+        work,
+        lossy.len(),
+        lossy.len(),
+        store_admission_error,
+        || {
+            let insensitive = path_identity::is_case_insensitive(path);
+            let mut key = String::with_capacity(lossy.len());
+            for (index, ch) in lossy.chars().enumerate() {
+                if index % 8 == 0 && cancel.is_cancelled() {
+                    return Err(SourceStoreError::Cancelled);
+                }
+                key.push(if ch == '\\' {
+                    '/'
+                } else if insensitive {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch
+                });
+            }
+            if cancel.is_cancelled() {
+                return Err(SourceStoreError::Cancelled);
+            }
+            Ok(key)
+        },
+    )
 }
 
 fn canonical_path(path: &Path) -> PathBuf {
@@ -10594,6 +11020,527 @@ mod tests {
         );
         assert!(budget.snapshot().work > before.work);
         assert!(budget.snapshot().byte_work > before.byte_work);
+    }
+
+    #[test]
+    fn include_reuse_owner_actual_seen_storage_is_retained_and_duplicates_do_not_accumulate() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let original = call
+            .load_candidate_with_limit(
+                &path,
+                &entry,
+                None,
+                SourceKind::Include,
+                4096,
+                &NoCancellation,
+            )
+            .unwrap();
+        let before = budget.snapshot();
+        let first = call
+            .load_include_candidate(&path, &entry, None, &NoCancellation)
+            .unwrap();
+        assert_eq!(first.bytes.as_ptr(), original.bytes.as_ptr());
+        drop(first);
+        let seen = budget.snapshot();
+        assert!(
+            seen.retained_bytes > before.retained_bytes,
+            "actual persistent seen key/set must retain independent original owners after query/source scratch drops"
+        );
+        let repeated = call
+            .load_include_candidate(&path, &entry, None, &NoCancellation)
+            .unwrap();
+        assert_eq!(repeated.bytes.as_ptr(), original.bytes.as_ptr());
+        drop(repeated);
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            seen.retained_bytes,
+            "duplicate has no dead key invoice"
+        );
+        assert!(budget.snapshot().work > seen.work);
+        assert!(budget.snapshot().byte_work > seen.byte_work);
+    }
+
+    #[test]
+    fn include_reuse_owner_original_query_transfer_growth_removal_and_shared_lifetime() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let source = call
+            .load_candidate_with_limit(
+                &path,
+                &entry,
+                None,
+                SourceKind::Include,
+                4096,
+                &NoCancellation,
+            )
+            .unwrap();
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        let before = budget.snapshot();
+        let query = include_query(&dir.path().join("absent/../value.inc"), &mut budget).unwrap();
+        assert_eq!(*query.canonical, path);
+        assert_eq!(*query.id, source.id);
+        assert_eq!(*query.identity, path_key(&path));
+        let pointer = query.id.as_str().as_ptr();
+        let key = OwnedLoadedKey(query.id);
+        drop(query.canonical);
+        drop(query.identity);
+        assert!(budget.snapshot().retained_bytes > before.retained_bytes);
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(cache.insert_seen(key, &mut budget).unwrap());
+            assert_eq!(
+                cache
+                    .include_seen
+                    .get(&source.id)
+                    .unwrap()
+                    .0
+                    .as_str()
+                    .as_ptr(),
+                pointer
+            );
+        }
+        let mut held = vec![source];
+        let mut growths = 0;
+        for i in 0..12 {
+            let p = dir.path().join(format!("Seen{i}.inc"));
+            fs::write(&p, format!("{{include {i}}}")).unwrap();
+            let e = call.context.path_entry_for(&p).unwrap();
+            let (cap, keys) = {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    cache.include_seen.capacity(),
+                    cache
+                        .include_seen
+                        .iter()
+                        .map(|k| ((*k.0).clone(), k.0.as_str().as_ptr()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let next = call
+                .load_include_candidate(&p, &e, None, &NoCancellation)
+                .unwrap();
+            {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                if cache.include_seen.capacity() > cap {
+                    growths += 1;
+                }
+                for (id, pointer) in keys {
+                    assert_eq!(
+                        cache.include_seen.get(&id).unwrap().0.as_str().as_ptr(),
+                        pointer
+                    );
+                }
+                assert!(
+                    cache
+                        .include_seen_capacity
+                        .as_ref()
+                        .unwrap()
+                        .is_admitted_by(&budget)
+                );
+            }
+            held.push(next);
+        }
+        assert!(growths >= 2);
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = cache.include_seen.capacity();
+            let before = budget.snapshot();
+            drop(cache.value_mut().include_seen.take(&held[1].id));
+            assert_eq!(cache.include_seen.capacity(), cap);
+            assert_eq!(
+                before.retained_bytes - budget.snapshot().retained_bytes,
+                held[1].id.as_str().len() + std::mem::size_of::<AdmittedOwned<SourceId>>()
+            );
+            assert_eq!(
+                cache
+                    .include_seen
+                    .get(&held[0].id)
+                    .unwrap()
+                    .0
+                    .as_str()
+                    .as_ptr(),
+                pointer
+            );
+        }
+        drop(call);
+        drop(resolver);
+        drop(budget);
+        assert!(
+            root.view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .include_seen
+                .contains(&held[0].id)
+        );
+        assert_eq!(held[0].bytes.as_ref(), b"{physical include}");
+        let spent = observer.budget_snapshot();
+        drop(held);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        drop(root);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[test]
+    fn include_reuse_owner_actual_precopy_peak_refusal_foreign_root_and_set_capacity() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let p = dir.path().join(format!("Full{i}.inc"));
+            fs::write(&p, "{full seen set}").unwrap();
+            let e = call.context.path_entry_for(&p).unwrap();
+            held.push(
+                call.load_include_candidate(&p, &e, None, &NoCancellation)
+                    .unwrap(),
+            );
+        }
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        let p = dir.path().join("Peak.inc");
+        fs::write(&p, "{peak include}").unwrap();
+        let e = call.context.path_entry_for(&p).unwrap();
+        let source = call
+            .load_candidate_with_limit(&p, &e, None, SourceKind::Include, 4096, &NoCancellation)
+            .unwrap();
+        let query = include_query(&p, &mut budget).unwrap();
+        let key = OwnedLoadedKey(query.id);
+        drop(query.canonical);
+        drop(query.identity);
+        let live = budget.snapshot();
+        let slot = std::mem::size_of::<OwnedLoadedKey>() + 1;
+        budget
+            .constrain_retained(live.retained_bytes + 4 * slot)
+            .unwrap();
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(cache.include_seen.len(), 3);
+            assert_eq!(cache.include_seen.capacity(), 3);
+            assert!(matches!(
+                cache.insert_seen(key, &mut budget),
+                Err(SourceStoreError::RootLimit { .. })
+            ));
+            assert_eq!(cache.include_seen.len(), 3);
+            assert_eq!(cache.include_seen.capacity(), 3);
+            assert!(!cache.include_seen.contains(&source.id));
+            assert!(
+                cache
+                    .include_seen_capacity
+                    .as_ref()
+                    .unwrap()
+                    .is_admitted_by(&budget)
+            );
+        }
+        assert!(budget.snapshot().work > live.work);
+        budget
+            .constrain_retained(budget.snapshot().retained_bytes)
+            .unwrap();
+        let before = budget.snapshot();
+        assert!(matches!(
+            include_query(&p, &mut budget),
+            Err(SourceStoreError::RootLimit { .. })
+        ));
+        assert_eq!(budget.snapshot(), before);
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let query = include_query(&p, &mut foreign).unwrap();
+        let before = foreign.snapshot();
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(matches!(
+                cache.insert_seen(OwnedLoadedKey(query.id), &mut foreign),
+                Err(SourceStoreError::AdmissionUnavailable)
+            ));
+            assert_eq!(cache.include_seen.len(), 3);
+        }
+        assert_eq!(foreign.snapshot().work, before.work);
+        assert_eq!(foreign.snapshot().byte_work, before.byte_work);
+        drop(query.canonical);
+        drop(query.identity);
+        // Removal destroys only original keys. Real backing remains admitted
+        // until it dies; this explicit teardown is test-only, not eviction.
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            cache.value_mut().include_seen.clear();
+            assert_eq!(cache.include_seen.capacity(), 3);
+            let before = budget.snapshot();
+            drop(std::mem::take(&mut cache.value_mut().include_seen));
+            drop(cache.value_mut().include_seen_capacity.take());
+            assert_eq!(
+                before.retained_bytes - budget.snapshot().retained_bytes,
+                4 * slot + 16 + std::mem::size_of::<AdmittedOwned<()>>()
+            );
+        }
+        assert_eq!(held[0].bytes.as_ref(), b"{full seen set}");
+        assert_eq!(source.bytes.as_ref(), b"{peak include}");
+    }
+
+    #[test]
+    fn include_reuse_owner_case_legacy_route_snapshot_and_nonutf8_query_identity() {
+        use crate::compile_time::CompileTimeLimits;
+        path_identity::with_case_insensitive_volumes(|| {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            let path = dir.path().join("MiXeD.inc");
+            fs::write(&path, "{original mixed snapshot}").unwrap();
+            let entry = resolver.context.path_entry_for(&path).unwrap();
+            let route = LegacyRoute {
+                source_path: root,
+                sibling_directory: dir.path().into(),
+            };
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let original = call
+                .load_candidate_with_limit(
+                    &path,
+                    &entry,
+                    Some(&route),
+                    SourceKind::Include,
+                    4096,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let requested = dir.path().join("absent/../mixed.inc");
+            let reused = call
+                .load_include_candidate(&requested, &entry, Some(&route), &NoCancellation)
+                .unwrap();
+            assert_eq!(reused.id, original.id);
+            assert_eq!(reused.bytes.as_ptr(), original.bytes.as_ptr());
+            fs::write(&path, "{changed disk snapshot stays unused}").unwrap();
+            let before = budget.snapshot();
+            let repeated = call
+                .load_include_candidate(&requested, &entry, Some(&route), &NoCancellation)
+                .unwrap();
+            assert_eq!(repeated.revision, original.revision);
+            assert_eq!(repeated.bytes.as_ptr(), original.bytes.as_ptr());
+            drop(repeated);
+            assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+            let root = call.compile_time_store.as_ref().unwrap().clone();
+            assert!(
+                root.view
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .include_seen
+                    .contains(&original.id)
+            );
+            assert!(!call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {revision,..} if revision!=&original.revision)));
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let (dir, _, mut resolver) = physical_report_resolver();
+            let path = dir
+                .path()
+                .join(std::ffi::OsString::from_vec(b"Bad\xff.inc".to_vec()));
+            fs::write(&path, "{nonutf8 include}").unwrap();
+            let entry = resolver.context.path_entry_for(&path).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let query = include_query(&path, &mut budget).unwrap();
+            assert_eq!(*query.id, source_id_for_path(&path));
+            assert_eq!(*query.identity, path_key(&path));
+            drop(query);
+            let source = resolver
+                .store_call(&mut budget)
+                .unwrap()
+                .load_include_candidate(&path, &entry, None, &NoCancellation)
+                .unwrap();
+            assert_eq!(source.path, path);
+            assert_eq!(source.bytes.as_ref(), b"{nonutf8 include}");
+        }
+    }
+
+    #[test]
+    fn include_reuse_owner_actual_query_seen_growth_cancel_unwind_and_errors_keep_prior_owners() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stopped = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stopped && self.panic {
+                    panic!("actual include query/reuse/seen unwind")
+                }
+                stopped
+            }
+        }
+        for panic in [false, true] {
+            let mut completed = false;
+            let mut failures = 0;
+            let mut later_failure_with_committed_leaf = 0usize;
+            for stop in 0..1000 {
+                let (dir, _, mut resolver) = physical_report_resolver();
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                let mut held = Vec::new();
+                for i in 0..3 {
+                    let p = dir.path().join(format!("Prior{i}.inc"));
+                    fs::write(&p, format!("{{prior {i}}}")).unwrap();
+                    let e = call.context.path_entry_for(&p).unwrap();
+                    held.push(
+                        call.load_include_candidate(&p, &e, None, &NoCancellation)
+                            .unwrap(),
+                    );
+                }
+                let root = call.compile_time_store.as_ref().unwrap().clone();
+                let pointers = {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(cache.include_seen.len(), cache.include_seen.capacity());
+                    cache
+                        .include_seen
+                        .iter()
+                        .map(|k| ((*k.0).clone(), k.0.as_str().as_ptr()))
+                        .collect::<Vec<_>>()
+                };
+                let p = dir.path().join("Next.inc");
+                fs::write(&p, "{next physical include}").unwrap();
+                let e = call.context.path_entry_for(&p).unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    call.load_include_candidate(
+                        &p,
+                        &e,
+                        None,
+                        &Poll {
+                            calls: 0.into(),
+                            stop,
+                            panic,
+                        },
+                    )
+                }));
+                let failure = match result {
+                    Err(_) => {
+                        assert!(panic);
+                        failures += 1;
+                        true
+                    }
+                    Ok(Err(SourceStoreError::Cancelled)) => {
+                        assert!(!panic);
+                        failures += 1;
+                        true
+                    }
+                    Ok(Ok(source)) => {
+                        held.push(source);
+                        completed = true;
+                        false
+                    }
+                    Ok(Err(error)) => panic!("unexpected {stop}: {error:?}"),
+                };
+                {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, pointer) in pointers {
+                        assert_eq!(
+                            cache.include_seen.get(&id).unwrap().0.as_str().as_ptr(),
+                            pointer
+                        );
+                        assert_eq!(
+                            cache.loaded.get(&id).unwrap().bytes.as_ptr(),
+                            held.iter().find(|s| s.id == id).unwrap().bytes.as_ptr()
+                        );
+                    }
+                    if failure {
+                        assert_eq!(cache.include_seen.len(), 3);
+                        assert_eq!(cache.include_seen.capacity(), 3);
+                        if cache.loaded.len() > 3 {
+                            later_failure_with_committed_leaf += 1;
+                        }
+                    } else {
+                        assert_eq!(cache.include_seen.len(), 4);
+                        assert!(cache.include_seen.capacity() > 3);
+                    }
+                }
+                let spent = budget.snapshot();
+                drop(call);
+                drop(resolver);
+                drop(root);
+                drop(budget);
+                assert_eq!(held[0].bytes.as_ref(), b"{prior 0}");
+                drop(held);
+                assert_eq!(
+                    observer.budget_snapshot().retained_bytes,
+                    baseline,
+                    "actual last owner retirement at poll {stop}, panic={panic}"
+                );
+                assert_eq!(observer.budget_snapshot().work, spent.work);
+                assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+                if completed {
+                    break;
+                }
+            }
+            assert!(completed);
+            assert!(failures > 20);
+            // Diagnostic inventory only, not a permissive acceptance assertion
+            // requiring the broader publication gap to remain in future work.
+            eprintln!(
+                "include-reuse outer transaction inventory: panic={panic}, failures={failures}, committed leaf before later seen failure={later_failure_with_committed_leaf}"
+            );
+        }
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let p = dir.path().join("value.inc");
+        let e = resolver.context.path_entry_for(&p).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let original = call
+            .load_include_candidate(&p, &e, None, &NoCancellation)
+            .unwrap();
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        let missing = dir.path().join("Missing.inc");
+        let denied = dir.path().join("Directory.inc");
+        fs::create_dir(&denied).unwrap();
+        for path in [&missing, &denied] {
+            let entry = call.context.path_entry_for(path).unwrap();
+            assert!(matches!(
+                call.load_include_candidate(path, &entry, None, &NoCancellation),
+                Err(SourceStoreError::NotFound { .. } | SourceStoreError::Unauthorized { .. })
+            ));
+            assert!(
+                root.view
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .include_seen
+                    .contains(&original.id)
+            );
+        }
+        call.limits.max_include_files = 1;
+        let next = dir.path().join("Limit.inc");
+        fs::write(&next, "{limited}").unwrap();
+        let e = call.context.path_entry_for(&next).unwrap();
+        assert!(matches!(
+            call.load_include_candidate(&next, &e, None, &NoCancellation),
+            Err(SourceStoreError::Incomplete { .. })
+        ));
+        assert_eq!(
+            root.view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .include_seen
+                .len(),
+            1
+        );
+        assert_eq!(original.bytes.as_ref(), b"{physical include}");
     }
 
     #[test]

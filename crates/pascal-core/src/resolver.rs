@@ -5243,16 +5243,42 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedSource>, ResolverError> {
         self.check_cancel(cancel)?;
+        if self.owning_include_callback {
+            let count = self
+                .context
+                .include_paths
+                .len()
+                .checked_add(self.context.search_paths.len())
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("include path sizing work overflow".into())
+                })?;
+            let mut budget = self.store_budget(cancel).expect("owning include root");
+            budget
+                .charge(count, 0, 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        }
         let paths = self
             .context
             .include_paths
             .iter()
             .chain(&self.context.search_paths)
-            .map(|p| p.as_os_str().len() + std::mem::size_of::<ProjectPathEntry>())
-            .sum::<usize>();
-        let reserve = paths.saturating_mul(4)
-            + request.including_path.as_os_str().len().saturating_mul(8)
-            + request.requested_name.len().saturating_mul(8);
+            .try_fold(0usize, |sum, path| {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                sum.checked_add(path.as_os_str().len())
+                    .and_then(|n| n.checked_add(std::mem::size_of::<ProjectPathEntry>()))
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("include path sizing overflow".into())
+                    })
+            })?;
+        let reserve = paths
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(request.including_path.as_os_str().len().checked_mul(8)?))
+            .and_then(|n| n.checked_add(request.requested_name.len().checked_mul(8)?))
+            .ok_or_else(|| {
+                ResolverError::InvalidRequest("include lookup reserve overflow".into())
+            })?;
         self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         if request.requested_name.trim().is_empty() {
             return Ok(Resolution::Incomplete {
@@ -5274,7 +5300,6 @@ impl<S: SourceStore> UnitResolver<S> {
         {
             entries.insert(0, owner_entry);
         }
-        let mut candidates = Vec::new();
         let mut saw_incomplete = false;
         for entry in entries {
             self.check_cancel(cancel)?;
@@ -5321,7 +5346,9 @@ impl<S: SourceStore> UnitResolver<S> {
             );
             match self.load_include_candidate(&path, &candidate_entry, request.legacy_route, cancel)
             {
-                Ok(source) => candidates.push(source),
+                // First authorized success always wins. Transfer this inline
+                // source directly; no temporary heap collection or invoice.
+                Ok(source) => return Ok(Resolution::Found(source)),
                 Err(SourceStoreError::NotFound { .. }) => {
                     let Some((case_base, case_base_entry)) = case_lookup_base else {
                         continue;
@@ -5342,7 +5369,7 @@ impl<S: SourceStore> UnitResolver<S> {
                                 request.legacy_route,
                                 cancel,
                             ) {
-                                Ok(source) => candidates.push(source),
+                                Ok(source) => return Ok(Resolution::Found(source)),
                                 Err(SourceStoreError::NotFound { .. }) => {}
                                 Err(SourceStoreError::Cancelled) => {
                                     return Err(ResolverError::Cancelled);
@@ -5366,12 +5393,38 @@ impl<S: SourceStore> UnitResolver<S> {
                         CaseInsensitiveLookup::Missing => {}
                         CaseInsensitiveLookup::Ambiguous(paths) => {
                             saw_incomplete = true;
-                            let bound = 128
-                                + request.requested_name.len()
-                                + paths
-                                    .iter()
-                                    .map(|p| 4 * p.as_os_str().len() + 2)
-                                    .sum::<usize>();
+                            if self.owning_include_callback {
+                                let mut budget =
+                                    self.store_budget(cancel).expect("owning include root");
+                                budget
+                                    .charge(paths.len(), 0, 0)
+                                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                            }
+                            let base =
+                                request
+                                    .requested_name
+                                    .len()
+                                    .checked_add(128)
+                                    .ok_or_else(|| {
+                                        ResolverError::InvalidRequest(
+                                            "include ambiguity warning bound overflow".into(),
+                                        )
+                                    })?;
+                            let bound = paths.iter().try_fold(base, |sum, path| {
+                                if cancel.is_cancelled() {
+                                    return Err(ResolverError::Cancelled);
+                                }
+                                path.as_os_str()
+                                    .len()
+                                    .checked_mul(4)
+                                    .and_then(|n| n.checked_add(2))
+                                    .and_then(|n| sum.checked_add(n))
+                                    .ok_or_else(|| {
+                                        ResolverError::InvalidRequest(
+                                            "include ambiguity warning sizing overflow".into(),
+                                        )
+                                    })
+                            })?;
                             self.warning_args(
                                 cancel,
                                 bound,
@@ -5403,43 +5456,40 @@ impl<S: SourceStore> UnitResolver<S> {
                     break;
                 }
             }
-            if !candidates.is_empty() {
-                break;
-            }
         }
-        candidates.sort_by_key(|left| path_key(&left.path));
-        candidates.dedup_by(|left, right| left.id == right.id);
-        match candidates.len() {
-            1 => Ok(Resolution::Found(
-                candidates.pop().expect("one include candidate"),
-            )),
-            0 if saw_incomplete => {
-                self.diagnostic_args(
+        if saw_incomplete {
+            self.diagnostic_args(
+                cancel,
+                request
+                    .requested_name
+                    .len()
+                    .checked_add(64)
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest(
+                            "incomplete include diagnostic bound overflow".into(),
+                        )
+                    })?,
+                format_args!(
+                    "include {} could not be resolved completely",
+                    request.requested_name
+                ),
+            )?;
+            Ok(Resolution::Incomplete {
+                reason: self.include_reason_build(
+                    request
+                        .requested_name
+                        .len()
+                        .checked_add(32)
+                        .ok_or_else(|| {
+                            ResolverError::InvalidRequest("include reason bound overflow".into())
+                        })?,
                     cancel,
-                    64 + request.requested_name.len(),
-                    format_args!(
-                        "include {} could not be resolved completely",
-                        request.requested_name
-                    ),
-                )?;
-                Ok(Resolution::Incomplete {
-                    reason: self.include_reason_build(
-                        request
-                            .requested_name
-                            .len()
-                            .checked_add(32)
-                            .ok_or_else(|| {
-                                ResolverError::InvalidRequest(
-                                    "include reason bound overflow".into(),
-                                )
-                            })?,
-                        cancel,
-                        format_args!("include {} lookup was incomplete", request.requested_name),
-                    )?,
-                    candidates: Vec::new(),
-                })
-            }
-            0 => Ok(Resolution::Unavailable {
+                    format_args!("include {} lookup was incomplete", request.requested_name),
+                )?,
+                candidates: Vec::new(),
+            })
+        } else {
+            Ok(Resolution::Unavailable {
                 reason: self.include_reason_build(
                     request
                         .requested_name
@@ -5451,16 +5501,7 @@ impl<S: SourceStore> UnitResolver<S> {
                     cancel,
                     format_args!("include {} was not found", request.requested_name),
                 )?,
-            }),
-            _ => Ok(Resolution::Ambiguous {
-                candidates: candidates
-                    .into_iter()
-                    .map(|source| ResolutionCandidate {
-                        path: source.path,
-                        declared_name: None,
-                    })
-                    .collect(),
-            }),
+            })
         }
     }
 
@@ -10043,6 +10084,342 @@ mod tests {
         assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
         assert_eq!(observer.budget_snapshot().work, spent.work);
         assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[test]
+    fn include_r18_first_hit_unwind_and_foreign_empty_failure_keep_selected_source() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct PanicAt {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for PanicAt {
+            fn is_cancelled(&self) -> bool {
+                if self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop {
+                    panic!("actual first-hit include callback unwind")
+                }
+                false
+            }
+        }
+        let mut done = false;
+        let mut panics = 0;
+        for stop in 0..400 {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let prior = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "absent.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolver.include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &PanicAt {
+                        calls: 0.into(),
+                        stop,
+                    },
+                )
+            })) {
+                Err(_) => panics += 1,
+                Ok(Ok(out)) => {
+                    assert!(matches!(out.result(), Resolution::Found(_)));
+                    drop(out);
+                    done = true;
+                }
+                Ok(Err(other)) => panic!("unexpected error: {other:?}"),
+            }
+            assert!(!resolver.owning_include_callback);
+            assert!(resolver.callback_include_reason.is_none());
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(
+                matches!(prior.result(),Resolution::Unavailable {reason} if reason.contains("absent.inc"))
+            );
+            drop(prior);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        assert!(panics > 10);
+        let (dir, root, mut resolver) = physical_report_resolver();
+        fs::create_dir(dir.path().join("bad.inc")).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let out = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "bad.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(out.result(),Resolution::Incomplete {reason,candidates} if !reason.is_empty() && candidates.capacity()==0)
+        );
+        let (result, reports) = out.into_parts();
+        let mut other = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut receiver = other
+            .admit_owned(0, 0, 0, || None::<Resolution<LoadedSource>>)
+            .unwrap();
+        let before = other.snapshot();
+        assert!(
+            result
+                .move_reason_into(&mut receiver, &other, |to, value| *to = Some(value))
+                .is_err()
+        );
+        assert_eq!(other.snapshot(), before);
+        assert!(receiver.is_none());
+        assert!(!reports.observations().is_empty());
+        assert!(
+            matches!(prior.result(),Resolution::Found(source) if source.bytes.as_ref()==b"{physical include}")
+        );
+    }
+
+    #[test]
+    fn include_r18_first_hit_overlay_dedup_and_exact_empty_case_warning_preserve_source_owners() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for overlay in [false, true] {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            let later = dir.path().join("later");
+            fs::create_dir(&later).unwrap();
+            fs::write(later.join("value.inc"), "{later physical include}").unwrap();
+            resolver.context.include_paths = vec![later.clone(), later.clone()];
+            resolver.context.include_path_entries =
+                vec![resolver.context.path_entry_for(&later).unwrap(); 2];
+            if overlay {
+                resolver.store.insert_overlay(
+                    dir.path().join("value.inc"),
+                    7,
+                    Arc::<[u8]>::from(&b"{overlay first}"[..]),
+                );
+            }
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let out = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let Resolution::Found(source) = out.result() else {
+                panic!("first source wins")
+            };
+            assert_eq!(source.path, dir.path().join("value.inc"));
+            if overlay {
+                assert_eq!(source.bytes.as_ref(), b"{overlay first}");
+            }
+            assert!(!out.reports().observations().iter().any(|o|matches!(o,ResolutionObservation::Payload {path,..} if path==&later.join("value.inc"))));
+            let backing = source.compile_time_backing.as_ref().unwrap().clone();
+            let source_pointer = source.bytes.as_ptr();
+            fs::create_dir(dir.path().join("Mixed")).unwrap();
+            fs::create_dir(dir.path().join("MIXED")).unwrap();
+            fs::write(dir.path().join("Mixed/body.inc"), "{one}").unwrap();
+            fs::write(dir.path().join("MIXED/body.inc"), "{two}").unwrap();
+            let failure = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "mixed/body.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let Resolution::Incomplete { reason, candidates } = failure.result() else {
+                panic!("nested physical case ambiguity stays incomplete")
+            };
+            assert_eq!(reason, "include mixed/body.inc lookup was incomplete");
+            assert!(candidates.is_empty());
+            assert_eq!(candidates.capacity(), 0);
+            let mut paths = vec![dir.path().join("Mixed"), dir.path().join("MIXED")];
+            paths.sort_by_key(|p| path_key(p));
+            let warning = format!(
+                "include mixed/body.inc has ambiguous case-insensitive path components: {}",
+                ReportPaths(&paths)
+            );
+            assert_eq!(failure.reports().warnings(), &[warning]);
+            let reason_pointer = reason.as_ptr();
+            drop(resolver);
+            drop(budget);
+            assert!(
+                matches!(out.result(),Resolution::Found(source) if source.bytes.as_ptr()==source_pointer)
+            );
+            assert!(
+                matches!(failure.result(),Resolution::Incomplete {reason,candidates} if reason.as_ptr()==reason_pointer && candidates.is_empty())
+            );
+            drop(out);
+            drop(failure);
+            assert_eq!(backing.bytes.as_ptr(), source_pointer);
+            assert!(
+                observer.budget_snapshot().retained_bytes > baseline,
+                "selected shared source backing survives discarded lookup/output controls"
+            );
+            let spent = observer.budget_snapshot();
+            drop(backing);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+        }
+    }
+
+    #[test]
+    fn include_r18_actual_first_hit_cancel_every_poll_and_precopy_refusal_keep_prior_reason() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut done = false;
+        let mut cancelled = 0;
+        for stop in 0..500 {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let prior = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "absent.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match resolver.include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &Poll {
+                    calls: 0.into(),
+                    stop,
+                },
+            ) {
+                Err(ResolverError::Cancelled) => cancelled += 1,
+                Ok(out) => {
+                    assert!(
+                        matches!(out.result(),Resolution::Found(source) if source.bytes.as_ref()==b"{physical include}")
+                    );
+                    drop(out);
+                    done = true;
+                }
+                Err(other) => panic!("unexpected error at {stop}: {other:?}"),
+            }
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(
+                matches!(prior.result(),Resolution::Unavailable {reason} if reason.contains("absent.inc"))
+            );
+            drop(prior);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        assert!(cancelled > 10);
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "absent.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        assert!(matches!(
+            resolver.include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None
+                },
+                &mut budget,
+                &NoCancellation
+            ),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(matches!(prior.result(),Resolution::Unavailable {reason} if !reason.is_empty()));
+        assert!(budget.snapshot().work >= before.work);
+        assert!(budget.snapshot().byte_work >= before.byte_work);
     }
 
     #[test]

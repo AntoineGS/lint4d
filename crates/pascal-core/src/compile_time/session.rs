@@ -3075,6 +3075,205 @@ mod tests {
     use super::*;
 
     #[test]
+    fn include_r18_root_output_and_provider_child_keep_selected_backing_and_empty_failure_reports()
+    {
+        struct Recording {
+            inner: crate::UnitResolver<crate::FilesystemSourceStore>,
+            backing: Option<AdmittedSourceBacking>,
+            reason: Option<usize>,
+            warnings: Vec<String>,
+            observations: Vec<ResolutionObservation>,
+        }
+        impl CompileTimeResolver for Recording {
+            fn include_capability(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+                let out = self.inner.include_capability(r, b, c)?;
+                match out.result() {
+                    Resolution::Found(source) => self.backing = source.compile_time_backing.clone(),
+                    Resolution::Incomplete { reason, candidates } => {
+                        assert_eq!(candidates.capacity(), 0);
+                        self.reason = Some(reason.as_ptr() as usize);
+                    }
+                    _ => panic!("actual R18 include callback"),
+                };
+                assert!(out.reports().warnings().len() < 8);
+                assert!(out.reports().observations().len() < 64);
+                self.warnings = out.reports().warnings().to_vec();
+                self.observations = out.reports().observations().to_vec();
+                Ok(out)
+            }
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                self.inner.unit_report_capability(r, b, c)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                self.inner.unit(r, b, c)
+            }
+        }
+        for child in [false, true] {
+            for failure in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("Main.pas");
+                let include = if failure {
+                    "{$I mixed/body.inc}"
+                } else {
+                    "{$I body.inc}"
+                };
+                let root_text = if child {
+                    "unit Main; interface uses Other; {$IF SizeOf(Other.T)=8}{$DEFINE HIT}{$ENDIF} implementation end.".to_string()
+                } else {
+                    format!("unit Main; interface {include} implementation end.")
+                };
+                std::fs::write(&path, root_text).unwrap();
+                std::fs::write(
+                    dir.path().join("Other.pas"),
+                    format!("unit Other; interface {include} type T=Int64; implementation end."),
+                )
+                .unwrap();
+                std::fs::write(dir.path().join("body.inc"), "{$DEFINE SELECTED}").unwrap();
+                if failure {
+                    for folder in ["Mixed", "MIXED"] {
+                        std::fs::create_dir(dir.path().join(folder)).unwrap();
+                        std::fs::write(dir.path().join(folder).join("body.inc"), "{case source}")
+                            .unwrap();
+                    }
+                }
+                let mut project = pascal_project::ProjectContext::discover(
+                    &path,
+                    &[dir.path().into()],
+                    &Default::default(),
+                )
+                .unwrap();
+                project.conditional_context = ConditionalContext::default()
+                    .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                    .with_layout(pascal_project::LayoutContext {
+                        platform: Some(pascal_project::LayoutPlatform::Win32),
+                        defaults: Default::default(),
+                    });
+                project.library_conditional_context = project.conditional_context.clone();
+                let context = project.conditional_context.clone();
+                let mut inner = crate::UnitResolver::new(
+                    project,
+                    vec![dir.path().into()],
+                    crate::FilesystemSourceStore::new(),
+                    Default::default(),
+                );
+                let root = inner
+                    .load_source(&path, None, crate::SourceKind::Unit, &crate::NoCancellation)
+                    .unwrap();
+                let mut recording = Recording {
+                    inner,
+                    backing: None,
+                    reason: None,
+                    warnings: Vec::new(),
+                    observations: Vec::new(),
+                };
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                let output = analyze_source_in_session(
+                    &root,
+                    &context,
+                    &mut recording,
+                    &mut budget,
+                    &crate::NoCancellation,
+                )
+                .unwrap();
+                if child {
+                    assert_eq!(
+                        output
+                            .root
+                            .directives
+                            .iter()
+                            .any(|d| d.body == "DEFINE HIT" && d.activity == Truth::True),
+                        !failure
+                    );
+                } else if failure {
+                    assert!(
+                        matches!(&output.includes[0].target,Resolution::Incomplete {reason,candidates} if Some(reason.as_ptr() as usize)==recording.reason && candidates.capacity()==0)
+                    );
+                } else {
+                    let backing = recording.backing.as_ref().unwrap();
+                    assert!(
+                        matches!(&output.includes[0].target,Resolution::Found(source) if source.bytes.as_ptr()==backing.bytes.as_ptr())
+                    );
+                    assert!(output.occurrences.iter().any(|o| {
+                        o.analysis
+                            .directives
+                            .iter()
+                            .any(|d| d.body == "DEFINE SELECTED" && d.activity == Truth::True)
+                    }));
+                }
+                for warning in &recording.warnings {
+                    assert!(output.warnings.contains(warning));
+                }
+                for observation in &recording.observations {
+                    assert!(output.observations.contains(observation));
+                }
+                if failure {
+                    assert!(recording.reason.is_some());
+                    assert!(
+                        recording
+                            .warnings
+                            .iter()
+                            .any(|w| w.contains("ambiguous case-insensitive path components"))
+                    );
+                } else {
+                    assert!(recording.backing.is_some());
+                }
+                let backing = recording.backing.take();
+                let pointer = backing.as_ref().map(|b| b.bytes.as_ptr());
+                drop(recording);
+                drop(root);
+                drop(budget);
+                let spent = observer.budget_snapshot();
+                assert!(spent.retained_bytes > baseline);
+                if !child && failure {
+                    assert!(
+                        matches!(&output.includes[0].target,Resolution::Incomplete {reason,candidates} if !reason.is_empty() && candidates.is_empty())
+                    );
+                }
+                drop(output);
+                if let Some(backing) = backing {
+                    assert_eq!(Some(backing.bytes.as_ptr()), pointer);
+                    assert!(observer.budget_snapshot().retained_bytes > baseline);
+                    drop(backing);
+                }
+                assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+                assert_eq!(observer.budget_snapshot().work, spent.work);
+                assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            }
+        }
+    }
+
+    #[test]
     fn unit_candidate_owner_provider_engine_classifies_owned_ambiguity_and_partial_failure() {
         struct Recording {
             inner: crate::UnitResolver<crate::FilesystemSourceStore>,

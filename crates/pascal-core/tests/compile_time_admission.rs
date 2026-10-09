@@ -10,10 +10,17 @@ use std::cell::Cell;
 struct ObservedAllocator;
 thread_local! {
     static OBSERVE: Cell<(usize, usize)> = const { Cell::new((usize::MAX, 0)) };
+    static EXACT: Cell<(usize,usize)> = const { Cell::new((usize::MAX,0)) };
 }
 #[global_allocator]
 static ALLOCATOR: ObservedAllocator = ObservedAllocator;
 fn observe(size: usize) {
+    let _ = EXACT.try_with(|cell| {
+        let (wanted, count) = cell.get();
+        if size == wanted {
+            cell.set((wanted, count + 1));
+        }
+    });
     let _ = OBSERVE.try_with(|cell| {
         let (minimum, count) = cell.get();
         if size >= minimum {
@@ -51,6 +58,55 @@ fn allocations_at_least<T>(minimum: usize, call: impl FnOnce() -> T) -> (T, usiz
 
 #[path = "support/compile_time.rs"]
 mod support;
+
+#[test]
+fn include_r18_first_hit_has_no_loaded_source_candidate_vec_allocation() {
+    use pascal_core::compile_time::{CompileTimeBudget, CompileTimeLimits, CompileTimeResolver};
+    use pascal_core::{IncludeResolveRequest, LoadedSource};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Main.pas");
+    std::fs::write(&root, "unit Main;").unwrap();
+    std::fs::write(dir.path().join("body.inc"), "{body}").unwrap();
+    let context =
+        ProjectContext::discover(&root, &[dir.path().into()], &Default::default()).unwrap();
+    let mut resolver = UnitResolver::new(
+        context,
+        vec![dir.path().into()],
+        FilesystemSourceStore::new(),
+        ResolverLimits::default(),
+    );
+    let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+    let request = IncludeResolveRequest {
+        including_path: &root,
+        byte_range: 0..0,
+        requested_name: "body.inc",
+        legacy_route: None,
+    };
+    let warm = resolver
+        .include_capability(request.clone(), &mut budget, &NoCancellation)
+        .unwrap();
+    drop(warm);
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXACT.with(|cell| cell.set((usize::MAX, 0)));
+        }
+    }
+    let reset = Reset;
+    EXACT.with(|cell| cell.set((4 * std::mem::size_of::<LoadedSource>(), 0)));
+    let out = resolver
+        .include_capability(request, &mut budget, &NoCancellation)
+        .unwrap();
+    let allocations = EXACT.with(|cell| cell.get().1);
+    drop(reset);
+    assert!(
+        matches!(out.result(),pascal_core::Resolution::Found(source) if source.path.ends_with("body.inc"))
+    );
+    assert_eq!(
+        allocations, 0,
+        "first-hit include must not allocate the legacy four-slot LoadedSource candidate Vec"
+    );
+}
 
 #[test]
 fn task9_b_receipt_control_refuses_before_first_ledger_or_payload_allocation() {

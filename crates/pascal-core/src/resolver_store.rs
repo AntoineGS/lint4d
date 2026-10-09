@@ -104,6 +104,18 @@ impl FilesystemSourceStore {
                 .allows_legacy_payload_entry(request.entry);
         if overlay.is_none() && !legacy_payload && !request.read_policy.allows_entry(request.entry)
         {
+            // Location authorization above permits a bounded spelling lookup,
+            // not a payload read. A genuinely absent entry can take the existing
+            // NotFound case-match route; existing denied entries (including
+            // dangling symlinks) must never acquire that route. The matched
+            // physical entry is independently authorized by a subsequent load.
+            if fs::symlink_metadata(request.path)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(SourceStoreError::NotFound {
+                    path: request.path.to_path_buf(),
+                });
+            }
             return Err(SourceStoreError::Unauthorized {
                 path: request.path.into(),
                 reason: "payload is not authorized".into(),

@@ -3134,11 +3134,28 @@ impl<S: SourceStore> UnitResolver<S> {
                     CaseInsensitiveLookup::Found(nested) => Some(nested),
                     CaseInsensitiveLookup::Missing => None,
                     CaseInsensitiveLookup::Ambiguous(paths) => {
+                        // The plain legacy/result contract is still backed by
+                        // its unmigrated result invoice. Borrow the new match
+                        // owner and admit this independent receiving copy;
+                        // never extract paths and refund live plain metadata.
+                        let bytes = paths.iter().try_fold(0usize, |sum, path| {
+                            sum.checked_add(path.as_os_str().len()).ok_or_else(|| {
+                                ResolverError::InvalidRequest("case result path overflow".into())
+                            })
+                        })?;
+                        let retained = paths
+                            .len()
+                            .checked_mul(std::mem::size_of::<ResolutionCandidate>())
+                            .and_then(|n| n.checked_add(bytes))
+                            .ok_or_else(|| {
+                                ResolverError::InvalidRequest("case result backing overflow".into())
+                            })?;
+                        self.admit_lookup_storage(paths.len(), bytes, retained, cancel)?;
                         return Ok(Some(Resolution::Ambiguous {
                             candidates: paths
-                                .into_iter()
+                                .iter()
                                 .map(|path| ResolutionCandidate {
-                                    path,
+                                    path: path.clone(),
                                     declared_name: None,
                                 })
                                 .collect(),
@@ -4542,6 +4559,15 @@ impl<S: SourceStore> UnitResolver<S> {
         _legacy_route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
     ) -> Result<CaseInsensitiveLookup, ResolverError> {
+        if self.compile_time_store.is_some() {
+            return self.resolve_case_insensitive_path_owned(
+                base,
+                path,
+                base_entry,
+                _legacy_route,
+                cancel,
+            );
+        }
         let base = canonical_path(base);
         let path = canonical_path(path);
         let Some(relative) = relative_components(&base, &path) else {
@@ -4588,12 +4614,193 @@ impl<S: SourceStore> UnitResolver<S> {
             } else if matches.len() == 1 {
                 current = matches.pop().expect("one path match");
             } else if matches.len() > 1 {
-                return Ok(CaseInsensitiveLookup::Ambiguous(matches));
+                return Ok(CaseInsensitiveLookup::Ambiguous(matches.into()));
             } else {
                 return Ok(CaseInsensitiveLookup::Missing);
             }
         }
-        Ok(CaseInsensitiveLookup::Found(current))
+        Ok(CaseInsensitiveLookup::Found(current.into()))
+    }
+
+    fn resolve_case_insensitive_path_owned(
+        &mut self,
+        base: &Path,
+        path: &Path,
+        base_entry: &ProjectPathEntry,
+        legacy_route: Option<&LegacyRoute>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<CaseInsensitiveLookup, ResolverError> {
+        let mut budget = self.store_budget(cancel).expect("typed case lookup");
+        let overflow = || ResolverError::InvalidRequest("case match construction overflow".into());
+        if (!base.is_absolute() && !base.has_root()) || (!path.is_absolute() && !path.has_root()) {
+            return Err(ResolverError::InvalidRequest(
+                "typed case matching requires rooted paths".into(),
+            ));
+        }
+        let canonical_bound = |path: &Path| {
+            path.as_os_str()
+                .len()
+                .checked_mul(4)
+                .map(|n| n.max(32))
+                .ok_or_else(overflow)
+        };
+        let base_bytes = canonical_bound(base)?;
+        let base = budget
+            .admit_owned(1, base_bytes, base_bytes, || canonical_path(base))
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let path_bytes = canonical_bound(path)?;
+        let path = budget
+            .admit_owned(1, path_bytes, path_bytes, || canonical_path(path))
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let Some(relative) = relative_components_owned(&base, &path, &mut budget, cancel)? else {
+            return Ok(CaseInsensitiveLookup::Missing);
+        };
+        drop(path);
+        if relative.is_empty() {
+            return Ok(CaseInsensitiveLookup::Found(LookupScratch::Admitted(
+                copy_case_path(&base, &mut budget)?,
+            )));
+        }
+        let mut current = base;
+        for wanted in relative.iter() {
+            self.check_cancel(cancel)?;
+            let mut provenance_bytes = 0usize;
+            if let ProjectPathProvenance::Mapped { root } = &base_entry.provenance {
+                provenance_bytes = root.as_os_str().len();
+            }
+            let entry_bytes = current
+                .as_os_str()
+                .len()
+                .checked_add(provenance_bytes)
+                .ok_or_else(overflow)?;
+            let current_entry = budget
+                .admit_owned(1, entry_bytes, entry_bytes, || ProjectPathEntry {
+                    path: (*current).clone(),
+                    provenance: base_entry.provenance.clone(),
+                })
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            let listing =
+                self.list_directory(&current, &current_entry, legacy_route, cancel, false)?;
+            let count = listing
+                .files
+                .len()
+                .checked_add(listing.directories.len())
+                .ok_or_else(overflow)?;
+            let index_bytes = count
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(overflow)?;
+            let mut sort_bytes = wanted
+                .as_os_str()
+                .len()
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(32))
+                .ok_or_else(overflow)?;
+            for candidate in listing.files.iter().chain(listing.directories.iter()) {
+                sort_bytes = sort_bytes
+                    .checked_add(
+                        candidate
+                            .as_os_str()
+                            .len()
+                            .checked_mul(8)
+                            .and_then(|n| n.checked_add(32))
+                            .ok_or_else(overflow)?,
+                    )
+                    .ok_or_else(overflow)?;
+            }
+            sort_bytes = sort_bytes
+                .checked_add(index_bytes.checked_mul(2).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?;
+            let work = count
+                .checked_mul(count.checked_add(1).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?;
+            let _sorting = budget
+                .admit_owned(
+                    work,
+                    sort_bytes.checked_mul(count.max(1)).ok_or_else(overflow)?,
+                    sort_bytes,
+                    || (),
+                )
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            let candidate_at = |index: usize| {
+                if index < listing.files.len() {
+                    &listing.files[index]
+                } else {
+                    &listing.directories[index - listing.files.len()]
+                }
+            };
+            let matches = budget.admit_fallible(
+                count,
+                index_bytes,
+                index_bytes,
+                crate::compile_time::resolver_error,
+                || {
+                    let mut matches: Vec<usize> = Vec::with_capacity(count);
+                    for (index, candidate) in listing
+                        .files
+                        .iter()
+                        .chain(listing.directories.iter())
+                        .enumerate()
+                    {
+                        if cancel.is_cancelled() {
+                            return Err(ResolverError::Cancelled);
+                        }
+                        if candidate.file_name().is_some_and(|name| {
+                            name.to_string_lossy()
+                                .eq_ignore_ascii_case(&wanted.to_string_lossy())
+                        }) && !matches
+                            .iter()
+                            .any(|previous| path_equivalent(candidate_at(*previous), candidate))
+                        {
+                            matches.push(index);
+                        }
+                    }
+                    matches.sort_by_key(|index| path_key(candidate_at(*index)));
+                    if cancel.is_cancelled() {
+                        return Err(ResolverError::Cancelled);
+                    }
+                    Ok(matches)
+                },
+            )?;
+            if !listing.complete {
+                let bound = current
+                    .as_os_str()
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|n| n.checked_add(64))
+                    .ok_or_else(overflow)?;
+                self.diagnostic_args(
+                    cancel,
+                    bound,
+                    format_args!(
+                        "case-insensitive lookup under {} was incomplete",
+                        current.display()
+                    ),
+                )?;
+                return Ok(CaseInsensitiveLookup::Incomplete);
+            }
+            let exact = matches.iter().find(|index| {
+                candidate_at(**index)
+                    .file_name()
+                    .is_some_and(|name| name == wanted)
+            });
+            if let Some(index) = exact.or_else(|| (matches.len() == 1).then(|| &matches[0])) {
+                let selected = candidate_at(*index);
+                let next = copy_case_path(selected, &mut budget)?;
+                // New selected-path storage is admitted while the old current
+                // owner is live. Assignment destroys old storage before refund.
+                current = next;
+            } else if matches.len() > 1 {
+                let paths = copy_case_paths(&listing, &matches, &mut budget, cancel)?;
+                return Ok(CaseInsensitiveLookup::Ambiguous(LookupScratch::Admitted(
+                    paths,
+                )));
+            } else {
+                return Ok(CaseInsensitiveLookup::Missing);
+            }
+        }
+        Ok(CaseInsensitiveLookup::Found(LookupScratch::Admitted(
+            current,
+        )))
     }
 
     fn filename_catalogue_candidates(
@@ -5742,8 +5949,8 @@ impl ResolverSessionCache {
 
 enum CaseInsensitiveLookup {
     Missing,
-    Found(PathBuf),
-    Ambiguous(Vec<PathBuf>),
+    Found(LookupScratch<PathBuf>),
+    Ambiguous(LookupScratch<Vec<PathBuf>>),
     Incomplete,
 }
 
@@ -6250,6 +6457,160 @@ fn legacy_route_authorizes_directory(directory: &Path, route: &LegacyRoute) -> b
         .parent()
         .is_some_and(|parent| path_equivalent(parent, &sibling_directory))
         && path_equivalent(&directory, &sibling_directory)
+}
+
+fn copy_case_path(
+    path: &PathBuf,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<AdmittedOwned<PathBuf>, ResolverError> {
+    let bytes = path.as_os_str().len();
+    budget
+        .admit_owned(1, bytes, bytes, || path.clone())
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))
+}
+
+fn copy_case_paths(
+    listing: &DirectoryListing,
+    matches: &[usize],
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<AdmittedOwned<Vec<PathBuf>>, ResolverError> {
+    let overflow = || ResolverError::InvalidRequest("case match-set receiving overflow".into());
+    let at = |index: usize| {
+        if index < listing.files.len() {
+            &listing.files[index]
+        } else {
+            &listing.directories[index - listing.files.len()]
+        }
+    };
+    let backing = matches
+        .len()
+        .checked_mul(std::mem::size_of::<PathBuf>())
+        .ok_or_else(overflow)?;
+    let payload = matches.iter().try_fold(0usize, |sum, index| {
+        sum.checked_add(at(*index).as_os_str().len())
+            .ok_or_else(overflow)
+    })?;
+    budget.admit_fallible(
+        matches.len(),
+        payload,
+        payload.checked_add(backing).ok_or_else(overflow)?,
+        crate::compile_time::resolver_error,
+        || {
+            let mut paths = Vec::with_capacity(matches.len());
+            for index in matches {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                paths.push(at(*index).clone());
+            }
+            Ok(paths)
+        },
+    )
+}
+
+fn relative_components_owned(
+    base: &Path,
+    path: &Path,
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<Option<AdmittedOwned<Vec<std::ffi::OsString>>>, ResolverError> {
+    let overflow =
+        || ResolverError::InvalidRequest("case relative-component construction overflow".into());
+    let base_count = base.components().count();
+    let path_count = path.components().count();
+    let component_bytes = |count: usize| {
+        count
+            .checked_mul(std::mem::size_of::<Component<'_>>())
+            .ok_or_else(overflow)
+    };
+    let base_bytes = component_bytes(base_count)?;
+    let base_components = budget.admit_fallible(
+        base_count,
+        0,
+        base_bytes,
+        crate::compile_time::resolver_error,
+        || {
+            let mut parts = Vec::with_capacity(base_count);
+            for part in base.components() {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                parts.push(part);
+            }
+            Ok(parts)
+        },
+    )?;
+    let path_bytes = component_bytes(path_count)?;
+    let path_components = budget.admit_fallible(
+        path_count,
+        0,
+        path_bytes,
+        crate::compile_time::resolver_error,
+        || {
+            let mut parts = Vec::with_capacity(path_count);
+            for part in path.components() {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                parts.push(part);
+            }
+            Ok(parts)
+        },
+    )?;
+    let key_bytes = base
+        .as_os_str()
+        .len()
+        .checked_add(path.as_os_str().len())
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add(32))
+        .ok_or_else(overflow)?;
+    let _keys = budget
+        .admit_owned(base_count, key_bytes, key_bytes, || ())
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    if path_count < base_count {
+        return Ok(None);
+    }
+    let insensitive = path_identity::is_case_insensitive(base);
+    for (left, right) in base_components.iter().zip(path_components.iter()) {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        if !path_identity::components_equal(*left, *right, insensitive) {
+            return Ok(None);
+        }
+    }
+    let count = path_count - base_count;
+    let payload =
+        path_components[base_count..]
+            .iter()
+            .try_fold(0usize, |sum, part| match part {
+                Component::Normal(name) => sum.checked_add(name.len()).ok_or_else(overflow),
+                _ => Ok(sum),
+            })?;
+    let retained = count
+        .checked_mul(std::mem::size_of::<std::ffi::OsString>())
+        .and_then(|n| n.checked_add(payload))
+        .ok_or_else(overflow)?;
+    let relative = budget.admit_fallible(
+        count,
+        payload,
+        retained,
+        crate::compile_time::resolver_error,
+        || {
+            let mut relative = Vec::with_capacity(count);
+            for part in &path_components[base_count..] {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                if let Component::Normal(name) = part {
+                    relative.push(name.to_os_string());
+                }
+            }
+            Ok(relative)
+        },
+    )?;
+    Ok(Some(relative))
 }
 
 fn relative_components(base: &Path, path: &Path) -> Option<Vec<std::ffi::OsString>> {
@@ -6819,6 +7180,630 @@ mod tests {
     }
 
     #[test]
+    fn case_match_owner_actual_found_refunds_only_returned_path_after_helper_exit() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let source = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        drop(
+            call.list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap(),
+        );
+        let before = budget.snapshot();
+        let result = call
+            .resolve_case_insensitive_path(
+                dir.path(),
+                &dir.path().join("VaLuE.InC"),
+                &entry,
+                None,
+                &NoCancellation,
+            )
+            .unwrap();
+        let CaseInsensitiveLookup::Found(path) = result else {
+            panic!("physical case match")
+        };
+        assert_eq!(path.as_os_str(), dir.path().join("value.inc").as_os_str());
+        let invoice = std::mem::size_of::<AdmittedOwned<PathBuf>>() + path.as_os_str().len();
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            before.retained_bytes + invoice,
+            "only the returned matched path survives helper scratch exit"
+        );
+        let spent = budget.snapshot();
+        drop(path);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert_eq!(budget.snapshot().work, spent.work);
+        assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+        assert!(matches!(source.result(), Resolution::Found(_)));
+        assert!(!source.reports().observations().is_empty());
+    }
+
+    #[test]
+    fn case_match_owner_actual_nested_include_unit_and_exact_preference() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let folder = dir.path().join("MiXeD");
+        let sub = folder.join("SuB");
+        fs::create_dir_all(&sub).unwrap();
+        let body = sub.join("body.inc");
+        fs::write(&body, "{nested physical include}").unwrap();
+        let provider = folder.join("THING.PAS");
+        fs::write(
+            &provider,
+            "unit Mixed.Thing; interface type T=Byte; implementation end.",
+        )
+        .unwrap();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let include = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "mixed/sub/BODY.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(include.result(),Resolution::Found(source) if source.path==body && source.compile_time_backing.is_some()),
+            "actual include result: {:?}; warnings: {:?}",
+            include.result(),
+            include.reports().warnings()
+        );
+        assert!(include.reports().observations().iter().any(|o|matches!(o,ResolutionObservation::Payload { path,revision:SourceRevision::Disk { path_entry:e,.. },.. } if path==&body && e.provenance==entry.provenance)));
+        let unit = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "mixed.Thing",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(unit.result(),Resolution::Found(source) if source.unit.source.path==provider && source.unit.declared_name.eq_ignore_ascii_case("Mixed.Thing"))
+        );
+        assert!(!unit.reports().observations().is_empty());
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let result = call
+            .resolve_case_insensitive_path(dir.path(), &body, &entry, None, &NoCancellation)
+            .unwrap();
+        assert!(matches!(&result,CaseInsensitiveLookup::Found(path) if **path==body));
+        drop(result);
+        if !path_identity::is_case_insensitive(dir.path()) {
+            fs::write(dir.path().join("OTHER.pas"), "unit Other;").unwrap();
+            let exact = call
+                .resolve_case_insensitive_path(
+                    dir.path(),
+                    &dir.path().join("Other.pas"),
+                    &entry,
+                    None,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(
+                matches!(&exact,CaseInsensitiveLookup::Found(path) if **path==dir.path().join("Other.pas"))
+            );
+            let ambiguous = call
+                .resolve_case_insensitive_path(
+                    dir.path(),
+                    &dir.path().join("oThEr.pas"),
+                    &entry,
+                    None,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(matches!(&ambiguous,CaseInsensitiveLookup::Ambiguous(paths) if paths.len()==2));
+        }
+    }
+
+    #[test]
+    fn case_match_owner_returned_found_and_ambiguity_survive_cache_and_budget_last_drop() {
+        use crate::compile_time::CompileTimeLimits;
+        for ambiguous in [false, true] {
+            let (dir, _, mut resolver) = physical_report_resolver();
+            if ambiguous {
+                if path_identity::is_case_insensitive(dir.path()) {
+                    continue;
+                }
+                fs::write(dir.path().join("VALUE.inc"), "{other physical file}").unwrap();
+            }
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let result;
+            let invoice;
+            {
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                drop(
+                    call.list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                        .unwrap(),
+                );
+                let before = budget.snapshot();
+                result = call
+                    .resolve_case_insensitive_path(
+                        dir.path(),
+                        &dir.path().join("VaLuE.InC"),
+                        &entry,
+                        None,
+                        &NoCancellation,
+                    )
+                    .unwrap();
+                invoice = match &result {
+                    CaseInsensitiveLookup::Found(path) => {
+                        std::mem::size_of::<AdmittedOwned<PathBuf>>() + path.as_os_str().len()
+                    }
+                    CaseInsensitiveLookup::Ambiguous(paths) => {
+                        std::mem::size_of::<AdmittedOwned<Vec<PathBuf>>>()
+                            + paths.capacity() * std::mem::size_of::<PathBuf>()
+                            + paths.iter().map(|p| p.as_os_str().len()).sum::<usize>()
+                    }
+                    _ => panic!("expected physical matched owner"),
+                };
+                assert_eq!(
+                    budget.snapshot().retained_bytes,
+                    before.retained_bytes + invoice,
+                    "only the matched return survives, not unrelated helper storage"
+                );
+            }
+            drop(resolver);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            assert_eq!(live.retained_bytes, baseline + invoice);
+            match &result {
+                CaseInsensitiveLookup::Found(path) => assert!(path.ends_with("value.inc")),
+                CaseInsensitiveLookup::Ambiguous(paths) => assert_eq!(paths.len(), 2),
+                _ => unreachable!(),
+            }
+            drop(result);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn case_match_owner_missing_overlay_dedup_and_authorization_preserve_live_directory() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let overlay = dir.path().join("value.inc");
+        resolver.store.inner.insert_overlay(
+            &overlay,
+            1,
+            Arc::<[u8]>::from(&b"{overlay include}"[..]),
+        );
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let directory = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let directory_pointer = directory.files.as_ptr();
+        let result = call
+            .resolve_case_insensitive_path(
+                dir.path(),
+                &dir.path().join("VaLuE.InC"),
+                &entry,
+                None,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(&result,CaseInsensitiveLookup::Found(path) if **path==overlay),
+            "same physical disk+overlay listing is not an ambiguity"
+        );
+        drop(result);
+        assert_eq!(directory.files.as_ptr(), directory_pointer);
+        assert!(directory.files.contains(&overlay));
+        // Once the original caller is dropped, reread replacement has the same
+        // cached backing cost; Missing must retain no helper construction.
+        drop(directory);
+        let before = budget.snapshot();
+        let result = call
+            .resolve_case_insensitive_path(
+                dir.path(),
+                &dir.path().join("absent.inc"),
+                &entry,
+                None,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(matches!(result, CaseInsensitiveLookup::Missing));
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        let outside = dir.path().parent().unwrap().join("not-this-base.inc");
+        assert!(matches!(
+            call.resolve_case_insensitive_path(dir.path(), &outside, &entry, None, &NoCancellation)
+                .unwrap(),
+            CaseInsensitiveLookup::Missing
+        ));
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        let denied = ProjectPathEntry {
+            path: entry.path.clone(),
+            provenance: ProjectPathProvenance::Mapped {
+                root: dir.path().join("not-authorized"),
+            },
+        };
+        let calls = call.store.calls;
+        assert!(matches!(
+            call.resolve_case_insensitive_path(
+                dir.path(),
+                &overlay,
+                &denied,
+                None,
+                &NoCancellation
+            ),
+            Err(ResolverError::SourceStore(
+                SourceStoreError::AdmissionUnavailable
+            ))
+        ));
+        assert!(call.store.calls > calls);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+    }
+
+    #[test]
+    fn case_match_owner_unit_ambiguous_component_builds_independent_plain_result_copy() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        if path_identity::is_case_insensitive(dir.path()) {
+            return;
+        }
+        for name in ["Space", "SPACE"] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let (first, second);
+        {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let matches = call
+                .resolve_case_insensitive_path(
+                    dir.path(),
+                    &dir.path().join("sPaCe"),
+                    &entry,
+                    None,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let CaseInsensitiveLookup::Ambiguous(paths) = matches else {
+                panic!("two physical component matches")
+            };
+            first = paths[0].as_os_str().as_encoded_bytes().as_ptr();
+            second = paths[1].as_os_str().as_encoded_bytes().as_ptr();
+            // Keep original owner through the receiving construction to prove
+            // these are independently admitted/copy-owned result path buffers.
+            let out = call
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: "sPaCe.Other",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(
+                matches!(out.result(),Resolution::Ambiguous { candidates } if candidates.len()==2 && candidates.iter().all(|c|c.declared_name.is_none() && c.path.as_os_str().as_encoded_bytes().as_ptr()!=first && c.path.as_os_str().as_encoded_bytes().as_ptr()!=second))
+            );
+            drop(paths);
+            assert!(
+                matches!(out.result(),Resolution::Ambiguous { candidates } if candidates.iter().all(|c|c.path.is_dir()))
+            );
+            let spent = budget.snapshot();
+            drop(out);
+            assert_eq!(budget.snapshot().work, spent.work);
+            assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+        }
+    }
+
+    #[test]
+    fn case_match_owner_nested_callback_error_cancel_unwind_and_partial_polls_retire_scratch() {
+        use crate::compile_time::CompileTimeLimits;
+        for failure in [
+            DirectoryFailure::Error,
+            DirectoryFailure::Cancel,
+            DirectoryFailure::Panic,
+            DirectoryFailure::Foreign,
+        ] {
+            let (dir, _, mut resolver) = directory_probe_resolver();
+            let nested = dir.path().join("Nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("Leaf.inc"), "{leaf}").unwrap();
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            call.store.failure = failure;
+            call.store.failure_call = Some(2);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                call.resolve_case_insensitive_path(
+                    dir.path(),
+                    &dir.path().join("nested/LEAF.inc"),
+                    &entry,
+                    None,
+                    &NoCancellation,
+                )
+            }));
+            assert_eq!(
+                call.store.calls, 2,
+                "reach actual second component callback with previous selected path live"
+            );
+            if matches!(failure, DirectoryFailure::Panic) {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            drop(call);
+            drop(resolver);
+            assert_eq!(
+                budget.snapshot().retained_bytes,
+                baseline,
+                "failed nested lookup leaves no leaked temporary construction"
+            );
+            assert!(budget.snapshot().work > 0);
+            assert!(budget.snapshot().byte_work > 0);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        }
+        struct Poll {
+            count: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.count.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut cancelled = 0;
+        let mut complete = false;
+        for stop in 0..400 {
+            let (dir, _, mut resolver) = directory_probe_resolver();
+            let nested = dir.path().join("Nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("Leaf.inc"), "{leaf}").unwrap();
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let result = {
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                call.resolve_case_insensitive_path(
+                    dir.path(),
+                    &dir.path().join("nested/LEAF.inc"),
+                    &entry,
+                    None,
+                    &Poll {
+                        count: 0.into(),
+                        stop,
+                    },
+                )
+            };
+            match result {
+                Err(ResolverError::Cancelled) => cancelled += 1,
+                Ok(CaseInsensitiveLookup::Found(path)) => {
+                    assert!(path.ends_with("Nested/Leaf.inc"));
+                    drop(path);
+                    complete = true;
+                }
+                Err(other) => panic!("unexpected stop {stop}: {other:?}"),
+                _ => panic!("unexpected match at stop {stop}"),
+            }
+            let spent = budget.snapshot();
+            drop(resolver);
+            assert_eq!(
+                budget.snapshot().retained_bytes,
+                baseline,
+                "partial helper allocation at poll {stop}"
+            );
+            assert_eq!(budget.snapshot().work, spent.work);
+            assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        assert!(
+            cancelled > 20,
+            "exercise deep callbacks, partial components, matching and returned copying"
+        );
+    }
+
+    #[test]
+    fn case_match_owner_precanonical_component_and_receiving_copy_refusals_keep_live_owners() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let pointer = listing.files.as_ptr();
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let calls = call.store.calls;
+        drop(call);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        assert!(matches!(
+            call.resolve_case_insensitive_path(
+                dir.path(),
+                &dir.path().join("VaLuE.inc"),
+                &entry,
+                None,
+                &NoCancellation
+            ),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(
+            call.store.calls, calls,
+            "canonical construction refusal precedes the directory callback"
+        );
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert!(matches!(
+            relative_components_owned(
+                dir.path(),
+                &dir.path().join("value.inc"),
+                &mut budget,
+                &NoCancellation
+            ),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            copy_case_path(&listing.files[0], &mut budget),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(matches!(
+            copy_case_paths(&listing, &[0], &mut budget, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(listing.files.as_ptr(), pointer);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert_eq!(budget.snapshot().work, before.work);
+        assert_eq!(budget.snapshot().byte_work, before.byte_work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_match_owner_missing_fallback_does_not_authorize_denied_or_dangling_payloads() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.inc");
+        fs::write(&secret, "{not authorized}").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("Denied.inc")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("gone.inc"),
+            dir.path().join("Dangling.inc"),
+        )
+        .unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        for name in ["Denied.inc", "denied.INC", "Dangling.inc"] {
+            let out = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: name,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            assert!(
+                !matches!(out.result(), Resolution::Found(_)),
+                "no unauthorized matched payload for {name}"
+            );
+            assert!(!out.reports().observations().iter().any(|o|matches!(o,ResolutionObservation::Payload {path,..} if path==&secret || path.ends_with("Denied.inc") || path.ends_with("Dangling.inc"))));
+        }
+    }
+
+    #[test]
+    fn case_match_owner_budget_sweep_reaches_matching_and_refunds_all_failed_peaks() {
+        use crate::compile_time::CompileTimeLimits;
+        let mut refused_before_read = false;
+        let mut refused_after_read = false;
+        let mut complete = false;
+        for headroom in (0..=65536).step_by(256) {
+            let (dir, _, mut resolver) = directory_probe_resolver();
+            for index in 0..8 {
+                fs::write(dir.path().join(format!("Extra{index}.pas")), "unit Extra;").unwrap();
+            }
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            {
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                drop(
+                    call.list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                        .unwrap(),
+                );
+            }
+            budget
+                .constrain_retained(budget.snapshot().retained_bytes + headroom)
+                .unwrap();
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let calls = call.store.calls;
+            match call.resolve_case_insensitive_path(
+                dir.path(),
+                &dir.path().join("VaLuE.InC"),
+                &entry,
+                None,
+                &NoCancellation,
+            ) {
+                Err(ResolverError::LimitExceeded { .. }) => {
+                    if call.store.calls == calls {
+                        refused_before_read = true;
+                    } else {
+                        refused_after_read = true;
+                    }
+                }
+                Ok(CaseInsensitiveLookup::Found(path)) => {
+                    assert!(path.ends_with("value.inc"));
+                    drop(path);
+                    complete = true;
+                }
+                Err(other) => panic!("unexpected budget refusal at {headroom}: {other:?}"),
+                _ => panic!("unexpected budget match at {headroom}"),
+            }
+            let spent = budget.snapshot();
+            drop(call);
+            drop(resolver);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline,
+                "all construction/storage retired at headroom {headroom}"
+            );
+            assert_eq!(budget.snapshot().work, spent.work);
+            assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+            if complete {
+                break;
+            }
+        }
+        assert!(
+            refused_before_read && refused_after_read && complete,
+            "exercise early and late actual helper peaks through first success"
+        );
+    }
+
+    #[test]
     fn directory_ownership_filesystem_caller_shares_cache_backing() {
         use crate::compile_time::CompileTimeLimits;
         let (dir, _root, mut resolver) = physical_report_resolver();
@@ -7251,6 +8236,7 @@ mod tests {
     struct DirectoryProbeStore {
         inner: FilesystemSourceStore,
         failure: DirectoryFailure,
+        failure_call: Option<usize>,
         calls: usize,
         files: usize,
         overlay_failure: DirectoryFailure,
@@ -7266,6 +8252,9 @@ mod tests {
             self.calls += 1;
             let listing = self.inner.list_directory_admitted(r, b, c)?;
             self.files = listing.files.as_ptr() as usize;
+            if self.failure_call.is_some_and(|call| call != self.calls) {
+                return Ok(listing);
+            }
             match self.failure {
                 DirectoryFailure::None => Ok(listing),
                 DirectoryFailure::Error => Err(SourceStoreError::Io {
@@ -7348,6 +8337,7 @@ mod tests {
             DirectoryProbeStore {
                 inner: FilesystemSourceStore::new(),
                 failure: DirectoryFailure::None,
+                failure_call: None,
                 calls: 0,
                 files: 0,
                 overlay_failure: DirectoryFailure::None,

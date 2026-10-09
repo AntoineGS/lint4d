@@ -774,20 +774,139 @@ pub struct AdmittedCapabilityReports {
 
 #[derive(Debug)]
 pub struct AdmittedCapabilityOutcome<T> {
-    result: Resolution<T>,
+    result: AdmittedCapabilityResult<T>,
     reports: AdmittedCapabilityReports,
 }
+
+/// Borrow-only callback result. Migrated reason payloads cannot be detached
+/// from their original construction receipt by splitting the outcome.
+#[derive(Debug)]
+pub struct AdmittedCapabilityResult<T> {
+    storage: CapabilityResultStorage<T>,
+}
+#[derive(Debug)]
+enum CapabilityResultStorage<T> {
+    Unmigrated(Resolution<T>),
+    Reason(AdmittedOwned<Resolution<T>>),
+}
+impl<T> From<Resolution<T>> for AdmittedCapabilityResult<T> {
+    fn from(value: Resolution<T>) -> Self {
+        Self {
+            storage: CapabilityResultStorage::Unmigrated(value),
+        }
+    }
+}
+impl<T> AdmittedCapabilityResult<T> {
+    pub fn result(&self) -> &Resolution<T> {
+        match &self.storage {
+            CapabilityResultStorage::Unmigrated(value) => value,
+            CapabilityResultStorage::Reason(value) => value,
+        }
+    }
+    pub(crate) fn owns_reason(&self) -> bool {
+        matches!(self.storage, CapabilityResultStorage::Reason(_))
+    }
+    pub(crate) fn into_unmigrated(self) -> Result<Resolution<T>, ResolverError> {
+        match self.storage {
+            CapabilityResultStorage::Unmigrated(value) => Ok(value),
+            CapabilityResultStorage::Reason(_) => Err(ResolverError::InvalidRequest(
+                "owned reason requires consuming field transfer".into(),
+            )),
+        }
+    }
+    pub(crate) fn move_reason_into<U>(
+        self,
+        destination: &mut AdmittedOwned<U>,
+        budget: &CompileTimeBudget<'_>,
+        install: impl FnOnce(&mut U, Resolution<T>),
+    ) -> Result<(), ResolverError> {
+        match self.storage {
+            CapabilityResultStorage::Reason(value) => destination
+                .move_field(value, budget, install)
+                .map_err(|r| crate::compile_time::resolver_error(r, budget)),
+            CapabilityResultStorage::Unmigrated(_) => Err(ResolverError::InvalidRequest(
+                "result has no original reason receipt".into(),
+            )),
+        }
+    }
+    pub(crate) fn reason(
+        reason: AdmittedOwned<String>,
+        incomplete: bool,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, ResolverError> {
+        let value = reason
+            .map_value(budget, |reason| {
+                if incomplete {
+                    Resolution::Incomplete {
+                        reason,
+                        candidates: Vec::new(),
+                    }
+                } else {
+                    Resolution::Unavailable { reason }
+                }
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        Ok(Self {
+            storage: CapabilityResultStorage::Reason(value),
+        })
+    }
+}
 impl<T> AdmittedCapabilityOutcome<T> {
+    pub fn from_reason(
+        reason: AdmittedOwned<String>,
+        incomplete: bool,
+        reports: AdmittedCapabilityReports,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, ResolverError> {
+        Ok(Self {
+            result: AdmittedCapabilityResult::reason(reason, incomplete, budget)?,
+            reports,
+        })
+    }
     pub fn new(result: Resolution<T>, reports: AdmittedCapabilityReports) -> Self {
-        Self { result, reports }
+        Self {
+            result: result.into(),
+            reports,
+        }
+    }
+    /// Bounded adapters copy borrowed failure reasons before construction.
+    /// Production resolvers instead hand off the original minted reason owner.
+    pub fn copy_bounded_result(
+        result: Resolution<T>,
+        reports: AdmittedCapabilityReports,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, ResolverError> {
+        let reason = match &result {
+            Resolution::Unavailable { reason }
+            | Resolution::Incomplete {
+                reason,
+                candidates: _,
+            } => Some(reason),
+            _ => None,
+        };
+        let Some(reason) = reason else {
+            return Ok(Self::new(result, reports));
+        };
+        if matches!(&result,Resolution::Incomplete {candidates,..} if !candidates.is_empty()) {
+            return Ok(Self::new(result, reports)); // candidate ownership is still unmigrated
+        }
+        let owner = budget
+            .admit_owned(1, reason.len(), reason.len(), || reason.clone())
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let incomplete = matches!(result, Resolution::Incomplete { .. });
+        drop(result);
+        Ok(Self {
+            result: AdmittedCapabilityResult::reason(owner, incomplete, budget)?,
+            reports,
+        })
     }
     pub fn result(&self) -> &Resolution<T> {
-        &self.result
+        self.result.result()
     }
     pub fn reports(&self) -> &AdmittedCapabilityReports {
         &self.reports
     }
-    pub fn into_parts(self) -> (Resolution<T>, AdmittedCapabilityReports) {
+    pub fn into_parts(self) -> (AdmittedCapabilityResult<T>, AdmittedCapabilityReports) {
         (self.result, self.reports)
     }
 }
@@ -1146,6 +1265,8 @@ pub struct UnitResolver<S> {
     compile_time_store: Option<StoreRoot>,
     compile_time_caches: Vec<StoreRoot>,
     callback_reports: Option<CallbackReports>,
+    callback_include_reason: Option<AdmittedOwned<String>>,
+    owning_include_callback: bool,
 }
 
 enum CallbackReports {
@@ -1155,6 +1276,8 @@ enum CallbackReports {
 struct CallbackReportCall<'a, S: SourceStore> {
     resolver: &'a mut UnitResolver<S>,
     previous: Option<CallbackReports>,
+    previous_reason: Option<AdmittedOwned<String>>,
+    previous_include: bool,
 }
 impl<S: SourceStore> std::ops::Deref for CallbackReportCall<'_, S> {
     type Target = UnitResolver<S>;
@@ -1170,18 +1293,41 @@ impl<S: SourceStore> std::ops::DerefMut for CallbackReportCall<'_, S> {
 impl<S: SourceStore> Drop for CallbackReportCall<'_, S> {
     fn drop(&mut self) {
         self.resolver.callback_reports = self.previous.take();
+        self.resolver.callback_include_reason = self.previous_reason.take();
+        self.resolver.owning_include_callback = self.previous_include;
     }
 }
 impl<S: SourceStore> CallbackReportCall<'_, S> {
     fn finish<T>(
         self,
         result: Resolution<T>,
+        budget: &mut CompileTimeBudget<'_>,
     ) -> Result<AdmittedCapabilityOutcome<T>, ResolverError> {
         let Some(CallbackReports::Built(reports)) = self.resolver.callback_reports.take() else {
             return Err(ResolverError::InvalidRequest(
                 "callback report capability was not constructed".into(),
             ));
         };
+        if let Some(reason) = self.resolver.callback_include_reason.take() {
+            let incomplete = match &result {
+                Resolution::Unavailable { reason } if reason.is_empty() => false,
+                Resolution::Incomplete { reason, candidates }
+                    if reason.is_empty() && candidates.is_empty() =>
+                {
+                    true
+                }
+                _ => {
+                    return Err(ResolverError::InvalidRequest(
+                        "include reason constructor/handoff mismatch".into(),
+                    ));
+                }
+            };
+            drop(result);
+            return Ok(AdmittedCapabilityOutcome {
+                result: AdmittedCapabilityResult::reason(reason, incomplete, budget)?,
+                reports,
+            });
+        }
         Ok(AdmittedCapabilityOutcome::new(result, reports))
     }
 }
@@ -1321,9 +1467,13 @@ impl<S: SourceStore> Drop for StoreCall<'_, S> {
 impl<S: SourceStore> UnitResolver<S> {
     fn callback_report_call(&mut self) -> CallbackReportCall<'_, S> {
         let previous = self.callback_reports.replace(CallbackReports::Requested);
+        let previous_reason = self.callback_include_reason.take();
+        let previous_include = std::mem::replace(&mut self.owning_include_callback, false);
         CallbackReportCall {
             resolver: self,
             previous,
+            previous_reason,
+            previous_include,
         }
     }
     fn store_call<'b>(
@@ -1927,6 +2077,8 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_store: None,
             compile_time_caches: Vec::new(),
             callback_reports: None,
+            callback_include_reason: None,
+            owning_include_callback: false,
         }
     }
 
@@ -2776,7 +2928,15 @@ impl<S: SourceStore> UnitResolver<S> {
                     resolver_error_report_bound(&error),
                     format_args!("{error}"),
                 )?;
-                let reason = error.to_string();
+                let reason = if self.owning_include_callback {
+                    self.include_reason_build(
+                        resolver_error_report_bound(&error),
+                        cancel,
+                        format_args!("{error}"),
+                    )?
+                } else {
+                    error.to_string()
+                };
                 Resolution::Incomplete {
                     reason,
                     candidates: Vec::new(),
@@ -4170,6 +4330,38 @@ impl<S: SourceStore> UnitResolver<S> {
         })
     }
 
+    fn include_reason_build(
+        &mut self,
+        bound: usize,
+        cancel: &dyn CancellationToken,
+        args: std::fmt::Arguments<'_>,
+    ) -> Result<String, ResolverError> {
+        if !self.owning_include_callback {
+            return Ok(args.to_string());
+        }
+        if self.callback_include_reason.is_some() {
+            return Err(ResolverError::InvalidRequest(
+                "duplicate include reason construction".into(),
+            ));
+        }
+        let mut budget = self.store_budget(cancel).ok_or_else(|| {
+            ResolverError::InvalidRequest("include reason requires admitted callback root".into())
+        })?;
+        let owner = budget
+            .admit_owned(1, bound, bound, || {
+                use std::fmt::Write;
+                let mut reason = String::with_capacity(bound);
+                reason.write_fmt(args).expect("include reason formatting");
+                reason
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        self.callback_include_reason = Some(owner);
+        // Private compatibility plumbing sees only this allocation-free marker.
+        // The actual String remains owned until finish constructs the safe
+        // callback carrier; no public owning callback returns this marker.
+        Ok(String::new())
+    }
+
     fn resolve_include_inner(
         &mut self,
         request: IncludeResolveRequest<'_>,
@@ -4189,7 +4381,11 @@ impl<S: SourceStore> UnitResolver<S> {
         self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         if request.requested_name.trim().is_empty() {
             return Ok(Resolution::Incomplete {
-                reason: "include directive has no file name".to_string(),
+                reason: self.include_reason_build(
+                    34,
+                    cancel,
+                    format_args!("include directive has no file name"),
+                )?,
                 candidates: Vec::new(),
             });
         }
@@ -4352,12 +4548,34 @@ impl<S: SourceStore> UnitResolver<S> {
                     ),
                 )?;
                 Ok(Resolution::Incomplete {
-                    reason: format!("include {} lookup was incomplete", request.requested_name),
+                    reason: self.include_reason_build(
+                        request
+                            .requested_name
+                            .len()
+                            .checked_add(32)
+                            .ok_or_else(|| {
+                                ResolverError::InvalidRequest(
+                                    "include reason bound overflow".into(),
+                                )
+                            })?,
+                        cancel,
+                        format_args!("include {} lookup was incomplete", request.requested_name),
+                    )?,
                     candidates: Vec::new(),
                 })
             }
             0 => Ok(Resolution::Unavailable {
-                reason: format!("include {} was not found", request.requested_name),
+                reason: self.include_reason_build(
+                    request
+                        .requested_name
+                        .len()
+                        .checked_add(24)
+                        .ok_or_else(|| {
+                            ResolverError::InvalidRequest("include reason bound overflow".into())
+                        })?,
+                    cancel,
+                    format_args!("include {} was not found", request.requested_name),
+                )?,
             }),
             _ => Ok(Resolution::Ambiguous {
                 candidates: candidates
@@ -5526,9 +5744,10 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         cancel: &dyn CancellationToken,
     ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
         let mut call = self.callback_report_call();
+        call.owning_include_callback = true;
         let outcome =
             crate::compile_time::CompileTimeResolver::include(&mut *call, request, budget, cancel)?;
-        call.finish(outcome.result)
+        call.finish(outcome.result, budget)
     }
     fn unit_report_capability(
         &mut self,
@@ -5541,7 +5760,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         let outcome = crate::compile_time::CompileTimeResolver::unit_capability(
             &mut *call, request, budget, cancel,
         )?;
-        call.finish(outcome.result)
+        call.finish(outcome.result, budget)
     }
     fn unit_capability(
         &mut self,
@@ -7827,6 +8046,371 @@ mod tests {
     }
 
     #[test]
+    fn escaped_result_owner_physical_include_reason_survives_report_cache_and_budget_drop() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for name in ["not-present.inc", ""] {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let outcome = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: name,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let pointer = match outcome.result() {
+                Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
+                    reason.as_ptr()
+                }
+                other => panic!("expected actual missing/incomplete result, got {other:?}"),
+            };
+            let (result, reports) = outcome.into_parts();
+            drop(reports);
+            drop(resolver);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            let reason = match result.result() {
+                Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
+                    reason
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                reason.as_ptr(),
+                pointer,
+                "owning callback consumption must not clone the already constructed result reason"
+            );
+            assert!(
+                live.retained_bytes >= baseline + reason.len(),
+                "live escaped reason requires independent original-construction credit after unrelated owners die"
+            );
+            assert_eq!(
+                live.retained_bytes,
+                baseline
+                    + reason.capacity()
+                    + std::mem::size_of::<AdmittedOwned<Resolution<LoadedSource>>>(),
+                "only the original reason construction and its current inline carrier survive"
+            );
+            drop(result);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline,
+                "last result drop retires its metadata, not a request-lifetime floor"
+            );
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn include_reason_owner_real_root_and_provider_child_failure_consumers() {
+        use crate::compile_time::{AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver};
+        struct Recording {
+            inner: UnitResolver<FilesystemSourceStore>,
+            reason: Option<usize>,
+            from: Option<PathBuf>,
+        }
+        impl CompileTimeResolver for Recording {
+            fn include_capability(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+                let from = r.including_path;
+                let out = self.inner.include_capability(r, b, c)?;
+                if let Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } =
+                    out.result()
+                {
+                    self.reason = Some(reason.as_ptr() as usize);
+                    self.from = Some(from.to_path_buf());
+                }
+                Ok(out)
+            }
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                self.inner.unit_report_capability(r, b, c)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<crate::compile_time::ProviderSource>, ResolverError>
+            {
+                self.inner.unit(r, b, c)
+            }
+        }
+        for scenario in 0..3 {
+            let provider = scenario == 2;
+            let (dir, path, mut inner) = physical_report_resolver();
+            let text = if provider {
+                "unit Main; interface uses Other; {$IF SizeOf(Other.T)=8}{$DEFINE HIT}{$ENDIF} implementation end."
+            } else if scenario == 1 {
+                "unit Main; interface {$I bad.inc} implementation end."
+            } else {
+                "unit Main; interface {$I absent.inc} implementation end."
+            };
+            fs::write(&path, text).unwrap();
+            fs::create_dir(dir.path().join("bad.inc")).unwrap();
+            fs::write(
+                dir.path().join("Other.pas"),
+                "unit Other; interface {$I absent.inc} type T=Int64; implementation end.",
+            )
+            .unwrap();
+            inner.context.conditional_context = pascal_project::ConditionalContext::default()
+                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                .with_layout(pascal_project::LayoutContext {
+                    platform: Some(pascal_project::LayoutPlatform::Win32),
+                    defaults: Default::default(),
+                });
+            inner.context.library_conditional_context = inner.context.conditional_context.clone();
+            let context = inner.context.conditional_context.clone();
+            let root = inner
+                .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+                .unwrap();
+            let mut recording = Recording {
+                inner,
+                reason: None,
+                from: None,
+            };
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let output = crate::compile_time::analyze_source_in_session(
+                &root,
+                &context,
+                &mut recording,
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+            assert!(
+                recording.reason.is_some(),
+                "actual failure callback reached in root/provider child"
+            );
+            if provider {
+                assert!(recording.from.as_ref().unwrap().ends_with("Other.pas"));
+                assert!(
+                    !output
+                        .root
+                        .directives
+                        .iter()
+                        .any(|d| d.body == "DEFINE HIT"
+                            && d.activity == crate::conditional::Truth::True),
+                    "failed provider child remains conservative"
+                );
+            } else {
+                let reason = match &output.includes[0].target {
+                    Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
+                        reason
+                    }
+                    _ => panic!("missing include target"),
+                };
+                assert_eq!(
+                    Some(reason.as_ptr() as usize),
+                    recording.reason,
+                    "original callback reason moves through IncludeOccurrence and final publication without cloning"
+                );
+            }
+            drop(recording);
+            drop(root);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            assert!(live.retained_bytes > baseline);
+            if !provider {
+                assert!(
+                    matches!(&output.includes[0].target,Resolution::Unavailable {reason}|Resolution::Incomplete {reason,..} if reason.contains(if scenario==1 {"bad.inc"} else {"absent.inc"}))
+                );
+            }
+            drop(output);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn include_reason_owner_transfer_no_copy_work_and_foreign_root_refusal() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let out = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "absent.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (result, reports) = out.into_parts();
+        let pointer = match result.result() {
+            Resolution::Unavailable { reason } => reason.as_ptr(),
+            _ => panic!("reason"),
+        };
+        let mut destination = budget.admit_owned(0, 0, 0, || None).unwrap();
+        let before = budget.snapshot();
+        result
+            .move_reason_into(&mut destination, &budget, |dest, value| *dest = Some(value))
+            .unwrap();
+        assert!(
+            matches!(&*destination,Some(Resolution::Unavailable {reason}) if reason.as_ptr()==pointer)
+        );
+        assert_eq!(budget.snapshot().work, before.work);
+        assert_eq!(budget.snapshot().byte_work, before.byte_work);
+        let out = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (result, other_reports) = out.into_parts();
+        let mut other = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut wrong = other.admit_owned(0, 0, 0, || None).unwrap();
+        let before = other.snapshot();
+        assert!(
+            result
+                .move_reason_into(&mut wrong, &other, |dest, value| *dest = Some(value))
+                .is_err()
+        );
+        assert!(wrong.is_none());
+        assert_eq!(other.snapshot(), before);
+        assert!(!reports.observations().is_empty());
+        drop(other_reports);
+        assert!(destination.is_some());
+    }
+
+    #[test]
+    fn include_reason_owner_preformat_refusal_cancel_and_formatter_unwind_preserve_live_fields() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let source = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let calls = std::cell::Cell::new(0);
+        struct Format<'a>(&'a std::cell::Cell<usize>, bool);
+        impl fmt::Display for Format<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.set(self.0.get() + 1);
+                if self.1 {
+                    panic!("reason formatter unwind")
+                }
+                f.write_str("reason")
+            }
+        }
+        {
+            let mut callback = resolver.callback_report_call();
+            callback.owning_include_callback = true;
+            let mut call = callback.store_call(&mut budget).unwrap();
+            assert!(matches!(
+                call.include_reason_build(
+                    128,
+                    &NoCancellation,
+                    format_args!("{}", Format(&calls, false))
+                ),
+                Err(ResolverError::LimitExceeded { .. })
+            ));
+            assert!(call.callback_include_reason.is_none());
+        }
+        assert_eq!(calls.get(), 0);
+        assert_eq!(budget.snapshot(), before);
+        // A new root permits the real constructor peak; errors/cancellation and
+        // unwind must not leave its independently minted String credit behind.
+        let mut fresh = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = fresh
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut fresh)
+            .unwrap();
+        let baseline = fresh.snapshot().retained_bytes;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut callback = resolver.callback_report_call();
+            callback.owning_include_callback = true;
+            let mut call = callback.store_call(&mut fresh).unwrap();
+            let _ = call.include_reason_build(
+                128,
+                &NoCancellation,
+                format_args!("{}", Format(&calls, true)),
+            );
+        }));
+        assert!(unwind.is_err());
+        assert!(resolver.callback_include_reason.is_none());
+        struct Cancel;
+        impl CancellationToken for Cancel {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        {
+            let mut callback = resolver.callback_report_call();
+            callback.owning_include_callback = true;
+            let mut call = callback.store_call(&mut fresh).unwrap();
+            assert!(matches!(
+                call.include_reason_build(128, &Cancel, format_args!("{}", Format(&calls, false))),
+                Err(ResolverError::Cancelled)
+            ));
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(source.result(), Resolution::Found(_)));
+        assert!(!source.reports().observations().is_empty());
+        drop(resolver);
+        let spent = fresh.snapshot();
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert!(spent.work > 0);
+        assert!(spent.byte_work > 0);
+    }
+
+    #[test]
     fn case_match_f1_exhausted_work_refuses_before_preflight_body() {
         use crate::compile_time::CompileTimeLimits;
         struct Probe(std::sync::atomic::AtomicUsize);
@@ -7884,6 +8468,95 @@ mod tests {
         assert_eq!(budget.snapshot().work, 0);
         assert_eq!(budget.snapshot().retained_bytes, 0);
         assert_eq!(listing.files.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn include_reason_owner_actual_error_callback_cancel_every_poll_refunds_only_dead_storage() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut cancelled = 0;
+        let mut complete = false;
+        for stop in 0..300 {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            fs::create_dir(dir.path().join("bad.inc")).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let source = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match resolver.include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "bad.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &Poll {
+                    calls: 0.into(),
+                    stop,
+                },
+            ) {
+                Err(ResolverError::Cancelled) => cancelled += 1,
+                Ok(out) => {
+                    assert!(
+                        matches!(out.result(),Resolution::Incomplete {reason,..} if reason.contains("bad.inc"))
+                    );
+                    assert!(out.result.owns_reason());
+                    drop(out);
+                    complete = true;
+                }
+                Err(other) => {
+                    panic!("unexpected include callback failure at poll {stop}: {other:?}")
+                }
+            }
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(
+                matches!(source.result(),Resolution::Found(s) if !s.analysis_bytes().is_empty())
+            );
+            assert!(!source.reports().observations().is_empty());
+            assert!(
+                observer.budget_snapshot().retained_bytes > baseline,
+                "live previous source/reports retain their own credits"
+            );
+            drop(source);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline,
+                "no leaked partial callback/reason owner at poll {stop}"
+            );
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        assert!(cancelled > 10);
     }
 
     #[test]
@@ -9045,7 +9718,7 @@ mod tests {
         assert_eq!(before.byte_work, budget.snapshot().byte_work);
         drop(cache);
         assert!(!reports.observations().is_empty());
-        assert!(matches!(&source,Resolution::Found(s) if !s.analysis_bytes().is_empty()));
+        assert!(matches!(source.result(),Resolution::Found(s) if !s.analysis_bytes().is_empty()));
     }
 
     #[test]
@@ -9507,7 +10180,7 @@ mod tests {
                 )
                 .unwrap();
                 let (result, reports) = outcome.into_parts();
-                assert!(matches!(result, Resolution::Found(_)));
+                assert!(matches!(result.result(), Resolution::Found(_)));
                 drop(result);
                 reports
             } else {
@@ -9524,7 +10197,7 @@ mod tests {
                 )
                 .unwrap();
                 let (result, reports) = outcome.into_parts();
-                assert!(matches!(result, Resolution::Found(_)));
+                assert!(matches!(result.result(), Resolution::Found(_)));
                 drop(result);
                 reports
             };
@@ -9772,7 +10445,7 @@ mod tests {
         assert_eq!(before.work, budget.snapshot().work);
         assert_eq!(before.byte_work, budget.snapshot().byte_work);
         assert_eq!(resolver.report.observations.as_ptr(), persistent);
-        let Resolution::Found(source) = source else {
+        let Resolution::Found(source) = source.into_unmigrated().unwrap() else {
             panic!("physical returned source")
         };
         assert!(source.analysis_bytes().starts_with(b"{physical"));
@@ -9926,7 +10599,7 @@ mod tests {
         assert!(target.is_empty());
         assert!(warnings.is_empty());
         assert_eq!(foreign.snapshot(), before);
-        assert!(matches!(source, Resolution::Found(_)));
+        assert!(matches!(source.result(), Resolution::Found(_)));
         assert!(!resolver.report.observations.is_empty());
     }
 

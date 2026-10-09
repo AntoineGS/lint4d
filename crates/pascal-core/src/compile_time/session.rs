@@ -164,15 +164,15 @@ pub trait CompileTimeResolver {
         _cancel: &dyn CancellationToken,
     ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError> {
         let reason = "no admitted provider capability";
-        budget
-            .charge(1, reason.len(), reason.len())
+        let owner = budget
+            .admit_owned(1, reason.len(), reason.len(), || reason.to_string())
             .map_err(|r| resolver_error(r, budget))?;
-        Ok(AdmittedCapabilityOutcome::new(
-            Resolution::Unavailable {
-                reason: reason.into(),
-            },
+        AdmittedCapabilityOutcome::from_reason(
+            owner,
+            false,
             AdmittedCapabilityReports::copy(&[], &[], budget)?,
-        ))
+            budget,
+        )
     }
     fn include_capability(
         &mut self,
@@ -181,15 +181,15 @@ pub trait CompileTimeResolver {
         _cancel: &dyn CancellationToken,
     ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
         let reason = "no admitted include capability";
-        budget
-            .charge(1, reason.len(), reason.len())
+        let owner = budget
+            .admit_owned(1, reason.len(), reason.len(), || reason.to_string())
             .map_err(|r| resolver_error(r, budget))?;
-        Ok(AdmittedCapabilityOutcome::new(
-            Resolution::Unavailable {
-                reason: reason.into(),
-            },
+        AdmittedCapabilityOutcome::from_reason(
+            owner,
+            false,
             AdmittedCapabilityReports::copy(&[], &[], budget)?,
-        ))
+            budget,
+        )
     }
     /// Compile-time capability entrypoint. Never delegates to an unbounded legacy
     /// callback. Adapters without this capability fail closed; legacy lookup
@@ -1401,6 +1401,15 @@ impl ProviderEngine<'_, '_> {
                 let (result, reports) = outcome.into_parts();
                 reports.consume_into(self.observations, self.warnings, self.budget)?;
                 state.interfaces[index].attempted = true;
+                let result = if result.owns_reason() {
+                    // Failed provider reason is discarded, not detached into a
+                    // plain field. Its actual storage dies before its credit.
+                    drop(result);
+                    state.interfaces[index].failure = Some(UnknownReason::UnresolvedName);
+                    continue;
+                } else {
+                    result.into_unmigrated()?
+                };
                 match result {
                     Resolution::Found(provider) => {
                         if !provider.is_admitted_by(self.budget)
@@ -1933,17 +1942,17 @@ impl RootSession<'_, '_> {
             .map_err(|r| resolver_error(r, &self.budget))?;
         let (mut result, reports) = if directive.activity != Truth::True {
             (
-                Resolution::Unavailable {
+                crate::resolver::AdmittedCapabilityResult::from(Resolution::Unavailable {
                     reason: "include conditional activity is unknown".into(),
-                },
+                }),
                 None,
             )
         } else if self.active_sources.len() > self.resolver.max_include_depth() {
             (
-                Resolution::Incomplete {
+                crate::resolver::AdmittedCapabilityResult::from(Resolution::Incomplete {
                     reason: "include depth limit reached".into(),
                     candidates: vec![],
-                },
+                }),
                 None,
             )
         } else if let Some(name) = name.as_deref() {
@@ -1963,31 +1972,45 @@ impl RootSession<'_, '_> {
             (result, Some(reports))
         } else {
             (
-                Resolution::Unavailable {
+                crate::resolver::AdmittedCapabilityResult::from(Resolution::Unavailable {
                     reason: "include has no statically known name".into(),
-                },
+                }),
                 None,
             )
         };
         if let Some(reports) = reports {
             reports.consume_into(&mut self.observations, &mut self.warnings, self.budget)?;
         }
-        if let Resolution::Found(child) = &result {
+        if let Resolution::Found(child) = result.result() {
             if self.active_sources.contains(&child.id) {
                 result = Resolution::Incomplete {
                     reason: "textual include cycle".into(),
                     candidates: vec![],
-                };
+                }
+                .into();
             }
         }
         let index = self.includes.len();
-        let fragments_bytes = mapping
-            .fragments
-            .iter()
-            .map(|a| std::mem::size_of::<SourceAnchor>() + a.source.as_str().len())
-            .sum::<usize>();
-        let target_payload = resolution_output_payload(&result);
-        let include = self
+        self.budget
+            .charge(mapping.fragments.len(), 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let fragments_bytes = mapping.fragments.iter().try_fold(0usize, |sum, a| {
+            if self.cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            sum.checked_add(std::mem::size_of::<SourceAnchor>())
+                .and_then(|n| n.checked_add(a.source.as_str().len()))
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("include fragment sizing overflow".into())
+                })
+        })?;
+        let owns_reason = result.owns_reason();
+        let target_payload = if owns_reason {
+            0
+        } else {
+            resolution_output_payload(result.result())
+        };
+        let mut include = self
             .budget
             .admit_owned(
                 mapping.fragments.len() + 1,
@@ -1997,12 +2020,24 @@ impl RootSession<'_, '_> {
                     owner,
                     directive: anchor.clone(),
                     fragments: mapping.fragments.clone(),
-                    target: result.clone(),
+                    target: if owns_reason {
+                        Resolution::Unavailable {
+                            reason: String::new(),
+                        }
+                    } else {
+                        result.result().clone()
+                    },
                     child: None,
                 },
             )
             .map_err(|r| resolver_error(r, self.budget))?;
-        drop(result);
+        if owns_reason {
+            result.move_reason_into(&mut include, self.budget, |include, target| {
+                include.target = target
+            })?;
+        } else {
+            drop(result);
+        }
         self.includes
             .with_budget_mut(self.budget, |values, budget| {
                 conditional::output_slot(values, &mut self.include_slots, budget)
@@ -2099,15 +2134,28 @@ impl RootSession<'_, '_> {
             failed => {
                 let reason = match failed {
                     Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
-                        reason.clone()
+                        reason.as_str()
                     }
-                    Resolution::Ambiguous { .. } => "ambiguous required include".into(),
+                    Resolution::Ambiguous { .. } => "ambiguous required include",
                     Resolution::Found(_) => unreachable!(),
                 };
-                self.record(IncompleteReason::RequiredSource {
-                    source: self.root.id.clone(),
-                    reason,
-                });
+                let bytes = self
+                    .root
+                    .id
+                    .as_str()
+                    .len()
+                    .checked_add(reason.len())
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("include failure provenance overflow".into())
+                    })?;
+                let reason = self
+                    .budget
+                    .admit_owned(1, bytes, bytes, || IncompleteReason::RequiredSource {
+                        source: self.root.id.clone(),
+                        reason: reason.to_string(),
+                    })
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                self.record_ref(&reason);
             }
         }
         Ok(())
@@ -2250,10 +2298,14 @@ impl RootSession<'_, '_> {
     }
 
     fn record(&mut self, reason: IncompleteReason) {
+        self.record_ref(&reason);
+    }
+
+    fn record_ref(&mut self, reason: &IncompleteReason) {
         if self.fatal.is_some() {
             return;
         }
-        let dynamic = match &reason {
+        let dynamic = match reason {
             IncompleteReason::RequiredSource { source, reason } => {
                 source.as_str().len() + reason.len()
             }
@@ -2263,7 +2315,7 @@ impl RootSession<'_, '_> {
             .reasons
             .with_budget_mut(self.budget, |reasons, budget| {
                 budget.charge(reasons.len() + 1, 0, 0)?;
-                if !reasons.contains(&reason) {
+                if !reasons.contains(reason) {
                     conditional::output_slot(reasons, &mut self.reason_slots, budget)?;
                     budget.charge(1, dynamic, dynamic)?;
                     reasons.push(reason.clone());

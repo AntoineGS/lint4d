@@ -210,10 +210,11 @@ impl CompileTimeResolver for Fixture {
         // This fixture's admitted provider callback has no reports. Explicit
         // opt-in forwards its proven bounded result, never a legacy default.
         let result = self.unit_capability(request, budget, cancel)?.result;
-        Ok(pascal_core::AdmittedCapabilityOutcome::new(
+        pascal_core::AdmittedCapabilityOutcome::copy_bounded_result(
             result,
             pascal_core::AdmittedCapabilityReports::copy(&[], &[], budget)?,
-        ))
+            budget,
+        )
     }
     fn include_capability(
         &mut self,
@@ -226,7 +227,7 @@ impl CompileTimeResolver for Fixture {
         // of the plain callback report and no old manual warning shadow charge.
         let reports =
             pascal_core::AdmittedCapabilityReports::copy(&[], &self.include_warnings, budget)?;
-        Ok(pascal_core::AdmittedCapabilityOutcome::new(result, reports))
+        pascal_core::AdmittedCapabilityOutcome::copy_bounded_result(result, reports, budget)
     }
     fn unit_capability(
         &mut self,

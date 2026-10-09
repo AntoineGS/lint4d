@@ -14466,6 +14466,227 @@ mod tests {
     }
 
     #[test]
+    fn include_limit_error_owner_real_provider_child_limits_keep_facts_conservative() {
+        use crate::compile_time::{
+            AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver, Fact, OccurrenceId,
+        };
+        struct Recording {
+            inner: UnitResolver<FilesystemSourceStore>,
+            include_from: Option<PathBuf>,
+            provider_request: Option<(String, PathBuf)>,
+            warning: Option<(String, usize)>,
+            incomplete: bool,
+        }
+        impl CompileTimeResolver for Recording {
+            fn include_capability(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+                self.include_from = Some(r.including_path.to_path_buf());
+                assert_eq!(r.requested_name, "export.inc");
+                let out = self.inner.include_capability(r, b, c)?;
+                self.incomplete = matches!(out.result(),Resolution::Incomplete {reason,candidates} if reason=="include export.inc lookup was incomplete" && candidates.is_empty());
+                if self.incomplete {
+                    let warning = out
+                        .reports()
+                        .warnings()
+                        .iter()
+                        .find(|w| w.starts_with("include candidate could not be loaded:"))
+                        .expect("actual typed limit warning");
+                    self.warning = Some((warning.clone(), warning.as_ptr() as usize));
+                } else {
+                    assert!(
+                        matches!(out.result(),Resolution::Found(source) if source.path.ends_with("export.inc"))
+                    );
+                }
+                Ok(out)
+            }
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                self.provider_request = Some((r.requested_name.into(), r.importer_path.into()));
+                self.inner.unit_report_capability(r, b, c)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<crate::compile_time::ProviderSource>, ResolverError>
+            {
+                self.inner.unit(r, b, c)
+            }
+        }
+        for limit in [None, Some("file"), Some("byte")] {
+            let (dir, path, mut inner) = physical_report_resolver();
+            fs::write(&path,"unit Main; interface uses Other; {$IF SizeOf(Other.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.").unwrap();
+            let provider_path = dir.path().join("Other.pas");
+            fs::write(
+                &provider_path,
+                "unit Other; interface {$I export.inc} implementation end.",
+            )
+            .unwrap();
+            let include_path = dir.path().join("export.inc");
+            fs::write(&include_path, "type Export=Int64;").unwrap();
+            inner.context.conditional_context = pascal_project::ConditionalContext::default()
+                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                .with_layout(pascal_project::LayoutContext {
+                    platform: Some(pascal_project::LayoutPlatform::Win32),
+                    defaults: Default::default(),
+                });
+            inner.context.library_conditional_context = inner.context.conditional_context.clone();
+            let context = inner.context.conditional_context.clone();
+            let root = inner
+                .load_source(&path, None, SourceKind::Unit, &NoCancellation)
+                .unwrap();
+            if limit == Some("file") {
+                // Limit the actual resolver helper, not provider-query admission.
+                inner.limits.max_include_files = 0;
+            }
+            let expected_directory = inner
+                .context
+                .include_search_entries(&provider_path)
+                .into_iter()
+                .find(|entry| entry.path == dir.path())
+                .expect("authorized provider include search provenance");
+            if limit == Some("byte") {
+                inner.limits.max_include_bytes = 0;
+            }
+            let mut recording = Recording {
+                inner,
+                include_from: None,
+                provider_request: None,
+                warning: None,
+                incomplete: false,
+            };
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let output = crate::compile_time::analyze_source_in_session(
+                &root,
+                &context,
+                &mut recording,
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+            assert_eq!(
+                recording.provider_request.as_ref(),
+                Some(&("Other".into(), path.clone()))
+            );
+            assert_eq!(recording.include_from.as_ref(), Some(&provider_path));
+            let activity = output
+                .root
+                .directives
+                .iter()
+                .find(|d| d.body == "DEFINE HIT")
+                .expect("downstream conditional fact")
+                .activity;
+            assert_eq!(
+                activity,
+                if limit.is_some() {
+                    crate::conditional::Truth::Unknown
+                } else {
+                    crate::conditional::Truth::True
+                }
+            );
+            let site = output
+                .facts
+                .site_at(&root.id, OccurrenceId(0), root.bytes.len())
+                .unwrap();
+            // Public fact queries use a separate query budget, as in existing
+            // provider tests; their manual scratch is not output-owner storage.
+            let mut query_budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let fact = output
+                .facts
+                .layout_name(site, "Other.Export", &mut query_budget);
+            if limit.is_some() {
+                assert!(
+                    matches!(fact, Fact::Unknown(_)),
+                    "failed provider child must expose unknown layout, got {fact:?}"
+                );
+            } else {
+                assert!(
+                    matches!(fact, Fact::Known(_)),
+                    "unrestricted actual included declaration proves layout: {fact:?}"
+                );
+            }
+            assert!(
+                output.observations.iter().any(
+                    |o| matches!(o,ResolutionObservation::Payload {path,..} if path==&provider_path)
+                ),
+                "actual provider was read"
+            );
+            let expected = limit.map(|kind| {
+                format!(
+                    "include candidate could not be loaded: {:?}",
+                    SourceStoreError::Incomplete {
+                        path: include_path.clone(),
+                        reason: format!("include {kind} limit (0) reached")
+                    }
+                )
+            });
+            if let Some(expected) = &expected {
+                assert!(recording.incomplete);
+                assert_eq!(&recording.warning.as_ref().unwrap().0, expected);
+                let warning = output
+                    .warnings
+                    .iter()
+                    .find(|w| *w == expected)
+                    .expect("transported provider-child warning");
+                assert_eq!(
+                    warning.as_ptr() as usize,
+                    recording.warning.as_ref().unwrap().1,
+                    "original admitted callback warning is consumed into actual output"
+                );
+                assert!(output.observations.iter().any(|o|matches!(o,ResolutionObservation::Directory {path,entry,complete:true,..} if path==dir.path() && entry==&expected_directory)),"failed-lookup search directory/provenance survives: {:?}",output.observations);
+                assert!(!output.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {path,..} if path==&include_path)),"limit forbids include payload read");
+            } else {
+                assert!(!recording.incomplete);
+                assert!(recording.warning.is_none());
+                assert!(output.observations.iter().any(
+                    |o| matches!(o,ResolutionObservation::Payload {path,..} if path==&include_path)
+                ));
+            }
+            drop(recording);
+            drop(root);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            assert!(
+                live.retained_bytes > baseline,
+                "actual provider output/report owners survive their producers"
+            );
+            if let Some(expected) = &expected {
+                assert!(output.warnings.iter().any(|w| w == expected));
+                assert!(output.observations.iter().any(|o|matches!(o,ResolutionObservation::Directory {path,complete:true,..} if path==dir.path())));
+            }
+            drop(output);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
     fn unit_reason_owner_actual_failure_callback_cancellation_every_poll_preserves_prior_owners() {
         use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
         struct Poll {

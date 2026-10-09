@@ -2,7 +2,8 @@
 /.worktrees/
 .cargo/config.toml
 
-.claude/
+.claude/*
+!.claude/settings.json
 
 tests/fixtures/projects/TestProject1/__history/
 crates/lint4d/tests/fixtures/projects/TestProject1/__history/
@@ -19,3 +20,10 @@ tests/fixtures/dcu/
 /docs/
 TODOS.md
 .superpowers/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*

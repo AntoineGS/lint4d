@@ -266,6 +266,49 @@ impl Default for ConditionalEnvironment {
 }
 
 impl ConditionalEnvironment {
+    // Low-level declaration graphs have no source-session scalar history. Their
+    // immutable context is still authoritative, but must be admitted before copy.
+    pub(crate) fn context_snapshot(
+        context: &ConditionalContext,
+        budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+    ) -> Result<Self, crate::compile_time::IncompleteReason> {
+        use crate::compile_time::IncompleteReason;
+        let before = budget.snapshot().retained_bytes;
+        let result = (|| {
+            let entries = context
+                .defines
+                .len()
+                .checked_add(context.options.len())
+                .and_then(|n| n.checked_add(context.constants.len()))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            let metadata = entries
+                .checked_mul(size_of::<(String, ConstantValue)>() + 4 * size_of::<usize>())
+                .and_then(|n| n.checked_add(size_of::<Self>()))
+                .ok_or(IncompleteReason::MalformedSource)?;
+            budget.charge(
+                entries
+                    .checked_add(1)
+                    .ok_or(IncompleteReason::MalformedSource)?,
+                0,
+                metadata,
+            )?;
+            let mut failure = None;
+            context
+                .visit_recovery_payload(&mut |bytes| {
+                    budget.charge(1, bytes, bytes).map_err(|reason| {
+                        failure = Some(reason);
+                        String::new()
+                    })
+                })
+                .map_err(|_| failure.unwrap_or(IncompleteReason::MalformedSource))?;
+            Self::try_from_context(context).ok_or(IncompleteReason::MalformedSource)
+        })();
+        if result.is_err() {
+            budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
+        }
+        result
+    }
+
     pub(crate) fn snapshot_scalar(
         &self,
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
@@ -2823,6 +2866,21 @@ pub(crate) fn bound_define(
     Ok(value)
 }
 
+pub(crate) fn bound_defined(
+    environment: &ConditionalEnvironment,
+    name: &str,
+    budget: &mut crate::compile_time::CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, crate::compile_time::IncompleteReason> {
+    budget.charge(1, name.len(), name.len())?;
+    let value = match environment_value(environment, name) {
+        Truth::True => BoundValue::Constant(ConstantValue::Boolean(true)),
+        Truth::False => BoundValue::Constant(ConstantValue::Boolean(false)),
+        Truth::Unknown => BoundValue::Unproven,
+    };
+    budget.release(name.len());
+    Ok(Some(value))
+}
+
 fn evaluate_expression(
     expression: &str,
     environment: &ConditionalEnvironment,
@@ -2849,7 +2907,7 @@ fn evaluate_typed_expression_with_lookup<'a>(
         return parse_bound_expression(expression, environment, complete, None, false);
     }
     let mut adapter = |query: ExpressionQuery<'_>| match query {
-        ExpressionQuery::Name(name) => lookup.as_mut().and_then(|lookup| lookup(name)),
+        ExpressionQuery::Name(name, _) => lookup.as_mut().and_then(|lookup| lookup(name)),
         _ => None,
     };
     parse_bound_expression(expression, environment, complete, Some(&mut adapter), false)
@@ -2858,15 +2916,28 @@ fn evaluate_typed_expression_with_lookup<'a>(
 /// Argument ranges are relative to the original expression, not a normalized
 /// synthetic wrapper. A source-backed caller maps them with its captured site.
 pub(crate) enum ExpressionQuery<'a> {
-    Name(&'a str),
+    Name(&'a str, Range<usize>),
     /// Check only source lexical bindings before intrinsic metadata/literals.
     /// An absent binding is different from a visible unproven variable value.
-    LexicalName(&'a str),
-    Declared(&'a str),
+    LexicalName(&'a str, Range<usize>),
+    Declared(&'a str, Range<usize>),
+    Defined(&'a str, Range<usize>),
     SizeOf {
         argument: &'a str,
         range: Range<usize>,
     },
+}
+
+impl ExpressionQuery<'_> {
+    pub(crate) fn range(&self) -> &Range<usize> {
+        match self {
+            Self::Name(_, range)
+            | Self::LexicalName(_, range)
+            | Self::Declared(_, range)
+            | Self::Defined(_, range)
+            | Self::SizeOf { range, .. } => range,
+        }
+    }
 }
 
 fn parse_bound_expression<'a>(
@@ -2944,7 +3015,7 @@ fn bound_expression_mode(
         &ConditionalEnvironment::default(),
         budget,
         &mut |query, budget| match query {
-            ExpressionQuery::Name(name) => lookup(name, budget),
+            ExpressionQuery::Name(name, _) => lookup(name, budget),
             _ => Ok(None),
         },
         static_only,
@@ -3271,6 +3342,12 @@ struct ExpressionParser<'a> {
 }
 
 impl ExpressionParser<'_> {
+    fn current_range(&self) -> Range<usize> {
+        self.spans
+            .get(self.index)
+            .cloned()
+            .unwrap_or(self.expression.len()..self.expression.len())
+    }
     fn peek(&self) -> &ExprToken {
         self.tokens.get(self.index).unwrap_or(&ExprToken::End)
     }
@@ -3546,6 +3623,7 @@ impl ExpressionParser<'_> {
     }
 
     fn parse_value(&mut self) -> Value {
+        let identifier_range = self.current_range();
         if self.static_only {
             return match self.take() {
                 ExprToken::Number(_) => Value::Number(0),
@@ -3557,11 +3635,9 @@ impl ExpressionParser<'_> {
                 }
                 ExprToken::Identifier(name) => {
                     // A lexical binding can block a familiar literal spelling.
-                    if let Some(value) = self
-                        .lookup
-                        .as_mut()
-                        .and_then(|lookup| lookup(ExpressionQuery::Name(&name)))
-                    {
+                    if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                        lookup(ExpressionQuery::Name(&name, identifier_range.clone()))
+                    }) {
                         Value::from_bound_value(value)
                     } else if name.eq_ignore_ascii_case("true")
                         || name.eq_ignore_ascii_case("false")
@@ -3581,6 +3657,7 @@ impl ExpressionParser<'_> {
                     return Value::Error;
                 }
                 self.take();
+                let symbol_range = self.current_range();
                 let symbol = match self.take() {
                     ExprToken::Identifier(value) => Some(value),
                     _ => None,
@@ -3591,7 +3668,15 @@ impl ExpressionParser<'_> {
                     self.take();
                 }
                 symbol
-                    .map(|symbol| Value::Truth(environment_value(self.environment, &symbol)))
+                    .map(|symbol| {
+                        if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                            lookup(ExpressionQuery::Defined(&symbol, symbol_range))
+                        }) {
+                            Value::from_bound_value(value)
+                        } else {
+                            Value::Truth(environment_value(self.environment, &symbol))
+                        }
+                    })
                     .unwrap_or_else(|| {
                         self.malformed = true;
                         Value::Unknown
@@ -3600,9 +3685,9 @@ impl ExpressionParser<'_> {
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("declared") => {
                 let symbol = self.parse_function_identifier();
                 symbol
-                    .map(|symbol| {
+                    .map(|(symbol, range)| {
                         if let Some(lookup) = &mut self.lookup {
-                            return lookup(ExpressionQuery::Declared(&symbol)).map(Value::from_bound_value).unwrap_or(Value::Unknown);
+                            return lookup(ExpressionQuery::Declared(&symbol, range)).map(Value::from_bound_value).unwrap_or(Value::Unknown);
                         }
                         Value::Truth(
                             if self.environment.constant(&symbol).is_some() {
@@ -3630,11 +3715,12 @@ impl ExpressionParser<'_> {
             ExprToken::Identifier(identifier)
                 if identifier.eq_ignore_ascii_case("compilerVersion") =>
             {
-                if let Some(value) = self
-                    .lookup
-                    .as_mut()
-                    .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
-                {
+                if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                    lookup(ExpressionQuery::LexicalName(
+                        &identifier,
+                        identifier_range.clone(),
+                    ))
+                }) {
                     return Value::from_bound_value(value);
                 }
                 self.environment
@@ -3643,21 +3729,23 @@ impl ExpressionParser<'_> {
                     .unwrap_or(Value::Unknown)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("true") => {
-                if let Some(value) = self
-                    .lookup
-                    .as_mut()
-                    .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
-                {
+                if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                    lookup(ExpressionQuery::LexicalName(
+                        &identifier,
+                        identifier_range.clone(),
+                    ))
+                }) {
                     return Value::from_bound_value(value);
                 }
                 Value::Truth(Truth::True)
             }
             ExprToken::Identifier(identifier) if identifier.eq_ignore_ascii_case("false") => {
-                if let Some(value) = self
-                    .lookup
-                    .as_mut()
-                    .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
-                {
+                if let Some(value) = self.lookup.as_mut().and_then(|lookup| {
+                    lookup(ExpressionQuery::LexicalName(
+                        &identifier,
+                        identifier_range.clone(),
+                    ))
+                }) {
                     return Value::from_bound_value(value);
                 }
                 Value::Truth(Truth::False)
@@ -3667,7 +3755,12 @@ impl ExpressionParser<'_> {
                     let blocked = self
                         .lookup
                         .as_mut()
-                        .and_then(|lookup| lookup(ExpressionQuery::LexicalName(&identifier)))
+                        .and_then(|lookup| {
+                            lookup(ExpressionQuery::LexicalName(
+                                &identifier,
+                                identifier_range.clone(),
+                            ))
+                        })
                         .is_some();
                     if identifier.eq_ignore_ascii_case("sizeof") {
                         let value = self.parse_sizeof();
@@ -3732,7 +3825,7 @@ impl ExpressionParser<'_> {
                     }
                 } else {
                     if let Some(lookup) = &mut self.lookup {
-                        return lookup(ExpressionQuery::Name(&identifier))
+                        return lookup(ExpressionQuery::Name(&identifier, identifier_range))
                             .map(Value::from_bound_value)
                             .unwrap_or(Value::Unknown);
                     }
@@ -3789,14 +3882,15 @@ impl ExpressionParser<'_> {
         }
     }
 
-    fn parse_function_identifier(&mut self) -> Option<String> {
+    fn parse_function_identifier(&mut self) -> Option<(String, Range<usize>)> {
         if !matches!(self.peek(), ExprToken::LParen) {
             self.malformed = true;
             return None;
         }
         self.take();
+        let range = self.current_range();
         let value = match self.take() {
-            ExprToken::Identifier(value) => Some(canonical_symbol(&value)?),
+            ExprToken::Identifier(value) => Some((canonical_symbol(&value)?, range)),
             _ => None,
         };
         if !matches!(self.peek(), ExprToken::RParen) {

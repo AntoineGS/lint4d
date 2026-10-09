@@ -525,60 +525,27 @@ fn evaluate_path_condition(
         &directive.body,
         environment,
         budget,
-        &mut |query, budget| match query {
-            ExpressionQuery::LexicalName(name) => {
-                super::arrays::lexical_constant_name(state, &site, name, 0, budget)
-            }
-            ExpressionQuery::Name(name) => {
-                if super::bindings::lookup(state, &site, name, budget)?.is_some() {
-                    return super::arrays::constant_name(state, &site, name, 0, budget);
-                }
-                if super::arrays::qualifier_blocked(state, &site, name, budget)? {
-                    return Ok(None);
-                }
-                let value = super::arrays::constant_name(state, &site, name, 0, budget)?;
-                if value.is_some() {
-                    Ok(value)
-                } else {
-                    conditional::bound_define(environment, name, budget)
-                }
-            }
-            ExpressionQuery::Declared(name) => {
-                let mut known = super::bindings::lookup(state, &site, name, budget)?.is_some();
-                if !known && super::arrays::qualifier_blocked(state, &site, name, budget)? {
-                    return Ok(None);
-                }
-                if !known {
-                    for key in state.context.constants.keys() {
-                        budget.charge(1, key.len().min(name.len()), 0)?;
-                        if super::bindings::same_name(key, name) {
-                            known = true;
-                            break;
-                        }
-                    }
-                }
-                budget.charge(1, name.len(), 0)?;
-                Ok(if known {
-                    Some(BoundValue::Constant(ConstantValue::Boolean(true)))
-                } else if state.context.rtl_constants_known
-                    && ConditionalContext::is_rtl_version_constant(name)
-                {
-                    Some(BoundValue::Constant(ConstantValue::Boolean(false)))
-                } else {
-                    None
-                })
-            }
-            ExpressionQuery::SizeOf { argument, range } => {
+        &mut |query, budget| {
+            if let ExpressionQuery::SizeOf { argument, range } = &query {
                 let before = budget.snapshot().retained_bytes;
-                let anchor =
-                    argument_anchor(root, text, &directive.body, directive.start, range, budget)?;
-                if text.get(anchor.range.clone()) != Some(argument) {
-                    return Err(IncompleteReason::MalformedSource);
-                }
-                drop(anchor);
+                let mapped = (|| {
+                    let anchor = argument_anchor(
+                        root,
+                        text,
+                        &directive.body,
+                        directive.start,
+                        range.clone(),
+                        budget,
+                    )?;
+                    if text.get(anchor.range.clone()) != Some(*argument) {
+                        return Err(IncompleteReason::MalformedSource);
+                    }
+                    Ok(())
+                })();
                 budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
-                sizeof_value(state, &site, argument, budget)
+                mapped?;
             }
+            super::arrays::scalar_query(state, &site, environment, query, 0, budget)
         },
     )
 }
@@ -1113,7 +1080,7 @@ mod tests {
                 &ConditionalEnvironment::default(),
                 &mut budget,
                 &mut |query, budget| {
-                    if matches!(query, ExpressionQuery::LexicalName(_)) {
+                    if matches!(query, ExpressionQuery::LexicalName(_, _)) {
                         return Ok(None);
                     }
                     let ExpressionQuery::SizeOf { argument, range } = query else {

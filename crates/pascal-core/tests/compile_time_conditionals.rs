@@ -14,6 +14,129 @@ use pascal_project::{
 use support::compile_time::{Fixture, activity, context};
 
 #[test]
+fn fix1_i1_interrupted_initializers_capture_each_sizeof_and_scalar_query_site() {
+    for (platform, pointer) in [(LayoutPlatform::Win32, 4), (LayoutPlatform::Win64, 8)] {
+        let source = format!(
+            "unit T; interface {{$H+}} const N=SizeOf(String){{$H-}}; \
+            {{$H+}} const Mixed=SizeOf(String){{$H-}}+SizeOf(String); \
+            {{$DEFINE FLAG}} const Enabled=Defined(FLAG){{$UNDEF FLAG}}; \
+            {{$DEFINE FLAG}} const Count=Ord(Defined(FLAG)){{$UNDEF FLAG}}+Ord(Defined(FLAG)); \
+            {{$IF (N={pointer}) and (Mixed={}) and Enabled and (Count=1)}}{{$DEFINE CAPTURED}}{{$ENDIF}} implementation end.",
+            pointer + 256
+        );
+        let a = Fixture::new(&source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE CAPTURED"), Truth::True);
+        assert_eq!(a.facts.reachable_states().count(), 1);
+    }
+}
+
+#[test]
+fn fix1_i1_scalar_history_is_captured_before_initializer_completion() {
+    let source = "unit T; interface {$DEFINE FLAG} const Enabled=Defined(FLAG){$UNDEF FLAG}; \
+        {$DEFINE FLAG} const Count=Ord(Defined(FLAG)){$UNDEF FLAG}+Ord(Defined(FLAG)); \
+        {$IF Enabled and (Count=1)}{$DEFINE SCALAR_CAPTURED}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE SCALAR_CAPTURED"), Truth::True);
+    assert_eq!(a.facts.reachable_states().count(), 1);
+}
+
+#[test]
+fn fix1_i2_enum_initializers_capture_defines_and_interrupted_member_sites() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let source = "unit T; interface {$DEFINE FLAG}{$Z1} type E=(e0=Ord(Defined(FLAG)){$UNDEF FLAG}, e1=3+Ord(Defined(FLAG))); \
+            A=array[E] of Byte; {$DEFINE FLAG}{$IF (SizeOf(A)=3) and (SizeOf(E)=1)}{$DEFINE ENUM_CAPTURED}{$ENDIF} implementation end.";
+        let a = Fixture::new(source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE ENUM_CAPTURED"), Truth::True);
+    }
+}
+
+#[test]
+fn fix1_i2_enum_sizeof_uses_the_members_physical_operand_site() {
+    for (platform, pointer) in [(LayoutPlatform::Win32, 4), (LayoutPlatform::Win64, 8)] {
+        let source = format!(
+            "unit T; interface {{$H+}} type E=(low=SizeOf(String){{$H-}},high=300); \
+            A=array[E] of Byte; {{$IF SizeOf(A)={}}}{{$DEFINE ENUM_SITE}}{{$ENDIF}} implementation end.",
+            301 - pointer
+        );
+        let a = Fixture::new(&source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE ENUM_SITE"), Truth::True);
+    }
+}
+
+#[test]
+fn fix1_i2_enum_snapshots_remain_correlated_after_a_common_define() {
+    let source = "unit T; interface {$Z1}{$IF Mystery}{$DEFINE FLAG}type E=(e0=Ord(Defined(FLAG)),e1=3); \
+        {$ELSE}{$UNDEF FLAG}type E=(e0=Ord(Defined(FLAG)),e1=3);{$ENDIF}type A=array[E] of Byte;{$DEFINE FLAG} \
+        {$IF SizeOf(A)=3}{$DEFINE ONE}{$ELSE}{$DEFINE ZERO}{$ENDIF} \
+        {$IF SizeOf(E)=1}{$DEFINE ENUM_SIZE}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, context(LayoutPlatform::Win32))
+        .analyze()
+        .unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(activity(&a, "DEFINE ONE"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE ZERO"), Truth::Unknown);
+    assert_eq!(activity(&a, "DEFINE ENUM_SIZE"), Truth::True);
+    assert_eq!(a.facts.reachable_states().count(), 2);
+}
+
+#[test]
+fn fix1_i3_direct_and_initializer_declared_and_bare_defines_share_policy() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let mut ctx = context(platform).with_constant(
+            "Known",
+            pascal_core::conditional::ConstantValue::Boolean(true),
+        );
+        ctx.defines.insert("EXPLICIT".into(), Truth::True);
+        ctx.rtl_constants_known = true;
+        let source = "unit T; interface {$DEFINE SOURCE} \
+            {$IF Declared(Known) and EXPLICIT and SOURCE}{$DEFINE DIRECT}{$ENDIF} \
+            const Has=Declared(Known); Enabled=EXPLICIT; Local=SOURCE; Absent=Declared(RTLVersion113); \
+            {$IF Has and Enabled and Local and (Absent=false)}{$DEFINE INITIALIZERS}{$ENDIF} \
+            {$IF Declared(RTLVersion113)=false}{$DEFINE DIRECT_ABSENCE}{$ENDIF} implementation end.";
+        let a = Fixture::new(source, ctx).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        for body in [
+            "DEFINE DIRECT",
+            "DEFINE INITIALIZERS",
+            "DEFINE DIRECT_ABSENCE",
+        ] {
+            assert_eq!(activity(&a, body), Truth::True, "{body}");
+        }
+    }
+}
+
+#[test]
+fn fix1_i3_lexical_and_previous_enum_members_block_context_fallbacks() {
+    let mut ctx = context(LayoutPlatform::Win32).with_constant(
+        "System.K",
+        pascal_core::conditional::ConstantValue::Integer(7),
+    );
+    ctx.defines.insert("FLAG".into(), Truth::True);
+    let source = "unit T; interface var FLAG:Integer; System:Integer; \
+        const Enabled=FLAG; Has=Declared(System.K); Value=System.K; \
+        {$IF FLAG}{$DEFINE DIRECT_BLOCKED}{$ENDIF}{$IF Enabled}{$DEFINE CONST_BLOCKED}{$ENDIF} \
+        {$IF Has or (Value=7)}{$DEFINE QUALIFIED_BLOCKED}{$ENDIF} \
+        {$Z1} type E=(previous=0,next=Ord(Declared(previous))+2); A=array[E] of Byte; \
+        {$IF SizeOf(A)=4}{$DEFINE PREVIOUS_DECLARED}{$ENDIF} implementation end.";
+    let a = Fixture::new(source, ctx).analyze().unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    for body in [
+        "DEFINE DIRECT_BLOCKED",
+        "DEFINE CONST_BLOCKED",
+        "DEFINE QUALIFIED_BLOCKED",
+    ] {
+        assert_eq!(activity(&a, body), Truth::Unknown, "{body}");
+    }
+    assert_eq!(activity(&a, "DEFINE PREVIOUS_DECLARED"), Truth::True);
+}
+
+#[test]
 fn phase_b_reachable_branches_keep_correlated_declarations_and_switches() {
     let source = "unit T; interface {$IF Mystery}{$DEFINE SMALL}type R=Byte;{$ELSE}{$UNDEF SMALL}type R=Int64;{$ENDIF} \
         {$IF Defined(SMALL)}{$IF SizeOf(R)=1}{$DEFINE SMALL_OK}{$ELSE}{$DEFINE WRONG_SMALL}{$ENDIF}{$ELSE}\

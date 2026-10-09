@@ -1006,6 +1006,26 @@ impl CompileTimeState {
             .map(|s| s.site.clone())
     }
 
+    /// Site of an actual logical character, excluding endpoint-only snapshots.
+    /// Fragment gaps/directives do not become expression bytes; the retained
+    /// occurrence maps still distinguish their pre/post-directive environments.
+    pub(super) fn site_at_logical(
+        &self,
+        logical: usize,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<BindingSite, IncompleteReason> {
+        budget.charge(self.spans.len(), 0, 0)?;
+        self.spans
+            .iter()
+            .rev()
+            .find(|span| {
+                span.logical_start <= logical
+                    && logical - span.logical_start < span.anchor.range.len()
+            })
+            .map(|span| span.site.clone())
+            .ok_or(IncompleteReason::MalformedSource)
+    }
+
     pub fn layout_name(
         &self,
         site: BindingSite,

@@ -762,34 +762,181 @@ fn constant_expression_at(
     depth: usize,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
+    captured_expression_at(state, site, text, logical, &[], &[], depth, budget)
+}
+
+fn captured_expression_at(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    text: &str,
+    logical: Option<usize>,
+    previous_members: &[EnumMember],
+    previous_values: &[i64],
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
     limit(depth, budget.limits().max_type_depth, "max_type_depth")?;
+    let before = budget.snapshot().retained_bytes;
+    let fallback = if state.scalar_history.is_empty() {
+        crate::conditional::ConditionalEnvironment::context_snapshot(&state.context, budget)?
+    } else {
+        crate::conditional::ConditionalEnvironment::default()
+    };
+    let fallback_bytes = budget.snapshot().retained_bytes.saturating_sub(before);
+    let result = (|| {
+        let initial = expression_query_site(state, site, logical, text, 0, budget)?;
+        let environment = scalar_environment_at(state, &initial, &fallback, budget)?;
+        crate::conditional::evaluate_layout_expression(
+            text,
+            environment,
+            budget,
+            &mut |query, budget| {
+                use crate::conditional::ExpressionQuery;
+                let captured =
+                    expression_query_site(state, site, logical, text, query.range().start, budget)?;
+                let environment = scalar_environment_at(state, &captured, &fallback, budget)?;
+                let name = match &query {
+                    ExpressionQuery::Name(name, _)
+                    | ExpressionQuery::LexicalName(name, _)
+                    | ExpressionQuery::Declared(name, _) => Some(*name),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let head = name.split_once('.').map(|(head, _)| head);
+                    for (previous, value) in previous_members.iter().zip(previous_values) {
+                        budget.charge(1, previous.name.len().min(name.len()), 0)?;
+                        if same_name(&previous.name, name) {
+                            return Ok(Some(BoundValue::Constant(match query {
+                                ExpressionQuery::Declared(_, _) => ConstantValue::Boolean(true),
+                                _ => ConstantValue::Integer(*value),
+                            })));
+                        }
+                        if let Some(head) = head {
+                            budget.charge(1, previous.name.len().min(head.len()), 0)?;
+                            if same_name(&previous.name, head) {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+                if let ExpressionQuery::SizeOf { argument, range } = query {
+                    return sizeof_expression_at(
+                        state, &captured, argument, range, logical, budget,
+                    );
+                }
+                scalar_query(state, &captured, environment, query, depth + 1, budget)
+            },
+            false,
+            false,
+        )
+    })();
+    budget.release(fallback_bytes);
+    result
+}
+
+fn expression_query_site(
+    state: &CompileTimeState,
+    fallback: &BindingSite,
+    logical: Option<usize>,
+    text: &str,
+    offset: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<BindingSite, IncompleteReason> {
+    let Some(logical) = logical else {
+        return Ok(fallback.clone());
+    };
+    let tail = text
+        .get(offset..)
+        .ok_or(IncompleteReason::MalformedSource)?;
+    budget.charge(1, tail.len(), 0)?;
+    let Some(skip) = tail.find(|ch: char| !ch.is_whitespace()) else {
+        return Ok(fallback.clone());
+    };
+    state.site_at_logical(
+        logical
+            .checked_add(offset)
+            .and_then(|n| n.checked_add(skip))
+            .ok_or(IncompleteReason::MalformedSource)?,
+        budget,
+    )
+}
+
+fn scalar_environment_at<'a>(
+    state: &'a CompileTimeState,
+    site: &BindingSite,
+    fallback: &'a crate::conditional::ConditionalEnvironment,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<&'a crate::conditional::ConditionalEnvironment, IncompleteReason> {
     budget.charge(state.scalar_history.len(), 0, 0)?;
-    let fallback = crate::conditional::ConditionalEnvironment::default();
-    let environment = state
+    Ok(state
         .scalar_history
         .iter()
         .rev()
         .find(|(sequence, _)| sequence.0 <= site.sequence.0)
-        .map_or(&fallback, |(_, environment)| environment);
-    crate::conditional::evaluate_layout_expression(
-        text,
-        environment,
-        budget,
-        &mut |query, budget| match query {
-            crate::conditional::ExpressionQuery::Name(name) => {
-                constant_name(state, site, name, depth + 1, budget)
+        .map_or(fallback, |(_, environment)| environment))
+}
+
+/// One bounded lexical/context/define policy for direct conditions and captured
+/// declaration expressions. The caller supplies the actual query's path/site.
+pub(super) fn scalar_query(
+    state: &CompileTimeState,
+    site: &BindingSite,
+    environment: &crate::conditional::ConditionalEnvironment,
+    query: crate::conditional::ExpressionQuery<'_>,
+    depth: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<Option<BoundValue>, IncompleteReason> {
+    use crate::conditional::ExpressionQuery;
+    match query {
+        ExpressionQuery::LexicalName(name, _) => {
+            lexical_constant_name(state, site, name, depth, budget)
+        }
+        ExpressionQuery::Name(name, _) => {
+            if lookup(state, site, name, budget)?.is_some() {
+                return constant_name(state, site, name, depth, budget);
             }
-            crate::conditional::ExpressionQuery::LexicalName(name) => {
-                lexical_constant_name(state, site, name, depth + 1, budget)
+            if qualifier_blocked(state, site, name, budget)? {
+                return Ok(None);
             }
-            crate::conditional::ExpressionQuery::SizeOf { argument, range } => {
-                sizeof_expression_at(state, site, argument, range, logical, budget)
+            let value = constant_name(state, site, name, depth, budget)?;
+            if value.is_some() {
+                Ok(value)
+            } else {
+                crate::conditional::bound_define(environment, name, budget)
             }
-            crate::conditional::ExpressionQuery::Declared(_) => Ok(None),
-        },
-        false,
-        false,
-    )
+        }
+        ExpressionQuery::Declared(name, _) => {
+            let mut known = lookup(state, site, name, budget)?.is_some();
+            if !known && qualifier_blocked(state, site, name, budget)? {
+                return Ok(None);
+            }
+            if !known {
+                for key in state.context.constants.keys() {
+                    budget.charge(1, key.len().min(name.len()), 0)?;
+                    if same_name(key, name) {
+                        known = true;
+                        break;
+                    }
+                }
+            }
+            budget.charge(1, name.len(), 0)?;
+            Ok(if known {
+                Some(BoundValue::Constant(ConstantValue::Boolean(true)))
+            } else if state.context.rtl_constants_known
+                && pascal_project::ConditionalContext::is_rtl_version_constant(name)
+            {
+                Some(BoundValue::Constant(ConstantValue::Boolean(false)))
+            } else {
+                None
+            })
+        }
+        ExpressionQuery::Defined(name, _) => {
+            crate::conditional::bound_defined(environment, name, budget)
+        }
+        ExpressionQuery::SizeOf { argument, .. } => {
+            super::session::sizeof_value(state, site, argument, budget)
+        }
+    }
 }
 
 pub(super) fn lexical_constant_name(
@@ -826,6 +973,7 @@ fn sizeof_expression_at(
     logical: Option<usize>,
     budget: &mut CompileTimeBudget<'_>,
 ) -> Result<Option<BoundValue>, IncompleteReason> {
+    let mut captured = site.clone();
     if let Some(logical) = logical {
         let start = logical
             .checked_add(range.start)
@@ -843,12 +991,22 @@ fn sizeof_expression_at(
             if mapped.iter().map(|a| a.range.len()).sum::<usize>() != argument.len() {
                 return Err(IncompleteReason::MalformedSource);
             }
+            budget.charge(1, argument.len(), 0)?;
+            let skip = argument
+                .find(|ch: char| !ch.is_whitespace())
+                .ok_or(IncompleteReason::MalformedSource)?;
+            captured = state.site_at_logical(
+                start
+                    .checked_add(skip)
+                    .ok_or(IncompleteReason::MalformedSource)?,
+                budget,
+            )?;
             Ok(())
         })();
         budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
         result?;
     }
-    super::session::sizeof_value(state, site, argument, budget)
+    super::session::sizeof_value(state, &captured, argument, budget)
 }
 
 pub(super) fn constant_name(
@@ -1013,49 +1171,15 @@ fn enum_values(
                             .ok_or(IncompleteReason::MalformedSource)?,
                     ),
                 };
-                let value = crate::conditional::evaluate_layout_expression(
+                let value = captured_expression_at(
+                    state,
+                    &prior,
                     text,
-                    &crate::conditional::ConditionalEnvironment::default(),
+                    member.value_logical,
+                    members,
+                    &values,
+                    depth + 1,
                     budget,
-                    &mut |query, budget| {
-                        let (name, lexical_only) = match query {
-                            crate::conditional::ExpressionQuery::Name(name) => (name, false),
-                            crate::conditional::ExpressionQuery::LexicalName(name) => (name, true),
-                            crate::conditional::ExpressionQuery::SizeOf { argument, range } => {
-                                return sizeof_expression_at(
-                                    state,
-                                    &prior,
-                                    argument,
-                                    range,
-                                    member.value_logical,
-                                    budget,
-                                );
-                            }
-                            crate::conditional::ExpressionQuery::Declared(_) => return Ok(None),
-                        };
-                        budget.charge(1, name.len(), 0)?;
-                        let qualifier = name.split_once('.').map(|(head, _)| head);
-                        for (previous, value) in members.iter().zip(&values) {
-                            budget.charge(1, previous.name.len().min(name.len()), 0)?;
-                            if same_name(&previous.name, name) {
-                                return Ok(Some(BoundValue::Constant(ConstantValue::Integer(
-                                    *value,
-                                ))));
-                            }
-                            if let Some(head) = qualifier {
-                                budget.charge(1, previous.name.len().min(head.len()), 0)?;
-                                if same_name(&previous.name, head) {
-                                    return Ok(None);
-                                }
-                            }
-                        }
-                        if lexical_only {
-                            return lexical_constant_name(state, &prior, name, depth + 1, budget);
-                        }
-                        constant_name(state, &prior, name, depth + 1, budget)
-                    },
-                    false,
-                    false,
                 )?;
                 match value {
                     Some(BoundValue::Constant(ConstantValue::Integer(n))) => n,

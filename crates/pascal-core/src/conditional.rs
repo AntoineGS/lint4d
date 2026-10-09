@@ -17,7 +17,7 @@ use std::ops::Range;
 #[cfg(test)]
 use std::cell::Cell;
 
-const MAX_DIRECTIVES: usize = 16_384;
+pub(crate) const MAX_DIRECTIVES: usize = 16_384;
 pub(crate) const MAX_CONDITIONAL_DEPTH: usize = 256;
 pub(crate) const MAX_EXPRESSION_TOKENS: usize = 256;
 const MAX_EXPRESSION_BYTES: usize = 4_096;
@@ -1125,6 +1125,10 @@ fn analyze_inner(
     )
 }
 
+/// Compatibility scalar callback. Its signature cannot carry physical source
+/// identities or a shared typed declaration continuation. Potentially active
+/// includes therefore make `complete` false even when scalar effects are known;
+/// source-backed clients should use `compile_time::analyze_source` instead.
 pub fn analyze_with_include_callback(
     source: &str,
     environment: &mut ConditionalEnvironment,
@@ -1167,6 +1171,11 @@ pub fn analyze_with_include_callback_context(
 /// Internal source-backed extension of the same directive interpreter. The
 /// session owns admission, lexical declarations, and unavailable-fact reasons.
 pub(crate) trait SourceOrder {
+    fn next_directive(
+        &mut self,
+        source: &str,
+        cursor: usize,
+    ) -> Result<Option<ConditionalDirective>, ()>;
     fn activity(&self) -> Truth;
     fn admit_directive(&mut self, body_bytes: usize) -> bool;
     fn admit_environment(&mut self, environment: &ConditionalEnvironment) -> bool;
@@ -1187,28 +1196,191 @@ pub(crate) fn analyze_with_source_order(
     cancel: &dyn CancellationToken,
     order: &mut dyn SourceOrder,
 ) -> ConditionalAnalysis {
-    let mut budget = AnalysisBudget {
-        cancel: Some(cancel),
-        work: 0,
-        byte_work: 0,
-        exhausted: false,
-    };
-    let mut environment =
-        initial_environment(context, &mut budget).unwrap_or_else(|| ConditionalEnvironment {
-            rejected_context: true,
-            ..Default::default()
-        });
-    let complete = !environment.rejected_context;
-    let lexed = lex_directives_inner(source, Some(cancel), Some(order));
-    analyze_lexed(
-        source,
-        lexed,
-        &mut environment,
-        Some(cancel),
-        None,
+    // Lex only as far as the next directive. An include callback can change the
+    // lexical continuation before the parent resumes (including opening a
+    // literal/comment). Prelexing the whole physical parent is not sound.
+    let _ = context;
+    let environment = ConditionalEnvironment::default();
+    let mut complete = true;
+    let mut cursor = 0;
+    let mut directives = Vec::new();
+    let mut inactive_spans = Vec::new();
+    let mut unknown_spans = Vec::new();
+    let mut masks = Vec::new();
+    loop {
+        if cancel.is_cancelled() {
+            complete = false;
+            break;
+        }
+        let next = match order.next_directive(source, cursor) {
+            Ok(next) => next,
+            Err(()) => {
+                complete = false;
+                break;
+            }
+        };
+        let end = next.as_ref().map_or(source.len(), |d| d.start);
+        let active = order.activity();
+        order.feed(cursor..end, active);
+        add_activity_span(
+            &mut inactive_spans,
+            &mut unknown_spans,
+            cursor,
+            end,
+            order.activity(),
+        );
+        let Some(mut directive) = next else { break };
+        directive.activity = order.activity();
+        order.directive(&directive);
+        if matches!(
+            directive.kind,
+            DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
+        ) && !is_else_directive(&directive.body)
+        {
+            directive.condition = Some(order.condition(
+                &directive.body,
+                directive.start,
+                &environment,
+                &mut complete,
+            ));
+        }
+        cursor = directive.end;
+        masks.push(directive.start..directive.end);
+        directives.push(directive);
+    }
+    ConditionalAnalysis {
+        projected_source: project_source(source, &inactive_spans, &masks),
+        directives,
+        inactive_spans,
+        unknown_spans,
         complete,
-        Some(order),
-    )
+    }
+}
+
+/// The same physical directive lexical rules as `lex_directives_inner`, but
+/// suspended at each directive and at child EOF rather than finalizing a root.
+#[derive(Default)]
+pub(crate) struct DirectiveScanner {
+    mode: DirectiveLex,
+}
+#[derive(Default)]
+enum DirectiveLex {
+    #[default]
+    Normal,
+    Slash,
+    Paren,
+    Brace,
+    Line,
+    StarComment,
+    StarEnd,
+    String,
+    Quote,
+}
+impl DirectiveScanner {
+    pub(crate) fn complete(&self) -> bool {
+        matches!(
+            self.mode,
+            DirectiveLex::Normal
+                | DirectiveLex::Slash
+                | DirectiveLex::Paren
+                | DirectiveLex::Line
+                | DirectiveLex::Quote
+        )
+    }
+    pub(crate) fn next<'a>(
+        &mut self,
+        source: &'a str,
+        cursor: usize,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Option<(Range<usize>, &'a str)>, ()> {
+        let bytes = source.as_bytes();
+        use DirectiveLex::*;
+        let mut i = cursor;
+        while i < bytes.len() {
+            if cancel.is_cancelled() {
+                return Err(());
+            }
+            let b = bytes[i];
+            match self.mode {
+                Slash => {
+                    self.mode = if b == b'/' { Line } else { Normal };
+                    if b != b'/' {
+                        continue;
+                    }
+                }
+                Paren => {
+                    self.mode = if b == b'*' { StarComment } else { Normal };
+                    if b != b'*' {
+                        continue;
+                    }
+                }
+                Brace => {
+                    if b == b'}' {
+                        self.mode = Normal;
+                    }
+                }
+                Line => {
+                    if b == b'\n' {
+                        self.mode = Normal;
+                    }
+                }
+                StarComment => {
+                    if b == b'*' {
+                        self.mode = StarEnd;
+                    }
+                }
+                StarEnd => {
+                    self.mode = if b == b')' {
+                        Normal
+                    } else if b == b'*' {
+                        StarEnd
+                    } else {
+                        StarComment
+                    };
+                }
+                String => {
+                    if b == b'\'' {
+                        self.mode = Quote;
+                    } else if b == b'\n' {
+                        return Err(());
+                    }
+                }
+                Quote => {
+                    self.mode = if b == b'\'' { String } else { Normal };
+                    if b != b'\'' {
+                        continue;
+                    }
+                }
+                Normal => {
+                    let (prefix, suffix) = if bytes.get(i..i + 2) == Some(b"{$") {
+                        (2, b"}".as_slice())
+                    } else if bytes.get(i..i + 3) == Some(b"(*$") {
+                        (3, b"*)".as_slice())
+                    } else {
+                        (0, b"".as_slice())
+                    };
+                    if prefix != 0 {
+                        let close = find_sequence(bytes, i + prefix, suffix).ok_or(())?;
+                        let body = &source[i + prefix..close];
+                        return Ok(Some((i..close + suffix.len(), body)));
+                    }
+                    self.mode = match b {
+                        b'/' => Slash,
+                        b'(' => Paren,
+                        b'{' => Brace,
+                        b'\'' => String,
+                        _ => Normal,
+                    };
+                    if b == b'"' {
+                        i = skip_assembler_string(bytes, i);
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        Ok(None)
+    }
 }
 
 fn analyze_lexed(
@@ -1446,6 +1618,9 @@ fn analyze_lexed(
                 // directives. Unless their contents have been soundly
                 // processed, no previously known fact survives an active
                 // include boundary.
+                if active != Truth::False && include.is_some() {
+                    complete = false;
+                }
                 if active == Truth::True {
                     if let Some(include) = include.as_deref_mut() {
                         let source_constants_before = environment.source_constants_fingerprint();
@@ -1466,6 +1641,11 @@ fn analyze_lexed(
                             // it back to the including frame without a full
                             // binding identity proof.
                             environment.remove_source_constants();
+                            // The scalar callback cannot carry lexical binding
+                            // identities or a pending declaration across EOF.
+                            // Report missing typed continuation, not a complete
+                            // analysis with include-derived facts silently lost.
+                            complete = false;
                         }
                     } else {
                         environment.clear();
@@ -2671,7 +2851,7 @@ fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
     index
 }
 
-fn directive_kind(body: &str) -> DirectiveKind {
+pub(crate) fn directive_kind(body: &str) -> DirectiveKind {
     if switch_list_members(body).is_some() {
         return DirectiveKind::Harmless;
     }

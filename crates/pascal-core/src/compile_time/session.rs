@@ -20,6 +20,19 @@ pub struct ProviderSource {
 }
 
 pub trait CompileTimeResolver {
+    fn max_include_depth(&self) -> usize {
+        64
+    }
+    fn admit_include(
+        &mut self,
+        budget: &mut CompileTimeBudget<'_>,
+        _cancel: &dyn CancellationToken,
+    ) -> Result<bool, ResolverError> {
+        budget
+            .charge(1, 0, 0)
+            .map_err(|r| resolver_error(r, budget))?;
+        Ok(true)
+    }
     fn include(
         &mut self,
         request: IncludeResolveRequest<'_>,
@@ -69,12 +82,12 @@ pub struct CompileTimeAnalysis {
 }
 
 /// Analyze one root with the shared conditional interpreter and lexical binder.
-/// Resource capabilities are deliberately not invoked until their session owners
-/// exist: a required include is an explicit unavailable barrier, never empty text.
+/// Authorized includes suspend only physical coordinates: the lexical binder,
+/// conditional paths and compiler context continue through every child EOF.
 pub fn analyze_source(
     root: &LoadedSource,
     context: &ConditionalContext,
-    _resolver: &mut dyn CompileTimeResolver,
+    resolver: &mut dyn CompileTimeResolver,
     limits: CompileTimeLimits,
     cancel: &dyn CancellationToken,
 ) -> Result<CompileTimeAnalysis, ResolverError> {
@@ -153,8 +166,20 @@ pub fn analyze_source(
         .push((Sequence(0), scalar));
     let first = ReachablePath { environment };
     let mut session = RootSession {
-        root,
-        text,
+        root: root.clone(),
+        text: text.to_owned(),
+        resolver,
+        cancel,
+        context,
+        occurrence: OccurrenceId(0),
+        next_occurrence: 1,
+        active_sources: vec![root.id.clone()],
+        occurrences: Vec::new(),
+        observations: Vec::new(),
+        warnings: Vec::new(),
+        scanner: conditional::DirectiveScanner::default(),
+        resource_error: None,
+        directive_count: 0,
         state,
         budget,
         reasons: Vec::new(),
@@ -165,6 +190,12 @@ pub fn analyze_source(
         last_condition: Truth::Unknown,
     };
     let mut analysis = conditional::analyze_with_source_order(text, context, cancel, &mut session);
+    if let Some(error) = session.resource_error.take() {
+        return Err(error);
+    }
+    if !session.scanner.complete() {
+        session.record(IncompleteReason::MalformedSource);
+    }
     if let Some(reason) = session.fatal.take() {
         return Err(resolver_error(reason, &session.budget));
     }
@@ -280,17 +311,59 @@ pub fn analyze_source(
     }
     Ok(CompileTimeAnalysis {
         root: analysis,
-        occurrences: vec![occurrence],
+        occurrences: {
+            session.occurrences.insert(0, occurrence);
+            session.occurrences
+        },
         includes: session.includes,
         facts: session.state,
         header: Fact::Unknown(UnknownReason::HeaderNotAnalyzed),
         reasons: session.reasons,
-        observations: Vec::new(),
-        warnings: Vec::new(),
+        observations: session.observations,
+        warnings: session.warnings,
     })
 }
 
-fn resolver_error(reason: IncompleteReason, budget: &CompileTimeBudget<'_>) -> ResolverError {
+fn admit_observation(
+    observation: &ResolutionObservation,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    let mut failure = None;
+    let mut visit = |n| {
+        budget.charge(1, n, n).map_err(|r| {
+            failure = Some(r);
+            "observation admission".into()
+        })
+    };
+    let result = match observation {
+        ResolutionObservation::Directory { path, entry, .. } => {
+            visit(path.as_os_str().len()).and_then(|_| entry.visit_recovery_payload(&mut visit))
+        }
+        ResolutionObservation::Candidate { path, entry, .. } => visit(path.as_os_str().len())
+            .and_then(|_| {
+                if let Some(entry) = entry {
+                    entry.visit_recovery_payload(&mut visit)
+                } else {
+                    Ok(())
+                }
+            }),
+        ResolutionObservation::Payload {
+            source_id, path, ..
+        } => visit(source_id.as_str().len()).and_then(|_| visit(path.as_os_str().len())),
+        ResolutionObservation::Metadata(observation) => {
+            observation.visit_recovery_payload(&mut visit)
+        }
+        ResolutionObservation::ProjectRead(observation) => {
+            observation.visit_recovery_payload(&mut visit)
+        }
+    };
+    result.map_err(|_| resolver_error(failure.unwrap_or(IncompleteReason::MalformedSource), budget))
+}
+
+pub(crate) fn resolver_error(
+    reason: IncompleteReason,
+    budget: &CompileTimeBudget<'_>,
+) -> ResolverError {
     match reason {
         IncompleteReason::Cancelled => ResolverError::Cancelled,
         IncompleteReason::Limit { name, maximum } => match budget.failure_observed(name, maximum) {
@@ -308,8 +381,20 @@ fn resolver_error(reason: IncompleteReason, budget: &CompileTimeBudget<'_>) -> R
 }
 
 struct RootSession<'a> {
-    root: &'a LoadedSource,
-    text: &'a str,
+    root: LoadedSource,
+    text: String,
+    resolver: &'a mut dyn CompileTimeResolver,
+    cancel: &'a dyn CancellationToken,
+    context: &'a ConditionalContext,
+    occurrence: OccurrenceId,
+    next_occurrence: u64,
+    active_sources: Vec<crate::SourceId>,
+    occurrences: Vec<OccurrenceAnalysis>,
+    observations: Vec<ResolutionObservation>,
+    warnings: Vec<String>,
+    scanner: conditional::DirectiveScanner,
+    resource_error: Option<ResolverError>,
+    directive_count: usize,
     state: CompileTimeState,
     budget: CompileTimeBudget<'a>,
     reasons: Vec<IncompleteReason>,
@@ -332,6 +417,211 @@ struct ReachableFrame {
 }
 
 impl RootSession<'_> {
+    fn walk_include(&mut self, directive: &ConditionalDirective) -> Result<(), ResolverError> {
+        // A reachable hypothetical path is not an authorization to read bytes.
+        let name = crate::resolver::include_name(&directive.body);
+        self.budget
+            .charge(
+                1,
+                directive.body.len(),
+                size_of::<IncludeOccurrence>() + self.root.id.as_str().len(),
+            )
+            .map_err(|r| resolver_error(r, &self.budget))?;
+        let outcome = if directive.activity != Truth::True {
+            ResolutionOutcome {
+                result: Resolution::Unavailable {
+                    reason: "include conditional activity is unknown".into(),
+                },
+                observations: vec![],
+                warnings: vec![],
+            }
+        } else if self.active_sources.len() > self.resolver.max_include_depth() {
+            ResolutionOutcome {
+                result: Resolution::Incomplete {
+                    reason: "include depth limit reached".into(),
+                    candidates: vec![],
+                },
+                observations: vec![],
+                warnings: vec![],
+            }
+        } else if let Some(name) = name.as_deref() {
+            self.resolver.include(
+                IncludeResolveRequest {
+                    including_path: &self.root.path,
+                    byte_range: directive.start..directive.end,
+                    requested_name: name,
+                    legacy_route: None,
+                },
+                &mut self.budget,
+                self.cancel,
+            )?
+        } else {
+            ResolutionOutcome {
+                result: Resolution::Unavailable {
+                    reason: "include has no statically known name".into(),
+                },
+                observations: vec![],
+                warnings: vec![],
+            }
+        };
+        let ResolutionOutcome {
+            mut result,
+            observations,
+            warnings,
+        } = outcome;
+        self.budget
+            .charge(
+                observations.len() + warnings.len(),
+                0,
+                observations.len() * size_of::<ResolutionObservation>()
+                    + warnings.len() * size_of::<String>(),
+            )
+            .map_err(|r| resolver_error(r, &self.budget))?;
+        for observation in &observations {
+            admit_observation(observation, &mut self.budget)?;
+        }
+        for warning in &warnings {
+            self.budget
+                .charge(1, warning.len(), warning.len())
+                .map_err(|r| resolver_error(r, &self.budget))?;
+        }
+        self.observations.extend(observations);
+        self.warnings.extend(warnings);
+        match &result {
+            Resolution::Found(source) => {
+                self.budget
+                    .charge(
+                        1,
+                        source.id.as_str().len() + source.path.as_os_str().len(),
+                        source.id.as_str().len() + source.path.as_os_str().len(),
+                    )
+                    .map_err(|r| resolver_error(r, &self.budget))?;
+            }
+            Resolution::Unavailable { reason } => {
+                self.budget
+                    .charge(1, reason.len(), reason.len())
+                    .map_err(|r| resolver_error(r, &self.budget))?;
+            }
+            Resolution::Ambiguous { candidates } | Resolution::Incomplete { candidates, .. } => {
+                self.budget
+                    .charge(
+                        candidates.len(),
+                        0,
+                        candidates.len() * size_of::<crate::ResolutionCandidate>(),
+                    )
+                    .map_err(|r| resolver_error(r, &self.budget))?;
+                for candidate in candidates {
+                    let n = candidate.path.as_os_str().len()
+                        + candidate.declared_name.as_ref().map_or(0, String::len);
+                    self.budget
+                        .charge(1, n, n)
+                        .map_err(|r| resolver_error(r, &self.budget))?;
+                }
+                if let Resolution::Incomplete { reason, .. } = &result {
+                    self.budget
+                        .charge(1, reason.len(), reason.len())
+                        .map_err(|r| resolver_error(r, &self.budget))?;
+                }
+            }
+        }
+        if let Resolution::Found(child) = &result {
+            if self.active_sources.contains(&child.id) {
+                result = Resolution::Incomplete {
+                    reason: "textual include cycle".into(),
+                    candidates: vec![],
+                };
+            }
+        }
+        let index = self.includes.len();
+        self.includes.push(IncludeOccurrence {
+            owner: self.occurrence,
+            directive: SourceAnchor {
+                source: self.root.id.clone(),
+                occurrence: self.occurrence,
+                range: directive.start..directive.end,
+            },
+            target: result,
+            child: None,
+        });
+        match &self.includes[index].target {
+            Resolution::Found(child) => {
+                let bytes = child.analysis_bytes();
+                let reserve = bytes
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|n| {
+                        n.checked_add(
+                            size_of::<OccurrenceAnalysis>()
+                                + child.id.as_str().len()
+                                + child.path.as_os_str().len(),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("include admission overflow".into())
+                    })?;
+                self.budget
+                    .charge(1, bytes.len(), reserve)
+                    .map_err(|r| resolver_error(r, &self.budget))?;
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| {
+                        ResolverError::InvalidRequest("include coordinate text is not UTF-8".into())
+                    })?
+                    .to_owned();
+                let child = child.clone();
+                let occurrence = OccurrenceId(self.next_occurrence);
+                self.next_occurrence = self
+                    .next_occurrence
+                    .checked_add(1)
+                    .ok_or_else(|| ResolverError::InvalidRequest("occurrence overflow".into()))?;
+                self.includes[index].child = Some(occurrence);
+                let parent = std::mem::replace(&mut self.root, child);
+                let parent_text = std::mem::replace(&mut self.text, text.clone());
+                let parent_occurrence = std::mem::replace(&mut self.occurrence, occurrence);
+                self.active_sources.push(self.root.id.clone());
+                let mut analysis =
+                    conditional::analyze_with_source_order(&text, self.context, self.cancel, self);
+                if !analysis.complete {
+                    self.record(IncompleteReason::MalformedSource);
+                }
+                if !self.reasons.is_empty() {
+                    analysis.complete = false;
+                    analysis.inactive_spans.clear();
+                    analysis.unknown_spans = if text.is_empty() {
+                        vec![]
+                    } else {
+                        vec![0..text.len()]
+                    };
+                    analysis.projected_source = text.clone();
+                }
+                // Only physical coordinates change. Typed paths, scopes, lexer,
+                // scalar history, settings and conditional frames stay alive.
+                let source = std::mem::replace(&mut self.root, parent);
+                self.text = parent_text;
+                self.occurrence = parent_occurrence;
+                self.active_sources.pop();
+                self.occurrences.push(OccurrenceAnalysis {
+                    id: occurrence,
+                    source,
+                    analysis,
+                });
+            }
+            failed => {
+                let reason = match failed {
+                    Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
+                        reason.clone()
+                    }
+                    Resolution::Ambiguous { .. } => "ambiguous required include".into(),
+                    Resolution::Found(_) => unreachable!(),
+                };
+                self.record(IncompleteReason::RequiredSource {
+                    source: self.root.id.clone(),
+                    reason,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn reachable_count(&self) -> usize {
         self.current.len()
             + self
@@ -356,8 +646,14 @@ impl RootSession<'_> {
         )?;
         let mut decisions = Vec::new();
         for path in &self.current {
-            let condition =
-                evaluate_path_condition(self.root, self.text, &path, directive, &mut self.budget)?;
+            let condition = evaluate_path_condition(
+                &self.root,
+                self.occurrence,
+                &self.text,
+                &path,
+                directive,
+                &mut self.budget,
+            )?;
             aggregate = Some(aggregate.map_or(condition, |prior: Truth| prior.merge(condition)));
             decisions.push(condition);
         }
@@ -513,6 +809,7 @@ impl ReachablePath {
 
 fn evaluate_path_condition(
     root: &LoadedSource,
+    occurrence: OccurrenceId,
     text: &str,
     path: &ReachablePath,
     directive: &ConditionalDirective,
@@ -531,6 +828,7 @@ fn evaluate_path_condition(
                 let mapped = (|| {
                     let anchor = argument_anchor(
                         root,
+                        occurrence,
                         text,
                         &directive.body,
                         directive.start,
@@ -551,6 +849,52 @@ fn evaluate_path_condition(
 }
 
 impl SourceOrder for RootSession<'_> {
+    fn next_directive(
+        &mut self,
+        source: &str,
+        cursor: usize,
+    ) -> Result<Option<ConditionalDirective>, ()> {
+        let next = self.scanner.next(source, cursor, self.cancel)?;
+        let Some((range, body)) = next else {
+            return Ok(None);
+        };
+        if self.directive_count >= conditional::MAX_DIRECTIVES {
+            self.record(IncompleteReason::Limit {
+                name: "max_directives",
+                maximum: conditional::MAX_DIRECTIVES,
+            });
+            return Err(());
+        }
+        self.directive_count += 1;
+        if !self.admit_directive(body.len()) {
+            return Err(());
+        }
+        let kind = conditional::directive_kind(body);
+        if kind == DirectiveKind::Include {
+            match self.resolver.admit_include(&mut self.budget, self.cancel) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.record(IncompleteReason::RequiredSource {
+                        source: self.root.id.clone(),
+                        reason: "include directive admission limit reached".into(),
+                    });
+                    return Err(());
+                }
+                Err(error) => {
+                    self.resource_error = Some(error);
+                    return Err(());
+                }
+            }
+        }
+        Ok(Some(ConditionalDirective {
+            kind,
+            body: body.to_owned(),
+            start: range.start,
+            end: range.end,
+            activity: Truth::Unknown,
+            condition: None,
+        }))
+    }
     fn activity(&self) -> Truth {
         if !self.reasons.is_empty() || self.fatal.is_some() {
             Truth::Unknown
@@ -610,7 +954,7 @@ impl SourceOrder for RootSession<'_> {
             if let Err(reason) = path.state_mut().feed(
                 SourceFragment {
                     source: &self.root.id,
-                    occurrence: OccurrenceId(0),
+                    occurrence: self.occurrence,
                     physical_start: range.start,
                     text: &self.text[range.clone()],
                 },
@@ -659,31 +1003,13 @@ impl SourceOrder for RootSession<'_> {
             return;
         }
         if directive.kind == DirectiveKind::Include {
-            const REASON: &str = "textual include analysis unavailable until Task8";
-            let bytes = self.root.id.as_str().len() * 2
-                + REASON.len() * 2
-                + size_of::<IncludeOccurrence>()
-                + size_of::<IncompleteReason>();
-            if let Err(reason) = self.budget.charge(1, bytes, bytes) {
-                self.fatal = Some(reason);
-                return;
-            }
-            self.includes.push(IncludeOccurrence {
-                owner: OccurrenceId(0),
-                directive: SourceAnchor {
+            if let Err(error) = self.walk_include(directive) {
+                self.resource_error = Some(error);
+                self.record(IncompleteReason::RequiredSource {
                     source: self.root.id.clone(),
-                    occurrence: OccurrenceId(0),
-                    range: directive.start..directive.end,
-                },
-                target: Resolution::Unavailable {
-                    reason: REASON.into(),
-                },
-                child: None,
-            });
-            self.record(IncompleteReason::RequiredSource {
-                source: self.root.id.clone(),
-                reason: REASON.into(),
-            });
+                    reason: "include admission failed".into(),
+                });
+            }
         } else {
             let mut failure = None;
             for path in &mut self.current {
@@ -862,6 +1188,7 @@ fn layout_body_key(body: &str) -> &str {
 
 fn argument_anchor(
     root: &LoadedSource,
+    occurrence: OccurrenceId,
     text: &str,
     body: &str,
     directive_start: usize,
@@ -909,7 +1236,7 @@ fn argument_anchor(
     }
     Ok(SourceAnchor {
         source: root.id.clone(),
-        occurrence: OccurrenceId(0),
+        occurrence,
         range: physical,
     })
 }
@@ -1089,7 +1416,8 @@ mod tests {
                     seen += 1;
                     assert_eq!(argument, " value.Field ");
                     assert_eq!(&expression[range.clone()], argument);
-                    let anchor = argument_anchor(&root, &text, body, start, range, budget)?;
+                    let anchor =
+                        argument_anchor(&root, OccurrenceId(0), &text, body, start, range, budget)?;
                     assert_eq!(anchor.source, root.id);
                     assert_eq!(anchor.occurrence, OccurrenceId(0));
                     let physical = text.find(" value.Field ").unwrap();

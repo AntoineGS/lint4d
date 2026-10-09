@@ -526,6 +526,13 @@ impl CompileTimeState {
                 self.section = Section::None;
                 self.clear_pending(budget);
             }
+            "uses" => {
+                // Import clauses are not another declarator in the preceding
+                // const/type/var section. Their resource owner consumes them;
+                // only keep source-order/scope framing here.
+                self.section = Section::None;
+                self.clear_pending(budget);
+            }
             "type" => {
                 self.section = Section::Types;
                 self.clear_pending(budget);

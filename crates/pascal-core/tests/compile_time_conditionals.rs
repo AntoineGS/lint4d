@@ -579,7 +579,9 @@ fn assert_transport(context: &ConditionalContext) {
             }
         },
     );
-    assert!(analysis.complete);
+    // Scalar transport remains lossless, but the legacy callback has no shared
+    // source-backed declaration continuation and must not claim completeness.
+    assert!(!analysis.complete);
     assert_eq!(seen, 1);
     assert_eq!(environment.to_context().layout, context.layout);
     assert_eq!(
@@ -687,7 +689,7 @@ fn unavailable_include_does_not_erase_immutable_source_entry_layout() {
             environment_known: false,
         },
     );
-    assert!(analysis.complete);
+    assert!(!analysis.complete);
     assert_eq!(analysis.directives[1].condition, Some(Truth::Unknown));
     assert_eq!(environment.to_context().layout, context.layout);
     assert_eq!(
@@ -828,7 +830,7 @@ fn root_occurrence_carriers_and_unavailable_resources_are_explicit() {
         "unit T; interface {$I child.inc} implementation end.",
         context(LayoutPlatform::Win32),
     );
-    f.include("child.inc", "type R=Byte;");
+    f.deny_include("child.inc");
     let a = f.analyze().unwrap();
     assert_eq!(a.occurrences.len(), 1);
     assert_eq!(a.occurrences[0].id, OccurrenceId(0));
@@ -843,7 +845,7 @@ fn root_occurrence_carriers_and_unavailable_resources_are_explicit() {
         &a.reasons[0],
         IncompleteReason::RequiredSource { .. }
     ));
-    assert!(f.read_names().is_empty());
+    assert_eq!(f.read_names(), vec!["child.inc"]);
 }
 
 #[test]

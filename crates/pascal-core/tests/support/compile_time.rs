@@ -60,7 +60,11 @@ pub struct Fixture {
     pub root: LoadedSource,
     pub context: ConditionalContext,
     pub limits: CompileTimeLimits,
+    pub max_include_depth: usize,
+    pub requests: Vec<(std::path::PathBuf, std::ops::Range<usize>, String)>,
+    pub include_warnings: Vec<String>,
     includes: std::collections::BTreeMap<String, LoadedSource>,
+    failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
     reads: Vec<String>,
 }
@@ -70,7 +74,11 @@ impl Fixture {
             root: loaded("T.pas", text),
             context,
             limits: CompileTimeLimits::default(),
+            max_include_depth: 64,
+            requests: vec![],
+            include_warnings: vec![],
             includes: Default::default(),
+            failures: Default::default(),
             denied: Default::default(),
             reads: vec![],
         }
@@ -81,17 +89,29 @@ impl Fixture {
     pub fn deny_include(&mut self, name: &str) {
         self.denied.insert(name.into());
     }
+    pub fn fail_include(&mut self, name: &str, failure: Resolution<LoadedSource>) {
+        self.failures.insert(name.into(), failure);
+    }
     pub fn read_names(&self) -> Vec<String> {
         self.reads.clone()
     }
     pub fn analyze(&mut self) -> Result<CompileTimeAnalysis, ResolverError> {
+        self.analyze_with_cancel(&NoCancellation)
+    }
+    pub fn analyze_with_cancel(
+        &mut self,
+        cancel: &dyn CancellationToken,
+    ) -> Result<CompileTimeAnalysis, ResolverError> {
         let root = self.root.clone();
         let context = self.context.clone();
         let limits = self.limits;
-        analyze_source(&root, &context, self, limits, &NoCancellation)
+        analyze_source(&root, &context, self, limits, cancel)
     }
 }
 impl CompileTimeResolver for Fixture {
+    fn max_include_depth(&self) -> usize {
+        self.max_include_depth
+    }
     fn include(
         &mut self,
         request: IncludeResolveRequest<'_>,
@@ -106,7 +126,14 @@ impl CompileTimeResolver for Fixture {
             )
             .map_err(|_| ResolverError::InvalidRequest("fixture budget".into()))?;
         self.reads.push(request.requested_name.into());
-        let result = if self.denied.contains(request.requested_name) {
+        self.requests.push((
+            request.including_path.into(),
+            request.byte_range.clone(),
+            request.requested_name.into(),
+        ));
+        let result = if let Some(failure) = self.failures.get(request.requested_name) {
+            failure.clone()
+        } else if self.denied.contains(request.requested_name) {
             Resolution::Unavailable {
                 reason: "denied fixture include".into(),
             }
@@ -122,7 +149,13 @@ impl CompileTimeResolver for Fixture {
         Ok(ResolutionOutcome {
             result,
             observations: vec![],
-            warnings: vec![],
+            warnings: {
+                let n = self.include_warnings.iter().map(String::len).sum();
+                budget
+                    .charge(1, n, n)
+                    .map_err(|_| ResolverError::InvalidRequest("fixture warning budget".into()))?;
+                self.include_warnings.clone()
+            },
         })
     }
     fn unit(

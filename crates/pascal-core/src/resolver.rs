@@ -311,6 +311,132 @@ pub enum SourceStoreError {
     },
 }
 
+/// Incoming store failures remain plain inputs. Only original typed include-
+/// limit constructors can mint the owned variant; no naked extraction exists.
+enum IncludeLoadError {
+    Plain(SourceStoreError),
+    Limit(AdmittedOwned<SourceStoreError>),
+}
+impl From<SourceStoreError> for IncludeLoadError {
+    fn from(error: SourceStoreError) -> Self {
+        Self::Plain(error)
+    }
+}
+impl IncludeLoadError {
+    fn error_ref(&self) -> &SourceStoreError {
+        match self {
+            Self::Plain(error) => error,
+            Self::Limit(error) => error,
+        }
+    }
+    fn refusal(&self) -> Option<ResolverError> {
+        match self.error_ref() {
+            SourceStoreError::Cancelled => Some(ResolverError::Cancelled),
+            SourceStoreError::RootLimit {
+                limit,
+                observed,
+                maximum,
+            } => Some(ResolverError::LimitExceeded {
+                limit,
+                observed: *observed,
+                maximum: *maximum,
+            }),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    fn move_into<T>(
+        self,
+        to: &mut AdmittedOwned<T>,
+        budget: &CompileTimeBudget<'_>,
+        install: impl FnOnce(&mut T, SourceStoreError),
+    ) -> Result<(), crate::compile_time::IncompleteReason> {
+        match self {
+            Self::Limit(error) => to.move_field(error, budget, install),
+            Self::Plain(_) => Err(crate::compile_time::IncompleteReason::MalformedSource),
+        }
+    }
+}
+impl fmt::Debug for IncludeLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error_ref().fmt(f)
+    }
+}
+
+fn include_limit_error(
+    path: AdmittedOwned<PathBuf>,
+    kind: &'static str,
+    maximum: usize,
+    status: &'static str,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<IncludeLoadError, SourceStoreError> {
+    if !path.is_admitted_by(budget) {
+        return Err(SourceStoreError::AdmissionUnavailable);
+    }
+    let digits = (usize::BITS as usize)
+        .checked_add(2)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?
+        / 3;
+    let bound = 32usize
+        .checked_add(digits)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    let cancel = budget.cancel_token();
+    let reason = budget.admit_fallible(1, bound, bound, store_admission_error, || {
+        if cancel.is_cancelled() {
+            return Err(SourceStoreError::Cancelled);
+        }
+        let mut writer = BoundedReportString {
+            string: String::with_capacity(bound),
+            bound,
+        };
+        fmt::write(
+            &mut writer,
+            format_args!("include {kind} limit ({maximum}) {status}"),
+        )
+        .map_err(|_| SourceStoreError::AdmissionUnavailable)?;
+        if cancel.is_cancelled() {
+            return Err(SourceStoreError::Cancelled);
+        }
+        Ok(writer.string)
+    })?;
+    let mut error = budget
+        .admit_owned(0, 0, 0, || SourceStoreError::Incomplete {
+            path: PathBuf::new(),
+            reason: String::new(),
+        })
+        .map_err(|r| store_admission_error(r, budget))?;
+    error
+        .move_field(path, budget, |error, path| {
+            let SourceStoreError::Incomplete { path: to, .. } = error else {
+                unreachable!("private limit receiver")
+            };
+            *to = path;
+        })
+        .map_err(|r| store_admission_error(r, budget))?;
+    error
+        .move_field(reason, budget, |error, reason| {
+            let SourceStoreError::Incomplete { reason: to, .. } = error else {
+                unreachable!("private limit receiver")
+            };
+            *to = reason;
+        })
+        .map_err(|r| store_admission_error(r, budget))?;
+    Ok(IncludeLoadError::Limit(error))
+}
+
+fn include_limit_path_copy(
+    path: &Path,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<AdmittedOwned<PathBuf>, SourceStoreError> {
+    let bytes = path.as_os_str().len();
+    let work = bytes
+        .checked_add(1)
+        .ok_or(SourceStoreError::AdmissionUnavailable)?;
+    budget
+        .admit_owned(work, bytes, bytes, || path.to_path_buf())
+        .map_err(|r| store_admission_error(r, budget))
+}
+
 pub(crate) fn store_admission_error(
     reason: crate::compile_time::IncompleteReason,
     budget: &crate::compile_time::CompileTimeBudget<'_>,
@@ -5665,7 +5791,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 // First authorized success always wins. Transfer this inline
                 // source directly; no temporary heap collection or invoice.
                 Ok(source) => return Ok(Resolution::Found(source)),
-                Err(SourceStoreError::NotFound { .. }) => {
+                Err(error) if matches!(error.error_ref(), SourceStoreError::NotFound { .. }) => {
                     let Some((case_base, case_base_entry)) = case_lookup_base else {
                         continue;
                     };
@@ -5686,22 +5812,17 @@ impl<S: SourceStore> UnitResolver<S> {
                                 cancel,
                             ) {
                                 Ok(source) => return Ok(Resolution::Found(source)),
-                                Err(SourceStoreError::NotFound { .. }) => {}
-                                Err(SourceStoreError::Cancelled) => {
-                                    return Err(ResolverError::Cancelled);
-                                }
-                                Err(error @ SourceStoreError::RootLimit { .. }) => {
-                                    return Err(root_store_error(error));
+                                Err(error)
+                                    if matches!(
+                                        error.error_ref(),
+                                        SourceStoreError::NotFound { .. }
+                                    ) => {}
+                                Err(error) if error.refusal().is_some() => {
+                                    return Err(error.refusal().expect("borrowed refusal"));
                                 }
                                 Err(error) => {
                                     saw_incomplete = true;
-                                    self.warning_args(
-                                        cancel,
-                                        source_error_report_bound(&error),
-                                        format_args!(
-                                            "include candidate could not be loaded: {error:?}"
-                                        ),
-                                    )?;
+                                    self.include_error_warning(error, cancel)?;
                                     break;
                                 }
                             }
@@ -5758,17 +5879,12 @@ impl<S: SourceStore> UnitResolver<S> {
                         }
                     }
                 }
-                Err(SourceStoreError::Cancelled) => return Err(ResolverError::Cancelled),
-                Err(error @ SourceStoreError::RootLimit { .. }) => {
-                    return Err(root_store_error(error));
+                Err(error) if error.refusal().is_some() => {
+                    return Err(error.refusal().expect("borrowed refusal"));
                 }
                 Err(error) => {
                     saw_incomplete = true;
-                    self.warning_args(
-                        cancel,
-                        source_error_report_bound(&error),
-                        format_args!("include candidate could not be loaded: {error:?}"),
-                    )?;
+                    self.include_error_warning(error, cancel)?;
                     break;
                 }
             }
@@ -5847,16 +5963,65 @@ impl<S: SourceStore> UnitResolver<S> {
         entry: &ProjectPathEntry,
         legacy_route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
-    ) -> Result<LoadedSource, SourceStoreError> {
+    ) -> Result<LoadedSource, IncludeLoadError> {
         if let Some(mut budget) = self.store_budget(cancel) {
-            return self.load_include_candidate_owned(
-                path,
-                entry,
-                legacy_route,
-                cancel,
-                &mut budget,
-            );
+            self.load_include_candidate_owned(path, entry, legacy_route, cancel, &mut budget)
+        } else {
+            self.load_include_candidate_plain(path, entry, legacy_route, cancel)
+                .map_err(IncludeLoadError::Plain)
         }
+    }
+
+    /// Consume the private carrier while formatting a separately admitted
+    /// report copy from borrowed input. Originals drop only after final use.
+    fn include_error_warning(
+        &mut self,
+        error: IncludeLoadError,
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        if let Some(mut budget) = self.store_budget(cancel) {
+            budget
+                .charge(2, 0, 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        }
+        let overflow =
+            || ResolverError::InvalidRequest("include error report sizing overflow".into());
+        let payload = match error.error_ref() {
+            SourceStoreError::NotFound { path }
+            | SourceStoreError::NotRegularFile { path }
+            | SourceStoreError::TooLarge { path, .. } => path.as_os_str().len(),
+            SourceStoreError::Incomplete { path, reason }
+            | SourceStoreError::Unauthorized { path, reason } => path
+                .as_os_str()
+                .len()
+                .checked_add(reason.len())
+                .ok_or_else(overflow)?,
+            SourceStoreError::Io { path, message } => path
+                .as_os_str()
+                .len()
+                .checked_add(message.len())
+                .ok_or_else(overflow)?,
+            SourceStoreError::RootLimit { limit, .. } => limit.len(),
+            _ => 0,
+        };
+        let bound = payload
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(256))
+            .ok_or_else(overflow)?;
+        self.warning_args(
+            cancel,
+            bound,
+            format_args!("include candidate could not be loaded: {error:?}"),
+        )
+    }
+
+    fn load_include_candidate_plain(
+        &mut self,
+        path: &Path,
+        entry: &ProjectPathEntry,
+        legacy_route: Option<&LegacyRoute>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<LoadedSource, SourceStoreError> {
         let source_id = source_id_for_path(path);
         let existing = self
             .loaded
@@ -5983,14 +6148,14 @@ impl<S: SourceStore> UnitResolver<S> {
         route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
         budget: &mut CompileTimeBudget<'_>,
-    ) -> Result<LoadedSource, SourceStoreError> {
+    ) -> Result<LoadedSource, IncludeLoadError> {
         let root = self
             .compile_time_store
             .as_ref()
             .expect("typed include reuse")
             .clone();
         if !root.view.is_admitted_by(budget) {
-            return Err(SourceStoreError::AdmissionUnavailable);
+            return Err(SourceStoreError::AdmissionUnavailable.into());
         }
         let query = include_query(path, budget)?;
         let existing = {
@@ -6024,36 +6189,37 @@ impl<S: SourceStore> UnitResolver<S> {
         let known_id = existing.as_ref().map_or(&*query.id, |source| &source.id);
         let is_new = !self.seen_include(known_id, Some(budget))?;
         if is_new && self.include_files >= self.limits.max_include_files {
-            return Err(SourceStoreError::Incomplete {
-                path: canonical_path(path),
-                reason: format!(
-                    "include file limit ({}) reached",
-                    self.limits.max_include_files
-                ),
-            });
+            return Err(include_limit_error(
+                query.canonical,
+                "file",
+                self.limits.max_include_files,
+                "reached",
+                budget,
+            )?);
         }
         let remaining = self
             .limits
             .max_include_bytes
             .saturating_sub(self.include_bytes);
         if is_new && remaining == 0 {
-            return Err(SourceStoreError::Incomplete {
-                path: canonical_path(path),
-                reason: format!(
-                    "include byte limit ({}) reached",
-                    self.limits.max_include_bytes
-                ),
-            });
+            return Err(include_limit_error(
+                query.canonical,
+                "byte",
+                self.limits.max_include_bytes,
+                "reached",
+                budget,
+            )?);
         }
         let prepared_source = if let Some(source) = existing {
             if is_new && source.bytes.len() > remaining {
-                return Err(SourceStoreError::Incomplete {
-                    path: source.path,
-                    reason: format!(
-                        "include byte limit ({}) exceeded",
-                        self.limits.max_include_bytes
-                    ),
-                });
+                let path = include_limit_path_copy(&source.path, budget)?;
+                return Err(include_limit_error(
+                    path,
+                    "byte",
+                    self.limits.max_include_bytes,
+                    "exceeded",
+                    budget,
+                )?);
             }
             PreparedSourceLoad {
                 loaded: source,
@@ -6087,13 +6253,14 @@ impl<S: SourceStore> UnitResolver<S> {
                 .checked_add(source.bytes.len())
                 .ok_or(SourceStoreError::AdmissionUnavailable)?;
             if bytes > self.limits.max_include_bytes {
-                return Err(SourceStoreError::Incomplete {
-                    path: source.path,
-                    reason: format!(
-                        "include byte limit ({}) exceeded",
-                        self.limits.max_include_bytes
-                    ),
-                });
+                let path = include_limit_path_copy(&source.path, budget)?;
+                return Err(include_limit_error(
+                    path,
+                    "byte",
+                    self.limits.max_include_bytes,
+                    "exceeded",
+                    budget,
+                )?);
             }
             (files, bytes)
         } else {
@@ -11213,6 +11380,413 @@ mod tests {
     }
 
     #[test]
+    fn include_limit_error_owner_actual_file_limit_survives_resolver_cache_and_budget_exit() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        call.limits.max_include_files = 0;
+        let error = call
+            .load_include_candidate(&path, &entry, None, &NoCancellation)
+            .unwrap_err();
+        let expected = format!(
+            "{:?}",
+            SourceStoreError::Incomplete {
+                path: path.clone(),
+                reason: "include file limit (0) reached".into()
+            }
+        );
+        assert_eq!(format!("{error:?}"), expected);
+        let spent = budget.snapshot();
+        drop(call);
+        drop(resolver);
+        drop(budget);
+        assert_eq!(format!("{error:?}"), expected);
+        assert!(
+            observer.budget_snapshot().retained_bytes > baseline,
+            "actual escaped path/reason remain live and must retain their original receipts"
+        );
+        drop(error);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[test]
+    fn include_limit_error_owner_actual_byte_variants_transfer_and_warning_lifetimes() {
+        use crate::compile_time::CompileTimeLimits;
+        for cached in [false, true] {
+            for exceeded in [false, true] {
+                if exceeded && !cached {
+                    continue;
+                }
+                let (dir, _, mut resolver) = physical_report_resolver();
+                let path = dir.path().join("value.inc");
+                let entry = resolver.context.path_entry_for(&path).unwrap();
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                let source = if cached {
+                    Some(
+                        call.load_candidate_with_limit(
+                            &path,
+                            &entry,
+                            None,
+                            SourceKind::Include,
+                            4096,
+                            &NoCancellation,
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                call.limits.max_include_bytes = if exceeded { 1 } else { 0 };
+                let error = call
+                    .load_include_candidate(&path, &entry, None, &NoCancellation)
+                    .unwrap_err();
+                let SourceStoreError::Incomplete {
+                    path: original_path,
+                    reason,
+                } = error.error_ref()
+                else {
+                    panic!("owned byte error expected")
+                };
+                assert_eq!(original_path, &path);
+                let pp = original_path.as_os_str().as_encoded_bytes().as_ptr();
+                let rp = reason.as_ptr();
+                assert_eq!(
+                    reason,
+                    &format!(
+                        "include byte limit ({}) {}",
+                        call.limits.max_include_bytes,
+                        if exceeded { "exceeded" } else { "reached" }
+                    )
+                );
+                let expected = format!("include candidate could not be loaded: {error:?}");
+                let mut receiver = budget.admit_owned(0, 0, 0, || None).unwrap();
+                error
+                    .move_into(&mut receiver, &budget, |to, error| *to = Some(error))
+                    .unwrap();
+                let SourceStoreError::Incomplete { path, reason } = receiver.as_ref().unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(path.as_os_str().as_encoded_bytes().as_ptr(), pp);
+                assert_eq!(reason.as_ptr(), rp);
+                // Another actual helper error is independently converted through the
+                // production warning consumer; original receiver remains credited.
+                let error = call
+                    .load_include_candidate(path, &entry, None, &NoCancellation)
+                    .unwrap_err();
+                call.include_error_warning(error, &NoCancellation).unwrap();
+                assert_eq!(call.report.warnings.last().unwrap(), &expected);
+                assert_eq!((call.include_files, call.include_bytes), (0, 0));
+                let cache = call
+                    .compile_time_store
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                assert_eq!(cache.loaded.len(), usize::from(cached));
+                assert_eq!(cache.include_seen.len(), 0);
+                drop(cache);
+                drop(call);
+                let report = resolver.finish_admitted(&mut budget).unwrap();
+                drop(source);
+                drop(budget);
+                assert_eq!(report.report().warnings.last().unwrap(), &expected);
+                assert!(observer.budget_snapshot().retained_bytes > baseline);
+                drop(receiver);
+                assert!(
+                    observer.budget_snapshot().retained_bytes > baseline,
+                    "actual warning remains independently owned after original error dies"
+                );
+                drop(report);
+                assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn include_limit_error_owner_actual_constructor_and_warning_cancel_unwind_sweeps() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stop = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stop && self.panic {
+                    panic!("include limit constructor/consumer injection")
+                }
+                stop
+            }
+        }
+        for byte_exceeded in [false, true] {
+            for conversion in [false, true] {
+                for panic in [false, true] {
+                    let mut finished = false;
+                    let mut failures = 0;
+                    for stop in 0..300 {
+                        let (dir, _, mut resolver) = physical_report_resolver();
+                        let path = dir.path().join("value.inc");
+                        let entry = resolver.context.path_entry_for(&path).unwrap();
+                        let mut budget =
+                            CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                        let mut call = resolver.store_call(&mut budget).unwrap();
+                        let source = call
+                            .load_candidate_with_limit(
+                                &path,
+                                &entry,
+                                None,
+                                SourceKind::Include,
+                                4096,
+                                &NoCancellation,
+                            )
+                            .unwrap();
+                        if byte_exceeded {
+                            call.limits.max_include_bytes = 1;
+                        } else {
+                            call.limits.max_include_files = 0;
+                        }
+                        let error = if conversion {
+                            Some(
+                                call.load_include_candidate(&path, &entry, None, &NoCancellation)
+                                    .unwrap_err(),
+                            )
+                        } else {
+                            None
+                        };
+                        let before = budget.snapshot();
+                        let token = Poll {
+                            calls: 0.into(),
+                            stop,
+                            panic,
+                        };
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Some(error) = error {
+                                    call.include_error_warning(error, &token)
+                                } else {
+                                    match call.load_include_candidate(&path, &entry, None, &token) {
+                                        Err(error)
+                                            if matches!(
+                                                error.error_ref(),
+                                                SourceStoreError::Incomplete { .. }
+                                            ) =>
+                                        {
+                                            Ok(())
+                                        }
+                                        Err(error) => Err(error
+                                            .refusal()
+                                            .expect("only cancellation expected")),
+                                        Ok(_) => panic!("file limit must refuse"),
+                                    }
+                                }
+                            }));
+                        match outcome {
+                            Err(_) => {
+                                assert!(panic);
+                                failures += 1;
+                            }
+                            Ok(Err(ResolverError::Cancelled)) => {
+                                assert!(!panic);
+                                failures += 1;
+                            }
+                            Ok(Ok(())) => {
+                                finished = true;
+                            }
+                            Ok(Err(error)) => panic!("unexpected {error:?}"),
+                        }
+                        let cache = call
+                            .compile_time_store
+                            .as_ref()
+                            .unwrap()
+                            .view
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        assert_eq!(cache.loaded.len(), 1);
+                        assert_eq!(cache.loaded.capacity(), 3);
+                        assert_eq!(cache.include_seen.len(), 0);
+                        assert_eq!(cache.include_seen.capacity(), 0);
+                        assert_eq!(
+                            cache.loaded.get(&source.id).unwrap().bytes.as_ptr(),
+                            source.bytes.as_ptr()
+                        );
+                        drop(cache);
+                        assert_eq!((call.include_files, call.include_bytes), (0, 0));
+                        assert!(budget.snapshot().work >= before.work);
+                        assert!(budget.snapshot().byte_work >= before.byte_work);
+                        if !conversion {
+                            assert_eq!(
+                                budget.snapshot().retained_bytes,
+                                before.retained_bytes,
+                                "no dead query/error receipts after poll {stop}"
+                            );
+                        }
+                        let retry = call
+                            .load_include_candidate(&path, &entry, None, &NoCancellation)
+                            .unwrap_err();
+                        assert!(matches!(
+                            retry.error_ref(),
+                            SourceStoreError::Incomplete { .. }
+                        ));
+                        drop(retry);
+                        if finished {
+                            break;
+                        }
+                    }
+                    assert!(finished);
+                    assert!(failures > 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn include_limit_error_owner_actual_refusal_foreign_transfer_and_owning_outcome() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        resolver.limits.max_include_files = 0;
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let before = budget.snapshot();
+        let error = call
+            .load_include_candidate(&path, &entry, None, &NoCancellation)
+            .unwrap_err();
+        let expected = format!("include candidate could not be loaded: {error:?}");
+        let after = budget.snapshot();
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut receiver = foreign.admit_owned(0, 0, 0, || None).unwrap();
+        let foreign_before = foreign.snapshot();
+        assert!(
+            error
+                .move_into(&mut receiver, &foreign, |to, error| *to = Some(error))
+                .is_err()
+        );
+        assert!(receiver.is_none());
+        assert_eq!(foreign.snapshot(), foreign_before);
+        drop(call);
+        let outcome = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome.result(),Resolution::Incomplete {reason,candidates} if reason=="include value.inc lookup was incomplete" && candidates.is_empty())
+        );
+        assert!(
+            outcome
+                .reports()
+                .warnings()
+                .iter()
+                .any(|warning| warning == &expected)
+        );
+        let report = resolver.finish_admitted(&mut budget).unwrap();
+        drop(budget);
+        assert!(
+            outcome
+                .reports()
+                .warnings()
+                .iter()
+                .any(|warning| warning == &expected)
+        );
+        drop(report);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        drop(outcome);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        // Real helper construction work refusal occurs at its last work admission
+        // (the original reason formatter), not after formatting a plain error.
+        let cost = after.work - before.work;
+        let (_dir, _, mut resolver) = physical_report_resolver();
+        let mut probe = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        drop(resolver.store_call(&mut probe).unwrap());
+        let setup = probe.snapshot().work;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut tight = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: setup + cost - 1,
+                ..Default::default()
+            },
+            &NoCancellation,
+        );
+        let mut call = resolver.store_call(&mut tight).unwrap();
+        call.limits.max_include_files = 0;
+        assert!(
+            matches!(call.load_include_candidate(&path,&entry,None,&NoCancellation),Err(error) if matches!(error.error_ref(),SourceStoreError::RootLimit {..}))
+        );
+        assert!(call.report.warnings.is_empty());
+        assert_eq!((call.include_files, call.include_bytes), (0, 0));
+        drop(call);
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_work: setup + cost + 1,
+                ..Default::default()
+            },
+            &NoCancellation,
+        );
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        call.limits.max_include_files = 0;
+        let error = call
+            .load_include_candidate(&path, &entry, None, &NoCancellation)
+            .unwrap_err();
+        assert!(matches!(
+            error.error_ref(),
+            SourceStoreError::Incomplete { .. }
+        ));
+        let live = budget.snapshot();
+        assert!(matches!(
+            call.include_error_warning(error, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert!(call.report.warnings.is_empty());
+        assert_eq!((call.include_files, call.include_bytes), (0, 0));
+        assert_eq!(
+            budget.snapshot().work,
+            live.work,
+            "refused sizing/formatting does not refund prior construction work"
+        );
+    }
+
+    #[test]
     fn include_publication_actual_both_receiving_refusals_after_read_report_preserve_caches_and_counters()
      {
         use crate::compile_time::{BudgetSnapshot, CompileTimeLimits};
@@ -11289,7 +11863,7 @@ mod tests {
                 let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
                 if refusal {
                     assert!(
-                        matches!(result, Err(SourceStoreError::RootLimit { .. })),
+                        matches!(&result, Err(error) if matches!(error.error_ref(),SourceStoreError::RootLimit { .. })),
                         "expected actual post-report preparation refusal: {result:?}"
                     );
                     assert_eq!(cache.loaded.len(), 3);
@@ -11445,7 +12019,7 @@ mod tests {
                         assert!(panic);
                         refused += 1;
                     }
-                    Ok(Err(SourceStoreError::Cancelled)) => {
+                    Ok(Err(error)) if matches!(error.error_ref(), SourceStoreError::Cancelled) => {
                         assert!(!panic);
                         refused += 1;
                     }
@@ -11520,13 +12094,13 @@ mod tests {
         call.limits.max_include_files = 1;
         assert!(matches!(
             call.load_include_candidate(&next, &entry, None, &NoCancellation),
-            Err(SourceStoreError::Incomplete { .. })
+            Err(error) if matches!(error.error_ref(),SourceStoreError::Incomplete { .. })
         ));
         call.limits.max_include_files = 2;
         call.limits.max_include_bytes = counters.1 + 1;
         assert!(matches!(
             call.load_include_candidate(&next, &entry, None, &NoCancellation),
-            Err(SourceStoreError::TooLarge { .. })
+            Err(error) if matches!(error.error_ref(),SourceStoreError::TooLarge { .. })
         ));
         assert_eq!((call.include_files, call.include_bytes), counters);
         let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -11587,7 +12161,7 @@ mod tests {
         let before = foreign.snapshot();
         assert!(matches!(
             call.load_include_candidate_owned(&p, &e, None, &NoCancellation, &mut foreign),
-            Err(SourceStoreError::AdmissionUnavailable)
+            Err(error) if matches!(error.error_ref(),SourceStoreError::AdmissionUnavailable)
         ));
         assert_eq!(foreign.snapshot(), before);
         assert!(
@@ -12099,7 +12673,7 @@ mod tests {
                         failures += 1;
                         true
                     }
-                    Ok(Err(SourceStoreError::Cancelled)) => {
+                    Ok(Err(error)) if matches!(error.error_ref(), SourceStoreError::Cancelled) => {
                         assert!(!panic);
                         failures += 1;
                         true
@@ -12199,7 +12773,7 @@ mod tests {
             let entry = call.context.path_entry_for(path).unwrap();
             assert!(matches!(
                 call.load_include_candidate(path, &entry, None, &NoCancellation),
-                Err(SourceStoreError::NotFound { .. } | SourceStoreError::Unauthorized { .. })
+                Err(error) if matches!(error.error_ref(),SourceStoreError::NotFound { .. } | SourceStoreError::Unauthorized { .. })
             ));
             assert!(
                 root.view
@@ -12215,7 +12789,7 @@ mod tests {
         let e = call.context.path_entry_for(&next).unwrap();
         assert!(matches!(
             call.load_include_candidate(&next, &e, None, &NoCancellation),
-            Err(SourceStoreError::Incomplete { .. })
+            Err(error) if matches!(error.error_ref(),SourceStoreError::Incomplete { .. })
         ));
         assert_eq!(
             root.view

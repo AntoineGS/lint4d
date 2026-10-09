@@ -5,7 +5,7 @@
 //! bytes.  No result is considered precise unless the candidate was loaded and
 //! its declaration matched the requested name.
 
-use crate::compile_time::{AdmittedOwned, CompileTimeBudget};
+use crate::compile_time::{AdmittedOwned, AdmittedShared, CompileTimeBudget};
 use pascal_project::{
     MetadataObservation, ProjectContext, ProjectPathEntry, ProjectPathProvenance,
     ProjectReadObservation, ProjectReadStamp, ReadPolicy, content_hash_bytes, path_identity,
@@ -1189,11 +1189,99 @@ impl<S: SourceStore> CallbackReportCall<'_, S> {
 #[derive(Default)]
 struct StoreCache {
     loaded: HashMap<SourceId, LoadedSource>,
-    directories: HashMap<DirectoryCacheKey, crate::compile_time::AdmittedOwned<DirectoryListing>>,
+    directories: HashMap<OwnedDirectoryKey, AdmittedShared<DirectoryListing>>,
     loaded_capacity_credit: usize,
-    directory_capacity_credit: usize,
+    directory_capacity: Option<AdmittedOwned<()>>,
     recorded_work: usize,
     recorded_byte_work: usize,
+}
+
+/// A key is moved into the map with its original construction receipt. There
+/// is no detached cache invoice for a cloned key or a temporary caller listing.
+struct OwnedDirectoryKey(AdmittedOwned<DirectoryCacheKey>);
+impl std::hash::Hash for OwnedDirectoryKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+impl PartialEq for OwnedDirectoryKey {
+    fn eq(&self, other: &Self) -> bool {
+        *self.0 == *other.0
+    }
+}
+impl Eq for OwnedDirectoryKey {}
+impl std::borrow::Borrow<DirectoryCacheKey> for OwnedDirectoryKey {
+    fn borrow(&self) -> &DirectoryCacheKey {
+        &self.0
+    }
+}
+
+enum DirectoryAccess {
+    Legacy(DirectoryListing),
+    Admitted(AdmittedShared<DirectoryListing>),
+}
+impl std::ops::Deref for DirectoryAccess {
+    type Target = DirectoryListing;
+    fn deref(&self) -> &DirectoryListing {
+        match self {
+            Self::Legacy(listing) => listing,
+            Self::Admitted(listing) => listing,
+        }
+    }
+}
+
+impl StoreCache {
+    fn insert_directory(
+        &mut self,
+        key: OwnedDirectoryKey,
+        listing: AdmittedShared<DirectoryListing>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), ResolverError> {
+        if !key.0.is_admitted_by(budget) || !listing.is_admitted_by(budget) {
+            return Err(ResolverError::InvalidRequest(
+                "foreign-root directory cache entry".into(),
+            ));
+        }
+        let replace = self.directories.contains_key(&*key.0);
+        if !replace && self.directories.len() == self.directories.capacity() {
+            let count = self.directories.len().checked_add(1).ok_or_else(|| {
+                ResolverError::InvalidRequest("directory map count overflow".into())
+            })?;
+            // A conservative hash-table backing bound includes bucket payload,
+            // control bytes and alignment slack. It is minted for this actual
+            // allocation, retained until that allocation is replaced/dropped.
+            let buckets = count
+                .checked_next_power_of_two()
+                .and_then(|n| n.checked_mul(2))
+                .map(|n| n.max(4))
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("directory map bucket overflow".into())
+                })?;
+            let bytes = buckets
+                .checked_mul(
+                    std::mem::size_of::<(OwnedDirectoryKey, AdmittedShared<DirectoryListing>)>()
+                        + 1,
+                )
+                .and_then(|n| n.checked_add(16))
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("directory map backing overflow".into())
+                })?;
+            let capacity = budget
+                .admit_owned(1, 0, bytes, || ())
+                .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+            let mut receiving = HashMap::with_capacity(count);
+            receiving.extend(self.directories.drain());
+            let old = std::mem::replace(&mut self.directories, receiving);
+            drop(old);
+            self.directory_capacity = Some(capacity);
+        }
+        // HashMap::insert retains an equal old key. Remove the old pair so the
+        // new actual key and receipt move together, and old storage dies first.
+        let old = self.directories.remove_entry(&*key.0);
+        drop(old);
+        self.directories.insert(key, listing);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -3405,18 +3493,11 @@ impl<S: SourceStore> UnitResolver<S> {
         _legacy_route: Option<&LegacyRoute>,
         cancel: &dyn CancellationToken,
         missing_is_incomplete: bool,
-    ) -> Result<DirectoryListing, ResolverError> {
+    ) -> Result<DirectoryAccess, ResolverError> {
         self.check_cancel(cancel)?;
-        let mut key_bytes =
-            4 * directory.as_os_str().len() + std::mem::size_of::<DirectoryCacheKey>();
-        self.context
-            .read_policy
-            .visit_owned_clone_payload(&mut |n| {
-                key_bytes += n;
-                Ok(())
-            })
-            .expect("infallible metadata sizing");
-        self.admit_lookup_storage(1, key_bytes, key_bytes, cancel)?;
+        if self.compile_time_store.is_some() {
+            return self.list_directory_owned(directory, entry, cancel, missing_is_incomplete);
+        }
         let key = canonical_path(directory);
         let cache_key = DirectoryCacheKey {
             path: path_identity::path_lookup_key(&key),
@@ -3427,76 +3508,14 @@ impl<S: SourceStore> UnitResolver<S> {
         if self.compile_time_store.is_none()
             && let Some(listing) = self.directories.get(&cache_key).cloned()
         {
-            return Ok(listing);
+            return Ok(DirectoryAccess::Legacy(listing));
         }
         let request = DirectoryRequest {
             directory: &key,
             entry,
             read_policy: &self.context.read_policy,
         };
-        let result = if let Some(mut budget) = self.store_budget(cancel) {
-            match self
-                .store
-                .list_directory_admitted(request, &mut budget, cancel)
-            {
-                Ok(mut owner) => {
-                    let bytes = owner
-                        .files
-                        .iter()
-                        .chain(&owner.directories)
-                        .map(|p| p.as_os_str().len() + std::mem::size_of::<PathBuf>())
-                        .sum::<usize>();
-                    let listing = owner
-                        .grow(
-                            &mut budget,
-                            1,
-                            bytes.saturating_mul(2),
-                            bytes.saturating_mul(2)
-                                + std::mem::size_of::<
-                                    crate::compile_time::AdmittedOwned<DirectoryListing>,
-                                >(),
-                            |v| v.clone(),
-                        )
-                        .map_err(|r| root_store_error(store_admission_error(r, &budget)))?;
-                    let root = self
-                        .compile_time_store
-                        .as_ref()
-                        .expect("admitted store call")
-                        .clone();
-                    let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-                    let old = cache.directory_capacity_credit;
-                    let growth = cache.directories.len() == cache.directories.capacity();
-                    let new = if growth {
-                        ((cache.directories.len() + 1).next_power_of_two() * 2).max(4)
-                            * (std::mem::size_of::<(
-                                DirectoryCacheKey,
-                                crate::compile_time::AdmittedOwned<DirectoryListing>,
-                            )>() + 1)
-                            + 16
-                    } else {
-                        0
-                    };
-                    cache
-                        .grow(&mut budget, 1, key_bytes, key_bytes + new, |c| {
-                            if growth {
-                                c.directories.reserve(1);
-                                c.directory_capacity_credit = new;
-                            }
-                            c.directories.insert(cache_key.clone(), owner);
-                        })
-                        .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-                    if growth {
-                        cache
-                            .retire_storage(old)
-                            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
-                    }
-                    Ok(listing)
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            self.store.list_directory(request, cancel)
-        };
+        let result = self.store.list_directory(request, cancel);
         let listing = match result {
             Ok(listing) => listing,
             Err(SourceStoreError::NotFound { path: _ }) => DirectoryListing {
@@ -3551,7 +3570,156 @@ impl<S: SourceStore> UnitResolver<S> {
         if self.compile_time_store.is_none() {
             self.directories.insert(cache_key, listing.clone());
         }
-        Ok(listing)
+        Ok(DirectoryAccess::Legacy(listing))
+    }
+
+    fn list_directory_owned(
+        &mut self,
+        directory: &Path,
+        entry: &ProjectPathEntry,
+        cancel: &dyn CancellationToken,
+        missing_is_incomplete: bool,
+    ) -> Result<DirectoryAccess, ResolverError> {
+        let mut budget = self.store_budget(cancel).expect("typed directory call");
+        // All resolver callers canonicalize their directory before this private
+        // boundary. Do not let an accidental relative input allocate a cwd of
+        // unknown size inside a supposedly bounded key constructor.
+        if !directory.is_absolute() && !directory.has_root() {
+            return Err(ResolverError::InvalidRequest(
+                "typed directory requires a rooted lookup path".into(),
+            ));
+        }
+        // Bound both lexical buffers and component scratch, including minimum
+        // small-string allocation capacity for short rooted paths.
+        let canonical_bytes = directory
+            .as_os_str()
+            .len()
+            .checked_mul(4)
+            .map(|n| n.max(32))
+            .ok_or_else(|| {
+                ResolverError::InvalidRequest("directory canonicalization overflow".into())
+            })?;
+        let canonical = budget
+            .admit_owned(1, canonical_bytes, canonical_bytes, || {
+                canonical_path(directory)
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        let mut key_bytes = canonical
+            .as_os_str()
+            .len()
+            .checked_mul(4)
+            .map(|n| n.max(32))
+            .ok_or_else(|| ResolverError::InvalidRequest("directory identity overflow".into()))?;
+        let mut visit = |n| {
+            key_bytes = key_bytes
+                .checked_add(n)
+                .ok_or_else(|| "directory key overflow".to_string())?;
+            Ok(())
+        };
+        entry
+            .visit_recovery_payload(&mut visit)
+            .map_err(ResolverError::InvalidRequest)?;
+        self.context
+            .read_policy
+            .visit_owned_clone_payload(&mut visit)
+            .map_err(ResolverError::InvalidRequest)?;
+        let key = OwnedDirectoryKey(
+            budget
+                .admit_owned(1, key_bytes, key_bytes, || DirectoryCacheKey {
+                    path: path_identity::path_lookup_key(&canonical),
+                    entry: entry.clone(),
+                    read_policy: self.context.read_policy.clone(),
+                    missing_is_incomplete,
+                })
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+        );
+        // Typed lookups deliberately reread; do not replace freshness checks by
+        // a same-root map hit. Neither this request nor callbacks hold the lock.
+        let result = self.store.list_directory_admitted(
+            DirectoryRequest {
+                directory: &canonical,
+                entry: &key.0.entry,
+                read_policy: &key.0.read_policy,
+            },
+            &mut budget,
+            cancel,
+        );
+        let (mut listing, cacheable) = match result {
+            Ok(listing) => (listing, true),
+            Err(SourceStoreError::NotFound { .. }) => (
+                budget
+                    .admit_owned(1, 0, 0, || DirectoryListing {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                        stamp: None,
+                        complete: !missing_is_incomplete,
+                    })
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+                false,
+            ),
+            Err(error) => return Err(root_store_error(error)),
+        };
+        if !listing.is_admitted_by(&budget) {
+            return Err(ResolverError::InvalidRequest(
+                "foreign-root directory listing".into(),
+            ));
+        }
+        self.scanned_entries = self.scanned_entries.saturating_add(
+            listing
+                .files
+                .len()
+                .saturating_add(listing.directories.len()),
+        );
+        self.scanned_bytes = self.scanned_bytes.saturating_add(
+            listing
+                .files
+                .iter()
+                .filter_map(|path| fs::symlink_metadata(path).ok())
+                .filter(|metadata| !metadata.file_type().is_symlink())
+                .map(|metadata| metadata.len() as usize)
+                .sum::<usize>(),
+        );
+        let complete = listing.complete
+            && self.scanned_entries <= self.limits.max_directory_entries
+            && self.scanned_bytes <= self.limits.max_scanned_bytes;
+        listing.value_mut().complete = complete;
+        self.record_observation_build(
+            report_path_payload(&canonical, Some(entry)),
+            cancel,
+            || ResolutionObservation::Directory {
+                path: (*canonical).clone(),
+                entry: entry.clone(),
+                stamp: listing.stamp.clone(),
+                complete,
+            },
+        )?;
+        if !complete {
+            self.diagnostic_args(
+                cancel,
+                64 + 4 * canonical.as_os_str().len(),
+                format_args!(
+                    "directory scan limit or traversal failure under {}",
+                    canonical.display()
+                ),
+            )?;
+        }
+        let caller = listing
+            .into_shared(&mut budget)
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        if cacheable {
+            let cached = caller
+                .try_clone(&mut budget)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            let root = self
+                .compile_time_store
+                .as_ref()
+                .expect("typed directory call");
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .value_mut()
+                .insert_directory(key, cached, &mut budget)?;
+        }
+        Ok(DirectoryAccess::Admitted(caller))
     }
 
     fn load_candidate(
@@ -4393,16 +4561,16 @@ impl<S: SourceStore> UnitResolver<S> {
                 complete = false;
                 break;
             }
-            for child in listing.directories {
-                let Some(child_entry) = self.context.path_entry_for(&child) else {
+            for child in &listing.directories {
+                let Some(child_entry) = self.context.path_entry_for(child) else {
                     continue;
                 };
                 if self.context.read_policy.allows_location(&child_entry) {
-                    queue.push_back(child);
+                    queue.push_back(child.clone());
                 }
             }
-            for file in listing.files {
-                let Some(file_entry) = self.context.path_entry_for(&file) else {
+            for file in &listing.files {
+                let Some(file_entry) = self.context.path_entry_for(file) else {
                     continue;
                 };
                 if !self.context.read_policy.allows_location(&file_entry) {
@@ -4417,7 +4585,10 @@ impl<S: SourceStore> UnitResolver<S> {
                         .file_name()
                         .map(|name| name.to_string_lossy().to_ascii_lowercase())
                         .unwrap_or_default();
-                    entries.entry(key).or_insert_with(Vec::new).push(file);
+                    entries
+                        .entry(key)
+                        .or_insert_with(Vec::new)
+                        .push(file.clone());
                 }
             }
             if !complete {
@@ -6398,6 +6569,921 @@ mod tests {
             Default::default(),
         );
         (dir, root, resolver)
+    }
+
+    #[test]
+    fn directory_ownership_filesystem_caller_shares_cache_backing() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _root, mut resolver) = physical_report_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let listing = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let root = call.compile_time_store.as_ref().unwrap();
+        let cache = root.view.lock().unwrap();
+        let cached = cache.directories.values().next().unwrap();
+        assert_eq!(
+            listing.files.as_ptr(),
+            cached.files.as_ptr(),
+            "caller must share actual admitted listing, not return a plain clone"
+        );
+        assert_eq!(
+            listing.files[0].as_os_str().as_encoded_bytes().as_ptr(),
+            cached.files[0].as_os_str().as_encoded_bytes().as_ptr()
+        );
+    }
+
+    fn physical_directory_backing_invoice(listing: &DirectoryListing, directory: &Path) -> usize {
+        let count = listing.files.len() + listing.directories.len();
+        std::mem::size_of::<AdmittedOwned<DirectoryListing>>()
+            + 2 * std::mem::size_of::<usize>() // Arc's actual counters; this backing is usize-aligned
+            + count * (directory.as_os_str().len() + 1 + if cfg!(windows) { 1024 } else { 255 })
+            + (listing.files.capacity() + listing.directories.capacity()) * std::mem::size_of::<PathBuf>()
+    }
+
+    #[derive(Clone, Copy)]
+    enum DirectoryFailure {
+        None,
+        Error,
+        Cancel,
+        Panic,
+        Foreign,
+    }
+    struct DirectoryProbeStore {
+        inner: FilesystemSourceStore,
+        failure: DirectoryFailure,
+        calls: usize,
+        files: usize,
+    }
+    impl SourceStore for DirectoryProbeStore {
+        fn list_directory_admitted(
+            &mut self,
+            r: DirectoryRequest<'_>,
+            b: &mut CompileTimeBudget<'_>,
+            c: &dyn CancellationToken,
+        ) -> Result<AdmittedOwned<DirectoryListing>, SourceStoreError> {
+            self.calls += 1;
+            let listing = self.inner.list_directory_admitted(r, b, c)?;
+            self.files = listing.files.as_ptr() as usize;
+            match self.failure {
+                DirectoryFailure::None => Ok(listing),
+                DirectoryFailure::Error => Err(SourceStoreError::Io {
+                    path: r.directory.into(),
+                    message: "directory build completed, injected error".into(),
+                }),
+                DirectoryFailure::Cancel => Err(SourceStoreError::Cancelled),
+                DirectoryFailure::Panic => panic!("directory build completed, injected unwind"),
+                DirectoryFailure::Foreign => {
+                    drop(listing);
+                    let mut other = CompileTimeBudget::new(
+                        crate::compile_time::CompileTimeLimits::default(),
+                        &NoCancellation,
+                    );
+                    self.inner
+                        .list_directory_admitted(r, &mut other, &NoCancellation)
+                }
+            }
+        }
+        fn overlay_candidates_admitted(
+            &self,
+            r: &[PathBuf],
+            n: &[String],
+            b: &mut CompileTimeBudget<'_>,
+            c: &dyn CancellationToken,
+        ) -> Result<AdmittedOwned<Vec<PathBuf>>, SourceStoreError> {
+            self.inner.overlay_candidates_admitted(r, n, b, c)
+        }
+        fn load_admitted(
+            &mut self,
+            r: SourceRequest<'_>,
+            b: &mut CompileTimeBudget<'_>,
+            c: &dyn CancellationToken,
+        ) -> Result<LoadedSource, SourceStoreError> {
+            self.inner.load_admitted(r, b, c)
+        }
+        fn list_directory(
+            &mut self,
+            _: DirectoryRequest<'_>,
+            _: &dyn CancellationToken,
+        ) -> Result<DirectoryListing, SourceStoreError> {
+            panic!("typed resolver must never use legacy directory callback")
+        }
+        fn overlay_candidates(&self, r: &[PathBuf], n: &[String]) -> Vec<PathBuf> {
+            self.inner.overlay_candidates(r, n)
+        }
+        fn load(
+            &mut self,
+            r: SourceRequest<'_>,
+            c: &dyn CancellationToken,
+        ) -> Result<LoadedSource, SourceStoreError> {
+            self.inner.load(r, c)
+        }
+    }
+    fn directory_probe_resolver() -> (
+        tempfile::TempDir,
+        PathBuf,
+        UnitResolver<DirectoryProbeStore>,
+    ) {
+        let (dir, root, resolver) = physical_report_resolver();
+        let probe = UnitResolver::new(
+            resolver.context,
+            vec![dir.path().into()],
+            DirectoryProbeStore {
+                inner: FilesystemSourceStore::new(),
+                failure: DirectoryFailure::None,
+                calls: 0,
+                files: 0,
+            },
+            Default::default(),
+        );
+        (dir, root, probe)
+    }
+
+    #[test]
+    fn directory_ownership_store_move_freshness_overlay_and_build_failures() {
+        use crate::compile_time::CompileTimeLimits;
+        for failure in [
+            DirectoryFailure::Error,
+            DirectoryFailure::Cancel,
+            DirectoryFailure::Panic,
+            DirectoryFailure::Foreign,
+        ] {
+            for replace in [false, true] {
+                let (dir, _root, mut resolver) = directory_probe_resolver();
+                let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                let previous = if replace {
+                    Some(
+                        call.list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let before = budget.snapshot();
+                let capacity = call
+                    .compile_time_store
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .lock()
+                    .unwrap()
+                    .directories
+                    .capacity();
+                call.store.failure = failure;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    call.list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                }));
+                match failure {
+                    DirectoryFailure::Panic => assert!(result.is_err()),
+                    DirectoryFailure::Cancel => {
+                        assert!(matches!(result.unwrap(), Err(ResolverError::Cancelled)))
+                    }
+                    DirectoryFailure::Foreign => assert!(matches!(
+                        result.unwrap(),
+                        Err(ResolverError::InvalidRequest(_))
+                    )),
+                    _ => assert!(result.unwrap().is_err()),
+                }
+                assert_eq!(
+                    budget.snapshot().retained_bytes,
+                    before.retained_bytes,
+                    "failed new/replacement construction releases temporary keys/listing, not old cache/report"
+                );
+                assert!(budget.snapshot().work > before.work);
+                assert!(budget.snapshot().byte_work > before.byte_work);
+                let cache = call
+                    .compile_time_store
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .lock()
+                    .unwrap();
+                assert_eq!(cache.directories.capacity(), capacity);
+                assert_eq!(cache.directories.len(), usize::from(replace));
+                if let Some(previous) = &previous {
+                    assert_eq!(
+                        previous.files.as_ptr(),
+                        cache.directories.values().next().unwrap().files.as_ptr()
+                    );
+                }
+            }
+        }
+        let (dir, _root, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let first = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        assert_eq!(
+            first.files.as_ptr() as usize,
+            call.store.files,
+            "store->caller handoff moves original Vec"
+        );
+        let overlay = dir.path().join("Unsaved.pas");
+        call.store
+            .inner
+            .insert_overlay(&overlay, 1, Arc::<[u8]>::from(&b"unit Unsaved;"[..]));
+        let second = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        assert_eq!(
+            call.store.calls, 2,
+            "same-root cache presence does not skip freshness reread"
+        );
+        assert_eq!(second.files.as_ptr() as usize, call.store.files);
+        assert!(!first.files.contains(&overlay));
+        assert!(second.files.contains(&overlay));
+        assert_eq!(
+            first.stamp, second.stamp,
+            "overlay freshness cannot rely only on disk stamp"
+        );
+        call.store.inner.insert_overlay(
+            &overlay,
+            2,
+            Arc::<[u8]>::from(&b"unit Unsaved; // version two"[..]),
+        );
+        let third = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        assert_eq!(
+            call.store.calls, 3,
+            "overlay version change still performs the required fresh listing"
+        );
+        assert_ne!(second.files.as_ptr(), third.files.as_ptr());
+        assert_eq!(third.files.as_ptr() as usize, call.store.files);
+        assert!(second.files.contains(&overlay));
+        assert!(third.files.contains(&overlay));
+        assert!(call.report.observations.iter().any(|o| matches!(o,ResolutionObservation::Directory { path,entry:e,.. } if path == dir.path() && e == &entry)));
+    }
+
+    #[test]
+    fn directory_ownership_cancel_every_actual_construction_poll_keeps_old_listing() {
+        use crate::compile_time::CompileTimeLimits;
+        struct PollCancel {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for PollCancel {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut cancellations = 0;
+        let mut successful = false;
+        for stop in 0..180 {
+            let (dir, _root, mut resolver) = directory_probe_resolver();
+            let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let previous = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            let before = budget.snapshot();
+            let cancel = PollCancel {
+                calls: 0.into(),
+                stop,
+            };
+            match call.list_directory(dir.path(), &entry, None, &cancel, false) {
+                Err(ResolverError::Cancelled) => {
+                    cancellations += 1;
+                    let cache = call
+                        .compile_time_store
+                        .as_ref()
+                        .unwrap()
+                        .view
+                        .lock()
+                        .unwrap();
+                    assert_eq!(
+                        cache.directories.values().next().unwrap().files.as_ptr(),
+                        previous.files.as_ptr()
+                    );
+                    assert_eq!(
+                        budget.snapshot().retained_bytes,
+                        before.retained_bytes,
+                        "partial replacement storage refunds at poll {stop}"
+                    );
+                    assert!(budget.snapshot().work >= before.work);
+                    assert!(budget.snapshot().byte_work >= before.byte_work);
+                }
+                Ok(next) => {
+                    assert_eq!(next.files, previous.files);
+                    successful = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected replacement failure: {other:?}"),
+            }
+        }
+        assert!(cancellations > 10);
+        assert!(successful);
+    }
+
+    #[test]
+    fn directory_ownership_low_budget_prekey_and_peak_map_refusal() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, _root, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let first = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            drop(first);
+        }
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let calls = call.store.calls;
+            assert!(matches!(
+                call.list_directory(dir.path(), &entry, None, &NoCancellation, false),
+                Err(ResolverError::LimitExceeded { .. })
+            ));
+            assert_eq!(
+                call.store.calls, calls,
+                "no store/copy reached before canonical/key admission refusal"
+            );
+        }
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        let (key_dir, _, mut key_resolver) = directory_probe_resolver();
+        let key_entry = key_resolver.context.path_entry_for(key_dir.path()).unwrap();
+        let mut key_budget = CompileTimeBudget::new(
+            CompileTimeLimits {
+                max_byte_work: 4 * key_dir.path().as_os_str().len(),
+                ..CompileTimeLimits::default()
+            },
+            &NoCancellation,
+        );
+        let mut key_call = key_resolver.store_call(&mut key_budget).unwrap();
+        let key_before = key_budget.snapshot();
+        assert!(matches!(
+            key_call.list_directory(key_dir.path(), &key_entry, None, &NoCancellation, false),
+            Err(ResolverError::LimitExceeded {
+                limit: "max_byte_work",
+                ..
+            })
+        ));
+        assert_eq!(
+            key_call.store.calls, 0,
+            "key copy is refused after canonicalization, before entering the filesystem store"
+        );
+        assert_eq!(
+            key_budget.snapshot().retained_bytes,
+            key_before.retained_bytes
+        );
+        assert_eq!(
+            key_budget.snapshot().byte_work,
+            4 * key_dir.path().as_os_str().len()
+        );
+        // Use a real admitted filesystem listing and exact construction-owned
+        // key from the actual cache. Empty-map growth must refuse before any
+        // receiving allocation; no old capacity/key/handle invoice is released.
+        let (dir, root, mut resolver) = directory_probe_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let out = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let caller = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let root_cache = call.compile_time_store.as_ref().unwrap().clone();
+        let mut cache = root_cache.view.lock().unwrap();
+        let (key, listing) = cache.value_mut().directories.drain().next().unwrap();
+        let capacity = cache.directories.capacity();
+        let before = budget.snapshot();
+        let mut receiving = StoreCache::default();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        assert!(matches!(
+            receiving.insert_directory(key, listing, &mut budget),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(receiving.directories.capacity(), 0);
+        assert!(receiving.directory_capacity.is_none());
+        assert_eq!(cache.directories.capacity(), capacity);
+        assert!(cache.directory_capacity.is_some());
+        assert!(call.report.observations.iter().any(
+            |o| matches!(o,ResolutionObservation::Directory { path,.. } if path == dir.path())
+        ));
+        assert_eq!(caller.files.as_ptr() as usize, call.store.files);
+        assert!(matches!(out.result(), Resolution::Found(_)));
+        // Keep the actual resolver call live to prove the cache lock is local,
+        // not part of a returned directory capability.
+        drop(cache);
+        drop(call);
+    }
+
+    #[test]
+    fn directory_ownership_replacement_and_last_owner_refund_with_live_report_source() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let out = resolver
+            .include_capability(
+                IncludeResolveRequest {
+                    including_path: &root,
+                    byte_range: 0..0,
+                    requested_name: "value.inc",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (source, reports) = out.into_parts();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let first = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        let old_pointer = first.files.as_ptr();
+        let old_invoice = physical_directory_backing_invoice(&first, dir.path());
+        fs::write(dir.path().join("Added.pas"), "unit Added;").unwrap();
+        let second = call
+            .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+            .unwrap();
+        assert_ne!(
+            second.files.as_ptr(),
+            old_pointer,
+            "deliberate reread replaces the cache allocation"
+        );
+        assert!(!first.files.iter().any(|p| p.ends_with("Added.pas")));
+        assert!(second.files.iter().any(|p| p.ends_with("Added.pas")));
+        let before = budget.snapshot();
+        drop(first);
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            old_invoice + std::mem::size_of::<AdmittedShared<DirectoryListing>>(),
+            "old caller was last owner after replacement"
+        );
+        assert_eq!(before.work, budget.snapshot().work);
+        assert_eq!(before.byte_work, budget.snapshot().byte_work);
+        let new_pointer = second.files.as_ptr();
+        let new_invoice = physical_directory_backing_invoice(&second, dir.path());
+        let before = budget.snapshot();
+        drop(second);
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            std::mem::size_of::<AdmittedShared<DirectoryListing>>(),
+            "cache keeps backing alive after caller drop"
+        );
+        let root_cache = call.compile_time_store.as_ref().unwrap().clone();
+        let mut cache = root_cache.view.lock().unwrap();
+        let cached = cache.directories.values().next().unwrap();
+        assert_eq!(cached.files.as_ptr(), new_pointer);
+        let last = cached.try_clone(&mut budget).unwrap();
+        let map_capacity = cache.directories.capacity();
+        let key = cache.directories.keys().next().unwrap();
+        let mut key_payload = key.0.path.as_os_str().len() * 4;
+        key.0
+            .entry
+            .visit_recovery_payload(&mut |n| {
+                key_payload += n;
+                Ok(())
+            })
+            .unwrap();
+        key.0
+            .read_policy
+            .visit_owned_clone_payload(&mut |n| {
+                key_payload += n;
+                Ok(())
+            })
+            .unwrap();
+        let before = budget.snapshot();
+        let entries = cache.value_mut().directories.drain().collect::<Vec<_>>();
+        drop(entries);
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            key_payload
+                + std::mem::size_of::<AdmittedOwned<DirectoryCacheKey>>()
+                + std::mem::size_of::<AdmittedShared<DirectoryListing>>()
+        );
+        assert_eq!(cache.directories.capacity(), map_capacity);
+        assert!(
+            cache.directory_capacity.is_some(),
+            "empty live map keeps its independent backing invoice"
+        );
+        assert_eq!(last.files.as_ptr(), new_pointer);
+        drop(cache);
+        let before = budget.snapshot();
+        drop(last);
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            new_invoice + std::mem::size_of::<AdmittedShared<DirectoryListing>>()
+        );
+        assert_eq!(before.work, budget.snapshot().work);
+        assert_eq!(before.byte_work, budget.snapshot().byte_work);
+        let mut cache = root_cache.view.lock().unwrap();
+        let before = budget.snapshot();
+        let backing = std::mem::take(&mut cache.value_mut().directories);
+        let capacity_owner = cache.value_mut().directory_capacity.take().unwrap();
+        drop(backing);
+        drop(capacity_owner);
+        let capacity_invoice = std::mem::size_of::<AdmittedOwned<()>>()
+            + 4 * (std::mem::size_of::<(OwnedDirectoryKey, AdmittedShared<DirectoryListing>)>()
+                + 1)
+            + 16;
+        assert_eq!(
+            before.retained_bytes - budget.snapshot().retained_bytes,
+            capacity_invoice,
+            "only the now-dead empty directory map's exact minted bound retires"
+        );
+        assert_eq!(before.work, budget.snapshot().work);
+        assert_eq!(before.byte_work, budget.snapshot().byte_work);
+        drop(cache);
+        assert!(!reports.observations().is_empty());
+        assert!(matches!(&source,Resolution::Found(s) if !s.analysis_bytes().is_empty()));
+    }
+
+    #[test]
+    fn directory_ownership_context_root_missing_and_survival_are_independent() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _root, mut resolver) = physical_report_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let first;
+        let first_invoice;
+        {
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            first = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            first_invoice = physical_directory_backing_invoice(&first, dir.path());
+            let alternate = ProjectPathEntry {
+                path: entry.path.clone(),
+                provenance: ProjectPathProvenance::Configured,
+            };
+            let second = call
+                .list_directory(dir.path(), &alternate, None, &NoCancellation, false)
+                .unwrap();
+            assert_ne!(second.files.as_ptr(), first.files.as_ptr());
+            let root_cache = call.compile_time_store.as_ref().unwrap();
+            assert_eq!(
+                root_cache.view.lock().unwrap().directories.len(),
+                2,
+                "authorization entry is part of cache identity"
+            );
+            let previous_policy = call.context.read_policy.clone();
+            call.context.read_policy = ReadPolicy::new(
+                &[dir.path().into()],
+                &[],
+                &["**/*.denied".into()],
+                &Default::default(),
+            );
+            let policy_listing = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            assert_ne!(policy_listing.files.as_ptr(), first.files.as_ptr());
+            {
+                let cache = call
+                    .compile_time_store
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .lock()
+                    .unwrap();
+                assert_eq!(
+                    cache.directories.len(),
+                    3,
+                    "same path/entry with a different read policy has an independent key"
+                );
+                assert!(
+                    cache
+                        .directories
+                        .keys()
+                        .any(|k| k.0.read_policy == previous_policy)
+                );
+                assert!(
+                    cache
+                        .directories
+                        .keys()
+                        .any(|k| k.0.read_policy == call.context.read_policy)
+                );
+            }
+            call.context.read_policy = previous_policy;
+            let missing = dir.path().join("missing");
+            let missing_entry = ProjectPathEntry {
+                path: missing.clone(),
+                provenance: entry.provenance.clone(),
+            };
+            let optional = call
+                .list_directory(&missing, &missing_entry, None, &NoCancellation, false)
+                .unwrap();
+            let required = call
+                .list_directory(&missing, &missing_entry, None, &NoCancellation, true)
+                .unwrap();
+            assert!(optional.complete);
+            assert!(!required.complete);
+            assert!(required.files.is_empty());
+            assert!(call.report.observations.iter().any(|o| matches!(o,ResolutionObservation::Directory { path,complete:false,.. } if path == &missing)));
+        }
+        // Another root must neither reuse the original root's backing nor mint
+        // its handle through the wrong budget identity.
+        let mut other = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        if let DirectoryAccess::Admitted(first_shared) = &first {
+            let before = other.snapshot();
+            assert!(first_shared.try_clone(&mut other).is_err());
+            assert_eq!(other.snapshot(), before);
+        } else {
+            panic!("typed listing")
+        }
+        {
+            let mut call = resolver.store_call(&mut other).unwrap();
+            let second = call
+                .list_directory(dir.path(), &entry, None, &NoCancellation, false)
+                .unwrap();
+            assert_ne!(second.files.as_ptr(), first.files.as_ptr());
+        }
+        drop(resolver);
+        drop(budget);
+        drop(other);
+        let live = observer.budget_snapshot();
+        assert_eq!(
+            live.retained_bytes,
+            baseline + first_invoice + std::mem::size_of::<AdmittedShared<DirectoryListing>>()
+        );
+        assert!(!first.files.is_empty());
+        drop(first);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, live.work);
+        assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn directory_ownership_actual_map_growth_budget_refusals_preserve_old_backing() {
+        use crate::compile_time::CompileTimeLimits;
+        let mut grew = false;
+        for extra in (0..16384).step_by(32) {
+            let (dir, _, mut resolver) = directory_probe_resolver();
+            let base_entry = resolver.context.path_entry_for(dir.path()).unwrap();
+            let paths = (0..4)
+                .map(|n| dir.path().join(format!("D{n}")))
+                .collect::<Vec<_>>();
+            for path in &paths {
+                fs::create_dir(path).unwrap();
+                fs::write(path.join("One.pas"), "unit One;").unwrap();
+            }
+            let entries = paths
+                .iter()
+                .map(|p| ProjectPathEntry {
+                    path: p.clone(),
+                    provenance: base_entry.provenance.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let mut callers = Vec::new();
+            {
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                for i in 0..3 {
+                    callers.push(
+                        call.list_directory(&paths[i], &entries[i], None, &NoCancellation, false)
+                            .unwrap(),
+                    );
+                }
+            }
+            let before = budget.snapshot();
+            budget
+                .constrain_retained(before.retained_bytes + extra)
+                .unwrap();
+            let mut call = resolver.store_call(&mut budget).unwrap();
+            let root_cache = call.compile_time_store.as_ref().unwrap().clone();
+            let old_capacity = root_cache.view.lock().unwrap().directories.capacity();
+            assert_eq!(old_capacity, 3);
+            match call.list_directory(&paths[3], &entries[3], None, &NoCancellation, false) {
+                Err(ResolverError::LimitExceeded { .. }) => {
+                    let cache = root_cache.view.lock().unwrap();
+                    assert_eq!(cache.directories.len(), 3);
+                    assert_eq!(cache.directories.capacity(), old_capacity);
+                    assert!(cache.directory_capacity.is_some());
+                    for caller in &callers {
+                        assert!(
+                            cache
+                                .directories
+                                .values()
+                                .any(|v| v.files.as_ptr() == caller.files.as_ptr())
+                        );
+                    }
+                    assert!(budget.snapshot().work >= before.work);
+                    assert!(budget.snapshot().byte_work >= before.byte_work);
+                }
+                Ok(caller) => {
+                    callers.push(caller);
+                    let mut cache = root_cache.view.lock().unwrap();
+                    assert_eq!(cache.directories.len(), 4);
+                    assert_eq!(cache.directories.capacity(), 7);
+                    for caller in &callers {
+                        assert!(
+                            cache
+                                .directories
+                                .values()
+                                .any(|v| v.files.as_ptr() == caller.files.as_ptr())
+                        );
+                    }
+                    let pairs = cache.value_mut().directories.drain().collect::<Vec<_>>();
+                    drop(pairs);
+                    assert_eq!(cache.directories.capacity(), 7);
+                    let before = budget.snapshot();
+                    let map = std::mem::take(&mut cache.value_mut().directories);
+                    let capacity = cache.value_mut().directory_capacity.take().unwrap();
+                    drop(map);
+                    drop(capacity);
+                    let new_invoice = std::mem::size_of::<AdmittedOwned<()>>()
+                        + 8 * (std::mem::size_of::<(
+                            OwnedDirectoryKey,
+                            AdmittedShared<DirectoryListing>,
+                        )>() + 1)
+                        + 16;
+                    assert_eq!(
+                        before.retained_bytes - budget.snapshot().retained_bytes,
+                        new_invoice
+                    );
+                    assert_eq!(before.work, budget.snapshot().work);
+                    assert_eq!(before.byte_work, budget.snapshot().byte_work);
+                    assert!(
+                        callers.iter().all(|v| v.files[0].ends_with("One.pas")),
+                        "callers survive entry and map backing death"
+                    );
+                    grew = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected growth failure: {other:?}"),
+            }
+        }
+        assert!(grew);
+    }
+
+    #[test]
+    fn directory_ownership_nonempty_receiving_map_refuses_before_old_backing_dies() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = directory_probe_resolver();
+        let entry = resolver.context.path_entry_for(dir.path()).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut callers = Vec::new();
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        for n in 0..4 {
+            let path = dir.path().join(format!("Map{n}"));
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("P.pas"), "unit P;").unwrap();
+            let local = ProjectPathEntry {
+                path: path.clone(),
+                provenance: entry.provenance.clone(),
+            };
+            callers.push(
+                call.list_directory(&path, &local, None, &NoCancellation, false)
+                    .unwrap(),
+            );
+        }
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        let mut cache = root.view.lock().unwrap();
+        let mut pairs = cache.value_mut().directories.drain().collect::<Vec<_>>();
+        // Test the actual receiving helper with filesystem-produced keys and
+        // handles, never synthetic backing receipts or payload-sized refunds.
+        let mut receiving = budget.admit_owned(0, 0, 0, StoreCache::default).unwrap();
+        for _ in 0..3 {
+            let (key, listing) = pairs.pop().unwrap();
+            receiving
+                .value_mut()
+                .insert_directory(key, listing, &mut budget)
+                .unwrap();
+        }
+        assert_eq!(receiving.directories.capacity(), 3);
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let (key, listing) = pairs.pop().unwrap();
+        assert!(matches!(
+            receiving
+                .value_mut()
+                .insert_directory(key, listing, &mut budget),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(receiving.directories.len(), 3);
+        assert_eq!(receiving.directories.capacity(), 3);
+        assert!(receiving.directory_capacity.is_some());
+        for listing in receiving.directories.values() {
+            assert!(
+                callers
+                    .iter()
+                    .any(|caller| caller.files.as_ptr() == listing.files.as_ptr())
+            );
+        }
+        assert!(
+            callers
+                .iter()
+                .all(|caller| caller.files[0].ends_with("P.pas"))
+        );
+        assert_eq!(
+            cache.directories.capacity(),
+            7,
+            "entry removal doesn't retire original cache table either"
+        );
+        let reports = call.report.observations.as_ptr();
+        drop(cache);
+        let before = budget.snapshot();
+        let pairs = receiving
+            .value_mut()
+            .directories
+            .drain()
+            .collect::<Vec<_>>();
+        drop(pairs);
+        let after_entries = budget.snapshot();
+        assert_eq!(receiving.directories.capacity(), 3);
+        assert!(receiving.directory_capacity.is_some());
+        assert_eq!(after_entries.work, before.work);
+        assert_eq!(after_entries.byte_work, before.byte_work);
+        let map = std::mem::take(&mut receiving.value_mut().directories);
+        let owner = receiving.value_mut().directory_capacity.take().unwrap();
+        drop(map);
+        drop(owner);
+        let invoice = std::mem::size_of::<AdmittedOwned<()>>()
+            + 4 * (std::mem::size_of::<(OwnedDirectoryKey, AdmittedShared<DirectoryListing>)>()
+                + 1)
+            + 16;
+        assert_eq!(
+            after_entries.retained_bytes - budget.snapshot().retained_bytes,
+            invoice
+        );
+        assert_eq!(
+            call.report.observations.as_ptr(),
+            reports,
+            "map capacity refund does not touch live report storage"
+        );
+    }
+
+    #[test]
+    fn directory_ownership_unsupported_store_does_not_call_legacy_listing() {
+        struct LegacyDirectoryStore;
+        impl SourceStore for LegacyDirectoryStore {
+            fn list_directory(
+                &mut self,
+                _: DirectoryRequest<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<DirectoryListing, SourceStoreError> {
+                panic!("unbounded legacy directory callback must not run")
+            }
+            fn overlay_candidates(&self, _: &[PathBuf], _: &[String]) -> Vec<PathBuf> {
+                panic!("unbounded legacy overlays must not run")
+            }
+            fn load(
+                &mut self,
+                _: SourceRequest<'_>,
+                _: &dyn CancellationToken,
+            ) -> Result<LoadedSource, SourceStoreError> {
+                panic!("unbounded legacy load must not run")
+            }
+        }
+        let (dir, _, original) = physical_report_resolver();
+        let entry = original.context.path_entry_for(dir.path()).unwrap();
+        let mut resolver = UnitResolver::new(
+            original.context,
+            vec![dir.path().into()],
+            LegacyDirectoryStore,
+            Default::default(),
+        );
+        let mut budget = CompileTimeBudget::new(
+            crate::compile_time::CompileTimeLimits::default(),
+            &NoCancellation,
+        );
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let before = budget.snapshot();
+        assert!(matches!(
+            call.list_directory(dir.path(), &entry, None, &NoCancellation, false),
+            Err(ResolverError::SourceStore(
+                SourceStoreError::AdmissionUnavailable
+            ))
+        ));
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert!(
+            call.compile_time_store
+                .as_ref()
+                .unwrap()
+                .view
+                .lock()
+                .unwrap()
+                .directories
+                .is_empty()
+        );
     }
 
     #[test]

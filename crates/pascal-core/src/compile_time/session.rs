@@ -115,6 +115,29 @@ impl ProviderSource {
             .map_err(|r| resolver_error(r, budget))
     }
 
+    /// Promote the actual selected provider without reconstructing its names
+    /// or context. Original field receipts are already installed in this owner.
+    pub(crate) fn promote_owned(
+        mut provider: AdmittedOwned<Self>,
+        backing: AdmittedSourceBacking,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<AdmittedProviderSource, ResolverError> {
+        if !provider.is_admitted_by(budget)
+            || !backing.is_admitted_by(budget)
+            || backing.id != provider.unit.source.id
+            || backing.revision != provider.unit.source.revision
+        {
+            return Err(ResolverError::InvalidRequest(
+                "provider promotion requires same-root source and field owners".into(),
+            ));
+        }
+        provider.value_mut().backing = Some(backing);
+        provider
+            .into_shared(budget)
+            .and_then(|provider| provider.into_arc(budget))
+            .map_err(|r| resolver_error(r, budget))
+    }
+
     fn valid_backing(&self, budget: &CompileTimeBudget<'_>) -> bool {
         self.backing.as_ref().is_some_and(|s| {
             s.is_admitted_by(budget)
@@ -3038,6 +3061,150 @@ fn argument_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn found_unit_name_owner_provider_engine_preserves_original_names_and_captured_alias() {
+        struct Recording {
+            inner: crate::UnitResolver<crate::FilesystemSourceStore>,
+            requested: Option<usize>,
+            declared: Option<usize>,
+            last: Option<AdmittedProviderSource>,
+        }
+        impl CompileTimeResolver for Recording {
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                let out = self.inner.unit_report_capability(r, b, c)?;
+                if let Resolution::Found(provider) = out.result() {
+                    self.requested = Some(provider.unit.requested_name.as_ptr() as usize);
+                    self.declared = Some(provider.unit.declared_name.as_ptr() as usize);
+                    self.last = Some(provider.clone());
+                }
+                Ok(out)
+            }
+            fn include_capability(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<LoadedSource>, ResolverError> {
+                self.inner.include_capability(r, b, c)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                self.inner.unit(r, b, c)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Main.pas");
+        std::fs::write(&path,"unit Main; interface uses Alias; {$IF SizeOf(Alias.V)=8}{$DEFINE HIT}{$ENDIF} implementation end.").unwrap();
+        std::fs::write(
+            dir.path().join("Space.Other.pas"),
+            "unit Space . Other; interface type T=Int64; var V:T; implementation end.",
+        )
+        .unwrap();
+        let mut project = pascal_project::ProjectContext::discover(
+            &path,
+            &[dir.path().into()],
+            &Default::default(),
+        )
+        .unwrap();
+        project
+            .unit_aliases
+            .insert("Alias".into(), "Space.Other".into());
+        project.conditional_context = ConditionalContext::default()
+            .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+            .with_layout(pascal_project::LayoutContext {
+                platform: Some(pascal_project::LayoutPlatform::Win32),
+                defaults: Default::default(),
+            });
+        project.library_conditional_context = project.conditional_context.clone();
+        let context = project.conditional_context.clone();
+        let mut inner = crate::UnitResolver::new(
+            project,
+            vec![dir.path().into()],
+            crate::FilesystemSourceStore::new(),
+            Default::default(),
+        );
+        let root = inner
+            .load_source(&path, None, crate::SourceKind::Unit, &crate::NoCancellation)
+            .unwrap();
+        let mut recording = Recording {
+            inner,
+            requested: None,
+            declared: None,
+            last: None,
+        };
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let output = analyze_source_in_session(
+            &root,
+            &context,
+            &mut recording,
+            &mut budget,
+            &crate::NoCancellation,
+        )
+        .unwrap();
+        assert!(
+            output
+                .root
+                .directives
+                .iter()
+                .any(|d| d.body == "DEFINE HIT" && d.activity == Truth::True),
+            "actual imported variable/type layout remains positive"
+        );
+        let provider = recording.last.as_ref().unwrap();
+        assert_eq!(provider.unit.requested_name, "Alias");
+        assert_eq!(provider.unit.declared_name, "Space.Other");
+        assert_eq!(
+            Some(provider.unit.requested_name.as_ptr() as usize),
+            recording.requested
+        );
+        assert_eq!(
+            Some(provider.unit.declared_name.as_ptr() as usize),
+            recording.declared
+        );
+        assert_eq!(output.facts.interfaces[0].pending.identity.name, "Alias");
+        let provider = recording.last.take().unwrap();
+        drop(recording);
+        drop(root);
+        drop(budget);
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > baseline);
+        assert_eq!(provider.unit.declared_name, "Space.Other");
+        drop(output);
+        assert!(
+            observer.budget_snapshot().retained_bytes > baseline,
+            "original returned provider names/source outlive compiled output when a real owner remains"
+        );
+        assert_eq!(provider.unit.requested_name, "Alias");
+        drop(provider);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, live.work);
+        assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+    }
     use crate::{NoCancellation, SourceId, SourceRevision};
 
     struct NoGraphCallbacks;

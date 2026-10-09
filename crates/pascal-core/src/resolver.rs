@@ -1267,6 +1267,14 @@ pub struct UnitResolver<S> {
     callback_reports: Option<CallbackReports>,
     callback_include_reason: Option<AdmittedOwned<String>>,
     owning_include_callback: bool,
+    owning_unit_callback: bool,
+    callback_unit_names: Option<OwnedUnitNames>,
+    callback_provider: Option<AdmittedOwned<crate::compile_time::ProviderSource>>,
+}
+
+struct OwnedUnitNames {
+    requested: AdmittedOwned<String>,
+    declared: AdmittedOwned<String>,
 }
 
 enum CallbackReports {
@@ -1278,6 +1286,9 @@ struct CallbackReportCall<'a, S: SourceStore> {
     previous: Option<CallbackReports>,
     previous_reason: Option<AdmittedOwned<String>>,
     previous_include: bool,
+    previous_unit: bool,
+    previous_names: Option<OwnedUnitNames>,
+    previous_provider: Option<AdmittedOwned<crate::compile_time::ProviderSource>>,
 }
 impl<S: SourceStore> std::ops::Deref for CallbackReportCall<'_, S> {
     type Target = UnitResolver<S>;
@@ -1295,6 +1306,9 @@ impl<S: SourceStore> Drop for CallbackReportCall<'_, S> {
         self.resolver.callback_reports = self.previous.take();
         self.resolver.callback_include_reason = self.previous_reason.take();
         self.resolver.owning_include_callback = self.previous_include;
+        self.resolver.owning_unit_callback = self.previous_unit;
+        self.resolver.callback_unit_names = self.previous_names.take();
+        self.resolver.callback_provider = self.previous_provider.take();
     }
 }
 impl<S: SourceStore> CallbackReportCall<'_, S> {
@@ -1469,11 +1483,17 @@ impl<S: SourceStore> UnitResolver<S> {
         let previous = self.callback_reports.replace(CallbackReports::Requested);
         let previous_reason = self.callback_include_reason.take();
         let previous_include = std::mem::replace(&mut self.owning_include_callback, false);
+        let previous_unit = std::mem::replace(&mut self.owning_unit_callback, false);
+        let previous_names = self.callback_unit_names.take();
+        let previous_provider = self.callback_provider.take();
         CallbackReportCall {
             resolver: self,
             previous,
             previous_reason,
             previous_include,
+            previous_unit,
+            previous_names,
+            previous_provider,
         }
     }
     fn store_call<'b>(
@@ -2079,6 +2099,9 @@ impl<S: SourceStore> UnitResolver<S> {
             callback_reports: None,
             callback_include_reason: None,
             owning_include_callback: false,
+            owning_unit_callback: false,
+            callback_unit_names: None,
+            callback_provider: None,
         }
     }
 
@@ -3454,24 +3477,70 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
         self.check_cancel(cancel)?;
-        let copies = group
-            .paths
-            .iter()
-            .map(|(p, e)| {
-                8 * (p.as_os_str().len()
-                    + e.path.as_os_str().len()
-                    + std::mem::size_of::<ResolutionCandidate>())
-            })
-            .sum::<usize>();
+        if self.owning_unit_callback {
+            let mut budget = self.store_budget(cancel).expect("owning unit root");
+            budget
+                .charge(group.paths.len(), 0, 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        }
+        let copies = group.paths.iter().try_fold(0usize, |sum, (p, e)| {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            p.as_os_str()
+                .len()
+                .checked_add(e.path.as_os_str().len())
+                .and_then(|n| n.checked_add(std::mem::size_of::<ResolutionCandidate>()))
+                .and_then(|n| n.checked_mul(8))
+                .and_then(|n| sum.checked_add(n))
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("candidate construction bound overflow".into())
+                })
+        })?;
         self.admit_lookup_storage(1, copies, copies, cancel)?;
-        let mut valid = Vec::new();
+        type ValidCandidate = (
+            LoadedSource,
+            ResolutionCandidate,
+            Option<AdmittedOwned<String>>,
+        );
+        let _valid_capacity = if self.owning_unit_callback {
+            let mut budget = self.store_budget(cancel).expect("owning unit root");
+            let bytes = group
+                .paths
+                .len()
+                .checked_mul(std::mem::size_of::<ValidCandidate>())
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("selected candidate capacity overflow".into())
+                })?;
+            Some(
+                budget
+                    .admit_owned(1, 0, bytes, || ())
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+            )
+        } else {
+            None
+        };
+        let mut valid = if self.owning_unit_callback {
+            Vec::with_capacity(group.paths.len())
+        } else {
+            Vec::new()
+        };
         let mut candidates = Vec::new();
         let mut order_bound = group
             .paths
             .len()
             .checked_mul(std::mem::size_of::<usize>() * 2)
             .ok_or_else(|| ResolverError::InvalidRequest("candidate ordering overflow".into()))?;
+        if self.owning_unit_callback {
+            let mut budget = self.store_budget(cancel).expect("owning unit root");
+            budget
+                .charge(group.paths.len(), 0, 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        }
         for (path, _) in group.paths.iter() {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
             order_bound = order_bound
                 .checked_add(
                     path.as_os_str()
@@ -3524,7 +3593,15 @@ impl<S: SourceStore> UnitResolver<S> {
                 cancel,
             ) {
                 Ok(source) => {
-                    let declared_name = if self.compile_time_store.is_some() {
+                    let mut parsed_owner = if self.owning_unit_callback {
+                        let mut budget = self.store_budget(cancel).expect("owning unit root");
+                        owned_header_name(source.analysis_bytes().as_ref(), &mut budget, cancel)?
+                    } else {
+                        None
+                    };
+                    let declared_name = if self.owning_unit_callback {
+                        None
+                    } else if self.compile_time_store.is_some() {
                         let bytes = source.analysis_bytes();
                         self.admit_lookup_storage(bytes.len(), bytes.len(), 0, cancel)?;
                         if let Some(name) = admitted_header_name(&bytes) {
@@ -3544,17 +3621,34 @@ impl<S: SourceStore> UnitResolver<S> {
                             None => self.source_metadata(&source).declared_name.clone(),
                         }
                     };
-                    let candidate = ResolutionCandidate {
-                        path: source.path.clone(),
-                        declared_name: declared_name.clone(),
-                    };
-                    if declared_name_matches(
-                        declared_name.as_deref(),
+                    let valid_name = declared_name_matches(
+                        parsed_owner
+                            .as_ref()
+                            .map(|n| n.as_str())
+                            .or(declared_name.as_deref()),
                         requested,
                         lookup,
                         &self.context,
-                    ) {
-                        valid.push((source, candidate));
+                    );
+                    // Only unselected/ambiguous legacy candidate metadata gets
+                    // its separate bounded copy. Selected names keep the
+                    // original header owner, never a clone of that candidate.
+                    let candidate_name = if self.owning_unit_callback && !valid_name {
+                        if let Some(name) = parsed_owner.as_ref() {
+                            self.admit_lookup_storage(1, name.len(), name.len(), cancel)?;
+                            Some((**name).clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        declared_name.clone()
+                    };
+                    let candidate = ResolutionCandidate {
+                        path: source.path.clone(),
+                        declared_name: candidate_name,
+                    };
+                    if valid_name {
+                        valid.push((source, candidate, parsed_owner.take()));
                     } else {
                         candidates.push(candidate);
                     }
@@ -3607,7 +3701,35 @@ impl<S: SourceStore> UnitResolver<S> {
         match valid.len() {
             0 => Ok(None),
             1 => {
-                let (source, candidate) = valid.pop().expect("one valid candidate");
+                let (source, candidate, declared_owner) = valid.pop().expect("one valid candidate");
+                if self.owning_unit_callback {
+                    let mut budget = self.store_budget(cancel).expect("owning unit root");
+                    let requested = budget
+                        .admit_owned(1, requested.len(), requested.len(), || {
+                            requested.to_string()
+                        })
+                        .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                    let declared = match declared_owner {
+                        Some(name) => name,
+                        None => budget
+                            .admit_owned(1, lookup.len(), lookup.len(), || lookup.to_string())
+                            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?,
+                    };
+                    if self.callback_unit_names.is_some() {
+                        return Err(ResolverError::InvalidRequest(
+                            "duplicate selected unit names".into(),
+                        ));
+                    }
+                    self.callback_unit_names = Some(OwnedUnitNames {
+                        requested,
+                        declared,
+                    });
+                    return Ok(Some(Resolution::Found(ResolvedUnit {
+                        requested_name: String::new(),
+                        declared_name: String::new(),
+                        source,
+                    })));
+                }
                 Ok(Some(Resolution::Found(ResolvedUnit {
                     requested_name: requested.to_string(),
                     declared_name: candidate
@@ -3618,7 +3740,14 @@ impl<S: SourceStore> UnitResolver<S> {
             }
             _ => {
                 valid.sort_by_key(|left| path_key(&left.0.path));
-                let candidates = valid.into_iter().map(|(_, candidate)| candidate).collect();
+                let mut candidates = Vec::with_capacity(valid.len());
+                for (_, mut candidate, name) in valid {
+                    if let Some(name) = name {
+                        self.admit_lookup_storage(1, name.len(), name.len(), cancel)?;
+                        candidate.declared_name = Some((*name).clone());
+                    }
+                    candidates.push(candidate);
+                }
                 self.warning_args(
                     cancel,
                     64 + requested.len(),
@@ -4328,6 +4457,104 @@ impl<S: SourceStore> UnitResolver<S> {
                 present,
             }
         })
+    }
+
+    fn build_owned_provider(
+        &self,
+        mut unit: ResolvedUnit,
+        names: OwnedUnitNames,
+        requested: &str,
+        budget: &mut CompileTimeBudget<'_>,
+        cancel: &dyn CancellationToken,
+    ) -> Result<AdmittedOwned<crate::compile_time::ProviderSource>, ResolverError> {
+        if !unit.requested_name.is_empty() || !unit.declared_name.is_empty() {
+            return Err(ResolverError::InvalidRequest(
+                "provider requires allocation-free name markers".into(),
+            ));
+        }
+        if !names.requested.is_admitted_by(budget) || !names.declared.is_admitted_by(budget) {
+            return Err(ResolverError::InvalidRequest(
+                "selected name owners belong to another root".into(),
+            ));
+        }
+        let overflow =
+            || ResolverError::InvalidRequest("provider construction bound overflow".into());
+        let scan_count = self
+            .context
+            .defines
+            .len()
+            .checked_add(self.context.conditional_context.defines.len())
+            .and_then(|n| n.checked_add(self.context.conditional_context.options.len()))
+            .and_then(|n| n.checked_add(self.context.conditional_context.constants.len()))
+            .and_then(|n| n.checked_add(self.context.library_conditional_context.defines.len()))
+            .and_then(|n| n.checked_add(self.context.library_conditional_context.options.len()))
+            .and_then(|n| n.checked_add(self.context.library_conditional_context.constants.len()))
+            .ok_or_else(overflow)?;
+        let sizing_work = scan_count
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_add(self.context.unit_aliases.len()))
+            .ok_or_else(overflow)?;
+        budget
+            .charge(sizing_work, 0, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        let reserve = conditional_context_reserve_polled(&self.context, cancel)?;
+        if unit.source.decoded_text.is_none() && std::str::from_utf8(&unit.source.bytes).is_err() {
+            unit.source = LoadedSource::admit_construction(
+                budget,
+                unit.source.bytes.len(),
+                unit.source.bytes.len().saturating_mul(3)
+                    + loaded_source_metadata_retained(&unit.source),
+                || {
+                    let mut decoded = unit.source.clone();
+                    decoded.decoded_text = Some(source_text(&unit.source).into());
+                    Ok(decoded)
+                },
+            )
+            .map_err(root_store_error)?;
+        }
+        let mut alias = requested;
+        for (key, target) in &self.context.unit_aliases {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            budget
+                .charge(1, key.len().min(requested.len()), 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+            if key.eq_ignore_ascii_case(requested) {
+                alias = target;
+                break;
+            }
+        }
+        let qualifiers = requested
+            .len()
+            .checked_add(alias.len())
+            .and_then(|n| n.checked_add(names.declared.len()))
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_add(8 * std::mem::size_of::<String>()))
+            .ok_or_else(overflow)?;
+        let construction_bytes = reserve.checked_add(qualifiers).ok_or_else(overflow)?;
+        let payload = construction_bytes
+            .checked_add(loaded_source_metadata_retained(&unit.source))
+            .ok_or_else(overflow)?;
+        let mut provider = budget
+            .admit_owned(scan_count + 1, construction_bytes, payload, || {
+                let context = self.context.conditional_context_for(&unit.source.path);
+                let qualifiers = qualifiers_for_found(requested, alias, &names.declared);
+                crate::compile_time::ProviderSource::new(unit, context, qualifiers)
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        provider
+            .move_field(names.requested, budget, |provider, name| {
+                provider.unit.requested_name = name
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        provider
+            .move_field(names.declared, budget, |provider, name| {
+                provider.unit.declared_name = name
+            })
+            .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+        Ok(provider)
     }
 
     fn include_reason_build(
@@ -5757,6 +5984,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
     ) -> Result<AdmittedCapabilityOutcome<crate::compile_time::AdmittedProviderSource>, ResolverError>
     {
         let mut call = self.callback_report_call();
+        call.owning_unit_callback = true;
         let outcome = crate::compile_time::CompileTimeResolver::unit_capability(
             &mut *call, request, budget, cancel,
         )?;
@@ -5768,15 +5996,46 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
         cancel: &dyn CancellationToken,
     ) -> Result<ResolutionOutcome<crate::compile_time::AdmittedProviderSource>, ResolverError> {
+        if !self.owning_unit_callback {
+            // The compatibility capability still returns plain report fields,
+            // but its Found provider must use original name owners as well.
+            // Scope only the private name handoff; don't replace that report
+            // contract with the owning callback's report constructor.
+            let mut call = self.callback_report_call();
+            call.callback_reports = None;
+            call.owning_unit_callback = true;
+            return crate::compile_time::CompileTimeResolver::unit_capability(
+                &mut *call, request, budget, cancel,
+            );
+        }
         let outcome =
             crate::compile_time::CompileTimeResolver::unit(self, request, budget, cancel)?;
-        let result = match outcome.result {
-            Resolution::Found(provider) => {
+        if self.owning_unit_callback {
+            if let Some(provider) = self.callback_provider.take() {
+                if !matches!(&outcome.result,Resolution::Unavailable {reason} if reason.is_empty())
+                {
+                    return Err(ResolverError::InvalidRequest(
+                        "owned provider handoff mismatch".into(),
+                    ));
+                }
                 let backing = crate::compile_time::ProviderSource::admit_cached_backing(
                     &provider.unit.source,
                     budget,
                 )?;
-                Resolution::Found(provider.admit_copy(&backing, budget)?)
+                let provider =
+                    crate::compile_time::ProviderSource::promote_owned(provider, backing, budget)?;
+                return Ok(ResolutionOutcome {
+                    result: Resolution::Found(provider),
+                    observations: outcome.observations,
+                    warnings: outcome.warnings,
+                });
+            }
+        }
+        let result = match outcome.result {
+            Resolution::Found(_) => {
+                return Err(ResolverError::InvalidRequest(
+                    "typed provider lost its original name construction owner".into(),
+                ));
             }
             Resolution::Unavailable { reason } => Resolution::Unavailable { reason },
             Resolution::Ambiguous { candidates } => Resolution::Ambiguous { candidates },
@@ -5934,6 +6193,33 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
         let outcome = outcome?;
         let result = match outcome.result {
             Resolution::Found(mut unit) => {
+                if self.owning_unit_callback {
+                    let names = self.callback_unit_names.take().ok_or_else(|| {
+                        ResolverError::InvalidRequest(
+                            "selected unit has no original name owners".into(),
+                        )
+                    })?;
+                    if !unit.requested_name.is_empty() || !unit.declared_name.is_empty() {
+                        return Err(ResolverError::InvalidRequest(
+                            "owned unit marker mismatch".into(),
+                        ));
+                    }
+                    let provider = self.build_owned_provider(
+                        unit,
+                        names,
+                        request.requested_name,
+                        budget,
+                        cancel,
+                    )?;
+                    self.callback_provider = Some(provider);
+                    return Ok(ResolutionOutcome {
+                        result: Resolution::Unavailable {
+                            reason: String::new(),
+                        },
+                        observations: outcome.observations,
+                        warnings: outcome.warnings,
+                    });
+                }
                 let reserve = conditional_context_reserve(&self.context)?;
                 let names = request.requested_name.len()
                     + aliased_name_ref(&self.context, request.requested_name).len()
@@ -5988,19 +6274,37 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
 }
 
 fn conditional_context_reserve(context: &ProjectContext) -> Result<usize, ResolverError> {
+    conditional_context_reserve_polled(context, &NoCancellation)
+}
+
+fn conditional_context_reserve_polled(
+    context: &ProjectContext,
+    cancel: &dyn CancellationToken,
+) -> Result<usize, ResolverError> {
     let mut total = std::mem::size_of::<pascal_project::ConditionalContext>();
     for candidate in [
         &context.conditional_context,
         &context.library_conditional_context,
     ] {
+        let mut cancelled = false;
         candidate
             .visit_recovery_payload(&mut |n| {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    return Err("context sizing cancelled".into());
+                }
                 total = total
                     .checked_add(n)
                     .ok_or_else(|| "context admission overflow".to_string())?;
                 Ok(())
             })
-            .map_err(ResolverError::InvalidRequest)?;
+            .map_err(|error| {
+                if cancelled {
+                    ResolverError::Cancelled
+                } else {
+                    ResolverError::InvalidRequest(error)
+                }
+            })?;
         total = total
             .checked_add(
                 (candidate.defines.len() + candidate.options.len() + candidate.constants.len())
@@ -6010,6 +6314,9 @@ fn conditional_context_reserve(context: &ProjectContext) -> Result<usize, Resolv
             .ok_or_else(|| ResolverError::InvalidRequest("context admission overflow".into()))?;
     }
     for define in &context.defines {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
         total = total
             .checked_add(
                 define.len()
@@ -6379,7 +6686,9 @@ fn declared_name_matches(
 }
 
 fn qualifiers_for_found(requested: &str, lookup: &str, declared: &str) -> Vec<String> {
-    let mut qualifiers = Vec::new();
+    // Five borrowed spellings at most; avoid a hidden old-plus-new growth
+    // peak inside the preadmitted provider construction.
+    let mut qualifiers = Vec::with_capacity(5);
     for spelling in [
         Some(requested),
         (!lookup.eq_ignore_ascii_case(requested)).then_some(lookup),
@@ -6536,6 +6845,149 @@ fn admitted_header_name(bytes: &[u8]) -> Option<&str> {
         }
     }
     (!start).then_some(name)
+}
+
+fn owned_header_name(
+    bytes: &[u8],
+    budget: &mut CompileTimeBudget<'_>,
+    cancel: &dyn CancellationToken,
+) -> Result<Option<AdmittedOwned<String>>, ResolverError> {
+    let work = bytes
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| ResolverError::InvalidRequest("header parsing work overflow".into()))?;
+    // CPU parsing is admitted before UTF-8 validation or header scanning. No
+    // whole-source parser/cache receipt is carried by the selected name.
+    let _parse = budget
+        .admit_owned(work, bytes.len(), 0, || ())
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    for _ in bytes.chunks(256) {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+    }
+    let Some(name) = header_name_polled(bytes, cancel)? else {
+        return Ok(None);
+    };
+    let name = budget.admit_fallible(
+        name.len(),
+        name.len(),
+        name.len(),
+        crate::compile_time::resolver_error,
+        || {
+            let mut output = String::with_capacity(name.len());
+            for character in name.chars() {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                if !character.is_whitespace() {
+                    output.push(character);
+                }
+            }
+            // Validated header names have no leading/trailing dot; this preserves
+            // canonical_unit_name without its transient replace/trim/copy buffers.
+            Ok(output)
+        },
+    )?;
+    Ok(Some(name))
+}
+
+fn header_name_polled<'a>(
+    bytes: &'a [u8],
+    cancel: &dyn CancellationToken,
+) -> Result<Option<&'a str>, ResolverError> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    fn trim_start<'a>(
+        text: &'a str,
+        cancel: &dyn CancellationToken,
+    ) -> Result<&'a str, ResolverError> {
+        for (index, character) in text.char_indices() {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            if !character.is_whitespace() {
+                return Ok(&text[index..]);
+            }
+        }
+        Ok("")
+    }
+    fn split<'a>(
+        text: &'a str,
+        needle: &str,
+        cancel: &dyn CancellationToken,
+    ) -> Result<Option<(&'a str, &'a str)>, ResolverError> {
+        for (index, window) in text.as_bytes().windows(needle.len()).enumerate() {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            if window == needle.as_bytes() {
+                return Ok(Some((&text[..index], &text[index + needle.len()..])));
+            }
+        }
+        Ok(None)
+    }
+    let mut rest = text.trim_start_matches('\u{feff}');
+    loop {
+        rest = trim_start(rest, cancel)?;
+        let (comment, end) = if let Some(comment) = rest.strip_prefix("//") {
+            (comment, "\n")
+        } else if let Some(comment) = rest.strip_prefix('{') {
+            if comment.starts_with('$') {
+                return Ok(None);
+            }
+            (comment, "}")
+        } else if let Some(comment) = rest.strip_prefix("(*") {
+            if comment.starts_with('$') {
+                return Ok(None);
+            }
+            (comment, "*)")
+        } else {
+            break;
+        };
+        let Some((_, after)) = split(comment, end, cancel)? else {
+            return Ok(None);
+        };
+        rest = after;
+    }
+    let Some(head) = rest.get(..4) else {
+        return Ok(None);
+    };
+    if !head.eq_ignore_ascii_case("unit")
+        || !rest
+            .get(4..)
+            .is_some_and(|tail| tail.starts_with(char::is_whitespace))
+    {
+        return Ok(None);
+    }
+    let Some((name, _)) = split(&rest[4..], ";", cancel)? else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    let mut start = true;
+    for character in name.chars() {
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        if character.is_whitespace() {
+            continue;
+        }
+        if character == '.' {
+            if start {
+                return Ok(None);
+            }
+            start = true;
+        } else if character == '_'
+            || character.is_alphabetic()
+            || (!start && character.is_ascii_digit())
+        {
+            start = false;
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok((!start).then_some(name))
 }
 
 fn package_stem(name: &str) -> String {
@@ -8114,6 +8566,67 @@ mod tests {
     }
 
     #[test]
+    fn found_unit_name_owner_actual_provider_promotion_preserves_selected_pointers() {
+        use crate::compile_time::{CompileTimeLimits, ProviderSource};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut callback = resolver.callback_report_call();
+        callback.owning_unit_callback = true;
+        let outcome = callback
+            .store_call(&mut budget)
+            .unwrap()
+            .try_resolve_unit(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &NoCancellation,
+            )
+            .unwrap();
+        let Resolution::Found(unit) = outcome.result else {
+            panic!("physical selected unit")
+        };
+        let names = callback
+            .callback_unit_names
+            .take()
+            .expect("original selected name owners");
+        let requested = names.requested.as_ptr();
+        let declared = names.declared.as_ptr();
+        let backing = ProviderSource::admit_cached_backing(&unit.source, &mut budget).unwrap();
+        let provider = callback
+            .build_owned_provider(unit, names, "Other", &mut budget, &NoCancellation)
+            .unwrap();
+        assert_eq!(
+            provider.unit.requested_name.as_ptr(),
+            requested,
+            "provider construction consumes the original requested owner"
+        );
+        assert_eq!(
+            provider.unit.declared_name.as_ptr(),
+            declared,
+            "provider construction consumes the original parsed owner"
+        );
+        let before = budget.snapshot();
+        let promoted = ProviderSource::promote_owned(provider, backing, &mut budget).unwrap();
+        assert_eq!(
+            promoted.unit.requested_name.as_ptr(),
+            requested,
+            "selected requested name must move, not be cloned in provider promotion"
+        );
+        assert_eq!(
+            promoted.unit.declared_name.as_ptr(),
+            declared,
+            "original parsed declaration must move with its minted credit"
+        );
+        assert_eq!(
+            budget.snapshot().byte_work,
+            before.byte_work,
+            "provider promotion performs no second payload/name/context byte copy"
+        );
+    }
+
+    #[test]
     fn include_reason_owner_real_root_and_provider_child_failure_consumers() {
         use crate::compile_time::{AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver};
         struct Recording {
@@ -8256,6 +8769,402 @@ mod tests {
             assert_eq!(observer.budget_snapshot().work, live.work);
             assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
         }
+    }
+
+    #[test]
+    fn found_unit_name_owner_foreign_constructor_and_promotion_preserve_receiving_root() {
+        use crate::compile_time::{CompileTimeLimits, ProviderSource};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut callback = resolver.callback_report_call();
+        callback.owning_unit_callback = true;
+        let out = callback
+            .store_call(&mut budget)
+            .unwrap()
+            .try_resolve_unit(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &NoCancellation,
+            )
+            .unwrap();
+        let Resolution::Found(unit) = out.result else {
+            panic!("physical unit")
+        };
+        let names = callback.callback_unit_names.take().unwrap();
+        let backing = ProviderSource::admit_cached_backing(&unit.source, &mut budget).unwrap();
+        let pointer = backing.bytes.as_ptr();
+        let Some(CallbackReports::Built(reports)) = callback.callback_reports.take() else {
+            panic!("actual reports")
+        };
+        let report_pointer = reports.observations().as_ptr();
+        let mut other = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let before = other.snapshot();
+        assert!(
+            callback
+                .build_owned_provider(unit, names, "Other", &mut other, &NoCancellation)
+                .is_err()
+        );
+        assert_eq!(other.snapshot(), before);
+        assert_eq!(backing.bytes.as_ptr(), pointer);
+        assert_eq!(reports.observations().as_ptr(), report_pointer);
+        let out = callback
+            .store_call(&mut budget)
+            .unwrap()
+            .try_resolve_unit(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &NoCancellation,
+            )
+            .unwrap();
+        let Resolution::Found(unit) = out.result else {
+            panic!("physical unit")
+        };
+        let names = callback.callback_unit_names.take().unwrap();
+        let provider = callback
+            .build_owned_provider(unit, names, "Other", &mut budget, &NoCancellation)
+            .unwrap();
+        assert!(ProviderSource::promote_owned(provider, backing.clone(), &mut other).is_err());
+        assert_eq!(other.snapshot(), before);
+        assert!(!backing.bytes.is_empty());
+        assert!(!reports.observations().is_empty());
+    }
+
+    #[test]
+    fn found_unit_name_owner_alias_namespace_last_provider_refund_keeps_source_and_reports() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for requested in ["Alias", "Named"] {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            fs::write(
+                dir.path().join("Space.Other.pas"),
+                "{comment} unit Space . Other; interface type T=Int64; implementation end.",
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join("Space.Named.pas"),
+                "unit Space.Named; interface type T=Int64; implementation end.",
+            )
+            .unwrap();
+            resolver
+                .context
+                .unit_aliases
+                .insert("Alias".into(), "Space.Other".into());
+            resolver.context.unit_namespaces = vec!["Space".into()];
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let out = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: requested,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let (result, reports) = out.into_parts();
+            let Resolution::Found(provider) = result.into_unmigrated().unwrap() else {
+                panic!("physical named provider")
+            };
+            assert_eq!(provider.unit.requested_name, requested);
+            assert_eq!(
+                provider.unit.declared_name,
+                if requested == "Alias" {
+                    "Space.Other"
+                } else {
+                    "Space.Named"
+                }
+            );
+            assert!(
+                provider
+                    .authorized_qualifiers
+                    .iter()
+                    .any(|n| n == requested)
+            );
+            let requested_pointer = provider.unit.requested_name.as_ptr();
+            let declared_pointer = provider.unit.declared_name.as_ptr();
+            let backing = provider
+                .unit
+                .source
+                .compile_time_backing
+                .as_ref()
+                .unwrap()
+                .clone();
+            let source_pointer = backing.bytes.as_ptr();
+            let report_pointer = reports.observations().as_ptr();
+            let last = provider.clone();
+            drop(resolver);
+            drop(budget);
+            let live = observer.budget_snapshot();
+            drop(provider);
+            assert_eq!(
+                observer.budget_snapshot(),
+                live,
+                "non-last provider Arc drop cannot refund live original names"
+            );
+            assert_eq!(last.unit.requested_name.as_ptr(), requested_pointer);
+            assert_eq!(last.unit.declared_name.as_ptr(), declared_pointer);
+            drop(last);
+            assert!(observer.budget_snapshot().retained_bytes < live.retained_bytes);
+            assert_eq!(backing.bytes.as_ptr(), source_pointer);
+            assert_eq!(reports.observations().as_ptr(), report_pointer);
+            assert!(!reports.observations().is_empty());
+            assert!(observer.budget_snapshot().retained_bytes > baseline);
+            drop(backing);
+            drop(reports);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, live.work);
+            assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn found_unit_name_owner_physical_headers_refund_individually_and_refuse_before_parse_copy() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let texts = [
+            "unit Wrong;",
+            "{comment}\nunit Space . Other;",
+            "{$IFDEF NO} unit Other;",
+            "// line\n(* comment *) unit _Name123;",
+            "unit Bad..Name;",
+            "unit Other; implementation end.",
+        ];
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        for (index, text) in texts.iter().enumerate() {
+            let path = dir.path().join(format!("Header{index}.pas"));
+            fs::write(&path, text).unwrap();
+            let entry = resolver.context.path_entry_for(&path).unwrap();
+            let source = resolver
+                .store
+                .load_admitted(
+                    SourceRequest {
+                        path: &path,
+                        entry: &entry,
+                        read_policy: &resolver.context.read_policy,
+                        legacy_route: None,
+                        kind: SourceKind::Unit,
+                        max_bytes: 4096,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let before = budget.snapshot();
+            let name = owned_header_name(
+                source.analysis_bytes().as_ref(),
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+            assert_eq!(
+                name.as_ref().map(|s| s.as_str()),
+                admitted_header_name(source.analysis_bytes().as_ref())
+                    .map(canonical_unit_name)
+                    .as_deref(),
+                "bounded header semantics unchanged for {text}"
+            );
+            if let Some(name) = name {
+                assert_eq!(
+                    budget.snapshot().retained_bytes,
+                    before.retained_bytes
+                        + std::mem::size_of::<AdmittedOwned<String>>()
+                        + name.capacity()
+                );
+                let spent = budget.snapshot();
+                drop(name);
+                assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+                assert_eq!(budget.snapshot().work, spent.work);
+                assert_eq!(budget.snapshot().byte_work, spent.byte_work);
+            } else {
+                assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+            }
+            assert!(!source.bytes.is_empty());
+        }
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        assert!(matches!(
+            owned_header_name(b"unit Other;", &mut budget, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(budget.snapshot(), before);
+        let mut limits = CompileTimeLimits::default();
+        limits.max_work = 0;
+        let mut exhausted = CompileTimeBudget::new(limits, &NoCancellation);
+        assert!(matches!(
+            owned_header_name(b"unit Other;", &mut exhausted, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(exhausted.snapshot().work, 0);
+        // Parser control fits, copied name/control does not. The admitted parse
+        // walk remains spent on this later receiving refusal.
+        let limits = CompileTimeLimits::default();
+        let mut tight = CompileTimeBudget::new(limits, &NoCancellation);
+        let observer = tight
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut tight)
+            .unwrap();
+        let base = tight.snapshot();
+        tight
+            .constrain_retained(base.retained_bytes + std::mem::size_of::<AdmittedOwned<()>>())
+            .unwrap();
+        assert!(matches!(
+            owned_header_name(b"unit Other;", &mut tight, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(tight.snapshot().retained_bytes, base.retained_bytes);
+        assert_eq!(tight.snapshot().work, base.work + 8 * b"unit Other;".len());
+        assert_eq!(observer.budget_snapshot().work, tight.snapshot().work);
+    }
+
+    #[test]
+    fn found_unit_name_owner_actual_callback_cancel_error_and_header_unwind_drop_temporary_names() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stopped = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stopped && self.panic {
+                    panic!("owned header cancellation callback unwind")
+                }
+                stopped
+            }
+        }
+        let mut complete = false;
+        let mut cancelled = 0;
+        for stop in 0..500 {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            fs::write(
+                dir.path().join("Other.pas"),
+                "unit Rejected; interface end.",
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join("Space.Other.pas"),
+                "unit Space.Other; interface implementation end.",
+            )
+            .unwrap();
+            resolver.context.unit_namespaces = vec!["Space".into()];
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let prior = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "value.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match resolver.unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &Poll {
+                    calls: 0.into(),
+                    stop,
+                    panic: false,
+                },
+            ) {
+                Err(ResolverError::Cancelled) => cancelled += 1,
+                Ok(out) => {
+                    assert!(
+                        matches!(out.result(),Resolution::Found(p) if p.unit.requested_name=="Other" && p.unit.declared_name=="Space.Other")
+                    );
+                    drop(out);
+                    complete = true;
+                }
+                Err(other) => panic!("unexpected unit error at {stop}: {other:?}"),
+            }
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(matches!(prior.result(), Resolution::Found(_)));
+            drop(prior);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline,
+                "no name/coordinator/provider leak at poll {stop}"
+            );
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        assert!(cancelled > 20);
+        let (dir, root, mut resolver) = physical_report_resolver();
+        fs::remove_file(dir.path().join("Other.pas")).unwrap();
+        fs::create_dir(dir.path().join("Other.pas")).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let out = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(matches!(
+            out.result(),
+            Resolution::Incomplete { .. } | Resolution::Unavailable { .. }
+        ));
+        drop(out);
+        drop(resolver);
+        assert_eq!(budget.snapshot().retained_bytes, baseline);
+        let before = budget.snapshot();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = owned_header_name(
+                b"{long comment} unit Space.Other;",
+                &mut budget,
+                &Poll {
+                    calls: 0.into(),
+                    stop: 12,
+                    panic: true,
+                },
+            );
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        assert!(budget.snapshot().work > before.work);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
     }
 
     #[test]

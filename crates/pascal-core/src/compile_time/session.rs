@@ -3063,6 +3063,157 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unit_reason_owner_provider_engine_discards_failure_but_preserves_exact_reports() {
+        struct Recording {
+            inner: crate::UnitResolver<crate::FilesystemSourceStore>,
+            seen: bool,
+            warnings: Vec<String>,
+            observations: Vec<ResolutionObservation>,
+        }
+        impl CompileTimeResolver for Recording {
+            fn unit_report_capability(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<AdmittedCapabilityOutcome<AdmittedProviderSource>, ResolverError>
+            {
+                let out = self.inner.unit_report_capability(r, b, c)?;
+                assert!(
+                    matches!(out.result(),Resolution::Unavailable {reason}|Resolution::Incomplete {reason,..} if !reason.is_empty())
+                );
+                // Explicit bounded test-only evidence copies, never production
+                // constructors used to manufacture the reason owner.
+                assert!(out.reports().observations().len() < 32);
+                assert!(out.reports().warnings().len() < 8);
+                self.observations = out.reports().observations().to_vec();
+                self.warnings = out.reports().warnings().to_vec();
+                self.seen = true;
+                Ok(out)
+            }
+            fn unit(
+                &mut self,
+                r: UnitResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<ProviderSource>, ResolverError> {
+                self.inner.unit(r, b, c)
+            }
+            fn include(
+                &mut self,
+                r: IncludeResolveRequest<'_>,
+                b: &mut CompileTimeBudget<'_>,
+                c: &dyn CancellationToken,
+            ) -> Result<ResolutionOutcome<LoadedSource>, ResolverError> {
+                self.inner.include(r, b, c)
+            }
+        }
+        for failed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Main.pas");
+            std::fs::write(&path,"unit Main; interface uses Broken; {$IF SizeOf(Broken.T)=8}{$DEFINE HIT}{$ENDIF} implementation end.").unwrap();
+            if failed {
+                std::fs::create_dir(dir.path().join("Broken.pas")).unwrap();
+            }
+            let mut project = pascal_project::ProjectContext::discover(
+                &path,
+                &[dir.path().into()],
+                &Default::default(),
+            )
+            .unwrap();
+            if failed {
+                let bad = dir.path().join("Broken.pas");
+                let entry = project.path_entry_for(&bad).unwrap();
+                project
+                    .explicit_unit_entries
+                    .insert("broken".into(), vec![entry]);
+            }
+            let context = ConditionalContext::default()
+                .with_compiler_version(pascal_project::CompilerVersion::new(37, 0))
+                .with_layout(pascal_project::LayoutContext {
+                    platform: Some(pascal_project::LayoutPlatform::Win32),
+                    defaults: Default::default(),
+                });
+            let mut inner = crate::UnitResolver::new(
+                project,
+                vec![dir.path().into()],
+                crate::FilesystemSourceStore::new(),
+                Default::default(),
+            );
+            let root = inner
+                .load_source(&path, None, crate::SourceKind::Unit, &crate::NoCancellation)
+                .unwrap();
+            let mut recording = Recording {
+                inner,
+                seen: false,
+                warnings: Vec::new(),
+                observations: Vec::new(),
+            };
+            let mut budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let output = analyze_source_in_session(
+                &root,
+                &context,
+                &mut recording,
+                &mut budget,
+                &crate::NoCancellation,
+            )
+            .unwrap();
+            assert!(
+                recording.seen,
+                "real ProviderEngine reaches owning unit failure"
+            );
+            assert!(
+                !output
+                    .root
+                    .directives
+                    .iter()
+                    .any(|d| d.body == "DEFINE HIT" && d.activity == Truth::True)
+            );
+            assert_eq!(
+                output.facts.interfaces[0].failure,
+                Some(UnknownReason::UnresolvedName)
+            );
+            assert!(output.facts.interfaces[0].provided.is_none());
+            for warning in &recording.warnings {
+                assert!(
+                    output.warnings.contains(warning),
+                    "exact warning text transferred independently"
+                );
+            }
+            for observation in &recording.observations {
+                assert!(
+                    output.observations.contains(observation),
+                    "exact source/authorization provenance transferred independently"
+                );
+            }
+            if failed {
+                assert!(
+                    recording
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("Broken.pas") && w.contains("unauthorized"))
+                );
+            }
+            drop(recording);
+            drop(root);
+            drop(budget);
+            let spent = observer.budget_snapshot();
+            assert!(spent.retained_bytes > baseline);
+            drop(output);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+        }
+    }
+
+    #[test]
     fn found_unit_name_owner_provider_engine_preserves_original_names_and_captured_alias() {
         struct Recording {
             inner: crate::UnitResolver<crate::FilesystemSourceStore>,

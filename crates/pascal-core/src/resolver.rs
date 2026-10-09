@@ -834,13 +834,18 @@ impl<T> AdmittedCapabilityResult<T> {
         incomplete: bool,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<Self, ResolverError> {
+        Self::reason_with_candidates(reason, incomplete, Vec::new(), budget)
+    }
+    fn reason_with_candidates(
+        reason: AdmittedOwned<String>,
+        incomplete: bool,
+        candidates: Vec<ResolutionCandidate>,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<Self, ResolverError> {
         let value = reason
             .map_value(budget, |reason| {
                 if incomplete {
-                    Resolution::Incomplete {
-                        reason,
-                        candidates: Vec::new(),
-                    }
+                    Resolution::Incomplete { reason, candidates }
                 } else {
                     Resolution::Unavailable { reason }
                 }
@@ -1266,6 +1271,8 @@ pub struct UnitResolver<S> {
     compile_time_caches: Vec<StoreRoot>,
     callback_reports: Option<CallbackReports>,
     callback_include_reason: Option<AdmittedOwned<String>>,
+    callback_unit_reason: Option<AdmittedOwned<String>>,
+    owning_unit_reason: bool,
     owning_include_callback: bool,
     owning_unit_callback: bool,
     callback_unit_names: Option<OwnedUnitNames>,
@@ -1285,6 +1292,8 @@ struct CallbackReportCall<'a, S: SourceStore> {
     resolver: &'a mut UnitResolver<S>,
     previous: Option<CallbackReports>,
     previous_reason: Option<AdmittedOwned<String>>,
+    previous_unit_reason: Option<AdmittedOwned<String>>,
+    previous_unit_reason_mode: bool,
     previous_include: bool,
     previous_unit: bool,
     previous_names: Option<OwnedUnitNames>,
@@ -1305,6 +1314,8 @@ impl<S: SourceStore> Drop for CallbackReportCall<'_, S> {
     fn drop(&mut self) {
         self.resolver.callback_reports = self.previous.take();
         self.resolver.callback_include_reason = self.previous_reason.take();
+        self.resolver.callback_unit_reason = self.previous_unit_reason.take();
+        self.resolver.owning_unit_reason = self.previous_unit_reason_mode;
         self.resolver.owning_include_callback = self.previous_include;
         self.resolver.owning_unit_callback = self.previous_unit;
         self.resolver.callback_unit_names = self.previous_names.take();
@@ -1339,6 +1350,25 @@ impl<S: SourceStore> CallbackReportCall<'_, S> {
             drop(result);
             return Ok(AdmittedCapabilityOutcome {
                 result: AdmittedCapabilityResult::reason(reason, incomplete, budget)?,
+                reports,
+            });
+        }
+        if let Some(reason) = self.resolver.callback_unit_reason.take() {
+            let (incomplete, candidates) = match result {
+                Resolution::Unavailable { reason } if reason.is_empty() => (false, Vec::new()),
+                Resolution::Incomplete { reason, candidates } if reason.is_empty() => {
+                    (true, candidates)
+                }
+                _ => {
+                    return Err(ResolverError::InvalidRequest(
+                        "unit reason constructor/handoff mismatch".into(),
+                    ));
+                }
+            };
+            return Ok(AdmittedCapabilityOutcome {
+                result: AdmittedCapabilityResult::reason_with_candidates(
+                    reason, incomplete, candidates, budget,
+                )?,
                 reports,
             });
         }
@@ -1482,6 +1512,8 @@ impl<S: SourceStore> UnitResolver<S> {
     fn callback_report_call(&mut self) -> CallbackReportCall<'_, S> {
         let previous = self.callback_reports.replace(CallbackReports::Requested);
         let previous_reason = self.callback_include_reason.take();
+        let previous_unit_reason = self.callback_unit_reason.take();
+        let previous_unit_reason_mode = std::mem::replace(&mut self.owning_unit_reason, false);
         let previous_include = std::mem::replace(&mut self.owning_include_callback, false);
         let previous_unit = std::mem::replace(&mut self.owning_unit_callback, false);
         let previous_names = self.callback_unit_names.take();
@@ -1490,6 +1522,8 @@ impl<S: SourceStore> UnitResolver<S> {
             resolver: self,
             previous,
             previous_reason,
+            previous_unit_reason,
+            previous_unit_reason_mode,
             previous_include,
             previous_unit,
             previous_names,
@@ -2098,6 +2132,8 @@ impl<S: SourceStore> UnitResolver<S> {
             compile_time_caches: Vec::new(),
             callback_reports: None,
             callback_include_reason: None,
+            callback_unit_reason: None,
+            owning_unit_reason: false,
             owning_include_callback: false,
             owning_unit_callback: false,
             callback_unit_names: None,
@@ -2951,7 +2987,13 @@ impl<S: SourceStore> UnitResolver<S> {
                     resolver_error_report_bound(&error),
                     format_args!("{error}"),
                 )?;
-                let reason = if self.owning_include_callback {
+                let reason = if self.owning_unit_reason {
+                    self.unit_reason_build(
+                        resolver_error_report_bound(&error),
+                        cancel,
+                        format_args!("{error}"),
+                    )?
+                } else if self.owning_include_callback {
                     self.include_reason_build(
                         resolver_error_report_bound(&error),
                         cancel,
@@ -3076,28 +3118,78 @@ impl<S: SourceStore> UnitResolver<S> {
         cancel: &dyn CancellationToken,
     ) -> Result<Resolution<ResolvedUnit>, ResolverError> {
         self.check_cancel(cancel)?;
+        if self.owning_unit_reason {
+            let count = self
+                .context
+                .unit_namespaces
+                .len()
+                .checked_add(self.context.search_path_entries.len())
+                .and_then(|n| n.checked_add(self.context.browsing_path_entries.len()))
+                .and_then(|n| n.checked_add(self.context.explicit_unit_entries.len()))
+                .ok_or_else(|| {
+                    ResolverError::InvalidRequest("unit lookup sizing work overflow".into())
+                })?;
+            let mut budget = self.store_budget(cancel).expect("owning unit reason root");
+            budget
+                .charge(count, 0, 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            for entries in self.context.explicit_unit_entries.values() {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                budget
+                    .charge(entries.len(), 0, 0)
+                    .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            }
+        }
         let names = self
             .context
             .unit_namespaces
             .iter()
-            .map(|n| n.len() + std::mem::size_of::<String>())
-            .sum::<usize>();
+            .try_fold(0usize, |sum, n| {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                sum.checked_add(n.len())
+                    .and_then(|n| n.checked_add(std::mem::size_of::<String>()))
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("unit namespace sizing overflow".into())
+                    })
+            })?;
         let paths = self
             .context
             .search_path_entries
             .iter()
             .chain(&self.context.browsing_path_entries)
-            .map(|e| e.path.as_os_str().len() + std::mem::size_of::<ProjectPathEntry>())
-            .sum::<usize>();
+            .try_fold(0usize, |sum, e| {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                sum.checked_add(e.path.as_os_str().len())
+                    .and_then(|n| n.checked_add(std::mem::size_of::<ProjectPathEntry>()))
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("unit path sizing overflow".into())
+                    })
+            })?;
         let explicit = self
             .context
             .explicit_unit_entries
             .values()
             .flatten()
-            .map(|e| {
-                2 * e.path.as_os_str().len() + std::mem::size_of::<(PathBuf, ProjectPathEntry)>()
-            })
-            .sum::<usize>();
+            .try_fold(0usize, |sum, e| {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                e.path
+                    .as_os_str()
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(std::mem::size_of::<(PathBuf, ProjectPathEntry)>()))
+                    .and_then(|n| sum.checked_add(n))
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("unit explicit sizing overflow".into())
+                    })
+            })?;
         let reserve = paths
             .saturating_mul(2)
             .saturating_add(explicit.saturating_mul(2))
@@ -3110,6 +3202,18 @@ impl<S: SourceStore> UnitResolver<S> {
         self.admit_lookup_storage(1, reserve, reserve, cancel)?;
         let requested = request.requested_name.trim();
         if requested.is_empty() {
+            if self.owning_unit_reason {
+                self.report.complete = false;
+                self.diagnostic_args(cancel, 18, format_args!("unit name is empty"))?;
+                return Ok(Resolution::Incomplete {
+                    reason: self.unit_reason_build(
+                        18,
+                        cancel,
+                        format_args!("unit name is empty"),
+                    )?,
+                    candidates: Vec::new(),
+                });
+            }
             return Err(ResolverError::InvalidRequest(
                 "unit name is empty".to_string(),
             ));
@@ -3117,16 +3221,86 @@ impl<S: SourceStore> UnitResolver<S> {
         if !self.context.can_resolve_units() {
             self.diagnostic_args(cancel, 30, format_args!("project metadata is incomplete"))?;
             return Ok(Resolution::Incomplete {
-                reason: "project metadata is incomplete".to_string(),
+                reason: self.unit_reason_build(
+                    30,
+                    cancel,
+                    format_args!("project metadata is incomplete"),
+                )?,
                 candidates: Vec::new(),
             });
         }
         let lookup = aliased_name(&self.context, requested);
-        if let Some(issue) = self.context.missing_explicit_unit(&lookup) {
-            let reason = issue.path.as_ref().map_or_else(
-                || format!("explicit unit {lookup} is missing"),
-                |path| format!("explicit unit {lookup} is missing: {}", path.display()),
-            );
+        let missing_issue = if self.owning_unit_reason {
+            let mut budget = self.store_budget(cancel).expect("owning unit reason root");
+            budget
+                .charge(self.context.path_issues.len(), 0, 0)
+                .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+            let mut found = None;
+            for issue in &self.context.path_issues {
+                if cancel.is_cancelled() {
+                    return Err(ResolverError::Cancelled);
+                }
+                if issue.kind == pascal_project::ProjectPathIssueKind::MissingReference {
+                    if let Some(name) = &issue.unit_name {
+                        budget
+                            .charge(1, name.len().min(lookup.len()), 0)
+                            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+                        if name.eq_ignore_ascii_case(&lookup) {
+                            found = Some(issue);
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        } else {
+            self.context.missing_explicit_unit(&lookup)
+        };
+        if let Some(issue) = missing_issue {
+            let reason = if self.owning_unit_reason {
+                let mut budget = self.store_budget(cancel).expect("owning unit reason root");
+                let bound = lookup
+                    .len()
+                    .checked_add(64)
+                    .and_then(|n| {
+                        n.checked_add(
+                            issue
+                                .path
+                                .as_ref()
+                                .map_or(Some(0), |p| p.as_os_str().len().checked_mul(4))?,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("explicit unit reason bound overflow".into())
+                    })?;
+                let owner = if let Some(path) = &issue.path {
+                    build_unit_reason(
+                        &mut budget,
+                        bound,
+                        cancel,
+                        format_args!("explicit unit {lookup} is missing: {}", path.display()),
+                    )?
+                } else {
+                    build_unit_reason(
+                        &mut budget,
+                        bound,
+                        cancel,
+                        format_args!("explicit unit {lookup} is missing"),
+                    )?
+                };
+                if self.callback_unit_reason.is_some() {
+                    return Err(ResolverError::InvalidRequest(
+                        "duplicate unit reason construction".into(),
+                    ));
+                }
+                self.callback_unit_reason = Some(owner);
+                String::new()
+            } else {
+                issue.path.as_ref().map_or_else(
+                    || format!("explicit unit {lookup} is missing"),
+                    |path| format!("explicit unit {lookup} is missing: {}", path.display()),
+                )
+            };
             return Ok(Resolution::Incomplete {
                 reason,
                 candidates: Vec::new(),
@@ -3245,7 +3419,13 @@ impl<S: SourceStore> UnitResolver<S> {
             self.package_lookup_for_unit(requested, &lookup, request.legacy_route, cancel)
         } else {
             Ok(Resolution::Unavailable {
-                reason: format!("no authorized unit candidate for {requested}"),
+                reason: self.unit_reason_build(
+                    requested.len().checked_add(40).ok_or_else(|| {
+                        ResolverError::InvalidRequest("unit reason bound overflow".into())
+                    })?,
+                    cancel,
+                    format_args!("no authorized unit candidate for {requested}"),
+                )?,
             })
         }
     }
@@ -3278,10 +3458,23 @@ impl<S: SourceStore> UnitResolver<S> {
         let listing = self.list_directory(&directory, &entry, legacy_route, cancel, false)?;
         if !listing.complete {
             return Ok(Some(Resolution::Incomplete {
-                reason: format!(
-                    "directory scan under {} was incomplete",
-                    directory.display()
-                ),
+                reason: self.unit_reason_build(
+                    directory
+                        .as_os_str()
+                        .len()
+                        .checked_mul(4)
+                        .and_then(|n| n.checked_add(64))
+                        .ok_or_else(|| {
+                            ResolverError::InvalidRequest(
+                                "directory unit reason bound overflow".into(),
+                            )
+                        })?,
+                    cancel,
+                    format_args!(
+                        "directory scan under {} was incomplete",
+                        directory.display()
+                    ),
+                )?,
                 candidates: Vec::new(),
             }));
         }
@@ -3346,7 +3539,11 @@ impl<S: SourceStore> UnitResolver<S> {
                     }
                     CaseInsensitiveLookup::Incomplete => {
                         return Ok(Some(Resolution::Incomplete {
-                            reason: "case-insensitive path lookup was incomplete".to_string(),
+                            reason: self.unit_reason_build(
+                                48,
+                                cancel,
+                                format_args!("case-insensitive path lookup was incomplete"),
+                            )?,
                             candidates: Vec::new(),
                         }));
                     }
@@ -3357,10 +3554,23 @@ impl<S: SourceStore> UnitResolver<S> {
                         self.list_directory(&nested, &nested_entry, legacy_route, cancel, false)?;
                     if !nested_listing.complete {
                         return Ok(Some(Resolution::Incomplete {
-                            reason: format!(
-                                "directory scan under {} was incomplete",
-                                nested.display()
-                            ),
+                            reason: self.unit_reason_build(
+                                nested
+                                    .as_os_str()
+                                    .len()
+                                    .checked_mul(4)
+                                    .and_then(|n| n.checked_add(64))
+                                    .ok_or_else(|| {
+                                        ResolverError::InvalidRequest(
+                                            "nested directory unit reason bound overflow".into(),
+                                        )
+                                    })?,
+                                cancel,
+                                format_args!(
+                                    "directory scan under {} was incomplete",
+                                    nested.display()
+                                ),
+                            )?,
                             candidates: Vec::new(),
                         }));
                     }
@@ -3671,7 +3881,11 @@ impl<S: SourceStore> UnitResolver<S> {
                         format_args!("unit candidate {} is unauthorized", path.display()),
                     )?;
                     return Ok(Some(Resolution::Incomplete {
-                        reason: "unit candidate is unauthorized".to_string(),
+                        reason: self.unit_reason_build(
+                            32,
+                            cancel,
+                            format_args!("unit candidate is unauthorized"),
+                        )?,
                         candidates,
                     }));
                 }
@@ -3685,6 +3899,11 @@ impl<S: SourceStore> UnitResolver<S> {
                         128 + 4 * path.as_os_str().len() + reason.len(),
                         format_args!("unit candidate {} is incomplete: {reason}", path.display()),
                     )?;
+                    let reason = if self.owning_unit_reason {
+                        self.unit_reason_build(reason.len(), cancel, format_args!("{reason}"))?
+                    } else {
+                        reason
+                    };
                     return Ok(Some(Resolution::Incomplete { reason, candidates }));
                 }
                 Err(error) => {
@@ -3693,7 +3912,11 @@ impl<S: SourceStore> UnitResolver<S> {
                         source_error_report_bound(&error),
                         format_args!("unit candidate could not be loaded: {error:?}"),
                     )?;
-                    let reason = format!("unit candidate could not be loaded: {error:?}");
+                    let reason = self.unit_reason_build(
+                        source_error_report_bound(&error),
+                        cancel,
+                        format_args!("unit candidate could not be loaded: {error:?}"),
+                    )?;
                     return Ok(Some(Resolution::Incomplete { reason, candidates }));
                 }
             }
@@ -4555,6 +4778,28 @@ impl<S: SourceStore> UnitResolver<S> {
             })
             .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
         Ok(provider)
+    }
+
+    fn unit_reason_build(
+        &mut self,
+        bound: usize,
+        cancel: &dyn CancellationToken,
+        args: std::fmt::Arguments<'_>,
+    ) -> Result<String, ResolverError> {
+        if !self.owning_unit_reason {
+            return Ok(args.to_string());
+        }
+        if self.callback_unit_reason.is_some() {
+            return Err(ResolverError::InvalidRequest(
+                "duplicate unit reason construction".into(),
+            ));
+        }
+        let mut budget = self.store_budget(cancel).ok_or_else(|| {
+            ResolverError::InvalidRequest("unit reason requires admitted callback root".into())
+        })?;
+        let owner = build_unit_reason(&mut budget, bound, cancel, args)?;
+        self.callback_unit_reason = Some(owner);
+        Ok(String::new())
     }
 
     fn include_reason_build(
@@ -5501,9 +5746,11 @@ impl<S: SourceStore> UnitResolver<S> {
             // capability. Never invoke its legacy transitive reader under a
             // typed root and pretend later catalogue charges admitted that IO.
             let reason = "package metadata has no admitted compile-time reader";
-            self.admit_lookup_storage(1, reason.len(), reason.len(), cancel)?;
+            if !self.owning_unit_reason {
+                self.admit_lookup_storage(1, reason.len(), reason.len(), cancel)?;
+            }
             return Ok(Resolution::Incomplete {
-                reason: reason.into(),
+                reason: self.unit_reason_build(reason.len(), cancel, format_args!("{reason}"))?,
                 candidates: vec![],
             });
         }
@@ -5985,6 +6232,7 @@ impl<S: SourceStore> crate::compile_time::CompileTimeResolver for UnitResolver<S
     {
         let mut call = self.callback_report_call();
         call.owning_unit_callback = true;
+        call.owning_unit_reason = true;
         let outcome = crate::compile_time::CompileTimeResolver::unit_capability(
             &mut *call, request, budget, cancel,
         )?;
@@ -6845,6 +7093,26 @@ fn admitted_header_name(bytes: &[u8]) -> Option<&str> {
         }
     }
     (!start).then_some(name)
+}
+
+fn build_unit_reason(
+    budget: &mut CompileTimeBudget<'_>,
+    bound: usize,
+    cancel: &dyn CancellationToken,
+    args: std::fmt::Arguments<'_>,
+) -> Result<AdmittedOwned<String>, ResolverError> {
+    budget.admit_fallible(1, bound, bound, crate::compile_time::resolver_error, || {
+        use std::fmt::Write;
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        let mut reason = String::with_capacity(bound);
+        reason.write_fmt(args).expect("unit reason formatting");
+        if cancel.is_cancelled() {
+            return Err(ResolverError::Cancelled);
+        }
+        Ok(reason)
+    })
 }
 
 fn owned_header_name(
@@ -8627,6 +8895,69 @@ mod tests {
     }
 
     #[test]
+    fn unit_reason_owner_physical_missing_and_empty_outlive_resolver_and_reports() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for requested in ["Missing", ""] {
+            let (_dir, root, mut resolver) = physical_report_resolver();
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let out = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: requested,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let (result, reports) = out.into_parts();
+            assert!(
+                result.owns_reason(),
+                "actual production unit reason must retain its original construction owner"
+            );
+            let reason = match result.result() {
+                Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
+                    reason
+                }
+                _ => panic!("unit failure"),
+            };
+            let pointer = reason.as_ptr();
+            let capacity = reason.capacity();
+            assert!(!reason.is_empty());
+            drop(reports);
+            drop(resolver);
+            drop(budget);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline
+                    + capacity
+                    + std::mem::size_of::<
+                        AdmittedOwned<Resolution<crate::compile_time::AdmittedProviderSource>>,
+                    >()
+            );
+            let reason = match result.result() {
+                Resolution::Unavailable { reason } | Resolution::Incomplete { reason, .. } => {
+                    reason
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(reason.as_ptr(), pointer);
+            let spent = observer.budget_snapshot();
+            drop(result);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+        }
+    }
+
+    #[test]
     fn include_reason_owner_real_root_and_provider_child_failure_consumers() {
         use crate::compile_time::{AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver};
         struct Recording {
@@ -8769,6 +9100,405 @@ mod tests {
             assert_eq!(observer.budget_snapshot().work, live.work);
             assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
         }
+    }
+
+    #[test]
+    fn unit_reason_owner_actual_failure_callback_cancellation_every_poll_preserves_prior_owners() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop
+            }
+        }
+        let mut cancelled = 0;
+        let mut completed = false;
+        for stop in 0..600 {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            let wrong = dir.path().join("A.pas");
+            let bad = dir.path().join("Z.pas");
+            fs::write(&wrong, "unit Wrong;").unwrap();
+            fs::create_dir(&bad).unwrap();
+            let mut first = resolver.context.path_entry_for(&wrong).unwrap();
+            first.path = wrong;
+            let mut second = first.clone();
+            second.path = bad;
+            resolver
+                .context
+                .explicit_unit_entries
+                .insert("broken".into(), vec![first, second]);
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let prior = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: "Other",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let include = resolver
+                .include_capability(
+                    IncludeResolveRequest {
+                        including_path: &root,
+                        byte_range: 0..0,
+                        requested_name: "absent.inc",
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match resolver.unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Broken",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &Poll {
+                    calls: 0.into(),
+                    stop,
+                },
+            ) {
+                Err(ResolverError::Cancelled) => cancelled += 1,
+                Ok(out) => {
+                    assert!(out.result.owns_reason());
+                    assert!(
+                        matches!(out.result(),Resolution::Incomplete {reason,candidates} if reason=="unit candidate is unauthorized" && candidates.len()==1)
+                    );
+                    completed = true;
+                    drop(out);
+                }
+                Err(other) => panic!("unexpected failure at {stop}: {other:?}"),
+            }
+            assert!(resolver.callback_unit_reason.is_none());
+            assert!(resolver.callback_include_reason.is_none());
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(
+                matches!(prior.result(),Resolution::Found(p) if p.unit.requested_name=="Other")
+            );
+            assert!(!prior.reports().observations().is_empty());
+            assert!(
+                matches!(include.result(),Resolution::Unavailable {reason} if reason.contains("absent.inc"))
+            );
+            drop(prior);
+            drop(include);
+            assert_eq!(
+                observer.budget_snapshot().retained_bytes,
+                baseline,
+                "every actual failure callback poll refunds only dead owners: {stop}"
+            );
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+            if completed {
+                break;
+            }
+        }
+        assert!(completed);
+        assert!(cancelled > 20);
+    }
+
+    #[test]
+    fn unit_reason_owner_original_callback_pointer_transfer_and_foreign_root_refusal() {
+        use crate::compile_time::{AdmittedProviderSource, CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let Resolution::Found(provider) = prior.result() else {
+            panic!("physical prior provider")
+        };
+        let source = provider.unit.source.bytes.as_ptr();
+        let requested = provider.unit.requested_name.as_ptr();
+        let declared = provider.unit.declared_name.as_ptr();
+        let mut call = resolver.callback_report_call();
+        call.owning_unit_callback = true;
+        call.owning_unit_reason = true;
+        let out = CompileTimeResolver::unit_capability(
+            &mut *call,
+            UnitResolveRequest {
+                importer_path: &root,
+                requested_name: "Absent",
+                legacy_route: None,
+            },
+            &mut budget,
+            &NoCancellation,
+        )
+        .unwrap();
+        let pointer = call.callback_unit_reason.as_ref().unwrap().as_ptr();
+        let before = budget.snapshot();
+        let out = call.finish(out.result, &mut budget).unwrap();
+        assert_eq!(
+            budget.snapshot().byte_work,
+            before.byte_work,
+            "owning callback handoff cannot copy the original reason payload"
+        );
+        let (result, reports) = out.into_parts();
+        assert!(
+            matches!(result.result(),Resolution::Unavailable {reason} if reason.as_ptr()==pointer)
+        );
+        let mut receiver = budget
+            .admit_owned(0, 0, 0, || None::<Resolution<AdmittedProviderSource>>)
+            .unwrap();
+        let before = budget.snapshot();
+        result
+            .move_reason_into(&mut receiver, &budget, |to, value| *to = Some(value))
+            .unwrap();
+        assert_eq!(budget.snapshot().byte_work, before.byte_work);
+        assert!(
+            matches!(&*receiver,Some(Resolution::Unavailable {reason}) if reason.as_ptr()==pointer)
+        );
+        let other_out = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Absent",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let (other_result, other_reports) = other_out.into_parts();
+        let mut other = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut foreign = other
+            .admit_owned(0, 0, 0, || None::<Resolution<AdmittedProviderSource>>)
+            .unwrap();
+        let before = other.snapshot();
+        assert!(
+            other_result
+                .move_reason_into(&mut foreign, &other, |to, value| *to = Some(value))
+                .is_err()
+        );
+        assert_eq!(other.snapshot(), before);
+        assert!(foreign.is_none());
+        assert_eq!(provider.unit.source.bytes.as_ptr(), source);
+        assert_eq!(provider.unit.requested_name.as_ptr(), requested);
+        assert_eq!(provider.unit.declared_name.as_ptr(), declared);
+        assert!(!prior.reports().observations().is_empty());
+        assert!(reports.warnings().is_empty());
+        assert!(other_reports.warnings().is_empty());
+    }
+
+    #[test]
+    fn unit_reason_owner_actual_partial_candidate_error_and_incomplete_tiers() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for scenario in 0..6 {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            if scenario == 0 {
+                let wrong = dir.path().join("A.pas");
+                let bad = dir.path().join("Z.pas");
+                fs::write(&wrong, "unit Wrong;").unwrap();
+                fs::create_dir(&bad).unwrap();
+                let mut first = resolver.context.path_entry_for(&wrong).unwrap();
+                first.path = wrong;
+                let mut second = first.clone();
+                second.path = bad;
+                resolver
+                    .context
+                    .explicit_unit_entries
+                    .insert("broken".into(), vec![first, second]);
+            } else if scenario == 1 {
+                resolver.context.discovery_complete = false;
+                resolver.context.binding_metadata_complete = false;
+            } else if scenario == 2 {
+                resolver.context.packages = vec!["UnadmittedPackage".into()];
+            } else if scenario == 3 {
+                resolver.limits.max_source_bytes = 1;
+            } else if scenario == 4 {
+                let missing = dir.path().join("Never.pas");
+                let entry = resolver.context.path_entry_for(&missing).unwrap();
+                resolver
+                    .context
+                    .path_issues
+                    .push(pascal_project::ProjectPathIssue {
+                        kind: pascal_project::ProjectPathIssueKind::MissingReference,
+                        source_file: root.clone(),
+                        property: "DCCReference".into(),
+                        raw: "Never.pas".into(),
+                        path: Some(missing),
+                        unit_name: Some("Absent".into()),
+                        provenance: entry.provenance,
+                    });
+            } else {
+                resolver.limits.max_directory_entries = 0;
+            }
+            let requested = if scenario == 0 {
+                "Broken"
+            } else if scenario == 3 {
+                "Other"
+            } else {
+                "Absent"
+            };
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let out = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        importer_path: &root,
+                        requested_name: requested,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            let Resolution::Incomplete { reason, candidates } = out.result() else {
+                panic!("actual incomplete unit scenario {scenario}")
+            };
+            assert!(!reason.is_empty());
+            assert!(out.result.owns_reason());
+            if scenario == 0 {
+                assert_eq!(reason, "unit candidate is unauthorized");
+                assert!(
+                    out.reports().warnings().iter().any(
+                        |warning| warning.contains("Z.pas") && warning.contains("unauthorized")
+                    )
+                );
+                assert_eq!(candidates.len(), 1);
+                assert!(candidates[0].path.ends_with("A.pas"));
+                assert_eq!(candidates[0].declared_name.as_deref(), Some("Wrong"));
+                assert!(out.reports().observations().iter().any(|o|matches!(o,ResolutionObservation::Payload {path,..} if path.ends_with("A.pas"))));
+            }
+            if scenario == 1 {
+                assert_eq!(reason, "project metadata is incomplete");
+            }
+            if scenario == 2 {
+                assert_eq!(
+                    reason,
+                    "package metadata has no admitted compile-time reader"
+                );
+            }
+            if scenario == 3 {
+                assert!(reason.contains("TooLarge"));
+            }
+            if scenario == 4 {
+                assert!(reason.starts_with("explicit unit Absent is missing:"));
+                assert!(reason.ends_with("Never.pas"));
+            }
+            if scenario == 5 {
+                assert!(reason.starts_with("directory scan under "));
+                assert!(reason.ends_with("was incomplete"));
+                assert!(out.reports().observations().iter().any(|o| matches!(
+                    o,
+                    ResolutionObservation::Directory {
+                        complete: false,
+                        ..
+                    }
+                )));
+            }
+            let pointer = reason.as_ptr();
+            let (result, reports) = out.into_parts();
+            drop(reports);
+            drop(resolver);
+            drop(budget);
+            assert!(
+                matches!(result.result(),Resolution::Incomplete {reason,..} if reason.as_ptr()==pointer)
+            );
+            assert!(
+                result.into_unmigrated().is_err(),
+                "candidate-bearing result cannot naked-extract its migrated reason"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_reason_owner_actual_constructor_refuses_before_format_and_unwinds() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        struct Format<'a>(&'a std::cell::Cell<usize>, bool);
+        impl std::fmt::Display for Format<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.set(self.0.get() + 1);
+                if self.1 {
+                    panic!("unit reason formatter unwind")
+                }
+                f.write_str("unit failure")
+            }
+        }
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let prior = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    importer_path: &root,
+                    requested_name: "Other",
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let before = budget.snapshot();
+        budget.constrain_retained(before.retained_bytes).unwrap();
+        let mut call = resolver.callback_report_call();
+        call.owning_unit_reason = true;
+        {
+            let mut store = call.store_call(&mut budget).unwrap();
+            let b = store.store_budget(&NoCancellation).unwrap();
+            let before = b.snapshot();
+            assert!(matches!(
+                store.unit_reason_build(
+                    128,
+                    &NoCancellation,
+                    format_args!("{}", Format(&calls, false))
+                ),
+                Err(ResolverError::LimitExceeded { .. })
+            ));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(b.snapshot(), before);
+        }
+        drop(call);
+        let mut fresh = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = fresh
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut fresh)
+            .unwrap();
+        let baseline = fresh.snapshot().retained_bytes;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut call = resolver.callback_report_call();
+            call.owning_unit_reason = true;
+            let mut store = call.store_call(&mut fresh).unwrap();
+            let _ = store.unit_reason_build(
+                128,
+                &NoCancellation,
+                format_args!("{}", Format(&calls, true)),
+            );
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(calls.get(), 1);
+        assert!(resolver.callback_unit_reason.is_none());
+        assert!(!resolver.owning_unit_reason);
+        let spent = fresh.snapshot();
+        drop(resolver);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert!(spent.work > 0);
+        assert!(spent.byte_work >= 128);
+        assert!(matches!(prior.result(), Resolution::Found(_)));
+        assert!(!prior.reports().observations().is_empty());
     }
 
     #[test]

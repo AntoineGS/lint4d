@@ -63,6 +63,7 @@ pub struct Fixture {
     pub max_include_depth: usize,
     pub requests: Vec<(std::path::PathBuf, std::ops::Range<usize>, String)>,
     pub include_warnings: Vec<String>,
+    pub unit_requests: Vec<(std::path::PathBuf, String)>,
     includes: std::collections::BTreeMap<String, LoadedSource>,
     failures: std::collections::BTreeMap<String, Resolution<LoadedSource>>,
     denied: std::collections::BTreeSet<String>,
@@ -80,6 +81,7 @@ impl Fixture {
             max_include_depth: 64,
             requests: vec![],
             include_warnings: vec![],
+            unit_requests: vec![],
             includes: Default::default(),
             failures: Default::default(),
             denied: Default::default(),
@@ -206,6 +208,17 @@ impl CompileTimeResolver for Fixture {
         if cancel.is_cancelled() {
             return Err(ResolverError::Cancelled);
         }
+        budget
+            .charge(
+                1,
+                request.importer_path.as_os_str().len() + request.requested_name.len(),
+                std::mem::size_of::<(std::path::PathBuf, String)>()
+                    + request.importer_path.as_os_str().len()
+                    + request.requested_name.len(),
+            )
+            .map_err(|_| ResolverError::InvalidRequest("fixture unit origin budget".into()))?;
+        self.unit_requests
+            .push((request.importer_path.into(), request.requested_name.into()));
         budget
             .charge(1, request.requested_name.len(), 0)
             .map_err(|_| ResolverError::InvalidRequest("fixture unit budget".into()))?;

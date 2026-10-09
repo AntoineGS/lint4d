@@ -12,6 +12,30 @@ pub struct SizeOfOperand {
     selectors: Vec<Selector>,
 }
 
+impl SizeOfOperand {
+    pub(super) fn leading_name(
+        &self,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(String, bool), IncompleteReason> {
+        budget.charge(self.selectors.len() + 1, self.text.len(), self.text.len())?;
+        let mut name = String::with_capacity(self.text.len());
+        name.push_str(&self.text[self.root.clone()]);
+        for selector in &self.selectors {
+            if let Selector::Field(span) = selector {
+                name.push('.');
+                name.push_str(&self.text[span.clone()]);
+            } else {
+                break;
+            }
+        }
+        let pointers = self
+            .selectors
+            .iter()
+            .any(|s| matches!(s, Selector::Dereference));
+        Ok((name, pointers))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Selector {
     Field(Range<usize>),

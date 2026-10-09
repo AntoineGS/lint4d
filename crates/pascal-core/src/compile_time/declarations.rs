@@ -87,7 +87,7 @@ pub struct CompileTimeState {
     pub(super) option_stack: Vec<Option<crate::conditional::ConditionalEnvironment>>,
     pub(super) conditional: Option<Box<crate::conditional::ConditionalEnvironment>>,
     pub(super) scalar_history: Vec<(Sequence, crate::conditional::ConditionalEnvironment)>,
-    pub(super) pending_imports: Vec<(String, BindingSite)>,
+    pub(super) pending_imports: Vec<super::bindings::ImportIdentity>,
     pub(super) interfaces: Vec<super::bindings::InterfaceFacts>,
     pub(super) interface_only: bool,
     pub(super) interface_complete: bool,
@@ -700,7 +700,7 @@ impl CompileTimeState {
                     self.unknown = true;
                     return Ok(());
                 }
-                self.admit_imports(decl, source.as_bytes(), budget)?;
+                self.admit_imports(decl, source.as_bytes(), prefix.len(), budget)?;
                 self.section = Section::None;
                 return Ok(());
             }
@@ -737,6 +737,7 @@ impl CompileTimeState {
         &mut self,
         node: Node<'_>,
         source: &[u8],
+        prefix: usize,
         budget: &mut CompileTimeBudget<'_>,
     ) -> Result<(), IncompleteReason> {
         if self.site().scope != ScopeId(0) {
@@ -751,15 +752,22 @@ impl CompileTimeState {
             budget.charge(
                 1,
                 text.len(),
-                text.len() + size_of::<(String, BindingSite)>(),
+                text.len() + size_of::<super::bindings::ImportIdentity>(),
             )?;
             let name = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-            self.pending_imports.push((name, self.site()));
+            let logical = self.node_logical_position(node.start_byte(), prefix)?;
+            let opener = self.anchor_at(logical, 1, budget)?;
+            self.pending_imports.reserve_exact(1);
+            self.pending_imports.push(super::bindings::ImportIdentity {
+                name,
+                site: self.site(),
+                opener,
+            });
             return Ok(());
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            self.admit_imports(child, source, budget)?;
+            self.admit_imports(child, source, prefix, budget)?;
         }
         Ok(())
     }
@@ -830,6 +838,7 @@ impl CompileTimeState {
             let name_text = name
                 .utf8_text(bytes)
                 .map_err(|_| IncompleteReason::MalformedSource)?;
+            budget.admit_definition()?;
             let mut type_cursor = node.walk();
             let mut type_fields = node.children_by_field_name("type", &mut type_cursor);
             let first = type_fields.next();
@@ -1160,6 +1169,10 @@ impl CompileTimeState {
                 (_, Fact::Incomplete(reason)) => Fact::Incomplete(reason.clone()),
                 (Fact::Incomplete(_), _) => result,
                 (Fact::Known(a), Fact::Known(b)) if a == b => result,
+                (
+                    Fact::Unknown(UnknownReason::CyclicProvider),
+                    Fact::Unknown(UnknownReason::CyclicProvider),
+                ) => result,
                 _ => Fact::Unknown(UnknownReason::AmbiguousBinding),
             };
             budget.release(budget.snapshot().retained_bytes.saturating_sub(scratch));
@@ -1271,8 +1284,12 @@ impl CompileTimeState {
         for source in &self.provider_sources {
             visit(crate::resolver::loaded_source_metadata_retained(source))?;
         }
-        for (name, _) in &self.pending_imports {
-            visit(size_of::<(String, BindingSite)>() + name.len())?;
+        for identity in &self.pending_imports {
+            visit(
+                size_of::<super::bindings::ImportIdentity>()
+                    + identity.name.len()
+                    + identity.opener.source.as_str().len(),
+            )?;
         }
         for interface in &self.interfaces {
             interface.visit_recovery_payload(visit)?;
@@ -1550,6 +1567,7 @@ pub(super) fn type_expr(
                 budget.limits().max_definitions,
                 "max_definitions",
             )?;
+            budget.admit_definition()?;
             budget.charge(1, 0, size_of::<EnumMember>())?;
             let name_node = member
                 .child_by_field_name("name")

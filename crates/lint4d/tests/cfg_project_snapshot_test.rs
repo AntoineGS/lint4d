@@ -238,7 +238,11 @@ fn adapter_prepares_configured_includes_and_preserves_their_origin() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("target unit");
     assert!(target.is_prepared());
     let included_start = target
@@ -400,7 +404,11 @@ fn adapter_projects_root_define_into_the_include_cfg_context() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("prepared root");
     assert!(
         target
@@ -464,7 +472,11 @@ fn adapter_projects_root_option_transition_into_the_include_cfg_context() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("prepared root");
     assert!(
         target
@@ -595,7 +607,11 @@ fn adapter_prepares_short_nested_conditionals_and_includes_with_exact_spans() {
     };
 
     let snapshot = to_cfg_project_snapshot(project, options).expect("prepared snapshot");
-    assert!(matches!(snapshot.status, CfgSnapshotStatus::Complete));
+    assert!(
+        matches!(snapshot.status, CfgSnapshotStatus::Complete),
+        "{:?}",
+        snapshot.status
+    );
     let target = snapshot.snapshot.units().first().expect("prepared root");
     assert!(target.is_prepared());
     assert!(

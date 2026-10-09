@@ -48,6 +48,9 @@ pub struct CompileTimeBudget<'a> {
     counters: BudgetSnapshot,
     layout_query_depth: usize,
     last_failed_charge: Option<(&'static str, usize, usize)>,
+    definitions: usize,
+    fields: usize,
+    variants: usize,
 }
 
 impl<'a> CompileTimeBudget<'a> {
@@ -63,6 +66,9 @@ impl<'a> CompileTimeBudget<'a> {
             counters: BudgetSnapshot::default(),
             layout_query_depth: 0,
             last_failed_charge: None,
+            definitions: 0,
+            fields: 0,
+            variants: 0,
         }
     }
 
@@ -105,6 +111,34 @@ impl<'a> CompileTimeBudget<'a> {
 
     pub fn snapshot(&self) -> BudgetSnapshot {
         self.counters
+    }
+
+    /// New admitted syntax consumes the request-wide allowance. Snapshot copies
+    /// retain already admitted identities and do not call these methods.
+    pub(super) fn admit_definition(&mut self) -> Result<(), IncompleteReason> {
+        self.charge(1, 0, 0)?;
+        self.definitions = self.admit_counter(
+            self.definitions,
+            1,
+            self.limits.max_definitions,
+            "max_definitions",
+        )?;
+        Ok(())
+    }
+    pub(super) fn admit_field(&mut self) -> Result<(), IncompleteReason> {
+        self.charge(1, 0, 0)?;
+        self.fields = self.admit_counter(self.fields, 1, self.limits.max_fields, "max_fields")?;
+        Ok(())
+    }
+    pub(super) fn admit_variant(&mut self) -> Result<(), IncompleteReason> {
+        self.charge(1, 0, 0)?;
+        self.variants = self.admit_counter(
+            self.variants,
+            1,
+            self.limits.max_variant_alternatives,
+            "max_variant_alternatives",
+        )?;
+        Ok(())
     }
 
     fn admit_counter(

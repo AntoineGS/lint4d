@@ -68,6 +68,24 @@ pub(super) struct InterfaceFacts {
     pub qualifiers: Vec<String>,
     pub site: BindingSite,
     pub graph: Option<std::sync::Arc<CompileTimeState>>,
+    pub pending: PendingProvider,
+    pub attempted: bool,
+    pub provided: Option<super::session::ProviderSource>,
+    pub failure: Option<UnknownReason>,
+}
+
+#[derive(Debug, Clone, Hash)]
+pub(super) struct ImportIdentity {
+    pub name: String,
+    pub site: BindingSite,
+    pub opener: SourceAnchor,
+}
+
+#[derive(Debug, Clone, Hash)]
+pub(super) struct PendingProvider {
+    pub identity: ImportIdentity,
+    pub importer_path: std::path::PathBuf,
+    pub authorized: bool,
 }
 
 impl InterfaceFacts {
@@ -76,6 +94,40 @@ impl InterfaceFacts {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.qualifiers.hash(&mut h);
         self.site.hash(&mut h);
+        self.pending.hash(&mut h);
+        self.attempted.hash(&mut h);
+        self.failure
+            .as_ref()
+            .map(|r| std::mem::discriminant(r))
+            .hash(&mut h);
+        if let Some(provider) = &self.provided {
+            provider.unit.requested_name.hash(&mut h);
+            provider.unit.declared_name.hash(&mut h);
+            provider.context.hash(&mut h);
+            provider.authorized_qualifiers.hash(&mut h);
+            provider.unit.source.id.hash(&mut h);
+            provider.unit.source.path.hash(&mut h);
+            match &provider.unit.source.revision {
+                crate::SourceRevision::Overlay {
+                    version,
+                    content_hash,
+                } => {
+                    version.hash(&mut h);
+                    content_hash.hash(&mut h);
+                }
+                crate::SourceRevision::Disk {
+                    stamp,
+                    content_hash,
+                    read_policy,
+                    path_entry,
+                } => {
+                    stamp.hash(&mut h);
+                    content_hash.hash(&mut h);
+                    read_policy.hash(&mut h);
+                    path_entry.hash(&mut h);
+                }
+            }
+        }
         self.graph.as_ref().map(|g| g.fingerprint()).hash(&mut h);
         h.finish()
     }
@@ -86,6 +138,29 @@ impl InterfaceFacts {
         visit(size_of::<Self>() + self.qualifiers.len() * size_of::<String>())?;
         for qualifier in &self.qualifiers {
             visit(qualifier.len())?;
+        }
+        visit(
+            self.pending.identity.name.len()
+                + self.pending.identity.opener.source.as_str().len()
+                + self.pending.importer_path.as_os_str().len(),
+        )?;
+        if let Some(provider) = &self.provided {
+            visit(
+                crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
+                    + provider.unit.requested_name.len()
+                    + provider.unit.declared_name.len(),
+            )?;
+            provider.context.visit_recovery_payload(visit)?;
+            visit(
+                (provider.context.defines.len()
+                    + provider.context.options.len()
+                    + provider.context.constants.len())
+                    * (size_of::<(String, crate::conditional::ConstantValue)>()
+                        + 4 * size_of::<usize>()),
+            )?;
+            for q in &provider.authorized_qualifiers {
+                visit(size_of::<String>() + q.len())?;
+            }
         }
         if let Some(graph) = &self.graph {
             graph.visit_recovery_payload(visit)?;
@@ -197,7 +272,12 @@ pub(super) fn imported_operand_with_query(
             .trim();
         let Some(graph) = &interface.graph else {
             if qualified || !text.contains('.') {
-                return Ok(Some(Fact::Unknown(UnknownReason::UnresolvedName)));
+                return Ok(Some(Fact::Unknown(
+                    interface
+                        .failure
+                        .clone()
+                        .unwrap_or(UnknownReason::UnresolvedName),
+                )));
             }
             continue;
         };

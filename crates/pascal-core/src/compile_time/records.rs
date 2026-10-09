@@ -41,6 +41,42 @@ struct Alternative {
     parts: Vec<Part>,
 }
 
+pub(super) enum RecordDependency<'a> {
+    Type(&'a TypeExpr),
+    Index(&'a IndexExpr),
+}
+impl Record {
+    pub(super) fn visit_dependencies<E>(
+        &self,
+        visit: &mut impl FnMut(RecordDependency<'_>, &BindingSite) -> Result<(), E>,
+    ) -> Result<(), E> {
+        fn parts<E>(
+            values: &[Part],
+            site: &BindingSite,
+            visit: &mut impl FnMut(RecordDependency<'_>, &BindingSite) -> Result<(), E>,
+        ) -> Result<(), E> {
+            for part in values {
+                match part {
+                    Part::Field { ty, .. } => visit(RecordDependency::Type(ty), site)?,
+                    Part::Variant {
+                        ty, alternatives, ..
+                    } => {
+                        visit(RecordDependency::Type(ty), site)?;
+                        for alternative in alternatives {
+                            for label in &alternative.labels {
+                                visit(RecordDependency::Index(label), site)?;
+                            }
+                            parts(&alternative.parts, site, visit)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        parts(&self.parts, &self.site, visit)
+    }
+}
+
 /// Bind every admitted field, including nested variants. Invalid admission or
 /// duplicate variant names cannot be repaired by selecting a convenient field.
 pub(super) fn operand_field<'a>(
@@ -219,6 +255,7 @@ impl Admission<'_, '_, '_> {
             .checked_add(1)
             .ok_or(IncompleteReason::MalformedSource)?;
         limit(*self.fields, budget.limits().max_fields, "max_fields")?;
+        budget.admit_field()?;
         let text = node
             .utf8_text(self.bytes)
             .map_err(|_| IncompleteReason::MalformedSource)?;
@@ -324,6 +361,7 @@ impl Admission<'_, '_, '_> {
                             budget.limits().max_variant_alternatives,
                             "max_variant_alternatives",
                         )?;
+                        budget.admit_variant()?;
                         let mut labels = Vec::new();
                         let mut lc = clause.walk();
                         for n in clause.named_children(&mut lc) {

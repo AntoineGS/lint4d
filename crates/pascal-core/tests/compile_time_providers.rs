@@ -369,3 +369,183 @@ fn declaration_limit_is_aggregate_across_root_and_provider_graphs() {
     f.limits.max_definitions = 1;
     assert!(f.analyze().is_err());
 }
+
+#[test]
+fn field_and_variant_caps_are_shared_by_root_and_provider() {
+    for variants in [false, true] {
+        let ty = if variants {
+            "packed record case Byte of 0:(X:Byte); end"
+        } else {
+            "packed record X:Byte; end"
+        };
+        let mut f = Fixture::new(
+            &format!(
+                "unit Main; interface uses Types; type Local={ty}; {{$IF SizeOf(Types.Export)=1}}{{$DEFINE HIT}}{{$ENDIF}} implementation end."
+            ),
+            context(LayoutPlatform::Win32),
+        );
+        f.unit(
+            "Types",
+            &format!("unit Types; interface type Export={ty}; implementation end."),
+            context(LayoutPlatform::Win32),
+        );
+        if variants {
+            f.limits.max_variant_alternatives = 1;
+        } else {
+            f.limits.max_fields = 1;
+        }
+        assert!(
+            f.analyze().is_err(),
+            "aggregate dimension variants={variants}"
+        );
+    }
+}
+
+#[test]
+fn nested_provider_definition_cap_is_not_reset() {
+    let mut f = Fixture::new(
+        "unit Main; interface uses A; type Local=Byte; {$IF SizeOf(A.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "A",
+        "unit A; interface uses B; type Export=B.Export; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "B",
+        "unit B; interface type Export=Int64; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.limits.max_definitions = 2;
+    assert!(f.analyze().is_err());
+    f.limits.max_definitions = 3;
+    assert_eq!(activity(&f.analyze().unwrap(), "DEFINE HIT"), Truth::True);
+}
+
+#[test]
+fn conditional_snapshots_do_not_readmit_existing_syntax() {
+    let mut f = Fixture::new(
+        "unit Main; interface type Local=packed record case Byte of 0:(X:Byte); end; {$IFDEF OPEN}{$DEFINE SIDE}{$ENDIF} {$IF SizeOf(Local)=1}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.limits.max_definitions = 1;
+    f.limits.max_fields = 1;
+    f.limits.max_variant_alternatives = 1;
+    assert_eq!(activity(&f.analyze().unwrap(), "DEFINE HIT"), Truth::True);
+}
+
+#[test]
+fn bound_constant_queries_compile_only_when_used_and_respect_blockers() {
+    let mut f = Fixture::new(
+        "unit Main; interface uses Types; const C=Types.Limit; {$IF C=2}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "Types",
+        "unit Types; interface {$I constant.inc} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("constant.inc", "const Limit=(1 shl 1);");
+    assert_eq!(activity(&f.analyze().unwrap(), "DEFINE HIT"), Truth::True);
+    let mut blocked = Fixture::new(
+        "unit Main; interface uses Types; const Types=1; {$IF Types.Limit=2}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    blocked.unit(
+        "Types",
+        "unit Types; interface {$I forbidden.inc} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    blocked.analyze().unwrap();
+    assert!(blocked.read_names().is_empty());
+}
+
+#[test]
+fn split_import_uses_physical_name_opener_not_completing_file() {
+    let mut f = Fixture::new(
+        "unit Main; interface uses Ty{$I suffix.inc} {$IF SizeOf(Types.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("suffix.inc", "pes;");
+    f.unit(
+        "Types",
+        "unit Types; interface type Export=Int64; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    assert_eq!(activity(&f.analyze().unwrap(), "DEFINE HIT"), Truth::True);
+    assert_eq!(f.unit_requests[0].0, f.root.path);
+}
+
+#[test]
+fn include_import_opener_survives_parent_completion() {
+    let mut f = Fixture::new(
+        "unit Main; interface {$I sub/imports.inc}pes; {$IF SizeOf(Types.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("sub/imports.inc", "uses Ty");
+    f.unit(
+        "Types",
+        "unit Types; interface type Export=Int64; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    assert_eq!(activity(&f.analyze().unwrap(), "DEFINE HIT"), Truth::True);
+    assert_eq!(
+        f.unit_requests[0].0,
+        std::path::PathBuf::from("/fixture/sub/imports.inc")
+    );
+}
+
+#[test]
+fn qualified_query_does_not_compile_unrelated_import() {
+    let mut f = Fixture::new(
+        "unit Main; interface uses Types, Unused; {$IF SizeOf(Types.Export)=8}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "Types",
+        "unit Types; interface type Export=Int64; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "Unused",
+        "unit Unused; interface {$I unused.inc} type Export=Byte; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("unused.inc", "type Ignored=Byte;");
+    assert_eq!(activity(&f.analyze().unwrap(), "DEFINE HIT"), Truth::True);
+    assert!(!f.read_names().iter().any(|name| name == "unused.inc"));
+}
+
+#[test]
+fn by_value_provider_cycle_has_explicit_provenance_and_does_not_poison_pointer() {
+    use pascal_core::compile_time::{
+        CompileTimeBudget, CompileTimeLimits, Fact, OccurrenceId, UnknownReason,
+    };
+    let mut f = Fixture::new(
+        "unit Main; interface uses A; {$IF SizeOf(A.R)=4}{$DEFINE VALUE}{$ENDIF} {$IF SizeOf(A.P)=4}{$DEFINE POINTER}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "A",
+        "unit A; interface uses B; type R=packed record Field:B.R; end; P=^B.R; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.unit(
+        "B",
+        "unit B; interface uses A; type R=packed record Field:A.R; end; implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    let a = f.analyze().unwrap();
+    assert_eq!(activity(&a, "DEFINE POINTER"), Truth::True);
+    let site = a
+        .facts
+        .site_at(&f.root.id, OccurrenceId(0), f.root.bytes.len())
+        .unwrap();
+    let mut b = CompileTimeBudget::new(CompileTimeLimits::default(), &pascal_core::NoCancellation);
+    let fact = a.facts.layout_name(site, "A.R", &mut b);
+    assert!(
+        matches!(fact, Fact::Unknown(UnknownReason::CyclicProvider)),
+        "{fact:?}"
+    );
+}

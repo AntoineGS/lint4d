@@ -129,6 +129,7 @@ pub(crate) fn analyze_source_in_session(
             active: Vec::new(),
             queries: 0,
             next_occurrence: 1,
+            declarations: Vec::new(),
         },
         false,
         OccurrenceId(0),
@@ -139,6 +140,7 @@ struct ProviderSession {
     active: Vec<ProviderKey>,
     queries: usize,
     next_occurrence: u64,
+    declarations: Vec<DefinitionKey>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -238,6 +240,13 @@ fn analyze_source_with_providers(
         .scalar_history
         .push((Sequence(0), scalar));
     let first = ReachablePath { environment };
+    budget
+        .charge(
+            1,
+            root.path.as_os_str().len(),
+            size_of::<(OccurrenceId, std::path::PathBuf)>() + root.path.as_os_str().len(),
+        )
+        .map_err(|r| resolver_error(r, budget))?;
     let mut session = RootSession {
         root: root.clone(),
         text: text.to_owned(),
@@ -263,6 +272,7 @@ fn analyze_source_with_providers(
         frames: Vec::new(),
         last_condition: Truth::Unknown,
         providers,
+        physical_paths: vec![(root_occurrence, root.path.clone())],
     };
     let mut analysis = conditional::analyze_with_source_order(text, context, cancel, &mut session);
     if let Some(error) = session.resource_error.take() {
@@ -520,6 +530,7 @@ struct RootSession<'a, 'b> {
     frames: Vec<ReachableFrame>,
     last_condition: Truth,
     providers: &'a mut ProviderSession,
+    physical_paths: Vec<(OccurrenceId, std::path::PathBuf)>,
 }
 
 struct ReachablePath {
@@ -533,21 +544,519 @@ struct ReachableFrame {
     has_else: bool,
 }
 
-impl RootSession<'_, '_> {
+struct ProviderEngine<'a, 'b> {
+    resolver: &'a mut dyn CompileTimeResolver,
+    providers: &'a mut ProviderSession,
+    cancel: &'a dyn CancellationToken,
+    budget: &'a mut CompileTimeBudget<'b>,
+    observations: &'a mut Vec<ResolutionObservation>,
+    warnings: &'a mut Vec<String>,
+}
+
+fn admit_provider_context(
+    context: &ConditionalContext,
+    budget: &mut CompileTimeBudget<'_>,
+    retained: bool,
+) -> Result<(), ResolverError> {
+    let entries = context
+        .defines
+        .len()
+        .checked_add(context.options.len())
+        .and_then(|n| n.checked_add(context.constants.len()))
+        .ok_or_else(|| ResolverError::InvalidRequest("provider context entries overflow".into()))?;
+    let metadata = entries
+        .checked_mul(size_of::<(String, ConstantValue)>() + 4 * size_of::<usize>())
+        .ok_or_else(|| {
+            ResolverError::InvalidRequest("provider context metadata overflow".into())
+        })?;
+    budget
+        .charge(entries, 0, if retained { metadata } else { 0 })
+        .map_err(|r| resolver_error(r, budget))?;
+    let mut failure = None;
+    context
+        .visit_recovery_payload(&mut |n| {
+            budget
+                .charge(1, n, if retained { n } else { 0 })
+                .map_err(|r| {
+                    failure = Some(r);
+                    "provider context admission".into()
+                })
+        })
+        .map_err(|_| resolver_error(failure.unwrap_or(IncompleteReason::MalformedSource), budget))
+}
+
+impl ProviderEngine<'_, '_> {
+    fn prepare_query(
+        &mut self,
+        state: &mut CompileTimeState,
+        site: &BindingSite,
+        query: &ExpressionQuery<'_>,
+        depth: usize,
+    ) -> Result<(), ResolverError> {
+        match query {
+            ExpressionQuery::Defined(..) => Ok(()),
+            ExpressionQuery::SizeOf { argument, .. } => {
+                let before = self.budget.snapshot().retained_bytes;
+                match parse_sizeof_operand(argument, self.budget) {
+                    Fact::Known(operand) => {
+                        let leading = operand
+                            .leading_name(self.budget)
+                            .map_err(|r| resolver_error(r, self.budget));
+                        let scratch = self.budget.snapshot().retained_bytes.saturating_sub(before);
+                        let result = match &leading {
+                            Ok((name, pointers)) => {
+                                self.prepare_name(state, site, name, *pointers, depth + 1)
+                            }
+                            Err(_) => Ok(()),
+                        };
+                        drop(operand);
+                        let error = leading.err();
+                        self.budget.release(scratch);
+                        if let Some(error) = error {
+                            return Err(error);
+                        }
+                        result
+                    }
+                    Fact::Incomplete(r) => Err(resolver_error(r, self.budget)),
+                    Fact::Unknown(_) => Ok(()),
+                }
+            }
+            ExpressionQuery::LexicalName(name, _) => {
+                // Intrinsic probes are explicitly source-lexical checks, not
+                // actual imported operand queries (e.g. the SizeOf callee).
+                if super::bindings::lookup(state, site, name, self.budget)
+                    .map_err(|r| resolver_error(r, self.budget))?
+                    .is_some()
+                {
+                    self.prepare_name(state, site, name, false, depth + 1)
+                } else {
+                    Ok(())
+                }
+            }
+            ExpressionQuery::Name(name, _) | ExpressionQuery::Declared(name, _) => {
+                self.prepare_name(state, site, name, false, depth + 1)
+            }
+        }
+    }
+
+    fn prepare_name(
+        &mut self,
+        state: &mut CompileTimeState,
+        site: &BindingSite,
+        name: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<(), ResolverError> {
+        use super::bindings::Binding;
+        if state.interfaces.is_empty() {
+            return Ok(());
+        }
+        super::declarations::limit(depth, self.budget.limits().max_type_depth, "max_type_depth")
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let root = name.split('.').next().unwrap_or(name);
+        let binding = super::bindings::lookup(state, site, name, self.budget)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        let binding = if binding.is_some() {
+            binding
+        } else {
+            super::bindings::lookup(state, site, root, self.budget)
+                .map_err(|r| resolver_error(r, self.budget))?
+        };
+        if let Some(binding) = binding {
+            let Binding::Declaration(decl) = binding else {
+                return Ok(());
+            };
+            if decl.is_routine {
+                return Ok(());
+            }
+            self.budget
+                .charge(
+                    self.providers.declarations.len() + 1,
+                    decl.key.anchor.source.as_str().len(),
+                    0,
+                )
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if self.providers.declarations.contains(&decl.key) {
+                return Ok(());
+            }
+            let key_payload = decl.key.anchor.source.as_str().len();
+            self.budget
+                .charge(1, key_payload, key_payload + size_of::<DefinitionKey>())
+                .map_err(|r| resolver_error(r, self.budget))?;
+            self.providers.declarations.reserve_exact(1);
+            self.providers.declarations.push(decl.key.clone());
+            // Retain the original captured sites while mutating only the live
+            // graph's lazy capabilities. Copying a snapshot is not syntax work.
+            let snapshot_before = self.budget.snapshot().retained_bytes;
+            let copy = state
+                .snapshot(self.budget)
+                .map_err(|r| resolver_error(r, self.budget));
+            let snapshot_bytes = self
+                .budget
+                .snapshot()
+                .retained_bytes
+                .saturating_sub(snapshot_before);
+            let result = copy.and_then(|copy| {
+                let binding = super::bindings::lookup(&copy, site, name, self.budget)
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                let binding = if binding.is_some() {
+                    binding
+                } else {
+                    super::bindings::lookup(&copy, site, root, self.budget)
+                        .map_err(|r| resolver_error(r, self.budget))?
+                };
+                let Some(Binding::Declaration(decl)) = binding else {
+                    return Ok(());
+                };
+                if let Some(expression) = &decl.initializer {
+                    let prior = BindingSite {
+                        scope: decl.site.scope,
+                        sequence: Sequence(decl.site.sequence.0.saturating_sub(1)),
+                    };
+                    self.prepare_expression(
+                        state,
+                        &prior,
+                        super::declarations::initializer_expression(expression),
+                        depth + 1,
+                    )?;
+                }
+                self.prepare_type(state, &decl.type_site, &decl.ty, pointers, depth + 1)
+            });
+            self.budget.release(snapshot_bytes);
+            self.providers.declarations.pop();
+            self.budget.release(key_payload);
+            return result;
+        }
+        for index in 0..state.interfaces.len() {
+            self.budget
+                .charge(1, 0, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if state.interfaces[index].site.sequence.0 > site.sequence.0
+                || !state.interfaces[index].pending.authorized
+            {
+                continue;
+            }
+            if !state.interfaces[index].attempted {
+                super::declarations::limit(
+                    self.providers.queries + 1,
+                    self.budget.limits().max_provider_queries,
+                    "max_provider_queries",
+                )
+                .map_err(|r| resolver_error(r, self.budget))?;
+                self.providers.queries += 1;
+                let pending = &state.interfaces[index].pending;
+                let outcome = self.resolver.unit(
+                    UnitResolveRequest {
+                        requested_name: &pending.identity.name,
+                        importer_path: &pending.importer_path,
+                        legacy_route: None,
+                    },
+                    self.budget,
+                    self.cancel,
+                )?;
+                self.budget
+                    .charge(
+                        outcome.observations.len() + outcome.warnings.len(),
+                        0,
+                        outcome.observations.len() * size_of::<ResolutionObservation>()
+                            + outcome.warnings.len() * size_of::<String>(),
+                    )
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                for o in &outcome.observations {
+                    admit_observation(o, self.budget)?;
+                }
+                for w in &outcome.warnings {
+                    self.budget
+                        .charge(1, w.len(), w.len())
+                        .map_err(|r| resolver_error(r, self.budget))?;
+                }
+                self.observations.reserve_exact(outcome.observations.len());
+                self.warnings.reserve_exact(outcome.warnings.len());
+                self.observations.extend(outcome.observations);
+                self.warnings.extend(outcome.warnings);
+                state.interfaces[index].attempted = true;
+                match outcome.result {
+                    Resolution::Found(provider) => {
+                        let n = provider
+                            .authorized_qualifiers
+                            .iter()
+                            .map(|q| size_of::<String>() + q.len())
+                            .sum();
+                        self.budget
+                            .charge(1, n, n)
+                            .map_err(|r| resolver_error(r, self.budget))?;
+                        state.interfaces[index].qualifiers = provider.authorized_qualifiers.clone();
+                        state.interfaces[index].provided = Some(provider);
+                    }
+                    Resolution::Ambiguous { .. } => {
+                        state.interfaces[index].failure = Some(UnknownReason::AmbiguousBinding)
+                    }
+                    _ => state.interfaces[index].failure = Some(UnknownReason::UnresolvedName),
+                }
+            }
+        }
+        // Resolve authorized spellings before selecting a graph. An alias may
+        // be supplied only by the existing unit capability, not guessed from
+        // uses text. A qualified query must not compile unrelated interfaces.
+        let mut qualified = false;
+        for interface in &state.interfaces {
+            if interface.site.sequence.0 > site.sequence.0 || !interface.pending.authorized {
+                continue;
+            }
+            for qualifier in &interface.qualifiers {
+                self.budget
+                    .charge(1, qualifier.len().min(name.len()), 0)
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                qualified |= name.len() > qualifier.len()
+                    && name.as_bytes().get(qualifier.len()) == Some(&b'.')
+                    && name
+                        .get(..qualifier.len())
+                        .is_some_and(|p| super::bindings::same_name(p, qualifier));
+            }
+        }
+        for index in 0..state.interfaces.len() {
+            self.budget
+                .charge(1, 0, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if state.interfaces[index].site.sequence.0 > site.sequence.0
+                || !state.interfaces[index].pending.authorized
+            {
+                continue;
+            }
+            let mut suffix = root;
+            let mut matches_qualifier = false;
+            for qualifier in &state.interfaces[index].qualifiers {
+                self.budget
+                    .charge(1, qualifier.len().min(name.len()), 0)
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                if name.len() > qualifier.len()
+                    && name.as_bytes().get(qualifier.len()) == Some(&b'.')
+                    && name
+                        .get(..qualifier.len())
+                        .is_some_and(|p| super::bindings::same_name(p, qualifier))
+                {
+                    suffix = name[qualifier.len() + 1..].split('.').next().unwrap_or("");
+                    matches_qualifier = true;
+                    break;
+                }
+            }
+            if qualified && !matches_qualifier {
+                continue;
+            }
+            if let Some(provider) = state.interfaces[index].provided.take() {
+                match self.compile_provider_interface(provider, suffix, pointers, depth + 1)? {
+                    Fact::Known(graph) => state.interfaces[index].graph = Some(graph),
+                    Fact::Unknown(reason) => state.interfaces[index].failure = Some(reason),
+                    Fact::Incomplete(reason) => return Err(resolver_error(reason, self.budget)),
+                }
+            } else if let Some(graph) = &state.interfaces[index].graph {
+                // Copy only through the existing admitted snapshot API; no
+                // interior mutability or name-only memo is introduced.
+                let mut copy = graph
+                    .snapshot(self.budget)
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                let captured = copy.site();
+                self.prepare_name(&mut copy, &captured, suffix, pointers, depth + 1)?;
+                self.budget
+                    .charge(1, 0, 2 * size_of::<usize>())
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                state.interfaces[index].graph = Some(std::sync::Arc::new(copy));
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_expression(
+        &mut self,
+        state: &mut CompileTimeState,
+        site: &BindingSite,
+        text: &str,
+        depth: usize,
+    ) -> Result<(), ResolverError> {
+        let before = self.budget.snapshot().retained_bytes;
+        let environment = if let Some((_, environment)) = state
+            .scalar_history
+            .iter()
+            .rev()
+            .find(|(seq, _)| seq.0 <= site.sequence.0)
+        {
+            environment.snapshot_scalar(self.budget)
+        } else {
+            ConditionalEnvironment::context_snapshot(&state.context, self.budget)
+        }
+        .map_err(|r| resolver_error(r, self.budget))?;
+        let environment_bytes = self.budget.snapshot().retained_bytes.saturating_sub(before);
+        let resolver = &mut *self.resolver;
+        let providers = &mut *self.providers;
+        let observations = &mut *self.observations;
+        let warnings = &mut *self.warnings;
+        let cancel = self.cancel;
+        let mut error = None;
+        let result = conditional::evaluate_layout_expression(
+            text,
+            &environment,
+            self.budget,
+            &mut |query, budget| {
+                let mut engine = ProviderEngine {
+                    resolver,
+                    providers,
+                    cancel,
+                    budget,
+                    observations,
+                    warnings,
+                };
+                if let Err(e) = engine.prepare_query(state, site, &query, depth + 1) {
+                    error = Some(e);
+                    return Err(IncompleteReason::MalformedSource);
+                }
+                super::arrays::scalar_query(
+                    state,
+                    site,
+                    &environment,
+                    query,
+                    depth + 1,
+                    engine.budget,
+                )
+            },
+            false,
+            false,
+        );
+        self.budget.release(environment_bytes);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        result
+            .map(|_| ())
+            .map_err(|r| resolver_error(r, self.budget))
+    }
+
+    fn prepare_type(
+        &mut self,
+        state: &mut CompileTimeState,
+        site: &BindingSite,
+        ty: &super::bindings::TypeExpr,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<(), ResolverError> {
+        use super::bindings::TypeExpr;
+        self.budget
+            .charge(1, 0, 0)
+            .map_err(|r| resolver_error(r, self.budget))?;
+        super::declarations::limit(depth, self.budget.limits().max_type_depth, "max_type_depth")
+            .map_err(|r| resolver_error(r, self.budget))?;
+        match ty {
+            TypeExpr::Named(name) | TypeExpr::StrongAlias(name) => {
+                self.prepare_name(state, site, name, pointers, depth + 1)
+            }
+            TypeExpr::Pointer(name) if pointers => {
+                self.prepare_name(state, site, name, false, depth + 1)
+            }
+            TypeExpr::Array {
+                dimensions,
+                element,
+                ..
+            } => {
+                for index in dimensions {
+                    self.prepare_index(state, site, index, depth + 1)?;
+                }
+                self.prepare_type(state, site, element, pointers, depth + 1)
+            }
+            TypeExpr::Range(index) => self.prepare_index(state, site, index, depth + 1),
+            TypeExpr::Enum(members) => {
+                for member in members {
+                    if let Some(value) = &member.value {
+                        self.prepare_expression(state, site, value, depth + 1)?;
+                    }
+                }
+                Ok(())
+            }
+            TypeExpr::Record(record) => {
+                record.visit_dependencies(&mut |dependency, captured| match dependency {
+                    super::records::RecordDependency::Type(ty) => {
+                        self.prepare_type(state, captured, ty, pointers, depth + 1)
+                    }
+                    super::records::RecordDependency::Index(index) => {
+                        self.prepare_index(state, captured, index, depth + 1)
+                    }
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn prepare_index(
+        &mut self,
+        state: &mut CompileTimeState,
+        site: &BindingSite,
+        index: &super::bindings::IndexExpr,
+        depth: usize,
+    ) -> Result<(), ResolverError> {
+        match index {
+            super::bindings::IndexExpr::Domain(name) => {
+                self.prepare_name(state, site, name, false, depth + 1)
+            }
+            super::bindings::IndexExpr::Bounds { lower, upper } => {
+                self.prepare_expression(state, site, lower, depth + 1)?;
+                self.prepare_expression(state, site, upper, depth + 1)
+            }
+        }
+    }
+
     fn compile_provider_interface(
         &mut self,
         provider: ProviderSource,
-    ) -> Result<Option<std::sync::Arc<CompileTimeState>>, ResolverError> {
+        name: &str,
+        pointers: bool,
+        depth: usize,
+    ) -> Result<Fact<std::sync::Arc<CompileTimeState>>, ResolverError> {
         self.budget
             .charge(self.providers.active.len() + 1, 0, 0)
             .map_err(|r| resolver_error(r, self.budget))?;
+        for key in &self.providers.active {
+            admit_provider_context(&provider.context, self.budget, false)?;
+            admit_provider_context(&key.context, self.budget, false)?;
+            let n = crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
+                + key.source.as_str().len()
+                + key.qualifiers.iter().map(String::len).sum::<usize>()
+                + provider
+                    .authorized_qualifiers
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>();
+            self.budget
+                .charge(1, n, 0)
+                .map_err(|r| resolver_error(r, self.budget))?;
+            if let crate::SourceRevision::Disk {
+                read_policy,
+                path_entry,
+                ..
+            } = &key.revision
+            {
+                let mut failure = None;
+                let mut visit = |n| {
+                    self.budget.charge(1, n, 0).map_err(|r| {
+                        failure = Some(r);
+                        "provider revision comparison".into()
+                    })
+                };
+                read_policy
+                    .visit_recovery_payload(&mut visit)
+                    .and_then(|_| path_entry.visit_recovery_payload(&mut visit))
+                    .map_err(|_| {
+                        resolver_error(
+                            failure.unwrap_or(IncompleteReason::MalformedSource),
+                            self.budget,
+                        )
+                    })?;
+            }
+        }
         if self.providers.active.iter().any(|key| {
             key.source == provider.unit.source.id
                 && key.revision == provider.unit.source.revision
                 && key.context == provider.context
                 && key.qualifiers == provider.authorized_qualifiers
         }) {
-            return Ok(None);
+            return Ok(Fact::Unknown(UnknownReason::CyclicProvider));
         }
         super::declarations::limit(
             self.providers.active.len() + 1,
@@ -557,6 +1066,7 @@ impl RootSession<'_, '_> {
         .map_err(|r| resolver_error(r, self.budget))?;
         let before = self.budget.snapshot().retained_bytes;
         let metadata = size_of::<ProviderKey>()
+            + crate::resolver::loaded_source_metadata_retained(&provider.unit.source)
             + provider.unit.source.id.as_str().len()
             + provider
                 .authorized_qualifiers
@@ -566,21 +1076,7 @@ impl RootSession<'_, '_> {
         self.budget
             .charge(1, metadata, metadata)
             .map_err(|r| resolver_error(r, self.budget))?;
-        let mut failure = None;
-        provider
-            .context
-            .visit_recovery_payload(&mut |n| {
-                self.budget.charge(1, n, n).map_err(|r| {
-                    failure = Some(r);
-                    "provider context".into()
-                })
-            })
-            .map_err(|_| {
-                resolver_error(
-                    failure.unwrap_or(IncompleteReason::MalformedSource),
-                    self.budget,
-                )
-            })?;
+        admit_provider_context(&provider.context, self.budget, true)?;
         let occurrence = OccurrenceId(self.providers.next_occurrence);
         self.providers.next_occurrence = self
             .providers
@@ -605,13 +1101,28 @@ impl RootSession<'_, '_> {
             true,
             occurrence,
         );
+        let result = result.and_then(|mut analysis| {
+            if let Some(reason) = analysis.reasons.iter().find(|r| {
+                matches!(
+                    r,
+                    IncompleteReason::Limit { .. } | IncompleteReason::Cancelled
+                )
+            }) {
+                return Err(resolver_error(reason.clone(), self.budget));
+            }
+            let site = analysis.facts.site();
+            self.prepare_name(&mut analysis.facts, &site, name, pointers, depth + 1)?;
+            Ok(analysis)
+        });
         self.providers.active.pop();
-        self.budget.release(key_bytes);
+        // The popped key's payload is dropped; its vector slot remains live.
+        self.budget
+            .release(key_bytes.saturating_sub(size_of::<ProviderKey>()));
         let mut analysis = result?;
         self.observations.extend(analysis.observations);
         self.warnings.extend(analysis.warnings);
         if !analysis.facts.interface_complete {
-            return Ok(None);
+            return Ok(Fact::Unknown(UnknownReason::UnresolvedName));
         }
         self.budget
             .charge(
@@ -625,82 +1136,43 @@ impl RootSession<'_, '_> {
         self.budget
             .charge(1, 0, size_of::<CompileTimeState>() + 2 * size_of::<usize>())
             .map_err(|r| resolver_error(r, self.budget))?;
-        Ok(Some(std::sync::Arc::new(analysis.facts)))
+        Ok(Fact::Known(std::sync::Arc::new(analysis.facts)))
     }
+}
 
+impl RootSession<'_, '_> {
     fn resolve_pending_imports(&mut self, activity: Truth) -> Result<(), ResolverError> {
         for index in 0..self.current.len() {
             let imports = std::mem::take(&mut self.current[index].state_mut().pending_imports);
-            for (name, site) in imports {
-                let outcome = if activity == Truth::True {
-                    super::declarations::limit(
-                        self.providers.queries + 1,
-                        self.budget.limits().max_provider_queries,
-                        "max_provider_queries",
-                    )
-                    .map_err(|r| resolver_error(r, self.budget))?;
-                    self.providers.queries += 1;
-                    self.resolver.unit(
-                        UnitResolveRequest {
-                            requested_name: &name,
-                            importer_path: &self.root.path,
-                            legacy_route: None,
-                        },
-                        self.budget,
-                        self.cancel,
-                    )?
-                } else {
-                    ResolutionOutcome {
-                        result: Resolution::Unavailable {
-                            reason: "unproven import activity".into(),
-                        },
-                        observations: vec![],
-                        warnings: vec![],
-                    }
-                };
+            for identity in imports {
                 self.budget
-                    .charge(
-                        outcome.observations.len() + outcome.warnings.len(),
-                        0,
-                        outcome.observations.len() * size_of::<ResolutionObservation>()
-                            + outcome.warnings.len() * size_of::<String>(),
-                    )
+                    .charge(self.physical_paths.len(), 0, 0)
                     .map_err(|r| resolver_error(r, self.budget))?;
-                for observation in &outcome.observations {
-                    admit_observation(observation, self.budget)?;
-                }
-                for warning in &outcome.warnings {
-                    self.budget
-                        .charge(1, warning.len(), warning.len())
-                        .map_err(|r| resolver_error(r, self.budget))?;
-                }
-                self.observations.extend(outcome.observations);
-                self.warnings.extend(outcome.warnings);
-                let (qualifiers, graph) = match outcome.result {
-                    Resolution::Found(provider) => {
-                        self.budget
-                            .charge(
-                                provider.authorized_qualifiers.len(),
-                                0,
-                                provider
-                                    .authorized_qualifiers
-                                    .iter()
-                                    .map(|q| size_of::<String>() + q.len())
-                                    .sum(),
-                            )
-                            .map_err(|r| resolver_error(r, self.budget))?;
-                        let qualifiers = provider.authorized_qualifiers.clone();
-                        (qualifiers, self.compile_provider_interface(provider)?)
-                    }
-                    _ => (vec![name.clone()], None),
-                };
+                let path = &self
+                    .physical_paths
+                    .iter()
+                    .find(|(id, _)| *id == identity.opener.occurrence)
+                    .ok_or_else(|| {
+                        ResolverError::InvalidRequest("missing import opener occurrence".into())
+                    })?
+                    .1;
                 self.budget
                     .charge(
                         1,
-                        name.len(),
-                        size_of::<super::bindings::InterfaceFacts>() + name.len(),
+                        identity.name.len() + path.as_os_str().len(),
+                        size_of::<super::bindings::InterfaceFacts>()
+                            + size_of::<String>()
+                            + identity.name.len()
+                            + path.as_os_str().len(),
                     )
                     .map_err(|r| resolver_error(r, self.budget))?;
+                let qualifiers = vec![identity.name.clone()];
+                let site = identity.site.clone();
+                let pending = super::bindings::PendingProvider {
+                    identity,
+                    importer_path: path.clone(),
+                    authorized: activity == Truth::True,
+                };
                 self.current[index].state_mut().interfaces.reserve_exact(1);
                 self.current[index]
                     .state_mut()
@@ -708,7 +1180,15 @@ impl RootSession<'_, '_> {
                     .push(super::bindings::InterfaceFacts {
                         qualifiers,
                         site,
-                        graph,
+                        graph: None,
+                        pending,
+                        attempted: activity != Truth::True,
+                        provided: None,
+                        failure: if activity != Truth::True {
+                            Some(UnknownReason::UnknownActivity)
+                        } else {
+                            None
+                        },
                     });
             }
         }
@@ -897,6 +1377,16 @@ impl RootSession<'_, '_> {
                     .to_owned();
                 let child = child.clone();
                 let occurrence = OccurrenceId(self.providers.next_occurrence);
+                self.budget
+                    .charge(
+                        1,
+                        child.path.as_os_str().len(),
+                        size_of::<(OccurrenceId, std::path::PathBuf)>()
+                            + child.path.as_os_str().len(),
+                    )
+                    .map_err(|r| resolver_error(r, self.budget))?;
+                self.physical_paths.reserve_exact(1);
+                self.physical_paths.push((occurrence, child.path.clone()));
                 self.providers.next_occurrence = self
                     .providers
                     .next_occurrence
@@ -974,16 +1464,24 @@ impl RootSession<'_, '_> {
             self.current.len() * (size_of::<Truth>() + 2 * size_of::<ReachablePath>()),
         )?;
         let mut decisions = Vec::new();
-        for path in &self.current {
+        let mut paths = std::mem::take(&mut self.current);
+        for path in &mut paths {
             let condition = evaluate_path_condition(
                 &self.directive_fragments[self.current_directive].body_fragments,
-                &path,
+                path,
                 directive,
                 &mut self.budget,
+                self.resolver,
+                self.providers,
+                self.cancel,
+                &mut self.observations,
+                &mut self.warnings,
+                &mut self.resource_error,
             )?;
             aggregate = Some(aggregate.map_or(condition, |prior: Truth| prior.merge(condition)));
             decisions.push(condition);
         }
+        self.current = paths;
         let forks = decisions.iter().filter(|d| **d == Truth::Unknown).count();
         super::declarations::limit(
             total + forks,
@@ -1136,14 +1634,20 @@ impl ReachablePath {
 
 fn evaluate_path_condition(
     body_fragments: &[SourceAnchor],
-    path: &ReachablePath,
+    path: &mut ReachablePath,
     directive: &ConditionalDirective,
     budget: &mut CompileTimeBudget<'_>,
+    resolver: &mut dyn CompileTimeResolver,
+    providers: &mut ProviderSession,
+    cancel: &dyn CancellationToken,
+    observations: &mut Vec<ResolutionObservation>,
+    warnings: &mut Vec<String>,
+    resource_error: &mut Option<ResolverError>,
 ) -> Result<Truth, IncompleteReason> {
-    let state = path.state();
+    let mut state = path.environment.typed_state.take().expect("typed path");
     let site = state.site();
     let environment = &path.environment;
-    conditional::evaluate_source_condition(
+    let result = conditional::evaluate_source_condition(
         &directive.body,
         environment,
         budget,
@@ -1176,9 +1680,23 @@ fn evaluate_path_condition(
                 budget.release(budget.snapshot().retained_bytes.saturating_sub(before));
                 mapped?;
             }
-            super::arrays::scalar_query(state, &site, environment, query, 0, budget)
+            let mut engine = ProviderEngine {
+                resolver,
+                providers,
+                cancel,
+                budget,
+                observations,
+                warnings,
+            };
+            if let Err(error) = engine.prepare_query(&mut state, &site, &query, 0) {
+                *resource_error = Some(error);
+                return Err(IncompleteReason::MalformedSource);
+            }
+            super::arrays::scalar_query(&state, &site, environment, query, 0, engine.budget)
         },
-    )
+    );
+    path.environment.typed_state = Some(state);
+    result
 }
 
 impl SourceOrder for RootSession<'_, '_> {

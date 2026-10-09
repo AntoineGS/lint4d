@@ -1104,6 +1104,11 @@ pub(super) fn constant_name(
         return Ok(None);
     }
     // Immutable explicit context facts are admitted only after lexical blockers.
+    if let Fact::Known((provider, decl)) =
+        super::bindings::imported_declaration(state, site, name, budget)?
+    {
+        return constant_name(provider, &provider.site(), &decl.name, depth + 1, budget);
+    }
     let mut found = None;
     for (key, value) in &state.context.constants {
         budget.charge(1, key.len().min(name.len()), 0)?;

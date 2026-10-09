@@ -1375,6 +1375,71 @@ impl<S: SourceStore> UnitResolver<S> {
         sites: &[ImportSite],
         cancel: &dyn CancellationToken,
     ) -> Result<ResolvedProject, ResolverError> {
+        let mut queue = ProjectImportQueue::default();
+        let result = self.resolve_project_queued(root, sites, cancel, &mut queue);
+        let retained = queue.site_retained + queue.storage_retained;
+        // This covers success, early abandonment, errors and cancellation.
+        // Drop the actual buffers before refunding them; work is never refunded.
+        drop(queue);
+        self.release_compile_time(retained);
+        result
+    }
+
+    fn enqueue_project_imports(
+        &mut self,
+        queue: &mut ProjectImportQueue,
+        unit: &ResolvedUnit,
+        sites: &[ImportSite],
+        cancel: &dyn CancellationToken,
+    ) -> Result<(), ResolverError> {
+        let mut retained = sites
+            .len()
+            .saturating_mul(std::mem::size_of::<ImportSite>());
+        for site in sites {
+            self.charge_compile_time(
+                1,
+                std::mem::size_of::<ImportSite>().saturating_add(site.requested_name.len()),
+                0,
+                cancel,
+            )?;
+            retained = retained.saturating_add(site.requested_name.len());
+        }
+        let additional = (queue.items.len() + 1).saturating_sub(queue.items.capacity());
+        // A growth may temporarily coexist with the old backing allocation.
+        let storage = if additional > 0 {
+            (queue.items.len() + 1).saturating_mul(std::mem::size_of::<QueuedProjectImporter>())
+        } else {
+            0
+        };
+        let moved_entries = if additional > 0 { queue.items.len() } else { 0 };
+        self.charge_compile_time(
+            moved_entries + 1,
+            moved_entries.saturating_mul(std::mem::size_of::<QueuedProjectImporter>()),
+            retained.saturating_add(storage),
+            cancel,
+        )?;
+        // reserve_exact avoids unadmitted geometric queue capacity growth.
+        if additional > 0 {
+            queue.items.reserve_exact(1);
+            self.release_compile_time(queue.storage_retained);
+            queue.storage_retained = storage;
+        }
+        queue.items.push_back(QueuedProjectImporter {
+            unit: unit.clone(),
+            sites: sites.to_vec(),
+            site_retained: retained,
+        });
+        queue.site_retained += retained;
+        Ok(())
+    }
+
+    fn resolve_project_queued(
+        &mut self,
+        root: ResolvedUnit,
+        sites: &[ImportSite],
+        cancel: &dyn CancellationToken,
+        queue: &mut ProjectImportQueue,
+    ) -> Result<ResolvedProject, ResolverError> {
         self.check_cancel(cancel)?;
         self.charge_compile_time(
             1,
@@ -1385,63 +1450,82 @@ impl<S: SourceStore> UnitResolver<S> {
                 + std::mem::size_of::<ResolvedUnit>(),
             cancel,
         )?;
+        let metadata;
         let root_sites = if sites.is_empty() {
-            self.source_metadata(&root.source).imports.clone()
+            metadata = self.source_metadata(&root.source);
+            &metadata.imports
         } else {
-            sites.to_vec()
+            sites
         };
         let mut imports = Vec::new();
         let mut units = Vec::new();
         let mut include_sources = Vec::new();
         let mut loaded_ids = HashSet::from([root.source.id.clone()]);
         self.project_unit_ids = Some(loaded_ids.clone());
-        let mut queue = VecDeque::from([(root.clone(), root_sites)]);
+        self.enqueue_project_imports(queue, &root, root_sites, cancel)?;
         let mut complete = self.context.discovery_complete && self.report.complete;
-        while let Some((importer, importer_sites)) = queue.pop_front() {
-            self.check_cancel(cancel)?;
-            if self.stop_when_incomplete && !complete {
-                break;
-            }
-            let text = source_text(&importer.source);
-            let (resolved, include_result) = self.resolve_imports_inner(
-                &importer,
-                &importer_sites,
-                &text,
-                importer.source.decoded_text.is_none(),
-                None,
-                true,
-                cancel,
-            )?;
-            complete &= resolved.complete;
-            let binding_storage =
-                resolved.bindings.capacity() * std::mem::size_of::<ResolvedImport>();
-            let additional =
-                (imports.len() + resolved.bindings.len()).saturating_sub(imports.capacity());
-            self.charge_compile_time(
-                resolved.bindings.len(),
-                0,
-                additional * std::mem::size_of::<ResolvedImport>(),
-                cancel,
-            )?;
-            if additional > 0 {
-                imports.reserve_exact(resolved.bindings.len());
-            }
-            imports.extend(resolved.bindings);
-            self.release_compile_time(binding_storage + std::mem::size_of::<ResolvedImports>());
-            for dependency in resolved.dependencies {
-                if loaded_ids.insert(dependency.source.id.clone()) {
-                    let dependency_sites = self.source_metadata(&dependency.source).imports.clone();
-                    units.push(dependency.clone());
-                    queue.push_back((dependency, dependency_sites));
+        while let Some(item) = queue.items.pop_front() {
+            let step = (|| {
+                let importer = &item.unit;
+                let importer_sites = &item.sites;
+                self.check_cancel(cancel)?;
+                if self.stop_when_incomplete && !complete {
+                    return Ok(false);
                 }
-            }
-            if let Some(include_result) = include_result {
-                self.append_include_result(
-                    include_result,
-                    &mut complete,
-                    &mut include_sources,
+                let text = source_text(&importer.source);
+                let (resolved, include_result) = self.resolve_imports_inner(
+                    &importer,
+                    &importer_sites,
+                    &text,
+                    importer.source.decoded_text.is_none(),
+                    None,
+                    true,
                     cancel,
                 )?;
+                complete &= resolved.complete;
+                let binding_storage =
+                    resolved.bindings.capacity() * std::mem::size_of::<ResolvedImport>();
+                let additional =
+                    (imports.len() + resolved.bindings.len()).saturating_sub(imports.capacity());
+                self.charge_compile_time(
+                    resolved.bindings.len(),
+                    0,
+                    additional * std::mem::size_of::<ResolvedImport>(),
+                    cancel,
+                )?;
+                if additional > 0 {
+                    imports.reserve_exact(resolved.bindings.len());
+                }
+                imports.extend(resolved.bindings);
+                self.release_compile_time(binding_storage + std::mem::size_of::<ResolvedImports>());
+                for dependency in resolved.dependencies {
+                    if loaded_ids.insert(dependency.source.id.clone()) {
+                        let metadata = self.source_metadata(&dependency.source);
+                        self.enqueue_project_imports(
+                            queue,
+                            &dependency,
+                            &metadata.imports,
+                            cancel,
+                        )?;
+                        units.push(dependency);
+                    }
+                }
+                if let Some(include_result) = include_result {
+                    self.append_include_result(
+                        include_result,
+                        &mut complete,
+                        &mut include_sources,
+                        cancel,
+                    )?;
+                }
+                Ok::<_, ResolverError>(true)
+            })();
+            let retained = item.site_retained;
+            drop(item);
+            queue.site_retained -= retained;
+            self.release_compile_time(retained);
+            if !step? {
+                break;
             }
         }
 
@@ -3312,6 +3396,21 @@ struct SourceOrderProjection {
     includes: Option<IncludeWalkResult>,
 }
 
+struct QueuedProjectImporter {
+    unit: ResolvedUnit,
+    sites: Vec<ImportSite>,
+    site_retained: usize,
+}
+
+/// Includes the currently popped/consumed site's reservation until its buffer
+/// drops; backing queue capacity stays reserved until the whole walk finishes.
+#[derive(Default)]
+struct ProjectImportQueue {
+    items: VecDeque<QueuedProjectImporter>,
+    site_retained: usize,
+    storage_retained: usize,
+}
+
 fn conditional_analysis_retained(analysis: &crate::conditional::ConditionalAnalysis) -> usize {
     use std::mem::size_of;
     size_of::<crate::conditional::ConditionalAnalysis>()
@@ -3850,6 +3949,355 @@ fn path_equivalent_ignore_case(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admission_root(text: &str) -> ResolvedUnit {
+        ResolvedUnit {
+            requested_name: "T".into(),
+            declared_name: "T".into(),
+            source: LoadedSource {
+                id: SourceId::new("source:/workspace/T.pas"),
+                path: PathBuf::from("/workspace/T.pas"),
+                bytes: Arc::from(text.as_bytes()),
+                decoded_text: None,
+                revision: SourceRevision::Overlay {
+                    version: 1,
+                    content_hash: 0,
+                },
+            },
+        }
+    }
+
+    fn admission_resolver(limits: ResolverLimits) -> UnitResolver<MemoryStore> {
+        UnitResolver::new(
+            ProjectContext {
+                discovery_complete: true,
+                search_paths: vec![PathBuf::from("/workspace")],
+                search_path_entries: vec![ProjectPathEntry::legacy(PathBuf::from("/workspace"))],
+                ..Default::default()
+            },
+            vec![PathBuf::from("/workspace")],
+            MemoryStore::default(),
+            limits,
+        )
+    }
+
+    fn root_output_reservation(root: &ResolvedUnit) -> usize {
+        loaded_source_retained(&root.source)
+            + root.requested_name.len()
+            + root.declared_name.len()
+            + std::mem::size_of::<ResolvedUnit>()
+    }
+
+    #[test]
+    fn fix2_queued_sites_aggregate_capacity_is_admitted_before_growth() {
+        let root = admission_root("unit T; interface implementation end.");
+        let sites = vec![ImportSite {
+            requested_name: "Provider".repeat(8),
+            byte_range: 0..1,
+            section: ImportSection::Interface,
+        }];
+        let site_bytes = std::mem::size_of::<ImportSite>() + sites[0].requested_name.len();
+        let mut r = admission_resolver(ResolverLimits {
+            max_compile_time_retained_bytes: 2 * site_bytes
+                + 3 * std::mem::size_of::<QueuedProjectImporter>(),
+            ..Default::default()
+        });
+        let mut queue = ProjectImportQueue::default();
+        for _ in 0..2 {
+            r.enqueue_project_imports(&mut queue, &root, &sites, &NoCancellation)
+                .unwrap();
+        }
+        assert_eq!(queue.site_retained, 2 * site_bytes);
+        assert_eq!(
+            queue.storage_retained,
+            queue.items.capacity() * std::mem::size_of::<QueuedProjectImporter>()
+        );
+        assert_eq!(
+            r.compile_time_usage().retained_bytes,
+            queue.site_retained + queue.storage_retained
+        );
+        let capacity = queue.items.capacity();
+        let before = r.compile_time_usage();
+        assert!(matches!(
+            r.enqueue_project_imports(&mut queue, &root, &sites, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(queue.items.len(), 2);
+        assert_eq!(queue.items.capacity(), capacity);
+        assert_eq!(r.compile_time_usage().retained_bytes, before.retained_bytes);
+        assert!(r.compile_time_usage().work > before.work);
+        assert!(r.report().observations.is_empty());
+    }
+
+    #[test]
+    fn fix2_parsed_root_queue_sites_and_capacity_refund_on_consumption() {
+        let root =
+            admission_root("unit T; interface {$IF false}uses A,B,C;{$ENDIF} implementation end.");
+        let initial = root_output_reservation(&root);
+        let mut r = admission_resolver(Default::default());
+        let p = r.resolve_project_inner(root, &[], &NoCancellation).unwrap();
+        assert!(p.complete);
+        assert_eq!(p.imports.len(), 3);
+        assert!(p.report.observations.is_empty());
+        let output = initial
+            + p.imports
+                .iter()
+                .map(|i| {
+                    std::mem::size_of::<ResolvedImport>()
+                    + i.site.requested_name.len()
+                    + i.importer_source_id.as_str().len()
+                    // Existing conservative qualifier-output reservation, even
+                    // for unavailable bindings (not queue input storage).
+                    + 8 * std::mem::size_of::<String>()
+                    + 8 * i.site.requested_name.len()
+                })
+                .sum::<usize>();
+        assert_eq!(
+            r.compile_time_usage().retained_bytes,
+            output,
+            "only existing published output reservations survive, not queue sites/capacity"
+        );
+        assert!(r.compile_time_usage().work > 3);
+    }
+
+    #[test]
+    fn fix2_popped_site_and_queue_refunds_on_error_cancel_and_abandonment() {
+        struct CancelAfterAdmission(std::cell::Cell<usize>);
+        impl CancellationToken for CancelAfterAdmission {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= 4
+            }
+        }
+        let root = admission_root("unit T; interface implementation end.");
+        let initial = root_output_reservation(&root);
+        let sites = [ImportSite {
+            requested_name: "ForbiddenProvider".into(),
+            byte_range: 0..1,
+            section: ImportSection::Interface,
+        }];
+        let mut r = admission_resolver(ResolverLimits {
+            max_compile_time_work: 50,
+            ..Default::default()
+        });
+        assert!(matches!(
+            r.resolve_project_inner(root.clone(), &sites, &NoCancellation),
+            Err(ResolverError::LimitExceeded { .. })
+        ));
+        assert_eq!(r.compile_time_usage().retained_bytes, initial);
+        assert!(r.compile_time_usage().work > 0);
+        assert!(r.report().observations.is_empty());
+        let mut r = admission_resolver(Default::default());
+        assert_eq!(
+            r.resolve_project_inner(
+                root.clone(),
+                &sites,
+                &CancelAfterAdmission(std::cell::Cell::new(0))
+            )
+            .unwrap_err(),
+            ResolverError::Cancelled
+        );
+        assert_eq!(r.compile_time_usage().retained_bytes, initial);
+        assert!(r.compile_time_usage().work > 0);
+        assert!(r.report().observations.is_empty());
+        let mut r = admission_resolver(Default::default());
+        r.stop_project_walk_when_incomplete(true);
+        r.mark_incomplete("prior lookup failure".into());
+        let p = r
+            .resolve_project_inner(root, &sites, &NoCancellation)
+            .unwrap();
+        assert!(!p.complete);
+        assert!(p.imports.is_empty());
+        assert_eq!(r.compile_time_usage().retained_bytes, initial);
+        assert!(r.compile_time_usage().work > 0);
+        assert_eq!(p.report.incomplete_reasons, vec!["prior lookup failure"]);
+    }
+
+    #[test]
+    fn fix2_parsed_dependency_queue_is_consumed_without_retaining_site_copies() {
+        let root = admission_root("unit T; interface uses A,B; implementation end.");
+        let mut r = admission_resolver(Default::default());
+        for name in ["A", "B"] {
+            r.store.sources.insert(
+                PathBuf::from(format!("/workspace/{name}.pas")),
+                format!(
+                    "unit {name}; interface {{$IF false}}uses Unread;{{$ENDIF}} implementation end."
+                )
+                .into_bytes(),
+            );
+        }
+        let mut queue = ProjectImportQueue::default();
+        let p = r
+            .resolve_project_queued(root, &[], &NoCancellation, &mut queue)
+            .unwrap();
+        assert!(p.complete);
+        assert_eq!(p.units.len(), 2);
+        assert_eq!(p.imports.len(), 4);
+        assert!(queue.items.is_empty());
+        assert_eq!(
+            queue.site_retained, 0,
+            "root and both parsed dependency inputs were consumed/refunded"
+        );
+        assert_eq!(
+            queue.storage_retained,
+            queue.items.capacity() * std::mem::size_of::<QueuedProjectImporter>()
+        );
+        assert!(queue.storage_retained > 0);
+        assert_eq!(
+            p.report
+                .observations
+                .iter()
+                .filter_map(|o| match o {
+                    ResolutionObservation::Payload { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/workspace/A.pas"),
+                PathBuf::from("/workspace/B.pas")
+            ]
+        );
+    }
+
+    #[test]
+    fn fix2_cancelled_dependency_walk_refunds_unconsumed_queue_tail_and_preserves_reads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Flag(Arc<AtomicBool>);
+        impl CancellationToken for Flag {
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+        struct CancelInclude {
+            inner: MemoryStore,
+            flag: Arc<AtomicBool>,
+        }
+        impl SourceStore for CancelInclude {
+            fn list_directory(
+                &mut self,
+                request: DirectoryRequest<'_>,
+                cancel: &dyn CancellationToken,
+            ) -> Result<DirectoryListing, SourceStoreError> {
+                self.inner.list_directory(request, cancel)
+            }
+            fn overlay_candidates(&self, roots: &[PathBuf], names: &[String]) -> Vec<PathBuf> {
+                self.inner.overlay_candidates(roots, names)
+            }
+            fn load(
+                &mut self,
+                request: SourceRequest<'_>,
+                cancel: &dyn CancellationToken,
+            ) -> Result<LoadedSource, SourceStoreError> {
+                if request.path.file_name().is_some_and(|n| n == "halt.inc") {
+                    self.flag.store(true, Ordering::Relaxed);
+                    Err(SourceStoreError::Cancelled)
+                } else {
+                    self.inner.load(request, cancel)
+                }
+            }
+        }
+        let new_resolver = || {
+            let flag = Arc::new(AtomicBool::new(false));
+            let mut inner = MemoryStore::default();
+            for (name, text) in [
+                (
+                    "A.pas",
+                    "unit A; interface {$I halt.inc}uses NeverA; implementation end.",
+                ),
+                (
+                    "B.pas",
+                    "unit B; interface uses NeverB; implementation end.",
+                ),
+                (
+                    "C.pas",
+                    "unit C; interface uses NeverC; implementation end.",
+                ),
+                ("halt.inc", "{never returned}"),
+            ] {
+                inner.sources.insert(
+                    PathBuf::from(format!("/workspace/{name}")),
+                    text.as_bytes().to_vec(),
+                );
+            }
+            (
+                UnitResolver::new(
+                    admission_resolver(Default::default()).context,
+                    vec![PathBuf::from("/workspace")],
+                    CancelInclude {
+                        inner,
+                        flag: flag.clone(),
+                    },
+                    Default::default(),
+                ),
+                Flag(flag),
+            )
+        };
+        let root = admission_root("unit T; interface uses A,B,C; implementation end.");
+        let (mut partial, cancel) = new_resolver();
+        let mut queue = ProjectImportQueue::default();
+        assert_eq!(
+            partial
+                .resolve_project_queued(root.clone(), &[], &cancel, &mut queue)
+                .unwrap_err(),
+            ResolverError::Cancelled
+        );
+        assert_eq!(queue.items.len(), 2);
+        let tail = queue
+            .items
+            .iter()
+            .map(|item| {
+                item.sites.capacity() * std::mem::size_of::<ImportSite>()
+                    + item
+                        .sites
+                        .iter()
+                        .map(|s| s.requested_name.capacity())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            queue.site_retained, tail,
+            "popped A sites refunded; B/C remain until queue owner drops them"
+        );
+        let temporary = queue.site_retained + queue.storage_retained;
+        let (mut owned, cancel) = new_resolver();
+        assert_eq!(
+            owned.resolve_project_inner(root, &[], &cancel).unwrap_err(),
+            ResolverError::Cancelled
+        );
+        assert_eq!(
+            owned.compile_time_usage().retained_bytes + temporary,
+            partial.compile_time_usage().retained_bytes
+        );
+        assert_eq!(
+            owned.compile_time_usage().work,
+            partial.compile_time_usage().work,
+            "temporary cleanup must not refund work"
+        );
+        let payloads = owned
+            .report()
+            .observations
+            .iter()
+            .filter_map(|o| match o {
+                ResolutionObservation::Payload { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            payloads,
+            vec![
+                PathBuf::from("/workspace/A.pas"),
+                PathBuf::from("/workspace/B.pas"),
+                PathBuf::from("/workspace/C.pas")
+            ]
+        );
+        assert!(!owned.report().complete);
+        assert_eq!(
+            owned.report().observations,
+            partial.report().observations,
+            "failure cleanup preserves lookup evidence"
+        );
+    }
 
     #[derive(Default)]
     struct MemoryStore {

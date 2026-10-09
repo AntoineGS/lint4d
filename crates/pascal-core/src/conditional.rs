@@ -2952,7 +2952,7 @@ pub(crate) fn source_directive_shape(
                 };
                 if bytes.get(i + 1) == Some(&b'$') {
                     count += 1;
-                    includes |= directive_kind(&source[i + 2..close]) == DirectiveKind::Include;
+                    includes |= include_shape(&source[i + 2..close]);
                 }
                 i = close + 1;
             }
@@ -2962,7 +2962,7 @@ pub(crate) fn source_directive_shape(
                 };
                 if bytes.get(i + 2) == Some(&b'$') {
                     count += 1;
-                    includes |= directive_kind(&source[i + 3..close]) == DirectiveKind::Include;
+                    includes |= include_shape(&source[i + 3..close]);
                 }
                 i = close + 2;
             }
@@ -2970,6 +2970,14 @@ pub(crate) fn source_directive_shape(
         }
     }
     (includes, count)
+}
+
+/// Shape classification needs no owned keyword or switch/condition decoder.
+/// Exact borrowed keywords also exclude I+/I- and comma switch lists.
+fn include_shape(body: &str) -> bool {
+    directive_keyword(body).is_some_and(|keyword| {
+        keyword.eq_ignore_ascii_case("i") || keyword.eq_ignore_ascii_case("include")
+    })
 }
 
 fn lex_directives_inner(
@@ -4827,6 +4835,27 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fix2_include_shape_uses_borrowed_keywords_not_switch_decoders() {
+        for (body, include) in [
+            ("i child.inc", true),
+            ("  InClUdE: child.inc", true),
+            ("I+", false),
+            ("I-", false),
+            ("I+,R-,Q+", false),
+            ("I+ , R-", false),
+            ("IF false", false),
+            ("unknown", false),
+            ("I ,R-", true),
+        ] {
+            assert_eq!(super::include_shape(body), include, "{body}");
+            assert_eq!(
+                super::include_shape(body),
+                super::directive_kind(body) == super::DirectiveKind::Include,
+                "shape must preserve existing classification: {body}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

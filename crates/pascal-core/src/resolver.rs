@@ -3820,12 +3820,8 @@ impl<S: SourceStore> UnitResolver<S> {
             .get(&lookup.to_ascii_lowercase())
         {
             let group = CandidateGroup {
-                paths: entries
-                    .iter()
-                    .map(|entry| (entry.path.clone(), entry.clone()))
-                    .collect::<Vec<_>>()
-                    .into(),
-                legacy_route: request.legacy_route.cloned(),
+                paths: self.explicit_structured_paths(entries, cancel)?,
+                legacy_route: request.legacy_route,
             };
             if let Some(result) =
                 self.resolve_candidate_group(&group, requested, &lookup, cancel)?
@@ -3848,7 +3844,7 @@ impl<S: SourceStore> UnitResolver<S> {
                 .collect();
             let group = CandidateGroup {
                 paths: paths.into(),
-                legacy_route: request.legacy_route.cloned(),
+                legacy_route: request.legacy_route,
             };
             if let Some(result) =
                 self.resolve_candidate_group(&group, requested, &lookup, cancel)?
@@ -3991,7 +3987,7 @@ impl<S: SourceStore> UnitResolver<S> {
             let paths = self.paths_for_names(&directory, &entry, &names, &listing, cancel)?;
             let group = CandidateGroup {
                 paths,
-                legacy_route: legacy_route.cloned(),
+                legacy_route,
             };
             if let Some(result) =
                 self.resolve_candidate_group(&group, requested, unit_name, cancel)?
@@ -4114,7 +4110,7 @@ impl<S: SourceStore> UnitResolver<S> {
                                 &nested_listing,
                                 cancel,
                             )?,
-                            legacy_route: legacy_route.cloned(),
+                            legacy_route,
                         };
                         if let Some(result) =
                             self.resolve_candidate_group(&group, requested, unit_name, cancel)?
@@ -4126,6 +4122,34 @@ impl<S: SourceStore> UnitResolver<S> {
             }
         }
         Ok(None)
+    }
+
+    fn explicit_structured_paths(
+        &self,
+        entries: &[ProjectPathEntry],
+        cancel: &dyn CancellationToken,
+    ) -> Result<LookupScratch<Vec<(PathBuf, ProjectPathEntry)>>, ResolverError> {
+        let Some(mut budget) = self.store_budget(cancel) else {
+            return Ok(LookupScratch::Legacy(
+                entries
+                    .iter()
+                    .map(|entry| (entry.path.clone(), entry.clone()))
+                    .collect(),
+            ));
+        };
+        let mut result = explicit_path_vector(entries.len(), &mut budget)?;
+        budget
+            .charge(entries.len(), 0, 0)
+            .map_err(|r| crate::compile_time::resolver_error(r, &budget))?;
+        for entry in entries {
+            if cancel.is_cancelled() {
+                return Err(ResolverError::Cancelled);
+            }
+            let local = source_request_entry(&entry.path, entry, &mut budget, cancel)
+                .map_err(root_store_error)?;
+            explicit_path_push(&mut result, &entry.path, local, &mut budget)?;
+        }
+        Ok(LookupScratch::Admitted(result))
     }
 
     fn legacy_entry_for_path(
@@ -4212,6 +4236,15 @@ impl<S: SourceStore> UnitResolver<S> {
         lookup: &str,
         cancel: &dyn CancellationToken,
     ) -> Result<Option<Resolution<ResolvedUnit>>, ResolverError> {
+        if let (LookupScratch::Admitted(paths), Some(budget)) =
+            (&group.paths, self.store_budget(cancel))
+        {
+            if !paths.is_admitted_by(&budget) {
+                return Err(ResolverError::InvalidRequest(
+                    "foreign-root candidate group".into(),
+                ));
+            }
+        }
         if self.owning_unit_candidates {
             return self.resolve_candidate_group_owned(group, requested, lookup, cancel);
         }
@@ -4324,13 +4357,7 @@ impl<S: SourceStore> UnitResolver<S> {
         for index in order.iter() {
             let (path, entry) = &group.paths[*index];
             self.check_cancel(cancel)?;
-            match self.load_candidate(
-                &path,
-                &entry,
-                group.legacy_route.as_ref(),
-                SourceKind::Unit,
-                cancel,
-            ) {
+            match self.load_candidate(&path, &entry, group.legacy_route, SourceKind::Unit, cancel) {
                 Ok(source) => {
                     let mut parsed_owner = if self.owning_unit_callback {
                         let mut budget = self.store_budget(cancel).expect("owning unit root");
@@ -4620,13 +4647,7 @@ impl<S: SourceStore> UnitResolver<S> {
         for index in order.iter() {
             let (path, entry) = &group.paths[*index];
             self.check_cancel(cancel)?;
-            match self.load_candidate(
-                path,
-                entry,
-                group.legacy_route.as_ref(),
-                SourceKind::Unit,
-                cancel,
-            ) {
+            match self.load_candidate(path, entry, group.legacy_route, SourceKind::Unit, cancel) {
                 Ok(source) => {
                     let name =
                         owned_header_name(source.analysis_bytes().as_ref(), &mut budget, cancel)?;
@@ -6676,7 +6697,7 @@ impl<S: SourceStore> UnitResolver<S> {
         &mut self,
         unit_name: &str,
         cancel: &dyn CancellationToken,
-    ) -> Result<Vec<CandidateGroup>, ResolverError> {
+    ) -> Result<Vec<CandidateGroup<'static>>, ResolverError> {
         let initial = self
             .workspace_roots
             .iter()
@@ -7773,9 +7794,44 @@ fn conditional_context_reserve_polled(
     Ok(total)
 }
 
-struct CandidateGroup {
+struct CandidateGroup<'a> {
     paths: LookupScratch<Vec<(PathBuf, ProjectPathEntry)>>,
-    legacy_route: Option<LegacyRoute>,
+    legacy_route: Option<&'a LegacyRoute>,
+}
+
+fn explicit_path_vector(
+    count: usize,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<AdmittedOwned<Vec<(PathBuf, ProjectPathEntry)>>, ResolverError> {
+    let slots = count
+        .checked_mul(std::mem::size_of::<(PathBuf, ProjectPathEntry)>())
+        .ok_or_else(|| ResolverError::InvalidRequest("explicit vector capacity overflow".into()))?;
+    budget
+        .admit_owned(count, 0, slots, || Vec::with_capacity(count))
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))
+}
+
+fn explicit_path_push(
+    to: &mut AdmittedOwned<Vec<(PathBuf, ProjectPathEntry)>>,
+    path: &Path,
+    entry: AdmittedOwned<ProjectPathEntry>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), ResolverError> {
+    if !to.is_admitted_by(budget) || !entry.is_admitted_by(budget) || to.len() == to.capacity() {
+        return Err(ResolverError::InvalidRequest(
+            "explicit receiving owner mismatch".into(),
+        ));
+    }
+    let path = include_limit_path_copy(path, budget).map_err(root_store_error)?;
+    let mut pair = path
+        .map_value(budget, |path| {
+            (path, ProjectPathEntry::legacy(PathBuf::new()))
+        })
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    pair.move_field(entry, budget, |pair, entry| pair.1 = entry)
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))?;
+    to.move_field(pair, budget, |to, pair| to.push(pair))
+        .map_err(|r| crate::compile_time::resolver_error(r, budget))
 }
 
 /// Private temporary storage only. Deref borrows cannot detach its payload from
@@ -14684,6 +14740,534 @@ mod tests {
             assert_eq!(observer.budget_snapshot().work, live.work);
             assert_eq!(observer.budget_snapshot().byte_work, live.byte_work);
         }
+    }
+
+    #[test]
+    fn explicit_structured_owner_actual_original_paths_provenance_outlive_cache() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        let entries = vec![ProjectPathEntry {
+            path: path.clone(),
+            provenance: ProjectPathProvenance::Mapped {
+                root: dir.path().into(),
+            },
+        }];
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let call = resolver.store_call(&mut budget).unwrap();
+        let group = call
+            .explicit_structured_paths(&entries, &NoCancellation)
+            .unwrap();
+        assert!(
+            matches!(group, LookupScratch::Admitted(_)),
+            "typed structured Vec/path/provenance must have original independent owner"
+        );
+        assert_eq!(group[0].0, path);
+        assert_eq!(group[0].1, entries[0]);
+        let pp = group[0].0.as_os_str().as_encoded_bytes().as_ptr();
+        let ep = group[0].1.path.as_os_str().as_encoded_bytes().as_ptr();
+        let rp = match &group[0].1.provenance {
+            ProjectPathProvenance::Mapped { root } => root.as_os_str().as_encoded_bytes().as_ptr(),
+            _ => unreachable!(),
+        };
+        let spent = budget.snapshot();
+        drop(call);
+        drop(resolver);
+        drop(entries);
+        drop(budget);
+        assert_eq!(group[0].0.as_os_str().as_encoded_bytes().as_ptr(), pp);
+        assert_eq!(group[0].1.path.as_os_str().as_encoded_bytes().as_ptr(), ep);
+        assert_eq!(
+            match &group[0].1.provenance {
+                ProjectPathProvenance::Mapped { root } =>
+                    root.as_os_str().as_encoded_bytes().as_ptr(),
+                _ => unreachable!(),
+            },
+            rp
+        );
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        drop(group);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_group_relative_legacy_route_compatibility_probe() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (_dir, root, mut resolver) = physical_report_resolver();
+        let sibling = tempfile::tempdir().unwrap();
+        let unit = sibling.path().join("Selected.pas");
+        let importer = sibling.path().join("LegacyMain.pas");
+        fs::write(&unit, "unit Selected; interface implementation end.").unwrap();
+        fs::write(&importer, "unit LegacyMain; interface implementation end.").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut prefix = PathBuf::new();
+        for _ in cwd
+            .components()
+            .filter(|part| matches!(part, Component::Normal(_)))
+        {
+            prefix.push("..");
+        }
+        let relative = |path: &Path| prefix.join(path.strip_prefix("/").unwrap());
+        let route = LegacyRoute {
+            source_path: relative(&importer),
+            sibling_directory: relative(sibling.path()),
+        };
+        assert!(!route.source_path.is_absolute());
+        assert!(
+            resolver
+                .legacy_entry_for_path(&unit, Some(&route))
+                .is_some(),
+            "existing actual legacy builder authorizes relative route"
+        );
+        resolver
+            .context
+            .explicit_units
+            .insert("selected".into(), vec![unit.clone()]);
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let outcome = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    requested_name: "Selected",
+                    importer_path: &root,
+                    legacy_route: Some(&route),
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome.result(),Resolution::Found(provider) if provider.unit.source.path==unit)
+        );
+    }
+
+    #[test]
+    fn explicit_structured_owner_real_callback_alias_ambiguity_and_error_escapes() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        for mode in 0..3 {
+            let (dir, root, mut resolver) = physical_report_resolver();
+            let a = dir.path().join("A.pas");
+            let b = dir.path().join("B.pas");
+            let rejected = dir.path().join("Rejected.pas");
+            fs::write(&a, "unit Other; interface implementation end.").unwrap();
+            fs::write(&rejected, "unit Wrong;").unwrap();
+            if mode == 2 {
+                fs::remove_file(&a).unwrap();
+                fs::write(&a, "unit Wrong;").unwrap();
+                fs::create_dir(&b).unwrap();
+            } else {
+                fs::write(&b, "unit Other; interface implementation end.").unwrap();
+            }
+            let mut paths = vec![rejected.clone(), a.clone()];
+            if mode > 0 {
+                paths.push(b.clone());
+            }
+            let entries = paths
+                .iter()
+                .map(|p| resolver.context.path_entry_for(p).unwrap())
+                .collect();
+            resolver
+                .context
+                .unit_aliases
+                .insert("alias".into(), "Other".into());
+            resolver
+                .context
+                .explicit_unit_entries
+                .insert("other".into(), entries);
+            let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = budget.snapshot().retained_bytes;
+            let outcome = resolver
+                .unit_report_capability(
+                    UnitResolveRequest {
+                        requested_name: "Alias",
+                        importer_path: &root,
+                        legacy_route: None,
+                    },
+                    &mut budget,
+                    &NoCancellation,
+                )
+                .unwrap();
+            match mode {
+                0 => assert!(
+                    matches!(outcome.result(),Resolution::Found(provider) if provider.unit.source.path==a && provider.unit.requested_name=="Alias" && provider.unit.declared_name=="Other")
+                ),
+                1 => assert!(
+                    matches!(outcome.result(),Resolution::Ambiguous {candidates} if candidates.len()==2 && candidates[0].path==a && candidates[1].path==b && candidates.iter().all(|c|c.declared_name.as_deref()==Some("Other")))
+                ),
+                _ => assert!(
+                    matches!(outcome.result(),Resolution::Incomplete {reason,candidates} if !reason.is_empty() && candidates.len()==1 && candidates[0].path==a && candidates[0].declared_name.as_deref()==Some("Wrong"))
+                ),
+            }
+            assert!(
+                outcome
+                    .reports()
+                    .observations()
+                    .iter()
+                    .any(|o| matches!(o,ResolutionObservation::Payload {path,..} if path==&a))
+            );
+            if mode == 2 {
+                assert!(
+                    !outcome.reports().observations().iter().any(
+                        |o| matches!(o,ResolutionObservation::Payload {path,..} if path==&rejected)
+                    ),
+                    "error before later sorted rejected path forbids read"
+                );
+            } else {
+                assert!(outcome.reports().observations().iter().any(
+                    |o| matches!(o,ResolutionObservation::Payload {path,..} if path==&rejected)
+                ));
+            }
+            let pointers = match outcome.result() {
+                Resolution::Ambiguous { candidates }
+                | Resolution::Incomplete { candidates, .. } => candidates
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.path.as_os_str().as_encoded_bytes().as_ptr(),
+                            c.declared_name.as_ref().unwrap().as_ptr(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                Resolution::Found(provider) => vec![(
+                    provider
+                        .unit
+                        .source
+                        .path
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .as_ptr(),
+                    provider.unit.declared_name.as_ptr(),
+                )],
+                _ => unreachable!(),
+            };
+            let spent = budget.snapshot();
+            drop(resolver);
+            drop(budget);
+            assert!(observer.budget_snapshot().retained_bytes > baseline);
+            match outcome.result() {
+                Resolution::Ambiguous { candidates }
+                | Resolution::Incomplete { candidates, .. } => {
+                    for (candidate, (path, name)) in candidates.iter().zip(pointers) {
+                        assert_eq!(candidate.path.as_os_str().as_encoded_bytes().as_ptr(), path);
+                        assert_eq!(candidate.declared_name.as_ref().unwrap().as_ptr(), name);
+                    }
+                }
+                Resolution::Found(provider) => {
+                    assert_eq!(
+                        provider
+                            .unit
+                            .source
+                            .path
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .as_ptr(),
+                        pointers[0].0
+                    );
+                    assert_eq!(provider.unit.declared_name.as_ptr(), pointers[0].1);
+                    assert!(provider.unit.source.bytes.starts_with(b"unit Other"));
+                }
+                _ => unreachable!(),
+            }
+            assert!(!outcome.reports().observations().is_empty());
+            drop(outcome);
+            assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+            assert_eq!(observer.budget_snapshot().work, spent.work);
+            assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+        }
+    }
+
+    #[test]
+    fn explicit_structured_owner_actual_empty_borrowed_route_foreign_group() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let route = LegacyRoute {
+            source_path: root,
+            sibling_directory: dir.path().into(),
+        };
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let call = resolver.store_call(&mut budget).unwrap();
+        let empty = call
+            .explicit_structured_paths(&[], &NoCancellation)
+            .unwrap();
+        assert!(matches!(empty, LookupScratch::Admitted(_)));
+        assert_eq!(empty.capacity(), 0);
+        drop(empty);
+        let entry = call
+            .context
+            .path_entry_for(&dir.path().join("Other.pas"))
+            .unwrap();
+        let group = CandidateGroup {
+            paths: call
+                .explicit_structured_paths(std::slice::from_ref(&entry), &NoCancellation)
+                .unwrap(),
+            legacy_route: Some(&route),
+        };
+        assert!(std::ptr::eq(group.legacy_route.unwrap(), &route));
+        assert_eq!(group.paths[0].1, entry);
+        let (_dir, _, mut foreign_resolver) = physical_report_resolver();
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut foreign_call = foreign_resolver.store_call(&mut foreign).unwrap();
+        let before = foreign.snapshot();
+        assert!(matches!(
+            foreign_call.resolve_candidate_group(&group, "Other", "Other", &NoCancellation),
+            Err(ResolverError::InvalidRequest(_))
+        ));
+        assert_eq!(foreign.snapshot(), before);
+        assert!(foreign_call.report.observations.is_empty());
+    }
+
+    #[test]
+    fn explicit_structured_owner_actual_cancel_unwind_and_work_refusal_preserve_prior_source() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stop = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stop && self.panic {
+                    panic!("structured construction injected unwind")
+                }
+                stop
+            }
+        }
+        for panic in [false, true] {
+            let mut done = false;
+            let mut refused = 0;
+            for stop in 0..300 {
+                let (dir, _, mut resolver) = physical_report_resolver();
+                let p = dir.path().join("Other.pas");
+                let entries = vec![resolver.context.path_entry_for(&p).unwrap(); 3];
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                let prior = call
+                    .load_candidate_with_limit(
+                        &p,
+                        &entries[0],
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &NoCancellation,
+                    )
+                    .unwrap();
+                let before = budget.snapshot();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    call.explicit_structured_paths(
+                        &entries,
+                        &Poll {
+                            calls: 0.into(),
+                            stop,
+                            panic,
+                        },
+                    )
+                }));
+                match outcome {
+                    Err(_) => {
+                        assert!(panic);
+                        refused += 1;
+                    }
+                    Ok(Err(ResolverError::Cancelled)) => {
+                        assert!(!panic);
+                        refused += 1;
+                    }
+                    Ok(Ok(group)) => {
+                        assert_eq!(group.len(), 3);
+                        drop(group);
+                        done = true;
+                    }
+                    Ok(Err(error)) => panic!("unexpected {error:?}"),
+                }
+                assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+                assert!(budget.snapshot().work >= before.work);
+                assert!(budget.snapshot().byte_work >= before.byte_work);
+                let cache = call
+                    .compile_time_store
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                assert_eq!(cache.loaded.len(), 1);
+                assert_eq!(
+                    cache.loaded.get(&prior.id).unwrap().bytes.as_ptr(),
+                    prior.bytes.as_ptr()
+                );
+                drop(cache);
+                assert_eq!(
+                    call.report
+                        .observations
+                        .iter()
+                        .filter(|o| matches!(o, ResolutionObservation::Payload { .. }))
+                        .count(),
+                    1
+                );
+                let retry = call
+                    .explicit_structured_paths(&entries, &NoCancellation)
+                    .unwrap();
+                drop(retry);
+                assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+                if done {
+                    break;
+                }
+            }
+            assert!(done);
+            assert!(refused > 10);
+        }
+        fn run(ceiling: Option<usize>) -> usize {
+            let (dir, _, mut resolver) = physical_report_resolver();
+            let entries = vec![
+                resolver
+                    .context
+                    .path_entry_for(&dir.path().join("Other.pas"))
+                    .unwrap();
+                3
+            ];
+            let mut budget = CompileTimeBudget::new(
+                CompileTimeLimits {
+                    max_work: ceiling.unwrap_or(CompileTimeLimits::default().max_work),
+                    ..Default::default()
+                },
+                &NoCancellation,
+            );
+            let call = resolver.store_call(&mut budget).unwrap();
+            let before = budget.snapshot();
+            let out = call.explicit_structured_paths(&entries, &NoCancellation);
+            if ceiling.is_some() {
+                assert!(matches!(out, Err(ResolverError::LimitExceeded { .. })));
+            } else {
+                drop(out.unwrap());
+            }
+            assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+            assert!(call.report.observations.is_empty());
+            budget.snapshot().work
+        }
+        let work = run(None);
+        run(Some(work - 1));
+    }
+
+    #[test]
+    fn explicit_structured_owner_actual_receiving_peak_refusal() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Trace<'a> {
+            owner: &'a AdmittedShared<()>,
+            peak: std::cell::Cell<usize>,
+        }
+        impl CancellationToken for Trace<'_> {
+            fn is_cancelled(&self) -> bool {
+                self.peak.set(
+                    self.peak
+                        .get()
+                        .max(self.owner.budget_snapshot().retained_bytes),
+                );
+                false
+            }
+        }
+        fn run(ceiling: Option<usize>) -> usize {
+            let (dir, _, mut resolver) = physical_report_resolver();
+            let entries = vec![
+                resolver
+                    .context
+                    .path_entry_for(&dir.path().join("Other.pas"))
+                    .unwrap();
+                4
+            ];
+            let mut budget = CompileTimeBudget::new(
+                CompileTimeLimits {
+                    max_retained_bytes: ceiling
+                        .unwrap_or(CompileTimeLimits::default().max_retained_bytes),
+                    ..Default::default()
+                },
+                &NoCancellation,
+            );
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let call = resolver.store_call(&mut budget).unwrap();
+            let before = budget.snapshot();
+            let trace = Trace {
+                owner: &observer,
+                peak: std::cell::Cell::new(before.retained_bytes),
+            };
+            let out = call.explicit_structured_paths(&entries, &trace);
+            if ceiling.is_some() {
+                assert!(matches!(out, Err(ResolverError::LimitExceeded { .. })));
+            } else {
+                drop(out.unwrap());
+            }
+            assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+            assert!(budget.snapshot().work > before.work);
+            assert!(budget.snapshot().byte_work > before.byte_work);
+            assert!(call.report.observations.is_empty());
+            let cache = call
+                .compile_time_store
+                .as_ref()
+                .unwrap()
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(cache.loaded.is_empty());
+            trace.peak.get()
+        }
+        let peak = run(None);
+        run(Some(peak - 1));
+    }
+
+    #[test]
+    fn explicit_structured_owner_actual_unauthorized_entry_stops_later_payload() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let outside = tempfile::tempdir().unwrap();
+        let denied = dir.path().join("A.pas");
+        let later = dir.path().join("Z.pas");
+        fs::write(&denied, "unit Selected;").unwrap();
+        fs::write(&later, "unit Selected;").unwrap();
+        let unauthorized = ProjectPathEntry {
+            path: denied.clone(),
+            provenance: ProjectPathProvenance::Mapped {
+                root: outside.path().into(),
+            },
+        };
+        let authorized = resolver.context.path_entry_for(&later).unwrap();
+        resolver
+            .context
+            .explicit_unit_entries
+            .insert("selected".into(), vec![authorized, unauthorized]);
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let outcome = resolver
+            .unit_report_capability(
+                UnitResolveRequest {
+                    requested_name: "Selected",
+                    importer_path: &root,
+                    legacy_route: None,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome.result(),Resolution::Incomplete {reason,candidates} if reason=="unit candidate could not be loaded: AdmissionUnavailable" && candidates.is_empty()),
+            "unmapped provenance must refuse through the actual admitted store bridge: {:?}",
+            outcome.result()
+        );
+        assert!(!outcome.reports().observations().iter().any(|o|matches!(o,ResolutionObservation::Payload {path,..} if path==&denied || path==&later)),"unauthorized first candidate prevents every later payload read");
     }
 
     #[test]

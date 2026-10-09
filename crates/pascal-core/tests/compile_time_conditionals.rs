@@ -14,6 +14,76 @@ use pascal_project::{
 use support::compile_time::{Fixture, activity, context};
 
 #[test]
+fn fix2_i4_ord_of_proven_enum_preserves_independent_later_proof() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let source = "unit T; interface {$DEFINE FLAG} type E=(e0=Ord(Defined(FLAG)),e1=e0+1); \
+            {$IF Ord(e0)=1}{$DEFINE HIT}{$ENDIF} \
+            {$IF SizeOf(Integer)=4}{$DEFINE INDEPENDENT}{$ENDIF} implementation end.";
+        let a = Fixture::new(source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE HIT"), Truth::True);
+        assert_eq!(activity(&a, "DEFINE INDEPENDENT"), Truth::True);
+        assert_eq!(a.facts.reachable_states().count(), 1);
+    }
+}
+
+#[test]
+fn fix2_i4_ord_initializers_retain_opposing_enum_capture_and_branch_correlation() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let source = "unit T; interface {$IF Mystery}{$DEFINE LEFT}{$DEFINE FLAG} \
+            type E=(e0=Ord(Defined(FLAG)),e1=e0+1);{$ELSE}{$UNDEF LEFT}{$UNDEF FLAG} \
+            type E=(e0=Ord(Defined(FLAG)),e1=e0+1);{$ENDIF}{$DEFINE FLAG} \
+            const N=Ord(e0); {$IF Defined(LEFT)} \
+            {$IF (N=1) and (Ord(e1)=2)}{$DEFINE LEFT_OK}{$ELSE}{$DEFINE LEFT_WRONG}{$ENDIF} \
+            {$ELSE}{$IF (N=0) and (Ord(e1)=1)}{$DEFINE RIGHT_OK}{$ELSE}{$DEFINE RIGHT_WRONG}{$ENDIF}{$ENDIF} \
+            {$IF SizeOf(Integer)=4}{$DEFINE INDEPENDENT}{$ENDIF} implementation end.";
+        let a = Fixture::new(source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        for body in ["DEFINE LEFT_OK", "DEFINE RIGHT_OK"] {
+            assert_eq!(activity(&a, body), Truth::Unknown, "{body}");
+        }
+        for body in ["DEFINE LEFT_WRONG", "DEFINE RIGHT_WRONG"] {
+            assert_eq!(activity(&a, body), Truth::False, "{body}");
+        }
+        assert_eq!(activity(&a, "DEFINE INDEPENDENT"), Truth::True);
+        assert_eq!(a.facts.reachable_states().count(), 2);
+    }
+}
+
+#[test]
+fn fix2_i4_valid_unknown_ord_does_not_poison_independent_proof() {
+    for platform in [LayoutPlatform::Win32, LayoutPlatform::Win64] {
+        let source = "unit T; interface type E=(e0=Ord(Defined(UNKNOWN)),e1=e0+1); \
+            {$IF Ord(e0)=1}{$DEFINE UNKNOWN_ORD}{$ENDIF} \
+            {$IF SizeOf(Integer)=4}{$DEFINE INDEPENDENT}{$ENDIF} implementation end.";
+        let a = Fixture::new(source, context(platform)).analyze().unwrap();
+        assert!(a.root.complete, "{:?}", a.reasons);
+        assert_eq!(activity(&a, "DEFINE UNKNOWN_ORD"), Truth::Unknown);
+        assert_eq!(activity(&a, "DEFINE INDEPENDENT"), Truth::True);
+    }
+}
+
+#[test]
+fn fix2_i4_ord_empty_and_multiple_arguments_remain_malformed() {
+    for expression in ["Ord()", "Ord(e0,e1)", "Ord(e0,UNKNOWN)"] {
+        let source = format!(
+            "unit T; interface {{$DEFINE FLAG}} type E=(e0=Ord(Defined(FLAG)),e1=e0+1); \
+            {{$IF {expression}=1}}{{$DEFINE INVALID}}{{$ENDIF}} \
+            {{$IF SizeOf(Integer)=4}}{{$DEFINE INDEPENDENT}}{{$ENDIF}} implementation end."
+        );
+        let a = Fixture::new(&source, context(LayoutPlatform::Win32))
+            .analyze()
+            .unwrap();
+        assert!(!a.root.complete, "{expression}");
+        assert!(
+            a.reasons.contains(&IncompleteReason::MalformedSource),
+            "{expression}"
+        );
+        assert_eq!(activity(&a, "DEFINE INDEPENDENT"), Truth::Unknown);
+    }
+}
+
+#[test]
 fn fix1_i1_interrupted_initializers_capture_each_sizeof_and_scalar_query_site() {
     for (platform, pointer) in [(LayoutPlatform::Win32, 4), (LayoutPlatform::Win64, 8)] {
         let source = format!(

@@ -3805,6 +3805,10 @@ impl ExpressionParser<'_> {
                             _ => Value::Error,
                         },
                         "ord" => match argument {
+                            // Explicit ordinal projection only: other operators
+                            // retain nominal identity. The consumed identity is
+                            // evaluator scratch, released by its output cleanup.
+                            Some(Value::EnumOrdinal(value, _identity)) => Value::Number(value),
                             Some(Value::String(value)) if value.is_ascii() => {
                                 let mut chars = value.chars();
                                 match (chars.next(), chars.next()) {
@@ -4378,6 +4382,59 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix2_i4_explicit_ord_consumes_nominal_identity_scratch_without_coercing_comparisons() {
+        use crate::compile_time::{
+            CompileTimeBudget, CompileTimeLimits, DefinitionKey, IncompleteReason, OccurrenceId,
+            ScopeId, SourceAnchor,
+        };
+        let identity = DefinitionKey {
+            anchor: SourceAnchor {
+                source: crate::SourceId::new("captured-enum.pas"),
+                occurrence: OccurrenceId(1),
+                range: 4..5,
+            },
+            scope: ScopeId(0),
+        };
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        budget.charge(1, 0, 17).unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        for expression in ["Ord(e)", "Ord((e))+Ord(e)", "Ord()", "Ord(e,e)", "e=7"] {
+            let result = evaluate_layout_expression(
+                expression,
+                &ConditionalEnvironment::default(),
+                &mut budget,
+                &mut |query, budget| {
+                    if let ExpressionQuery::Name("e", _) = query {
+                        let bytes = std::mem::size_of::<DefinitionKey>()
+                            + identity.anchor.source.as_str().len();
+                        budget.charge(1, identity.anchor.source.as_str().len(), bytes)?;
+                        return Ok(Some(BoundValue::EnumOrdinal(7, identity.clone())));
+                    }
+                    Ok(None)
+                },
+                false,
+                true,
+            );
+            assert_eq!(budget.snapshot().retained_bytes, baseline, "{expression}");
+            match expression {
+                "Ord(e)" => assert!(matches!(
+                    result,
+                    Ok(Some(BoundValue::Constant(ConstantValue::Integer(7))))
+                )),
+                "Ord((e))+Ord(e)" => assert!(matches!(
+                    result,
+                    Ok(Some(BoundValue::Constant(ConstantValue::Integer(14))))
+                )),
+                _ => assert!(
+                    matches!(result, Err(IncompleteReason::MalformedSource)),
+                    "{expression}"
+                ),
+            }
+        }
+    }
 
     struct AlreadyCancelled;
 

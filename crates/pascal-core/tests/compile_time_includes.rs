@@ -346,6 +346,21 @@ fn split_operand_initializer_maps_child_and_parent_bytes() {
 }
 
 #[test]
+fn scanner_deferred_ordinary_prefix_feeds_before_parent_expression() {
+    let mut f = Fixture::new(
+        "unit T; interface {$I prefix.inc}1); {$IF N=1}{$DEFINE HIT}{$ENDIF} implementation end.",
+        context(LayoutPlatform::Win32),
+    );
+    f.include("prefix.inc", "const N=(");
+    let a = f.analyze().unwrap();
+    assert!(a.root.complete, "{:?}", a.reasons);
+    assert_eq!(f.read_names(), ["prefix.inc"]);
+    assert_eq!(activity(&a, "DEFINE HIT"), Truth::True);
+    let child = a.occurrences.iter().find(|o| o.id.0 != 0).unwrap();
+    assert!(a.facts.site_at(&child.source.id, child.id, 8).is_some());
+}
+
+#[test]
 fn child_eof_does_not_close_literal_and_comment_continuations() {
     for (payload, resume) in [
         ("'abc", "{$I forbidden.inc}'"),

@@ -263,7 +263,7 @@ struct SessionOutput {
     reasons: Vec<IncompleteReason>,
     observations: AdmittedOwned<Vec<ResolutionObservation>>,
     warnings: AdmittedOwned<Vec<String>>,
-    directive_fragments: Vec<DirectiveFragments>,
+    directive_fragments: AdmittedOwned<Vec<DirectiveFragments>>,
 }
 
 /// Analyze one root with the shared conditional interpreter and lexical binder.
@@ -386,14 +386,6 @@ fn publish_analysis(
             payload += source.as_str().len() + reason.len();
         }
     }
-    for d in &analysis.directive_fragments {
-        payload += size_of::<DirectiveFragments>()
-            + d.directive.body.len()
-            + (d.fragments.len() + d.body_fragments.len()) * size_of::<SourceAnchor>();
-        for a in d.fragments.iter().chain(&d.body_fragments) {
-            payload += a.source.as_str().len();
-        }
-    }
     let mut output = budget
         .admit_owned(1, payload, payload, || CompileTimeOutput {
             root: analysis.root.clone(),
@@ -404,7 +396,7 @@ fn publish_analysis(
             reasons: analysis.reasons.clone(),
             observations: Vec::new(),
             warnings: Vec::new(),
-            directive_fragments: analysis.directive_fragments.clone(),
+            directive_fragments: Vec::new(),
             budget: view,
         })
         .map_err(|r| resolver_error(r, budget))?;
@@ -417,9 +409,16 @@ fn publish_analysis(
     let empty_warnings = budget
         .admit_owned(0, 0, 0, Vec::new)
         .map_err(|r| resolver_error(r, budget))?;
+    let empty_fragments = budget
+        .admit_owned(0, 0, 0, Vec::new)
+        .map_err(|r| resolver_error(r, budget))?;
     let observations =
         std::mem::replace(&mut analysis.value_mut().observations, empty_observations);
     let warnings = std::mem::replace(&mut analysis.value_mut().warnings, empty_warnings);
+    let fragments = std::mem::replace(
+        &mut analysis.value_mut().directive_fragments,
+        empty_fragments,
+    );
     output
         .move_field(observations, budget, |output, observations| {
             output.observations = observations
@@ -428,6 +427,11 @@ fn publish_analysis(
     output
         .move_field(warnings, budget, |output, warnings| {
             output.warnings = warnings
+        })
+        .map_err(|r| resolver_error(r, budget))?;
+    output
+        .move_field(fragments, budget, |output, fragments| {
+            output.directive_fragments = fragments
         })
         .map_err(|r| resolver_error(r, budget))?;
     Ok(output)
@@ -613,10 +617,14 @@ fn analyze_source_with_providers_inner(
         warnings: budget
             .admit_owned(0, 0, 0, Vec::new)
             .map_err(|r| resolver_error(r, budget))?,
-        scanner: conditional::DirectiveScanner::default(),
+        scanner: conditional::DirectiveScanner::new(budget)
+            .map_err(|r| resolver_error(r, budget))?,
         resource_error: None,
         directive_count: 0,
-        directive_fragments: Vec::new(),
+        directive_fragments: budget
+            .admit_owned(0, 0, 0, Vec::new)
+            .map_err(|r| resolver_error(r, budget))?,
+        directive_fragment_slots: 0,
         current_directive: 0,
         state,
         budget,
@@ -758,7 +766,7 @@ fn analyze_source_with_providers_inner(
             .charge(1, occurrence.analysis.projected_source.len(), 0)
             .map_err(|r| resolver_error(r, &session.budget))?;
         let mut bytes = std::mem::take(&mut occurrence.analysis.projected_source).into_bytes();
-        for directive in &session.directive_fragments {
+        for directive in session.directive_fragments.iter() {
             session
                 .budget
                 .charge(1, 0, 0)
@@ -937,7 +945,8 @@ struct RootSession<'a, 'b> {
     scanner: conditional::DirectiveScanner,
     resource_error: Option<ResolverError>,
     directive_count: usize,
-    directive_fragments: Vec<DirectiveFragments>,
+    directive_fragments: AdmittedOwned<Vec<DirectiveFragments>>,
+    directive_fragment_slots: usize,
     current_directive: usize,
     state: CompileTimeState,
     budget: &'a mut CompileTimeBudget<'b>,
@@ -2191,7 +2200,7 @@ impl SourceOrder for RootSession<'_, '_> {
                 return Err(());
             }
         };
-        for (anchor, text) in next.deferred {
+        for (anchor, text) in next.deferred.iter() {
             if self.reasons.is_empty() {
                 for path in &mut self.current {
                     if let Err(reason) = path.state_mut().feed(
@@ -2209,13 +2218,10 @@ impl SourceOrder for RootSession<'_, '_> {
                     }
                 }
             }
-            self.budget.release(
-                std::mem::size_of::<(SourceAnchor, String)>()
-                    + text.len()
-                    + std::mem::size_of::<SourceAnchor>()
-                    + anchor.source.as_str().len(),
-            );
         }
+        // Each deferred owner keeps its actual prefix text and moved anchors
+        // alive through the feed, then drops payload before refunding credits.
+        drop(next.deferred);
         let Some(scanned) = next.directive else {
             return Ok(conditional::SourceOrderStep {
                 text_end: next.text_end,
@@ -2252,25 +2258,87 @@ impl SourceOrder for RootSession<'_, '_> {
         }
         let directive = ConditionalDirective {
             kind,
-            body: scanned.body,
+            body: String::new(),
             start: scanned.range.start,
             end: scanned.range.end,
             activity: Truth::Unknown,
             condition: None,
         };
-        self.budget
-            .charge(1, 0, std::mem::size_of::<DirectiveFragments>())
+        self.current_directive = self.directive_fragments.len();
+        let slots = if self.directive_fragments.len() == self.directive_fragments.capacity() {
+            (self.directive_fragments.len() + 1)
+                .checked_mul(size_of::<DirectiveFragments>())
+                .ok_or_else(|| {
+                    self.fatal = Some(IncompleteReason::MalformedSource);
+                })?
+        } else {
+            0
+        };
+        let copy_slots = if slots != 0 {
+            self.directive_fragment_slots
+        } else {
+            0
+        };
+        self.directive_fragments
+            .grow(self.budget, 1, copy_slots, slots, |values| {
+                if slots != 0 {
+                    values.reserve_exact(1);
+                }
+                values.push(DirectiveFragments {
+                    completion: self.occurrence,
+                    directive,
+                    fragments: Vec::new(),
+                    body_fragments: Vec::new(),
+                });
+            })
             .map_err(|r| {
                 self.fatal = Some(r);
             })?;
-        self.current_directive = self.directive_fragments.len();
-        self.directive_fragments.reserve_exact(1);
-        self.directive_fragments.push(DirectiveFragments {
-            completion: self.occurrence,
-            directive: directive.clone(),
-            fragments: scanned.fragments,
-            body_fragments: scanned.body_fragments,
-        });
+        if slots != 0 {
+            self.directive_fragments
+                .retire_storage(self.directive_fragment_slots)
+                .map_err(|r| {
+                    self.fatal = Some(r);
+                })?;
+            self.directive_fragment_slots = slots;
+        }
+        self.directive_fragments
+            .move_field(scanned.body, self.budget, |values, body| {
+                values
+                    .last_mut()
+                    .expect("physical directive")
+                    .directive
+                    .body = body;
+            })
+            .map_err(|r| {
+                self.fatal = Some(r);
+            })?;
+        self.directive_fragments
+            .move_field(scanned.fragments, self.budget, |values, fragments| {
+                values.last_mut().expect("physical directive").fragments = fragments;
+            })
+            .map_err(|r| {
+                self.fatal = Some(r);
+            })?;
+        self.directive_fragments
+            .move_field(scanned.body_fragments, self.budget, |values, fragments| {
+                values
+                    .last_mut()
+                    .expect("physical directive")
+                    .body_fragments = fragments;
+            })
+            .map_err(|r| {
+                self.fatal = Some(r);
+            })?;
+        // The source-order ConditionalAnalysis needs its own body String. This
+        // is a real independent copy, not a second invoice for emitted metadata.
+        let physical = &self.directive_fragments[self.current_directive].directive;
+        self.budget
+            .charge(1, physical.body.len(), physical.body.len())
+            .map_err(|r| {
+                self.fatal = Some(r);
+            })?;
+        let directive = physical.clone();
         Ok(conditional::SourceOrderStep {
             text_end: next.text_end,
             directive: Some(directive),
@@ -2295,15 +2363,14 @@ impl SourceOrder for RootSession<'_, '_> {
         if self.fatal.is_some() {
             return false;
         }
-        // Lexer RawDirective, final directive/clone, mask/activity ranges, frame
-        // metadata and possible DEFINE/option keys. Actual body length is known
-        // before the lexer copies it; no worst-case whole-source prefix parse.
-        let retained = body_bytes.saturating_mul(4).saturating_add(
-            4 * size_of::<ConditionalDirective>()
-                + 8 * size_of::<Range<usize>>()
-                + 4 * size_of::<String>()
-                + size_of::<ConditionalEnvironment>(),
-        );
+        // Interpreter directive/mask/activity slots and conservative frame/key
+        // controls. Scanner body/anchor payload and physical Vec backing have
+        // their own receipts; the one independent source-order body copy is
+        // admitted separately immediately before cloning it.
+        let retained = 3 * size_of::<ConditionalDirective>()
+            + 8 * size_of::<Range<usize>>()
+            + 4 * size_of::<String>()
+            + size_of::<ConditionalEnvironment>();
         match self.budget.charge(1, body_bytes, retained) {
             Ok(()) => true,
             Err(reason) => {
@@ -2369,7 +2436,7 @@ impl SourceOrder for RootSession<'_, '_> {
     }
 
     fn directive(&mut self, directive: &ConditionalDirective) {
-        self.directive_fragments[self.current_directive]
+        self.directive_fragments.value_mut()[self.current_directive]
             .directive
             .activity = directive.activity;
         if !self.current.is_empty() && self.current.iter().all(|p| p.state().interface_complete) {
@@ -2392,7 +2459,7 @@ impl SourceOrder for RootSession<'_, '_> {
                 DirectiveKind::ConditionalStart | DirectiveKind::ConditionalMiddle
             ) && !layout_body_key(&directive.body).eq_ignore_ascii_case("ELSE")
             {
-                self.directive_fragments[self.current_directive]
+                self.directive_fragments.value_mut()[self.current_directive]
                     .directive
                     .condition = Some(self.last_condition);
             }
@@ -2667,7 +2734,7 @@ mod tests {
                 panic!("no uses in this root");
             }
         }
-        let text = "unit T; interface type R=record X:Byte; end; implementation end.";
+        let text = "unit T; interface {$H+} type R=record X:Byte; end; implementation end.";
         let root = LoadedSource {
             id: SourceId::new("T.pas"),
             path: "T.pas".into(),
@@ -2722,6 +2789,10 @@ mod tests {
         let observations_ptr = analysis.observations.as_ptr();
         let warnings_ptr = analysis.warnings.as_ptr();
         let warning_text_ptr = analysis.warnings[0].as_ptr();
+        let physical_ptr = analysis.directive_fragments.as_ptr();
+        let fragment_ptr = analysis.directive_fragments[0].fragments.as_ptr();
+        let body_fragment_ptr = analysis.directive_fragments[0].body_fragments.as_ptr();
+        let directive_body_ptr = analysis.directive_fragments[0].directive.body.as_ptr();
         struct CancelAt(std::cell::Cell<usize>, usize);
         impl CancellationToken for CancelAt {
             fn is_cancelled(&self) -> bool {
@@ -2766,7 +2837,47 @@ mod tests {
             assert!(after.work >= before.work);
             assert!(after.byte_work >= before.byte_work);
         }
+        let mut facts_copy = 0;
+        analysis
+            .facts
+            .visit_snapshot_payload(&mut |n| {
+                facts_copy += n;
+                Ok(())
+            })
+            .unwrap();
+        // admitted_snapshot's carrier constructor separately admits the inline
+        // state/control floor; its byte-work invoice is owned backing only.
+        facts_copy -= size_of::<CompileTimeState>();
+        let remaining_output_copy = conditional_output_payload(&analysis.root).unwrap()
+            + analysis
+                .occurrences
+                .iter()
+                .map(|o| {
+                    size_of::<OccurrenceAnalysis>()
+                        + crate::resolver::loaded_source_metadata_retained(&o.source)
+                        + conditional_output_payload(&o.analysis).unwrap()
+                })
+                .sum::<usize>();
+        let before_publication = budget.snapshot();
         let output = publish_analysis(analysis, &mut budget).unwrap();
+        assert_eq!(
+            budget.snapshot().byte_work - before_publication.byte_work,
+            facts_copy + remaining_output_copy,
+            "publication copies the still-plain facts/root, not emitted physical metadata or sidebuffers"
+        );
+        assert_eq!(output.directive_fragments.as_ptr(), physical_ptr);
+        assert_eq!(
+            output.directive_fragments[0].fragments.as_ptr(),
+            fragment_ptr
+        );
+        assert_eq!(
+            output.directive_fragments[0].body_fragments.as_ptr(),
+            body_fragment_ptr
+        );
+        assert_eq!(
+            output.directive_fragments[0].directive.body.as_ptr(),
+            directive_body_ptr
+        );
         assert_eq!(
             output.observations.as_ptr(),
             observations_ptr,
@@ -2792,6 +2903,11 @@ mod tests {
         drop(providers);
         drop(budget);
         assert_eq!(output.warnings[0], "warning".repeat(128));
+        assert_eq!(output.directive_fragments[0].directive.body, "H+");
+        assert_eq!(
+            output.directive_fragments[0].fragments[0].occurrence,
+            OccurrenceId(0)
+        );
         let live = view.budget_snapshot();
         drop(output);
         assert!(

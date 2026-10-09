@@ -5,6 +5,7 @@
 //! unconditionally while walking a source buffer; anything else remains
 //! [`Truth::Unknown`].
 
+use crate::compile_time::{AdmittedOwned, CompileTimeBudget, IncompleteReason, SourceAnchor};
 use crate::resolver::{CancellationToken, NoCancellation};
 use pascal_project::canonical_option_name;
 use pascal_project::{LayoutContext, LayoutPlatform};
@@ -1262,11 +1263,13 @@ pub(crate) fn analyze_with_source_order(
 
 /// The same physical directive lexical rules as `lex_directives_inner`, but
 /// suspended at each directive and at child EOF rather than finalizing a root.
-#[derive(Default)]
 pub(crate) struct DirectiveScanner {
     mode: DirectiveLex,
-    pending: String,
-    fragments: Vec<crate::compile_time::SourceAnchor>,
+    pending: AdmittedOwned<String>,
+    fragments: AdmittedOwned<Vec<SourceAnchor>>,
+    // Exact backing invoice minted at the last replacement, not a final len
+    // estimate. Anchor payload invoices stay with the independently owned Vec.
+    fragment_slots: usize,
     prefix: usize,
 }
 #[derive(Default)]
@@ -1290,16 +1293,27 @@ enum DirectiveLex {
 
 pub(crate) struct ScannedDirective {
     pub range: Range<usize>,
-    pub body: String,
-    pub fragments: Vec<crate::compile_time::SourceAnchor>,
-    pub body_fragments: Vec<crate::compile_time::SourceAnchor>,
+    pub body: AdmittedOwned<String>,
+    pub fragments: AdmittedOwned<Vec<SourceAnchor>>,
+    pub body_fragments: AdmittedOwned<Vec<SourceAnchor>>,
 }
 pub(crate) struct ScannerStep {
     pub text_end: usize,
     pub directive: Option<ScannedDirective>,
-    pub deferred: Vec<(crate::compile_time::SourceAnchor, String)>,
+    pub deferred: AdmittedOwned<Vec<(SourceAnchor, String)>>,
 }
 impl DirectiveScanner {
+    pub(crate) fn new(budget: &mut CompileTimeBudget<'_>) -> Result<Self, IncompleteReason> {
+        let pending = budget.admit_owned(0, 0, 0, String::new)?;
+        let fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        Ok(Self {
+            mode: DirectiveLex::default(),
+            pending,
+            fragments,
+            fragment_slots: 0,
+            prefix: 0,
+        })
+    }
     pub(crate) fn complete(&self) -> bool {
         matches!(
             self.mode,
@@ -1319,7 +1333,8 @@ impl DirectiveScanner {
         let bytes = source.as_bytes();
         use DirectiveLex::*;
         let mut i = cursor;
-        let mut deferred = Vec::new();
+        let mut deferred = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let mut deferred_slots = 0;
         while i < bytes.len() {
             if cancel.is_cancelled() {
                 return Err(IncompleteReason::Cancelled);
@@ -1338,7 +1353,7 @@ impl DirectiveScanner {
                         self.append(source, i..i + 1, id, occurrence, budget)?;
                         self.mode = StarOpen;
                     } else {
-                        self.flush_prefix(occurrence, &mut deferred, budget)?;
+                        self.flush_prefix(occurrence, &mut deferred, &mut deferred_slots, budget)?;
                         self.mode = Normal;
                         continue;
                     }
@@ -1349,7 +1364,7 @@ impl DirectiveScanner {
                         self.prefix = 2;
                         self.mode = DirectiveBrace;
                     } else {
-                        self.flush_prefix(occurrence, &mut deferred, budget)?;
+                        self.flush_prefix(occurrence, &mut deferred, &mut deferred_slots, budget)?;
                         self.mode = Brace;
                         continue;
                     }
@@ -1360,7 +1375,7 @@ impl DirectiveScanner {
                         self.prefix = 3;
                         self.mode = DirectiveParen;
                     } else {
-                        self.flush_prefix(occurrence, &mut deferred, budget)?;
+                        self.flush_prefix(occurrence, &mut deferred, &mut deferred_slots, budget)?;
                         self.mode = StarComment;
                         continue;
                     }
@@ -1477,7 +1492,7 @@ impl DirectiveScanner {
         occurrence: crate::compile_time::OccurrenceId,
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
     ) -> Result<(), crate::compile_time::IncompleteReason> {
-        use crate::compile_time::{IncompleteReason, SourceAnchor};
+        use crate::compile_time::IncompleteReason;
         let maximum = budget.limits().max_pending_bytes;
         if self.pending.len().saturating_add(range.len()) > maximum {
             return Err(IncompleteReason::Limit {
@@ -1495,60 +1510,105 @@ impl DirectiveScanner {
                 .saturating_mul(2)
                 .min(maximum)
                 .max(needed);
-            budget.charge(1, self.pending.len(), capacity - self.pending.capacity())?;
-            self.pending.reserve_exact(capacity - self.pending.len());
+            // Admit the full replacement peak while the old String is live.
+            // The old owner drops its actual backing before refunding credits.
+            let replacement = budget.admit_owned(1, self.pending.len(), capacity, || {
+                let mut text = String::with_capacity(capacity);
+                text.push_str(&self.pending);
+                text
+            })?;
+            self.pending = replacement;
         }
-        if let Some(last) = self
-            .fragments
-            .last_mut()
-            .filter(|a| a.source == *id && a.occurrence == occurrence && a.range.end == range.start)
+        if let Some(last) =
+            self.fragments.value_mut().last_mut().filter(|a| {
+                a.source == *id && a.occurrence == occurrence && a.range.end == range.start
+            })
         {
             last.range.end = range.end;
         } else {
-            budget.charge(
-                1,
-                id.as_str().len(),
-                std::mem::size_of::<SourceAnchor>() + id.as_str().len(),
-            )?;
-            self.fragments.reserve_exact(1);
-            self.fragments.push(SourceAnchor {
-                source: id.clone(),
+            append_scanner_anchor(
+                &mut self.fragments,
+                &mut self.fragment_slots,
+                id,
                 occurrence,
-                range: range.clone(),
-            });
+                range.clone(),
+                budget,
+            )?;
         }
-        self.pending.push_str(&source[range]);
+        self.pending.value_mut().push_str(&source[range]);
         Ok(())
     }
 
     fn flush_prefix(
         &mut self,
         current: crate::compile_time::OccurrenceId,
-        deferred: &mut Vec<(crate::compile_time::SourceAnchor, String)>,
+        deferred: &mut AdmittedOwned<Vec<(SourceAnchor, String)>>,
+        deferred_slots: &mut usize,
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
     ) -> Result<(), crate::compile_time::IncompleteReason> {
-        let mut offset = 0;
-        for anchor in std::mem::take(&mut self.fragments) {
-            let end = offset + anchor.range.len();
-            if anchor.occurrence != current {
-                budget.charge(
-                    1,
-                    anchor.range.len(),
-                    std::mem::size_of::<(crate::compile_time::SourceAnchor, String)>()
-                        + anchor.range.len(),
-                )?;
-                deferred.reserve_exact(1);
-                deferred.push((anchor, self.pending[offset..end].to_owned()));
-            } else {
-                budget.release(
-                    std::mem::size_of::<crate::compile_time::SourceAnchor>()
-                        + anchor.source.as_str().len(),
-                );
-            }
-            offset = end;
+        let count = self
+            .fragments
+            .iter()
+            .filter(|a| a.occurrence != current)
+            .count();
+        let text_bytes = self
+            .fragments
+            .iter()
+            .filter(|a| a.occurrence != current)
+            .map(|a| a.range.len())
+            .sum::<usize>();
+        let needed = deferred
+            .len()
+            .checked_add(count)
+            .ok_or(IncompleteReason::MalformedSource)?;
+        let slots = if needed > deferred.capacity() {
+            needed
+                .checked_mul(size_of::<(SourceAnchor, String)>())
+                .ok_or(IncompleteReason::MalformedSource)?
+        } else {
+            0
+        };
+        let copy_slots = if slots != 0 { *deferred_slots } else { 0 };
+        deferred.grow(
+            budget,
+            count,
+            text_bytes
+                .checked_add(copy_slots)
+                .ok_or(IncompleteReason::MalformedSource)?,
+            text_bytes
+                .checked_add(slots)
+                .ok_or(IncompleteReason::MalformedSource)?,
+            |values| {
+                if slots != 0 {
+                    values.reserve_exact(needed - values.len());
+                }
+            },
+        )?;
+        if slots != 0 {
+            deferred.retire_storage(*deferred_slots)?;
+            *deferred_slots = slots;
         }
-        budget.release(self.pending.capacity());
-        self.pending = String::new();
+        let empty_fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let empty_pending = budget.admit_owned(0, 0, 0, String::new)?;
+        let fragments = std::mem::replace(&mut self.fragments, empty_fragments);
+        let fragment_slots = std::mem::replace(&mut self.fragment_slots, 0);
+        // The fragment payload and its credits move together. Current-source
+        // anchors die here; their conservative credits die with the deferred
+        // owner too, never by a guessed length refund.
+        deferred.move_field(fragments, budget, |values, fragments| {
+            let mut offset = 0;
+            for anchor in fragments {
+                let end = offset + anchor.range.len();
+                if anchor.occurrence != current {
+                    values.push((anchor, self.pending[offset..end].to_owned()));
+                }
+                offset = end;
+            }
+        })?;
+        // The consumed source Vec's backing is now dead, not its moved anchors.
+        deferred.retire_storage(fragment_slots)?;
+        let pending = std::mem::replace(&mut self.pending, empty_pending);
+        drop(pending);
         Ok(())
     }
 
@@ -1557,46 +1617,96 @@ impl DirectiveScanner {
         suffix: usize,
         budget: &mut crate::compile_time::CompileTimeBudget<'_>,
     ) -> Result<ScannedDirective, crate::compile_time::IncompleteReason> {
-        use crate::compile_time::SourceAnchor;
         let body_end = self.pending.len() - suffix;
         let mut logical = 0;
-        let mut body_fragments = Vec::new();
-        for anchor in &self.fragments {
+        let mut body_fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let mut body_slots = 0;
+        for anchor in self.fragments.iter() {
             let end = logical + anchor.range.len();
             let a = logical.max(self.prefix);
             let b = end.min(body_end);
             if a < b {
-                budget.charge(
-                    1,
-                    anchor.source.as_str().len(),
-                    std::mem::size_of::<SourceAnchor>() + anchor.source.as_str().len(),
+                append_scanner_anchor(
+                    &mut body_fragments,
+                    &mut body_slots,
+                    &anchor.source,
+                    anchor.occurrence,
+                    anchor.range.start + a - logical..anchor.range.start + b - logical,
+                    budget,
                 )?;
-                body_fragments.reserve_exact(1);
-                body_fragments.push(SourceAnchor {
-                    source: anchor.source.clone(),
-                    occurrence: anchor.occurrence,
-                    range: anchor.range.start + a - logical..anchor.range.start + b - logical,
-                });
             }
             logical = end;
         }
-        budget.charge(1, body_end - self.prefix, body_end - self.prefix)?;
-        let body = self.pending[self.prefix..body_end].to_owned();
+        let body = budget.admit_owned(1, body_end - self.prefix, body_end - self.prefix, || {
+            self.pending[self.prefix..body_end].to_owned()
+        })?;
         let range = self
             .fragments
             .last()
             .expect("directive delimiter")
             .range
             .clone();
-        budget.release(self.pending.capacity());
-        self.pending = String::new();
+        let empty_pending = budget.admit_owned(0, 0, 0, String::new)?;
+        let empty_fragments = budget.admit_owned(0, 0, 0, Vec::new)?;
+        let pending = std::mem::replace(&mut self.pending, empty_pending);
+        drop(pending);
+        let fragments = std::mem::replace(&mut self.fragments, empty_fragments);
+        self.fragment_slots = 0;
         Ok(ScannedDirective {
             range,
             body,
-            fragments: std::mem::take(&mut self.fragments),
+            fragments,
             body_fragments,
         })
     }
+}
+
+/// Scanner-only vector growth. Payload invoices attach before cloning identity
+/// metadata; a replacement admits its whole backing peak. The previous named
+/// slot invoice retires only after reserve has destroyed/replaced that backing.
+fn append_scanner_anchor(
+    target: &mut AdmittedOwned<Vec<SourceAnchor>>,
+    slot_invoice: &mut usize,
+    source: &crate::SourceId,
+    occurrence: crate::compile_time::OccurrenceId,
+    range: Range<usize>,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<(), IncompleteReason> {
+    let slots = if target.len() == target.capacity() {
+        (target.len() + 1)
+            .checked_mul(size_of::<SourceAnchor>())
+            .ok_or(IncompleteReason::MalformedSource)?
+    } else {
+        0
+    };
+    let copy_slots = if slots != 0 { *slot_invoice } else { 0 };
+    target.grow(
+        budget,
+        1,
+        source
+            .as_str()
+            .len()
+            .checked_add(copy_slots)
+            .ok_or(IncompleteReason::MalformedSource)?,
+        slots
+            .checked_add(source.as_str().len())
+            .ok_or(IncompleteReason::MalformedSource)?,
+        |anchors| {
+            if slots != 0 {
+                anchors.reserve_exact(1);
+            }
+            anchors.push(SourceAnchor {
+                source: source.clone(),
+                occurrence,
+                range,
+            });
+        },
+    )?;
+    if slots != 0 {
+        target.retire_storage(*slot_invoice)?;
+        *slot_invoice = slots;
+    }
+    Ok(())
 }
 
 fn analyze_lexed(
@@ -4835,6 +4945,335 @@ fn is_harmless_keyword(keyword: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scanner_split_emission_keeps_physical_owners_after_reuse_and_budget_exit() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        for pieces in [vec!["{", "$H", "+", "}"], vec!["(", "*", "$H+", "*", ")"]] {
+            let mut budget =
+                CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+            let observer = budget
+                .admit_owned(0, 0, 0, || ())
+                .unwrap()
+                .into_shared(&mut budget)
+                .unwrap();
+            let baseline = observer.budget_snapshot().retained_bytes;
+            let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+            let mut emitted = None;
+            let mut sources = Vec::new();
+            for (n, piece) in pieces.iter().enumerate() {
+                let id = crate::SourceId::new(format!("physical-{n}.inc"));
+                let step = scanner
+                    .next(
+                        piece,
+                        0,
+                        &id,
+                        OccurrenceId(n as u64 + 1),
+                        &mut budget,
+                        &crate::NoCancellation,
+                    )
+                    .unwrap();
+                assert!(step.deferred.is_empty());
+                assert_eq!(step.directive.is_some(), n + 1 == pieces.len());
+                emitted = step.directive.or(emitted);
+                sources.push(id);
+            }
+            let emitted = emitted.unwrap();
+            assert_eq!(&*emitted.body, "H+");
+            assert_eq!(emitted.fragments.len(), pieces.len());
+            for (n, anchor) in emitted.fragments.iter().enumerate() {
+                assert_eq!(anchor.source, sources[n]);
+                assert_eq!(anchor.occurrence, OccurrenceId(n as u64 + 1));
+                assert_eq!(anchor.range, 0..pieces[n].len());
+            }
+            let mapped = emitted
+                .body_fragments
+                .iter()
+                .map(|a| {
+                    let n = a.occurrence.0 as usize - 1;
+                    &pieces[n][a.range.clone()]
+                })
+                .collect::<String>();
+            assert_eq!(mapped, "H+");
+            let saved = emitted.fragments.as_ptr();
+            let reused = scanner
+                .next(
+                    "ordinary",
+                    0,
+                    &sources[0],
+                    OccurrenceId(99),
+                    &mut budget,
+                    &crate::NoCancellation,
+                )
+                .unwrap();
+            assert!(reused.directive.is_none());
+            drop(reused);
+            drop(scanner);
+            drop(budget);
+            assert_eq!(emitted.fragments.as_ptr(), saved);
+            assert_eq!(&*emitted.body, "H+");
+            let live = observer.budget_snapshot();
+            assert!(live.retained_bytes > baseline);
+            drop(emitted);
+            let dead = observer.budget_snapshot();
+            assert_eq!(dead.retained_bytes, baseline);
+            assert_eq!(dead.work, live.work);
+            assert_eq!(dead.byte_work, live.byte_work);
+        }
+    }
+
+    #[test]
+    fn scanner_finish_cancellation_keeps_pending_owner_and_drops_partial_emission() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        struct CancelAt(Cell<usize>, usize);
+        impl CancellationToken for CancelAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                n >= self.1
+            }
+        }
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        scanner
+            .append(
+                "{$H+}",
+                0..5,
+                &crate::SourceId::new("pending.inc"),
+                OccurrenceId(4),
+                &mut budget,
+            )
+            .unwrap();
+        scanner.prefix = 2;
+        let pending = scanner.pending.as_ptr();
+        let fragments = scanner.fragments.as_ptr();
+        for allowed in 0..5 {
+            let before = observer.budget_snapshot();
+            let cancel = CancelAt(Cell::new(0), allowed);
+            let mut cancelled = observer.store_budget(CompileTimeLimits::default(), &cancel);
+            assert!(
+                matches!(
+                    scanner.finish(1, &mut cancelled),
+                    Err(IncompleteReason::Cancelled)
+                ),
+                "boundary {allowed}"
+            );
+            assert_eq!(scanner.pending.as_ptr(), pending);
+            assert_eq!(scanner.fragments.as_ptr(), fragments);
+            assert_eq!(&*scanner.pending, "{$H+}");
+            let after = observer.budget_snapshot();
+            assert_eq!(
+                after.retained_bytes, before.retained_bytes,
+                "partial emission must die at boundary {allowed}"
+            );
+            assert!(after.work >= before.work);
+            assert!(after.byte_work >= before.byte_work);
+        }
+        drop(scanner);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
+    #[test]
+    fn scanner_pending_replacement_refuses_full_peak_before_copy() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let text = "{$123456789012345}";
+        let id = crate::SourceId::new("peak.inc");
+        scanner
+            .append(text, 0..16, &id, OccurrenceId(2), &mut budget)
+            .unwrap();
+        let before = budget.snapshot();
+        let backing = scanner.pending.as_ptr();
+        let capacity = scanner.pending.capacity();
+        assert_eq!(capacity, 16);
+        // One byte below the actual new String/carrier invoice, while the old
+        // String remains live. A delta-capacity invoice would incorrectly fit.
+        budget
+            .constrain_retained(
+                before.retained_bytes + size_of::<AdmittedOwned<String>>() + 2 * capacity - 1,
+            )
+            .unwrap();
+        assert!(matches!(
+            scanner.append(text, 16..17, &id, OccurrenceId(2), &mut budget),
+            Err(IncompleteReason::Limit {
+                name: "max_retained_bytes",
+                ..
+            })
+        ));
+        assert_eq!(scanner.pending.as_ptr(), backing);
+        assert_eq!(&*scanner.pending, &text[..16]);
+        assert_eq!(scanner.fragments[0].range, 0..16);
+        assert_eq!(budget.snapshot().retained_bytes, before.retained_bytes);
+        drop(scanner);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+    }
+
+    #[test]
+    fn scanner_next_unwind_keeps_actual_partial_pending_credits_until_drop() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        struct PanicAt(Cell<usize>);
+        impl CancellationToken for PanicAt {
+            fn is_cancelled(&self) -> bool {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                assert_ne!(n, 12, "actual scanner cancellation callback unwind");
+                false
+            }
+        }
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let before = budget.snapshot();
+        let panic = PanicAt(Cell::new(0));
+        let mut callback_budget = observer.store_budget(CompileTimeLimits::default(), &panic);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner
+                    .next(
+                        "{$H+}",
+                        0,
+                        &crate::SourceId::new("unwind.inc"),
+                        OccurrenceId(3),
+                        &mut callback_budget,
+                        &panic,
+                    )
+                    .unwrap();
+            }))
+            .is_err()
+        );
+        assert!(!scanner.pending.is_empty());
+        assert!(!scanner.fragments.is_empty());
+        let live = observer.budget_snapshot();
+        assert!(
+            live.retained_bytes > before.retained_bytes,
+            "surviving partial scanner retains its allocations"
+        );
+        drop(scanner);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn scanner_deferred_prefix_owns_moved_anchor_and_text_until_feed_drop() {
+        use crate::compile_time::{CompileTimeLimits, OccurrenceId};
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let child = crate::SourceId::new("ordinary-prefix.inc");
+        let first = scanner
+            .next(
+                "(",
+                0,
+                &child,
+                OccurrenceId(6),
+                &mut budget,
+                &crate::NoCancellation,
+            )
+            .unwrap();
+        assert!(first.directive.is_none());
+        drop(first);
+        let step = scanner
+            .next(
+                "1)",
+                0,
+                &crate::SourceId::new("parent.pas"),
+                OccurrenceId(0),
+                &mut budget,
+                &crate::NoCancellation,
+            )
+            .unwrap();
+        assert_eq!(step.deferred.len(), 1);
+        assert_eq!(step.deferred[0].0.source, child);
+        assert_eq!(step.deferred[0].0.occurrence, OccurrenceId(6));
+        assert_eq!(step.deferred[0].0.range, 0..1);
+        assert_eq!(step.deferred[0].1, "(");
+        drop(scanner);
+        drop(budget);
+        // RootSession consumes these same coordinates/text through feed before
+        // dropping this owner. The integration test exercises that real path.
+        let live = observer.budget_snapshot();
+        assert!(live.retained_bytes > baseline);
+        drop(step);
+        let dead = observer.budget_snapshot();
+        assert_eq!(dead.retained_bytes, baseline);
+        assert_eq!(dead.work, live.work);
+        assert_eq!(dead.byte_work, live.byte_work);
+    }
+
+    #[test]
+    fn scanner_emission_moves_fragments_and_refunds_only_dead_owners() {
+        use crate::compile_time::{CompileTimeBudget, CompileTimeLimits, OccurrenceId};
+        let mut budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &crate::NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = observer.budget_snapshot().retained_bytes;
+        let mut scanner = super::DirectiveScanner::new(&mut budget).unwrap();
+        let source = crate::SourceId::new("child.inc");
+        scanner
+            .append("{$H+}", 0..5, &source, OccurrenceId(7), &mut budget)
+            .unwrap();
+        scanner.prefix = 2;
+        let fragments = scanner.fragments.as_ptr();
+        let before = budget.snapshot();
+        let emitted = scanner.finish(1, &mut budget).unwrap();
+        assert_eq!(
+            emitted.fragments.as_ptr(),
+            fragments,
+            "finish moves original vector backing"
+        );
+        assert_eq!(
+            budget.snapshot().byte_work - before.byte_work,
+            2 + source.as_str().len(),
+            "only body and body-anchor identity are copied"
+        );
+        drop(scanner);
+        drop(budget);
+        assert_eq!(&*emitted.body, "H+");
+        assert_eq!(emitted.fragments[0].occurrence, OccurrenceId(7));
+        assert_eq!(emitted.body_fragments[0].range, 2..4);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        let cumulative = observer.budget_snapshot();
+        drop(emitted);
+        let dead = observer.budget_snapshot();
+        assert_eq!(
+            dead.retained_bytes, baseline,
+            "last emitted owner releases its live payload"
+        );
+        assert_eq!(dead.work, cumulative.work);
+        assert_eq!(dead.byte_work, cumulative.byte_work);
+    }
     #[test]
     fn fix2_include_shape_uses_borrowed_keywords_not_switch_decoders() {
         for (body, include) in [

@@ -1472,12 +1472,41 @@ impl<S: SourceStore> CallbackReportCall<'_, S> {
 
 #[derive(Default)]
 struct StoreCache {
-    loaded: HashMap<SourceId, LoadedSource>,
+    loaded: HashMap<OwnedLoadedKey, LoadedSource>,
     directories: HashMap<OwnedDirectoryKey, AdmittedShared<DirectoryListing>>,
-    loaded_capacity_credit: usize,
+    loaded_capacity: Option<AdmittedOwned<()>>,
     directory_capacity: Option<AdmittedOwned<()>>,
     recorded_work: usize,
     recorded_byte_work: usize,
+}
+
+/// Original cloned key storage and its receipt enter/leave the map together.
+struct OwnedLoadedKey(AdmittedOwned<SourceId>);
+impl std::hash::Hash for OwnedLoadedKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+impl PartialEq for OwnedLoadedKey {
+    fn eq(&self, other: &Self) -> bool {
+        *self.0 == *other.0
+    }
+}
+impl Eq for OwnedLoadedKey {}
+impl std::borrow::Borrow<SourceId> for OwnedLoadedKey {
+    fn borrow(&self) -> &SourceId {
+        &self.0
+    }
+}
+
+fn loaded_cache_key(
+    id: &SourceId,
+    budget: &mut CompileTimeBudget<'_>,
+) -> Result<OwnedLoadedKey, SourceStoreError> {
+    budget
+        .admit_owned(1, id.as_str().len(), id.as_str().len(), || id.clone())
+        .map(OwnedLoadedKey)
+        .map_err(|r| store_admission_error(r, budget))
 }
 
 /// A key is moved into the map with its original construction receipt. There
@@ -1515,6 +1544,79 @@ impl std::ops::Deref for DirectoryAccess {
 }
 
 impl StoreCache {
+    fn insert_loaded_pair(
+        &mut self,
+        key: OwnedLoadedKey,
+        source: LoadedSource,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), SourceStoreError> {
+        if !key.0.is_admitted_by(budget)
+            || !source
+                .compile_time_backing
+                .as_ref()
+                .is_some_and(|owner| owner.is_admitted_by(budget))
+            || self
+                .loaded_capacity
+                .as_ref()
+                .is_some_and(|owner| !owner.is_admitted_by(budget))
+        {
+            return Err(SourceStoreError::AdmissionUnavailable);
+        }
+        let overflow = || SourceStoreError::AdmissionUnavailable;
+        // Hashing for contains/remove/insert is input-sized, even on replacement.
+        let hash_bytes = key.0.as_str().len().checked_mul(3).ok_or_else(overflow)?;
+        budget
+            .charge(3, hash_bytes, 0)
+            .map_err(|r| store_admission_error(r, budget))?;
+        let replace = self.loaded.contains_key(&*key.0);
+        if !replace && self.loaded.len() == self.loaded.capacity() {
+            let count = self.loaded.len().checked_add(1).ok_or_else(overflow)?;
+            let buckets = count
+                .checked_next_power_of_two()
+                .and_then(|n| n.checked_mul(2))
+                .map(|n| n.max(4))
+                .ok_or_else(overflow)?;
+            let bytes = buckets
+                .checked_mul(std::mem::size_of::<(OwnedLoadedKey, LoadedSource)>() + 1)
+                .and_then(|n| n.checked_add(16))
+                .ok_or_else(overflow)?;
+            // Admit scalar sizing visits before walking old keys; rehash work
+            // and receiving allocation get their own admission afterwards.
+            budget
+                .charge(self.loaded.len(), 0, 0)
+                .map_err(|r| store_admission_error(r, budget))?;
+            let mut rehash_bytes = 0usize;
+            for old in self.loaded.keys() {
+                if budget.cancel_token().is_cancelled() {
+                    return Err(SourceStoreError::Cancelled);
+                }
+                rehash_bytes = rehash_bytes
+                    .checked_add(old.0.as_str().len())
+                    .ok_or_else(overflow)?;
+            }
+            let capacity = budget
+                .admit_owned(
+                    self.loaded.len().checked_add(1).ok_or_else(overflow)?,
+                    rehash_bytes,
+                    bytes,
+                    || (),
+                )
+                .map_err(|r| store_admission_error(r, budget))?;
+            // All refusal/cancellation callbacks precede the destructive move.
+            // No store reads or recursive calls occur under this cache lock.
+            let mut receiving = HashMap::with_capacity(count);
+            receiving.extend(self.loaded.drain());
+            let old = std::mem::replace(&mut self.loaded, receiving);
+            drop(old);
+            self.loaded_capacity = Some(capacity);
+        }
+        // insert alone retains an equal old key. Destroy the actual old pair
+        // before dropping its owners, then consume the prepared new pair.
+        drop(self.loaded.remove_entry(&*key.0));
+        self.loaded.insert(key, source);
+        Ok(())
+    }
+
     fn insert_directory(
         &mut self,
         key: OwnedDirectoryKey,
@@ -1565,6 +1667,20 @@ impl StoreCache {
         drop(old);
         self.directories.insert(key, listing);
         Ok(())
+    }
+}
+
+impl AdmittedOwned<StoreCache> {
+    fn insert_loaded(
+        &mut self,
+        key: OwnedLoadedKey,
+        source: LoadedSource,
+        budget: &mut CompileTimeBudget<'_>,
+    ) -> Result<(), SourceStoreError> {
+        if !self.is_admitted_by(budget) {
+            return Err(SourceStoreError::AdmissionUnavailable);
+        }
+        self.value_mut().insert_loaded_pair(key, source, budget)
     }
 }
 
@@ -4964,41 +5080,14 @@ impl<S: SourceStore> UnitResolver<S> {
         }
         if let Some(mut budget) = self.store_budget(cancel) {
             let cached = loaded.admitted_copy(&mut budget)?;
+            let key = loaded_cache_key(&loaded.id, &mut budget)?;
             let root = self
                 .compile_time_store
                 .as_ref()
                 .expect("store call")
                 .clone();
             let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
-            let old = cache.loaded_capacity_credit;
-            let growth = cache.loaded.len() == cache.loaded.capacity();
-            let new = if growth {
-                ((cache.loaded.len() + 1).next_power_of_two() * 2).max(4)
-                    * (std::mem::size_of::<(SourceId, LoadedSource)>() + 1)
-                    + 16
-            } else {
-                0
-            };
-            cache
-                .grow(
-                    &mut budget,
-                    1,
-                    loaded.id.as_str().len(),
-                    new + loaded.id.as_str().len(),
-                    |c| {
-                        if growth {
-                            c.loaded.reserve(1);
-                            c.loaded_capacity_credit = new;
-                        }
-                        c.loaded.insert(loaded.id.clone(), cached);
-                    },
-                )
-                .map_err(|r| store_admission_error(r, &budget))?;
-            if growth {
-                cache
-                    .retire_storage(old)
-                    .map_err(|r| store_admission_error(r, &budget))?;
-            }
+            cache.insert_loaded(key, cached, &mut budget)?;
         } else {
             self.loaded.insert(loaded.id.clone(), loaded.clone());
         }
@@ -10454,6 +10543,718 @@ mod tests {
         );
         assert!(budget.snapshot().work > before.work);
         assert!(budget.snapshot().byte_work > before.byte_work);
+    }
+
+    #[test]
+    fn loaded_cache_owner_actual_replacement_does_not_accumulate_dead_key_invoices() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let first = call
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        drop(first);
+        call.report = ResolutionReport {
+            observations: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+        };
+        call.report_owners = ReportOwners::default();
+        let before = budget.snapshot();
+        let second = call
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        drop(second);
+        call.report = ResolutionReport {
+            observations: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+            incomplete_reasons: Vec::new(),
+        };
+        call.report_owners = ReportOwners::default();
+        assert_eq!(
+            budget.snapshot().retained_bytes,
+            before.retained_bytes,
+            "actual replaced key/value die; receiving capacity is unchanged, no cumulative cache key invoice"
+        );
+        assert!(budget.snapshot().work > before.work);
+        assert!(budget.snapshot().byte_work > before.byte_work);
+    }
+
+    #[test]
+    fn loaded_cache_owner_actual_include_revision_reuse_and_replacement_preserve_reports() {
+        use crate::compile_time::{CompileTimeLimits, CompileTimeResolver};
+        let (dir, root, mut resolver) = physical_report_resolver();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let request = || IncludeResolveRequest {
+            including_path: &root,
+            byte_range: 0..0,
+            requested_name: "value.inc",
+            legacy_route: None,
+        };
+        let first = resolver
+            .include_capability(request(), &mut budget, &NoCancellation)
+            .unwrap();
+        let Resolution::Found(old) = first.result() else {
+            panic!("actual authorized include")
+        };
+        let old_pointer = old.bytes.as_ptr();
+        let cache_root = resolver
+            .compile_time_caches
+            .iter()
+            .find(|r| r.view.is_admitted_by(&budget))
+            .unwrap()
+            .clone();
+        let (key_pointer, capacity) = {
+            let cache = cache_root.view.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                cache
+                    .loaded
+                    .get_key_value(&old.id)
+                    .unwrap()
+                    .0
+                    .0
+                    .as_str()
+                    .as_ptr(),
+                cache.loaded.capacity(),
+            )
+        };
+        let reused = resolver
+            .include_capability(request(), &mut budget, &NoCancellation)
+            .unwrap();
+        assert!(
+            matches!(reused.result(),Resolution::Found(s) if s.bytes.as_ptr()==old_pointer && s.revision==old.revision)
+        );
+        {
+            let cache = cache_root.view.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                cache
+                    .loaded
+                    .get_key_value(&old.id)
+                    .unwrap()
+                    .0
+                    .0
+                    .as_str()
+                    .as_ptr(),
+                key_pointer
+            );
+        }
+        fs::write(
+            dir.path().join("value.inc"),
+            "{changed physical include version}",
+        )
+        .unwrap();
+        let same_request = resolver
+            .include_capability(request(), &mut budget, &NoCancellation)
+            .unwrap();
+        assert!(
+            matches!(same_request.result(),Resolution::Found(s) if s.revision==old.revision && s.bytes.as_ptr()==old_pointer),
+            "preserve existing authorization-only same-request include reuse"
+        );
+        let path = dir.path().join("value.inc");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let new = resolver
+            .store_call(&mut budget)
+            .unwrap()
+            .load_candidate_with_limit(
+                &path,
+                &entry,
+                None,
+                SourceKind::Include,
+                4096,
+                &NoCancellation,
+            )
+            .unwrap();
+        assert_eq!(old.id, new.id);
+        assert_ne!(old.revision, new.revision);
+        assert_ne!(new.bytes.as_ptr(), old_pointer);
+        {
+            let cache = cache_root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let (key, value) = cache.loaded.get_key_value(&new.id).unwrap();
+            assert_ne!(key.0.as_str().as_ptr(), key_pointer);
+            assert_eq!(value.bytes.as_ptr(), new.bytes.as_ptr());
+            assert_eq!(cache.loaded.len(), 1);
+            assert_eq!(cache.loaded.capacity(), capacity);
+        }
+        assert!(first.reports().observations().iter().any(
+            |o| matches!(o,ResolutionObservation::Payload {revision,..} if revision==&old.revision)
+        ));
+        assert!(resolver.report.observations.iter().any(
+            |o| matches!(o,ResolutionObservation::Payload {revision,..} if revision==&new.revision)
+        ));
+        let changed = resolver
+            .include_capability(request(), &mut budget, &NoCancellation)
+            .unwrap();
+        assert!(
+            matches!(changed.result(),Resolution::Found(s) if s.revision==new.revision && s.bytes.as_ptr()==new.bytes.as_ptr())
+        );
+        drop(resolver);
+        drop(cache_root);
+        drop(budget);
+        assert_eq!(old.bytes.as_ptr(), old_pointer);
+        assert_eq!(new.bytes.as_ref(), b"{changed physical include version}");
+    }
+
+    #[test]
+    fn loaded_cache_owner_actual_versions_growth_removal_and_last_root_lifetime() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let observer = budget
+            .admit_owned(0, 0, 0, || ())
+            .unwrap()
+            .into_shared(&mut budget)
+            .unwrap();
+        let baseline = budget.snapshot().retained_bytes;
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let old = call
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        let old_pointer = old.bytes.as_ptr();
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        let old_key_pointer = {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let (key, value) = cache.loaded.get_key_value(&old.id).unwrap();
+            assert_eq!(value.bytes.as_ptr(), old_pointer);
+            assert!(key.0.is_admitted_by(&budget));
+            key.0.as_str().as_ptr()
+        };
+        fs::write(
+            &path,
+            "unit Other; interface {new version} implementation end.",
+        )
+        .unwrap();
+        let new = call
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        assert_eq!(old.id, new.id);
+        assert_ne!(old.revision, new.revision);
+        assert_eq!(old.bytes.as_ptr(), old_pointer);
+        assert_ne!(new.bytes.as_ptr(), old_pointer);
+        {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let (key, value) = cache.loaded.get_key_value(&new.id).unwrap();
+            assert_ne!(
+                key.0.as_str().as_ptr(),
+                old_key_pointer,
+                "new original clone replaces equal old key"
+            );
+            assert_eq!(value.bytes.as_ptr(), new.bytes.as_ptr());
+        }
+        let mut held = vec![old, new];
+        let mut growths = 0;
+        for i in 0..12 {
+            let p = dir.path().join(format!("Grow{i}.pas"));
+            fs::write(&p, format!("unit Grow{i}; interface implementation end.")).unwrap();
+            let e = call.context.path_entry_for(&p).unwrap();
+            let (cap, keys) = {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    cache.loaded.capacity(),
+                    cache
+                        .loaded
+                        .keys()
+                        .map(|k| ((*k.0).clone(), k.0.as_str().as_ptr()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let source = call
+                .load_candidate_with_limit(&p, &e, None, SourceKind::Unit, 4096, &NoCancellation)
+                .unwrap();
+            {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                if cache.loaded.capacity() > cap {
+                    growths += 1;
+                }
+                for (id, pointer) in keys {
+                    assert_eq!(
+                        cache
+                            .loaded
+                            .get_key_value(&id)
+                            .unwrap()
+                            .0
+                            .0
+                            .as_str()
+                            .as_ptr(),
+                        pointer,
+                        "rehash moves original key owners without second clones"
+                    );
+                }
+                assert_eq!(
+                    cache.loaded.get(&source.id).unwrap().bytes.as_ptr(),
+                    source.bytes.as_ptr()
+                );
+                assert!(
+                    cache
+                        .loaded_capacity
+                        .as_ref()
+                        .unwrap()
+                        .is_admitted_by(&budget)
+                );
+            }
+            held.push(source);
+        }
+        assert!(growths >= 2);
+        let before = budget.snapshot();
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = cache.loaded.capacity();
+            let receipt = cache
+                .loaded_capacity
+                .as_ref()
+                .unwrap()
+                .is_admitted_by(&budget);
+            let removed = cache.value_mut().loaded.remove_entry(&held[1].id).unwrap();
+            drop(removed);
+            assert_eq!(cache.loaded.capacity(), cap);
+            assert_eq!(
+                cache
+                    .loaded_capacity
+                    .as_ref()
+                    .unwrap()
+                    .is_admitted_by(&budget),
+                receipt
+            );
+        }
+        assert!(budget.snapshot().retained_bytes < before.retained_bytes);
+        assert_eq!(held[0].bytes.as_ptr(), old_pointer);
+        assert!(call.report.observations.iter().any(|o|matches!(o,ResolutionObservation::Payload {revision,..} if revision==&held[0].revision)));
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = cache.loaded.capacity();
+            drop(cache.value_mut().loaded.drain().collect::<Vec<_>>());
+            assert_eq!(
+                cache.loaded.capacity(),
+                cap,
+                "entry death does not destroy receiving backing"
+            );
+            let live = budget.snapshot();
+            let expected = (cap + 1).next_power_of_two()
+                * (std::mem::size_of::<(OwnedLoadedKey, LoadedSource)>() + 1)
+                + 16
+                + std::mem::size_of::<AdmittedOwned<()>>();
+            assert!(live.retained_bytes >= expected);
+            // Test-only teardown follows actual backing death before credit
+            // death; production never clears/evicts this root to gain budget.
+            drop(std::mem::take(&mut cache.value_mut().loaded));
+            drop(cache.value_mut().loaded_capacity.take());
+            assert_eq!(
+                live.retained_bytes - budget.snapshot().retained_bytes,
+                expected,
+                "only this independent actual map invoice retires"
+            );
+        }
+        drop(call);
+        drop(resolver);
+        drop(budget);
+        assert_eq!(held[0].bytes.as_ptr(), old_pointer);
+        let spent = observer.budget_snapshot();
+        drop(held);
+        assert!(observer.budget_snapshot().retained_bytes > baseline);
+        drop(root);
+        assert_eq!(observer.budget_snapshot().retained_bytes, baseline);
+        assert_eq!(observer.budget_snapshot().work, spent.work);
+        assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+    }
+
+    #[test]
+    fn loaded_cache_owner_original_prepared_pair_peak_refusal_and_foreign_root() {
+        use crate::compile_time::CompileTimeLimits;
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        let entry = resolver.context.path_entry_for(&path).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let source = call
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        // Consume an actual independently prepared original pair into its real
+        // receiving cache. No extra source/key copies occur at insertion.
+        let cached = source.admitted_copy(&mut budget).unwrap();
+        let pointer = cached.bytes.as_ptr();
+        let key = loaded_cache_key(&source.id, &mut budget).unwrap();
+        let key_pointer = key.0.as_str().as_ptr();
+        {
+            let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert_loaded(key, cached, &mut budget).unwrap();
+            let (key, value) = cache.loaded.get_key_value(&source.id).unwrap();
+            assert_eq!(key.0.as_str().as_ptr(), key_pointer);
+            assert_eq!(value.bytes.as_ptr(), pointer);
+        }
+        // Fill the actual production map to its retained backing capacity.
+        let mut i = 0;
+        loop {
+            let full = {
+                let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                cache.loaded.len() == cache.loaded.capacity()
+            };
+            if full {
+                break;
+            }
+            let p = dir.path().join(format!("Fill{i}.pas"));
+            fs::write(&p, format!("unit Fill{i}; interface implementation end.")).unwrap();
+            let e = call.context.path_entry_for(&p).unwrap();
+            drop(
+                call.load_candidate_with_limit(
+                    &p,
+                    &e,
+                    None,
+                    SourceKind::Unit,
+                    4096,
+                    &NoCancellation,
+                )
+                .unwrap(),
+            );
+            i += 1;
+        }
+        // Read a real new authorized source before testing the exact receiving
+        // construction boundary, with the original cache already full.
+        let p = dir.path().join("Peak.pas");
+        fs::write(&p, "unit Peak; interface implementation end.").unwrap();
+        let e = call.context.path_entry_for(&p).unwrap();
+        let fresh = call
+            .resolver
+            .store
+            .load_admitted(
+                SourceRequest {
+                    path: &p,
+                    entry: &e,
+                    read_policy: &call.resolver.context.read_policy,
+                    legacy_route: None,
+                    kind: SourceKind::Unit,
+                    max_bytes: 4096,
+                },
+                &mut budget,
+                &NoCancellation,
+            )
+            .unwrap();
+        let cached = fresh.admitted_copy(&mut budget).unwrap();
+        let key = loaded_cache_key(&fresh.id, &mut budget).unwrap();
+        let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        let capacity = cache.loaded.capacity();
+        let len = cache.loaded.len();
+        let old_capacity = cache
+            .loaded_capacity
+            .as_ref()
+            .unwrap()
+            .is_admitted_by(&budget);
+        let live = budget.snapshot();
+        let slot = std::mem::size_of::<(OwnedLoadedKey, LoadedSource)>() + 1;
+        let old_bytes = (capacity + 1).next_power_of_two() * slot
+            + 16
+            + std::mem::size_of::<AdmittedOwned<()>>();
+        let new_bytes = (len + 1).next_power_of_two() * 2 * slot
+            + 16
+            + std::mem::size_of::<AdmittedOwned<()>>();
+        budget
+            .constrain_retained(live.retained_bytes + new_bytes - old_bytes)
+            .unwrap();
+        assert!(matches!(
+            cache.insert_loaded(key, cached, &mut budget),
+            Err(SourceStoreError::RootLimit { .. })
+        ));
+        assert_eq!(cache.loaded.len(), len);
+        assert_eq!(cache.loaded.capacity(), capacity);
+        assert_eq!(
+            cache
+                .loaded_capacity
+                .as_ref()
+                .unwrap()
+                .is_admitted_by(&budget),
+            old_capacity
+        );
+        assert!(!cache.loaded.contains_key(&fresh.id));
+        assert_eq!(
+            cache
+                .loaded
+                .get_key_value(&source.id)
+                .unwrap()
+                .0
+                .0
+                .as_str()
+                .as_ptr(),
+            key_pointer
+        );
+        assert!(
+            budget.snapshot().work > live.work,
+            "performed sizing/hash work survives receiving refusal"
+        );
+        drop(cache);
+        budget
+            .constrain_retained(budget.snapshot().retained_bytes)
+            .unwrap();
+        let before = budget.snapshot();
+        assert!(matches!(
+            loaded_cache_key(&fresh.id, &mut budget),
+            Err(SourceStoreError::RootLimit { .. })
+        ));
+        assert_eq!(
+            budget.snapshot(),
+            before,
+            "refused original key clone does not run"
+        );
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let foreign_key = loaded_cache_key(&source.id, &mut foreign).unwrap();
+        let before = foreign.snapshot();
+        let mut cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(
+            cache.insert_loaded(foreign_key, fresh, &mut foreign),
+            Err(SourceStoreError::AdmissionUnavailable)
+        ));
+        assert_eq!(cache.loaded.len(), len);
+        assert_eq!(cache.loaded.capacity(), capacity);
+        assert_eq!(foreign.snapshot().work, before.work);
+        assert_eq!(
+            cache.loaded.get(&source.id).unwrap().bytes.as_ptr(),
+            source.bytes.as_ptr()
+        );
+    }
+
+    #[test]
+    fn loaded_cache_owner_actual_growth_cancel_unwind_and_store_errors_keep_prior_pairs() {
+        use crate::compile_time::CompileTimeLimits;
+        struct Poll {
+            calls: std::sync::atomic::AtomicUsize,
+            stop: usize,
+            panic: bool,
+        }
+        impl CancellationToken for Poll {
+            fn is_cancelled(&self) -> bool {
+                let stop = self.calls.fetch_add(1, Ordering::Relaxed) >= self.stop;
+                if stop && self.panic {
+                    panic!("actual loaded cache construction/growth/report unwind")
+                }
+                stop
+            }
+        }
+        for panic in [false, true] {
+            let mut completed = false;
+            let mut refused = 0;
+            let mut published_before_refusal = false;
+            for stop in 0..700 {
+                let (dir, _, mut resolver) = physical_report_resolver();
+                let mut budget =
+                    CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+                let observer = budget
+                    .admit_owned(0, 0, 0, || ())
+                    .unwrap()
+                    .into_shared(&mut budget)
+                    .unwrap();
+                let baseline = budget.snapshot().retained_bytes;
+                let mut call = resolver.store_call(&mut budget).unwrap();
+                let mut held = Vec::new();
+                for i in 0..3 {
+                    let p = dir.path().join(format!("Prior{i}.pas"));
+                    fs::write(&p, format!("unit Prior{i}; interface implementation end.")).unwrap();
+                    let e = call.context.path_entry_for(&p).unwrap();
+                    held.push(
+                        call.load_candidate_with_limit(
+                            &p,
+                            &e,
+                            None,
+                            SourceKind::Unit,
+                            4096,
+                            &NoCancellation,
+                        )
+                        .unwrap(),
+                    );
+                }
+                let root = call.compile_time_store.as_ref().unwrap().clone();
+                let (cap, keys) = {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(cache.loaded.len(), cache.loaded.capacity());
+                    (
+                        cache.loaded.capacity(),
+                        cache
+                            .loaded
+                            .keys()
+                            .map(|k| ((*k.0).clone(), k.0.as_str().as_ptr()))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let p = dir.path().join("Next.pas");
+                fs::write(&p, "unit Next; interface implementation end.").unwrap();
+                let e = call.context.path_entry_for(&p).unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    call.load_candidate_with_limit(
+                        &p,
+                        &e,
+                        None,
+                        SourceKind::Unit,
+                        4096,
+                        &Poll {
+                            calls: 0.into(),
+                            stop,
+                            panic,
+                        },
+                    )
+                }));
+                let failure = match result {
+                    Err(_) => {
+                        assert!(panic);
+                        refused += 1;
+                        true
+                    }
+                    Ok(Err(SourceStoreError::Cancelled)) => {
+                        assert!(!panic);
+                        refused += 1;
+                        true
+                    }
+                    Ok(Ok(source)) => {
+                        held.push(source);
+                        completed = true;
+                        false
+                    }
+                    Ok(Err(error)) => panic!("unexpected {stop}: {error:?}"),
+                };
+                {
+                    let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, pointer) in keys {
+                        let (key, value) = cache.loaded.get_key_value(&id).unwrap();
+                        assert_eq!(key.0.as_str().as_ptr(), pointer);
+                        assert_eq!(
+                            value.bytes.as_ptr(),
+                            held.iter().find(|s| s.id == id).unwrap().bytes.as_ptr()
+                        );
+                    }
+                    if cache.loaded.len() == 3 {
+                        assert_eq!(cache.loaded.capacity(), cap);
+                    } else {
+                        assert_eq!(cache.loaded.len(), 4);
+                        assert!(cache.loaded.capacity() > cap);
+                        if failure {
+                            published_before_refusal = true;
+                        }
+                    }
+                }
+                let spent = budget.snapshot();
+                drop(call);
+                drop(resolver);
+                drop(budget);
+                assert!(held[0].bytes.starts_with(b"unit Prior0"));
+                drop(root);
+                assert!(
+                    observer.budget_snapshot().retained_bytes > baseline,
+                    "external admitted source owners outlive cache"
+                );
+                drop(held);
+                assert_eq!(
+                    observer.budget_snapshot().retained_bytes,
+                    baseline,
+                    "last original storage owner dies at poll {stop}, panic={panic}"
+                );
+                assert_eq!(observer.budget_snapshot().work, spent.work);
+                assert_eq!(observer.budget_snapshot().byte_work, spent.byte_work);
+                if completed {
+                    break;
+                }
+            }
+            assert!(completed);
+            assert!(refused > 20);
+            assert!(
+                published_before_refusal,
+                "inherited cache-before-report publication gap is explicit, not falsely certified transactional"
+            );
+        }
+        let (dir, _, mut resolver) = physical_report_resolver();
+        let p = dir.path().join("Other.pas");
+        let e = resolver.context.path_entry_for(&p).unwrap();
+        let mut budget = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let mut call = resolver.store_call(&mut budget).unwrap();
+        let source = call
+            .load_candidate_with_limit(&p, &e, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        let root = call.compile_time_store.as_ref().unwrap().clone();
+        let pointer = {
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .loaded
+                .get_key_value(&source.id)
+                .unwrap()
+                .0
+                .0
+                .as_str()
+                .as_ptr()
+        };
+        let missing = dir.path().join("Missing.pas");
+        let denied = dir.path().join("Directory.pas");
+        fs::create_dir(&denied).unwrap();
+        for (path, max) in [(&missing, 4096), (&denied, 4096), (&p, 1)] {
+            let e = call.context.path_entry_for(path).unwrap();
+            assert!(matches!(
+                call.load_candidate_with_limit(
+                    path,
+                    &e,
+                    None,
+                    SourceKind::Unit,
+                    max,
+                    &NoCancellation
+                ),
+                Err(SourceStoreError::NotFound { .. }
+                    | SourceStoreError::Unauthorized { .. }
+                    | SourceStoreError::TooLarge { .. })
+            ));
+            let cache = root.view.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(cache.loaded.len(), 1);
+            assert_eq!(
+                cache
+                    .loaded
+                    .get_key_value(&source.id)
+                    .unwrap()
+                    .0
+                    .0
+                    .as_str()
+                    .as_ptr(),
+                pointer
+            );
+            assert_eq!(
+                cache.loaded.get(&source.id).unwrap().bytes.as_ptr(),
+                source.bytes.as_ptr()
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_cache_owner_empty_receiving_root_rejects_other_roots_original_pair() {
+        use crate::compile_time::CompileTimeLimits;
+        let (_dir, _, mut receiver) = physical_report_resolver();
+        let mut receiving_budget =
+            CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let call = receiver.store_call(&mut receiving_budget).unwrap();
+        let receiving = call.compile_time_store.as_ref().unwrap().clone();
+        let (dir, _, mut foreign_resolver) = physical_report_resolver();
+        let path = dir.path().join("Other.pas");
+        let entry = foreign_resolver.context.path_entry_for(&path).unwrap();
+        let mut foreign = CompileTimeBudget::new(CompileTimeLimits::default(), &NoCancellation);
+        let source = foreign_resolver
+            .store_call(&mut foreign)
+            .unwrap()
+            .load_candidate_with_limit(&path, &entry, None, SourceKind::Unit, 4096, &NoCancellation)
+            .unwrap();
+        let cached = source.admitted_copy(&mut foreign).unwrap();
+        let key = loaded_cache_key(&source.id, &mut foreign).unwrap();
+        let original = receiving_budget.snapshot();
+        let before = foreign.snapshot();
+        let mut cache = receiving.view.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cache.loaded_capacity.is_none());
+        assert!(matches!(
+            cache.insert_loaded(key, cached, &mut foreign),
+            Err(SourceStoreError::AdmissionUnavailable)
+        ));
+        assert!(cache.loaded.is_empty());
+        assert_eq!(cache.loaded.capacity(), 0);
+        assert!(cache.loaded_capacity.is_none());
+        assert_eq!(receiving_budget.snapshot(), original);
+        assert_eq!(foreign.snapshot().work, before.work);
+        assert_eq!(foreign.snapshot().byte_work, before.byte_work);
+        assert!(source.bytes.starts_with(b"unit Other"));
     }
 
     #[test]
